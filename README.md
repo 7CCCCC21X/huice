@@ -203,6 +203,7 @@ EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:6888
 | `/web` | 获取概率网页链接（自动刷新，需在 Railway 生成域名） |
 | `/diag` | 逐个检测所有数据源，找出哪里出问题（仅管理员，通常 10–30 秒、最长约 2 分钟；在后台进行，期间其他命令照常响应，报告单独发出；探测不会改变后台刷新的源顺序） |
 | `/sim` | 模拟交易：净优势 ≥10¢ 时按建议买 100 份，只记账不下单（`LIVE=on` 时真实下单），看长期是赚还是亏；另列持仓的共同风险（最坏单一事件）、依赖的数据源、组上限拦下的买入和成交后市场走向 |
+| `/web` | 概率网页链接；设置了 `WEB_CONTROL_KEY` 时一并给出控制台链接 |
 | `/live` | 真实交易（`LIVE=on`）：钱包与下单账户、API 登录、USDT/BNB 余额、交易所授权、风控用量、今日盈亏与最近的真实订单；`/live pause [原因]` 停止开新仓、`/live resume` 恢复（也解除当日亏损停机）、`/live cancel all` 或 `/live cancel <订单号>` 撤真实挂单、`/live redeem` 领取已结算持仓、`/live check` 自检、`/live orders` / `/live positions` 看 Predict 上的开放订单与持仓 |
 | `/edge` | 优势提醒门槛：不带参数查看；`/edge 6` 改默认；`/edge 市值阶梯 6` 按栏目（指数 / 合约标的 / 加密 / 价格阶梯 / 市值阶梯）；`/edge 牛来 4` 按市场（名字、别名或代码）；`/edge 牛来 300M 3` 按档位；末尾写 `off` 取消；`/edge 清空` 全部取消。档位 > 市场 > 栏目 > 默认 |
 | `/calib` | 用保存的预测快照和实际收盘给概率模型打分：Brier、对数损失、与 Predict 盘口中间价的对比（模型有没有赢过市场）、校准表（每档带按日数算的 95% 区间）、标准化残差（均方根 1 为校准，>1 说明 σ 偏小）及其按剩余方差份额 R 的分桶、代理系数拟合与逐日向前检验；另有全市场快照（含阶梯各档，每 2 小时一条）按类型打分（只评估，不自动改参数；也可 `python main.py --calib`） |
@@ -348,7 +349,7 @@ HL_TICKERS=UNITREEUSDT=xyz:UNITREE,HK0625USDT=xyz:SHEIN,CXMTUSDT=xyz:CXMT,SKHYNI
 说明：
 
 - 链接里的令牌第一次启动时随机生成并保存在 SQLite，重新部署不变；想换就设置 `WEB_TOKEN`（16～64 位字母数字）。没有令牌的路径一律返回 404，令牌按常量时间比较。
-- 网页只读，不能修改任何设置，也不展示订阅或 Telegram 信息；响应带 `no-store`、`noindex`、`no-referrer` 和限制性的 CSP。
+- 概率页和复盘页只读，不能修改任何设置，也不展示订阅或 Telegram 信息；响应带 `no-store`、`noindex`、`no-referrer` 和限制性的 CSP。需要在网页上改参数或操作真实交易时，另有口令保护的控制台（见「[网页控制台](#网页控制台control)」）。
 - 其他部署环境用 `WEB_PORT` 指定端口、`WEB_BASE_URL` 指定公网地址；`WEB=off` 关闭。
 - `/health` 返回 `ok`，可以作为健康检查路径。
 - `data.json` 只带每个盘口前 10 档和模型公平价，不带服务端算好的四个优势格子（页面按你选的金额自己重算，用不到它们）；比带着小四成。
@@ -560,6 +561,16 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | `LIVE_MAX_DAILY_LOSS_USD` | `200` | 当日已结算亏损达到即停止开新仓并撤挂单；0 不限 |
 | `LIVE_AUTO_REDEEM` | `on` | 自动在链上领取已结算的赢方份额 |
 | `LIVE_NOTIFY` | `on` | 真实订单的 Telegram 通知 |
+| `WEB_CONTROL_KEY` | 空 | 网页控制台口令，见下一节 |
+
+### 网页控制台（/control）
+
+概率网页的链接后面加 `/control`（`/web` 会直接给出），就是控制台。它和概率页共用同一个私密令牌，但**每个操作都要再输一次控制口令**：环境变量 `WEB_CONTROL_KEY`（12～64 个不含空格的 ASCII 字符）。不设置这个变量时控制台只能查看，所有操作都被拒绝；口令连续错 5 次，控制接口锁 10 分钟。口令只存在环境变量里，页面不显示；勾选“在这个浏览器记住口令”才会存进该浏览器的 localStorage。
+
+- **真实交易开关**：暂停开新仓（可填原因）、恢复（也解除当天的亏损停机）、撤掉全部真实挂单或某一张、领取已结算持仓、自检、刷新 Predict 持仓。和 `/live` 的命令是同一套代码，Telegram 里也能看到结果。`LIVE=off` 时这一栏显示未开启。
+- **在线改参数**：策略（`SIM_EDGE_CENTS`、`SIM_SHARES`、`SIM_WAYS`、`SIM_MARKETS`、`SIM_GROUP_USD`、`PREDICT_MIN_EDGE_CENTS`、`PREDICT_TRADE_USD`）和真实交易风控（`LIVE_MAX_ORDER_USD`、`LIVE_MAX_OPEN_USD`、`LIVE_MAX_DAILY_LOSS_USD`、`LIVE_TAKER`、`LIVE_SLIPPAGE_BPS`、`LIVE_TAKER_WAIT_SECONDS`、`LIVE_RETRY_SECONDS`、`LIVE_AUTO_REDEEM`、`LIVE_NOTIFY`）。填的就是环境变量的写法，保存时和启动时一样整体校验（错了会给出同样的提示，什么都不改），通过后**立即生效**，并保存到数据库（`control:env`），重启后仍按网页上的设置运行；某一项留空就恢复为环境变量，“清除全部”回到纯环境变量。页面上每一项都标明现在生效的值和环境变量的值。私钥、API Key、Token、钱包、链等不能在网页上改。
+- **看一眼**：真实订单列表（时间、市场、方向、价格 × 份数、状态、订单号，挂单可直接撤）、最近读到的 Predict 持仓、最近的错误、持仓 + 挂单占用与上限、今日已结算盈亏。每 10 秒自动刷新。
+- 后台任务不会被控制台卡住：操作在收到请求时执行，失败的原因会原样返回到页面。
 
 ### 上证指数与 A50 夜盘
 
@@ -679,6 +690,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | `BASELINE_MODE` | 配置了 `EXCHANGE_TICKERS` 时为 `exchange_close`，否则 `binance_daily` | `exchange_close`、`binance_daily` 或 `manual` |
 | `STATE_DB` | 本地 `./data/bot.sqlite3`；Docker `/data/bot.sqlite3` | SQLite 文件位置 |
 | `LIVE` 及 `PREDICT_PRIVATE_KEY` 等 | `off` | 真实交易，见「[真实交易](#真实交易liveon)」一节的变量表 |
+| `WEB_CONTROL_KEY` | 空 | 网页控制台的口令（12～64 个 ASCII 字符）；空 = 控制台只能查看 |
 
 通过 TG 命令修改的阈值、冷却和模式会保存到 Volume，并**优先于对应环境变量默认值**。以后要修改它们，直接发 TG 命令；只改 Railway 对应默认变量不一定覆盖已有持久设置。
 
@@ -744,7 +756,7 @@ heartbeat: valid_quotes=4/4 active_subscriptions=1 mode=binance_daily
 Python 3.12 环境下运行离线测试，无须 Token、私钥，无须联网（`tests/test_trading.py` 需要 `pip install -r requirements.txt` 装好 `eth-account`）：
 
 ```bash
-python tests/run_all.py            # 全部 49 组
+python tests/run_all.py            # 全部 50 组
 python tests/run_all.py sse exmode # 只跑指定几组
 ```
 

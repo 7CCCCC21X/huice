@@ -1,0 +1,217 @@
+"""The control page (/p/<token>/control): settings changed while the bot runs (validated like the environment, applied
+at once, saved across restarts), and the real-trading switches, every action behind WEB_CONTROL_KEY."""
+import asyncio, dataclasses, json, sys, time, datetime as dt
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+import offline  # noqa: F401  (blocks real HTTP)
+import main as m
+import live as L
+D = m.D
+WEI = 10 ** 18
+KEY = "secret-key-12345"
+TOKEN = "t" * 20
+BJ = lambda mo, d, h, mi=0: int(dt.datetime(2026, mo, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+NOW = BJ(10, 5, 10, 0)
+base = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080"}
+
+# --- settings ----------------------------------------------------------------------------------------------------------
+c = m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY})
+assert c.web_control_key == KEY and c.env["WEB_PORT"] == "8080" and "web_control_key" not in repr(c) and "env=" not in repr(c)
+assert m.Config.from_env(base).web_control_key == "" and m.Config.from_env(base).env["TELEGRAM_BOT_TOKEN"] == "1:x"
+for bad in ("short", "has space in it yes", "x" * 65, "中文口令中文口令中文口令"):
+    try: m.Config.from_env({**base, "WEB_CONTROL_KEY": bad}); assert False, bad
+    except ValueError: pass
+assert [k for k, _, _ in m.CONTROL_KEYS][:2] == ["SIM_EDGE_CENTS", "SIM_SHARES"] and m.CONTROL_KEY_SET >= {"LIVE_MAX_ORDER_USD", "LIVE_TAKER"}
+assert all(len(row) == 3 and row[0] == row[0].upper() for row in m.CONTROL_KEYS)
+
+
+class FM:
+    def __init__(self, now): self.now, self.config = now, None
+    def now_ms(self): return self.now
+
+
+async def request(port, raw):
+    r, w = await asyncio.open_connection("127.0.0.1", port)
+    w.write(raw); await w.drain()
+    data = await r.read(); w.close()
+    head, _, body = data.partition(b"\r\n\r\n")
+    return int(head.split(b" ")[1]), head.decode(), body
+
+
+async def post(port, body, path=f"/p/{TOKEN}/control"):
+    raw = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    st, head, out = await request(port, f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                                        f"Content-Length: {len(raw)}\r\n\r\n".encode() + raw)
+    try:
+        return st, json.loads(out)
+    except ValueError:
+        return st, {"raw": out.decode(errors="replace")}
+
+
+async def get_json(port, name):
+    st, _, body = await request(port, f"GET /p/{TOKEN}/{name} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    assert st == 200, (name, st)
+    return json.loads(body)
+
+
+class FakeApi:
+    def __init__(self):
+        self.jwt, self.jwt_exp, self.auth_error, self.lookup = "t", 0, "", ""
+        self.open, self.closed, self.calls, self.positions_rows, self.markets = {}, {}, [], [], {}
+    async def ensure_auth(self): pass
+    async def market(self, mid): return self.markets[str(mid)]
+    async def remove_orders(self, ids):
+        self.calls.append(("remove", list(ids)))
+        removed = []
+        for i in ids:
+            row = self.open.pop(i, None)
+            if row:
+                row["status"] = "CANCELLED"
+                self.closed[i] = row
+                removed.append(i)
+        return {"removed": removed, "noop": [i for i in ids if i not in removed]}
+    async def orders(self, status="OPEN", **params):
+        return list(self.open.values()) if status == "OPEN" else [r for r in self.closed.values() if r["status"] == status]
+    async def order(self, oid, hash_=""): return self.open.get(oid) or self.closed.get(oid)
+    async def positions(self): return self.positions_rows
+
+
+class FakeChain:
+    async def usdt_balance(self, owner=None): return 500 * WEI
+    async def bnb_balance(self, owner=None): return 10 ** 17
+    async def allowance(self, key, owner=None): return 10 ** 30
+
+
+async def run():
+    store = m.Store(":memory:")
+    bot = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY}), store, FM(NOW), None)
+    assert bot.control_value("SIM_EDGE_CENTS") == "10" and bot.control_value("SIM_MARKETS") == "close" and bot.control_value("LIVE_TAKER") == "market"
+    assert bot.control_value("LIVE_AUTO_REDEEM") == "on" and bot.control_value("nope") == ""
+    web = m.WebServer(bot, 0, TOKEN); web.CACHE_SECONDS = {}; port = await web.start()
+    st, head, body = await request(port, f"GET /p/{TOKEN}/control HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    assert st == 200 and "<title>交易控制台</title>" in body.decode() and "text/html" in head and "Content-Security-Policy" in head
+    data = await get_json(port, "control.json")
+    assert data["enabled"] and data["mode"] == "paper" and data["live"] is None and data["version"] == m.VERSION
+    s = {x["key"]: x for x in data["settings"]}
+    assert s["SIM_EDGE_CENTS"] == {"key": "SIM_EDGE_CENTS", "label": "触发买入的净优势（¢/份）", "hint": "0.5～50", "value": "10", "saved": "", "env": ""}
+    assert data["scope"] == ["只吃单", "指数/个股日涨跌"] and data["sim"]["trades"] == 0 and len(data["settings"]) == len(m.CONTROL_KEYS)
+    # the token still gates everything; other POSTs stay refused; the key is required and compared, the body must be JSON
+    st, _, _ = await request(port, f"GET /p/{'u' * 20}/control.json HTTP/1.1\r\nHost: x\r\n\r\n".encode()); assert st == 404
+    st, _, _ = await request(port, f"POST /p/{TOKEN}/journal HTTP/1.1\r\nHost: x\r\n\r\n".encode()); assert st == 405
+    st, _, _ = await request(port, f"POST /p/{'u' * 20}/control HTTP/1.1\r\nHost: x\r\n\r\n".encode()); assert st == 405
+    st, j = await post(port, {"action": "set", "values": {"SIM_EDGE_CENTS": "12"}}); assert (st, j) == (403, {"ok": False, "message": "口令错误"})
+    st, j = await post(port, {"key": "wrong-key-123456", "action": "set"}); assert st == 403 and j["message"] == "口令错误"
+    st, j = await post(port, b"not json"); assert st == 400 and "JSON" in j["message"]
+    st, j = await post(port, b"[1,2]"); assert st == 400
+    assert bot.config.sim_edge == 0.10 and store.get("control:env") is None
+    # set: validated like the environment, applied at once, saved; a bad value changes nothing
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_EDGE_CENTS": "12", "SIM_WAYS": "both", "LIVE_MAX_ORDER_USD": "40", "SIM_SHARES": ""}})
+    assert st == 200 and j["ok"] and "SIM_EDGE_CENTS=12（原 10）" in j["message"] and "SIM_WAYS=both（原 taker）" in j["message"], j
+    assert bot.config.sim_edge == 0.12 and bot.config.sim_ways == "both" and bot.config.live_max_order_usd == 40 and bot.config.sim_shares == 100
+    assert store.get("control:env") == {"SIM_EDGE_CENTS": "12", "SIM_WAYS": "both", "LIVE_MAX_ORDER_USD": "40"}
+    assert m.sim_scope(bot.config) == ("挂单和吃单", "指数/个股日涨跌") and bot.sim_version()["sim_edge"] == 0.12  # the loops read self.config
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_EDGE_CENTS": "99"}})
+    assert st == 400 and not j["ok"] and "SIM_EDGE_CENTS" in j["message"] and bot.config.sim_edge == 0.12
+    assert store.get("control:env")["SIM_EDGE_CENTS"] == "12"
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"TELEGRAM_BOT_TOKEN": "x"}})
+    assert st == 400 and "不能在网页上改的变量" in j["message"] and store.get("control:env") == {"SIM_EDGE_CENTS": "12", "SIM_WAYS": "both", "LIVE_MAX_ORDER_USD": "40"}
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_WAYS": "maker", "SIM_MARKETS": "range"}})
+    assert st == 400 and "价格阶梯" in j["message"] or st == 200  # a combination the environment would accept is accepted too
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_WAYS": "", "SIM_MARKETS": "all"}})
+    assert st == 200 and bot.config.sim_ways == "taker" and bot.config.sim_markets == frozenset(m.SIM_KINDS), (st, j, bot.config.sim_ways, sorted(bot.config.sim_markets), store.get("control:env"))
+    data = await get_json(port, "control.json")
+    s = {x["key"]: x for x in data["settings"]}
+    assert s["SIM_WAYS"]["saved"] == "" and s["SIM_WAYS"]["value"] == "taker" and s["SIM_EDGE_CENTS"]["saved"] == "12" and s["SIM_MARKETS"]["value"] == "all"
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MARKETS": "all"}})
+    assert st == 200 and j["message"] == "已保存，设置没有变化。"
+    # a new bot on the same store starts with the saved settings; a saved value that stopped validating is ignored
+    again = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY}), store, FM(NOW), None)
+    assert again.config.sim_edge == 0.12 and again.config.live_max_order_usd == 40 and again.config.sim_markets == frozenset(m.SIM_KINDS)
+    assert again.config.env["WEB_PORT"] == "8080" and again.config.web_control_key == KEY
+    store.put("control:env", {"SIM_EDGE_CENTS": "nonsense", "SIM_SHARES": "5"})
+    assert m.Bot(m.Config.from_env(base), store, FM(NOW), None).config.sim_edge == 0.10  # nothing of it applied
+    store.put("control:env", {"SIM_EDGE_CENTS": "12", "LIVE_MAX_ORDER_USD": "40"})
+    # reset: back to the environment, nothing saved
+    st, j = await post(port, {"key": KEY, "action": "reset"})
+    assert st == 200 and j["ok"] and store.get("control:env") is None and bot.config.sim_edge == 0.10 and bot.config.live_max_order_usd == 100
+    # a live action on a paper bot
+    st, j = await post(port, {"key": KEY, "action": "pause"}); assert st == 400 and "LIVE=off" in j["message"]
+    st, j = await post(port, {"key": KEY, "action": "bogus"}); assert st == 400
+    # too many wrong keys lock the route for a while, the right key included
+    for _ in range(5):
+        st, _ = await post(port, {"key": "wrong-key-123456", "action": "reset"}); assert st == 403
+    st, j = await post(port, {"key": KEY, "action": "reset"}); assert st == 429 and "口令错误次数过多" in j["message"]
+    web.control_lock_until = 0.0
+    st, j = await post(port, {"key": KEY, "action": "reset"}); assert st == 200
+    # a request body over the limit, and one that lies about its length
+    st, j = await post(port, json.dumps({"key": KEY, "action": "set", "values": {"SIM_SHARES": "9" * 20000}}).encode()); assert st == 400 and "过大" in j["message"]
+    await web.stop()
+    # without a key the page is served but every action is refused with the hint
+    off_bot = m.Bot(m.Config.from_env(base), m.Store(":memory:"), FM(NOW), None)
+    web2 = m.WebServer(off_bot, 0, TOKEN); web2.CACHE_SECONDS = {}; port2 = await web2.start()
+    assert not (await get_json(port2, "control.json"))["enabled"]
+    st, j = await post(port2, {"key": "anything-at-all", "action": "reset"}); assert st == 403 and "WEB_CONTROL_KEY" in j["message"]
+    await web2.stop()
+    # /web names the control page only when a key is set
+    bot.web_token, bot.config = TOKEN, dataclasses.replace(bot.config, web_base="https://x.example")
+    off_bot.web_token, off_bot.config = TOKEN, dataclasses.replace(off_bot.config, web_base="https://x.example")
+    assert bot.cmd_web(None).endswith(f"https://x.example/p/{TOKEN}/control") and "/control" not in off_bot.cmd_web(None)
+
+    # --- the live bot: its block on the page, the switches, settings reaching the trader ---------------------------------
+    lstore = m.Store(":memory:")
+    lbot = L.LiveBot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY, "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "PREDICT_API_KEY": "k",
+                                        "SIM_WAYS": "both", "SIM_MARKETS": "all"}), lstore, FM(NOW), None)
+    fake = lbot.live.api = FakeApi()
+    lbot.live.chain = FakeChain()
+    await lbot.live_prepare()
+    web3 = m.WebServer(lbot, 0, TOKEN); web3.CACHE_SECONDS = {}; port3 = await web3.start()
+    data = await get_json(port3, "control.json")
+    live = data["live"]
+    assert data["mode"] == "live" and live["ready"] and live["paused"] == "" and live["killed"] == "" and live["orders"] == []
+    assert live["lines"][0].startswith("钱包：普通钱包") and live["caps"] == {"order": 100, "open": 500, "daily_loss": 200} and live["exposure"] == 0
+    assert live["account"] == "0x8fd3…7A03" and live["positions"] == [] and live["errors"] == []
+    st, j = await post(port3, {"key": KEY, "action": "pause", "why": "维护"})
+    assert st == 200 and "已暂停（维护）" in j["message"] and lbot.live_paused() == "维护" and (await get_json(port3, "control.json"))["live"]["paused"] == "维护"
+    st, j = await post(port3, {"key": KEY, "action": "resume"}); assert st == 200 and lbot.live_paused() == ""
+    st, j = await post(port3, {"key": KEY, "action": "set", "values": {"LIVE_MAX_OPEN_USD": "123", "LIVE_TAKER": "limit"}})
+    assert st == 200 and lbot.config.live_max_open_usd == 123 and lbot.live.config.live_max_open_usd == 123 and lbot.live.config.live_taker == "limit"
+    assert (await get_json(port3, "control.json"))["live"]["caps"]["open"] == 123 and "限价单" in (await get_json(port3, "control.json"))["live"]["lines"][-1]
+    # a resting real order appears with its cancel switch; cancelling through the page reaches Predict
+    trade = {"v": 2, "market": "x", "slug": "x", "market_id": "9", "item": "恒生指数", "kind": "close", "key": "HSI", "side": "up", "label": "挂涨",
+             "maker": True, "fair": 0.70, "opened": NOW - 60_000, "settle": {}, "driver": "HSI@2026-10-05", "driver_name": "恒生指数",
+             "order": 100.0, "fills": [], "revisions": [], "entry": {}, "version": {}, "price": 0.55, "signal": 0.15, "shares": 0.0,
+             "status": "resting", "filled": None, "queue_ahead": 0.0, "queue_min": 0.0, "edge": 0.15,
+             "live": {"state": "open", "order_id": "77", "hash": "0xh", "placed_at": NOW - 60_000, "attempt": 1, "events": [],
+                      "want": {"maker": True, "fee_bps": 200}}}
+    lbot.sim_save([("x|up|挂", trade)])
+    fake.open["77"] = {"id": "77", "status": "OPEN", "amount": str(100 * WEI), "amountFilled": "0", "order": {"hash": "0xh"}}
+    rows = (await get_json(port3, "control.json"))["live"]["orders"]
+    assert len(rows) == 1 and rows[0]["cancellable"] and rows[0]["order_id"] == "77" and rows[0]["status"] == "挂单中（真实订单 #77 已成交 0/100 份）"
+    assert rows[0]["price"] == 0.55 and rows[0]["order"] == 100 and rows[0]["maker"] and rows[0]["url"].startswith(m.PREDICT_SITE)
+    st, j = await post(port3, {"key": KEY, "action": "cancel", "id": "99"}); assert st == 200 and "没有订单号为 99" in j["message"]
+    st, j = await post(port3, {"key": KEY, "action": "cancel", "id": "77"})
+    assert st == 200 and "已撤单 1 笔" in j["message"] and ("remove", ["77"]) in fake.calls
+    t = lbot.sim_trades()["x|up|挂"]
+    assert t["status"] == "cancelled" and "管理员撤单" in t["note"] and t["live"]["state"] == "done"
+    rows = (await get_json(port3, "control.json"))["live"]["orders"]
+    assert rows[0]["cancellable"] is False and rows[0]["status"] == "已撤单"
+    st, j = await post(port3, {"key": KEY, "action": "cancel", "id": "all"}); assert st == 200 and "没有真实挂单可撤" in j["message"]
+    fake.positions_rows = [{"id": "p1", "market": {"id": 9, "title": "恒生指数"}, "outcome": {"name": "Up", "indexSet": 1}, "amount": str(3 * WEI)}]
+    st, j = await post(port3, {"key": KEY, "action": "positions"}); assert st == 200 and "恒生指数｜Up 3 份" in j["message"]
+    assert (await get_json(port3, "control.json"))["live"]["positions"] == ["恒生指数｜Up 3 份"]
+    st, j = await post(port3, {"key": KEY, "action": "check"}); assert st == 200 and "自检" in j["message"]
+    st, j = await post(port3, {"key": KEY, "action": "redeem"}); assert st == 200 and "没有可领取" in j["message"]
+    st, j = await post(port3, {"key": KEY, "action": "bogus"}); assert st == 400 and j["message"] == "未知操作"
+    # the Telegram command still works through the same code
+    reply = await lbot.cmd_live(m.Request("/live", [], 1, 0, 1))
+    assert isinstance(reply, m.Reply) and "真实交易" in reply.text
+    assert "已暂停（看看）" in await lbot.cmd_live(m.Request("/live", ["pause", "看看"], 1, 0, 1)) and lbot.live_paused() == "看看"
+    assert "▶️" in await lbot.cmd_live(m.Request("/live", ["resume"], 1, 0, 1))
+    # a live bot on a store with saved settings starts with them, trader included
+    lstore.put("control:env", {"LIVE_MAX_ORDER_USD": "33"})
+    lbot2 = L.LiveBot(m.Config.from_env({**base, "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64}), lstore, FM(NOW), None)
+    assert lbot2.config.live_max_order_usd == 33 and lbot2.live.config.live_max_order_usd == 33
+    await web3.stop()
+    print("CONTROL_OK")
+
+
+asyncio.run(run())

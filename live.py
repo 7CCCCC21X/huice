@@ -811,7 +811,7 @@ class LiveBot(core.Bot):
 
     def __init__(self, config: core.Config, store: core.Store, market: Any, telegram: Any):
         super().__init__(config, store, market, telegram)
-        self.live = LiveTrader(config)
+        self.live = LiveTrader(self.config)  # self.config: with the control page's saved changes applied
         self.handlers["/live"] = self.cmd_live
         self.live_backoff: dict[tuple[str, str], tuple[float, str]] = {}  # (market, side) -> (monotonic until, why)
         self.live_noted: dict[str, float] = {}
@@ -1346,10 +1346,13 @@ class LiveBot(core.Bot):
     # --- commands and texts -------------------------------------------------------------------------------------------------
     async def cmd_live(self, req: core.Request) -> Any:
         words = [w.lower() for w in req.args]
-        action = words[0] if words else ""
-        now_ms = self.market.now_ms()
+        return await self.live_action(words[0] if words else "", req.args[1:], self.market.now_ms())
+
+    async def live_action(self, action: str, args: list[str], now_ms: int) -> Any:
+        """/live and the control page share these: "" = the status card (a Reply), else the action's answer text."""
+        words = [a.lower() for a in args]
         if action == "pause":
-            why = " ".join(req.args[1:]) or "手动暂停"
+            why = " ".join(a for a in args if a).strip() or "手动暂停"
             self.store.put("live:paused", {"at": now_ms, "why": why})
             return f"⏸ 真实交易已暂停（{why}）：不再开新仓；已有挂单保留，/live cancel all 可撤。/live resume 恢复。"
         if action == "resume":
@@ -1358,7 +1361,7 @@ class LiveBot(core.Bot):
                 self.store.put("live:killed", {**record, "resumed": True, "resumed_at": now_ms})
             return "▶️ 真实交易已恢复：满足条件的建议会重新下单。"
         if action == "cancel":
-            return await self.live_cancel_command(words[1:], now_ms)
+            return await self.live_cancel_command(words, now_ms)
         if action == "redeem":
             if not self.live.ready:
                 return f"未就绪：{self.live.ready_error}"
@@ -1379,6 +1382,56 @@ class LiveBot(core.Bot):
             self.live_positions = (rows, time.time())
             return "Predict 上的持仓：\n" + ("\n".join(self.position_line(r) for r in rows[:30]) or "无")
         return core.Reply(self.live_text(now_ms), html=True)
+
+    # --- the control page --------------------------------------------------------------------------------------------------
+    def apply_config(self, config: core.Config) -> None:
+        super().apply_config(config)
+        self.live.config = config
+
+    def control_payload(self) -> dict:
+        data = super().control_payload()
+        data["mode"], data["live"] = "live", self.live_status(self.market.now_ms())
+        return data
+
+    def live_status(self, now_ms: int) -> dict:
+        """The real-trading block of the control page: readiness, the switches' state, limits and their use, the
+        recent orders (with what the page may cancel), the positions last read, the latest failures."""
+        c = self.config
+        trades = self.sim_trades()
+        live = [(tid, t) for tid, t in trades.items() if isinstance(t.get("live"), dict)]
+        today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
+        since = int(today.timestamp() * 1000)
+        rows = []
+        for tid, t in sorted(live, key=lambda kv: kv[1].get("opened", 0), reverse=True)[:30]:
+            st = t["live"]
+            rows.append({"id": tid, "opened": core.stamp(t["opened"], seconds=False), "item": t["item"], "label": t["label"],
+                         "price": float(t["price"]), "order": float(t.get("order") or 0), "shares": float(t.get("shares") or 0),
+                         "status": sim_status(t), "state": core.sim_state(t), "order_id": str(st.get("order_id") or ""),
+                         "live_state": str(st.get("state") or ""), "maker": bool(t.get("maker")),
+                         "cancellable": t["status"] == "resting" and st.get("state") in {"open", "placing"} and bool(st.get("order_id")),
+                         "url": self.sim_url(t)})
+        positions, at = self.live_positions
+        return {"ready": self.live.ready, "ready_error": self.live.ready_error, "paused": self.live_paused(), "killed": self.live_killed(),
+                "lines": self.live.summary_lines(), "account": short_addr(self.live.wallet.maker),
+                "exposure": self.live_exposure(trades), "daily_pnl": self.live_daily_pnl(trades, now_ms),
+                "caps": {"order": c.live_max_order_usd, "open": c.live_max_open_usd, "daily_loss": c.live_max_daily_loss_usd},
+                "resting": sum(t["status"] == "resting" for _, t in live),
+                "placed_today": sum(int(t["opened"]) >= since for _, t in live),
+                "failed_today": sum(int(t["opened"]) >= since and t["live"].get("final") == "failed" for _, t in live),
+                "orders": rows, "positions": [self.position_line(r) for r in positions[:30]],
+                "positions_at": core.stamp(at * 1000) if at else "", "errors": self.live_errors[-5:]}
+
+    async def live_control(self, action: str, data: dict) -> dict:
+        now_ms = self.market.now_ms()
+        if action == "pause":
+            text = await self.live_action("pause", [str(data.get("why") or "")], now_ms)
+        elif action == "cancel":
+            text = await self.live_action("cancel", [str(data.get("id") or "")], now_ms)
+        elif action in {"resume", "redeem", "check", "orders", "positions"}:
+            text = await self.live_action(action, [], now_ms)
+        else:
+            return {"ok": False, "message": "未知操作"}
+        return {"ok": True, "message": text if isinstance(text, str) else text.text}
 
     async def live_cancel_command(self, words: list[str], now_ms: int) -> str:
         trades = self.sim_trades()

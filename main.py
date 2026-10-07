@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.35.0"
+VERSION = "1.36.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -434,6 +434,30 @@ BASELINE_MODES = {
 }
 
 
+# Settings the control page (/p/<token>/control) may change while the bot runs: (variable, label, hint). A change is
+# saved as the variable's text (control:env), re-read through Config.from_env on top of the environment (the same
+# validation and wording as at start-up), and applied at once; it survives restarts until cleared.
+CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
+    ("SIM_EDGE_CENTS", "触发买入的净优势（¢/份）", "0.5～50"),
+    ("SIM_SHARES", "每次买多少份", "1～1000000"),
+    ("SIM_WAYS", "做哪种单", "taker 只吃单 / maker 只挂单 / both"),
+    ("SIM_MARKETS", "做哪些市场", "all，或 close,touch,updown,flip,range,ladder 的组合"),
+    ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "0 = 不限"),
+    ("PREDICT_MIN_EDGE_CENTS", "卡片建议至少要有的净优势（¢）", "0～50，模型误差之上"),
+    ("PREDICT_TRADE_USD", "卡片吃单按多少美元走盘口", "1～1000000"),
+    ("LIVE_MAX_ORDER_USD", "真实交易单笔上限（$）", "1～1000000"),
+    ("LIVE_MAX_OPEN_USD", "持仓 + 挂单上限（$）", "1～100000000"),
+    ("LIVE_MAX_DAILY_LOSS_USD", "当日已结算亏损停机线（$）", "0 = 不限"),
+    ("LIVE_TAKER", "吃单方式", "market 市价单 / limit 封顶限价单"),
+    ("LIVE_SLIPPAGE_BPS", "市价单滑点（bps）", "0～5000，100 = 1%"),
+    ("LIVE_TAKER_WAIT_SECONDS", "吃单未成交多久撤单（秒）", "5～3600"),
+    ("LIVE_RETRY_SECONDS", "下单失败后回避（秒）", "10～86400"),
+    ("LIVE_AUTO_REDEEM", "自动领取已结算持仓", "on / off"),
+    ("LIVE_NOTIFY", "真实订单的 Telegram 通知", "on / off"),
+)
+CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
+
+
 @dataclass(frozen=True)
 class Config:
     token: str
@@ -505,6 +529,8 @@ class Config:
     live_max_daily_loss_usd: float = 200.0  # LIVE_MAX_DAILY_LOSS_USD: realised loss per Beijing day that stops new orders; 0 = no limit
     live_auto_redeem: bool = True      # LIVE_AUTO_REDEEM: redeem resolved positions for USDT on-chain
     live_notify: bool = True           # LIVE_NOTIFY: Telegram lines for orders, fills and failures
+    web_control_key: str = field(default="", repr=False)  # WEB_CONTROL_KEY: the control page's secret; "" = the page is read-only
+    env: dict = field(default_factory=dict, repr=False, compare=False)  # the variables this was read from (runtime changes re-read it)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -547,6 +573,9 @@ class Config:
             raise ValueError("BSC_RPC_URL 必须是 http(s) 节点地址")
         if live and not live_key:
             raise ValueError("LIVE=on 需要 PREDICT_PRIVATE_KEY（签名钱包的私钥）")
+        control_key = e.get("WEB_CONTROL_KEY", "").strip()
+        if control_key and not re.fullmatch(r"[\x21-\x7e]{12,64}", control_key):
+            raise ValueError("WEB_CONTROL_KEY 应为 12～64 个不含空格的 ASCII 字符")
         if live and (off(e.get("SIM", "on")) or off(e.get("PREDICT", "on"))):
             raise ValueError("LIVE=on 需要 SIM=on 且 PREDICT=on（真实交易执行的是模拟交易的决定）")
         url = e.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
@@ -624,6 +653,7 @@ class Config:
             live_max_daily_loss_usd=parse_bounded(e, "LIVE_MAX_DAILY_LOSS_USD", "200", 0, 100_000_000),
             live_auto_redeem=not off(e.get("LIVE_AUTO_REDEEM", "on")),
             live_notify=not off(e.get("LIVE_NOTIFY", "on")),
+            web_control_key=control_key, env={k: v for k, v in e.items() if isinstance(k, str) and isinstance(v, str)},
             web_base=(e.get("WEB_BASE_URL", "").strip().rstrip("/")
                       or (f"https://{e['RAILWAY_PUBLIC_DOMAIN'].strip()}" if e.get("RAILWAY_PUBLIC_DOMAIN", "").strip() else "")),
         )
@@ -8299,6 +8329,92 @@ load();setInterval(load,60000);
 </script></body></html>"""
 
 
+# --- the control page (/p/<token>/control): settings while running, the real-trading switches ------------------------
+CONTROL_PAGE = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>交易控制台</title>
+<style>
+:root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;--muted:#636b77;--line:#e2e6ec;--chip:#eef1f5;--best:#2a66e0;--on-accent:#fff;--warn:#b86e00;--warn-bg:#fff4df;--up:#dd3a40;--down:#17a05b;--up-bg:#fdeaea;--down-bg:#e3f6ec;--shadow:0 1px 2px rgba(18,26,40,.05),0 2px 8px rgba(18,26,40,.05);--r:14px}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--line:#262c34;--chip:#20252c;--best:#79a7f7;--on-accent:#0d1014;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--up-bg:#3a1b1f;--down-bg:#11301f;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25)}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:860px;margin:0 auto;padding:12px 16px 40px}
+header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 16px;padding:4px 0 10px}
+h1{font-size:20px;font-weight:750;margin:0}h2{font-size:16px;margin:0 0 8px}
+.meta{color:var(--muted);font-size:13px}.mut{color:var(--muted);font-size:13px}
+.btns{display:flex;gap:8px;flex-wrap:wrap}.btn,button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:10px;padding:7px 12px;cursor:pointer;text-decoration:none}
+button.pri{background:var(--best);color:var(--on-accent);border-color:var(--best)}button.bad{color:var(--up);border-color:var(--up)}button:disabled{opacity:.5;cursor:default}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);padding:14px 16px;margin:10px 0}
+.row{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+label.f{display:grid;grid-template-columns:1fr;gap:2px;margin:8px 0}label.f span{font-size:13px}label.f small{color:var(--muted)}
+input[type=text],input[type=password]{font:inherit;width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)}
+.state{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--chip);font-size:13px}.state.on{background:var(--down-bg);color:var(--down)}.state.off{background:var(--up-bg);color:var(--up)}.state.warn{background:var(--warn-bg);color:var(--warn)}
+pre{white-space:pre-wrap;word-break:break-all;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:8px 0 0;color:var(--text)}
+#orders{overflow-x:auto;-webkit-overflow-scrolling:touch}table{width:100%;min-width:560px;border-collapse:collapse;font-size:13px}td,th{padding:5px 6px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;white-space:nowrap}td:nth-child(5){white-space:normal;min-width:160px}th{color:var(--muted);font-weight:500}
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);max-width:90vw;padding:10px 14px;border-radius:10px;background:var(--card);border:1px solid var(--line);box-shadow:var(--shadow);display:none;z-index:9}#toast.ok{border-color:var(--down)}#toast.bad{border-color:var(--up)}
+@media (min-width:640px){label.f{grid-template-columns:260px 1fr;align-items:center}label.f small{grid-column:2}}
+</style></head>
+<body><div class="wrap">
+<header><div><h1>交易控制台</h1><div class="meta" id="meta">加载中…</div></div>
+<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="journal" href="#">复盘页</a><button id="reload">刷新</button></div></header>
+<section class="card"><label class="f"><span>控制口令</span><input type="password" id="key" autocomplete="off" placeholder="环境变量 WEB_CONTROL_KEY"><small><label><input type="checkbox" id="remember"> 在这个浏览器记住口令</label></small></label><p class="mut" id="authnote"></p></section>
+<section class="card" id="live"><h2>真实交易 <span class="state" id="livestate"></span></h2>
+<div class="row" id="livebtns"><button data-act="pause">⏸ 暂停开新仓</button><button data-act="resume" class="pri">▶️ 恢复</button><button data-act="cancelall" class="bad">撤掉全部挂单</button><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button></div>
+<pre id="livelines"></pre></section>
+<section class="card"><h2>策略与风控参数</h2><p class="mut">留空 = 用部署时的环境变量；填写后点保存立即生效，并保存到数据库（重启仍有效）。框内灰字是现在生效的值。</p>
+<div id="fields"></div><div class="row"><button id="save" class="pri">保存</button><button id="reset">清除全部，按环境变量运行</button></div></section>
+<section class="card"><h2>模拟交易 / 真实订单</h2><div id="simline" class="mut"></div><div id="orders"></div></section>
+<section class="card" id="posbox"><h2>Predict 持仓</h2><div id="positions" class="mut"></div></section>
+<section class="card" id="errbox"><h2>最近错误</h2><pre id="errors"></pre></section>
+</div><div id="toast"></div>
+<script>
+const base=location.pathname.replace(/\/control\/?$/,"");
+const $=id=>document.getElementById(id);
+$("back").href=base;$("journal").href=base+"/journal";
+let data=null,busy=false,built=false;
+try{const k=localStorage.getItem("ctlkey");if(k){$("key").value=k;$("remember").checked=true}}catch(e){}
+function keep(){try{if($("remember").checked)localStorage.setItem("ctlkey",$("key").value);else localStorage.removeItem("ctlkey")}catch(e){}}
+$("remember").addEventListener("change",keep);$("key").addEventListener("input",keep);
+function toast(t,ok){const el=$("toast");el.textContent=t;el.className=ok?"ok":"bad";el.style.display="block";clearTimeout(toast.t);toast.t=setTimeout(()=>{el.style.display="none"},7000)}
+async function load(){try{const r=await fetch(base+"/control.json",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();render()}catch(e){$("meta").textContent="加载失败："+e.message}}
+async function act(body){if(busy)return;const key=$("key").value.trim();if(!key){toast("请先输入控制口令",false);return}
+  busy=true;try{const r=await fetch(base+"/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key,...body})});
+  let j={};try{j=await r.json()}catch(e){}toast(j.message||("HTTP "+r.status),!!j.ok);await load()}catch(e){toast("请求失败："+e.message,false)}finally{busy=false}}
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
+function money(x){return (x>=0?"+$":"−$")+Math.abs(x).toFixed(2)}
+function render(){
+  $("meta").textContent="v"+data.version+"｜"+data.generated_at+(data.enabled?"":"｜网页控制未开启");
+  $("authnote").textContent=data.enabled?"每次操作都会带上口令；口令只在环境变量里，页面不显示。":"未设置 WEB_CONTROL_KEY：只能查看，不能操作。";
+  const L=data.live;
+  $("livestate").textContent=L?(L.paused?"已暂停："+L.paused:L.killed?"今日停开新仓："+L.killed:L.ready?"运行中":"未就绪："+L.ready_error):"未开启（LIVE=off）";
+  $("livestate").className="state "+(L?(L.paused||L.killed?"warn":L.ready?"on":"off"):"");
+  $("livebtns").querySelectorAll("button").forEach(b=>{b.disabled=!L||!data.enabled});
+  $("livelines").textContent=L?[...L.lines,"策略："+data.scope.join("；"),"持仓+挂单 $"+L.exposure.toFixed(2)+" / $"+L.caps.open+"｜今日已结算盈亏 "+money(L.daily_pnl)+"（上限 −$"+L.caps.daily_loss+"）｜挂单中 "+L.resting+"｜今日下单 "+L.placed_today+"｜失败 "+L.failed_today].join("\n"):"LIVE=off：模拟交易只记账。开启方法见 README「真实交易」。";
+  if(!built){built=true;const box=$("fields");data.settings.forEach(s=>{const lab=el("label","f");lab.append(el("span","",s.label+"（"+s.key+"）"));const inp=el("input");inp.type="text";inp.dataset.key=s.key;inp.autocomplete="off";lab.append(inp);lab.append(el("small","",s.hint+(s.env?"｜环境变量 "+s.env:"")));box.append(lab)})}
+  data.settings.forEach(s=>{const inp=document.querySelector('input[data-key="'+s.key+'"]');if(!inp)return;inp.placeholder="当前 "+s.value;if(document.activeElement!==inp)inp.value=s.saved||""});
+  $("simline").textContent="记录 "+data.sim.trades+" 笔｜已结算 "+data.sim.settled+" 笔，盈亏 "+money(data.sim.pnl)+"｜持仓 "+data.sim.open+"｜挂单中 "+data.sim.resting+"（成本 $"+data.sim.open_cost.toFixed(2)+"）";
+  const o=$("orders");o.replaceChildren();
+  if(L&&L.orders.length){const t=el("table");const h=el("tr");["时间","市场","方向","价格×份数","状态","订单",""].forEach(x=>h.append(el("th","",x)));t.append(h);
+    L.orders.forEach(r=>{const tr=el("tr");[r.opened,r.item,r.label,(r.price*100).toFixed(1)+"¢×"+r.order,r.status+(r.state?"·"+r.state:""),r.order_id?"#"+r.order_id:r.live_state].forEach(x=>tr.append(el("td","",x)));
+      const td=el("td");if(r.cancellable){const b=el("button","bad","撤单");b.disabled=!data.enabled;b.addEventListener("click",()=>{if(confirm("撤掉这张真实挂单（#"+r.order_id+"）？"))act({action:"cancel",id:r.order_id})});td.append(b)}tr.append(td);t.append(tr)});o.append(t)}
+  else o.append(el("p","mut",L?"还没有真实订单。":"真实订单只在 LIVE=on 时出现；模拟交易的记录看复盘页。"));
+  $("posbox").style.display=L?"":"none";$("errbox").style.display=L?"":"none";
+  if(L){$("positions").textContent=L.positions.length?L.positions.join("\n")+(L.positions_at?"\n（读取于 "+L.positions_at+"）":""):"没有持仓，或还没读取（点“刷新持仓”）";$("errors").textContent=L.errors.length?L.errors.join("\n"):"无"}
+}
+$("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.act;
+  if(a==="pause"){const why=prompt("暂停原因（可留空）","");if(why===null)return;act({action:"pause",why})}
+  else if(a==="cancelall"){if(confirm("撤掉 Predict 上全部真实挂单？已成交的份数继续持有。"))act({action:"cancel",id:"all"})}
+  else act({action:a})});
+$("save").addEventListener("click",()=>{const values={};document.querySelectorAll("#fields input").forEach(i=>{values[i.dataset.key]=i.value.trim()});act({action:"set",values})});
+$("reset").addEventListener("click",()=>{if(confirm("清除网页上保存的全部设置，恢复为环境变量？"))act({action:"reset"})});
+$("reload").addEventListener("click",load);
+load();setInterval(()=>{if(!busy&&document.visibilityState==="visible")load()},10000);
+</script></body></html>
+"""
+
+
 def accepts_gzip(header_block: str) -> bool:
     """Whether the request's Accept-Encoding lists gzip (any positive q), from the raw header lines after the request line."""
     for line in header_block.split("\r\n"):
@@ -8338,13 +8454,17 @@ class WebServer:
 
     Routes: /health, /p/<token> (HTML), /p/<token>/data.json (JSON), /p/<token>/events (server-sent events: the daily
     cards' live numbers whenever they change, checked every second), /p/<token>/journal (the paper trades' review
-    page) with journal.json / journal.csv (exports). Everything else is 404, the token is compared in constant time,
-    and responses are no-store with a restrictive CSP. Text bodies are gzip-compressed for a client that accepts it
+    page) with journal.json / journal.csv (exports), /p/<token>/control (the control page) with control.json and the
+    one POST route (control, keyed by WEB_CONTROL_KEY). Everything else is 404, the token is compared in constant
+    time, and responses are no-store with a restrictive CSP. Text bodies are gzip-compressed for a client that accepts it
     (the page is ~80 KB, data.json is fetched every 10 seconds by every open tab).
     """
     MAX_HEADER_BYTES = 8192
     GZIP_MIN_BYTES = 512  # below this a gzip header costs about as much as it saves
-    CACHE_SECONDS = {"data.json": 1.0, "journal.json": 5.0, "live.json": 1.0}  # several tabs (or a scanner) share one build per interval
+    CACHE_SECONDS = {"data.json": 1.0, "journal.json": 5.0, "live.json": 1.0, "control.json": 1.0}  # several tabs (or a scanner) share one build per interval
+    CONTROL_BODY_MAX = 16384   # bytes a control request may carry
+    CONTROL_TRIES = 5          # wrong keys within CONTROL_LOCK_SECONDS that lock the control route for as long
+    CONTROL_LOCK_SECONDS = 600
     STREAM_SECONDS = 1.0        # an event stream looks for a change this often
     STREAM_PING_SECONDS = 20    # a comment keeps a quiet stream (and any proxy in front of it) open
     STREAM_LIFE_SECONDS = 3600  # then the stream ends; the browser's EventSource reconnects by itself
@@ -8354,7 +8474,9 @@ class WebServer:
         self.bot, self.port, self.token = bot, port, token
         self.streams = 0  # event streams open now
         self.server: asyncio.base_events.Server | None = None
-        self.pages = {"page": WEB_PAGE.encode("utf-8"), "journal": JOURNAL_PAGE.encode("utf-8")}
+        self.pages = {"page": WEB_PAGE.encode("utf-8"), "journal": JOURNAL_PAGE.encode("utf-8"), "control": CONTROL_PAGE.encode("utf-8")}
+        self.control_failures: list[float] = []  # monotonic times of wrong keys (CONTROL_TRIES in CONTROL_LOCK_SECONDS locks)
+        self.control_lock_until = 0.0
         self.cache: dict[str, tuple[float, bytes]] = {}  # name -> (expires, body): the JSON is built once per interval
         self.gzipped: dict[bytes, bytes] = {body: gzip.compress(body, compresslevel=9) for body in self.pages.values()}
 
@@ -8404,7 +8526,49 @@ class WebServer:
                     "journal.json", lambda: json.dumps(self.bot.journal_payload(), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "journal.csv":
                 return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
+            if parts[2] == "control":
+                return 200, "text/html; charset=utf-8", self.pages["control"]
+            if parts[2] == "control.json":
+                return 200, "application/json; charset=utf-8", self.cached(
+                    "control.json", lambda: json.dumps(self.bot.control_payload(), ensure_ascii=False, default=str).encode("utf-8"))
         return 404, "text/plain; charset=utf-8", b"not found"
+
+    def is_control(self, path: str) -> bool:
+        parts = path.strip("/").split("/")
+        return (len(parts) == 3 and parts[0] == "p" and parts[2] == "control" and parts[1].isascii()
+                and hmac.compare_digest(parts[1], self.token))
+
+    async def control(self, reader: asyncio.StreamReader, head: str) -> tuple[int, str, bytes]:
+        """POST /p/<token>/control: a JSON body with the control key and an action. The key is compared in constant
+        time; CONTROL_TRIES wrong keys lock the route for CONTROL_LOCK_SECONDS. Answers are JSON {"ok", "message"}."""
+        answer = lambda status, ok, message: (status, "application/json; charset=utf-8",
+                                              json.dumps({"ok": ok, "message": message}, ensure_ascii=False).encode("utf-8"))
+        match = re.search(r"(?im)^content-length:[ \t]*(\d+)[ \t]*\r?$", head)
+        length = int(match.group(1)) if match else 0
+        if length > self.CONTROL_BODY_MAX:
+            return answer(400, False, "请求过大")
+        body = await asyncio.wait_for(reader.readexactly(length), timeout=10) if length else b""
+        try:
+            data = json.loads(body.decode("utf-8") or "{}")
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+        except (ValueError, UnicodeDecodeError):
+            return answer(400, False, "请求不是 JSON 对象")
+        configured = self.bot.config.web_control_key
+        if not configured:
+            return answer(403, False, "网页控制未开启：请在环境变量设置 WEB_CONTROL_KEY（12～64 个字符）后重启")
+        now = time.monotonic()
+        if now < self.control_lock_until:
+            return answer(429, False, f"口令错误次数过多，{int(self.control_lock_until - now) + 1} 秒后再试")
+        key = str(data.get("key") or "")
+        if not key.isascii() or not hmac.compare_digest(key, configured):
+            self.control_failures = [t for t in self.control_failures if now - t < self.CONTROL_LOCK_SECONDS] + [now]
+            if len(self.control_failures) >= self.CONTROL_TRIES:
+                self.control_lock_until, self.control_failures = now + self.CONTROL_LOCK_SECONDS, []
+            return answer(403, False, "口令错误")
+        self.control_failures = []
+        result = await self.bot.control_action(data)
+        return answer(200 if result.get("ok") else 400, bool(result.get("ok")), str(result.get("message") or ""))
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -8418,7 +8582,10 @@ class WebServer:
             if method.upper() == "GET" and self.is_stream(path):
                 await self.stream(writer)
                 return
-            status, ctype, body = self.route(method.upper(), path)
+            if method.upper() == "POST" and self.is_control(path):
+                status, ctype, body = await self.control(reader, rest)
+            else:
+                status, ctype, body = self.route(method.upper(), path)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
             status, ctype, body, method, gzip_ok = 400, "text/plain; charset=utf-8", b"bad request", "GET", False
         except Exception as error:  # Never let a page request touch the bot's loops.
@@ -8427,7 +8594,8 @@ class WebServer:
         encoding = ""
         if gzip_ok and status == 200 and len(body) >= self.GZIP_MIN_BYTES:
             body, encoding = self.compressed(body), "Content-Encoding: gzip\r\n"
-        reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 500: "Internal Server Error"}[status]
+        reason = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
+                  429: "Too Many Requests", 500: "Internal Server Error"}[status]
         headers = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n{encoding}"
                    "Vary: Accept-Encoding\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
                    "X-Robots-Tag: noindex\r\nContent-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; "
@@ -9013,6 +9181,7 @@ def parse_close_entries(raw: str, now_ms: int, command: str = "/setclose") -> li
 
 class Bot:
     def __init__(self, config: Config, store: Store, market: Binance, telegram: Telegram):
+        config = self.control_config(config, store)  # the control page's saved changes, on top of the environment
         self.config, self.store, self.market, self.telegram = config, store, market, telegram
         self.snapshots: dict[str, dict] = {}
         self.stocks = StockMarket(config, store)
@@ -12417,6 +12586,97 @@ class Bot:
         path = f"/p/{self.web_token}"
         return f"{self.config.web_base}{path}" if self.config.web_base else path
 
+    # --- the control page (/p/<token>/control): settings while running, the real-trading switches ------------------
+    @staticmethod
+    def control_config(config: Config, store: Store) -> Config:
+        """The configuration with the control page's saved changes (control:env) applied on top of the environment;
+        saved values that no longer validate are ignored with a warning, never a crash at start-up."""
+        saved = store.get("control:env")
+        if not isinstance(saved, dict) or not saved:
+            return config
+        try:
+            applied = Config.from_env({**config.env, **{k: str(v) for k, v in saved.items() if k in CONTROL_KEY_SET}})
+        except ValueError as error:
+            LOG.warning("网页控制台保存的设置无效，已忽略：%s", clean_error(error))
+            return config
+        return dataclasses.replace(applied, env=config.env)  # env stays the environment itself, never the merged values
+
+    def apply_config(self, config: Config) -> None:
+        """A changed configuration takes effect: every loop reads self.config at use."""
+        self.config = config
+
+    def control_value(self, key: str) -> str:
+        """A control setting's value in force, as the variable would be written."""
+        c = self.config
+        flag = lambda value: "on" if value else "off"
+        values = {"SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": f"{c.sim_shares:g}", "SIM_WAYS": c.sim_ways,
+                  "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
+                  "SIM_GROUP_USD": f"{c.sim_group_usd:g}", "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}",
+                  "PREDICT_TRADE_USD": f"{c.predict_trade_usd:g}", "LIVE_MAX_ORDER_USD": f"{c.live_max_order_usd:g}",
+                  "LIVE_MAX_OPEN_USD": f"{c.live_max_open_usd:g}", "LIVE_MAX_DAILY_LOSS_USD": f"{c.live_max_daily_loss_usd:g}",
+                  "LIVE_TAKER": c.live_taker, "LIVE_SLIPPAGE_BPS": str(c.live_slippage_bps), "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait),
+                  "LIVE_RETRY_SECONDS": str(c.live_retry), "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify)}
+        return values.get(key, "")
+
+    def control_payload(self) -> dict:
+        """What the control page shows: whether it may act, each setting (in force, saved, from the environment), the
+        paper trader's totals; the live bot adds its own block."""
+        now_ms = self.market.now_ms()
+        saved = self.store.get("control:env") or {}
+        trades = list(self.sim_trades().values())
+        stats = sim_stats(trades)
+        return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）",
+                "enabled": bool(self.config.web_control_key), "mode": "paper", "live": None,
+                "settings": [{"key": key, "label": label, "hint": hint, "value": self.control_value(key),
+                              "saved": str(saved.get(key, "")) if isinstance(saved, dict) else "", "env": self.config.env.get(key, "")}
+                             for key, label, hint in CONTROL_KEYS],
+                "scope": sim_scope(self.config),
+                "sim": {"trades": stats["trades"], "settled": stats["settled"], "pnl": stats["pnl"], "open": stats["open"],
+                        "resting": stats["resting"], "open_cost": stats["open_cost"]}}
+
+    async def control_action(self, data: dict) -> dict:
+        """One request from the control page (its key already checked): {"ok", "message"}."""
+        action = str(data.get("action") or "")
+        if action == "set":
+            return self.control_set(data.get("values") if isinstance(data.get("values"), dict) else {})
+        if action == "reset":
+            self.store.delete_keys(["control:env"])
+            self.apply_config(Config.from_env(self.config.env))
+            return {"ok": True, "message": "已清除网页上保存的设置，全部按环境变量运行。"}
+        return await self.live_control(action, data)
+
+    def control_set(self, values: dict) -> dict:
+        """Save the settings given (an empty value clears that one), validated together like the environment."""
+        saved = {k: str(v) for k, v in (self.store.get("control:env") or {}).items() if k in CONTROL_KEY_SET}
+        changed = []
+        for key, _, _ in CONTROL_KEYS:
+            if key not in values:
+                continue
+            value = str(values[key]).strip()
+            if value and len(value) > 200:
+                return {"ok": False, "message": f"{key} 太长"}
+            if value != saved.get(key, ""):
+                changed.append(key)
+            if value:
+                saved[key] = value
+            else:
+                saved.pop(key, None)
+        unknown = [k for k in values if k not in CONTROL_KEY_SET]
+        if unknown:
+            return {"ok": False, "message": "不能在网页上改的变量：" + "、".join(str(k)[:40] for k in unknown[:5])}
+        try:
+            config = dataclasses.replace(Config.from_env({**self.config.env, **saved}), env=self.config.env)
+        except ValueError as error:
+            return {"ok": False, "message": clean_error(error)}
+        before = {key: self.control_value(key) for key, _, _ in CONTROL_KEYS}
+        self.store.put("control:env", saved)
+        self.apply_config(config)
+        words = [f"{key}={self.control_value(key)}（原 {before[key]}）" for key in changed if self.control_value(key) != before[key]]
+        return {"ok": True, "message": ("已保存并生效：" + "；".join(words)) if words else "已保存，设置没有变化。"}
+
+    async def live_control(self, action: str, data: dict) -> dict:
+        return {"ok": False, "message": "真实交易未开启（LIVE=off）：这里只能改模拟交易的参数。"}
+
     def cmd_web(self, req: Request) -> str:
         if not self.config.web_port or not self.web_token:
             return ("网页未开启：需要一个监听端口。Railway 会自动提供 PORT；其他环境请设置 WEB_PORT。"
@@ -12425,7 +12685,10 @@ class Bot:
             return (f"网页已在端口 {self.config.web_port} 运行，但还没有公网域名。\n"
                     "Railway：服务 Settings → Networking → Generate Domain，重新部署后再发 /web；"
                     f"或设置 WEB_BASE_URL。\n路径：{self.web_url()}")
-        return f"📊 概率网页（每 10 秒自动刷新，链接含私密令牌，请勿转发）：\n{self.web_url()}"
+        text = f"📊 概率网页（每 10 秒自动刷新，链接含私密令牌，请勿转发）：\n{self.web_url()}"
+        if self.config.web_control_key:
+            text += f"\n🎛 控制台（需要 WEB_CONTROL_KEY 口令）：{self.web_url()}/control"
+        return text
 
     def cmd_prob(self, req: Request) -> "Reply":
         if not self.config.probability:
