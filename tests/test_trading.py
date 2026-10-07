@@ -350,6 +350,7 @@ async def step(bot, at, *markets):
 def make_bot(**env):
     cfg = m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
                              "SIM_WAYS": "both", "SIM_MARKETS": "all", "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT_API_KEY": "k",
+                             "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off",  # resting orders rest as placed, unless a test says otherwise
                              "LIVE_MAX_ORDER_USD": "100", "LIVE_MAX_OPEN_USD": "250", "LIVE_MAX_DAILY_LOSS_USD": "50", **env})
     bot = L.LiveBot(cfg, m.Store(":memory:"), FM(NOW), None)
     bot.live.api, bot.live.chain = FakeApi(), FakeChain()
@@ -719,6 +720,40 @@ async def run():
     assert ("remove", [maker_rec["live"]["order_id"]]) in qbot.live.api.calls
     assert any(b["id"] == "other|up|吃" and b["why"] == "结束前 15 分钟不交易" for b in qbot.sim_blocks()), qbot.sim_blocks()
     assert "结束前 15 分钟起不开新单" in qbot.sim_text() and "结束前" not in bot.sim_text()
+
+    # --- the resting-order rules on a real order: our own shares make no 买1 valid; the cancel is confirmed before the re-placement
+    mbot = make_bot(SIM_MAKER_MIN_BID="100", SIM_MAKER_EXIT_CENTS="5", SIM_MAKER_SESSION="on", SIM_WAYS="maker")
+    await mbot.live_prepare()
+    mfake = mbot.live.api
+    await mbot.live_prefetch(NOW)
+    await step(mbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    mtid = f"{HSI_SLUG}|up|挂"
+    mt = mbot.sim_trades()[mtid]
+    assert mt["live"]["state"] == "open" and mt["price"] == 0.55 and mt["live"]["order_id"] == "101"
+    # the real book now shows our 100 among the 55¢ bids: 400 there, 300 of them others → still the valid 买1
+    await step(mbot, NOW + 10_000, hsi(0.70, [("0.55", "400")], [("0.58", "400")], NOW + 10_000))
+    assert mbot.sim_trades()[mtid]["status"] == "resting"
+    # the others leave: 55¢ holds only our 100, the valid 买1 is the 200 at 53¢ → cancelled on Predict, re-placed there next step
+    await step(mbot, NOW + 20_000, hsi(0.70, [("0.55", "100"), ("0.53", "200")], [("0.58", "400")], NOW + 20_000))
+    trades = mbot.sim_trades()
+    old = trades[f"{mtid}#1"]
+    assert mtid not in trades and old["status"] == "cancelled" and old["live"]["final"] == "cancelled" and ("remove", ["101"]) in mfake.calls
+    assert old["live"]["cancel_why"] == "买1 移到 53.0¢，改跟" and old["live"]["rekeyed"] == f"{mtid}#1"
+    await step(mbot, NOW + 30_000, hsi(0.70, [("0.53", "200")], [("0.58", "400")], NOW + 30_000))  # our cancelled 100 are gone from the book
+    new = mbot.sim_trades()[mtid]
+    assert new["price"] == 0.53 and new["live"]["order_id"] == "102" and new["live"]["want"]["price"] == 0.53
+    # while a cancel is unconfirmed (the order list cannot be read), no fresh order goes out for that slot
+    mfake.fail_open = "HTTP 500: boom"
+    await step(mbot, NOW + 40_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 40_000))
+    trades = mbot.sim_trades()
+    assert mtid not in trades and trades[f"{mtid}#2"]["live"]["state"] == "cancelling"
+    await step(mbot, NOW + 50_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 50_000))
+    assert mtid not in mbot.sim_trades() and any(b["id"] == mtid and "撤单中" in b["why"] for b in mbot.sim_blocks()), mbot.sim_blocks()
+    mfake.fail_open = None
+    await step(mbot, NOW + 60_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 60_000))
+    assert mbot.sim_trades()[f"{mtid}#2"]["live"]["state"] == "done" and ("remove", ["102"]) in mfake.calls
+    await step(mbot, NOW + 70_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 70_000))
+    assert mbot.sim_trades()[mtid]["price"] == 0.57 and mbot.sim_trades()[mtid]["live"]["order_id"] == "103"
 
     # --- /live test: a tiny resting order far under the market, listed, withdrawn, its final state read ---------------------
     tbot = make_bot(SIM_WAYS="both")

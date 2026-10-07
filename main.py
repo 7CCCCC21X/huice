@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.43.0"
+VERSION = "1.44.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -446,6 +446,9 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "0 = 不限"),
     ("SIM_TAKER_SESSION", "只在标的开盘时段吃单", "开 = 指数/个股日涨跌的吃单只在标的开盘时段（卡片按现货定价时）进行，盘后只挂单；挂单不受影响"),
     ("SIM_QUIET_MINUTES", "结束前多少分钟不交易", "0～1440：从标的收盘 / 市场截止前这么多分钟起不开新单，未成交的挂单撤掉；0 = 不限"),
+    ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
+    ("SIM_MAKER_EXIT_CENTS", "挂单撤单线（¢/份）", "0～50：挂着的单净优势降到这个数以下就撤掉（不会高于触发门槛）；0 = 不撤"),
+    ("SIM_MAKER_SESSION", "只在标的开盘时段挂单", "开 = 指数/个股日涨跌的挂单只在标的开盘时段挂着，开盘前、收盘后全部撤掉；加密市场不受影响"),
     ("PREDICT_MIN_EDGE_CENTS", "卡片建议至少要有的净优势（¢）", "0～50，模型误差之上"),
     ("PREDICT_TRADE_USD", "卡片吃单按多少美元走盘口", "1～1000000"),
     ("LIVE_MAX_ORDER_USD", "真实交易单笔上限（$）", "1～1000000"),
@@ -511,6 +514,10 @@ class Config:
     sim_taker_session: bool = False  # SIM_TAKER_SESSION: a daily card is taken only while its underlying trades (priced from the spot); makers always
     sim_quiet_minutes: int = 0        # SIM_QUIET_MINUTES: from this many minutes before a market's end (the underlying's close, a deadline) no new
     # paper order; a resting one is withdrawn (the real one cancelled). 0 = off
+    sim_maker_min_bid: float = 100.0  # SIM_MAKER_MIN_BID: a resting order joins the first bid level holding this many shares besides ours and follows
+    # it (withdrawn and re-placed when the valid 买1 moves a cent); 0 = the top level whatever its size, and no following
+    sim_maker_exit: float = 0.05      # SIM_MAKER_EXIT_CENTS / 100: a resting order is withdrawn when its edge falls under this; 0 = never
+    sim_maker_session: bool = True    # SIM_MAKER_SESSION: a daily card's resting orders only while its underlying trades (withdrawn before the open)
     touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
     auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
     edge_alert: bool = True  # Telegram: a suggestion reaching edge_alert_edge; later, that suggestion going away or turning
@@ -628,6 +635,9 @@ class Config:
             sim_group_usd=parse_bounded(e, "SIM_GROUP_USD", "300", 0, 10_000_000),
             sim_taker_session=not off(e.get("SIM_TAKER_SESSION", "off")),
             sim_quiet_minutes=bounded_int(e, "SIM_QUIET_MINUTES", 0, 0, 1440),
+            sim_maker_min_bid=parse_bounded(e, "SIM_MAKER_MIN_BID", "100", 0, 10_000_000),
+            sim_maker_exit=parse_bounded(e, "SIM_MAKER_EXIT_CENTS", "5", 0, 50) / 100,
+            sim_maker_session=not off(e.get("SIM_MAKER_SESSION", "on")),
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -6854,6 +6864,9 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_MARKETS": {"kind": "multi", "group": "策略", "options": [[k, n] for k, n in SIM_KINDS.items()]},
     "SIM_TAKER_SESSION": {"kind": "choice", "group": "策略", "options": [["off", "全天都吃单"], ["on", "只在开盘时段吃单"]]},
     "SIM_QUIET_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "5", "10", "15", "30", "60"], "unit": "分钟", "zero": "不限"},
+    "SIM_MAKER_MIN_BID": {"kind": "number", "group": "策略", "presets": ["0", "20", "50", "100", "200", "500"], "unit": "份", "zero": "不限、不改跟"},
+    "SIM_MAKER_EXIT_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "2", "3", "5", "8"], "unit": "¢", "zero": "不撤"},
+    "SIM_MAKER_SESSION": {"kind": "choice", "group": "策略", "options": [["off", "盘前盘后也挂"], ["on", "只在开盘时段挂"]]},
     "SIM_GROUP_USD": {"kind": "number", "group": "策略", "presets": ["0", "100", "300", "500", "1000"], "unit": "$", "zero": "不限"},
     "LIVE_MAX_ORDER_USD": {"kind": "number", "group": "风控", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
     "LIVE_MAX_OPEN_USD": {"kind": "number", "group": "风控", "presets": ["100", "300", "500", "1000", "3000"], "unit": "$"},
@@ -6888,6 +6901,20 @@ def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
     if gap > spread + 1e-9:
         return f"买卖价差 {cents(gap)} 超过 {cents(spread)}"
     return ""
+
+
+SIM_MAKER_FOLLOW = 0.01  # a resting order follows the valid 买1 once it has moved this far (1¢) from the order's price
+
+
+def maker_level(book: PredictBook, side: str, min_size: float, own: float = 0.0, own_price: float | None = None) -> tuple[float, float] | None:
+    """The 买1 a resting buy of ``side`` joins: the first bid level (涨: the bids; 跌: 1 − the asks) holding at least
+    ``min_size`` shares besides ``own`` (our own resting order at ``own_price``, which a real book shows). None when
+    no level is that deep."""
+    for price, size in own_levels(book, side):
+        others = size - (own if own_price is not None and abs(price - own_price) < 1e-9 else 0.0)
+        if others > 1e-9 and others >= min_size - 1e-9:
+            return price, others
+    return None
 
 
 def sim_end_ms(settle: Mapping | None) -> int | None:
@@ -8253,7 +8280,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
   trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
@@ -11133,7 +11160,10 @@ class Bot:
                 "fee_bps": c.predict_fee_bps, "trade_usd": c.predict_trade_usd, "a50_beta": c.a50_beta,
                 "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR,
                 **({"sim_taker_session": True} if c.sim_taker_session else {}),
-                **({"sim_quiet_minutes": c.sim_quiet_minutes} if c.sim_quiet_minutes else {})}
+                **({"sim_quiet_minutes": c.sim_quiet_minutes} if c.sim_quiet_minutes else {}),
+                **({"sim_maker_min_bid": c.sim_maker_min_bid} if c.sim_maker_min_bid > 0 else {}),
+                **({"sim_maker_exit": self.sim_maker_exit()} if self.sim_maker_exit() > 0 else {}),
+                **({"sim_maker_session": True} if c.sim_maker_session else {})}
 
     def evidence(self, build: Any) -> "LazyEvidence":
         """A SimMarket's evidence, built on first access: when a trade is opened or filled, not for every market on
@@ -11302,6 +11332,78 @@ class Bot:
         if (kind == "range" and not RANGE_SIM_MAKERS) or (mk is not None and not mk.makers):
             return f"{SIM_KINDS.get(kind, kind)}只做吃单"
         return ""
+
+    @staticmethod
+    def sim_own_resting(trades: dict[str, dict], market: str, side: str) -> tuple[float, float | None]:
+        """Our own resting real order on a market's side (a real book shows it among the bids): its unfilled shares and
+        its price; (0, None) when there is none."""
+        for t in trades.values():
+            if (t.get("market") == market and t.get("side") == side and t.get("maker") and t.get("status") == "resting"
+                    and isinstance(t.get("live"), dict)):
+                return max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0), float(t.get("price") or 0)
+        return 0.0, None
+
+    def sim_maker_candidate(self, mk: SimMarket, trades: dict[str, dict]) -> BookEdge | None:
+        """The resting order the paper trader would place on this market now: the side whose valid 买1 (maker_level: the
+        first level holding SIM_MAKER_MIN_BID shares besides ours) leaves the larger edge above the card's error. None
+        when neither side does, or the book is one-sided, crossed or too wide (sim_maker_block)."""
+        if sim_maker_block(mk.book):
+            return None
+        best = None
+        for side, name in (("up", "涨"), ("down", "跌")):
+            own, own_price = self.sim_own_resting(trades, mk.market, side)
+            level = maker_level(mk.book, side, self.config.sim_maker_min_bid, own, own_price)
+            if level is None:
+                continue
+            edge = (mk.fair_up if side == "up" else 1 - mk.fair_up) - level[0]
+            if edge > mk.need and (best is None or edge > best.edge):
+                best = BookEdge(name, True, level[0], edge, level[1], edge)
+        return best
+
+    def sim_maker_exit(self) -> float:
+        """The edge under which a resting order is withdrawn: SIM_MAKER_EXIT_CENTS, kept half a cent under the entry bar
+        so an order is never withdrawn the moment it is placed; 0 = never."""
+        exit_edge = self.config.sim_maker_exit
+        return min(exit_edge, max(self.config.sim_edge - 0.005, 0.0)) if exit_edge > 0 else 0.0
+
+    def sim_requote_reason(self, trade: dict, mk: SimMarket | None, now_ms: int) -> str:
+        """Why a resting order is withdrawn to be placed afresh when the chance returns (its slot is freed when nothing
+        filled): the underlying is not in session (SIM_MAKER_SESSION), its edge fell under the exit line
+        (SIM_MAKER_EXIT_CENTS), the valid 买1 is gone or has moved (SIM_MAKER_MIN_BID). "" while it may stand."""
+        c = self.config
+        if not trade.get("maker") or mk is None:
+            return ""
+        if c.sim_maker_session and mk.in_session is False:
+            return "标的未开盘，不挂单"
+        if mk.hold or mk.book.stale(now_ms) or book_crossed(mk.book):
+            return ""  # no fresh view of the market: the order stands
+        side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)
+        edge = (mk.fair_up if side == "up" else 1 - mk.fair_up) - price
+        exit_edge = self.sim_maker_exit()
+        if exit_edge > 0 and edge < exit_edge - 1e-9:
+            return f"净优势降到 {cents(edge)}，低于撤单线 {cents(exit_edge)}"
+        if c.sim_maker_min_bid > 0:
+            own = max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0) if isinstance(trade.get("live"), dict) else 0.0
+            level = maker_level(mk.book, side, c.sim_maker_min_bid, own, price)
+            if level is None:
+                return f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟"
+            if abs(level[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
+                return f"买1 移到 {cents(level[0])}，改跟"
+        return ""
+
+    def sim_rekey(self, tid: str, trade: dict) -> str:
+        """Move a record to tid#n: the slot (one order per market, side and way of trading) is free for a fresh order,
+        the attempt stays in the journal. A record already numbered keeps its key."""
+        if "#" in tid.rsplit("|", 1)[-1]:
+            return tid
+        existing = [k for k in self.sim_trades() if k.startswith(tid + "#")]
+        new_tid = f"{tid}#{len(existing) + 1}"
+        if isinstance(trade.get("live"), dict):
+            trade["live"]["rekeyed"] = new_tid
+        self.store.delete_keys([f"sim:{tid}"])
+        self.sim_cache = None
+        self.sim_save([(new_tid, trade)])
+        return new_tid
 
     def sim_withdraw(self, trade: dict, why: str, now_ms: int) -> None:
         """Withdraw a resting order: the shares it had filled stay a position, the rest lapses now, not at the result."""
@@ -11560,9 +11662,10 @@ class Bot:
         for mk in markets.values():
             if mk.hold or mk.book.stale(now_ms) or mk.kind not in kinds or book_crossed(mk.book):
                 continue  # positions filled in other kinds (SIM_MARKETS narrowed) still settle below; resting ones are withdrawn
-            maker = (best_edge([e for e in book_edges(mk.fair_up, mk.book, costs) if e.maker], mk.need)
-                     if mk.makers and ways != "taker" else None)
-            if maker is not None and maker.edge >= bar - 1e-9 and not sim_maker_block(mk.book):
+            # SIM_MAKER_SESSION: a daily card after hours carries no resting order either (the ones there are withdrawn below)
+            maker = (self.sim_maker_candidate(mk, trades) if mk.makers and ways != "taker"
+                     and not (self.config.sim_maker_session and mk.in_session is False) else None)
+            if maker is not None and maker.edge >= bar - 1e-9:
                 side = "up" if maker.side == "涨" else "down"
                 tid = f"{mk.market}|{side}|挂"
                 if tid not in trades:  # one position per market, side and way of trading, however long the edge lasts
@@ -11594,16 +11697,20 @@ class Bot:
                     else:
                         trades[tid] = self.sim_open(mk, side, now_ms, taker=q)
                         changed.append((tid, trades[tid]))
-        opened = {tid for tid, _ in changed}
+        opened, rekeys = {tid for tid, _ in changed}, []
         for tid, trade in trades.items():
             if trade.get("final") or tid in opened:
                 continue  # settled and confirmed: nothing below applies (and no JSON round trip for it every 10 seconds)
             before = json.dumps(trade, sort_keys=True, default=str)
             mk = markets.get(trade["market"])
             if trade["status"] == "resting":
-                why = self.sim_withdraw_reason(trade, mk, now_ms)
+                why, requote = self.sim_withdraw_reason(trade, mk, now_ms), False
+                if not why:
+                    why, requote = self.sim_requote_reason(trade, mk, now_ms), True
                 if why:
                     self.sim_withdraw(trade, why, now_ms)
+                    if requote and float(trade.get("shares") or 0) <= 1e-9:
+                        rekeys.append(tid)  # nothing filled: the slot is free for a fresh order; the record keeps the attempt
                 elif mk is not None and not mk.book.stale(now_ms) and not book_crossed(mk.book):
                     # a crossed snapshot opens nothing (above) and fills nothing either: its "sellers through the price"
                     # are a feed caught mid-update, and a presumed fill is never taken back
@@ -11621,6 +11728,10 @@ class Bot:
                     trade["confirm"] = "local"
             if json.dumps(trade, sort_keys=True, default=str) != before:
                 changed.append((tid, trade))
+        for tid in rekeys:
+            new_tid = self.sim_rekey(tid, trades[tid])
+            trades[new_tid] = trades.pop(tid)
+            changed = [(new_tid if k == tid else k, t) for k, t in changed]
         if changed:
             self.sim_save(changed)
         await self.sim_confirm(trades, now_ms)
@@ -11738,6 +11849,12 @@ class Bot:
         if r["ways"] != "只吃单":
             how.append("挂单只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交，"
                        "出结果时没成交的部分作废；不再做的挂单撤掉")
+            if self.config.sim_maker_min_bid > 0:
+                how.append(f"只跟不少于 {self.config.sim_maker_min_bid:g} 份的买1，买1 移动 1¢ 以上就撤了改跟")
+            if self.sim_maker_exit() > 0:
+                how.append(f"挂着的单净优势降到 {cents(self.sim_maker_exit())} 以下撤掉")
+            if self.config.sim_maker_session:
+                how.append("指数/个股日涨跌只在标的开盘时段挂单，开盘前、收盘后撤掉")
         lines = [f"🧪 {bold('模拟交易')}（净优势 ≥{edge:g}¢ 时按卡片建议买 {shares} 份，只记账不下单）",
                  f"范围：{r['scope']}；{r['ways']}。" + "；".join(how) + "。先按机器人数据预结算，再以 Predict 的结果确认。"]
         if not t["trades"]:
@@ -12758,7 +12875,8 @@ class Bot:
         values = {"LIVE": c.live_mode, "SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": f"{c.sim_shares:g}", "SIM_WAYS": c.sim_ways,
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
                   "SIM_GROUP_USD": f"{c.sim_group_usd:g}", "SIM_TAKER_SESSION": flag(c.sim_taker_session),
-                  "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes),
+                  "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes), "SIM_MAKER_MIN_BID": f"{c.sim_maker_min_bid:g}",
+                  "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_SESSION": flag(c.sim_maker_session),
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}",
                   "PREDICT_TRADE_USD": f"{c.predict_trade_usd:g}", "LIVE_MAX_ORDER_USD": f"{c.live_max_order_usd:g}",
                   "LIVE_MAX_OPEN_USD": f"{c.live_max_open_usd:g}", "LIVE_MAX_DAILY_LOSS_USD": f"{c.live_max_daily_loss_usd:g}",

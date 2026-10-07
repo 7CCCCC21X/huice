@@ -18,6 +18,7 @@ NOW = BJ(10, 5, 10, 0)
 HSI_SLUG = "hang-seng-index-up-or-down-on-october-5-2026"
 KOSPI_SLUG = "kospi-composite-index-up-or-down-on-october-5-2026"
 CLOSE = BJ(10, 5, 16, 10)
+LEGACY = {"SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off"}  # the resting-order rules off: orders rest as placed
 FEE = 0.02  # Predict: 2% × min(p, 1 − p) when the market states no rate
 
 # --- settings ----------------------------------------------------------------------------------------------------------
@@ -110,7 +111,7 @@ def hsi(fair, bids, asks, at, **kw):
 
 async def run():
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
-                             "WEB_PORT": "8080", "SIM_WAYS": "both", "SIM_MARKETS": "all"})  # every kind and both ways, as below
+                             "WEB_PORT": "8080", "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY})  # every kind and both ways, as below
     store = m.Store(":memory:")
     bot = m.Bot(cfg, store, FM(NOW), None)
     bot.sim_markets = lambda now: world["markets"]
@@ -473,7 +474,7 @@ async def run():
     await step(dbot, NOW, hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW), far)  # 挂涨 +15¢ and 吃涨 +11¢ on both
     assert sorted(dbot.sim_trades()) == [f"{HSI_SLUG}|up|吃"], sorted(dbot.sim_trades())
     mbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
-                                    "SIM_WAYS": "maker", "SIM_MARKETS": "touch"}), m.Store(":memory:"), FM(NOW), None)
+                                    "SIM_WAYS": "maker", "SIM_MARKETS": "touch", **LEGACY}), m.Store(":memory:"), FM(NOW), None)
     mbot.sim_markets = lambda now: world["markets"]
     await step(mbot, NOW, hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW), far)
     assert sorted(mbot.sim_trades()) == ["will-bnb-hit-700-or-900|up|挂"], sorted(mbot.sim_trades())
@@ -485,7 +486,7 @@ async def run():
     assert m.sim_maker_block(book([("0.003", "50")], [("0.80", "100")])) == "买卖价差 79.7¢ 超过 10.0¢"
     assert m.sim_maker_block(book([("0.60", "50")], [("0.58", "100")])).startswith("盘口交叉") and not m.book_crossed(book([("0.55", "1")], [("0.58", "1")]))
     gbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
-                                    "SIM_WAYS": "both", "SIM_MARKETS": "all"}), m.Store(":memory:"), FM(NOW), None)
+                                    "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}), m.Store(":memory:"), FM(NOW), None)
     gbot.sim_markets = lambda now: world["markets"]
     lone = lambda name, bids, asks, fair: m.SimMarket(name, name, "close", "X", fair, book(bids, asks, NOW, name, mid=name), 0.03, "", ("涨", "跌"), {})
     # the 10-03 price-ladder case: a lone 0.3¢ bid under an 80¢ ask shows 挂涨 +58.7¢, but nobody sells into it: no order;
@@ -572,4 +573,78 @@ async def browser_check(bot):
     await web.stop()
 
 
+async def maker_rules():
+    """The resting-order rules on by default: the valid 买1, following it, the exit line, the session, the freed slot."""
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                             "WEB_PORT": "8080", "SIM_WAYS": "maker", "SIM_MARKETS": "all"})
+    assert cfg.sim_maker_min_bid == 100 and cfg.sim_maker_exit == 0.05 and cfg.sim_maker_session
+    for bad in ({"SIM_MAKER_MIN_BID": "-1"}, {"SIM_MAKER_EXIT_CENTS": "51"}, {"SIM_MAKER_EXIT_CENTS": "x"}):
+        try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
+        except ValueError: pass
+    bot = m.Bot(cfg, m.Store(":memory:"), FM(NOW), None)
+    bot.sim_markets = lambda now: world["markets"]
+    assert bot.control_value("SIM_MAKER_MIN_BID") == "100" and bot.control_value("SIM_MAKER_EXIT_CENTS") == "5" and bot.control_value("SIM_MAKER_SESSION") == "on"
+    assert bot.sim_version()["sim_maker_min_bid"] == 100 and bot.sim_version()["sim_maker_exit"] == 0.05 and bot.sim_version()["sim_maker_session"] is True
+    # maker_level: the first level deep enough, our own order not counted
+    b = book([("0.56", "5"), ("0.55", "300"), ("0.53", "500")], [("0.58", "400")])
+    assert m.maker_level(b, "up", 100) == (0.55, 300.0) and m.maker_level(b, "up", 0) == (0.56, 5.0) and m.maker_level(b, "up", 400) == (0.53, 500.0)
+    assert m.maker_level(b, "up", 1000) is None and m.maker_level(b, "up", 100, own=250.0, own_price=0.55) == (0.53, 500.0)
+    assert m.maker_level(b, "down", 100) == (1 - 0.58, 400.0)  # 跌 bids are 1 − the asks
+    # a 5-share 买1 is not followed: the order joins the 300 at 55¢ behind them
+    await step(bot, NOW, hsi(0.70, [("0.56", "5"), ("0.55", "300")], [("0.58", "400")], NOW))
+    tid = f"{HSI_SLUG}|up|挂"
+    t = bot.sim_trades()[tid]
+    assert list(bot.sim_trades()) == [tid] and t["price"] == 0.55 and t["queue_ahead"] == 300 and abs(t["edge"] - 0.15) < 1e-9
+    # only thin bids: nothing to follow, the resting order is withdrawn and its slot freed (the attempt kept as #1)
+    await step(bot, NOW + 10_000, hsi(0.70, [("0.56", "5"), ("0.55", "30")], [("0.58", "400")], NOW + 10_000))
+    trades = bot.sim_trades()
+    assert sorted(trades) == [f"{tid}#1"] and trades[f"{tid}#1"]["status"] == "cancelled" and trades[f"{tid}#1"]["note"] == "撤单：买1 不足 100 份，不跟，一份都没成交"
+    await step(bot, NOW + 20_000, hsi(0.70, [("0.56", "5"), ("0.55", "30")], [("0.58", "400")], NOW + 20_000))
+    assert sorted(bot.sim_trades()) == [f"{tid}#1"]  # still nothing to join
+    # the 买1 is back, deep enough: a fresh order; then it moves up two cents → withdrawn, re-placed at the new level next step
+    await step(bot, NOW + 30_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 30_000))
+    assert sorted(bot.sim_trades()) == [tid, f"{tid}#1"] and bot.sim_trades()[tid]["price"] == 0.55
+    await step(bot, NOW + 40_000, hsi(0.70, [("0.57", "150"), ("0.55", "300")], [("0.58", "400")], NOW + 40_000))
+    trades = bot.sim_trades()
+    assert sorted(trades) == [f"{tid}#1", f"{tid}#2"] and trades[f"{tid}#2"]["note"] == "撤单：买1 移到 57.0¢，改跟，一份都没成交" and trades[f"{tid}#2"]["price"] == 0.55
+    await step(bot, NOW + 50_000, hsi(0.70, [("0.57", "150"), ("0.55", "300")], [("0.58", "400")], NOW + 50_000))
+    trades = bot.sim_trades()
+    assert trades[tid]["price"] == 0.57 and trades[tid]["queue_ahead"] == 150 and abs(trades[tid]["edge"] - 0.13) < 1e-9  # re-placed at the new 买1
+    # a half-cent move is not followed
+    await step(bot, NOW + 60_000, hsi(0.70, [("0.575", "150"), ("0.55", "300")], [("0.58", "400")], NOW + 60_000))
+    assert bot.sim_trades()[tid]["price"] == 0.57 and bot.sim_trades()[tid]["status"] == "resting"
+    # the edge falls under the exit line (5¢): withdrawn; back above the bar: placed again
+    await step(bot, NOW + 70_000, hsi(0.61, [("0.57", "150"), ("0.55", "300")], [("0.58", "400")], NOW + 70_000))
+    trades = bot.sim_trades()
+    assert tid not in trades and trades[f"{tid}#3"]["note"] == "撤单：净优势降到 4.0¢，低于撤单线 5.0¢，一份都没成交"
+    await step(bot, NOW + 80_000, hsi(0.66, [("0.57", "150"), ("0.55", "300")], [("0.58", "400")], NOW + 80_000))
+    assert tid not in bot.sim_trades()  # 9¢: under the 10¢ bar, not placed
+    await step(bot, NOW + 90_000, hsi(0.70, [("0.57", "150"), ("0.55", "300")], [("0.58", "400")], NOW + 90_000))
+    assert bot.sim_trades()[tid]["price"] == 0.57
+    # SIM_MAKER_SESSION: the underlying not trading → withdrawn, nothing placed; trading again → placed
+    closed = m.dataclasses.replace(hsi(0.70, [("0.57", "150"), ("0.55", "300")], [("0.58", "400")], NOW + 100_000), in_session=False)
+    await step(bot, NOW + 100_000, closed)
+    trades = bot.sim_trades()
+    assert tid not in trades and trades[f"{tid}#4"]["note"] == "撤单：标的未开盘，不挂单，一份都没成交"
+    await step(bot, NOW + 110_000, closed)
+    assert tid not in bot.sim_trades()
+    await step(bot, NOW + 120_000, m.dataclasses.replace(closed, in_session=True))
+    assert bot.sim_trades()[tid]["price"] == 0.57
+    # a part fill, then the 买1 moves: the filled shares stay a position under the slot, the rest lapses, no fresh order
+    await step(bot, NOW + 130_000, hsi(0.70, [("0.565", "150")], [("0.57", "40"), ("0.58", "400")], NOW + 130_000))  # a seller at 57¢: 40 presumed
+    assert bot.sim_trades()[tid]["shares"] == 40 and bot.sim_trades()[tid]["status"] == "resting"
+    await step(bot, NOW + 140_000, hsi(0.70, [("0.59", "200"), ("0.565", "150")], [("0.60", "400")], NOW + 140_000))
+    t = bot.sim_trades()[tid]
+    assert t["status"] == "filled" and t["shares"] == 40 and t["unfilled"] == 60 and "买1 移到 59.0¢，改跟" in t["note"] and f"{tid}#5" not in bot.sim_trades()
+    await step(bot, NOW + 150_000, hsi(0.70, [("0.59", "200"), ("0.565", "150")], [("0.60", "400")], NOW + 150_000))
+    assert bot.sim_trades()[tid]["shares"] == 40 and len([k for k in bot.sim_trades() if k.startswith(tid)]) == 5  # the position holds the slot
+    # the exit line never sits above the bar: SIM_EDGE_CENTS=3 with the 5¢ default → 2.5¢
+    low = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_EDGE_CENTS": "3"}), m.Store(":memory:"), FM(NOW), None)
+    why = low.sim_requote_reason({"maker": True, "side": "up", "price": 0.69, "order": 100, "shares": 0}, hsi(0.70, [("0.69", "300")], [("0.72", "400")], NOW), NOW)
+    assert abs(low.sim_maker_exit() - 0.025) < 1e-12 and why == "净优势降到 1.0¢，低于撤单线 2.5¢", why
+    assert "只跟不少于 100 份的买1" in bot.sim_text() and "降到 5.0¢ 以下撤掉" in bot.sim_text() and "开盘前、收盘后撤掉" in bot.sim_text()
+    print("MAKER_RULES_OK")
+
+
 asyncio.run(run())
+asyncio.run(maker_rules())

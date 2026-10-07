@@ -873,6 +873,9 @@ class LiveBot(core.Bot):
         held = self.live_backoff.get((mk.market, side))
         if held and time.monotonic() < held[0]:
             return f"{held[1]}，{int(held[0] - time.monotonic()) + 1} 秒后再试"
+        if any(t.get("market") == mk.market and t.get("side") == side and bool(t.get("maker")) == (taker is None)
+               and isinstance(t.get("live"), dict) and t["live"].get("state") in {"pending", "placing", "cancelling"} for t in trades.values()):
+            return "这个市场这一边还有同类订单在发送或撤单中，等它结束"  # a re-placed resting order waits for the old one's cancel
         if taker and taker.get("cap"):
             price, shares = float(taker["cap"]), float(c.sim_shares)  # the LIMIT order asks for SIM_SHARES at the cap: the most it can cost
         notional = float(price) * float(shares)
@@ -1041,7 +1044,7 @@ class LiveBot(core.Bot):
             if time.monotonic() - self.live.approvals_at >= self.LIVE_APPROVALS_SECONDS or not self.live.approvals:
                 with contextlib.suppress(Exception):
                     await self.live.refresh_approvals()
-        costs, bar, c = self.edge_costs(), self.config.sim_edge - 0.03, self.config
+        bar, c, trades = self.config.sim_edge - 0.03, self.config, self.sim_trades()
         wanted, self.live_wanted = list(self.live_wanted), set()
         for mk in self.sim_markets(now_ms):
             if mk.hold or mk.book.stale(now_ms) or mk.kind not in c.sim_markets or core.book_crossed(mk.book):
@@ -1049,9 +1052,9 @@ class LiveBot(core.Bot):
             info = self.live.markets.get(str(mk.book.market_id))
             if info and time.monotonic() - info.at < 3600:
                 continue
-            near = False  # judged as the paper trader judges: the best maker, a taker on SIM_SHARES
+            near = False  # judged as the paper trader judges: the valid 买1's edge, a taker under its cap
             if mk.makers and c.sim_ways != "taker":
-                maker = core.best_edge([e for e in core.book_edges(mk.fair_up, mk.book, costs) if e.maker], mk.need)
+                maker = self.sim_maker_candidate(mk, trades)
                 near = maker is not None and maker.edge >= bar
             bps = mk.book.fee_bps if mk.book.fee_bps is not None else c.predict_fee_bps
             for side in ("up", "down") if c.sim_ways != "maker" else ():
@@ -1142,14 +1145,7 @@ class LiveBot(core.Bot):
 
     def live_rekey(self, tid: str, trade: dict) -> str:
         """Move a record to tid#n, freeing the paper trader's one slot per market, side and way."""
-        if "#" in tid.rsplit("|", 1)[-1]:
-            return tid  # already an attempt record
-        existing = [k for k in self.sim_trades() if k.startswith(tid + "#")]
-        new_tid = f"{tid}#{len(existing) + 1}"
-        self.store.delete_keys([f"sim:{tid}"])
-        self.sim_cache = None
-        self.sim_save([(new_tid, trade)])
-        return new_tid
+        return self.sim_rekey(tid, trade)
 
     # --- reading back: fills, cancels, the final state of each order ---------------------------------------------------
     async def live_sync(self, now_ms: int) -> None:
