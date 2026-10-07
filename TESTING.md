@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.40.0
+版本：1.41.0
 
 ## 已完成
 
+- 1.41.0（控制台参数改为卡片选择）：`CONTROL_FORMS` 给每个控制项一个控件：选择型（LIVE、SIM_WAYS、SIM_TAKER_SESSION、LIVE_TAKER、LIVE_AUTO_REDEEM、LIVE_NOTIFY，每个值一张带中文说明的选项）、多选（SIM_MARKETS，全选即 all，至少保留一个）、数字型（预设值 + 自定义框，0 标“不限”），分组 策略 / 真实交易风控 / 高级；`control_payload` 把 kind / group / options / presets / unit / zero 一并给页面。页面：点选项立即 `set`（LIVE 卡片走 mode 动作并确认；无私钥时走 set 以拿到校验提示），每张卡片标当前值与“已保存 / 环境变量 / 默认值”，“恢复环境变量”撤销单项；整栏可收起、“高级参数”默认折叠（两者记在 localStorage）；输入自定义值时刷新不打断。选择型的 hint 改为解释含义。tests/test_control.py：页面元素、各控件的 options / presets、每个预设与选项都通过 `Config.from_env`、分组齐全。
 - 1.40.0（最低订单金额与 Predict 错误原话）：`MIN_ORDER_USD = 1`（接口拒绝低于 0.9 USD 的订单）：`live_room` 拦下金额不足的决定并写明原因；`live_test` 的份数按最低金额自动取（`ceil($1 / 价格)`，默认 2¢ 时 50 份；指定份数不足时提高并在首行说明），参数只在给出时校验范围。`_http_get` 对 predict.fun 域名优先用服务器自己的错误文本，403 附地区限制提示（原先 403 的通用提示盖掉了原话）。控制台挂单测试的确认文案、README（挂单测试、地区与最低金额一节、`/live` 行）、.env.example 同步。tests/test_trading.py：默认 50 份 $1.00、不足时改为 4 份并说明、正好够时不改、`live_room` 最低金额拦截；tests/test_control.py：页面测试 2 份改为 50 份；tests/test_tuning.py：`_http_get` 对 Predict 400/403/429 与 Binance 403 的文本。
 - 1.39.0（运行中切换 LIVE）：`main()` 只要配置了 `PREDICT_PRIVATE_KEY` 就运行 `LiveBot`；`LIVE` 成为控制项（`CONTROL_KEYS` 首项，`control_value`），`/live mode off|pause|on`（`live_set_mode` → `control_set({"LIVE": …}) → apply_config`，重启沿用）和控制台的模式按钮（`live_control` 的 `mode`）切换。off 时 `live_room` 放行、`sim_open` 返回纸面记录、`sim_version` 同基类、不预取不登录；`live_sync` 对已有真实订单仍登录并跟踪到结束；`live_mode_changed`：→off 撤掉未成交真实挂单并通知，→pause/on 下一步登录并通知；`live_place_pending` 在 off 时把待下单记录记为未发。`/live`、`/sim`、`/status`、`/help`、启动日志按模式措辞；无私钥的基类 `/live` 说明要配什么。README：LIVE 为初始值、准备步骤与 4b 教程改为用 `/live mode` 切换。tests/test_trading.py：off 模式下纸面成交与推定成交、不登录、`/live mode` 用法与三态切换、切 on 后真实下单、切 off 撤挂单并继续跟踪、重启沿用保存的模式、无私钥时拒绝；tests/test_control.py：LIVE 控制项与页面 mode 动作。
 - 1.38.0（LIVE=pause）：`Config.live_mode`（off / pause / on，`test`、`paused` 视为 pause；`live` = 非 off）。pause 时 `LiveBot` 正常加载（登录、链上账户校验、余额授权、`/live check`、`/live test`、撤单、领取、同步与结算都可用），`live_room` 一律拒绝开新仓并记为拦下；控制台徽标、`/live`、`/sim`、`/status`、启动通知都标明“LIVE=pause：只测试，不开新仓”；纸面模式的 `/live` 和控制台提示改成先 pause 再 on。README 的准备步骤与 4b 教程改为 off → pause → on。tests/test_trading.py：配置三态、pause 下决定被拦下且不留纸面记录、挂单测试照常、各处文案。

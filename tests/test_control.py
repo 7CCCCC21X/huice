@@ -90,10 +90,25 @@ async def run():
     st, head, body = await request(port, f"GET /p/{TOKEN}/control HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     assert st == 200 and "<title>交易控制台</title>" in body.decode() and "text/html" in head and "Content-Security-Policy" in head
     assert 'data-act="test"' in body.decode() and 'id="testlines"' in body.decode() and 'data-mode="pause"' in body.decode()
+    assert 'id="cards"' in body.decode() and 'id="fold"' in body.decode() and 'id="adv"' in body.decode() and 'id="fields"' not in body.decode()  # option cards, no form
     data = await get_json(port, "control.json")
     assert data["enabled"] and data["mode"] == "paper" and data["live"] is None and data["version"] == m.VERSION
     s = {x["key"]: x for x in data["settings"]}
-    assert s["SIM_EDGE_CENTS"] == {"key": "SIM_EDGE_CENTS", "label": "触发买入的净优势（¢/份）", "hint": "0.5～50", "value": "10", "saved": "", "env": ""}
+    assert {k: s["SIM_EDGE_CENTS"][k] for k in ("key", "label", "hint", "value", "saved", "env")} == {"key": "SIM_EDGE_CENTS", "label": "触发买入的净优势（¢/份）", "hint": "0.5～50", "value": "10", "saved": "", "env": ""}
+    assert s["SIM_EDGE_CENTS"]["kind"] == "number" and s["SIM_EDGE_CENTS"]["group"] == "策略" and "10" in s["SIM_EDGE_CENTS"]["presets"] and s["SIM_EDGE_CENTS"]["unit"] == "¢"
+    assert s["SIM_WAYS"]["kind"] == "choice" and s["SIM_WAYS"]["options"] == [["taker", "只吃单"], ["maker", "只挂单"], ["both", "挂单和吃单"]]
+    assert s["SIM_MARKETS"]["kind"] == "multi" and [o[0] for o in s["SIM_MARKETS"]["options"]] == list(m.SIM_KINDS) and s["SIM_MARKETS"]["options"][0][1] == "指数/个股日涨跌"
+    assert s["SIM_TAKER_SESSION"]["options"] == [["off", "全天都吃单"], ["on", "只在开盘时段吃单"]] and s["LIVE"]["options"][1][0] == "pause" and s["LIVE_NOTIFY"]["group"] == "高级"
+    assert s["SIM_GROUP_USD"]["zero"] == "不限" and s["LIVE_MAX_DAILY_LOSS_USD"]["presets"][0] == "0"
+    # every setting has a widget, every group is one the page knows, and every preset / option is a value the Config accepts
+    assert set(m.CONTROL_FORMS) == set(m.CONTROL_KEY_SET) and {f["group"] for f in m.CONTROL_FORMS.values()} == {"策略", "风控", "高级"}
+    withkey = {**base, "PREDICT_PRIVATE_KEY": "a" * 64}
+    for key, form in m.CONTROL_FORMS.items():
+        assert form["kind"] in {"choice", "multi", "number"} and (form["kind"] == "number") == ("presets" in form) and (form["kind"] != "number") == ("options" in form), key
+        for value in (form.get("presets") or [o[0] for o in form.get("options", [])]):
+            m.Config.from_env({**withkey, key: value})  # raises when a preset is out of range
+        if form["kind"] == "multi":
+            m.Config.from_env({**withkey, key: ",".join(o[0] for o in form["options"])})
     assert data["scope"] == ["只吃单", "指数/个股日涨跌"] and data["sim"]["trades"] == 0 and len(data["settings"]) == len(m.CONTROL_KEYS)
     # the token still gates everything; other POSTs stay refused; the key is required and compared, the body must be JSON
     st, _, _ = await request(port, f"GET /p/{'u' * 20}/control.json HTTP/1.1\r\nHost: x\r\n\r\n".encode()); assert st == 404
