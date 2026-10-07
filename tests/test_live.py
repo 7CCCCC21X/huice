@@ -1,644 +1,201 @@
-"""Real trading (LIVE=on): the paper trader's decisions become Predict orders. Offline: the API, the chain and the
-cards are stand-ins; the signing vectors come from the official predict-sdk (same key, same order, same output)."""
-import asyncio, base64, dataclasses, json, sys, time, datetime as dt
+"""Contract odds switch from the Binance proxy to the stock's own realtime quote while the stock trades."""
+import asyncio, sys, json, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
-import live as L
 D = m.D
-WEI = 10 ** 18
-KEY = "0x" + "a" * 64  # the SDK test suite's key (never a real one): 0x8fd379246834eac74B8419FfdA202CF8051F7A03
-ADDR = "0x8fd379246834eac74B8419FfdA202CF8051F7A03"
-PA = "0x1111111111111111111111111111111111111111"
-BJ = lambda mo, d, h, mi=0: int(dt.datetime(2026, mo, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
-NOW = BJ(10, 5, 10, 0)
-HSI_SLUG = "hang-seng-index-up-or-down-on-october-5-2026"
-CLOSE = BJ(10, 5, 16, 10)
+tz8, kst = dt.timezone(dt.timedelta(hours=8)), dt.timezone(dt.timedelta(hours=9))
+def bj(mo, d, h, mi, s=0): return int(dt.datetime(2026, mo, d, h, mi, s, tzinfo=tz8).timestamp() * 1000)
+def kr(mo, d, h, mi): return int(dt.datetime(2026, mo, d, h, mi, tzinfo=kst).timestamp() * 1000)
 
-# --- settings ----------------------------------------------------------------------------------------------------------
-base = {"TELEGRAM_BOT_TOKEN": "1:x"}
-c = m.Config.from_env(base)
-assert not c.live and c.live_key == "" and c.live_chain == 56 and c.live_taker == "market" and c.live_max_order_usd == 100
-assert "live_key" not in repr(c)  # the key is never in a repr / log line
-c = m.Config.from_env({**base, "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY[2:], "PREDICT_ACCOUNT": PA, "LIVE_TAKER": "Limit",
-                       "LIVE_MAX_ORDER_USD": "50", "LIVE_MAX_OPEN_USD": "300", "LIVE_MAX_DAILY_LOSS_USD": "0", "LIVE_SLIPPAGE_BPS": "50",
-                       "LIVE_AUTO_REDEEM": "off", "PREDICT_CHAIN_ID": "97", "BSC_RPC_URL": "https://rpc.example/"})
-assert c.live and c.live_key == KEY[2:] and c.live_account == PA and c.live_taker == "limit" and c.live_max_order_usd == 50
-assert c.live_max_open_usd == 300 and c.live_max_daily_loss_usd == 0 and c.live_slippage_bps == 50 and not c.live_auto_redeem
-assert c.live_chain == 97 and c.live_rpc == "https://rpc.example"
-for bad in ({"LIVE": "on"}, {"LIVE": "on", "PREDICT_PRIVATE_KEY": "abc"}, {"PREDICT_PRIVATE_KEY": KEY, "PREDICT_ACCOUNT": "0x12"},
-            {"LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT_CHAIN_ID": "1"}, {"LIVE_TAKER": "ioc"}, {"BSC_RPC_URL": "ftp://x"},
-            {"LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "SIM": "off"}, {"LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT": "off"}):
-    try: m.Config.from_env({**base, **bad}); assert False, bad
+def tencent(code, cur, prev, when):
+    return (f'v_{code}="1~宇树科技~688836~{cur}~{prev}~75.20~' + "~".join(["0"] * 24) + f'~{when}~x";').encode("gbk")
+
+# --- parsing ---------------------------------------------------------------------------------------
+q = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "78.00", "76.50", "20260928100003"), 0)
+assert (q.last, q.prev_close, q.quoted_ms, q.source) == (D("78.00"), D("76.50"), bj(9, 28, 10, 0, 3), "腾讯"), q
+sina = ('var hq_str_sh688836="宇树科技,75.20,76.50,78.10,' + ",".join(["0"] * 26) + ',2026-09-28,10:00:05,00";').encode("gbk")
+q = m.parse_stock_live("新浪", "sh", sina, 0)
+assert (q.last, q.prev_close, q.quoted_ms) == (D("78.10"), D("76.50"), bj(9, 28, 10, 0, 5)), q
+sina_hk = ('var hq_str_rt_hk00625="SHEIN,希音,38.00,38.10,38.20,37.50,37.76,' + ",".join(["0"] * 10) + ',2026/09/28,10:15:00";').encode("gbk")
+q = m.parse_stock_live("新浪", "hk", sina_hk, 0)
+assert (q.last, q.prev_close, q.quoted_ms) == (D("37.76"), D("38.10"), bj(9, 28, 10, 15)), q
+naver = json.dumps({"datas": [{"stockName": "SK하이닉스", "closePrice": "1,870,000", "compareToPreviousClosePrice": "13,000",
+                               "compareToPreviousPrice": {"code": "2"}, "localTradedAt": "2026-09-28T10:00:00+09:00",
+                               "marketStatus": "OPEN"}]}).encode()
+q = m.parse_stock_live("Naver", "kr", naver, 0)
+assert (q.last, q.prev_close, q.quoted_ms, q.source) == (D("1870000"), D("1857000"), kr(9, 28, 10, 0), "Naver"), q
+for bad in [b'v_sh688836="";', tencent("sh688836", "0.00", "76.50", "20260928092000")]:
+    try: m.parse_stock_live("腾讯", "sh", bad, 0); assert False, bad
     except ValueError: pass
-assert not m.Config.from_env({**base, "PREDICT_PRIVATE_KEY": KEY}).live  # a key alone does not switch live trading on
+hk_src = m.StockMarket.live_sources(m.StockTicker("hk", "00625"))
+assert [n for n, _, _ in hk_src] == ["腾讯", "新浪"] and hk_src[0][1].endswith("q=r_hk00625") and hk_src[1][1].endswith("list=rt_hk00625")
+assert m.StockMarket.live_sources(m.StockTicker("sh", "688825"))[0][1].endswith("q=sh688825")
+assert "domestic/stock/000660" in m.StockMarket.live_sources(m.StockTicker("kr", "000660"))[0][1]
 
-# --- amounts: the official SDK's arithmetic (vectors computed with predict-sdk 0.0.22) --------------------------------------
-assert L.to_wei(0.46) == 460000000000000000 and L.to_wei("0.421031") == 421031000000000000 and L.to_wei(D("100")) == 100 * WEI
-assert L.retain_sig(627500000000000000, 3) == 627000000000000000 and L.retain_sig(123456, 5) == 123450 and L.retain_sig(0, 3) == 0
-assert L.retain_sig(-123456, 2) == -120000 and L.retain_sig(99, 5) == 99
-assert L.limit_amounts(True, 627500000000000000, 100 * WEI) == {
-    "price_per_share": 627000000000000000, "maker": 62700000000000000000, "taker": 100 * WEI, "amount": 100 * WEI,
-    "last": 627000000000000000, "slippage_bps": 0, "min_out": False}
-assert L.limit_amounts(False, 627000000000000000, 10 * WEI)["maker"] == 10 * WEI and L.limit_amounts(False, 627000000000000000, 10 * WEI)["taker"] == 6270000000000000000
-asks = [(0.58, 30.0), (0.66, 500.0)]
-ma = L.market_buy_amounts(asks, 100 * WEI, 100, True)
-assert (ma["price_per_share"], ma["maker"], ma["taker"], ma["amount"], ma["last"]) == (
-    636000000000000000, 63600000000000000000, 95399999999999999999, 100 * WEI, 660000000000000000) and ma["min_out"] and ma["slippage_bps"] == 100
-plain = L.market_buy_amounts(asks, 100 * WEI, 100, False)
-assert (plain["maker"], plain["taker"]) == (66660000000000000000, 100 * WEI) and not plain["min_out"]
-assert L.market_buy_amounts(asks, 100 * WEI, 0, False)["maker"] == 66 * WEI
-short = L.market_buy_amounts(asks, 1000 * WEI, 50, True)  # the book holds 530 shares: the amounts are for those
-assert (short["price_per_share"], short["maker"], short["taker"], short["amount"]) == (
-    655471698113207547, 347400000000000000000, 523731818181818181817, 530 * WEI), short
-for bad in (lambda: L.market_buy_amounts([], 100 * WEI), lambda: L.limit_amounts(True, 0, 100 * WEI), lambda: L.limit_amounts(True, WEI, 10 ** 15),
-            lambda: L.market_buy_amounts(asks, 10 ** 15)):
-    try: bad(); assert False
-    except ValueError: pass
-assert L.exchange_key(False, False) == "CTF_EXCHANGE" and L.exchange_key(True, True) == "YIELD_BEARING_NEG_RISK_CTF_EXCHANGE"
-assert L.tokens_key(True, False) == "NEG_RISK_CONDITIONAL_TOKENS"
-
-# --- signing: the same hash and signature as the official SDK -----------------------------------------------------------------
-w = L.Wallet(KEY, 56)
-assert w.signer == ADDR and w.maker == ADDR and not w.predict_account and w.kind == "普通钱包"
-ZERO = "0x" + "0" * 40
-order = {"salt": "123456789", "maker": "0x1234567890123456789012345678901234567890", "signer": "0x1234567890123456789012345678901234567890",
-         "taker": ZERO, "tokenId": "12345", "makerAmount": "1000000000000000000", "takerAmount": "2000000000000000000",
-         "expiration": "4102444800", "nonce": "0", "feeRateBps": "100", "side": 0, "signatureType": 0}
-assert w.order_hash(order, False, False) == "0x814000c89efa61ae42a2bcc4c98e06e90c11480b95a12edea00e3411ec76821d"  # the SDK's own vector
-assert w.order_hash(order, True, False) == "0x8933540fa69d874eb627f27b47fc913902ac470d3cefe61ca16f05425c50c4a1"  # another exchange, another hash
-o2 = L.build_order(w, "98765", 55 * WEI, 100 * WEI, 200, 4102444800, salt=123456789)
-assert o2 == {"salt": "123456789", "maker": ADDR, "signer": ADDR, "taker": ZERO, "tokenId": "98765", "makerAmount": "55000000000000000000",
-              "takerAmount": "100000000000000000000", "expiration": "4102444800", "nonce": "0", "feeRateBps": "200", "side": 0, "signatureType": 0}
-h2, sig2 = w.sign_order(o2, False, False)
-assert h2 == "0xc053e9707ffed7a3c30af95d33f20d7c39ac3e322a2f42b5065a3ffe87d0b672"
-assert sig2 == "0xf11cc96337b432b3686ee32d4686507d4705ae3a85d1d87e69a8be3556213512005234d1590b46bc2362c671995eb0849c4fcb091a9661b61877111b206f0a471b"
-from eth_account import Account
-from eth_account.messages import encode_typed_data
-assert Account.recover_message(encode_typed_data(full_message=w.typed_data(o2, False, False)), signature=sig2) == ADDR
-assert w.sign_text("Sign in to Predict\nNonce: abc123") == ("0xa845ed1d522b341e854cc0ae95e33d2d29a1c49469596f939ac55b4de376460d"
-                                                            "57f293cf49aba6834d021ecf9ffd305efa966dafda2786f6d5d29a964e14c81c1c")
-assert int(L.build_order(w, "1", 1, 1, 0, 1)["salt"]) <= L.MAX_SALT and L.build_order(w, "1", 1, 1, 0, 1)["salt"] != L.build_order(w, "1", 1, 1, 0, 1)["salt"]
-# a Predict account: the key signs for the smart wallet, Kernel-wrapped, validator-prefixed (the SDK's format and bytes)
-k = L.Wallet(KEY, 56, PA.lower())
-assert k.maker == PA and k.signer == ADDR and k.predict_account == PA and k.kind.startswith("Predict 账户")
-o3 = L.build_order(k, "98765", 55 * WEI, 100 * WEI, 200, 4102444800, salt=123456789)
-assert o3["maker"] == PA and o3["signer"] == PA
-h3, sig3 = k.sign_order(o3, False, False)
-assert h3 == "0xb09712f122846a41d60af7541d20829d14d47e8510b8f01ff670027286222d21"
-assert sig3 == ("0x01845ADb2C711129d4f3966735eD98a9F09fC4cE5709392012521d9efa76de3a3f617e4856130005a888d1ecd493b485a6e57667ce73c0a3e8dd4f8fe5"
-                "008b0e0a1ee1b9b1404323e478cbe66f98e400851087906b1c")
-assert k.sign_text("Sign in to Predict\nNonce: abc123") == (
-    "0x01845ADb2C711129d4f3966735eD98a9F09fC4cE5792259d89fe6dccaf6458c4a36eebf28b0b1136ddde2a2f8388af343425e9f6294f33121a9ae7dd2692a32095a8970d9ee7148fd538840dc53d739cc0134417e51c")
-try: L.Wallet(KEY, 1); assert False
-except ValueError: pass
-
-# --- small parsers ----------------------------------------------------------------------------------------------------------
-tok = "x." + base64.urlsafe_b64encode(json.dumps({"exp": 1800000000}).encode()).decode().rstrip("=") + ".y"
-assert L.jwt_expiry(tok) == 1800000000 and L.jwt_expiry("bad") == 0 and L.jwt_expiry("") == 0
-assert L.http_status(m.RemoteError("HTTP 401: nope")) == 401 and L.http_status(m.RemoteError("网络错误")) == 0
-assert L.order_fill({"amount": str(100 * WEI), "amountFilled": str(30 * WEI), "status": "open"}, 100) == (30.0, "OPEN")
-assert L.order_fill({"amount": "0", "status": "FILLED"}, 60) == (60.0, "FILLED") and L.order_fill({"status": "CANCELLED"}, 60) == (0.0, "CANCELLED")
-assert L.order_fill({"amount": "100", "amountFilled": "250"}, 100) == (100.0, "")  # never more than ordered
-assert L.order_price({"averagePrice": "0.58"}) == 0.58 and L.order_price({"avgPrice": str(58 * 10 ** 16)}) == 0.58 and L.order_price({}) is None
-assert L.order_price({"averagePrice": "0"}) is None and L.order_hash_of({"order": {"hash": "0xAB"}}) == "0xab" and L.order_hash_of({"hash": "0xCD"}) == "0xcd"
-assert L.PredictApi.rows({"success": True, "data": [{"id": 1}, 3]}) == [{"id": 1}] and L.PredictApi.rows({"data": {"items": [{"a": 1}]}}) == [{"a": 1}]
-assert L.PredictApi.rows([{"b": 2}]) == [{"b": 2}] and L.PredictApi.rows({"data": {}}) == []
-outs = [{"name": "Up", "index_set": 1, "token": "1"}, {"name": "Down", "index_set": 2, "token": "2"}]
-assert L.outcome_for_side("close", "up", outs) == (outs[0], "") and L.outcome_for_side("close", "down", outs) == (outs[1], "")
-flipped = [{"name": "No", "index_set": 1, "token": "9"}, {"name": "Yes", "index_set": 2, "token": "8"}]
-assert L.outcome_for_side("ladder", "up", flipped)[0]["token"] == "8" and L.outcome_for_side("range", "down", flipped)[0]["token"] == "9"
-assert L.outcome_for_side("flip", "down", [{"name": "Yes", "index_set": 1, "token": "5"}, {"name": "Maybe", "index_set": 2, "token": "6"}])[0]["token"] == "6"
-odd = [{"name": "A", "index_set": 1, "token": "3"}, {"name": "B", "index_set": 2, "token": "4"}]
-assert L.outcome_for_side("close", "down", odd) == (odd[1], "按结果顺序推定（结果名称：a、b）") and L.outcome_for_side("ladder", "up", odd)[0] is None
-assert L.outcome_for_side("close", "up", outs[:1])[0] is None and L.outcome_for_side("close", "up", [{**outs[0], "token": ""}, outs[1]])[0] is None
-bnb = next(s for s in m.TOUCH_MARKETS if s.key == "BNB")
-touch_outs = [{"name": "$700", "index_set": 1, "token": "70"}, {"name": "$900", "index_set": 2, "token": "90"}]
-assert L.outcome_for_side("touch", "up", touch_outs, bnb)[0]["token"] == "90" and L.outcome_for_side("touch", "down", touch_outs, bnb)[0]["token"] == "70"
-info = L.parse_market({"id": 101, "status": "REGISTERED", "isNegRisk": True, "isYieldBearing": False, "feeRateBps": "150", "conditionId": "0xab",
-                       "outcomes": [{"name": "Down", "indexSet": 2, "onChainId": "222"}, {"name": "Up", "indexSet": 1, "onChainId": "111"}]}, 200)
-assert info.market_id == "101" and info.neg_risk and not info.yield_bearing and info.fee_bps == 150 and info.condition_id == "0xab"
-assert [o["token"] for o in info.outcomes] == ["111", "222"]  # index order, whatever the API's order
-assert L.parse_market({"id": 5, "outcomes": [], "feeRateBps": None}, 200).fee_bps == 200
-assert L.short_addr(ADDR) == "0x8fd3…7A03" and L.money(-3.5) == "−$3.50" and L.money(0) == "+$0.00"
-assert L.Chain.encode("approve(address,uint256)", ["address", "uint256"], [L.ADDRESSES[56]["USDT"], 1]).hex().startswith("095ea7b3")
-
-# --- the REST client against a canned server -------------------------------------------------------------------------------
-server = {"calls": [], "answers": {}, "fail": {}}
-
-
-def fake_http(url, payload=None, timeout=15, headers=None):
-    path = url.replace(m.PREDICT_REST, "")
-    server["calls"].append((path, payload, dict(headers or {})))
-    if path in server["fail"]:
-        error = server["fail"][path]
-        if isinstance(error, list):
-            error = error.pop(0) if error else None
-        if error:
-            raise m.RemoteError(error, 7 if "429" in error else 0)
-    answer = server["answers"].get(path, {"success": True, "data": {}})
-    return json.dumps(answer(payload) if callable(answer) else answer).encode()
-
-
-m._http_get = fake_http
-
-
-async def api_checks():
-    api = L.PredictApi(m.PREDICT_REST, "key-1", w)
-    server["answers"]["/auth/message"] = {"success": True, "data": {"message": "Sign in to Predict\nNonce: abc123"}}
-    server["answers"]["/auth"] = lambda body: {"success": True, "data": {"token": tok}} if body == {
-        "signer": ADDR, "signature": w.sign_text("Sign in to Predict\nNonce: abc123"), "message": "Sign in to Predict\nNonce: abc123"} else {"success": False}
-    assert await api.authenticate() == tok and api.jwt_exp == 1800000000 and api.auth_error == ""
-    assert server["calls"][0][2] == {"x-api-key": "key-1"} and api.headers() == {"x-api-key": "key-1", "Authorization": f"Bearer {tok}"}
-    # a 401 signs in again, once; a 429 pauses every request
-    server["answers"]["/orders?status=OPEN"] = {"success": True, "cursor": None, "data": [{"id": "7", "status": "OPEN"}]}
-    server["fail"]["/orders?status=OPEN"] = ["HTTP 401: expired"]
-    server["calls"].clear()
-    assert await api.orders("OPEN") == [{"id": "7", "status": "OPEN"}]
-    assert [p for p, _, _ in server["calls"]] == ["/orders?status=OPEN", "/auth/message", "/auth", "/orders?status=OPEN"]
-    server["fail"]["/orders?status=OPEN"] = ["HTTP 429: slow down"]
-    try: await api.orders("OPEN"); assert False
-    except m.RemoteError as e: assert "429" in str(e)
-    try: await api.orders("OPEN"); assert False
-    except m.RemoteError as e: assert "限流冷却" in str(e) and e.retry_after >= 1
-    api.blocked_until = 0.0
-    # orders: the body the API documents; its refusals carry its reason
-    server["answers"]["/orders"] = lambda body: {"success": True, "data": {"code": "OK", "orderId": "123", "orderHash": body["data"]["order"]["hash"]}}
-    got = await api.create_order({"data": {"order": {"hash": "0xh"}, "strategy": "LIMIT"}})
-    assert got == {"order_id": "123", "hash": "0xh", "code": "OK"} and server["calls"][-1][0] == "/orders"
-    server["answers"]["/orders"] = {"success": False, "message": "Insufficient balance"}
-    try: await api.create_order({"data": {}}); assert False
-    except m.RemoteError as e: assert "Insufficient balance" in str(e)
-    server["answers"]["/orders"] = {"success": True, "data": {"nothing": 1}}
-    try: await api.create_order({"data": {}}); assert False
-    except m.RemoteError as e: assert "订单号" in str(e)
-    server["answers"]["/orders/remove"] = lambda body: {"success": True, "removed": body["data"]["ids"][:1], "noop": body["data"]["ids"][1:]}
-    assert await api.remove_orders(["1", "2"]) == {"removed": ["1"], "noop": ["2"]}
-    server["answers"]["/orders/remove"] = {"success": True, "data": {"removed": [], "noop": ["9"]}}
-    assert await api.remove_orders(["9"]) == {"removed": [], "noop": ["9"]}
-    # one order: by id when the API serves it, else found in the status lists (remembered)
-    server["answers"]["/orders/55"] = {"success": True, "data": {"id": "55", "status": "FILLED"}}
-    assert (await api.order("55"))["status"] == "FILLED" and api.lookup == "id"
-    api.lookup = ""
-    server["fail"]["/orders/66"] = ["HTTP 404: no"]
-    server["answers"]["/orders?status=FILLED"] = {"data": []}
-    server["answers"]["/orders?status=CANCELLED"] = {"data": [{"id": "66", "status": "CANCELLED", "order": {"hash": "0xcc"}}]}
-    assert (await api.order("66"))["status"] == "CANCELLED" and api.lookup == "scan"
-    server["calls"].clear()
-    assert (await api.order("", "0xcc"))["id"] == "66" and not any(p.startswith("/orders/") for p, _, _ in server["calls"])  # by hash: no id call
-    server["answers"]["/orders?status=EXPIRED"] = server["answers"]["/orders?status=INVALIDATED"] = {"data": []}
-    assert await api.order("77") is None
-    server["answers"]["/positions"] = {"success": True, "data": [{"id": "p1"}]}
-    assert await api.positions() == [{"id": "p1"}]
-    server["answers"]["/markets/101"] = {"success": True, "data": {"id": 101, "outcomes": []}}
-    assert (await api.market("101"))["id"] == 101
-    # no wallet: no sign-in, a plain reason
-    plain_api = L.PredictApi(m.PREDICT_REST, "", None)
-    try: await plain_api.authenticate(); assert False
-    except m.RemoteError as e: assert "签名钱包" in str(e)
-    # the chain: calls encoded and decoded, transactions built, signed and awaited; Kernel-wrapped for a Predict account
-    rpc_calls = []
-    values = {"eth_call": "0x" + hex(5 * WEI)[2:].rjust(64, "0"), "eth_getBalance": hex(10 ** 17), "eth_getTransactionCount": "0x5",
-              "eth_gasPrice": "0x3b9aca00", "eth_estimateGas": "0x5208", "eth_sendRawTransaction": "0xtxhash",
-              "eth_getTransactionReceipt": {"blockNumber": "0x10", "status": "0x1"}}
-
-    class FakeChain(L.Chain):
-        async def rpc(self, method, params):
-            rpc_calls.append((method, params))
-            return values[method]
-    chain = FakeChain("https://rpc.example", w)
-    assert await chain.usdt_balance() == 5 * WEI and await chain.bnb_balance() == 10 ** 17 and await chain.allowance("CTF_EXCHANGE") == 5 * WEI
-    assert rpc_calls[0][1][0]["to"] == L.ADDRESSES[56]["USDT"] and rpc_calls[0][1][0]["data"].startswith("0x70a08231")  # balanceOf(address)
-    assert await chain.approved_for_all("CONDITIONAL_TOKENS", "CTF_EXCHANGE") is True
-    signed = []
-    w.sign_transaction = lambda tx: signed.append(tx) or b"\x01\x02"
-    assert await chain.send(L.ADDRESSES[56]["USDT"], b"\xaa\xbb") == "0xtxhash"
-    assert signed[-1] == {"chainId": 56, "nonce": 5, "gasPrice": 10 ** 9, "gas": 26250, "to": L.ADDRESSES[56]["USDT"], "value": 0, "data": "0xaabb"}
-    assert rpc_calls[-1] == ("eth_sendRawTransaction", ["0x0102"])
-    assert (await chain.wait("0xtxhash"))["status"] == "0x1"
-    values["eth_getTransactionReceipt"] = {"blockNumber": "0x10", "status": "0x0"}
-    try: await chain.wait("0xtxhash"); assert False
-    except m.RemoteError as e: assert "回滚" in str(e)
-    values["eth_getTransactionReceipt"] = {"blockNumber": "0x10", "status": "0x1"}
-    kchain = FakeChain("https://rpc.example", k)
-    k.sign_transaction = lambda tx: signed.append(tx) or b"\x03"
-    await kchain.send(L.ADDRESSES[56]["USDT"], b"\xaa\xbb", 0)
-    tx = signed[-1]
-    assert tx["to"] == PA and tx["data"].startswith("0xe9ae5c53")  # Kernel.execute(bytes32,bytes), to the account, from the key
-    assert tx["data"].endswith(L.ADDRESSES[56]["USDT"][2:].lower() + "0" * 64 + "aabb" + "0" * 20)  # target ‖ value ‖ calldata, padded
-    # approvals: five steps per track; in place = skipped, missing = sent
-    assert [ok for _, ok in await chain.check_approvals(False)] == [True, True, True, False, False]  # 5 USDT allowance is not "unlimited"
-    values["eth_call"] = "0x" + "0" * 64
-    steps = await chain.set_approvals(False)
-    assert len(steps) == 5 and all(outcome.startswith("已完成 0xtxhash") for _, outcome in steps), steps
-    values["eth_call"] = "0x" + hex(10 ** 24)[2:].rjust(64, "0")
-    assert [outcome for _, outcome in await chain.set_approvals(True)] == ["已授权"] * 5
-    # redeeming: the conditional tokens for a standard market, the adapter for a multi-outcome one
-    await chain.redeem("0x" + "ab" * 32, 1, 7 * WEI, False, False)
-    assert signed[-1]["to"] == L.ADDRESSES[56]["CONDITIONAL_TOKENS"] and signed[-1]["data"].startswith("0x01b7037c")
-    await chain.redeem("0x" + "ab" * 32, 2, 7 * WEI, True, False)
-    neg_selector = "0x" + L.Chain.encode("redeemPositions(bytes32,uint256[])", ["bytes32", "uint256[]"], [bytes(32), [0, 0]]).hex()[:8]
-    assert signed[-1]["to"] == L.ADDRESSES[56]["NEG_RISK_ADAPTER"] and signed[-1]["data"].startswith(neg_selector)
-    assert signed[-1]["data"].endswith("0" * 64 + hex(7 * WEI)[2:].rjust(64, "0"))  # amounts [0, 7 shares] for outcome 2
-    values["eth_call"] = "0x"
-    assert await chain.usdt_balance() == 0
-
-
-asyncio.run(api_checks())
-
-
-# --- the bot: every decision an order, every fill read back -------------------------------------------------------------------
-class FakeApi:
-    """Predict as the bot sees it: markets, an order book of our own orders, positions."""
-    def __init__(self):
-        self.jwt, self.jwt_exp, self.auth_error, self.lookup = "t", 0, "", ""
-        self.markets, self.open, self.closed, self.calls, self.positions_rows = {}, {}, {}, [], []
-        self.next_id, self.fail_create, self.fail_open = 100, None, None
-
-    async def ensure_auth(self): pass
-
-    async def market(self, mid): return self.markets[str(mid)]
-
-    async def create_order(self, body):
-        self.calls.append(("create", body))
-        if self.fail_create:
-            raise m.RemoteError(self.fail_create)
-        self.next_id += 1
-        oid, data = str(self.next_id), body["data"]
-        amount = data["amount"] if data["strategy"] == "MARKET" else data["order"]["takerAmount"]
-        self.open[oid] = {"id": oid, "status": "OPEN", "amount": amount, "amountFilled": "0", "strategy": data["strategy"],
-                          "order": {**data["order"]}}
-        return {"order_id": oid, "hash": data["order"]["hash"], "code": None}
-
-    async def remove_orders(self, ids):
-        self.calls.append(("remove", list(ids)))
-        removed = []
-        for i in ids:
-            row = self.open.pop(i, None)
-            if row:
-                row["status"] = "CANCELLED"
-                self.closed[i] = row
-                removed.append(i)
-        return {"removed": removed, "noop": [i for i in ids if i not in removed]}
-
-    async def orders(self, status="OPEN", **params):
-        if self.fail_open:
-            raise m.RemoteError(self.fail_open)
-        return list(self.open.values()) if status == "OPEN" else [r for r in self.closed.values() if r["status"] == status]
-
-    async def order(self, oid, hash_=""):
-        rows = [*self.open.values(), *self.closed.values()]
-        return self.open.get(oid) or self.closed.get(oid) or next((r for r in rows if hash_ and r["order"]["hash"] == hash_), None)
-
-    async def positions(self): return self.positions_rows
-
-    def fill(self, oid, shares, done=False, price=None):
-        row = self.open[oid]
-        row["amountFilled"] = str(L.to_wei(shares))
-        if price is not None:
-            row["averagePrice"] = str(price)
-        if done:
-            row["status"] = "FILLED"
-            self.closed[oid] = self.open.pop(oid)
-
-
-class FakeChain:
-    def __init__(self): self.usdt, self.bnb, self.allow, self.redeemed, self.fail = 1000 * WEI, 10 ** 17, 10 ** 30, [], ""
-    async def usdt_balance(self, owner=None): return self.usdt
-    async def bnb_balance(self, owner=None): return self.bnb
-    async def allowance(self, key, owner=None): return self.allow
-    async def redeem(self, cid, index_set, amount, neg, yb):
-        if self.fail:
-            raise m.RemoteError(self.fail)
-        self.redeemed.append((cid, index_set, amount, neg, yb))
-        return "0xredeem"
-
-
-class FM:
-    def __init__(self, now): self.now, self.config = now, None
-    def now_ms(self): return self.now
-
-
-def book(bids, asks, at=NOW, slug=HSI_SLUG, key="HSI", fee=None, mid="101"):
-    return m.PredictBook(key, slug, mid, "t", tuple((D(str(p)), D(str(q))) for p, q in bids), tuple((D(str(p)), D(str(q))) for p, q in asks), at, fee)
-
-
-SETTLE_HSI = {"key": "HSI", "target": "2026-10-05", "line": 24600.0, "close_ms": CLOSE}
-
-
-def hsi(fair, bids, asks, at, **kw):
-    return m.SimMarket(HSI_SLUG, "恒生指数", "close", "HSI", fair, book(bids, asks, at), 0.03, kw.get("hold", ""), ("涨", "跌"), SETTLE_HSI,
-                       {"basis": {"fair_up": fair, "ref": 24600.0}, "sources": [{"what": "恒指期货", "source": "etnet"}], "proxy": None})
-
-
-def market_json(mid, names=("Up", "Down"), status="REGISTERED", neg=False, fee=200):
-    return {"id": int(mid), "status": status, "isNegRisk": neg, "isYieldBearing": False, "feeRateBps": fee, "conditionId": "0x" + "ab" * 32,
-            "outcomes": [{"name": names[0], "indexSet": 1, "onChainId": f"{mid}1"}, {"name": names[1], "indexSet": 2, "onChainId": f"{mid}2"}]}
-
-
-world = {"markets": []}
-FEE = 0.02
-
-
-async def step(bot, at, *markets):
-    bot.market.now, bot.sim_ran = at, -1e9
-    if markets:
-        world["markets"] = list(markets)
-    return await bot.sim_step(at)
-
-
-def make_bot(**env):
-    cfg = m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
-                             "SIM_WAYS": "both", "SIM_MARKETS": "all", "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT_API_KEY": "k",
-                             "LIVE_MAX_ORDER_USD": "100", "LIVE_MAX_OPEN_USD": "250", "LIVE_MAX_DAILY_LOSS_USD": "50", **env})
-    bot = L.LiveBot(cfg, m.Store(":memory:"), FM(NOW), None)
-    bot.live.api, bot.live.chain = FakeApi(), FakeChain()
-    bot.live.api.markets["101"] = market_json("101")
-    bot.sim_markets = lambda now: world["markets"]
-    return bot
+# --- session window: first continuous minute until the close is final --------------------------------
+hol = frozenset({dt.date(2026, 10, 1)})
+assert m.stock_live_window("sh", bj(9, 28, 9, 29)) is None and m.stock_live_window("sh", bj(9, 28, 9, 30))
+assert m.stock_live_window("sh", bj(9, 28, 15, 14)) and m.stock_live_window("sh", bj(9, 28, 15, 15)) is None
+assert m.stock_live_window("hk", bj(9, 28, 16, 20)) and m.stock_live_window("hk", bj(9, 28, 16, 25)) is None
+assert m.stock_live_window("kr", kr(9, 28, 9, 0)) and m.stock_live_window("kr", kr(9, 28, 15, 45)) is None
+assert m.stock_live_window("sh", bj(9, 26, 10, 0)) is None and m.stock_live_window("sh", bj(10, 1, 10, 0), hol) is None
 
 
 async def run():
-    bot = make_bot()
-    fake = bot.live.api
-    assert "/live" in bot.handlers and not bot.live.ready and bot.live.ready_error
-    assert "真实交易未就绪" in bot.live_room({}, hsi(0.70, [], [], NOW), "up", 0.5, 100)
-    lines = await bot.live_prepare()
-    assert bot.live.ready and bot.live.usd() == 1000.0 and bot.live.approvals == {"CTF_EXCHANGE": True, "NEG_RISK_CTF_EXCHANGE": True}
-    assert any("普通钱包" in line and "0x8fd3…7A03" in line for line in lines) and any("USDT 1,000.00" in line for line in lines), lines
-    # a market whose details are not read yet is not traded, and is read when its suggestion nears the bar
-    assert "尚未读到" in bot.live_room({}, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW), "up", 0.58, 100)
-    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
-    await bot.live_prefetch(NOW)
-    assert "101" in bot.live.markets and bot.live.markets["101"].fee_bps == 200
-    assert bot.live_room({}, world["markets"][0], "up", 0.58, 100) == ""
+    class FakeMarket(m.Binance):
+        def __init__(self, c): super().__init__(c); self.now = bj(9, 28, 10, 1)
+        def now_ms(self): return self.now
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "PROB_VOL": "UNITREEUSDT=3.5"})
+    bot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(cfg), None)
+    sh = m.STOCK_MARKETS["sh"]
+    bot.stocks.closes["UNITREEUSDT"] = m.StockMarket.baseline(m.StockTicker("sh", "688836"), sh, "腾讯", dt.date(2026, 9, 24), D("76.50"))
+    bot.anchors["UNITREEUSDT"] = (bj(9, 24, 15, 0), D("10.60"))
+    now = bot.market.now
 
-    # --- HSI: fair 70¢, bid 55¢ (挂涨 +15¢) and ask 58¢×400 (吃涨 +11.16¢): a LIMIT order and a MARKET order go out ------------
-    await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
-    trades = bot.sim_trades()
-    maker_tid, taker_tid = f"{HSI_SLUG}|up|挂", f"{HSI_SLUG}|up|吃"
-    assert sorted(trades) == [taker_tid, maker_tid], sorted(trades)
-    maker, taker = trades[maker_tid], trades[taker_tid]
-    assert maker["status"] == "resting" and maker["shares"] == 0 and maker["live"]["state"] == "open" and maker["live"]["order_id"] == "101"
-    assert taker["status"] == "resting" and taker["shares"] == 0 and taker["live"]["state"] == "open" and taker["live"]["order_id"] == "102"
-    assert taker["fills"] == [] and taker["filled"] is None and abs(taker["expected_price"] - (0.58 + FEE * 0.42)) < 1e-12
-    creates = [body for kind, body in fake.calls if kind == "create"]
-    lim, mkt = creates[0]["data"], creates[1]["data"]
-    assert lim["strategy"] == "LIMIT" and lim["pricePerShare"] == str(55 * 10 ** 16) and "slippageBps" not in lim
-    o = lim["order"]
-    assert o["tokenId"] == "1011" and o["makerAmount"] == str(55 * WEI) and o["takerAmount"] == str(100 * WEI) and o["side"] == 0
-    assert o["maker"] == ADDR and o["feeRateBps"] == "200" and o["expiration"] == str(CLOSE // 1000 + 7200) and o["signatureType"] == 0
-    assert o["hash"] == bot.live.wallet.order_hash(o, False, False) and o["signature"].startswith("0x") and len(o["signature"]) == 132
-    assert Account.recover_message(encode_typed_data(full_message=bot.live.wallet.typed_data(o, False, False)), signature=o["signature"]) == ADDR
-    assert mkt["strategy"] == "MARKET" and mkt["slippageBps"] == 100 and mkt["isMinAmountOut"] is True and mkt["amount"] == str(100 * WEI)
-    assert mkt["pricePerShare"] == str(58 * 10 ** 16) and mkt["order"]["makerAmount"] == str(58 * WEI) and mkt["order"]["takerAmount"] == str(99 * WEI)
-    assert mkt["order"]["expiration"] == str(NOW // 1000 + 300) and mkt["order"]["tokenId"] == "1011"
-    assert maker["live"]["hash"] == o["hash"].lower() and maker["live"]["want"]["outcome"] == "Up" and maker["live"]["usd_cap"] == 55.0
-    assert maker["version"]["live"] and maker["version"]["live_account"] == "0x8fd3…7A03"
-    assert abs(bot.live_exposure(trades) - (55 + 100 * taker["price"])) < 1e-9  # resting orders count at their price
-    assert L.sim_status(taker) == "市价单等待成交（真实订单 #102 已成交 0/100 份）" and L.sim_status(maker) == "挂单中（真实订单 #101 已成交 0/100 份）"
-    assert "等待 Predict 成交" in bot.sim_wait(taker, world["markets"][0], NOW) and "挂 55.0¢" in bot.sim_wait(maker, world["markets"][0], NOW)
-    # the edge lasting buys nothing more; the open orders are read back each step
-    await step(bot, NOW + 10_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
-    assert len(bot.sim_trades()) == 2 and len([1 for kind, _ in fake.calls if kind == "create"]) == 2
+    # Before the open (and on holidays / weekends) the Binance proxy is the only live price
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 9, 0))
+    assert isinstance(o, m.CloseOdds) and o.proxy_note.startswith("币安 10.8 / 收盘时刻 10.6") and "现货" not in o.proxy_note, o
 
-    # --- the MARKET order fills in full: a position, with the fill's own record ------------------------------------------------
-    fake.fill("102", 100, done=True, price=0.585)
-    await step(bot, NOW + 20_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 20_000))
-    t = bot.sim_trades()[taker_tid]
-    assert t["status"] == "filled" and t["shares"] == 100 and t["filled"] == NOW + 20_000 and t["live"]["state"] == "done" and t["live"]["final"] == "filled"
-    assert t["fills"] == [{"at": NOW + 20_000, "shares": 100.0, "fair": 0.70, "how": "真实成交（市价单）", "order_id": "102",
-                           "book": m.book_snapshot(world["markets"][0].book)}], t["fills"]
-    assert t["avg"] == 0.585 and abs(t["price"] - (0.585 + FEE * 0.415)) < 1e-12 and t["expected_price"] < t["price"]  # the stated average replaces the estimate
-    assert L.sim_status(t) == "持仓" and bot.sim_wait(t, None, NOW) == "等 10-05 收盘（10-05 16:10）后 1 小时（10-05 17:10），按官方收盘预结算，再等 Predict 确认"
+    # The session runs: fetch the stock's own quote, Tencent first
+    calls = []
+    async def fake_get(url, timeout=15, headers=None):
+        calls.append(url)
+        if "gtimg" in url: return tencent("sh688836", "78.00", "76.50", "20260928100003")
+        raise AssertionError(url)
+    m.http_get = fake_get
+    assert await bot.stocks.refresh_live(bj(9, 28, 9, 0)) is False and not calls  # not trading yet: no request
+    await bot.stocks.refresh_live(now)
+    assert len(calls) == 1 and bot.stocks.live["UNITREEUSDT"].last == D("78.00")
+    assert await bot.stocks.refresh_live(now) is False and len(calls) == 1          # QUOTE_REFRESH_SECONDS cadence (5 s)
+    assert cfg.quote_refresh == 1 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "QUOTE_REFRESH_SECONDS": "10"}).quote_refresh == 10
+    try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "QUOTE_REFRESH_SECONDS": "0"}); assert False
+    except ValueError as e: assert "QUOTE_REFRESH_SECONDS" in str(e), e
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), now)
+    assert isinstance(o, m.CloseOdds) and o.effective == D("78.00") and o.ref == D("76.50") and o.mode == "盘中", o
+    assert o.proxy_note == "上交所现货 78（腾讯·盘中直接用现货）" and o.ref_note.endswith("·腾讯") and o.unit == "CNY", o
+    assert o.target == dt.date(2026, 9, 28) and abs(o.remaining - 209 / 240) < 1e-9, o.remaining
 
-    # --- the LIMIT order fills in part, then the paper trader withdraws it: the rest is cancelled on Predict ------------------
-    fake.fill("101", 30)
-    await step(bot, NOW + 30_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 30_000))
-    t = bot.sim_trades()[maker_tid]
-    assert t["status"] == "resting" and t["shares"] == 30 and t["fills"][0]["how"] == "真实成交（挂单）" and t["fills"][0]["shares"] == 30
-    assert L.sim_status(t) == "挂单中（真实订单 #101 已成交 30/100 份）" and "已成交 30/100" in bot.sim_wait(t, world["markets"][0], NOW + 30_000)
-    await step(bot, NOW + 40_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 40_000))  # the same fill seen again: nothing new
-    assert len(bot.sim_trades()[maker_tid]["fills"]) == 1
-    bot.config = dataclasses.replace(bot.config, sim_ways="taker")
-    await step(bot, NOW + 50_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 50_000))
-    t = bot.sim_trades()[maker_tid]
-    assert ("remove", ["101"]) in fake.calls and "101" in fake.closed and t["live"]["state"] == "done" and t["live"]["final"] == "cancelled"
-    assert t["status"] == "filled" and t["shares"] == 30 and t["unfilled"] == 70 and "其余 70 份模拟交易已改为只吃单" in t["note"], t["note"]
-    assert t["live"]["cancel_why"] == "模拟交易已改为只吃单" and any("撤单请求已发送" in e["what"] for e in t["live"]["events"])
+    # The stored close is not the previous session's (e.g. still pending): use the live quote's previous close
+    bot.stocks.closes["UNITREEUSDT"] = m.StockMarket.baseline(m.StockTicker("sh", "688836"), sh, "腾讯", dt.date(2026, 9, 23), D("75.00"))
+    bot.anchors["UNITREEUSDT"] = (bj(9, 23, 15, 0), D("10.40"))
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), now)
+    assert o.ref == D("76.50") and o.ref_note == "昨收（实时行情）", o
+    bot.stocks.closes["UNITREEUSDT"] = m.StockMarket.baseline(m.StockTicker("sh", "688836"), sh, "腾讯", dt.date(2026, 9, 24), D("76.50"))
+    bot.anchors["UNITREEUSDT"] = (bj(9, 24, 15, 0), D("10.60"))
 
-    # --- a MARKET order Predict leaves open fills nothing: cancelled after LIVE_TAKER_WAIT_SECONDS, the slot freed later --------
-    deep = lambda at, mid="103": m.SimMarket("deep", "deep", "close", "X", 0.70, book([], [("0.58", "100"), ("0.70", "1000")], at, "deep", mid=mid), 0.03, "", ("涨", "跌"),
-                                             {"key": "X", "target": "2026-10-05", "line": 1.0, "close_ms": CLOSE})
-    fake.markets["103"] = market_json("103")
-    await step(bot, NOW + 60_000, deep(NOW + 60_000))
-    t = bot.sim_trades()["deep|up|吃"]
-    assert t["live"]["order_id"] == "103" and t["live"]["placed_at"] == NOW + 60_000 and "103" in fake.open
-    await step(bot, NOW + 100_000, deep(NOW + 100_000))  # 40 s: still waiting
-    assert bot.sim_trades()["deep|up|吃"]["status"] == "resting" and "103" in fake.open
-    await step(bot, NOW + 121_000, deep(NOW + 121_000))  # 61 s: cancelled, no fill: the attempt is kept, the slot is free
-    trades = bot.sim_trades()
-    assert "deep|up|吃" not in trades and trades["deep|up|吃#1"]["status"] == "cancelled" and "103" in fake.closed
-    assert trades["deep|up|吃#1"]["live"]["final"] == "failed" and "市价单未成交" in trades["deep|up|吃#1"]["note"]
-    assert ("deep", "up") in bot.live_backoff and "再试" in bot.live_room(trades, deep(NOW + 121_000), "up", 0.58, 100)
-    await step(bot, NOW + 131_000, deep(NOW + 131_000))  # within LIVE_RETRY_SECONDS: refused, and the refusal recorded
-    assert "deep|up|吃" not in bot.sim_trades() and any(b["id"] == "deep|up|吃" and "再试" in b["why"] for b in bot.sim_blocks())
-    bot.live_backoff[("deep", "up")] = (time.monotonic() - 1, "x")
-    await step(bot, NOW + 141_000, deep(NOW + 141_000))
-    t = bot.sim_trades()["deep|up|吃"]
-    assert t["live"]["order_id"] == "104" and bot.sim_trades()["deep|up|吃#1"]["status"] == "cancelled"  # the second attempt, the first kept
-    fake.fill("104", 60, done=False)
-    await step(bot, NOW + 203_000, deep(NOW + 203_000))  # 62 s: the rest cancelled, the 60 shares are the position
-    t = bot.sim_trades()["deep|up|吃"]
-    assert t["status"] == "filled" and t["shares"] == 60 and t["unfilled"] == 40 and "真实成交 60/100 份" in t["note"], t
+    # Lunch break does not age the quote; after 10 minutes of silence in-session we fall back to Binance, labelled
+    bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "78.00", "76.50", "20260928113000"), 0)
+    assert isinstance(bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 13, 5)), m.CloseOdds)
+    assert bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 13, 5)).effective == D("78.00")
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 13, 15))
+    assert "现货行情已超 10 分钟未更新" in o.proxy_note and "暂用币安" in o.proxy_note and o.proxy_note.startswith("币安"), o.proxy_note
+    # The last print just after 15:00 stands until the close is final at 15:15
+    bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "79.00", "76.50", "20260928150002"), 0)
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 15, 14))
+    assert o.effective == D("79.00") and o.fair_up > 0.99, o
+    # Once the closing print is noted, the card moves on to the next close measured from it, without
+    # waiting for the daily bar (which only confirms it after 15:15)
+    bot.note_live_close("UNITREEUSDT", cfg.tickers["UNITREEUSDT"], bj(9, 28, 15, 14))
+    assert bot.odds_base("UNITREEUSDT", bj(9, 28, 15, 14))[:2] == (bj(9, 28, 15, 0), D("79.00"))
+    assert bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 15, 14)) == "等待币安在收盘时刻的价格"
+    bot.anchors["UNITREEUSDT"] = (bj(9, 28, 15, 0), D("10.80"))
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 15, 14))
+    assert o.target == dt.date(2026, 9, 29) and o.ref == D("79.00") and o.effective == D("79.00") and "日K待确认" in o.ref_note, o
+    o = bot.contract_odds("UNITREEUSDT", D("10.90"), bj(9, 28, 15, 40))  # live window over, bar still pending
+    assert o.target == dt.date(2026, 9, 29) and o.ref == D("79.00") and o.effective > D("79.00"), o
+    bot.anchors["UNITREEUSDT"] = (bj(9, 24, 15, 0), D("10.60"))
+    # Yesterday's quote at the open is not today's price
+    bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "76.50", "75.00", "20260924150002"), 0)
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 9, 31))
+    assert o.proxy_note.endswith("｜现货今日尚未开盘成交，暂用币安"), o.proxy_note
+    # Every source failing is reported next to the Binance fallback
+    bot.stocks.live.clear()
+    async def down(url, timeout=15, headers=None): raise m.RemoteError("HTTP 502")
+    m.http_get = down
+    await bot.stocks.refresh_live(now, force=True)
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), now)
+    assert "现货行情未取得（腾讯: HTTP 502" in o.proxy_note and "暂用币安" in o.proxy_note, o.proxy_note
+    # No Binance anchor either: say what is missing
+    bot.anchors.clear()
+    assert bot.contract_odds("UNITREEUSDT", D("10.80"), now) == "等待币安在收盘时刻的价格"
 
-    # --- a refused request: no record under the slot, the attempt journaled, the market backed off ------------------------------
-    fake.fail_create = "HTTP 400: insufficient balance"
-    fake.markets["105"] = market_json("105")
-    thin = lambda at: m.SimMarket("thin", "thin", "close", "X2", 0.70, book([], [("0.58", "200")], at, "thin", mid="105"), 0.03, "", ("涨", "跌"), {})
-    await step(bot, NOW + 210_000, thin(NOW + 210_000))
-    trades = bot.sim_trades()
-    assert "thin|up|吃" not in trades and trades["thin|up|吃#1"]["status"] == "cancelled" and "下单失败：HTTP 400" in trades["thin|up|吃#1"]["note"]
-    assert trades["thin|up|吃#1"]["live"]["state"] == "done" and ("thin", "up") in bot.live_backoff and bot.live_errors[-1].endswith("insufficient balance")
-    # a request whose outcome is unknown (the network dropped) stays "placing": adopted by its hash when Predict lists it,
-    # given up (never re-sent) when it does not within the grace period
-    fake.fail_create = "网络错误 (TimeoutError)"
-    fake.markets["106"] = market_json("106")
-    lost = lambda at: m.SimMarket("lost", "lost", "close", "X3", 0.70, book([], [("0.58", "200")], at, "lost", mid="106"), 0.03, "", ("涨", "跌"), {})
-    bot.live_backoff.clear()
-    await step(bot, NOW + 220_000, lost(NOW + 220_000))
-    t = bot.sim_trades()["lost|up|吃"]
-    assert t["live"]["state"] == "placing" and t["live"]["hash"] and t["live"]["placing_at"] == NOW + 220_000 and not t["live"]["order_id"]
-    fake.fail_create = None
-    fake.open["900"] = {"id": "900", "status": "OPEN", "amount": str(100 * WEI), "amountFilled": str(100 * WEI), "order": {"hash": t["live"]["hash"]}}
-    await step(bot, NOW + 230_000, lost(NOW + 230_000))
-    t = bot.sim_trades()["lost|up|吃"]
-    assert t["live"]["order_id"] == "900" and t["shares"] == 100 and t["status"] == "filled" and any("找回" in e["what"] for e in t["live"]["events"])
-    fake.markets["107"] = market_json("107")
-    gone = lambda at: m.SimMarket("gone", "gone", "close", "X4", 0.70, book([], [("0.58", "200")], at, "gone", mid="107"), 0.03, "", ("涨", "跌"), {})
-    fake.fail_create = "网络错误 (TimeoutError)"
-    await step(bot, NOW + 240_000, gone(NOW + 240_000))
-    fake.fail_create = None
-    await step(bot, NOW + 250_000, gone(NOW + 250_000))
-    assert bot.sim_trades()["gone|up|吃"]["live"]["state"] == "placing"  # within the grace period: still waiting
-    await step(bot, NOW + 370_000, gone(NOW + 370_000))
-    trades = bot.sim_trades()
-    assert "gone|up|吃" not in trades and "无法确认" in trades["gone|up|吃#1"]["note"] and len([1 for kind, _ in fake.calls if kind == "create"]) == 7
-    # an open order Predict stops listing without a final record: cancelled after a few looks, nothing invented
-    fake.markets["108"] = market_json("108")
-    ghost = lambda at: m.SimMarket("ghost", "ghost", "close", "X5", 0.70, book([], [("0.58", "200")], at, "ghost", mid="108"), 0.03, "", ("涨", "跌"), {})
-    await step(bot, NOW + 380_000, ghost(NOW + 380_000))
-    oid = bot.sim_trades()["ghost|up|吃"]["live"]["order_id"]
-    fake.open.pop(oid)
-    for i in range(3):
-        await step(bot, NOW + 390_000 + i * 10_000, ghost(NOW + 390_000 + i * 10_000))
-    ghost_t = bot.sim_trades()["ghost|up|吃#1"]
-    assert ghost_t["live"]["final"] == "failed" and any("UNKNOWN" in e["what"] for e in ghost_t["live"]["events"]) and "ghost|up|吃" not in bot.sim_trades()
+    # HK: a lagging Tencent quote (e.g. the 15-minute delayed feed) is not accepted; Sina's fresh print is used
+    hcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "HK0625USDT"})
+    hbot = m.Bot(hcfg, m.Store(":memory:"), FakeMarket(hcfg), None)
+    hbot.stocks.closes["HK0625USDT"] = m.StockMarket.baseline(m.StockTicker("hk", "00625", True), m.STOCK_MARKETS["hk"], "腾讯",
+                                                              dt.date(2026, 9, 25), D("35.10"))
+    hbot.anchors["HK0625USDT"] = (bj(9, 25, 16, 10), D("35.63"))
+    lagging = ('v_r_hk00625="100~希音~00625~35.20~35.10~35.00~' + "~".join(["0"] * 24) + '~2026/09/28 09:33:00~x";').encode("gbk")
+    fresh = ('var hq_str_rt_hk00625="SHEIN,希音,35.00,35.10,35.60,34.90,35.40,' + ",".join(["0"] * 10) + ',2026/09/28,09:48:50";').encode("gbk")
+    async def hk_get(url, timeout=15, headers=None):
+        return lagging if "gtimg" in url else fresh
+    m.http_get = hk_get
+    t = bj(9, 28, 9, 49)
+    await hbot.stocks.refresh_live(t, force=True)
+    o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
+    assert o.effective == D("35.40") and "新浪" in o.proxy_note and o.ref == D("35.10") and o.unit == "", o
+    assert hbot.card_currency("HK0625USDT") == "HKD" and hbot.card_currency("") == ""  # the web card still names it
+    async def all_lag(url, timeout=15, headers=None): return lagging
+    m.http_get = all_lag
+    await hbot.stocks.refresh_live(t, force=True)
+    o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
+    assert "现货行情已超 10 分钟未更新" in o.proxy_note and "报价停在 09-28 09:33" in hbot.stocks.live_errors["HK0625USDT"], hbot.stocks.live_errors
 
-    # --- the gate: every limit in words -----------------------------------------------------------------------------------------
-    mk = hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)
-    trades = bot.sim_trades()
-    assert "单笔 $120.00 超过 LIVE_MAX_ORDER_USD $100" in bot.live_room(trades, mk, "up", 0.6, 200)
-    held = {"a": {"live": {}, "status": "filled", "shares": 100, "order": 100, "price": 0.9},
-            "b": {"live": {}, "status": "resting", "shares": 20, "order": 100, "price": 0.5},
-            "c": {"live": {}, "status": "filled", "shares": 20, "order": 100, "price": 1.0},
-            "paper": {"status": "filled", "shares": 100, "order": 100, "price": 0.9}, "d": {"live": {}, "status": "settled", "shares": 100, "price": 0.9, "payout": 1}}
-    assert bot.live_exposure(held) == 160.0  # filled shares and the unfilled rest of a resting order, live records only
-    assert "持仓+挂单 $160.00 加本单 $95.00 超过 LIVE_MAX_OPEN_USD $250" in bot.live_room(held, mk, "up", 0.95, 100)
-    assert bot.live_room(held, mk, "up", 0.9, 100) == ""
-    bot.live.chain.usdt = 10 * WEI
-    await bot.live.refresh_balance()
-    assert "USDT 余额 $10.00 不足本单 $58.00" in bot.live_room({}, mk, "up", 0.58, 100)
-    bot.live.chain.usdt = 1000 * WEI
-    await bot.live.refresh_balance()
-    bot.live.approvals["CTF_EXCHANGE"] = False
-    assert "未授权交易所使用 USDT" in bot.live_room({}, mk, "up", 0.58, 100)
-    bot.live.approvals["CTF_EXCHANGE"] = True
-    bot.live.markets["101"] = L.parse_market(market_json("101", status="RESOLVED"), 200)
-    assert "RESOLVED" in bot.live_room({}, mk, "up", 0.58, 100)
-    bot.live.markets["101"] = L.parse_market(market_json("101", names=("A", "B")), 200)
-    assert bot.live_room({}, mk, "down", 0.42, 100) == ""  # a daily market: assumed from the order, and said so in the record
-    bot.live.markets["101"] = L.parse_market(market_json("101", names=("Maybe", "Later")), 200)
-    assert "无法确定要买的结果代币" in bot.live_room({}, dataclasses.replace(mk, kind="ladder"), "up", 0.58, 100)
-    bot.live.markets["101"] = L.parse_market(market_json("101"), 200)
-    bot.store.put("live:paused", {"at": NOW, "why": "试一下"})
-    assert "已暂停（试一下" in bot.live_room({}, mk, "up", 0.58, 100)
-    bot.store.delete_keys(["live:paused"])
-    bot.live.ready_error = "HTTP 401"
-    assert "未就绪：HTTP 401" in bot.live_room({}, mk, "up", 0.58, 100)
-    bot.live.ready_error = ""
-    # 跌: the other outcome's token at the 跌 price, never a sale of 涨
-    fake.markets["109"] = market_json("109", names=("Yes", "No"), neg=True)
-    down = lambda at: m.SimMarket("down", "down", "flip", "F", 0.20, book([("0.35", "30"), ("0.30", "500")], [("0.38", "100")], at, "down", mid="109"),
-                                  0.02, "", ("Yes", "No"), {})
-    await step(bot, NOW + 500_000, down(NOW + 500_000))
-    t = bot.sim_trades()["down|down|吃"]
-    body = [b for kind, b in fake.calls if kind == "create"][-1]["data"]
-    assert t["label"] == "吃No" and body["order"]["tokenId"] == "1092" and body["order"]["side"] == 0 and t["live"]["want"]["neg_risk"]
-    assert body["pricePerShare"] == str(L.market_buy_amounts([(0.65, 30.0), (0.70, 500.0)], 100 * WEI, 100)["price_per_share"])
-    assert body["order"]["hash"] == bot.live.wallet.order_hash(body["order"], True, False)  # signed for the multi-outcome exchange
+    # Several A-share / HK stocks: one Tencent request for all of them per round (1-second polling); Sina is asked only
+    # for the codes Tencent left stale or unknown, and only for those
+    m.SOURCE_HEALTH.hosts.clear()
+    assert m.split_quote_records("腾讯", b'v_sh688836="1~a";\nv_r_hk00625="2~b";\nv_pv_none_match="1";') == {"sh688836": "1~a", "r_hk00625": "2~b", "pv_none_match": "1"}
+    assert m.split_quote_records("新浪", 'var hq_str_sh688836="x,1";\nvar hq_str_rt_hk00625="";'.encode("gbk")) == {"sh688836": "x,1", "rt_hk00625": ""}
+    assert m.StockMarket.live_batch_sources([m.StockTicker("sh", "688836"), m.StockTicker("hk", "00625")])[0][1].endswith("q=sh688836,r_hk00625")
+    assert m.StockMarket.live_batch_sources([m.StockTicker("sh", "688836"), m.StockTicker("hk", "00625")])[1][1].endswith("list=sh688836,rt_hk00625")
+    bcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT,CXMTUSDT,HK0625USDT"})
+    bbot = m.Bot(bcfg, m.Store(":memory:"), FakeMarket(bcfg), None)
+    hk_rec = lambda when: ('v_r_hk00625="100~希音~00625~35.20~35.10~35.00~' + "~".join(["0"] * 24) + f'~{when}~x";').encode("gbk")
+    three = tencent("sh688836", "78.00", "76.50", "20260928100003") + tencent("sh688825", "54.00", "55.00", "20260928100002") + hk_rec("2026/09/28 10:00:01")
+    calls = []
+    async def batch_get(url, timeout=15, headers=None):
+        calls.append(url)
+        if "gtimg" in url: return three
+        raise AssertionError(url)
+    m.http_get = batch_get
+    t = bj(9, 28, 10, 0, 5)
+    await bbot.stocks.refresh_live(t, force=True)
+    codes = lambda url: sorted(url.split("=")[-1].split(","))  # the request lists the tickers in EXCHANGE_TICKERS order
+    assert len(calls) == 1 and codes(calls[0]) == ["r_hk00625", "sh688825", "sh688836"], calls
+    assert [bbot.stocks.live[s].last for s in ("UNITREEUSDT", "CXMTUSDT", "HK0625USDT")] == [D("78.00"), D("54.00"), D("35.20")] and not bbot.stocks.live_errors
+    stale_one = tencent("sh688836", "78.00", "76.50", "20260928100003") + tencent("sh688825", "54.00", "55.00", "20260925150001") + hk_rec("2026/09/28 10:00:01")
+    sina_one = ('var hq_str_sh688825="长鑫科技,55.00,55.00,54.50,' + ",".join(["0"] * 26) + ',2026-09-28,10:00:04,00";').encode("gbk")
+    calls.clear()
+    async def mixed_get(url, timeout=15, headers=None):
+        calls.append(url)
+        if "gtimg" in url: return stale_one
+        if "sinajs" in url: return sina_one
+        raise AssertionError(url)
+    m.http_get = mixed_get
+    await bbot.stocks.refresh_live(t, force=True)
+    assert len(calls) == 2 and calls[1].endswith("list=sh688825"), calls
+    assert bbot.stocks.live["CXMTUSDT"].last == D("54.50") and bbot.stocks.live["CXMTUSDT"].source == "新浪" and not bbot.stocks.live_errors, bbot.stocks.live_errors
+    calls.clear()  # a code neither feed knows is reported as such; the others are unaffected
+    async def missing_get(url, timeout=15, headers=None):
+        calls.append(url)
+        if "gtimg" in url: return tencent("sh688836", "78.00", "76.50", "20260928100003") + b'v_pv_none_match="1";'
+        if "sinajs" in url: return b'var hq_str_sh688825="";\nvar hq_str_rt_hk00625="";'
+        raise AssertionError(url)
+    m.http_get = missing_get
+    await bbot.stocks.refresh_live(t, force=True)
+    assert codes(calls[1]) == ["rt_hk00625", "sh688825"] and bbot.stocks.live["UNITREEUSDT"].last == D("78.00"), calls
+    assert "腾讯: 腾讯行情为空" in bbot.stocks.live_errors["CXMTUSDT"] and "新浪: 新浪行情为空" in bbot.stocks.live_errors["HK0625USDT"], bbot.stocks.live_errors
 
-    # --- settlement: the paper trader's, on the shares really filled; a loss trips the daily limit ------------------------------
-    bot.note_outcome("HSI", "2026-10-05", 24500.0, "tencent 日K")  # below 24,600: 涨 loses
-    world["markets"] = []
-    await step(bot, CLOSE + 61 * 60_000)
-    trades = bot.sim_trades()
-    t = trades[taker_tid]
-    assert t["status"] == "settled" and t["payout"] == 0.0 and t["confirm"] == "local" and abs(t["payout"] - t["price"]) * 100 > 50
-    assert trades[maker_tid]["status"] == "settled" and trades[maker_tid]["shares"] == 30 and trades[maker_tid]["payout"] == 0.0
-    assert bot.live_daily_pnl(trades, CLOSE + 61 * 60_000) < -50 and bot.live_killed().startswith("今日已结算亏损")
-    assert "今日停止开新仓" in bot.live_room(trades, mk, "up", 0.58, 100) and bot.store.get("live:killed")["day"] == "2026-10-05"
-    down_t = trades["down|down|吃#1"]  # its MARKET order had waited too long: cancelled, nothing filled, the attempt kept
-    assert down_t["live"]["final"] == "failed" and ("remove", [down_t["live"]["order_id"]]) in fake.calls and "down|down|吃" not in trades
-    assert bot.live_killed() and not m.beijing_day((CLOSE + 25 * 3_600_000) / 1000) == "2026-10-05"
-    bot.market.now = CLOSE + 25 * 3_600_000
-    assert bot.live_killed() == ""  # the next day trades again
-    bot.market.now = CLOSE + 61 * 60_000
-    # the administrator's commands
-    req = lambda *args: m.Request("/live", list(args), 1, 0, 1)
-    assert "▶️" in await bot.cmd_live(req("resume")) and bot.live_killed() == "" and bot.store.get("live:killed")["resumed"]
-    bot.live_check_kill(bot.sim_trades(), CLOSE + 61 * 60_000)
-    assert bot.live_killed() == ""  # resumed by hand: the same day's losses do not trip it again
-    assert "⏸" in await bot.cmd_live(req("pause", "休息", "一下")) and bot.live_paused() == "休息 一下"
-    reply = await bot.cmd_live(req())
-    assert isinstance(reply, m.Reply) and "真实交易" in reply.text and "已暂停（休息 一下）" in reply.text and "已结算 2 笔" in reply.text, reply.text
-    assert "最近的真实订单" in reply.text and "#102" in reply.text and "持仓+挂单" in reply.text and "日亏损 ≤$50" in reply.text
-    await bot.cmd_live(req("resume"))
-    assert "用法" in await bot.cmd_live(req("cancel")) and "没有订单号为 77" in await bot.cmd_live(req("cancel", "77"))
-    fake.markets["110"] = market_json("110")
-    rest = lambda at: m.SimMarket("rest", "rest", "close", "R", 0.70, book([("0.55", "100")], [("0.60", "100")], at, "rest", mid="110"), 0.03, "", ("涨", "跌"), {})
-    bot.config = dataclasses.replace(bot.config, sim_ways="both")
-    await step(bot, CLOSE + 62 * 60_000, rest(CLOSE + 62 * 60_000))
-    oid = bot.sim_trades()["rest|up|挂"]["live"]["order_id"]
-    assert oid in fake.open and "已撤单 1 笔" in await bot.cmd_live(req("cancel", "all"))
-    t = bot.sim_trades()["rest|up|挂"]
-    assert oid in fake.closed and t["status"] == "cancelled" and "管理员撤单" in t["note"] and t["live"]["final"] == "cancelled"
-    assert "没有真实挂单可撤" in await bot.cmd_live(req("cancel", "all"))
-    fake.positions_rows = [{"id": "p1", "market": {"id": 101, "title": "恒生指数 10-05"}, "outcome": {"name": "Down", "indexSet": 2, "onChainId": "1012"},
-                            "amount": str(100 * WEI), "valueUsd": "100"}]
-    assert "恒生指数 10-05｜Down 100 份｜≈$100.00" in await bot.cmd_live(req("positions"))
-    assert "开放订单" in await bot.cmd_live(req("orders")) and "自检" in await bot.cmd_live(req("check"))
-    assert "真实下单：LIVE=on" in bot.sim_text() and "/live" in bot.sim_text() and "💰" in bot.sim_text()
-    assert "LIVE=on" in bot.cmd_help(None) and "不会自动下单" not in bot.cmd_help(None)
-    assert "💰 真实交易" in bot.status("1:0") and "不会自动撤单" not in bot.status("1:0")
-    assert bot.journal_payload()["live"] == {"enabled": True, "account": "0x8fd3…7A03", "ready": True, "paused": "", "killed": ""}
-    assert bot.journal_csv().count("\n") >= 8 and json.dumps(bot.journal_payload(), default=str) and json.dumps(bot.sim_report())
-
-    # --- redeeming: the winning outcome of a resolved market, once ----------------------------------------------------------------
-    fake.markets["101"] = {**market_json("101", status="RESOLVED"), "outcomes": [{"name": "Up", "indexSet": 1, "onChainId": "1011", "status": "LOST"},
-                                                                                {"name": "Down", "indexSet": 2, "onChainId": "1012", "status": "WON"}]}
-    fake.positions_rows.append({"id": "p2", "market": {"id": 101, "title": "恒生指数 10-05"}, "outcome": {"name": "Up", "indexSet": 1, "onChainId": "1011"},
-                                "amount": str(40 * WEI)})
-    fake.positions_rows.append({"id": "p3", "market": {"id": 110, "title": "rest"}, "outcome": {"name": "Up", "indexSet": 1}, "amount": str(5 * WEI)})
-    lines = await bot.live_redeem(CLOSE + 70 * 60_000)
-    assert len(lines) == 1 and "已领取 恒生指数 10-05 Down 100 份：0xredeem" in lines[0], lines
-    assert bot.live.chain.redeemed == [("0x" + "ab" * 32, 2, 100 * WEI, False, False)] and bot.store.get("live:redeemed:101:2")["tx"] == "0xredeem"
-    assert await bot.live_redeem(CLOSE + 71 * 60_000) == [] and len(bot.live.chain.redeemed) == 1  # not twice; the loser and the open market untouched
-    assert "没有可领取" in await bot.cmd_live(req("redeem"))
-    bot.live.chain.fail = "交易失败（已回滚）"
-    fake.positions_rows.append({"id": "p4", "market": {"id": 101, "title": "恒生指数 10-05"}, "outcome": {"name": "Down", "indexSet": 2, "onChainId": "1012"},
-                                "amount": str(1 * WEI)})
-    bot.store.delete_keys(["live:redeemed:101:2"])
-    assert await bot.live_redeem(CLOSE + 72 * 60_000) == [] and "领取" in bot.live_errors[-1] and bot.store.get("live:redeemed:101:2") is None
-    # the sync step never stops the paper trader: an API failure is a line in /live
-    fake.fail_open = "HTTP 500: down"
-    fake.markets["111"] = market_json("111")
-    await step(bot, CLOSE + 73 * 60_000, m.SimMarket("late", "late", "close", "Z", 0.70, book([("0.55", "100")], [("0.60", "100")], CLOSE + 73 * 60_000, "late", mid="111"),
-                                                   0.03, "", ("涨", "跌"), {}))
-    assert bot.sim_trades()["late|up|挂"]["live"]["state"] == "open" and "同步真实订单失败" in bot.live_errors[-1]
-    fake.fail_open = None
-
-    # --- LIVE_TAKER=limit: a LIMIT order capped at the worst level the paper fill walked --------------------------------------------
-    lbot = make_bot(LIVE_TAKER="limit", SIM_WAYS="taker")
-    await lbot.live_prepare()
-    lbot.live.api.markets["103"] = market_json("103")
-    world["markets"] = [deep(NOW)]
-    await lbot.live_prefetch(NOW)
-    await step(lbot, NOW, deep(NOW))
-    body = lbot.live.api.calls[-1][1]["data"]
-    assert body["strategy"] == "LIMIT" and body["pricePerShare"] == str(58 * 10 ** 16) and body["order"]["makerAmount"] == str(58 * WEI)
-    assert body["order"]["expiration"] == str(NOW // 1000 + 300) and "slippageBps" not in body
-    # the book's second level walked: the cap is that level's price
-    world["markets"] = [m.SimMarket("two", "two", "close", "X", 0.80, book([], [("0.58", "40"), ("0.62", "100")], NOW + 10_000, "two", mid="103"), 0.03, "", ("涨", "跌"), {})]
-    await step(lbot, NOW + 10_000)
-    body = lbot.live.api.calls[-1][1]["data"]
-    assert body["pricePerShare"] == str(62 * 10 ** 16) and body["order"]["takerAmount"] == str(100 * WEI)
-
-    # a Predict account signs and trades for the smart wallet
-    kbot = make_bot(PREDICT_ACCOUNT=PA, SIM_WAYS="maker")
-    await kbot.live_prepare()
-    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
-    await kbot.live_prefetch(NOW)
-    await step(kbot, NOW)
-    body = kbot.live.api.calls[-1][1]["data"]
-    assert body["order"]["maker"] == PA and body["order"]["signer"] == PA and body["order"]["signature"].startswith("0x01845adb2c".lower()[:4])
-    assert body["order"]["signature"].lower().startswith("0x01" + L.ADDRESSES[56]["ECDSA_VALIDATOR"][2:].lower()) and len(body["order"]["signature"]) == 2 + 2 + 40 + 130
-    assert any("Predict 账户" in line and "下单账户 0x1111…1111" in line and "签名钱包 0x8fd3…7A03" in line for line in kbot.live.summary_lines())
-
-    # paper mode: the base bot answers /live with a plain refusal, and trades on paper as before
-    pbot = m.Bot(m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"}), m.Store(":memory:"), FM(NOW), None)
-    assert "LIVE=off" in pbot.cmd_live(None) and not any(name == "真实交易" for name, _ in pbot.reference_jobs())
-    assert L.sim_status({"status": "filled", "payout": 1, "price": 0.5, "shares": 10}) == "持仓"  # the base words, untouched for paper records
+    # KOSPI trading: today's 15:30 anchor is in the future, so HL is not asked for it (no bogus error)
+    asked = []
+    async def hl_json(url, payload=None, timeout=15): asked.append(payload); return []
+    m.http_json = hl_json
+    k = m.IndexQuote("KOSPI", D("6933.77"), D("7080.92"), None, None, None, kr(9, 28, 10, 53), "Naver")
+    kbot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(cfg), None)
+    class H: coin, fetched_ms, mark = "xyz:KR200", kr(9, 28, 10, 53), D("1099.2")
+    await kbot.kospi_anchor(k, H)
+    assert not asked and kbot.kospi_anchor_error == "" and "KOSPI" not in kbot.anchors
     print("LIVE_OK")
 
 

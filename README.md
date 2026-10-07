@@ -741,7 +741,7 @@ heartbeat: valid_quotes=4/4 active_subscriptions=1 mode=binance_daily
 
 ## 本地测试与行情诊断
 
-Python 3.12 环境下运行离线测试，无须 Token、私钥，无须联网（`tests/test_live.py` 需要 `pip install -r requirements.txt` 装好 `eth-account`）：
+Python 3.12 环境下运行离线测试，无须 Token、私钥，无须联网（`tests/test_trading.py` 需要 `pip install -r requirements.txt` 装好 `eth-account`）：
 
 ```bash
 python tests/run_all.py            # 全部 49 组
