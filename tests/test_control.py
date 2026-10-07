@@ -89,6 +89,7 @@ async def run():
     web = m.WebServer(bot, 0, TOKEN); web.CACHE_SECONDS = {}; port = await web.start()
     st, head, body = await request(port, f"GET /p/{TOKEN}/control HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     assert st == 200 and "<title>交易控制台</title>" in body.decode() and "text/html" in head and "Content-Security-Policy" in head
+    assert 'data-act="test"' in body.decode() and 'id="testlines"' in body.decode()
     data = await get_json(port, "control.json")
     assert data["enabled"] and data["mode"] == "paper" and data["live"] is None and data["version"] == m.VERSION
     s = {x["key"]: x for x in data["settings"]}
@@ -201,6 +202,20 @@ async def run():
     st, j = await post(port3, {"key": KEY, "action": "check"}); assert st == 200 and "自检" in j["message"]
     st, j = await post(port3, {"key": KEY, "action": "redeem"}); assert st == 200 and "没有可领取" in j["message"]
     st, j = await post(port3, {"key": KEY, "action": "bogus"}); assert st == 400 and j["message"] == "未知操作"
+    st, j = await post(port3, {"key": KEY, "action": "test"}); assert st == 200 and "没有可用的市场" in j["message"]  # no fresh two-sided book here
+    assert (await get_json(port3, "control.json"))["live"]["last_test"] == ""
+    lbot.sim_markets = lambda now: [m.SimMarket("hsi", "恒生指数", "close", "HSI", 0.7, m.PredictBook("HSI", "hsi", "9", "t", ((D("0.55"), D("300")),), ((D("0.58"), D("400")),), now),
+                                                0.03, "", ("涨", "跌"), {})]
+    fake.markets["9"] = {"id": 9, "status": "REGISTERED", "isNegRisk": False, "isYieldBearing": False, "feeRateBps": 200, "conditionId": "0x" + "ab" * 32,
+                         "outcomes": [{"name": "Up", "indexSet": 1, "onChainId": "91"}, {"name": "Down", "indexSet": 2, "onChainId": "92"}]}
+
+    async def create_order(body):
+        fake.open["500"] = {"id": "500", "status": "OPEN", "amount": body["data"]["order"]["takerAmount"], "amountFilled": "0", "order": {**body["data"]["order"]}}
+        return {"order_id": "500", "hash": body["data"]["order"]["hash"], "code": None}
+    fake.create_order = create_order
+    st, j = await post(port3, {"key": KEY, "action": "test", "args": ["恒生", "2"]})
+    assert st == 200 and "1/4 下单成功：订单 #500" in j["message"] and "3/4 撤单：已撤" in j["message"] and "2.0¢×2 份" in j["message"], j
+    assert (await get_json(port3, "control.json"))["live"]["last_test"] == j["message"]
     # the Telegram command still works through the same code
     reply = await lbot.cmd_live(m.Request("/live", [], 1, 0, 1))
     assert isinstance(reply, m.Reply) and "真实交易" in reply.text

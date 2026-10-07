@@ -32,6 +32,8 @@ for bad in ({"LIVE": "on"}, {"LIVE": "on", "PREDICT_PRIVATE_KEY": "abc"}, {"PRED
     try: m.Config.from_env({**base, **bad}); assert False, bad
     except ValueError: pass
 assert not m.Config.from_env({**base, "PREDICT_PRIVATE_KEY": KEY}).live  # a key alone does not switch live trading on
+assert not m.Config.from_env(base).sim_taker_session and m.Config.from_env({**base, "SIM_TAKER_SESSION": "on"}).sim_taker_session
+assert "SIM_TAKER_SESSION" in m.CONTROL_KEY_SET
 
 # --- amounts: the official SDK's arithmetic (vectors computed with predict-sdk 0.0.22) --------------------------------------
 assert L.to_wei(0.46) == 460000000000000000 and L.to_wei("0.421031") == 421031000000000000 and L.to_wei(D("100")) == 100 * WEI
@@ -634,6 +636,70 @@ async def run():
     assert body["order"]["maker"] == PA and body["order"]["signer"] == PA and body["order"]["signature"].startswith("0x01845adb2c".lower()[:4])
     assert body["order"]["signature"].lower().startswith("0x01" + L.ADDRESSES[56]["ECDSA_VALIDATOR"][2:].lower()) and len(body["order"]["signature"]) == 2 + 2 + 40 + 130
     assert any("Predict 账户" in line and "下单账户 0x1111…1111" in line and "签名钱包 0x8fd3…7A03" in line for line in kbot.live.summary_lines())
+
+    # --- SIM_TAKER_SESSION: a daily card after hours (priced from a proxy) is not taken, only quoted; crypto cards unaffected ------
+    sbot = make_bot(SIM_TAKER_SESSION="on", SIM_WAYS="both")
+    await sbot.live_prepare()
+    assert sbot.control_value("SIM_TAKER_SESSION") == "on" and sbot.sim_version()["sim_taker_session"] is True and "sim_taker_session" not in bot.sim_version()
+    after_hours = dataclasses.replace(hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW), in_session=False)
+    world["markets"] = [after_hours]
+    await sbot.live_prefetch(NOW)
+    await step(sbot, NOW, after_hours)
+    assert sorted(sbot.sim_trades()) == [f"{HSI_SLUG}|up|挂"], sorted(sbot.sim_trades())  # the maker rests, the taker waits for the session
+    sbot.live.api.markets["103"] = market_json("103")
+    crypto = m.SimMarket("deep2", "deep2", "updown", "X", 0.70, book([], [("0.58", "100"), ("0.70", "1000")], NOW + 10_000, "deep2", mid="103"), 0.03, "",
+                         ("涨", "跌"), {"key": "X", "end": CLOSE})  # in_session None: not a session market
+    world["markets"] = [dataclasses.replace(after_hours, in_session=True), crypto]
+    await sbot.live_prefetch(NOW + 10_000)
+    await step(sbot, NOW + 10_000)
+    assert sorted(sbot.sim_trades()) == ["deep2|up|吃", f"{HSI_SLUG}|up|吃", f"{HSI_SLUG}|up|挂"], sorted(sbot.sim_trades())
+    assert "只在标的开盘时段吃单" in sbot.sim_text() and "只在标的开盘时段吃单" not in bot.sim_text()
+    # the daily cards carry whether their underlying trades now (the odds come from the spot)
+    cbot = m.Bot(m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"}), m.Store(":memory:"), FM(BJ(9, 28, 10, 5)), None)
+    sat = cbot.market.now
+    cbot.cn.quote = m.IndexQuote("上证指数", D("3860"), D("3850"), None, None, None, sat - 3000, "腾讯", fetched_ms=sat - 1000)
+    cbot.cn.close = m.DailyClose(dt.date(2026, 9, 25), D("3850"), D("3840"), "腾讯日K", sat - 600_000)
+    sse_slug = "sse-composite-index-up-or-down-on-september-28-2026"
+    cbot.predict.slugs["SSE"] = sse_slug
+    cbot.predict.books["SSE"] = m.PredictBook("SSE", sse_slug, "901", "t", ((D("0.40"), D("100")),), ((D("0.45"), D("100")),), sat)
+    smk = next(x for x in cbot.sim_markets(sat) if x.kind == "close" and x.key == "SSE")
+    assert smk.in_session is True and smk.evidence["basis"]["direct"]
+
+    # --- /live test: a tiny resting order far under the market, listed, withdrawn, its final state read ---------------------
+    tbot = make_bot(SIM_WAYS="both")
+    tfake = tbot.live.api
+    await tbot.live_prepare()
+    world["markets"] = []
+    assert "没有可用的市场" in await tbot.live_action("test", [], NOW)
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    text = await tbot.live_action("test", [], NOW)
+    body = [b for k, b in tfake.calls if k == "create"][-1]["data"]
+    assert body["strategy"] == "LIMIT" and body["order"]["tokenId"] == "1011" and body["pricePerShare"] == str(2 * 10 ** 16)  # 2¢: under the 55¢ bid
+    assert body["order"]["takerAmount"] == str(5 * WEI) and body["order"]["makerAmount"] == str(10 * 10 ** 16) and body["order"]["expiration"] == str(NOW // 1000 + 600)
+    assert text.startswith("🧪 挂单测试") and "恒生指数" in text and "2.0¢×5 份" in text and "最多花 $0.10" in text, text
+    assert "1/4 下单成功：订单 #" in text and "2/4 开放订单列表：已列出" in text and "3/4 撤单：已撤" in text and "4/4 最终状态：CANCELLED，成交 0/5 份" in text, text
+    assert ("remove", [tbot.store.get("live:test")["order_id"]]) in tfake.calls and tbot.store.get("live:test")["text"] == text
+    assert tbot.live_status(NOW)["last_test"] == text and "最近挂单测试：" in tbot.live_text(NOW) and "deep2|up|吃" not in tbot.sim_trades()
+    assert len([1 for kind, _ in tfake.calls if kind == "create"]) == 1 and not tbot.sim_trades()  # a test is never a paper record
+    # arguments: the market by name, the shares, the price in cents (a price at the bid may trade, and says so)
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW),
+                        m.SimMarket("other", "BTC 先触", "updown", "X", 0.7, book([("0.30", "10")], [("0.35", "10")], NOW, "other", mid="103"), 0.03, "", ("涨", "跌"), {})]
+    tfake.markets["103"] = market_json("103")
+    text = await tbot.live_action("test", ["btc", "3", "30"], NOW)
+    body = [b for k, b in tfake.calls if k == "create"][-1]["data"]
+    assert "BTC 先触" in text and body["order"]["takerAmount"] == str(3 * WEI) and body["pricePerShare"] == str(30 * 10 ** 16) and "可能成交" in text
+    assert "没有可用的市场" in await tbot.live_action("test", ["nothing-like-this"], NOW) and "0.01～1000" in await tbot.live_action("test", ["5000"], NOW)
+    # a refusal is reported with the request body (without the signature) so the API's complaint can be read against it
+    tfake.fail_create = "HTTP 400: order value below minimum"
+    text = await tbot.live_action("test", [], NOW)
+    assert "1/4 下单失败：HTTP 400: order value below minimum" in text and "请求体（不含签名）" in text and "\"signature\":" not in text and "signatureType" in text and "2/4" not in text
+    tfake.fail_create = None
+    # a market whose best bid leaves no room under it
+    world["markets"] = [m.SimMarket("low", "low", "close", "L", 0.1, book([("0.005", "10")], [("0.02", "10")], NOW, "low", mid="103"), 0.03, "", ("涨", "跌"), {})]
+    assert "放不下更低的测试挂单" in await tbot.live_action("test", [], NOW)
+    tbot.live.ready_error = "HTTP 401"
+    assert "未就绪" in await tbot.live_action("test", [], NOW)
+    tbot.live.ready_error = ""
 
     # paper mode: the base bot answers /live with a plain refusal, and trades on paper as before
     pbot = m.Bot(m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"}), m.Store(":memory:"), FM(NOW), None)

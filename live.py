@@ -1362,6 +1362,8 @@ class LiveBot(core.Bot):
             return "▶️ 真实交易已恢复：满足条件的建议会重新下单。"
         if action == "cancel":
             return await self.live_cancel_command(words, now_ms)
+        if action == "test":
+            return await self.live_test(args, now_ms)
         if action == "redeem":
             if not self.live.ready:
                 return f"未就绪：{self.live.ready_error}"
@@ -1419,7 +1421,94 @@ class LiveBot(core.Bot):
                 "placed_today": sum(int(t["opened"]) >= since for _, t in live),
                 "failed_today": sum(int(t["opened"]) >= since and t["live"].get("final") == "failed" for _, t in live),
                 "orders": rows, "positions": [self.position_line(r) for r in positions[:30]],
-                "positions_at": core.stamp(at * 1000) if at else "", "errors": self.live_errors[-5:]}
+                "positions_at": core.stamp(at * 1000) if at else "", "errors": self.live_errors[-5:],
+                "last_test": str((self.store.get("live:test") or {}).get("text") or "")}
+
+    # --- the order test: a tiny resting order, listed, cancelled ------------------------------------------------------------
+    LIVE_TEST_SHARES = 5.0
+    LIVE_TEST_PRICE = 0.02  # never above this, and always under the best bid: it rests, it does not trade
+
+    async def live_test(self, args: list[str], now_ms: int) -> str:
+        """The real order path checked end to end at the cost of a few cents at most: a LIMIT buy of a few shares far
+        under the market (it rests; it is withdrawn at once; it expires in ten minutes by itself), then the open-order
+        list, the cancel and the final state, each step reported with what Predict answered. Arguments: a market name
+        to pick it, a share count, a price in cents (a price at or above the best bid may trade)."""
+        if not self.live.ready:
+            return f"未就绪：{self.live.ready_error}"
+        words = [a.strip() for a in args if a and a.strip()]
+        numbers = [w for w in words if re.fullmatch(r"\d+(\.\d+)?", w)]
+        want = next((w.lower() for w in words if w not in numbers), "")
+        shares = float(numbers[0]) if numbers else self.LIVE_TEST_SHARES
+        cents_given = float(numbers[1]) if len(numbers) > 1 else None
+        if shares < 0.01 or shares > 1000:
+            return "测试份数应在 0.01～1000 之间"
+        markets = [mk for mk in self.sim_markets(now_ms) if mk.book.bid and mk.book.ask and not mk.book.stale(now_ms) and not core.book_crossed(mk.book)]
+        if want:
+            markets = [mk for mk in markets if want in mk.item.lower() or want in mk.key.lower() or want in mk.market.lower()]
+        markets.sort(key=lambda mk: (mk.kind != "close", mk.item))
+        if not markets:
+            return "没有可用的市场：需要一个双边有报价、盘口新鲜的市场" + (f"，且名字含“{want}”" if want else "") + "。"
+        mk = markets[0]
+        try:
+            info = await self.live.market(mk.book.market_id)
+        except Exception as error:
+            return f"读取市场 {mk.item} 的详情失败：{core.clean_error(error) or type(error).__name__}"
+        spec = self.touches[mk.key].spec if mk.kind == "touch" and mk.key in self.touches else None
+        outcome, note = outcome_for_side(mk.kind, "up", info.outcomes, spec)
+        if outcome is None:
+            return f"{mk.item}：无法确定结果代币（{note}）"
+        best_bid = float(mk.book.bid[0])
+        price = round(cents_given / 100, 3) if cents_given is not None else min(self.LIVE_TEST_PRICE, round(best_bid - 0.01, 3))
+        if price < 0.001:
+            return f"{mk.item} 的最高买价只有 {core.cents(best_bid)}，放不下更低的测试挂单；换个市场：/live test <市场名>"
+        caution = "（价格不低于盘口最高买价，可能成交）" if price >= best_bid - 1e-9 else ""
+        try:
+            amounts = limit_amounts(True, to_wei(price), to_wei(shares))
+            order = build_order(self.live.wallet, outcome["token"], amounts["maker"], amounts["taker"], info.fee_bps, int(now_ms // 1000) + 600)
+            digest, signature = self.live.wallet.sign_order(order, info.neg_risk, info.yield_bearing)
+        except Exception as error:
+            return f"构造测试订单失败：{core.clean_error(error) or type(error).__name__}"
+        body = {"data": {"order": {**order, "signature": signature, "hash": digest}, "pricePerShare": str(amounts["price_per_share"]), "strategy": "LIMIT"}}
+        lines = [f"🧪 挂单测试 {core.stamp(now_ms)}：{mk.item}（市场 {info.market_id}）买 {outcome['name']} {core.cents(price)}×{shares:g} 份，"
+                 f"最多花 ${from_wei(amounts['maker']):.2f}，10 分钟后自动过期{caution}"]
+        record = {"at": now_ms, "market": mk.item, "market_id": info.market_id, "price": price, "shares": shares, "hash": digest, "order_id": ""}
+        try:
+            result = await self.live.api.create_order(body)
+        except Exception as error:
+            lines.append(f"1/4 下单失败：{core.clean_error(error) or type(error).__name__}")
+            shown = {**body["data"], "order": {k: v for k, v in body["data"]["order"].items() if k != "signature"}}
+            lines.append("请求体（不含签名）：" + json.dumps(shown, ensure_ascii=False))
+            return self.live_test_done(record, lines)
+        oid = record["order_id"] = result["order_id"]
+        lines.append(f"1/4 下单成功：订单 #{oid}" + (f"（code {result['code']}）" if result.get("code") else ""))
+        try:
+            rows = await self.live.api.orders("OPEN")
+            listed = next((r for r in rows if str(r.get("id")) == oid or order_hash_of(r) == digest.lower()), None)
+            lines.append("2/4 开放订单列表：" + (f"已列出（status {listed.get('status')}，amount {listed.get('amount')}，amountFilled {listed.get('amountFilled')}）"
+                                            if listed else f"未列出（列表共 {len(rows)} 条）"))
+        except Exception as error:
+            lines.append(f"2/4 读取开放订单失败：{core.clean_error(error) or type(error).__name__}")
+        try:
+            removed = await self.live.api.remove_orders([oid])
+            lines.append("3/4 撤单：" + ("已撤" if oid in removed["removed"] else f"接口未确认（removed {removed['removed']}，noop {removed['noop']}）"))
+        except Exception as error:
+            lines.append(f"3/4 撤单失败：{core.clean_error(error) or type(error).__name__}；这张单 10 分钟后自动过期，也可在网站撤")
+        try:
+            final = await self.live.api.order(oid, digest.lower())
+            if final is None:
+                lines.append("4/4 最终状态：Predict 已不再列出这张单")
+            else:
+                filled, status = order_fill(final, shares)
+                lines.append(f"4/4 最终状态：{status or '未知'}，成交 {filled:g}/{shares:g} 份" + ("；成交的份额留在账户里" if filled > 0 else ""))
+        except Exception as error:
+            lines.append(f"4/4 查询最终状态失败：{core.clean_error(error) or type(error).__name__}")
+        return self.live_test_done(record, lines)
+
+    def live_test_done(self, record: dict, lines: list[str]) -> str:
+        text = "\n".join(lines)
+        self.store.put("live:test", {**record, "text": text})
+        self.live_notify(text)
+        return text
 
     async def live_control(self, action: str, data: dict) -> dict:
         now_ms = self.market.now_ms()
@@ -1427,6 +1516,8 @@ class LiveBot(core.Bot):
             text = await self.live_action("pause", [str(data.get("why") or "")], now_ms)
         elif action == "cancel":
             text = await self.live_action("cancel", [str(data.get("id") or "")], now_ms)
+        elif action == "test":
+            text = await self.live_action("test", [str(a) for a in (data.get("args") or []) if str(a).strip()], now_ms)
         elif action in {"resume", "redeem", "check", "orders", "positions"}:
             text = await self.live_action(action, [], now_ms)
         else:
@@ -1496,7 +1587,9 @@ class LiveBot(core.Bot):
                              f" → {sim_status(t)}" + (f"·{core.sim_state(t)}" if core.sim_state(t) else "") + f"（{tag}）")
         if self.live_errors:
             lines.append("\n最近错误：\n" + "\n".join(self.live_errors[-3:]))
-        lines.append("\n/live pause｜resume｜cancel all｜redeem｜check｜orders｜positions")
+        if last := (self.store.get("live:test") or {}).get("text"):
+            lines.append("\n最近挂单测试：" + str(last).split("\n")[0].removeprefix("🧪 挂单测试 ") + "…（/live test 重跑）")
+        lines.append("\n/live pause｜resume｜cancel all｜redeem｜check｜orders｜positions｜test [市场] [份数] [价格¢]")
         return "\n".join(lines)
 
     def sim_text(self) -> str:

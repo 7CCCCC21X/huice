@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.36.0"
+VERSION = "1.37.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -443,6 +443,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_WAYS", "做哪种单", "taker 只吃单 / maker 只挂单 / both"),
     ("SIM_MARKETS", "做哪些市场", "all，或 close,touch,updown,flip,range,ladder 的组合"),
     ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "0 = 不限"),
+    ("SIM_TAKER_SESSION", "只在标的开盘时段吃单", "on / off：指数/个股日涨跌的吃单只在盘中（卡片按现货定价时）进行，挂单不受影响"),
     ("PREDICT_MIN_EDGE_CENTS", "卡片建议至少要有的净优势（¢）", "0～50，模型误差之上"),
     ("PREDICT_TRADE_USD", "卡片吃单按多少美元走盘口", "1～1000000"),
     ("LIVE_MAX_ORDER_USD", "真实交易单笔上限（$）", "1～1000000"),
@@ -507,6 +508,7 @@ class Config:
     sim_ways: str = "taker"  # which suggestions it takes: taker (吃单), maker (挂单) or both
     sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
     sim_group_usd: float = 300.0  # the most one driver's positions may lose on a single move (paper $); 0 = no limit
+    sim_taker_session: bool = False  # SIM_TAKER_SESSION: a daily card is taken only while its underlying trades (priced from the spot); makers always
     touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
     auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
     edge_alert: bool = True  # Telegram: a suggestion reaching edge_alert_edge; later, that suggestion going away or turning
@@ -624,6 +626,7 @@ class Config:
             sim_shares=parse_bounded(e, "SIM_SHARES", "100", 1, 1_000_000),
             sim_ways=sim_ways, sim_markets=sim_markets,
             sim_group_usd=parse_bounded(e, "SIM_GROUP_USD", "300", 0, 10_000_000),
+            sim_taker_session=not off(e.get("SIM_TAKER_SESSION", "off")),
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -6779,6 +6782,7 @@ class SimMarket:
     makers: bool = True      # paper-trading maker orders (price ladders remain taker-only)
     maker_alerts: bool = False  # price ladders: separately gated maker opportunities, independent of taker alerts
     maker_note: str = ""     # why a price-ladder maker suggestion is unavailable
+    in_session: bool | None = None  # a daily card: its underlying trades now (the odds come from the spot); None = not a session market
 
 
 class LazyEvidence(Mapping):
@@ -8361,8 +8365,8 @@ pre{white-space:pre-wrap;word-break:break-all;font:13px/1.5 ui-monospace,Menlo,C
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="journal" href="#">复盘页</a><button id="reload">刷新</button></div></header>
 <section class="card"><label class="f"><span>控制口令</span><input type="password" id="key" autocomplete="off" placeholder="环境变量 WEB_CONTROL_KEY"><small><label><input type="checkbox" id="remember"> 在这个浏览器记住口令</label></small></label><p class="mut" id="authnote"></p></section>
 <section class="card" id="live"><h2>真实交易 <span class="state" id="livestate"></span></h2>
-<div class="row" id="livebtns"><button data-act="pause">⏸ 暂停开新仓</button><button data-act="resume" class="pri">▶️ 恢复</button><button data-act="cancelall" class="bad">撤掉全部挂单</button><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button></div>
-<pre id="livelines"></pre></section>
+<div class="row" id="livebtns"><button data-act="pause">⏸ 暂停开新仓</button><button data-act="resume" class="pri">▶️ 恢复</button><button data-act="cancelall" class="bad">撤掉全部挂单</button><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button><button data-act="test">挂单测试</button></div>
+<pre id="livelines"></pre><pre id="testlines" class="mut"></pre></section>
 <section class="card"><h2>策略与风控参数</h2><p class="mut">留空 = 用部署时的环境变量；填写后点保存立即生效，并保存到数据库（重启仍有效）。框内灰字是现在生效的值。</p>
 <div id="fields"></div><div class="row"><button id="save" class="pri">保存</button><button id="reset">清除全部，按环境变量运行</button></div></section>
 <section class="card"><h2>模拟交易 / 真实订单</h2><div id="simline" class="mut"></div><div id="orders"></div></section>
@@ -8401,10 +8405,11 @@ function render(){
       const td=el("td");if(r.cancellable){const b=el("button","bad","撤单");b.disabled=!data.enabled;b.addEventListener("click",()=>{if(confirm("撤掉这张真实挂单（#"+r.order_id+"）？"))act({action:"cancel",id:r.order_id})});td.append(b)}tr.append(td);t.append(tr)});o.append(t)}
   else o.append(el("p","mut",L?"还没有真实订单。":"真实订单只在 LIVE=on 时出现；模拟交易的记录看复盘页。"));
   $("posbox").style.display=L?"":"none";$("errbox").style.display=L?"":"none";
-  if(L){$("positions").textContent=L.positions.length?L.positions.join("\n")+(L.positions_at?"\n（读取于 "+L.positions_at+"）":""):"没有持仓，或还没读取（点“刷新持仓”）";$("errors").textContent=L.errors.length?L.errors.join("\n"):"无"}
+  if(L){$("positions").textContent=L.positions.length?L.positions.join("\n")+(L.positions_at?"\n（读取于 "+L.positions_at+"）":""):"没有持仓，或还没读取（点“刷新持仓”）";$("errors").textContent=L.errors.length?L.errors.join("\n"):"无";$("testlines").textContent=L.last_test||""}
 }
 $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.act;
   if(a==="pause"){const why=prompt("暂停原因（可留空）","");if(why===null)return;act({action:"pause",why})}
+  else if(a==="test"){if(confirm("在 Predict 上挂一张远离盘口的极小限价单（默认 5 份、不高于 2¢），确认它出现在盘口后立即撤掉，用来验证真实下单链路。最多锁定几美分，极少数情况下可能成交。继续？"))act({action:"test"})}
   else if(a==="cancelall"){if(confirm("撤掉 Predict 上全部真实挂单？已成交的份数继续持有。"))act({action:"cancel",id:"all"})}
   else act({action:a})});
 $("save").addEventListener("click",()=>{const values={};document.querySelectorAll("#fields input").forEach(i=>{values[i.dataset.key]=i.value.trim()});act({action:"set",values})});
@@ -11009,7 +11014,8 @@ class Bot:
         return {"code": VERSION, "sim_edge": c.sim_edge, "sim_shares": c.sim_shares, "sim_ways": ways, "sim_markets": kinds,
                 "sim_group_usd": c.sim_group_usd, "min_edge": c.predict_min_edge,
                 "fee_bps": c.predict_fee_bps, "trade_usd": c.predict_trade_usd, "a50_beta": c.a50_beta,
-                "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR}
+                "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR,
+                **({"sim_taker_session": True} if c.sim_taker_session else {})}
 
     def evidence(self, build: Any) -> "LazyEvidence":
         """A SimMarket's evidence, built on first access: when a trade is opened or filled, not for every market on
@@ -11034,7 +11040,8 @@ class Bot:
                 out.append(SimMarket(slug, name, "close", key, odds.fair_up, book, self.edge_need(model_swing(odds)), odds.warn,
                                      ("涨", "跌"), {"key": symbol or key, "target": odds.target.isoformat(),
                                                    "line": float(odds.ref), "close_ms": close_ms},
-                                     self.evidence(lambda title=title, odds=odds: self.close_evidence(title, odds, now_ms))))
+                                     self.evidence(lambda title=title, odds=odds: self.close_evidence(title, odds, now_ms)),
+                                     in_session=odds.direct))
         if not self.config.touch:
             return out
         for touch in self.touches.values():
@@ -11436,7 +11443,9 @@ class Bot:
                         changed.append((tid, trades[tid]))
             bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
             quotes = []
-            for side in ("up", "down") if ways != "maker" else ():
+            # SIM_TAKER_SESSION: a daily card after hours is priced from a proxy; its taker waits for the session
+            takers = ways != "maker" and not (self.config.sim_taker_session and mk.in_session is False)
+            for side in ("up", "down") if takers else ():
                 q = taker_quote(mk.book, side, self.config.sim_shares, bps)
                 fair = mk.fair_up if side == "up" else 1 - mk.fair_up
                 # checked on the fill itself; a few dust shares at a stray price are not the trade the edge is about,
@@ -11590,6 +11599,8 @@ class Bot:
         r = self.sim_report(recent=10)
         t, edge, shares = r["total"], r["edge"] * 100, f"{r['shares']:g}"
         how = [f"吃单按 {shares} 份吃到的均价和手续费判断并成交"] if r["ways"] != "只挂单" else []
+        if how and self.config.sim_taker_session:
+            how.append("指数/个股日涨跌只在标的开盘时段吃单（SIM_TAKER_SESSION=on），盘后只挂单")
         if r["ways"] != "只吃单":
             how.append("挂单只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交，"
                        "出结果时没成交的部分作废；不再做的挂单撤掉")
@@ -12611,7 +12622,8 @@ class Bot:
         flag = lambda value: "on" if value else "off"
         values = {"SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": f"{c.sim_shares:g}", "SIM_WAYS": c.sim_ways,
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
-                  "SIM_GROUP_USD": f"{c.sim_group_usd:g}", "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}",
+                  "SIM_GROUP_USD": f"{c.sim_group_usd:g}", "SIM_TAKER_SESSION": flag(c.sim_taker_session),
+                  "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}",
                   "PREDICT_TRADE_USD": f"{c.predict_trade_usd:g}", "LIVE_MAX_ORDER_USD": f"{c.live_max_order_usd:g}",
                   "LIVE_MAX_OPEN_USD": f"{c.live_max_open_usd:g}", "LIVE_MAX_DAILY_LOSS_USD": f"{c.live_max_daily_loss_usd:g}",
                   "LIVE_TAKER": c.live_taker, "LIVE_SLIPPAGE_BPS": str(c.live_slippage_bps), "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait),

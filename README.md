@@ -204,7 +204,7 @@ EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:6888
 | `/diag` | 逐个检测所有数据源，找出哪里出问题（仅管理员，通常 10–30 秒、最长约 2 分钟；在后台进行，期间其他命令照常响应，报告单独发出；探测不会改变后台刷新的源顺序） |
 | `/sim` | 模拟交易：净优势 ≥10¢ 时按建议买 100 份，只记账不下单（`LIVE=on` 时真实下单），看长期是赚还是亏；另列持仓的共同风险（最坏单一事件）、依赖的数据源、组上限拦下的买入和成交后市场走向 |
 | `/web` | 概率网页链接；设置了 `WEB_CONTROL_KEY` 时一并给出控制台链接 |
-| `/live` | 真实交易（`LIVE=on`）：钱包与下单账户、API 登录、USDT/BNB 余额、交易所授权、风控用量、今日盈亏与最近的真实订单；`/live pause [原因]` 停止开新仓、`/live resume` 恢复（也解除当日亏损停机）、`/live cancel all` 或 `/live cancel <订单号>` 撤真实挂单、`/live redeem` 领取已结算持仓、`/live check` 自检、`/live orders` / `/live positions` 看 Predict 上的开放订单与持仓 |
+| `/live` | 真实交易（`LIVE=on`）：钱包与下单账户、API 登录、USDT/BNB 余额、交易所授权、风控用量、今日盈亏与最近的真实订单；`/live test [市场] [份数] [价格¢]` 挂单测试（极小限价单 → 列表确认 → 撤单 → 最终状态）；`/live pause [原因]` 停止开新仓、`/live resume` 恢复（也解除当日亏损停机）、`/live cancel all` 或 `/live cancel <订单号>` 撤真实挂单、`/live redeem` 领取已结算持仓、`/live check` 自检、`/live orders` / `/live positions` 看 Predict 上的开放订单与持仓 |
 | `/edge` | 优势提醒门槛：不带参数查看；`/edge 6` 改默认；`/edge 市值阶梯 6` 按栏目（指数 / 合约标的 / 加密 / 价格阶梯 / 市值阶梯）；`/edge 牛来 4` 按市场（名字、别名或代码）；`/edge 牛来 300M 3` 按档位；末尾写 `off` 取消；`/edge 清空` 全部取消。档位 > 市场 > 栏目 > 默认 |
 | `/calib` | 用保存的预测快照和实际收盘给概率模型打分：Brier、对数损失、与 Predict 盘口中间价的对比（模型有没有赢过市场）、校准表（每档带按日数算的 95% 区间）、标准化残差（均方根 1 为校准，>1 说明 σ 偏小）及其按剩余方差份额 R 的分桶、代理系数拟合与逐日向前检验；另有全市场快照（含阶梯各档，每 2 小时一条）按类型打分（只评估，不自动改参数；也可 `python main.py --calib`） |
 | `/test` | 仅测试消息能否发到当前私聊/话题 |
@@ -526,6 +526,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | `SIM_WAYS` | `taker` | 模拟交易做哪种单：`taker` 只吃单、`maker` 只挂单、`both` 都做 |
 | `SIM_MARKETS` | `close` | 模拟交易做哪些市场：`all`，或 `close`（指数/个股日涨跌）、`touch`、`updown`、`flip`、`range`、`ladder` 的组合 |
 | `SIM_GROUP_USD` | `300` | 每组（同一结算事件）持仓在最坏单一事件下最多亏多少模拟美元，超过的建议不买；0 = 不限 |
+| `SIM_TAKER_SESSION` | `off` | `on`：指数/个股日涨跌只在标的开盘时段（卡片按现货定价、不是盘后代理估算时）吃单，盘后只挂单；加密市场不受影响。真实交易同样遵守，控制台可在线改 |
 
 ### 真实交易（LIVE=on）
 
@@ -540,6 +541,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 - **挂单 → 限价单**：按建议价挂 `SIM_SHARES` 份，到期时间为市场收盘/截止后两小时（取不到就不设）。成交按 Predict 回报逐笔记录，不再按盘口“推定”。模拟交易撤单的情形（`SIM_WAYS`、`SIM_MARKETS` 缩小、价格阶梯只吃单）、市场出结果、触发日亏损上限、`/live cancel`，都会向 Predict 发撤单；已成交的份数照常持仓结算。
 - **结算与复盘**：和模拟交易相同——先按机器人数据预结算，再以 Predict 的结果确认，`/sim`、网页“模拟交易”栏、复盘页和 CSV 里就是真实的交易，每笔多一组 `live` 记录（订单号、哈希、策略、下单时的盘口与数量、事件时间线、Predict 回报的状态）。市场结算后，赢的一边自动在链上领取 USDT（`LIVE_AUTO_REDEEM=on`，每 10 分钟查一次持仓；签名钱包需有 BNB 付 gas；`/live redeem` 手动领取）。
 - **风控（在策略之上）**：`LIVE_MAX_ORDER_USD` 单笔上限；`LIVE_MAX_OPEN_USD` 持仓加挂单（按成本）上限；`LIVE_MAX_DAILY_LOSS_USD` 当日已结算亏损达到后停止开新仓、撤掉挂单，次日自动恢复，`/live resume` 可提前解除；USDT 余额不足、交易所未授权、Predict 登录失败、市场已关闭、分不清要买哪个结果代币时都不下单。被拦下的决定和模拟交易的组上限一样记在复盘页“拦下的买入”里（`/sim` 的 ⛔ 行），**不会退回纸面记账**。`/live pause` 手动暂停。
+- **挂单测试**（`/live test`，控制台“挂单测试”按钮）：先用最小代价验证整条真实链路——挑一个盘口新鲜、双边有报价的市场（默认第一个日涨跌市场，可写名字指定），买涨方向挂一张**远低于盘口最高买价**的限价单（默认 5 份、不高于 2¢，最多锁定一毛钱，10 分钟后自动过期），然后依次确认它出现在开放订单列表、发撤单、读最终状态，四步逐条报告 Predict 的应答；任一步失败时原样给出错误和不含签名的请求体，方便对照接口要求。`/live test 恒生 3 1` = 恒生指数市场、3 份、1¢。价格不低于最高买价时会提醒可能成交，成交的份额留在账户里。测试不计入模拟交易记录，最近一次结果显示在 `/live` 和控制台里。
 - **防重复**：每张订单先在本地算好哈希并保存，再发给 Predict；进程在两者之间崩溃时，重启后按哈希在 Predict 找回这张单，找不到也不会再发一次（记为放弃，提示在网站核对）。订单只买（BUY）结果代币：买“跌/No”就是买第二个结果的代币，从不卖出。
 - **通知**：下单、成交、撤单、失败、停机、领取都会发到已订阅的聊天（`LIVE_NOTIFY=off` 关闭）；`/status` 和 `/help` 会注明真实交易已开启。
 - **接口口径**：订单签名（EIP-712，`predict.fun CTF Exchange` v1，BNB 链合约地址）、数量换算（价格 3 位、数量 5 位有效数字，最小 0.01 份）、请求体（`data.order`、`pricePerShare`、`strategy`、`slippageBps`、`isMinAmountOut`、`amount`）和登录流程（`GET /v1/auth/message` → 签名 → `POST /v1/auth`）按官方 TypeScript / Python SDK 实现，测试里用 SDK 的向量逐字节核对；订单、撤单、持仓的应答格式按公开的第三方客户端整理，字段名不一致时程序会在 `/live` 和日志里写明原始应答，`/live orders` 可直接看 Predict 返回的内容。
@@ -567,8 +569,8 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 
 概率网页的链接后面加 `/control`（`/web` 会直接给出），就是控制台。它和概率页共用同一个私密令牌，但**每个操作都要再输一次控制口令**：环境变量 `WEB_CONTROL_KEY`（12～64 个不含空格的 ASCII 字符）。不设置这个变量时控制台只能查看，所有操作都被拒绝；口令连续错 5 次，控制接口锁 10 分钟。口令只存在环境变量里，页面不显示；勾选“在这个浏览器记住口令”才会存进该浏览器的 localStorage。
 
-- **真实交易开关**：暂停开新仓（可填原因）、恢复（也解除当天的亏损停机）、撤掉全部真实挂单或某一张、领取已结算持仓、自检、刷新 Predict 持仓。和 `/live` 的命令是同一套代码，Telegram 里也能看到结果。`LIVE=off` 时这一栏显示未开启。
-- **在线改参数**：策略（`SIM_EDGE_CENTS`、`SIM_SHARES`、`SIM_WAYS`、`SIM_MARKETS`、`SIM_GROUP_USD`、`PREDICT_MIN_EDGE_CENTS`、`PREDICT_TRADE_USD`）和真实交易风控（`LIVE_MAX_ORDER_USD`、`LIVE_MAX_OPEN_USD`、`LIVE_MAX_DAILY_LOSS_USD`、`LIVE_TAKER`、`LIVE_SLIPPAGE_BPS`、`LIVE_TAKER_WAIT_SECONDS`、`LIVE_RETRY_SECONDS`、`LIVE_AUTO_REDEEM`、`LIVE_NOTIFY`）。填的就是环境变量的写法，保存时和启动时一样整体校验（错了会给出同样的提示，什么都不改），通过后**立即生效**，并保存到数据库（`control:env`），重启后仍按网页上的设置运行；某一项留空就恢复为环境变量，“清除全部”回到纯环境变量。页面上每一项都标明现在生效的值和环境变量的值。私钥、API Key、Token、钱包、链等不能在网页上改。
+- **真实交易开关**：暂停开新仓（可填原因）、恢复（也解除当天的亏损停机）、撤掉全部真实挂单或某一张、领取已结算持仓、自检、刷新 Predict 持仓、挂单测试（见「真实交易」）。和 `/live` 的命令是同一套代码，Telegram 里也能看到结果。`LIVE=off` 时这一栏显示未开启。
+- **在线改参数**：策略（`SIM_EDGE_CENTS`、`SIM_SHARES`、`SIM_WAYS`、`SIM_MARKETS`、`SIM_GROUP_USD`、`SIM_TAKER_SESSION`、`PREDICT_MIN_EDGE_CENTS`、`PREDICT_TRADE_USD`）和真实交易风控（`LIVE_MAX_ORDER_USD`、`LIVE_MAX_OPEN_USD`、`LIVE_MAX_DAILY_LOSS_USD`、`LIVE_TAKER`、`LIVE_SLIPPAGE_BPS`、`LIVE_TAKER_WAIT_SECONDS`、`LIVE_RETRY_SECONDS`、`LIVE_AUTO_REDEEM`、`LIVE_NOTIFY`）。填的就是环境变量的写法，保存时和启动时一样整体校验（错了会给出同样的提示，什么都不改），通过后**立即生效**，并保存到数据库（`control:env`），重启后仍按网页上的设置运行；某一项留空就恢复为环境变量，“清除全部”回到纯环境变量。页面上每一项都标明现在生效的值和环境变量的值。私钥、API Key、Token、钱包、链等不能在网页上改。
 - **看一眼**：真实订单列表（时间、市场、方向、价格 × 份数、状态、订单号，挂单可直接撤）、最近读到的 Predict 持仓、最近的错误、持仓 + 挂单占用与上限、今日已结算盈亏。每 10 秒自动刷新。
 - 后台任务不会被控制台卡住：操作在收到请求时执行，失败的原因会原样返回到页面。
 
