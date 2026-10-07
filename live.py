@@ -87,6 +87,7 @@ ADDRESSES: dict[int, dict[str, str]] = {
          "ECDSA_VALIDATOR": "0x845ADb2C711129d4f3966735eD98a9F09fC4cE57"},
 }
 RPC_URLS = {56: "https://bsc-dataseed.bnbchain.org/", 97: "https://bsc-testnet-dataseed.bnbchain.org/"}
+API_BASES = {56: core.PREDICT_REST, 97: "https://api-testnet.predict.fun/v1"}  # the testnet API needs no API key
 CHAIN_NAMES = {56: "BNB 主网", 97: "BNB 测试网"}
 ORDER_TYPES = [("salt", "uint256"), ("maker", "address"), ("signer", "address"), ("taker", "address"),
                ("tokenId", "uint256"), ("makerAmount", "uint256"), ("takerAmount", "uint256"), ("expiration", "uint256"),
@@ -682,7 +683,7 @@ class LiveTrader:
     def __init__(self, config: core.Config):
         self.config = config
         self.wallet = Wallet(config.live_key, config.live_chain, config.live_account)
-        self.api = PredictApi(core.PREDICT_REST, config.predict_api_key, self.wallet)
+        self.api = PredictApi(API_BASES[config.live_chain], config.predict_api_key, self.wallet)
         self.chain = Chain(config.live_rpc or RPC_URLS[config.live_chain], self.wallet)
         self.ready_error = "尚未登录 Predict"
         self.ready_at = 0.0

@@ -534,7 +534,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 
 - **准备**：
   1. Predict 账户里有 USDT（BNB 链）。网站账户是一个智能钱包（Predict 账户）：在网站“账户设置”里导出 Privy 钱包私钥，填 `PREDICT_PRIVATE_KEY`，再把账户设置里的**充值地址**填 `PREDICT_ACCOUNT`。也可以用一个普通钱包直接交易：只填它的私钥，USDT 和份额都在这个地址上。
-  2. 在 Predict 开发者后台申请 API Key，填 `PREDICT_API_KEY`（请求头 `x-api-key`；登录签名换取的 JWT 由程序自动处理和续期）。
+  2. 在 Predict 开发者控制台 <https://developers.predict.fun> 申请 API Key，填 `PREDICT_API_KEY`（请求头 `x-api-key`，主网所有接口都要；登录签名换取的 JWT 由程序自动处理和续期）。
   3. 交易所要先获得 USDT 额度授权（和结果代币操作权）。网站上交易过一次的 Predict 账户通常已经授权；没有的话给签名钱包转约 0.005 BNB 作 gas，运行 `python main.py --approve`（逐项检查、只发缺的那几笔交易）。
   4. 运行 `python main.py --live-check`：登录、余额、授权、开放订单和持仓逐项打印，全部 OK 再把 `LIVE=on` 加进 Railway Variables。建议先用小的 `SIM_SHARES` 跑几天，看 `/live` 和复盘页里的真实成交是否符合预期。
 - **吃单 → 市价单**：模拟交易按 `SIM_SHARES` 份走盘口得出的成交数量和均价，变成一张 `MARKET` 策略的买单：数量就是模拟吃到的份数，USDT 上限 = 当时盘口算出的预期成本，`LIVE_SLIPPAGE_BPS`（默认 1%）是允许少收的份数比例（官方 SDK 的 `isMinAmountOut` 模型）。`LIVE_TAKER=limit` 则改为一张限价买单，价格封在模拟吃单走到的最差一档，`LIVE_TAKER_WAIT_SECONDS`（默认 60）后仍未成交的部分撤掉。两种方式下，成交份数以 Predict 回报为准：一份没成交就记为一次失败的尝试（复盘页里编号带 `#1`、`#2`），这个市场这一边 `LIVE_RETRY_SECONDS`（默认 300）内不再下单，之后有机会再下。
@@ -551,8 +551,8 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | `LIVE` | `off` | `on` 真实下单（需要 `SIM=on`、`PREDICT=on`） |
 | `PREDICT_PRIVATE_KEY` | 无 | 签名钱包私钥（64 位十六进制，0x 可省）；普通钱包，或网站导出的 Privy 钱包 |
 | `PREDICT_ACCOUNT` | 空 | Predict 账户（智能钱包）地址 = 网站账户设置里的充值地址；空 = 用私钥自己的地址交易 |
-| `PREDICT_API_KEY` | 空 | Predict 开发者 API Key（订单簿只读时可不填，真实交易需要） |
-| `PREDICT_CHAIN_ID` | `56` | 56 BNB 主网，97 BNB 测试网 |
+| `PREDICT_API_KEY` | 空 | Predict 开发者 API Key，在开发者控制台 <https://developers.predict.fun> 申请；主网所有接口都要它（默认限额每分钟 240 次请求，本机器人远低于此） |
+| `PREDICT_CHAIN_ID` | `56` | 56 BNB 主网，97 BNB 测试网（下单走 `api-testnet.predict.fun`，不需要 API Key；但卡片和盘口仍来自主网市场，测试网只能验证签名和下单链路，不能完整回放策略） |
 | `BSC_RPC_URL` | 公共节点 | 读余额、授权，发授权/领取交易的 JSON-RPC 节点 |
 | `LIVE_TAKER` | `market` | 吃单用市价单（`market`）还是封顶限价单（`limit`） |
 | `LIVE_SLIPPAGE_BPS` | `100` | 市价单允许少收的份数比例（1% = 100） |

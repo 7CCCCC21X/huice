@@ -364,6 +364,8 @@ async def run():
     bot = make_bot()
     fake = bot.live.api
     assert "/live" in bot.handlers and not bot.live.ready and bot.live.ready_error
+    assert L.LiveTrader(bot.config).api.base == m.PREDICT_REST and L.API_BASES[97].startswith("https://api-testnet.predict.fun")
+    assert L.LiveTrader(dataclasses.replace(bot.config, live_chain=97)).api.base == "https://api-testnet.predict.fun/v1"
     assert "真实交易未就绪" in bot.live_room({}, hsi(0.70, [], [], NOW), "up", 0.5, 100)
     lines = await bot.live_prepare()
     assert bot.live.ready and bot.live.usd() == 1000.0 and bot.live.approvals == {"CTF_EXCHANGE": True, "NEG_RISK_CTF_EXCHANGE": True}
