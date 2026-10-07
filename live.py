@@ -1054,8 +1054,7 @@ class LiveBot(core.Bot):
                 continue
             near = False  # judged as the paper trader judges: the valid 买1's edge, a taker under its cap
             if mk.makers and c.sim_ways != "taker":
-                maker = self.sim_maker_candidate(mk, trades)
-                near = maker is not None and maker.edge >= bar
+                near = self.sim_maker_reason(mk, trades, now_ms)[0] is not None
             bps = mk.book.fee_bps if mk.book.fee_bps is not None else c.predict_fee_bps
             for side in ("up", "down") if c.sim_ways != "maker" else ():
                 fair = mk.fair_up if side == "up" else 1 - mk.fair_up
@@ -1417,6 +1416,14 @@ class LiveBot(core.Bot):
             self.live_notify(f"⚪ 真实交易模式 {before} → off：回到只记账，未成交的真实挂单已撤，已有持仓继续跟踪到结算。")
         else:
             self.live_last_signin = -1e9
+            if before == "off":  # paper orders resting from LIVE=off are not real: withdrawn, placed again as real ones
+                for tid, t in list(self.sim_trades().items()):
+                    if t.get("status") == "resting" and not isinstance(t.get("live"), dict):
+                        self.sim_withdraw(t, "切到真实交易，按真实订单重挂", now_ms)
+                        if float(t.get("shares") or 0) <= 1e-9:
+                            self.sim_rekey(tid, t)
+                        else:
+                            self.sim_save([(tid, t)])
             self.live_notify(("🧪 真实交易模式 {b} → pause：登录 Predict，可自检和挂单测试，不开新仓。" if after == "pause"
                               else "💰 真实交易模式 {b} → on：模拟交易的每个决定都会真实下单。").format(b=before))
 

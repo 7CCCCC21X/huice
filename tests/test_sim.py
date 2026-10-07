@@ -18,7 +18,7 @@ NOW = BJ(10, 5, 10, 0)
 HSI_SLUG = "hang-seng-index-up-or-down-on-october-5-2026"
 KOSPI_SLUG = "kospi-composite-index-up-or-down-on-october-5-2026"
 CLOSE = BJ(10, 5, 16, 10)
-LEGACY = {"SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off"}  # the resting-order rules off: orders rest as placed
+LEGACY = {"SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off"}  # the resting-order rules off: orders rest as placed
 FEE = 0.02  # Predict: 2% × min(p, 1 − p) when the market states no rate
 
 # --- settings ----------------------------------------------------------------------------------------------------------
@@ -583,6 +583,9 @@ async def maker_rules():
         except ValueError: pass
     bot = m.Bot(cfg, m.Store(":memory:"), FM(NOW), None)
     bot.sim_markets = lambda now: world["markets"]
+    active = {"rewards": {"current": {"hourlyRate": "10", "startsAt": "2026-10-01T00:00:00Z", "endsAt": "2026-12-31T00:00:00Z"}}, "trading_status": "OPEN"}
+    bot.predict.market_meta["101"] = (active, time.monotonic())  # the HSI market pays points: its resting orders are allowed
+    assert cfg.sim_maker_points and bot.control_value("SIM_MAKER_POINTS") == "on" and bot.sim_version()["sim_maker_points"] is True
     assert bot.control_value("SIM_MAKER_MIN_BID") == "100" and bot.control_value("SIM_MAKER_EXIT_CENTS") == "5" and bot.control_value("SIM_MAKER_SESSION") == "on"
     assert bot.sim_version()["sim_maker_min_bid"] == 100 and bot.sim_version()["sim_maker_exit"] == 0.05 and bot.sim_version()["sim_maker_session"] is True
     # maker_level: the first level deep enough, our own order not counted
@@ -642,7 +645,38 @@ async def maker_rules():
     low = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_EDGE_CENTS": "3"}), m.Store(":memory:"), FM(NOW), None)
     why = low.sim_requote_reason({"maker": True, "side": "up", "price": 0.69, "order": 100, "shares": 0}, hsi(0.70, [("0.69", "300")], [("0.72", "400")], NOW), NOW)
     assert abs(low.sim_maker_exit() - 0.025) < 1e-12 and why == "净优势降到 1.0¢，低于撤单线 2.5¢", why
-    assert "只跟不少于 100 份的买1" in bot.sim_text() and "降到 5.0¢ 以下撤掉" in bot.sim_text() and "开盘前、收盘后撤掉" in bot.sim_text()
+    assert "只跟不少于 100 份的买1" in bot.sim_text() and "降到 5.0¢ 以下撤掉" in bot.sim_text() and "开盘前、收盘后撤掉" in bot.sim_text() and "只挂积分已激活的市场" in bot.sim_text()
+    # SIM_MAKER_POINTS: nothing while the points status is unknown or inactive; placed when they pay; withdrawn when they stop
+    pts = lambda at: m.SimMarket("pts", "pts", "close", "X", 0.70, book([("0.55", "300")], [("0.58", "400")], at, "pts", mid="202"), 0.03, "", ("涨", "跌"),
+                                 {"key": "X", "close_ms": CLOSE})
+    await step(bot, NOW + 160_000, pts(NOW + 160_000))
+    checks = {r["item"]: r for r in bot.sim_checks(NOW + 160_000)}
+    assert "pts|up|挂" not in bot.sim_trades() and checks["pts"]["maker_why"] == "积分状态暂缺，不挂" and checks["pts"]["points"] == "积分状态暂缺" and checks["pts"]["maker"] == ""
+    bot.predict.market_meta["202"] = ({"rewards": {"current": None}, "trading_status": "OPEN"}, time.monotonic())
+    await step(bot, NOW + 170_000, pts(NOW + 170_000))
+    assert "pts|up|挂" not in bot.sim_trades() and {r["item"]: r for r in bot.sim_checks(NOW + 170_000)}["pts"]["maker_why"] == "积分未激活，不挂"
+    bot.predict.market_meta["202"] = (active, time.monotonic())
+    await step(bot, NOW + 180_000, pts(NOW + 180_000))
+    assert bot.sim_trades()["pts|up|挂"]["price"] == 0.55
+    row = {r["item"]: r for r in bot.sim_checks(NOW + 180_000)}["pts"]
+    assert row["points"] == "积分已激活" and row["points_active"] is True and row["maker_why"].startswith("已有挂单中") and row["taker_why"] == "SIM_WAYS=maker：只挂单"
+    assert row["session"] is None and row["bid"] == [0.55, 300.0] and row["ask"] == [0.58, 400.0] and row["url"].startswith(m.PREDICT_SITE) and row["kind"] == "指数/个股日涨跌"
+    bot.predict.market_meta["202"] = ({"rewards": {"current": None}, "trading_status": "OPEN"}, time.monotonic())
+    await step(bot, NOW + 190_000, pts(NOW + 190_000))
+    assert "pts|up|挂" not in bot.sim_trades() and bot.sim_trades()["pts|up|挂#1"]["note"] == "撤单：积分已停止发放，不挂，一份都没成交"
+    # a changed setting re-judges the resting orders: SIM_SHARES → re-placed with the new size; a higher bar → withdrawn when under it
+    bot.predict.market_meta["202"] = (active, time.monotonic())
+    await step(bot, NOW + 200_000, pts(NOW + 200_000))
+    assert bot.sim_trades()["pts|up|挂"]["order"] == 100
+    bot.apply_config(m.dataclasses.replace(bot.config, sim_shares=50.0))
+    await step(bot, NOW + 210_000, pts(NOW + 210_000))
+    assert bot.sim_trades()["pts|up|挂#2"]["note"] == "撤单：每次份数已改为 50 份，按新份数重挂，一份都没成交" and "pts|up|挂" not in bot.sim_trades()
+    await step(bot, NOW + 220_000, pts(NOW + 220_000))
+    assert bot.sim_trades()["pts|up|挂"]["order"] == 50
+    bot.apply_config(m.dataclasses.replace(bot.config, sim_edge=0.20))
+    await step(bot, NOW + 230_000, pts(NOW + 230_000))
+    assert bot.sim_trades()["pts|up|挂#3"]["note"] == "撤单：触发门槛已改为 20.0¢，现净优势 15.0¢ 不达标，一份都没成交" and "pts|up|挂" not in bot.sim_trades()
+    assert {r["item"]: r for r in bot.sim_checks(NOW + 230_000)}["pts"]["maker_why"] == "净优势 15.0¢ 低于触发门槛 20.0¢"
     print("MAKER_RULES_OK")
 
 

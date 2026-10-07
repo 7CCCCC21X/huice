@@ -350,7 +350,7 @@ async def step(bot, at, *markets):
 def make_bot(**env):
     cfg = m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
                              "SIM_WAYS": "both", "SIM_MARKETS": "all", "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT_API_KEY": "k",
-                             "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off",  # resting orders rest as placed, unless a test says otherwise
+                             "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off",  # resting orders rest as placed, unless a test says otherwise
                              "LIVE_MAX_ORDER_USD": "100", "LIVE_MAX_OPEN_USD": "250", "LIVE_MAX_DAILY_LOSS_USD": "50", **env})
     bot = L.LiveBot(cfg, m.Store(":memory:"), FM(NOW), None)
     bot.live.api, bot.live.chain = FakeApi(), FakeChain()
@@ -860,6 +860,21 @@ async def run():
     r = obot.control_set({"LIVE": "on"})
     assert r["ok"] and obot.config.live_mode == "on"
     assert not m.Bot(m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT"}), m.Store(":memory:"), FM(NOW), None).control_set({"LIVE": "pause"})["ok"]
+
+    # --- LIVE off → pause: the paper orders resting from paper mode are withdrawn (their slots freed) and placed again as real orders
+    wbot = make_bot(LIVE="off", SIM_WAYS="maker")
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    await step(wbot, NOW, world["markets"][0])
+    wtid = f"{HSI_SLUG}|up|挂"
+    assert wbot.sim_trades()[wtid]["status"] == "resting" and "live" not in wbot.sim_trades()[wtid]  # a paper order
+    text = await wbot.cmd_live(m.Request("/live", ["mode", "pause"], 1, 0, 1))
+    assert "off → pause" in text
+    wt = wbot.sim_trades()
+    assert wtid not in wt and wt[f"{wtid}#1"]["status"] == "cancelled" and wt[f"{wtid}#1"]["note"] == "撤单：切到真实交易，按真实订单重挂，一份都没成交"
+    await wbot.cmd_live(m.Request("/live", ["mode", "on"], 1, 0, 1))
+    await wbot.live_prefetch(NOW + 10_000)
+    await step(wbot, NOW + 10_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
+    assert wbot.sim_trades()[wtid]["live"]["state"] == "open" and wbot.sim_trades()[wtid]["price"] == 0.55  # the real one
 
     # paper mode: the base bot answers /live with a plain refusal, and trades on paper as before
     pbot = m.Bot(m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"}), m.Store(":memory:"), FM(NOW), None)

@@ -92,7 +92,8 @@ async def run():
     assert 'data-act="test"' in body.decode() and 'id="testlines"' in body.decode() and 'data-mode="pause"' in body.decode()
     assert 'id="cards"' in body.decode() and 'id="fold"' in body.decode() and 'id="adv"' in body.decode() and 'id="fields"' not in body.decode()  # option cards, no form
     data = await get_json(port, "control.json")
-    assert data["enabled"] and data["mode"] == "paper" and data["live"] is None and data["version"] == m.VERSION
+    assert data["enabled"] and data["mode"] == "paper" and data["live"] is None and data["version"] == m.VERSION and data["checks"] == []
+    assert 'id="checks"' in body.decode()
     s = {x["key"]: x for x in data["settings"]}
     assert {k: s["SIM_EDGE_CENTS"][k] for k in ("key", "label", "hint", "value", "saved", "env")} == {"key": "SIM_EDGE_CENTS", "label": "触发买入的净优势（¢/份）", "hint": "0.5～50", "value": "10", "saved": "", "env": ""}
     assert s["SIM_EDGE_CENTS"]["kind"] == "number" and s["SIM_EDGE_CENTS"]["group"] == "策略" and "10" in s["SIM_EDGE_CENTS"]["presets"] and s["SIM_EDGE_CENTS"]["unit"] == "¢"
@@ -237,6 +238,7 @@ async def run():
     st, j = await post(port3, {"key": KEY, "action": "test", "args": ["恒生", "2"]})
     assert st == 200 and "1/4 下单成功：订单 #500" in j["message"] and "3/4 撤单：已撤" in j["message"] and "2.0¢×50 份" in j["message"] and "2 份不足 Predict 最低订单金额 $1，改为 50 份" in j["message"], j
     assert (await get_json(port3, "control.json"))["live"]["last_test"] == j["message"]
+    assert [(r["item"], r["kind"]) for r in (await get_json(port3, "control.json"))["checks"]] == [("恒生指数", "指数/个股日涨跌")]  # the order check lists the market
     # the Telegram command still works through the same code
     reply = await lbot.cmd_live(m.Request("/live", [], 1, 0, 1))
     assert isinstance(reply, m.Reply) and "真实交易" in reply.text
