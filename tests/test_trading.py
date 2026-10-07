@@ -697,6 +697,37 @@ async def run():
     smk = next(x for x in cbot.sim_markets(sat) if x.kind == "close" and x.key == "SSE")
     assert smk.in_session is True and smk.evidence["basis"]["direct"]
 
+    # --- SIM_QUIET_MINUTES: from N minutes before a market's end no new order (refusals recorded), a resting one is withdrawn ----
+    assert m.Config.from_env({**base, "SIM_QUIET_MINUTES": "15"}).sim_quiet_minutes == 15 and m.Config.from_env(base).sim_quiet_minutes == 0
+    for bad in ("-1", "1441", "x"):
+        try: m.Config.from_env({**base, "SIM_QUIET_MINUTES": bad}); assert False, bad
+        except ValueError: pass
+    assert m.sim_end_ms({"close_ms": CLOSE}) == CLOSE and m.sim_end_ms({"deadline": 5}) == 5 and m.sim_end_ms({"end": "7"}) == 7
+    assert m.sim_end_ms({}) is None and m.sim_end_ms(None) is None and m.sim_end_ms({"end": "soon"}) is None
+    qbot = make_bot(SIM_QUIET_MINUTES="15", SIM_WAYS="both")
+    await qbot.live_prepare()
+    assert qbot.control_value("SIM_QUIET_MINUTES") == "15" and qbot.sim_version()["sim_quiet_minutes"] == 15 and "sim_quiet_minutes" not in bot.sim_version()
+    assert qbot.sim_quiet(SETTLE_HSI, CLOSE - 15 * 60_000 - 1) == "" and qbot.sim_quiet(SETTLE_HSI, CLOSE - 15 * 60_000) == "结束前 15 分钟不交易"
+    assert qbot.sim_quiet(SETTLE_HSI, CLOSE + 1) != "" and qbot.sim_quiet({}, CLOSE) == "" and bot.sim_quiet(SETTLE_HSI, CLOSE) == ""  # past the end: still quiet; no end / option off: not
+    early = CLOSE - 60 * 60_000
+    await qbot.live_prefetch(early)
+    await step(qbot, early, hsi(0.70, [("0.55", "300")], [("0.58", "400")], early))
+    assert sorted(qbot.sim_trades()) == [f"{HSI_SLUG}|up|吃", f"{HSI_SLUG}|up|挂"]  # an hour before the close: trades as usual
+    late = CLOSE - 14 * 60_000
+    qbot.live.api.markets["103"] = market_json("103")
+    other = m.SimMarket("other", "other", "close", "X", 0.70, book([("0.55", "300")], [("0.58", "400")], late, "other", mid="103"), 0.03, "", ("涨", "跌"),
+                        {"key": "X", "close_ms": CLOSE})
+    await qbot.live_prefetch(late)
+    await step(qbot, late, hsi(0.70, [("0.55", "300")], [("0.58", "400")], late), other)
+    qt = qbot.sim_trades()
+    assert sorted(qt) == [f"{HSI_SLUG}|up|吃#1", f"{HSI_SLUG}|up|挂"], sorted(qt)  # nothing new on either market (the unfilled market order lapsed after LIVE_TAKER_WAIT_SECONDS, as always)
+    maker_rec = qt[f"{HSI_SLUG}|up|挂"]
+    assert maker_rec["status"] == "cancelled" and maker_rec["note"] == "撤单：结束前 15 分钟不交易，一份都没成交" and maker_rec["withdrawn"]["why"] == "结束前 15 分钟不交易"
+    assert maker_rec["live"]["state"] == "done" and maker_rec["live"]["cancel_why"] == "结束前 15 分钟不交易"  # the real order: cancel sent and confirmed in the same step
+    assert ("remove", [maker_rec["live"]["order_id"]]) in qbot.live.api.calls
+    assert any(b["id"] == "other|up|吃" and b["why"] == "结束前 15 分钟不交易" for b in qbot.sim_blocks()), qbot.sim_blocks()
+    assert "结束前 15 分钟起不开新单" in qbot.sim_text() and "结束前" not in bot.sim_text()
+
     # --- /live test: a tiny resting order far under the market, listed, withdrawn, its final state read ---------------------
     tbot = make_bot(SIM_WAYS="both")
     tfake = tbot.live.api

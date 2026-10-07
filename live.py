@@ -995,10 +995,10 @@ class LiveBot(core.Bot):
             return  # a real order's fills come from Predict (live_sync), never presumed from the book
         super().sim_fill(trade, mk, now_ms)
 
-    def sim_withdraw_reason(self, trade: dict, mk: core.SimMarket | None) -> str:
+    def sim_withdraw_reason(self, trade: dict, mk: core.SimMarket | None, now_ms: int | None = None) -> str:
         if isinstance(trade.get("live"), dict) and not trade.get("maker"):
             return ""  # a taker order in flight rests only until LIVE_TAKER_WAIT_SECONDS: SIM_WAYS / SIM_MARKETS do not withdraw it
-        return super().sim_withdraw_reason(trade, mk)
+        return super().sim_withdraw_reason(trade, mk, now_ms)
 
     def sim_withdraw(self, trade: dict, why: str, now_ms: int) -> None:
         super().sim_withdraw(trade, why, now_ms)

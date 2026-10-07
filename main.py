@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.41.1"
+VERSION = "1.42.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -445,6 +445,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_MARKETS", "做哪些市场", "可多选；全选 = all"),
     ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "0 = 不限"),
     ("SIM_TAKER_SESSION", "只在标的开盘时段吃单", "开 = 指数/个股日涨跌的吃单只在标的开盘时段（卡片按现货定价时）进行，盘后只挂单；挂单不受影响"),
+    ("SIM_QUIET_MINUTES", "结束前多少分钟不交易", "0～1440：从标的收盘 / 市场截止前这么多分钟起不开新单，未成交的挂单撤掉；0 = 不限"),
     ("PREDICT_MIN_EDGE_CENTS", "卡片建议至少要有的净优势（¢）", "0～50，模型误差之上"),
     ("PREDICT_TRADE_USD", "卡片吃单按多少美元走盘口", "1～1000000"),
     ("LIVE_MAX_ORDER_USD", "真实交易单笔上限（$）", "1～1000000"),
@@ -510,6 +511,8 @@ class Config:
     sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
     sim_group_usd: float = 300.0  # the most one driver's positions may lose on a single move (paper $); 0 = no limit
     sim_taker_session: bool = False  # SIM_TAKER_SESSION: a daily card is taken only while its underlying trades (priced from the spot); makers always
+    sim_quiet_minutes: int = 0        # SIM_QUIET_MINUTES: from this many minutes before a market's end (the underlying's close, a deadline) no new
+    # paper order; a resting one is withdrawn (the real one cancelled). 0 = off
     touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
     auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
     edge_alert: bool = True  # Telegram: a suggestion reaching edge_alert_edge; later, that suggestion going away or turning
@@ -631,6 +634,7 @@ class Config:
             sim_ways=sim_ways, sim_markets=sim_markets,
             sim_group_usd=parse_bounded(e, "SIM_GROUP_USD", "300", 0, 10_000_000),
             sim_taker_session=not off(e.get("SIM_TAKER_SESSION", "off")),
+            sim_quiet_minutes=bounded_int(e, "SIM_QUIET_MINUTES", 0, 0, 1440),
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -6836,6 +6840,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_WAYS": {"kind": "choice", "group": "策略", "options": [["taker", "只吃单"], ["maker", "只挂单"], ["both", "挂单和吃单"]]},
     "SIM_MARKETS": {"kind": "multi", "group": "策略", "options": [[k, n] for k, n in SIM_KINDS.items()]},
     "SIM_TAKER_SESSION": {"kind": "choice", "group": "策略", "options": [["off", "全天都吃单"], ["on", "只在开盘时段吃单"]]},
+    "SIM_QUIET_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "5", "10", "15", "30", "60"], "unit": "分钟", "zero": "不限"},
     "SIM_GROUP_USD": {"kind": "number", "group": "策略", "presets": ["0", "100", "300", "500", "1000"], "unit": "$", "zero": "不限"},
     "LIVE_MAX_ORDER_USD": {"kind": "number", "group": "风控", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
     "LIVE_MAX_OPEN_USD": {"kind": "number", "group": "风控", "presets": ["100", "300", "500", "1000", "3000"], "unit": "$"},
@@ -6872,6 +6877,19 @@ def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
     if gap > spread + 1e-9:
         return f"买卖价差 {cents(gap)} 超过 {cents(spread)}"
     return ""
+
+
+def sim_end_ms(settle: Mapping | None) -> int | None:
+    """When a market's result is fixed, from what deciding it needs: a daily card's exchange close, a touch market's
+    deadline, a window's end. None when the record carries no such time."""
+    for key in ("close_ms", "deadline", "end"):
+        value = (settle or {}).get(key)
+        if value:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def sim_scope(config: Config) -> tuple[str, str]:
@@ -8221,7 +8239,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
   trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
@@ -11100,7 +11118,8 @@ class Bot:
                 "sim_group_usd": c.sim_group_usd, "min_edge": c.predict_min_edge,
                 "fee_bps": c.predict_fee_bps, "trade_usd": c.predict_trade_usd, "a50_beta": c.a50_beta,
                 "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR,
-                **({"sim_taker_session": True} if c.sim_taker_session else {})}
+                **({"sim_taker_session": True} if c.sim_taker_session else {}),
+                **({"sim_quiet_minutes": c.sim_quiet_minutes} if c.sim_quiet_minutes else {})}
 
     def evidence(self, build: Any) -> "LazyEvidence":
         """A SimMarket's evidence, built on first access: when a trade is opened or filled, not for every market on
@@ -11245,10 +11264,23 @@ class Bot:
         if credited >= float(trade["order"]) - 1e-9:
             trade["status"] = "filled"
 
-    def sim_withdraw_reason(self, trade: dict, mk: SimMarket | None) -> str:
+    def sim_quiet(self, settle: Mapping | None, now_ms: int) -> str:
+        """SIM_QUIET_MINUTES: why no new paper order is placed on a market now — its end is this close, or past with the
+        result pending. "" when the option is off, the end is not known, or it is further away."""
+        minutes = self.config.sim_quiet_minutes
+        end = sim_end_ms(settle) if minutes else None
+        if end is None or now_ms < end - minutes * 60_000:
+            return ""
+        return f"结束前 {minutes} 分钟不交易"
+
+    def sim_withdraw_reason(self, trade: dict, mk: SimMarket | None, now_ms: int | None = None) -> str:
         """Why a resting paper order is withdrawn now rather than left to the result: the trader no longer places such
-        orders (SIM_WAYS, SIM_MARKETS, a kind that is taker-only such as the price ladders). "" while it stands."""
+        orders (SIM_WAYS, SIM_MARKETS, a kind that is taker-only such as the price ladders), or the market is in its
+        last minutes (SIM_QUIET_MINUTES). "" while it stands."""
         kind = str(trade.get("kind") or "")
+        quiet = self.sim_quiet(trade.get("settle") or (mk.settle if mk is not None else None), self.market.now_ms() if now_ms is None else now_ms)
+        if quiet:
+            return quiet
         if self.config.sim_ways == "taker":
             return "模拟交易已改为只吃单"
         if kind not in self.config.sim_markets:
@@ -11520,7 +11552,7 @@ class Bot:
                 side = "up" if maker.side == "涨" else "down"
                 tid = f"{mk.market}|{side}|挂"
                 if tid not in trades:  # one position per market, side and way of trading, however long the edge lasts
-                    why = self.sim_group_room(trades, mk, side, maker.price, self.config.sim_shares)
+                    why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, maker.price, self.config.sim_shares)
                     if why:
                         self.sim_note_block(tid, mk, "挂" + mk.sides[0 if side == "up" else 1], maker.price, why, now_ms)
                     else:
@@ -11542,7 +11574,7 @@ class Bot:
                 _, side, q = max(quotes, key=lambda x: x[0])
                 tid = f"{mk.market}|{side}|吃"
                 if tid not in trades:
-                    why = self.sim_group_room(trades, mk, side, q["cost"], q["got"])
+                    why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, q["cost"], q["got"])
                     if why:
                         self.sim_note_block(tid, mk, "吃" + mk.sides[0 if side == "up" else 1], q["cost"], why, now_ms)
                     else:
@@ -11555,7 +11587,7 @@ class Bot:
             before = json.dumps(trade, sort_keys=True, default=str)
             mk = markets.get(trade["market"])
             if trade["status"] == "resting":
-                why = self.sim_withdraw_reason(trade, mk)
+                why = self.sim_withdraw_reason(trade, mk, now_ms)
                 if why:
                     self.sim_withdraw(trade, why, now_ms)
                 elif mk is not None and not mk.book.stale(now_ms) and not book_crossed(mk.book):
@@ -11686,6 +11718,8 @@ class Bot:
         how = [f"吃单按 {shares} 份吃到的均价和手续费判断并成交"] if r["ways"] != "只挂单" else []
         if how and self.config.sim_taker_session:
             how.append("指数/个股日涨跌只在标的开盘时段吃单（SIM_TAKER_SESSION=on），盘后只挂单")
+        if self.config.sim_quiet_minutes:
+            how.append(f"每个市场结束前 {self.config.sim_quiet_minutes} 分钟起不开新单、撤掉未成交挂单（SIM_QUIET_MINUTES）")
         if r["ways"] != "只吃单":
             how.append("挂单只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交，"
                        "出结果时没成交的部分作废；不再做的挂单撤掉")
@@ -12709,6 +12743,7 @@ class Bot:
         values = {"LIVE": c.live_mode, "SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": f"{c.sim_shares:g}", "SIM_WAYS": c.sim_ways,
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
                   "SIM_GROUP_USD": f"{c.sim_group_usd:g}", "SIM_TAKER_SESSION": flag(c.sim_taker_session),
+                  "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes),
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}",
                   "PREDICT_TRADE_USD": f"{c.predict_trade_usd:g}", "LIVE_MAX_ORDER_USD": f"{c.live_max_order_usd:g}",
                   "LIVE_MAX_OPEN_USD": f"{c.live_max_open_usd:g}", "LIVE_MAX_DAILY_LOSS_USD": f"{c.live_max_daily_loss_usd:g}",

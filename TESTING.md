@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.41.1
+版本：1.42.0
 
 ## 已完成
 
+- 1.42.0（结束前不交易）：`SIM_QUIET_MINUTES`（0～1440，默认 0；`Config.sim_quiet_minutes`，控制项，预设 5/10/15/30/60 分钟）：`sim_end_ms` 从结算信息取市场结束时间（日涨跌 `close_ms`、先触价 `deadline`、其它 `end`），`Bot.sim_quiet` 在结束前 N 分钟起（含结束后待结算）给出原因；`sim_step` 的挂单与吃单候选先过它（拦下的记为 block，复盘页可见），`sim_withdraw_reason` 据此撤未成交挂单（真实交易由 cancelling 流程向 Predict 撤单），`/sim` 说明行与 `sim_version` 注明，复盘页标签。tests/test_trading.py：配置范围、`sim_end_ms`、窗口边界、一小时前照常开仓、14 分钟前不开新单且挂单被撤（live 进入 cancelling）、拦截记录、文案。
 - 1.41.1（订单回读按哈希）：`PredictApi.order` 改为 `GET /v1/orders/{hash}`（接口唯一的单笔读取；404 = 不存在），不再按 id 读、也不再用猜的状态值（FILLED 等）扫列表——真实接口的 status 过滤只认 OPEN，别的值报 `OrderStatusFilter: Expect a valid enumeration value`，挂单测试第 4 步因此失败；没有哈希时只在开放订单里按 id 找。去掉 `lookup` 状态。tests/test_trading.py：按哈希读到、404 为 None、其它错误抛出、空答复为 None、无哈希只查 OPEN。
 - 1.41.0（控制台参数改为卡片选择）：`CONTROL_FORMS` 给每个控制项一个控件：选择型（LIVE、SIM_WAYS、SIM_TAKER_SESSION、LIVE_TAKER、LIVE_AUTO_REDEEM、LIVE_NOTIFY，每个值一张带中文说明的选项）、多选（SIM_MARKETS，全选即 all，至少保留一个）、数字型（预设值 + 自定义框，0 标“不限”），分组 策略 / 真实交易风控 / 高级；`control_payload` 把 kind / group / options / presets / unit / zero 一并给页面。页面：点选项立即 `set`（LIVE 卡片走 mode 动作并确认；无私钥时走 set 以拿到校验提示），每张卡片标当前值与“已保存 / 环境变量 / 默认值”，“恢复环境变量”撤销单项；整栏可收起、“高级参数”默认折叠（两者记在 localStorage）；输入自定义值时刷新不打断。选择型的 hint 改为解释含义。tests/test_control.py：页面元素、各控件的 options / presets、每个预设与选项都通过 `Config.from_env`、分组齐全。
 - 1.40.0（最低订单金额与 Predict 错误原话）：`MIN_ORDER_USD = 1`（接口拒绝低于 0.9 USD 的订单）：`live_room` 拦下金额不足的决定并写明原因；`live_test` 的份数按最低金额自动取（`ceil($1 / 价格)`，默认 2¢ 时 50 份；指定份数不足时提高并在首行说明），参数只在给出时校验范围。`_http_get` 对 predict.fun 域名优先用服务器自己的错误文本，403 附地区限制提示（原先 403 的通用提示盖掉了原话）。控制台挂单测试的确认文案、README（挂单测试、地区与最低金额一节、`/live` 行）、.env.example 同步。tests/test_trading.py：默认 50 份 $1.00、不足时改为 4 份并说明、正好够时不改、`live_room` 最低金额拦截；tests/test_control.py：页面测试 2 份改为 50 份；tests/test_tuning.py：`_http_get` 对 Predict 400/403/429 与 Binance 403 的文本。
