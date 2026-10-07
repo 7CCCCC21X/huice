@@ -677,6 +677,16 @@ async def maker_rules():
     await step(bot, NOW + 230_000, pts(NOW + 230_000))
     assert bot.sim_trades()["pts|up|挂#3"]["note"] == "撤单：触发门槛已改为 20.0¢，现净优势 15.0¢ 不达标，一份都没成交" and "pts|up|挂" not in bot.sim_trades()
     assert {r["item"]: r for r in bot.sim_checks(NOW + 230_000)}["pts"]["maker_why"] == "净优势 15.0¢ 低于触发门槛 20.0¢"
+    # a book silent for over five minutes: the resting order is withdrawn (no pricing basis left), placed again on a fresh one
+    bot.apply_config(m.dataclasses.replace(bot.config, sim_edge=0.10))
+    await step(bot, NOW + 240_000, pts(NOW + 240_000))
+    assert bot.sim_trades()["pts|up|挂"]["order"] == 50
+    await step(bot, NOW + 250_000, pts(NOW + 250_000 - 6 * 60_000))  # the book is six minutes old
+    assert bot.sim_trades()["pts|up|挂#4"]["note"] == "撤单：盘口断流超过 5 分钟，撤单，一份都没成交" and "pts|up|挂" not in bot.sim_trades()
+    await step(bot, NOW + 260_000, pts(NOW + 260_000 - 2 * 60_000))  # stale, but not for that long: nothing new, nothing withdrawn
+    assert "pts|up|挂" not in bot.sim_trades()
+    await step(bot, NOW + 270_000, pts(NOW + 270_000))
+    assert bot.sim_trades()["pts|up|挂"]["price"] == 0.55
     print("MAKER_RULES_OK")
 
 

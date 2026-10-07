@@ -37,9 +37,9 @@ async def request(port, raw):
     return int(head.split(b" ")[1]), head.decode(), body
 
 
-async def post(port, body, path=f"/p/{TOKEN}/control"):
+async def post(port, body, path=f"/p/{TOKEN}/control", headers=""):
     raw = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
-    st, head, out = await request(port, f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+    st, head, out = await request(port, f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{headers}"
                                         f"Content-Length: {len(raw)}\r\n\r\n".encode() + raw)
     try:
         return st, json.loads(out)
@@ -47,9 +47,11 @@ async def post(port, body, path=f"/p/{TOKEN}/control"):
         return st, {"raw": out.decode(errors="replace")}
 
 
-async def get_json(port, name):
-    st, _, body = await request(port, f"GET /p/{TOKEN}/{name} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
-    assert st == 200, (name, st)
+async def get_json(port, name, key=KEY, client=""):
+    """control.json needs the control key (X-Control-Key) when one is configured; the odds data does not."""
+    extra = (f"X-Control-Key: {key}\r\n" if key else "") + (f"X-Forwarded-For: {client}\r\n" if client else "")
+    st, _, body = await request(port, f"GET /p/{TOKEN}/{name} HTTP/1.1\r\nHost: x\r\n{extra}\r\n".encode())
+    assert st == 200, (name, st, body[:200])
     return json.loads(body)
 
 
@@ -91,6 +93,11 @@ async def run():
     assert st == 200 and "<title>交易控制台</title>" in body.decode() and "text/html" in head and "Content-Security-Policy" in head
     assert 'data-act="test"' in body.decode() and 'id="testlines"' in body.decode() and 'data-mode="pause"' in body.decode()
     assert 'id="cards"' in body.decode() and 'id="fold"' in body.decode() and 'id="adv"' in body.decode() and 'id="fields"' not in body.decode()  # option cards, no form
+    assert 'data-act="cancelaccount"' in body.decode() and 'sessionStorage.getItem("ctlkey")' in body.decode() and 'X-Control-Key' in body.decode()
+    st, _, raw = await request(port, f"GET /p/{TOKEN}/control.json HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    assert st == 403 and json.loads(raw)["locked"] and "需要控制口令" in json.loads(raw)["message"]  # the page token alone shows no account data
+    st, _, raw = await request(port, f"GET /p/{TOKEN}/control.json HTTP/1.1\r\nHost: x\r\nX-Control-Key: nope-nope-nope\r\n\r\n".encode())
+    assert st == 403 and json.loads(raw)["message"] == "口令错误"
     data = await get_json(port, "control.json")
     assert data["enabled"] and data["mode"] == "paper" and data["live"] is None and data["version"] == m.VERSION and data["checks"] == []
     assert 'id="checks"' in body.decode()
@@ -158,7 +165,10 @@ async def run():
     for _ in range(5):
         st, _ = await post(port, {"key": "wrong-key-123456", "action": "reset"}); assert st == 403
     st, j = await post(port, {"key": KEY, "action": "reset"}); assert st == 429 and "口令错误次数过多" in j["message"]
-    web.control_lock_until = 0.0
+    st, _, raw = await request(port, f"GET /p/{TOKEN}/control.json HTTP/1.1\r\nHost: x\r\nX-Control-Key: {KEY}\r\n\r\n".encode()); assert st == 429  # the same client, the read too
+    assert (await get_json(port, "control.json", client="10.9.8.7"))["enabled"]  # another client (X-Forwarded-For) is not locked
+    st, j = await post(port, {"key": KEY, "action": "reset"}, headers="X-Forwarded-For: 10.9.8.7\r\n"); assert st == 200
+    web.control_lock_until = {}  # the lock lapses
     st, j = await post(port, {"key": KEY, "action": "reset"}); assert st == 200
     # a request body over the limit, and one that lies about its length
     st, j = await post(port, json.dumps({"key": KEY, "action": "set", "values": {"SIM_SHARES": "9" * 20000}}).encode()); assert st == 400 and "过大" in j["message"]
@@ -207,7 +217,8 @@ async def run():
     assert rows[0]["price"] == 0.55 and rows[0]["order"] == 100 and rows[0]["maker"] and rows[0]["url"].startswith(m.PREDICT_SITE)
     st, j = await post(port3, {"key": KEY, "action": "cancel", "id": "99"}); assert st == 200 and "没有订单号为 99" in j["message"]
     st, j = await post(port3, {"key": KEY, "action": "cancel", "id": "77"})
-    assert st == 200 and "已撤单 1 笔" in j["message"] and ("remove", ["77"]) in fake.calls
+    assert st == 200 and "策略挂单 1 笔：Predict 确认撤掉 1 笔" in j["message"] and ("remove", ["77"]) in fake.calls
+    st, j = await post(port3, {"key": KEY, "action": "cancel", "id": "account"}); assert st == 200 and "没有真实挂单可撤" in j["message"], j  # the account-wide scope, nothing open now
     t = lbot.sim_trades()["x|up|挂"]
     assert t["status"] == "cancelled" and "管理员撤单" in t["note"] and t["live"]["state"] == "done"
     rows = (await get_json(port3, "control.json"))["live"]["orders"]

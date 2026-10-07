@@ -147,12 +147,16 @@ async def api_checks():
     assert await api.authenticate() == tok and api.jwt_exp == 1800000000 and api.auth_error == ""
     assert server["calls"][0][2] == {"x-api-key": "key-1"} and api.headers() == {"x-api-key": "key-1", "Authorization": f"Bearer {tok}"}
     # a 401 signs in again, once; a 429 pauses every request
-    server["answers"]["/orders?status=OPEN"] = {"success": True, "cursor": None, "data": [{"id": "7", "status": "OPEN"}]}
-    server["fail"]["/orders?status=OPEN"] = ["HTTP 401: expired"]
+    server["answers"]["/orders?status=OPEN&first=50"] = {"success": True, "cursor": None, "data": [{"id": "7", "status": "OPEN"}]}
+    server["fail"]["/orders?status=OPEN&first=50"] = ["HTTP 401: expired"]
     server["calls"].clear()
     assert await api.orders("OPEN") == [{"id": "7", "status": "OPEN"}]
-    assert [p for p, _, _ in server["calls"]] == ["/orders?status=OPEN", "/auth/message", "/auth", "/orders?status=OPEN"]
-    server["fail"]["/orders?status=OPEN"] = ["HTTP 429: slow down"]
+    assert [p for p, _, _ in server["calls"]] == ["/orders?status=OPEN&first=50", "/auth/message", "/auth", "/orders?status=OPEN&first=50"]
+    server["answers"]["/orders?status=OPEN&first=50"] = {"success": True, "cursor": "c1", "data": [{"id": "7", "status": "OPEN"}]}
+    server["answers"]["/orders?status=OPEN&first=50&after=c1"] = {"success": True, "cursor": None, "data": [{"id": "8", "status": "OPEN"}]}
+    assert [r["id"] for r in await api.orders("OPEN")] == ["7", "8"]  # the second page is read: a long list is never cut off
+    server["answers"]["/orders?status=OPEN&first=50"] = {"success": True, "cursor": None, "data": [{"id": "7", "status": "OPEN"}]}
+    server["fail"]["/orders?status=OPEN&first=50"] = ["HTTP 429: slow down"]
     try: await api.orders("OPEN"); assert False
     except m.RemoteError as e: assert "429" in str(e)
     try: await api.orders("OPEN"); assert False
@@ -164,7 +168,7 @@ async def api_checks():
     assert got == {"order_id": "123", "hash": "0xh", "code": "OK"} and server["calls"][-1][0] == "/orders"
     server["answers"]["/orders"] = {"success": False, "message": "Insufficient balance"}
     try: await api.create_order({"data": {}}); assert False
-    except m.RemoteError as e: assert "Insufficient balance" in str(e)
+    except m.RemoteError as e: assert isinstance(e, L.OrderRejected); assert "Insufficient balance" in str(e)
     server["answers"]["/orders"] = {"success": True, "data": {"nothing": 1}}
     try: await api.create_order({"data": {}}); assert False
     except m.RemoteError as e: assert "订单号" in str(e)
@@ -183,10 +187,10 @@ async def api_checks():
     except m.RemoteError as e: assert "500" in str(e)
     server["answers"]["/orders/0xee"] = {"success": True, "data": {}}
     assert await api.order("", "0xee") is None  # an empty answer is no order
-    server["answers"]["/orders?status=OPEN"] = {"data": [{"id": "66", "status": "OPEN", "order": {"hash": "0xcc"}}]}
+    server["answers"]["/orders?status=OPEN&first=50"] = {"data": [{"id": "66", "status": "OPEN", "order": {"hash": "0xcc"}}]}
     server["calls"].clear()
-    assert (await api.order("66"))["id"] == "66" and [p for p, _, _ in server["calls"]] == ["/orders?status=OPEN"]
-    assert await api.order("77") is None and all(p in {"/orders?status=OPEN"} for p, _, _ in server["calls"])
+    assert (await api.order("66"))["id"] == "66" and [p for p, _, _ in server["calls"]] == ["/orders?status=OPEN&first=50"]
+    assert await api.order("77") is None and all(p in {"/orders?status=OPEN&first=50"} for p, _, _ in server["calls"])
     server["answers"]["/positions"] = {"success": True, "data": [{"id": "p1"}]}
     assert await api.positions() == [{"id": "p1"}]
     server["answers"]["/markets/101"] = {"success": True, "data": {"id": 101, "outcomes": []}}
@@ -400,7 +404,7 @@ async def run():
     assert mkt["order"]["expiration"] == str(NOW // 1000 + 300) and mkt["order"]["tokenId"] == "1011"
     assert maker["live"]["hash"] == o["hash"].lower() and maker["live"]["want"]["outcome"] == "Up" and maker["live"]["usd_cap"] == 55.0
     assert maker["version"]["live"] and maker["version"]["live_account"] == "0x8fd3…7A03"
-    assert abs(bot.live_exposure(trades) - (55 + 100 * taker["price"])) < 1e-9  # resting orders count at their price
+    assert abs(bot.live_exposure(trades) - (55 + 100 * 0.591)) < 1e-9  # resting orders are reserved at their cap: the maker's price, the taker's limit
     assert L.sim_status(taker) == "吃单等待成交（真实订单 #102 已成交 0/100 份）" and L.sim_status(maker) == "挂单中（真实订单 #101 已成交 0/100 份）"
     assert "限价吃单等待 Predict 成交（封顶 59.1¢" in bot.sim_wait(taker, world["markets"][0], NOW) and "挂 55.0¢" in bot.sim_wait(maker, world["markets"][0], NOW)
     # the edge lasting buys nothing more; the open orders are read back each step
@@ -522,7 +526,7 @@ async def run():
     bot.live.markets["101"] = L.parse_market(market_json("101", status="RESOLVED"), 200)
     assert "RESOLVED" in bot.live_room({}, mk, "up", 0.58, 100)
     bot.live.markets["101"] = L.parse_market(market_json("101", names=("A", "B")), 200)
-    assert bot.live_room({}, mk, "down", 0.42, 100) == ""  # a daily market: assumed from the order, and said so in the record
+    assert "结果名称无法确认方向，不下真实单（按结果顺序推定" in bot.live_room({}, mk, "down", 0.42, 100)  # a guessed side is never a real order
     bot.live.markets["101"] = L.parse_market(market_json("101", names=("Maybe", "Later")), 200)
     assert "无法确定要买的结果代币" in bot.live_room({}, dataclasses.replace(mk, kind="ladder"), "up", 0.58, 100)
     bot.live.markets["101"] = L.parse_market(market_json("101"), 200)
@@ -576,7 +580,7 @@ async def run():
     bot.config = dataclasses.replace(bot.config, sim_ways="both")
     await step(bot, CLOSE + 62 * 60_000, rest(CLOSE + 62 * 60_000))
     oid = bot.sim_trades()["rest|up|挂"]["live"]["order_id"]
-    assert oid in fake.open and "已撤单 1 笔" in await bot.cmd_live(req("cancel", "all"))
+    assert oid in fake.open and "策略挂单 1 笔：Predict 确认撤掉 1 笔" in await bot.cmd_live(req("cancel", "all"))
     t = bot.sim_trades()["rest|up|挂"]
     assert oid in fake.closed and t["status"] == "cancelled" and "管理员撤单" in t["note"] and t["live"]["final"] == "cancelled"
     assert "没有真实挂单可撤" in await bot.cmd_live(req("cancel", "all"))
@@ -754,6 +758,158 @@ async def run():
     assert mbot.sim_trades()[f"{mtid}#2"]["live"]["state"] == "done" and ("remove", ["102"]) in mfake.calls
     await step(mbot, NOW + 70_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 70_000))
     assert mbot.sim_trades()[mtid]["price"] == 0.57 and mbot.sim_trades()[mtid]["live"]["order_id"] == "103"
+
+    # --- execution safety: reserved until Predict's final word, cancels confirmed, unknown results reconciled, the pre-send check
+    sbot = make_bot(SIM_WAYS="both")
+    await sbot.live_prepare()
+    sfake = sbot.live.api
+    assert 0 <= time.monotonic() - sbot.live.approvals_mono < 60 and sbot.live.approvals_at > 1e9  # one clock for the interval, one for display
+    await sbot.live_prefetch(NOW)
+    await step(sbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    s_trades = sbot.sim_trades()
+    smaker, staker = s_trades[f"{HSI_SLUG}|up|挂"], s_trades[f"{HSI_SLUG}|up|吃"]
+    assert abs(sbot.live_reserved(smaker) - 55.0) < 1e-9 and abs(sbot.live_reserved(staker) - 59.1) < 1e-9  # every unfilled share at the order's cap
+    status0 = sbot.live_status(NOW)
+    assert status0["unconfirmed"] == 0 and status0["synced_at"] and status0["unknown_open"] == [] and status0["allowed"] is True
+    # a withdrawal releases nothing while the cancel is unconfirmed (the open list cannot be read): the reservation stays
+    sfake.fail_open = "HTTP 500: boom"
+    result = await sbot.live_control("cancel", {"id": "all"})
+    text = result["message"]
+    assert result["ok"] is False and text.startswith("❌") and "发送撤单请求失败" in text and "尚未发出" in text, text  # the page is told it did not succeed
+    s_trades = sbot.sim_trades()
+    assert s_trades[f"{HSI_SLUG}|up|挂"]["status"] == "cancelled" and s_trades[f"{HSI_SLUG}|up|挂"]["live"]["state"] == "cancelling"
+    assert abs(sbot.live_exposure(s_trades) - 114.1) < 1e-9 and sbot.live_status(NOW)["unconfirmed"] == 2
+    assert sbot.live_status(NOW)["orders"][0]["live_state"] == "cancelling"  # the active orders come first
+    sfake.fail_open = None
+    await step(sbot, NOW + 10_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
+    s_trades = sbot.sim_trades()
+    assert all(t["live"]["state"] == "done" for t in s_trades.values()) and sbot.live_exposure(s_trades) == 0.0  # confirmed: released
+    assert any(("Predict 确认已撤" in e["what"]) for e in s_trades[f"{HSI_SLUG}|up|挂"]["live"]["events"])
+    # an order whose id never came back (the answer was lost): the cancel asks Predict by the hash, adopts the id, removes it
+    sfake.markets["103"] = market_json("103")
+    await sbot.live_prefetch(NOW + 20_000)
+    await step(sbot, NOW + 20_000, deep(NOW + 20_000))
+    d_rec = sbot.sim_trades()["deep|up|吃"]
+    lost_id = d_rec["live"]["order_id"]
+    d_rec["live"].update(order_id="", state="cancelling", cancel_why="测试", placing_at=NOW + 20_000)
+    d_rec["status"] = "cancelled"
+    sbot.sim_save([("deep|up|吃", d_rec)])
+    await step(sbot, NOW + 30_000, deep(NOW + 30_000))
+    d2 = sbot.sim_trades()["deep|up|吃#1"]
+    assert d2["live"]["order_id"] == lost_id and ("remove", [lost_id]) in sfake.calls and d2["live"]["state"] == "done"
+    assert any("撤单前按哈希找到" in e["what"] for e in d2["live"]["events"]), d2["live"]["events"]
+    # a hash Predict does not know: the record waits through the grace period, then ends as never sent; no hash at all ends at once
+    sfake.markets["110"] = market_json("110")
+    rest_mk = lambda at: m.SimMarket("rest2", "rest2", "close", "R2", 0.70, book([("0.55", "300")], [("0.60", "100")], at, "rest2", mid="110"), 0.03, "", ("涨", "跌"), {"key": "R2", "close_ms": CLOSE})
+    await sbot.live_prefetch(NOW + 40_000)
+    await step(sbot, NOW + 40_000, rest_mk(NOW + 40_000))
+    r_rec = sbot.sim_trades()["rest2|up|挂"]
+    real_id = r_rec["live"]["order_id"]
+    sfake.open.pop(real_id)  # the real one is gone from the fake book: this record now stands for a request Predict never saw
+    r_rec["live"].update(order_id="", hash="0x" + "77" * 32, state="cancelling", cancel_why="测试", placing_at=NOW + 40_000)
+    r_rec["status"] = "cancelled"
+    sbot.sim_save([("rest2|up|挂", r_rec)])
+    await step(sbot, NOW + 50_000, rest_mk(NOW + 50_000))
+    assert sbot.sim_trades()["rest2|up|挂"]["live"]["state"] == "cancelling"  # within the grace period: still asked for
+    assert abs(sbot.live_reserved(sbot.sim_trades()["rest2|up|挂"]) - 55.0) < 1e-9  # and still reserved
+    await step(sbot, NOW + 50_000 + sbot.LIVE_PLACING_GRACE_MS + 10_000, rest_mk(NOW + 50_000 + sbot.LIVE_PLACING_GRACE_MS + 10_000))
+    r2 = sbot.sim_trades()["rest2|up|挂"]
+    assert r2["live"]["state"] == "done" and r2["live"]["final"] == "cancelled" and sbot.live_reserved(r2) == 0.0
+    sfake.markets["111"] = market_json("111")
+    rest3 = lambda at: m.SimMarket("rest3", "rest3", "close", "R3", 0.70, book([("0.55", "300")], [("0.60", "100")], at, "rest3", mid="111"), 0.03, "", ("涨", "跌"), {"key": "R3", "close_ms": CLOSE})
+    await sbot.live_prefetch(NOW + 300_000)
+    await step(sbot, NOW + 300_000, rest3(NOW + 300_000))
+    r3 = sbot.sim_trades()["rest3|up|挂"]
+    sfake.open.pop(r3["live"]["order_id"])
+    r3["live"].update(order_id="", hash="", state="cancelling", cancel_why="测试")
+    r3["status"] = "cancelled"
+    sbot.sim_save([("rest3|up|挂", r3)])
+    calls_before = len(sfake.calls)
+    await step(sbot, NOW + 310_000, rest3(NOW + 310_000))
+    assert sbot.sim_trades()["rest3|up|挂"]["live"]["state"] == "done" and len([c for c in sfake.calls[calls_before:] if c[0] == "remove"]) == 0  # never built: nothing to ask Predict
+    # the open list misses an order whose own record still says OPEN: it is not ended; when the record says FILLED it is
+    sfake.markets["112"] = market_json("112")
+    gone = lambda at: m.SimMarket("gone", "gone", "close", "G", 0.70, book([], [("0.58", "100"), ("0.70", "1000")], at, "gone", mid="112"), 0.03, "", ("涨", "跌"), {"key": "G", "close_ms": CLOSE})
+    await sbot.live_prefetch(NOW + 320_000)
+    await step(sbot, NOW + 320_000, gone(NOW + 320_000))
+    g_rec = sbot.sim_trades()["gone|up|吃"]
+    g_row = sfake.open.pop(g_rec["live"]["order_id"])
+    sfake.closed[g_rec["live"]["order_id"]] = g_row  # findable by id / hash, but no longer in the open list; still OPEN
+    await step(sbot, NOW + 330_000, gone(NOW + 330_000))
+    g2 = sbot.sim_trades()["gone|up|吃"]
+    assert g2["live"]["state"] == "open" and g2["status"] == "resting" and any("继续跟踪" in e["what"] for e in g2["live"]["events"])
+    assert abs(sbot.live_reserved(g2) - 59.1) < 1e-9
+    g_row["status"], g_row["amountFilled"] = "FILLED", g_row["amount"]
+    await step(sbot, NOW + 340_000, gone(NOW + 340_000))
+    g3 = sbot.sim_trades()["gone|up|吃"]
+    assert g3["live"]["state"] == "done" and g3["live"]["final"] == "filled" and g3["shares"] == 100 and g3["status"] == "filled"
+    # a 5xx on sending leaves the result unknown: the record stays "placing" (nothing is re-sent) and is reconciled by its hash —
+    # here Predict had filled it at once, so the position is recognised rather than the attempt failed
+    sfake.markets["113"] = market_json("113")
+    fast = lambda at: m.SimMarket("fast", "fast", "close", "F", 0.70, book([], [("0.58", "100"), ("0.70", "1000")], at, "fast", mid="113"), 0.03, "", ("涨", "跌"), {"key": "F", "close_ms": CLOSE})
+    sfake.fail_create = "HTTP 502: bad gateway"
+    await sbot.live_prefetch(NOW + 400_000)
+    await step(sbot, NOW + 400_000, fast(NOW + 400_000))
+    f_rec = sbot.sim_trades()["fast|up|吃"]
+    assert f_rec["live"]["state"] == "placing" and any("结果未知" in e["what"] for e in f_rec["live"]["events"]) and abs(sbot.live_reserved(f_rec) - 59.1) < 1e-9
+    sfake.fail_create = None
+    sfake.closed["900"] = {"id": "900", "status": "FILLED", "amount": str(100 * WEI), "amountFilled": str(100 * WEI), "order": {"hash": f_rec["live"]["hash"]}}
+    await step(sbot, NOW + 410_000, fast(NOW + 410_000))
+    f2 = sbot.sim_trades()["fast|up|吃"]
+    assert f2["live"]["order_id"] == "900" and f2["shares"] == 100 and f2["status"] == "filled" and any("按哈希找回" in e["what"] for e in f2["live"]["events"])
+    await step(sbot, NOW + 420_000, fast(NOW + 420_000))
+    assert sbot.sim_trades()["fast|up|吃"]["live"]["state"] == "done" and len([1 for k, _ in sfake.calls if k == "create"]) == len([1 for k, _ in sfake.calls if k == "create"])
+    # an answer without an order id is unknown too; a 4xx is a definite refusal (failed at once, backed off)
+    sfake.markets["114"] = market_json("114")
+    noid = lambda at: m.SimMarket("noid", "noid", "close", "N", 0.70, book([], [("0.58", "100"), ("0.70", "1000")], at, "noid", mid="114"), 0.03, "", ("涨", "跌"), {"key": "N", "close_ms": CLOSE})
+    sfake.fail_create = "下单应答没有订单号：{}"
+    await sbot.live_prefetch(NOW + 500_000)
+    await step(sbot, NOW + 500_000, noid(NOW + 500_000))
+    assert sbot.sim_trades()["noid|up|吃"]["live"]["state"] == "placing"
+    sfake.fail_create = None
+    await step(sbot, NOW + 500_000 + sbot.LIVE_PLACING_GRACE_MS + 10_000, noid(NOW + 500_000 + sbot.LIVE_PLACING_GRACE_MS + 10_000))
+    assert sbot.sim_trades()["noid|up|吃#1"]["live"]["final"] == "failed" and "noid|up|吃" not in sbot.sim_trades()  # never found by its hash: given up, never re-sent
+    # the pre-send check: a pending record is not sent in pause, nor when its decision is stale
+    sfake.markets["115"] = market_json("115")
+    late_mk = lambda at: m.SimMarket("late2", "late2", "close", "L2", 0.70, book([], [("0.58", "100"), ("0.70", "1000")], at, "late2", mid="115"), 0.03, "", ("涨", "跌"), {"key": "L2", "close_ms": CLOSE})
+    await sbot.live_prefetch(NOW + 600_000)
+    await step(sbot, NOW + 600_000, late_mk(NOW + 600_000))
+    l_rec = sbot.sim_trades()["late2|up|吃"]
+    sfake.open.pop(l_rec["live"]["order_id"])
+    l_rec["live"].update(state="pending", order_id="", hash="")  # as if restored before it was ever sent
+    sbot.sim_save([("late2|up|吃", l_rec)])
+    sbot.apply_config(dataclasses.replace(sbot.config, live_mode="pause"))
+    creates = len([1 for k, _ in sfake.calls if k == "create"])
+    await step(sbot, NOW + 610_000, late_mk(NOW + 610_000))
+    assert len([1 for k, _ in sfake.calls if k == "create"]) == creates and sbot.sim_trades()["late2|up|吃#1"]["note"] == "未下单：LIVE=pause，不下单"
+    sbot.apply_config(dataclasses.replace(sbot.config, live_mode="on"))
+    sbot.live_backoff.clear()
+    stale_rec = dict(sbot.sim_trades()["late2|up|吃#1"])
+    stale_rec["live"] = {**stale_rec["live"], "state": "pending", "order_id": "", "hash": "", "events": [{"at": NOW + 400_000, "what": "决定下单"}]}
+    stale_rec["status"] = "resting"
+    sbot.sim_save([("late2|up|吃", stale_rec)])
+    await step(sbot, NOW + 620_000, late_mk(NOW + 620_000))
+    assert len([1 for k, _ in sfake.calls if k == "create"]) == creates and "决定已过时" in sbot.sim_trades()["late2|up|吃#2"]["note"]
+    # orders on the account this bot never placed: listed, announced, not counted; /live cancel account removes them too
+    sfake.open["777"] = {"id": "777", "status": "OPEN", "amount": str(10 * WEI), "amountFilled": "0", "order": {"hash": "0xforeign"}}
+    await step(sbot, NOW + 700_000, late_mk(NOW + 700_000))  # nothing in flight: the list is still re-read every minute
+    assert [u["id"] for u in sbot.live_unknown_open] == ["777"] and "没有记录的挂单" in sbot.live_text(NOW + 700_000) and sbot.live_status(NOW + 700_000)["unknown_open"][0]["id"] == "777"
+    text = await sbot.cmd_live(m.Request("/live", ["cancel", "account"], 1, 0, 1))
+    assert ("remove", ["777"]) in sfake.calls and "账户上无记录的挂单 1 张：Predict 确认撤掉 1 张" in text and sbot.live_unknown_open == [], text
+    # the hard switch: LIVE_TRADING_ALLOWED=off caps the mode at pause, refuses the switch to on and the sending alike
+    hc = m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "LIVE_TRADING_ALLOWED": "off"})
+    assert hc.live_mode == "pause" and hc.live_allowed is False and hc.live
+    hbot = make_bot(LIVE_TRADING_ALLOWED="off")
+    await hbot.live_prepare()
+    assert hbot.config.live_mode == "pause" and "硬开关" in "\n".join(hbot.live.summary_lines()) and hbot.live_status(NOW)["allowed"] is False
+    assert "LIVE_TRADING_ALLOWED=off" in await hbot.cmd_live(m.Request("/live", ["mode", "on"], 1, 0, 1)) and hbot.config.live_mode == "pause"
+    hbot.apply_config(dataclasses.replace(hbot.config, live_mode="on"))  # even forced on in memory, nothing goes out
+    assert "LIVE_TRADING_ALLOWED=off" in hbot.live_room({}, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW), "up", 0.58, 100)
+    assert "LIVE_TRADING_ALLOWED=off" in hbot.live_send_block({"live": {"want": {"shares": 100}, "events": [{"at": NOW}]}, "order": 100, "price": 0.5, "opened": NOW}, {}, NOW)
+    # a failing page action is not reported as a success
+    sbot.live.ready_error = "HTTP 401"
+    assert (await sbot.live_control("test", {}))["ok"] is False
+    sbot.live.ready_error = ""
 
     # --- /live test: a tiny resting order far under the market, listed, withdrawn, its final state read ---------------------
     tbot = make_bot(SIM_WAYS="both")

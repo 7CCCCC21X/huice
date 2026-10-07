@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.45.0"
+VERSION = "1.46.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -530,6 +530,7 @@ class Config:
     # Real trading (live.py): LIVE=on sends every paper-trading decision to Predict as a real order.
     live: bool = False                 # LIVE=on or LIVE=pause: the real-trading module runs (live_mode says whether it opens positions)
     live_mode: str = "off"             # off | pause (wallet, sign-in, checks, the order test and cancels work; no new positions) | on
+    live_allowed: bool = True          # LIVE_TRADING_ALLOWED: the deployment's hard switch; off caps the mode at pause whatever the database saved
     live_key: str = field(default="", repr=False)  # PREDICT_PRIVATE_KEY: the signing wallet's private key (never logged)
     live_account: str = ""             # PREDICT_ACCOUNT: the Predict account (smart wallet / deposit address) the key controls; "" = the key's own address
     live_chain: int = 56               # PREDICT_CHAIN_ID: 56 = BNB mainnet, 97 = BNB testnet
@@ -571,6 +572,9 @@ class Config:
         live_mode = {"on": "on", "1": "on", "true": "on", "yes": "on", "pause": "pause", "paused": "pause", "test": "pause"}.get(
             e.get("LIVE", "off").strip().lower(), "off")
         live = live_mode != "off"
+        live_allowed = not off(e.get("LIVE_TRADING_ALLOWED", "on"))
+        if live_mode == "on" and not live_allowed:
+            live_mode = "pause"  # the hard switch: nothing the database saved can turn real orders on past it
         live_key, live_account = e.get("PREDICT_PRIVATE_KEY", "").strip(), e.get("PREDICT_ACCOUNT", "").strip()
         live_chain = bounded_int(e, "PREDICT_CHAIN_ID", 56, 1, 10**9)
         live_rpc = e.get("BSC_RPC_URL", "").strip().rstrip("/")
@@ -661,7 +665,7 @@ class Config:
             web_port=0 if e.get("WEB", "on").strip().lower() in {"off", "0", "false", "no"}
             else bounded_int(e, "WEB_PORT", int(e.get("PORT") or 0), 0, 65535),
             web_token=e.get("WEB_TOKEN", "").strip(),
-            live=live, live_mode=live_mode, live_key=live_key, live_account=live_account, live_chain=live_chain, live_rpc=live_rpc,
+            live=live, live_mode=live_mode, live_allowed=live_allowed, live_key=live_key, live_account=live_account, live_chain=live_chain, live_rpc=live_rpc,
             live_taker_wait=bounded_int(e, "LIVE_TAKER_WAIT_SECONDS", 60, 5, 3600),
             live_retry=bounded_int(e, "LIVE_RETRY_SECONDS", 300, 10, 86400),
             live_max_order_usd=parse_bounded(e, "LIVE_MAX_ORDER_USD", "100", 1, 1_000_000),
@@ -6908,6 +6912,7 @@ def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
 
 
 SIM_MAKER_FOLLOW = 0.01  # a resting order follows the valid 买1 once it has moved this far (1¢) from the order's price
+SIM_STALE_WITHDRAW_MS = 5 * 60_000  # a resting order whose book has not refreshed this long is withdrawn: no pricing basis is left
 
 
 def maker_level(book: PredictBook, side: str, min_size: float, own: float = 0.0, own_price: float | None = None) -> tuple[float, float] | None:
@@ -8469,10 +8474,10 @@ button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
 <body><div class="wrap">
 <header><div><h1>交易控制台</h1><div class="meta" id="meta">加载中…</div></div>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="journal" href="#">复盘页</a><button id="reload">刷新</button></div></header>
-<section class="card"><label class="f"><span>控制口令</span><input type="password" id="key" autocomplete="off" placeholder="环境变量 WEB_CONTROL_KEY"><small><label><input type="checkbox" id="remember"> 在这个浏览器记住口令</label></small></label><p class="mut" id="authnote"></p></section>
+<section class="card"><label class="f"><span>控制口令</span><input type="password" id="key" autocomplete="off" placeholder="环境变量 WEB_CONTROL_KEY"><small><label><input type="checkbox" id="remember"> 在这个标签页保留口令（关闭标签页即清除）</label></small></label><p class="mut" id="authnote"></p></section>
 <section class="card" id="live"><h2>真实交易 <span class="state" id="livestate"></span></h2>
 <div class="row" id="modebtns"><span class="mut" style="align-self:center">模式：</span><button data-mode="off">off 只记账</button><button data-mode="pause">pause 登录不开仓</button><button data-mode="on">on 真实下单</button></div>
-<div class="row" id="livebtns"><button data-act="pause">⏸ 暂停开新仓</button><button data-act="resume" class="pri">▶️ 恢复</button><button data-act="cancelall" class="bad">撤掉全部挂单</button><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button><button data-act="test">挂单测试</button></div>
+<div class="row" id="livebtns"><button data-act="pause">⏸ 暂停开新仓</button><button data-act="resume" class="pri">▶️ 恢复</button><button data-act="cancelall" class="bad">撤掉本策略挂单</button><button data-act="cancelaccount" class="bad">撤掉账户全部挂单</button><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button><button data-act="test">挂单测试</button></div>
 <pre id="livelines"></pre><pre id="testlines" class="mut"></pre></section>
 <section class="card" id="settings"><div class="hd"><h2>策略与风控参数</h2><button id="fold" class="lnk">收起</button></div>
 <div id="setbody"><p class="mut">点一个选项就立即生效，并保存到数据库（重启仍有效）；数字项点预设值，或填自定义值后按保存。标“环境变量”的是部署时的值，标“已保存”的是在这里改过的，“恢复环境变量”撤销单项。</p>
@@ -8488,11 +8493,14 @@ const $=id=>document.getElementById(id);
 $("back").href=base;$("journal").href=base+"/journal";
 let data=null,busy=false,adv=false,folded=false;
 try{adv=localStorage.getItem("ctladv")==="1";folded=localStorage.getItem("ctlfold")==="1"}catch(e){}
-try{const k=localStorage.getItem("ctlkey");if(k){$("key").value=k;$("remember").checked=true}}catch(e){}
-function keep(){try{if($("remember").checked)localStorage.setItem("ctlkey",$("key").value);else localStorage.removeItem("ctlkey")}catch(e){}}
-$("remember").addEventListener("change",keep);$("key").addEventListener("input",keep);
+try{const k=sessionStorage.getItem("ctlkey");if(k){$("key").value=k;$("remember").checked=true}}catch(e){}
+function keep(){try{if($("remember").checked)sessionStorage.setItem("ctlkey",$("key").value);else sessionStorage.removeItem("ctlkey")}catch(e){}}
+$("remember").addEventListener("change",keep);$("key").addEventListener("input",keep);$("key").addEventListener("change",load);
 function toast(t,ok){const el=$("toast");el.textContent=t;el.className=ok?"ok":"bad";el.style.display="block";clearTimeout(toast.t);toast.t=setTimeout(()=>{el.style.display="none"},7000)}
-async function load(){try{const r=await fetch(base+"/control.json",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();render()}catch(e){$("meta").textContent="加载失败："+e.message}}
+async function load(){const key=$("key").value.trim();
+  try{const r=await fetch(base+"/control.json",{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
+    if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}$("meta").textContent=(j.message||("HTTP "+r.status))+"｜账户、订单与设置只在口令正确时显示";data=null;return}
+    if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();render()}catch(e){$("meta").textContent="加载失败："+e.message}}
 async function act(body){if(busy)return;const key=$("key").value.trim();if(!key){toast("请先输入控制口令",false);return}
   busy=true;try{const r=await fetch(base+"/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key,...body})});
   let j={};try{j=await r.json()}catch(e){}toast(j.message||("HTTP "+r.status),!!j.ok);await load()}catch(e){toast("请求失败："+e.message,false)}finally{busy=false}}
@@ -8505,9 +8513,10 @@ function render(){
   const liveOn=!!L&&L.mode!=="off";
   $("livestate").textContent=L?(L.mode==="off"?"LIVE=off：只记账":L.mode==="pause"?"LIVE=pause：只测试，不开新仓"+(L.ready?"":"｜未就绪："+L.ready_error):L.paused?"已暂停："+L.paused:L.killed?"今日停开新仓："+L.killed:L.ready?"LIVE=on：运行中":"未就绪："+L.ready_error):"未加载（没有私钥）";
   $("livestate").className="state "+(L?(L.mode==="off"?"":L.mode==="pause"||L.paused||L.killed?"warn":L.ready?"on":"off"):"");
+  if(L&&L.allowed===false)$("livestate").textContent+="｜硬开关 LIVE_TRADING_ALLOWED=off";
   $("modebtns").querySelectorAll("button").forEach(b=>{b.disabled=!L||!data.enabled;b.className=L&&b.dataset.mode===L.mode?"pri":""});
   $("livebtns").querySelectorAll("button").forEach(b=>{b.disabled=!liveOn||!data.enabled});
-  $("livelines").textContent=L?(liveOn?[...L.lines,"策略："+data.scope.join("；"),"持仓+挂单 $"+L.exposure.toFixed(2)+" / $"+L.caps.open+"｜今日已结算盈亏 "+money(L.daily_pnl)+"（上限 −$"+L.caps.daily_loss+"）｜挂单中 "+L.resting+"｜今日下单 "+L.placed_today+"｜失败 "+L.failed_today].join("\n"):"LIVE=off：模拟交易只记账。点 pause 会登录 Predict、校验钱包、读余额和授权，可自检和挂单测试，但不开新仓；点 on 才真实下单。切换立即生效并保存。"):"没有配置 PREDICT_PRIVATE_KEY：在 Railway Variables 配置私钥（和 PREDICT_API_KEY）并重新部署后，这里才能切换模式。";
+  $("livelines").textContent=L?(liveOn?[...L.lines,"策略："+data.scope.join("；"),"持仓+挂单 $"+L.exposure.toFixed(2)+" / $"+L.caps.open+"｜今日已结算盈亏 "+money(L.daily_pnl)+"（上限 −$"+L.caps.daily_loss+"）｜挂单中 "+L.resting+"｜未确认 "+L.unconfirmed+"｜今日下单 "+L.placed_today+"｜失败 "+L.failed_today+(L.synced_at?"｜订单同步 "+L.synced_at:""),...(L.unknown_open&&L.unknown_open.length?["⚠️ 账户上有 "+L.unknown_open.length+" 张本机器人没有记录的挂单（#"+L.unknown_open.map(u=>u.id).join("、#")+"）：不计入这里的额度；“撤掉账户全部挂单”可一起撤"]:[])].join("\n"):"LIVE=off：模拟交易只记账。点 pause 会登录 Predict、校验钱包、读余额和授权，可自检和挂单测试，但不开新仓；点 on 才真实下单。切换立即生效并保存。"):"没有配置 PREDICT_PRIVATE_KEY：在 Railway Variables 配置私钥（和 PREDICT_API_KEY）并重新部署后，这里才能切换模式。";
   renderSettings();
   $("simline").textContent="记录 "+data.sim.trades+" 笔｜已结算 "+data.sim.settled+" 笔，盈亏 "+money(data.sim.pnl)+"｜持仓 "+data.sim.open+"｜挂单中 "+data.sim.resting+"（成本 $"+data.sim.open_cost.toFixed(2)+"）";
   const o=$("orders");o.replaceChildren();
@@ -8568,7 +8577,8 @@ $("adv").addEventListener("click",()=>{adv=!adv;try{localStorage.setItem("ctladv
 $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.act;
   if(a==="pause"){const why=prompt("暂停原因（可留空）","");if(why===null)return;act({action:"pause",why})}
   else if(a==="test"){if(confirm("在 Predict 上挂一张远离盘口的限价单（不高于 2¢，份数按 Predict 最低订单金额 $1 取，2¢ 时 50 份），确认它出现在盘口后立即撤掉，用来验证真实下单链路。最多锁定约 1 美元，极少数情况下可能成交。继续？"))act({action:"test"})}
-  else if(a==="cancelall"){if(confirm("撤掉 Predict 上全部真实挂单？已成交的份数继续持有。"))act({action:"cancel",id:"all"})}
+  else if(a==="cancelall"){if(confirm("撤掉本策略在 Predict 上的全部真实挂单？已成交的份数继续持有；以 Predict 的确认为准，确认前额度仍占用。"))act({action:"cancel",id:"all"})}
+  else if(a==="cancelaccount"){if(confirm("撤掉这个 Predict 账户上的全部挂单，包括手动单和本机器人没有记录的单？"))act({action:"cancel",id:"account"})}
   else act({action:a})});
 $("reset").addEventListener("click",()=>{if(confirm("清除网页上保存的全部设置，恢复为环境变量？"))act({action:"reset"})});
 $("reload").addEventListener("click",load);
@@ -8637,8 +8647,8 @@ class WebServer:
         self.streams = 0  # event streams open now
         self.server: asyncio.base_events.Server | None = None
         self.pages = {"page": WEB_PAGE.encode("utf-8"), "journal": JOURNAL_PAGE.encode("utf-8"), "control": CONTROL_PAGE.encode("utf-8")}
-        self.control_failures: list[float] = []  # monotonic times of wrong keys (CONTROL_TRIES in CONTROL_LOCK_SECONDS locks)
-        self.control_lock_until = 0.0
+        self.control_failures: dict[str, list[float]] = {}  # client -> monotonic times of wrong keys (CONTROL_TRIES in CONTROL_LOCK_SECONDS locks)
+        self.control_lock_until: dict[str, float] = {}      # client -> locked until (monotonic); one viewer's guesses lock no one else
         self.cache: dict[str, tuple[float, bytes]] = {}  # name -> (expires, body): the JSON is built once per interval
         self.gzipped: dict[bytes, bytes] = {body: gzip.compress(body, compresslevel=9) for body in self.pages.values()}
 
@@ -8690,17 +8700,58 @@ class WebServer:
                 return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
             if parts[2] == "control":
                 return 200, "text/html; charset=utf-8", self.pages["control"]
-            if parts[2] == "control.json":
-                return 200, "application/json; charset=utf-8", self.cached(
-                    "control.json", lambda: json.dumps(self.bot.control_payload(), ensure_ascii=False, default=str).encode("utf-8"))
         return 404, "text/plain; charset=utf-8", b"not found"
 
-    def is_control(self, path: str) -> bool:
+    def is_control(self, path: str, name: str = "control") -> bool:
         parts = path.strip("/").split("/")
-        return (len(parts) == 3 and parts[0] == "p" and parts[2] == "control" and parts[1].isascii()
+        return (len(parts) == 3 and parts[0] == "p" and parts[2] == name and parts[1].isascii()
                 and hmac.compare_digest(parts[1], self.token))
 
-    async def control(self, reader: asyncio.StreamReader, head: str) -> tuple[int, str, bytes]:
+    @staticmethod
+    def client_of(head: str, writer: asyncio.StreamWriter | None) -> str:
+        """Who is asking, for the per-client lock: the first address in X-Forwarded-For (Railway's edge sets it), else
+        the peer's address."""
+        match = re.search(r"(?im)^x-forwarded-for:[ \t]*([^,\r\n]+)", head)
+        if match and match.group(1).strip():
+            return match.group(1).strip()[:64]
+        peer = writer.get_extra_info("peername") if writer is not None else None
+        return str(peer[0]) if isinstance(peer, tuple) and peer else "-"
+
+    def control_key_failed(self, client: str, now: float) -> None:
+        fails = [t for t in self.control_failures.get(client, []) if now - t < self.CONTROL_LOCK_SECONDS] + [now]
+        if len(fails) >= self.CONTROL_TRIES:
+            self.control_lock_until[client], fails = now + self.CONTROL_LOCK_SECONDS, []
+        self.control_failures[client] = fails
+        if len(self.control_failures) > 500:  # a scanner with many addresses: forget the oldest
+            for old in list(self.control_failures)[:-500]:
+                self.control_failures.pop(old, None)
+        self.control_lock_until = {k: v for k, v in self.control_lock_until.items() if v > now}
+
+    def control_json(self, head: str, client: str) -> tuple[int, str, bytes]:
+        """GET /p/<token>/control.json: the control page's data (account, orders, positions, settings, the order check).
+        With WEB_CONTROL_KEY set it needs the key in X-Control-Key: the page token alone shows the odds page, never the
+        account. A wrong key counts towards the client's lock like a wrong action key."""
+        answer = lambda status, message: (status, "application/json; charset=utf-8",
+                                          json.dumps({"ok": False, "locked": True, "message": message}, ensure_ascii=False).encode("utf-8"))
+        full = lambda: (200, "application/json; charset=utf-8", self.cached(
+            "control.json", lambda: json.dumps(self.bot.control_payload(), ensure_ascii=False, default=str).encode("utf-8")))
+        configured = self.bot.config.web_control_key
+        if not configured:
+            return full()  # no key configured: the page is view-only and says so
+        now = time.monotonic()
+        if now < self.control_lock_until.get(client, 0.0):
+            return answer(429, f"口令错误次数过多，{int(self.control_lock_until[client] - now) + 1} 秒后再试")
+        match = re.search(r"(?im)^x-control-key:[ \t]*(\S+)[ \t]*\r?$", head)
+        key = match.group(1) if match else ""
+        if not key:
+            return answer(403, "需要控制口令：输入口令后才显示账户、订单、持仓和设置")
+        if not key.isascii() or not hmac.compare_digest(key, configured):
+            self.control_key_failed(client, now)
+            return answer(403, "口令错误")
+        self.control_failures.pop(client, None)
+        return full()
+
+    async def control(self, reader: asyncio.StreamReader, head: str, client: str = "-") -> tuple[int, str, bytes]:
         """POST /p/<token>/control: a JSON body with the control key and an action. The key is compared in constant
         time; CONTROL_TRIES wrong keys lock the route for CONTROL_LOCK_SECONDS. Answers are JSON {"ok", "message"}."""
         answer = lambda status, ok, message: (status, "application/json; charset=utf-8",
@@ -8720,15 +8771,13 @@ class WebServer:
         if not configured:
             return answer(403, False, "网页控制未开启：请在环境变量设置 WEB_CONTROL_KEY（12～64 个字符）后重启")
         now = time.monotonic()
-        if now < self.control_lock_until:
-            return answer(429, False, f"口令错误次数过多，{int(self.control_lock_until - now) + 1} 秒后再试")
+        if now < self.control_lock_until.get(client, 0.0):
+            return answer(429, False, f"口令错误次数过多，{int(self.control_lock_until[client] - now) + 1} 秒后再试")
         key = str(data.get("key") or "")
         if not key.isascii() or not hmac.compare_digest(key, configured):
-            self.control_failures = [t for t in self.control_failures if now - t < self.CONTROL_LOCK_SECONDS] + [now]
-            if len(self.control_failures) >= self.CONTROL_TRIES:
-                self.control_lock_until, self.control_failures = now + self.CONTROL_LOCK_SECONDS, []
+            self.control_key_failed(client, now)
             return answer(403, False, "口令错误")
-        self.control_failures = []
+        self.control_failures.pop(client, None)
         result = await self.bot.control_action(data)
         return answer(200 if result.get("ok") else 400, bool(result.get("ok")), str(result.get("message") or ""))
 
@@ -8745,7 +8794,9 @@ class WebServer:
                 await self.stream(writer)
                 return
             if method.upper() == "POST" and self.is_control(path):
-                status, ctype, body = await self.control(reader, rest)
+                status, ctype, body = await self.control(reader, rest, self.client_of(rest, writer))
+            elif method.upper() in {"GET", "HEAD"} and self.is_control(path, "control.json"):
+                status, ctype, body = self.control_json(rest, self.client_of(rest, writer))
             else:
                 status, ctype, body = self.route(method.upper(), path)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
@@ -11474,6 +11525,8 @@ class Bot:
             return f"每次份数已改为 {c.sim_shares:g} 份，按新份数重挂"
         if c.sim_maker_points and mk.book.market_id and self.points_status(mk.book.market_id, mk.book, now_ms, PREDICT_POINTS_STALE_SECONDS)["points_active"] is False:
             return "积分已停止发放，不挂"
+        if mk.book.stale(now_ms) and now_ms - mk.book.fetched_ms > SIM_STALE_WITHDRAW_MS:
+            return f"盘口断流超过 {SIM_STALE_WITHDRAW_MS // 60_000} 分钟，撤单"  # no pricing basis: not left for someone with one to fill
         if mk.hold or mk.book.stale(now_ms) or book_crossed(mk.book):
             return ""  # no fresh view of the market: the order stands
         side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)
