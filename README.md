@@ -533,7 +533,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 `LIVE=on` 把模拟交易的每个决定原样发给 Predict.fun：什么时候买、买哪边、买多少，仍由上一节的 `SIM_EDGE_CENTS`、`SIM_SHARES`、`SIM_WAYS`、`SIM_MARKETS`、`SIM_GROUP_USD` 决定；`live.py` 只负责把决定变成真实订单、把真实成交读回来，并在策略之上加几道硬性风控。没有 `LIVE=on` 时一切照旧，只记账。
 
 - **准备**：
-  1. Predict 账户里有 USDT（BNB 链）。网站账户是一个智能钱包（Predict 账户）：在网站“账户设置”里导出 Privy 钱包私钥，填 `PREDICT_PRIVATE_KEY`，再把账户设置里的**充值地址**填 `PREDICT_ACCOUNT`。也可以用一个普通钱包直接交易：只填它的私钥，USDT 和份额都在这个地址上。
+  1. Predict 账户里有 USDT（BNB 链）。网站账户是一个智能钱包（Predict 账户）：在网站“账户设置”里导出 Privy 钱包私钥，填 `PREDICT_PRIVATE_KEY`，再把账户设置里的**充值地址**填 `PREDICT_ACCOUNT`（两个地址不同是正常的：前者签名，后者持币）。也可以用一个普通钱包直接交易：只填它的私钥、`PREDICT_ACCOUNT` 留空，USDT 和份额都在这个地址上。`--live-check` 的“账户校验”会在链上确认这把私钥确实控制填写的 Predict 账户，对不上会直接说明。
   2. 在 Predict 开发者控制台 <https://developers.predict.fun> 申请 API Key，填 `PREDICT_API_KEY`（请求头 `x-api-key`，主网所有接口都要；登录签名换取的 JWT 由程序自动处理和续期）。
   3. 交易所要先获得 USDT 额度授权（和结果代币操作权）。网站上交易过一次的 Predict 账户通常已经授权；没有的话给签名钱包转约 0.005 BNB 作 gas，运行 `python main.py --approve`（逐项检查、只发缺的那几笔交易）。
   4. 运行 `python main.py --live-check`：登录、余额、授权、开放订单和持仓逐项打印，全部 OK 再把 `LIVE=on` 加进 Railway Variables。建议先用小的 `SIM_SHARES` 跑几天，看 `/live` 和复盘页里的真实成交是否符合预期。
@@ -549,8 +549,8 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `LIVE` | `off` | `on` 真实下单（需要 `SIM=on`、`PREDICT=on`） |
-| `PREDICT_PRIVATE_KEY` | 无 | 签名钱包私钥（64 位十六进制，0x 可省）；普通钱包，或网站导出的 Privy 钱包 |
-| `PREDICT_ACCOUNT` | 空 | Predict 账户（智能钱包）地址 = 网站账户设置里的充值地址；空 = 用私钥自己的地址交易 |
+| `PREDICT_PRIVATE_KEY` | 无 | 签名用的私钥，64 位十六进制（0x 可省）。两种填法：**A.** 用 Predict 网站账户交易：网站账户设置里“导出私钥 / Export wallet”得到的 Privy 钱包私钥（它的地址和充值地址不是同一个，这是正常的）；**B.** 用自己的普通钱包交易：那个钱包的私钥，建议新建一个机器人专用钱包 |
+| `PREDICT_ACCOUNT` | 空 | 填法 A 必填：网站账户设置里的**充值地址**（0x 开头 40 位，USDT 和份额都在这个地址上）；填法 B 留空。启动和 `--live-check` 会在链上核对这把私钥是不是该账户的控制钥匙，对不上就不下单并说明原因 |
 | `PREDICT_API_KEY` | 空 | Predict 开发者 API Key，在开发者控制台 <https://developers.predict.fun> 申请；主网所有接口都要它（默认限额每分钟 240 次请求，本机器人远低于此） |
 | `PREDICT_CHAIN_ID` | `56` | 56 BNB 主网，97 BNB 测试网（下单走 `api-testnet.predict.fun`，不需要 API Key；但卡片和盘口仍来自主网市场，测试网只能验证签名和下单链路，不能完整回放策略） |
 | `BSC_RPC_URL` | 公共节点 | 读余额、授权，发授权/领取交易的 JSON-RPC 节点 |

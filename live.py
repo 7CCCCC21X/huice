@@ -526,6 +526,11 @@ class Chain:
         return await self.call_uint(self.addresses["USDT"], "allowance(address,address)", ["address", "address"],
                                     [owner or self.wallet.maker, self.addresses[spender_key]])
 
+    async def account_owner(self, account: str) -> str:
+        """The signer the ECDSA validator holds for a Predict account (0x000… when the account is unknown to it)."""
+        out = await self.call(self.addresses["ECDSA_VALIDATOR"], self.encode("ecdsaValidatorStorage(address)", ["address"], [account]))
+        return "0x" + out[12:32].hex() if len(out) >= 32 else ZERO_ADDRESS
+
     async def approved_for_all(self, token_key: str, operator_key: str, owner: str | None = None) -> bool:
         return bool(await self.call_uint(self.addresses[token_key], "isApprovedForAll(address,address)", ["address", "address"],
                                          [owner or self.wallet.maker, self.addresses[operator_key]]))
@@ -687,6 +692,7 @@ class LiveTrader:
         self.chain = Chain(config.live_rpc or RPC_URLS[config.live_chain], self.wallet)
         self.ready_error = "尚未登录 Predict"
         self.ready_at = 0.0
+        self.account_error = ""  # a Predict account the key does not control (checked on-chain): nothing is sent
         self.balance: tuple[int, int, float] | None = None  # (USDT wei, BNB wei, when)
         self.balance_error = ""
         self.approvals: dict[str, bool] = {}  # exchange key -> allowance in place (read from the chain)
@@ -696,7 +702,31 @@ class LiveTrader:
 
     @property
     def ready(self) -> bool:
-        return not self.ready_error
+        return not self.ready_error and not self.account_error
+
+    @property
+    def not_ready_why(self) -> str:
+        return self.ready_error or self.account_error
+
+    async def verify_account(self) -> None:
+        """PREDICT_ACCOUNT must be a Predict account whose signer is PREDICT_PRIVATE_KEY (the validator says who): a
+        mismatch would have every order refused, so it blocks trading until fixed. A plain wallet needs no check."""
+        if not self.wallet.predict_account:
+            self.account_error = ""
+            return
+        try:
+            owner = await self.chain.account_owner(self.wallet.predict_account)
+        except Exception as error:
+            raise core.RemoteError(f"无法在链上核对 PREDICT_ACCOUNT 的控制钥匙：{core.clean_error(error) or type(error).__name__}") from None
+        if int(owner, 16) == 0:
+            self.account_error = f"链上没有 Predict 账户 {short_addr(self.wallet.predict_account)} 的签名记录：地址填错，或账户还没在链上激活（先在网站交易一次）"
+        elif owner.lower() != self.wallet.signer.lower():
+            self.account_error = (f"PREDICT_PRIVATE_KEY（{short_addr(self.wallet.signer)}）不是 Predict 账户 {short_addr(self.wallet.predict_account)} 的控制钥匙"
+                                  f"（链上记录的是 {short_addr(checksum(owner))}）：请导出该账户的 Privy 钱包私钥")
+        else:
+            self.account_error = ""
+        if self.account_error:
+            raise core.RemoteError(self.account_error)
 
     async def sign_in(self) -> None:
         try:
@@ -744,8 +774,10 @@ class LiveTrader:
                  + (f"｜签名钱包 {short_addr(self.wallet.signer)}" if self.wallet.predict_account else "")
                  + f"｜{CHAIN_NAMES.get(c.live_chain, c.live_chain)}",
                  ("API：已登录" + (f"（token 至 {core.stamp(self.api.jwt_exp * 1000, seconds=False)}）" if self.api.jwt_exp else "")
-                  if self.ready else f"API：未就绪：{self.ready_error}")
+                  if not self.ready_error else f"API：未就绪：{self.ready_error}")
                  + ("" if c.predict_api_key else "｜未设置 PREDICT_API_KEY")]
+        if self.wallet.predict_account:
+            lines.append("账户校验：" + (f"✗ {self.account_error}" if self.account_error else "✓ 私钥是这个 Predict 账户的控制钥匙"))
         if self.balance:
             lines.append(f"余额：USDT {from_wei(self.balance[0]):,.2f}｜BNB {from_wei(self.balance[1]):.4f}（gas）"
                          f"｜读取于 {core.stamp(self.balance[2] * 1000)}")
@@ -830,7 +862,8 @@ class LiveBot(core.Bot):
     async def live_prepare(self) -> list[str]:
         """Sign in, read the balances and the allowances; the report lines. Nothing here stops the bot: a failure is
         shown in /live and retried by the sync step."""
-        for name, job in (("登录", self.live.sign_in), ("余额", self.live.refresh_balance), ("授权", self.live.refresh_approvals)):
+        for name, job in (("登录", self.live.sign_in), ("账户校验", self.live.verify_account), ("余额", self.live.refresh_balance),
+                          ("授权", self.live.refresh_approvals)):
             try:
                 await job()
             except Exception as error:
@@ -867,7 +900,7 @@ class LiveBot(core.Bot):
     def live_room(self, trades: dict[str, dict], mk: core.SimMarket, side: str, price: float, shares: float) -> str:
         c = self.config
         if not self.live.ready:
-            return f"真实交易未就绪：{self.live.ready_error}"
+            return f"真实交易未就绪：{self.live.not_ready_why}"
         if paused := self.live_paused():
             return f"真实交易已暂停（{paused}；/live resume 恢复）"
         if killed := self.live_killed():
@@ -1026,6 +1059,7 @@ class LiveBot(core.Bot):
             self.live_last_signin = time.monotonic()
             with contextlib.suppress(Exception):
                 await self.live.sign_in()
+                await self.live.verify_account()
                 self.live_notify("✅ Predict 登录成功，真实交易就绪。", key="signin")
         if not self.live.ready:
             return
@@ -1367,7 +1401,7 @@ class LiveBot(core.Bot):
             return await self.live_test(args, now_ms)
         if action == "redeem":
             if not self.live.ready:
-                return f"未就绪：{self.live.ready_error}"
+                return f"未就绪：{self.live.not_ready_why}"
             lines = await self.live_redeem(now_ms)
             return "\n".join(lines) if lines else "没有可领取的已结算持仓（或已全部领取）。"
         if action == "check":
@@ -1375,12 +1409,12 @@ class LiveBot(core.Bot):
             return "🔎 真实交易自检\n" + "\n".join(lines) + ("\n最近错误：\n" + "\n".join(self.live_errors[-5:]) if self.live_errors else "")
         if action == "orders":
             if not self.live.ready:
-                return f"未就绪：{self.live.ready_error}"
+                return f"未就绪：{self.live.not_ready_why}"
             rows = await self.live.api.orders("OPEN")
             return "Predict 上的开放订单：\n" + ("\n".join(core.brief_error(json.dumps(r, ensure_ascii=False), 300) for r in rows[:20]) or "无")
         if action == "positions":
             if not self.live.ready:
-                return f"未就绪：{self.live.ready_error}"
+                return f"未就绪：{self.live.not_ready_why}"
             rows = await self.live.api.positions()
             self.live_positions = (rows, time.time())
             return "Predict 上的持仓：\n" + ("\n".join(self.position_line(r) for r in rows[:30]) or "无")
@@ -1414,7 +1448,7 @@ class LiveBot(core.Bot):
                          "cancellable": t["status"] == "resting" and st.get("state") in {"open", "placing"} and bool(st.get("order_id")),
                          "url": self.sim_url(t)})
         positions, at = self.live_positions
-        return {"ready": self.live.ready, "ready_error": self.live.ready_error, "paused": self.live_paused(), "killed": self.live_killed(),
+        return {"ready": self.live.ready, "ready_error": self.live.not_ready_why, "paused": self.live_paused(), "killed": self.live_killed(),
                 "lines": self.live.summary_lines(), "account": short_addr(self.live.wallet.maker),
                 "exposure": self.live_exposure(trades), "daily_pnl": self.live_daily_pnl(trades, now_ms),
                 "caps": {"order": c.live_max_order_usd, "open": c.live_max_open_usd, "daily_loss": c.live_max_daily_loss_usd},
@@ -1435,7 +1469,7 @@ class LiveBot(core.Bot):
         list, the cancel and the final state, each step reported with what Predict answered. Arguments: a market name
         to pick it, a share count, a price in cents (a price at or above the best bid may trade)."""
         if not self.live.ready:
-            return f"未就绪：{self.live.ready_error}"
+            return f"未就绪：{self.live.not_ready_why}"
         words = [a.strip() for a in args if a and a.strip()]
         numbers = [w for w in words if re.fullmatch(r"\d+(\.\d+)?", w)]
         want = next((w.lower() for w in words if w not in numbers), "")
@@ -1562,7 +1596,7 @@ class LiveBot(core.Bot):
         trades = self.sim_trades()
         live = [t for t in trades.values() if isinstance(t.get("live"), dict)]
         state = ("⏸ 已暂停（" + self.live_paused() + "）" if self.live_paused() else "🛑 今日停开新仓（" + self.live_killed() + "）"
-                 if self.live_killed() else ("🟢 运行中" if self.live.ready else "🔴 未就绪"))
+                 if self.live_killed() else ("🟢 运行中" if self.live.ready else "🔴 未就绪：" + self.live.not_ready_why))
         ways, kinds = core.sim_scope(self.config)
         lines = [f"💰 {core.bold('真实交易')} v{core.VERSION}｜{state}", *self.live.summary_lines(),
                  f"策略：同模拟交易：净优势 ≥{self.config.sim_edge * 100:g}¢ 买 {self.config.sim_shares:g} 份；{ways}；{kinds}"]
@@ -1601,7 +1635,7 @@ class LiveBot(core.Bot):
         return super().cmd_help(req).replace("不会自动下单、撤单。", "⚠️ LIVE=on：模拟交易的每个决定都会在 Predict 真实下单、撤单（/live 查看与暂停）。")
 
     def status(self, sub_id: str) -> str:
-        state = "已暂停" if self.live_paused() else "今日停开新仓" if self.live_killed() else ("运行中" if self.live.ready else f"未就绪：{self.live.ready_error}")
+        state = "已暂停" if self.live_paused() else "今日停开新仓" if self.live_killed() else ("运行中" if self.live.ready else f"未就绪：{self.live.not_ready_why}")
         return super().status(sub_id).replace("仅价格提醒；不会自动撤单/交易。", f"💰 真实交易 {state}｜/live 查看订单、持仓与风控")
 
     def journal_payload(self) -> dict:
@@ -1623,7 +1657,7 @@ async def live_check(config: core.Config) -> int:
     trader = LiveTrader(config)
     print(f"签名钱包 {trader.wallet.signer}；下单账户 {trader.wallet.maker}（{trader.wallet.kind}）；{CHAIN_NAMES.get(config.live_chain)}")
     ok = True
-    for name, job in (("登录", trader.sign_in), ("余额", trader.refresh_balance), ("授权", trader.refresh_approvals)):
+    for name, job in (("登录", trader.sign_in), ("账户校验", trader.verify_account), ("余额", trader.refresh_balance), ("授权", trader.refresh_approvals)):
         try:
             await job()
             print(f"OK {name}")

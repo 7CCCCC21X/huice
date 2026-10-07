@@ -305,7 +305,8 @@ class FakeApi:
 
 
 class FakeChain:
-    def __init__(self): self.usdt, self.bnb, self.allow, self.redeemed, self.fail = 1000 * WEI, 10 ** 17, 10 ** 30, [], ""
+    def __init__(self): self.usdt, self.bnb, self.allow, self.redeemed, self.fail, self.owner = 1000 * WEI, 10 ** 17, 10 ** 30, [], "", ADDR
+    async def account_owner(self, account): return self.owner
     async def usdt_balance(self, owner=None): return self.usdt
     async def bnb_balance(self, owner=None): return self.bnb
     async def allowance(self, key, owner=None): return self.allow
@@ -638,6 +639,27 @@ async def run():
     assert body["order"]["maker"] == PA and body["order"]["signer"] == PA and body["order"]["signature"].startswith("0x01845adb2c".lower()[:4])
     assert body["order"]["signature"].lower().startswith("0x01" + L.ADDRESSES[56]["ECDSA_VALIDATOR"][2:].lower()) and len(body["order"]["signature"]) == 2 + 2 + 40 + 130
     assert any("Predict 账户" in line and "下单账户 0x1111…1111" in line and "签名钱包 0x8fd3…7A03" in line for line in kbot.live.summary_lines())
+    assert kbot.live.ready and any(line.startswith("账户校验：✓") for line in kbot.live.summary_lines())
+    # the key must control the Predict account (the validator says who); a plain wallet needs no such check
+    kbot.live.chain.owner = "0x2222222222222222222222222222222222222222"
+    try: await kbot.live.verify_account(); assert False
+    except m.RemoteError as e: assert "不是 Predict 账户" in str(e) and "0x2222…2222" in str(e)
+    assert not kbot.live.ready and "不是 Predict 账户" in kbot.live_room({}, hsi(0.70, [], [], NOW), "up", 0.5, 100) and kbot.live.ready_error == ""
+    assert any(line.startswith("账户校验：✗") for line in kbot.live.summary_lines()) and "未就绪：PREDICT_PRIVATE_KEY" in kbot.live_text(NOW)
+    kbot.live.chain.owner = "0x" + "0" * 40
+    try: await kbot.live.verify_account(); assert False
+    except m.RemoteError as e: assert "没有 Predict 账户" in str(e)
+    kbot.live.chain.owner = ADDR.lower()
+    await kbot.live.verify_account()
+    assert kbot.live.ready and kbot.live.account_error == ""
+    await bot.live.verify_account()  # a plain wallet: nothing to check
+    assert bot.live.account_error == "" and (await bot.live_prepare()) and bot.live.ready
+    # the on-chain read, decoded from the validator's answer
+    class OwnerChain(L.Chain):
+        async def rpc(self, method, params):
+            assert method == "eth_call" and params[0]["to"] == L.ADDRESSES[56]["ECDSA_VALIDATOR"] and params[0]["data"].startswith("0x" + L.Chain.encode("ecdsaValidatorStorage(address)", ["address"], [PA]).hex()[:8])
+            return "0x" + "0" * 24 + ADDR[2:].lower()
+    assert (await OwnerChain("https://rpc.example", k).account_owner(PA)).lower() == ADDR.lower()
 
     # --- SIM_TAKER_SESSION: a daily card after hours (priced from a proxy) is not taken, only quoted; crypto cards unaffected ------
     sbot = make_bot(SIM_TAKER_SESSION="on", SIM_WAYS="both")
