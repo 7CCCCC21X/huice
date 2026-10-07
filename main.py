@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.42.0"
+VERSION = "1.43.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -440,8 +440,8 @@ BASELINE_MODES = {
 CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE", "真实交易模式", "off 只记账 / pause 登录 Predict、可自检和挂单测试、不开新仓 / on 真实下单（pause、on 需要已配置 PREDICT_PRIVATE_KEY）"),
     ("SIM_EDGE_CENTS", "触发买入的净优势（¢/份）", "0.5～50"),
-    ("SIM_SHARES", "每次买多少份", "1～1000000"),
-    ("SIM_WAYS", "做哪种单", "吃单 = 按盘口立即成交（真实交易走市价单或封顶限价单）；挂单 = 按建议价挂着等成交"),
+    ("SIM_SHARES", "每次最多买多少份", "1～1000000：吃单在封顶价之下有多少买多少、最多这么多；挂单按这个数量挂"),
+    ("SIM_WAYS", "做哪种单", "吃单 = 算出仍留足净优势的最高价位（封顶价），盘口在它之下的立即买（真实交易用封顶限价单）；挂单 = 按建议价挂着等成交"),
     ("SIM_MARKETS", "做哪些市场", "可多选；全选 = all"),
     ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "0 = 不限"),
     ("SIM_TAKER_SESSION", "只在标的开盘时段吃单", "开 = 指数/个股日涨跌的吃单只在标的开盘时段（卡片按现货定价时）进行，盘后只挂单；挂单不受影响"),
@@ -451,9 +451,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_MAX_ORDER_USD", "真实交易单笔上限（$）", "1～1000000"),
     ("LIVE_MAX_OPEN_USD", "持仓 + 挂单上限（$）", "1～100000000"),
     ("LIVE_MAX_DAILY_LOSS_USD", "当日已结算亏损停机线（$）", "0 = 不限"),
-    ("LIVE_TAKER", "吃单方式", "市价单按滑点上限成交；封顶限价单封在模拟吃单走到的最差一档，等待时间后撤掉未成交部分"),
-    ("LIVE_SLIPPAGE_BPS", "市价单滑点（bps）", "0～5000，100 = 1%"),
-    ("LIVE_TAKER_WAIT_SECONDS", "吃单未成交多久撤单（秒）", "5～3600"),
+    ("LIVE_TAKER_WAIT_SECONDS", "吃单的限价单等多久（秒）", "5～3600：封顶限价单挂出后，这么多秒内没成交的部分撤掉"),
     ("LIVE_RETRY_SECONDS", "下单失败后回避（秒）", "10～86400"),
     ("LIVE_AUTO_REDEEM", "自动领取已结算持仓", "开 = 市场结算后自动在链上领取赢的一边（签名钱包需有 BNB 付 gas）"),
     ("LIVE_NOTIFY", "真实订单的 Telegram 通知", "开 = 真实下单、成交、撤单、失败都发 Telegram 通知"),
@@ -527,9 +525,7 @@ class Config:
     live_account: str = ""             # PREDICT_ACCOUNT: the Predict account (smart wallet / deposit address) the key controls; "" = the key's own address
     live_chain: int = 56               # PREDICT_CHAIN_ID: 56 = BNB mainnet, 97 = BNB testnet
     live_rpc: str = ""                 # BSC_RPC_URL: JSON-RPC node for balances, allowances, approvals, redeeming; "" = the chain's public node
-    live_taker: str = "market"         # LIVE_TAKER: market (MARKET order with slippage cap) or limit (LIMIT at the worst level the paper fill walked)
-    live_slippage_bps: int = 100       # LIVE_SLIPPAGE_BPS: a MARKET order's tolerance (1% = 100)
-    live_taker_wait: int = 60          # LIVE_TAKER_WAIT_SECONDS: the unfilled rest of a taker order is cancelled after this
+    live_taker_wait: int = 60          # LIVE_TAKER_WAIT_SECONDS: a taker's LIMIT order (capped at the dearest acceptable price) is cancelled after this
     live_retry: int = 300              # LIVE_RETRY_SECONDS: a market and side whose order failed or filled nothing waits this long
     live_max_order_usd: float = 100.0  # LIVE_MAX_ORDER_USD: the most one order may cost
     live_max_open_usd: float = 500.0   # LIVE_MAX_OPEN_USD: filled positions plus resting orders, at cost
@@ -568,7 +564,6 @@ class Config:
         live = live_mode != "off"
         live_key, live_account = e.get("PREDICT_PRIVATE_KEY", "").strip(), e.get("PREDICT_ACCOUNT", "").strip()
         live_chain = bounded_int(e, "PREDICT_CHAIN_ID", 56, 1, 10**9)
-        live_taker = (e.get("LIVE_TAKER") or "market").strip().lower()
         live_rpc = e.get("BSC_RPC_URL", "").strip().rstrip("/")
         if live_key and not re.fullmatch(r"(0x)?[0-9a-fA-F]{64}", live_key):
             raise ValueError("PREDICT_PRIVATE_KEY 应为 64 位十六进制私钥（可带 0x）")
@@ -576,8 +571,6 @@ class Config:
             raise ValueError("PREDICT_ACCOUNT 应为 0x 开头的 40 位十六进制地址（网站账户设置里的充值地址）")
         if live_chain not in {56, 97}:
             raise ValueError("PREDICT_CHAIN_ID 只能是 56（BNB 主网）或 97（BNB 测试网）")
-        if live_taker not in {"market", "limit"}:
-            raise ValueError("LIVE_TAKER 只能是 market（市价单）或 limit（限价单）")
         if live_rpc and urllib.parse.urlsplit(live_rpc).scheme not in {"http", "https"}:
             raise ValueError("BSC_RPC_URL 必须是 http(s) 节点地址")
         if live and not live_key:
@@ -656,8 +649,6 @@ class Config:
             else bounded_int(e, "WEB_PORT", int(e.get("PORT") or 0), 0, 65535),
             web_token=e.get("WEB_TOKEN", "").strip(),
             live=live, live_mode=live_mode, live_key=live_key, live_account=live_account, live_chain=live_chain, live_rpc=live_rpc,
-            live_taker=live_taker,
-            live_slippage_bps=bounded_int(e, "LIVE_SLIPPAGE_BPS", 100, 0, 5000),
             live_taker_wait=bounded_int(e, "LIVE_TAKER_WAIT_SECONDS", 60, 5, 3600),
             live_retry=bounded_int(e, "LIVE_RETRY_SECONDS", 300, 10, 86400),
             live_max_order_usd=parse_bounded(e, "LIVE_MAX_ORDER_USD", "100", 1, 1_000_000),
@@ -4041,6 +4032,28 @@ def taker_fee(price: float, bps: int) -> float:
     return bps / 10_000 * min(price, 1 - price)
 
 
+def floor_price(price: float) -> float:
+    """A price rounded down to Predict's tick (three significant digits), at most 99.9¢; 0 under 0.1¢."""
+    price = min(max(price, 0.0), 0.999)
+    if price < 0.001:
+        return 0.0
+    tick = D(10) ** (math.floor(math.log10(price)) - 2)
+    return float((D(str(price)) / tick).to_integral_value(rounding=decimal.ROUND_FLOOR) * tick)
+
+
+def taker_cap(fair: float, required: float, bps: int) -> float:
+    """The dearest price a taker may pay for one side and still keep ``required`` of edge per share after the fee
+    (rate × min(p, 1 − p)): the paper trader buys every ask at or under it, nothing above it. 0 when no price does."""
+    budget = fair - required  # price + fee must stay within this
+    if budget <= 0:
+        return 0.0
+    rate = bps / 10_000
+    price = budget / (1 + rate)  # fee = rate × p under 50¢
+    if price > 0.5 and rate < 1:
+        price = (budget - rate) / (1 - rate)  # fee = rate × (1 − p) above
+    return floor_price(price)
+
+
 def book_edges(fair_up: float, book: PredictBook, costs: EdgeCosts | None = None) -> list[BookEdge]:
     """挂涨 = rest a bid at 买1, 挂跌 = rest a 跌 bid at 1 − 卖1, 吃涨 = buy at 卖1, 吃跌 = buy 跌 at 1 − 买1. Edges are
     net: a taker pays the fee and walks the book for the trade size; a maker pays no fee."""
@@ -6845,10 +6858,8 @@ CONTROL_FORMS: dict[str, dict] = {
     "LIVE_MAX_ORDER_USD": {"kind": "number", "group": "风控", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
     "LIVE_MAX_OPEN_USD": {"kind": "number", "group": "风控", "presets": ["100", "300", "500", "1000", "3000"], "unit": "$"},
     "LIVE_MAX_DAILY_LOSS_USD": {"kind": "number", "group": "风控", "presets": ["0", "50", "100", "200", "500"], "unit": "$", "zero": "不限"},
-    "LIVE_TAKER": {"kind": "choice", "group": "风控", "options": [["market", "市价单"], ["limit", "封顶限价单"]]},
     "PREDICT_MIN_EDGE_CENTS": {"kind": "number", "group": "高级", "presets": ["0", "1", "2", "3", "5"], "unit": "¢"},
     "PREDICT_TRADE_USD": {"kind": "number", "group": "高级", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
-    "LIVE_SLIPPAGE_BPS": {"kind": "number", "group": "高级", "presets": ["50", "100", "200", "300"], "unit": "bps"},
     "LIVE_TAKER_WAIT_SECONDS": {"kind": "number", "group": "高级", "presets": ["15", "30", "60", "120"], "unit": "秒"},
     "LIVE_RETRY_SECONDS": {"kind": "number", "group": "高级", "presets": ["60", "300", "600", "1800"], "unit": "秒"},
     "LIVE_AUTO_REDEEM": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
@@ -6858,7 +6869,7 @@ CONTROL_FORMS: dict[str, dict] = {
 # 0.2¢ bid under an 80¢ ask is not a quote anyone sells into: an order joining it would rest until the result and tell
 # nothing (10-03: 54 such price-ladder orders sat as 挂单中 0/100 for weeks).
 SIM_MAKER_SPREAD = 0.10
-SIM_MIN_FILL = 0.5  # a taker buys only when the book fills at least this share of SIM_SHARES (dust is not a trade)
+SIM_MIN_SHARES = 1.0  # a taker buys only when at least this many shares are there at acceptable prices (dust is not a trade)
 
 
 def book_crossed(book: PredictBook) -> bool:
@@ -7149,10 +7160,13 @@ def price_evidence(what: str, source: str, symbol: str, kind: str, price: Any, q
             "quoted_ms": int(quoted_ms or 0), "fetched_ms": int(fetched_ms or 0), **extra}
 
 
-def taker_quote(book: PredictBook, side: str, shares: float, fee_bps: int) -> dict | None:
-    """Buying ``shares`` of one side now, across the book: average price, shares got (fewer when the book is thin),
-    fee per share, cost per share (average + fee), the best price and the levels walked. None for an empty side."""
+def taker_quote(book: PredictBook, side: str, shares: float, fee_bps: int, cap: float | None = None) -> dict | None:
+    """Buying up to ``shares`` of one side now across the book — only the levels at or under ``cap`` when one is given
+    (the dearest acceptable price, taker_cap): average price, shares got (fewer when the book is thin or dear), fee per
+    share, cost per share (average + fee), the best price, the levels walked and the cap. None when nothing is there."""
     levels = side_levels(book, side)
+    if cap is not None:
+        levels = [(p, q) for p, q in levels if p <= cap + 1e-9]
     if not levels:
         return None
     avg, got = fill_shares(levels, shares)
@@ -7167,7 +7181,7 @@ def taker_quote(book: PredictBook, side: str, shares: float, fee_bps: int) -> di
         left -= take
     fee = taker_fee(avg, fee_bps)
     return {"avg": avg, "got": got, "fee": fee, "cost": avg + fee, "best": levels[0][0], "short": got < shares - 1e-9,
-            "levels": walked}
+            "levels": walked, "cap": cap}
 
 
 def maker_fill(trade: dict, book: PredictBook) -> tuple[float, dict]:
@@ -11241,7 +11255,7 @@ class Bot:
                          queue_ahead=queue, queue_min=queue)
         else:
             trade.update(price=taker["cost"], avg=taker["avg"], fee=taker["fee"], best=taker["best"],
-                         slip=taker["avg"] - taker["best"], signal=fair - taker["cost"], shares=taker["got"], status="filled",
+                         slip=taker["avg"] - taker["best"], signal=fair - taker["cost"], shares=taker["got"], status="filled", cap=taker.get("cap"),
                          filled=now_ms, fill_fair=fair,
                          fills=[{"at": now_ms, "shares": taker["got"], "fair": fair, "how": "吃单立即成交",
                                  "levels": taker["levels"], "short": taker["short"]}])
@@ -11563,18 +11577,18 @@ class Bot:
             # SIM_TAKER_SESSION: a daily card after hours is priced from a proxy; its taker waits for the session
             takers = ways != "maker" and not (self.config.sim_taker_session and mk.in_session is False)
             for side in ("up", "down") if takers else ():
-                q = taker_quote(mk.book, side, self.config.sim_shares, bps)
                 fair = mk.fair_up if side == "up" else 1 - mk.fair_up
-                # checked on the fill itself; a few dust shares at a stray price are not the trade the edge is about,
-                # and would hold the market's one position slot against the real opportunity
-                if (q and q["got"] >= self.config.sim_shares * SIM_MIN_FILL - 1e-9
-                        and fair - q["cost"] > mk.need and fair - q["cost"] >= bar - 1e-9):
+                # the dearest price that still leaves the edge the trade is about (the card's error and SIM_EDGE_CENTS):
+                # every ask at or under it is bought, up to SIM_SHARES; nothing above it, however much is wanted
+                cap = taker_cap(fair, max(mk.need, bar), bps)
+                q = taker_quote(mk.book, side, self.config.sim_shares, bps, cap) if cap > 0 else None
+                if q and q["got"] >= SIM_MIN_SHARES - 1e-9:  # under a share is dust, not a trade: the slot stays free
                     quotes.append((round(fair - q["cost"], 4), side, q))
             if quotes:
                 _, side, q = max(quotes, key=lambda x: x[0])
                 tid = f"{mk.market}|{side}|吃"
                 if tid not in trades:
-                    why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, q["cost"], q["got"])
+                    why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, q["cost"], q["got"], taker=q)
                     if why:
                         self.sim_note_block(tid, mk, "吃" + mk.sides[0 if side == "up" else 1], q["cost"], why, now_ms)
                     else:
@@ -11618,7 +11632,8 @@ class Bot:
     SIM_BLOCK_KEEP_MS = 7 * DAY_MS  # a refused paper buy is remembered this long
     SIM_BLOCK_NOTE_MS = 10 * 60_000  # ...and the same refusal re-recorded (its time) at most this often
 
-    def sim_group_room(self, trades: dict[str, dict], mk: SimMarket, side: str, price: float, shares: float) -> str:
+    def sim_group_room(self, trades: dict[str, dict], mk: SimMarket, side: str, price: float, shares: float,
+                       taker: dict | None = None) -> str:
         """"" when a paper position of ``shares`` at ``price`` may be added under SIM_GROUP_USD, else why not: with it,
         the driver's positions (filled shares, plus resting orders as if filled) would lose more than the cap on their
         worst single move. A position on the other side of the same event adds nothing to that; a fourth No on the
@@ -11715,7 +11730,7 @@ class Bot:
     def sim_text(self) -> str:
         r = self.sim_report(recent=10)
         t, edge, shares = r["total"], r["edge"] * 100, f"{r['shares']:g}"
-        how = [f"吃单按 {shares} 份吃到的均价和手续费判断并成交"] if r["ways"] != "只挂单" else []
+        how = [f"吃单：算出仍留足净优势的最高价位（封顶价），盘口在它之下有多少买多少，最多 {shares} 份"] if r["ways"] != "只挂单" else []
         if how and self.config.sim_taker_session:
             how.append("指数/个股日涨跌只在标的开盘时段吃单（SIM_TAKER_SESSION=on），盘后只挂单")
         if self.config.sim_quiet_minutes:
@@ -12747,7 +12762,7 @@ class Bot:
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}",
                   "PREDICT_TRADE_USD": f"{c.predict_trade_usd:g}", "LIVE_MAX_ORDER_USD": f"{c.live_max_order_usd:g}",
                   "LIVE_MAX_OPEN_USD": f"{c.live_max_open_usd:g}", "LIVE_MAX_DAILY_LOSS_USD": f"{c.live_max_daily_loss_usd:g}",
-                  "LIVE_TAKER": c.live_taker, "LIVE_SLIPPAGE_BPS": str(c.live_slippage_bps), "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait),
+                  "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait),
                   "LIVE_RETRY_SECONDS": str(c.live_retry), "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify)}
         return values.get(key, "")
 

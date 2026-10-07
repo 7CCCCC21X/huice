@@ -20,7 +20,7 @@ assert m.Config.from_env(base).web_control_key == "" and m.Config.from_env(base)
 for bad in ("short", "has space in it yes", "x" * 65, "中文口令中文口令中文口令"):
     try: m.Config.from_env({**base, "WEB_CONTROL_KEY": bad}); assert False, bad
     except ValueError: pass
-assert [k for k, _, _ in m.CONTROL_KEYS][:3] == ["LIVE", "SIM_EDGE_CENTS", "SIM_SHARES"] and m.CONTROL_KEY_SET >= {"LIVE_MAX_ORDER_USD", "LIVE_TAKER"}
+assert [k for k, _, _ in m.CONTROL_KEYS][:3] == ["LIVE", "SIM_EDGE_CENTS", "SIM_SHARES"] and m.CONTROL_KEY_SET >= {"LIVE_MAX_ORDER_USD", "LIVE_TAKER_WAIT_SECONDS"} and not m.CONTROL_KEY_SET & {"LIVE_TAKER", "LIVE_SLIPPAGE_BPS"}
 assert all(len(row) == 3 and row[0] == row[0].upper() for row in m.CONTROL_KEYS)
 
 
@@ -84,7 +84,7 @@ class FakeChain:
 async def run():
     store = m.Store(":memory:")
     bot = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY}), store, FM(NOW), None)
-    assert bot.control_value("SIM_EDGE_CENTS") == "10" and bot.control_value("SIM_MARKETS") == "close" and bot.control_value("LIVE_TAKER") == "market"
+    assert bot.control_value("SIM_EDGE_CENTS") == "10" and bot.control_value("SIM_MARKETS") == "close"
     assert bot.control_value("LIVE_AUTO_REDEEM") == "on" and bot.control_value("nope") == "" and bot.control_value("LIVE") == "off"
     web = m.WebServer(bot, 0, TOKEN); web.CACHE_SECONDS = {}; port = await web.start()
     st, head, body = await request(port, f"GET /p/{TOKEN}/control HTTP/1.1\r\nHost: x\r\n\r\n".encode())
@@ -189,9 +189,9 @@ async def run():
     st, j = await post(port3, {"key": KEY, "action": "pause", "why": "维护"})
     assert st == 200 and "已暂停（维护）" in j["message"] and lbot.live_paused() == "维护" and (await get_json(port3, "control.json"))["live"]["paused"] == "维护"
     st, j = await post(port3, {"key": KEY, "action": "resume"}); assert st == 200 and lbot.live_paused() == ""
-    st, j = await post(port3, {"key": KEY, "action": "set", "values": {"LIVE_MAX_OPEN_USD": "123", "LIVE_TAKER": "limit"}})
-    assert st == 200 and lbot.config.live_max_open_usd == 123 and lbot.live.config.live_max_open_usd == 123 and lbot.live.config.live_taker == "limit"
-    assert (await get_json(port3, "control.json"))["live"]["caps"]["open"] == 123 and "限价单" in (await get_json(port3, "control.json"))["live"]["lines"][-1]
+    st, j = await post(port3, {"key": KEY, "action": "set", "values": {"LIVE_MAX_OPEN_USD": "123", "LIVE_TAKER_WAIT_SECONDS": "30"}})
+    assert st == 200 and lbot.config.live_max_open_usd == 123 and lbot.live.config.live_max_open_usd == 123 and lbot.live.config.live_taker_wait == 30
+    assert (await get_json(port3, "control.json"))["live"]["caps"]["open"] == 123 and "30 秒未成交撤单" in (await get_json(port3, "control.json"))["live"]["lines"][-1]
     # a resting real order appears with its cancel switch; cancelling through the page reaches Predict
     trade = {"v": 2, "market": "x", "slug": "x", "market_id": "9", "item": "恒生指数", "kind": "close", "key": "HSI", "side": "up", "label": "挂涨",
              "maker": True, "fair": 0.70, "opened": NOW - 60_000, "settle": {}, "driver": "HSI@2026-10-05", "driver_name": "恒生指数",

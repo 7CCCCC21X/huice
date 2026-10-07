@@ -53,6 +53,11 @@ avg = (30 * 0.58 + 70 * 0.66) / 100
 assert abs(q["avg"] - avg) < 1e-12 and q["got"] == 100 and abs(q["fee"] - FEE * (1 - avg)) < 1e-12 and not q["short"]
 assert q["levels"] == [[0.58, 30.0], [0.66, 70.0]] and q["best"] == 0.58 and abs(q["cost"] - (avg + q["fee"])) < 1e-12
 assert m.taker_quote(book([], [("0.58", "40")]), "up", 100, 200)["short"] and m.taker_quote(book([], []), "up", 100, 200) is None
+# the cap: the dearest price that keeps the required edge after the fee (rate × min(p, 1 − p)), on Predict's three-digit tick
+assert m.taker_cap(0.70, 0.10, 200) == 0.591 and m.taker_cap(0.30, 0.10, 200) == 0.196 and m.taker_cap(0.10, 0.10, 200) == 0 and m.taker_cap(0.05, 0.10, 200) == 0
+assert m.taker_cap(0.995, 0.001, 0) == 0.994 and m.floor_price(0.59184) == 0.591 and m.floor_price(0.059184) == 0.0591 and m.floor_price(1.2) == 0.999 and m.floor_price(0.0001) == 0
+q = m.taker_quote(book([], [("0.58", "30"), ("0.66", "500")]), "up", 100, 200, cap=0.591)  # with a cap only the levels under it are walked
+assert q["got"] == 30 and q["levels"] == [[0.58, 30.0]] and q["short"] and q["cap"] == 0.591 and m.taker_quote(book([], [("0.60", "30")]), "up", 100, 200, cap=0.591) is None
 # a resting buy: sellers at or through its price are what fills it; the most seen, never a sum of looks
 order = {"price": 0.55, "side": "up", "order": 100.0, "shares": 0.0}
 got, seen = m.maker_fill(order, book([("0.54", "10")], [("0.55", "30"), ("0.56", "500")]))
@@ -153,16 +158,19 @@ async def run():
     assert t["shares"] == 100 and abs(t["edge"] - (0.70 - 0.58 - fee)) < 1e-12, t
     card = next(e for e in t["entry"]["card"] if e["label"] == "吃涨")
     assert abs(card["edge"] - (0.70 - 0.625 - FEE * 0.375)) < 1e-12 and card["size"] == 160, card
-    # the best level alone clears the bar, the 100 shares do not (10 at 58¢, 90 at 69¢): no trade
+    # only the levels under the cap (59.1¢: the dearest price keeping 10¢ after the fee) are bought: 10 at 58¢, none at 69¢
     await step(bot, NOW + 80_000, same([("0.58", "10"), ("0.69", "1000")], NOW + 80_000, "shallow"))
-    assert "shallow|up|吃" not in bot.sim_trades()
-    # a thin book fills what it holds (at least half the order), and says so
+    t = bot.sim_trades()["shallow|up|吃"]
+    assert t["shares"] == 10 and t["order"] == 100 and t["cap"] == 0.591 and t["fills"][0]["short"] and t["fills"][0]["levels"] == [[0.58, 10.0]], t
+    # a thin book fills what it holds (whatever is there, up to the order), and says so
     await step(bot, NOW + 90_000, same([("0.58", "60")], NOW + 90_000, "thin"))
     t = bot.sim_trades()["thin|up|吃"]
     assert t["shares"] == 60 and t["order"] == 100 and t["fills"][0]["short"], t
-    # a few dust shares at a stray price are not the trade: nothing is bought, the slot stays free for the real one
+    # anything from one share up is bought; under one share is dust, not a trade: the slot stays free for the real one
     await step(bot, NOW + 95_000, same([("0.58", "5")], NOW + 95_000, "dust"))
-    assert "dust|up|吃" not in bot.sim_trades()
+    assert bot.sim_trades()["dust|up|吃"]["shares"] == 5
+    await step(bot, NOW + 96_000, same([("0.58", "0.5")], NOW + 96_000, "dust2"))
+    assert "dust2|up|吃" not in bot.sim_trades()
     # a crossed snapshot (bid at or above ask) is not a book anyone could trade: neither way opens on it
     crossed = m.SimMarket("x", "x", "close", "X", 0.70, book([("0.60", "100")], [("0.58", "100")], NOW + 97_000, "x", mid="x"), 0.03, "", ("涨", "跌"), {})
     await step(bot, NOW + 97_000, crossed)
@@ -206,9 +214,10 @@ async def run():
     t = bot.sim_trades()
     down_maker, down_taker = t[f"{KOSPI_SLUG}|down|挂"], t[f"{KOSPI_SLUG}|down|吃"]
     assert down_maker["label"] == "挂跌" and abs(down_maker["price"] - 0.62) < 1e-9 and down_maker["queue_ahead"] == 100
-    k_avg = (30 * 0.65 + 70 * 0.70) / 100
-    k_cost = k_avg + FEE * min(k_avg, 1 - k_avg)
-    assert down_taker["shares"] == 100 and abs(down_taker["price"] - k_cost) < 1e-12 and abs(down_taker["slip"] - (k_avg - 0.65)) < 1e-12
+    # the 跌 cap (fair 80¢, 10¢ required after the fee) is 69.3¢: the 65¢ level (30 shares) is bought, the 70¢ level is not
+    k_cost = 0.65 + FEE * min(0.65, 1 - 0.65)
+    assert down_taker["shares"] == 30 and down_taker["order"] == 100 and abs(down_taker["price"] - k_cost) < 1e-12 and down_taker["slip"] == 0
+    assert down_taker["cap"] == 0.693 and down_taker["fills"][0]["short"] and down_taker["fills"][0]["levels"] == [[0.65, 30.0]], down_taker["fills"]
     await step(bot, NOW + 460_000, kospi([("0.39", "25")], [("0.41", "100")], NOW + 460_000))  # a 跌 seller at 61¢ ≤ 62¢
     assert bot.sim_trades()[f"{KOSPI_SLUG}|down|挂"]["shares"] == 25
     wait = {x["id"]: x["wait"] for x in bot.journal_payload()["trades"]}
@@ -369,7 +378,7 @@ async def run():
     assert abs(tot["pnl"] - sum((t["payout"] - t["price"]) * t["shares"] for t in settled)) < 1e-9
     assert abs(tot["expected"] - sum(t["edge"] * t["shares"] for t in settled)) < 1e-9
     assert abs(tot["expected_fill"] - sum(m.sim_fill_expectation(t) for t in settled)) < 1e-9 and tot["expected_fill"] < tot["expected"]
-    assert tot["partial"] == 1 and tot["expired"] == 1 and tot["open"] == 2  # PONS's maker never filled; deep/thin still held
+    assert tot["partial"] == 1 and tot["expired"] == 1 and tot["open"] == 4  # PONS's maker never filled; deep/thin/shallow/dust still held
     row = next(x for x in r["rows"] if x["id"] == f"{KOSPI_SLUG}|down|吃")
     assert row["state"] == "结果不一致" and row["order"] == 100 and row["url"].startswith(m.PREDICT_SITE)
     json.dumps(r)
@@ -457,7 +466,7 @@ async def run():
                  m.Store(":memory:"), FM(NOW), None)
     dbot.sim_markets = lambda now: world["markets"]
     rep = dbot.sim_report()
-    assert rep["ways"] == "只吃单" and rep["scope"] == "指数/个股日涨跌" and "范围：指数/个股日涨跌；只吃单。吃单按 100 份" in dbot.cmd_sim(None).text
+    assert rep["ways"] == "只吃单" and rep["scope"] == "指数/个股日涨跌" and "范围：指数/个股日涨跌；只吃单。吃单：算出仍留足净优势的最高价位（封顶价），盘口在它之下有多少买多少，最多 100 份" in dbot.cmd_sim(None).text
     assert "挂单" not in dbot.cmd_sim(None).text.split("\n")[1] and dbot.sim_version()["sim_ways"] == "只吃单"
     far = m.SimMarket("will-bnb-hit-700-or-900", "BNB 先触 700/900", "touch", "BNB", 0.70, book([(0.55, 100)], [(0.58, 100)], NOW), 0.03, "",
                       ("$900", "$700"), {"low": 700, "high": 900, "deadline": CLOSE}, {})

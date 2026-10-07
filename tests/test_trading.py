@@ -18,16 +18,16 @@ CLOSE = BJ(10, 5, 16, 10)
 # --- settings ----------------------------------------------------------------------------------------------------------
 base = {"TELEGRAM_BOT_TOKEN": "1:x"}
 c = m.Config.from_env(base)
-assert not c.live and c.live_key == "" and c.live_chain == 56 and c.live_taker == "market" and c.live_max_order_usd == 100
+assert not c.live and c.live_key == "" and c.live_chain == 56 and c.live_max_order_usd == 100
 assert "live_key" not in repr(c)  # the key is never in a repr / log line
-c = m.Config.from_env({**base, "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY[2:], "PREDICT_ACCOUNT": PA, "LIVE_TAKER": "Limit",
-                       "LIVE_MAX_ORDER_USD": "50", "LIVE_MAX_OPEN_USD": "300", "LIVE_MAX_DAILY_LOSS_USD": "0", "LIVE_SLIPPAGE_BPS": "50",
+c = m.Config.from_env({**base, "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY[2:], "PREDICT_ACCOUNT": PA,
+                       "LIVE_MAX_ORDER_USD": "50", "LIVE_MAX_OPEN_USD": "300", "LIVE_MAX_DAILY_LOSS_USD": "0",
                        "LIVE_AUTO_REDEEM": "off", "PREDICT_CHAIN_ID": "97", "BSC_RPC_URL": "https://rpc.example/"})
-assert c.live and c.live_key == KEY[2:] and c.live_account == PA and c.live_taker == "limit" and c.live_max_order_usd == 50
-assert c.live_max_open_usd == 300 and c.live_max_daily_loss_usd == 0 and c.live_slippage_bps == 50 and not c.live_auto_redeem
+assert c.live and c.live_key == KEY[2:] and c.live_account == PA and c.live_max_order_usd == 50
+assert c.live_max_open_usd == 300 and c.live_max_daily_loss_usd == 0 and not c.live_auto_redeem
 assert c.live_chain == 97 and c.live_rpc == "https://rpc.example"
 for bad in ({"LIVE": "on"}, {"LIVE": "on", "PREDICT_PRIVATE_KEY": "abc"}, {"PREDICT_PRIVATE_KEY": KEY, "PREDICT_ACCOUNT": "0x12"},
-            {"LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT_CHAIN_ID": "1"}, {"LIVE_TAKER": "ioc"}, {"BSC_RPC_URL": "ftp://x"},
+            {"LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT_CHAIN_ID": "1"}, {"BSC_RPC_URL": "ftp://x"},
             {"LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "SIM": "off"}, {"LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT": "off"}):
     try: m.Config.from_env({**base, **bad}); assert False, bad
     except ValueError: pass
@@ -48,18 +48,7 @@ assert L.limit_amounts(True, 627500000000000000, 100 * WEI) == {
     "price_per_share": 627000000000000000, "maker": 62700000000000000000, "taker": 100 * WEI, "amount": 100 * WEI,
     "last": 627000000000000000, "slippage_bps": 0, "min_out": False}
 assert L.limit_amounts(False, 627000000000000000, 10 * WEI)["maker"] == 10 * WEI and L.limit_amounts(False, 627000000000000000, 10 * WEI)["taker"] == 6270000000000000000
-asks = [(0.58, 30.0), (0.66, 500.0)]
-ma = L.market_buy_amounts(asks, 100 * WEI, 100, True)
-assert (ma["price_per_share"], ma["maker"], ma["taker"], ma["amount"], ma["last"]) == (
-    636000000000000000, 63600000000000000000, 95399999999999999999, 100 * WEI, 660000000000000000) and ma["min_out"] and ma["slippage_bps"] == 100
-plain = L.market_buy_amounts(asks, 100 * WEI, 100, False)
-assert (plain["maker"], plain["taker"]) == (66660000000000000000, 100 * WEI) and not plain["min_out"]
-assert L.market_buy_amounts(asks, 100 * WEI, 0, False)["maker"] == 66 * WEI
-short = L.market_buy_amounts(asks, 1000 * WEI, 50, True)  # the book holds 530 shares: the amounts are for those
-assert (short["price_per_share"], short["maker"], short["taker"], short["amount"]) == (
-    655471698113207547, 347400000000000000000, 523731818181818181817, 530 * WEI), short
-for bad in (lambda: L.market_buy_amounts([], 100 * WEI), lambda: L.limit_amounts(True, 0, 100 * WEI), lambda: L.limit_amounts(True, WEI, 10 ** 15),
-            lambda: L.market_buy_amounts(asks, 10 ** 15)):
+for bad in (lambda: L.limit_amounts(True, 0, 100 * WEI), lambda: L.limit_amounts(True, WEI, 10 ** 15)):
     try: bad(); assert False
     except ValueError: pass
 assert L.exchange_key(False, False) == "CTF_EXCHANGE" and L.exchange_key(True, True) == "YIELD_BEARING_NEG_RISK_CTF_EXCHANGE"
@@ -275,7 +264,7 @@ class FakeApi:
             raise m.RemoteError(self.fail_create)
         self.next_id += 1
         oid, data = str(self.next_id), body["data"]
-        amount = data["amount"] if data["strategy"] == "MARKET" else data["order"]["takerAmount"]
+        amount = data["order"]["takerAmount"]
         self.open[oid] = {"id": oid, "status": "OPEN", "amount": amount, "amountFilled": "0", "strategy": data["strategy"],
                           "order": {**data["order"]}}
         return {"order_id": oid, "hash": data["order"]["hash"], "code": None}
@@ -386,7 +375,8 @@ async def run():
     assert "101" in bot.live.markets and bot.live.markets["101"].fee_bps == 200
     assert bot.live_room({}, world["markets"][0], "up", 0.58, 100) == ""
 
-    # --- HSI: fair 70¢, bid 55¢ (挂涨 +15¢) and ask 58¢×400 (吃涨 +11.16¢): a LIMIT order and a MARKET order go out ------------
+    # --- HSI: fair 70¢, bid 55¢ (挂涨 +15¢) and ask 58¢×400 (吃涨 +11.16¢): two LIMIT orders go out, the taker's capped at 59.1¢
+    # (the dearest price that keeps 10¢ of edge after the fee) for the full 100 shares -------------------------------------------
     await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
     trades = bot.sim_trades()
     maker_tid, taker_tid = f"{HSI_SLUG}|up|挂", f"{HSI_SLUG}|up|吃"
@@ -403,24 +393,25 @@ async def run():
     assert o["maker"] == ADDR and o["feeRateBps"] == "200" and o["expiration"] == str(CLOSE // 1000 + 7200) and o["signatureType"] == 0
     assert o["hash"] == bot.live.wallet.order_hash(o, False, False) and o["signature"].startswith("0x") and len(o["signature"]) == 132
     assert Account.recover_message(encode_typed_data(full_message=bot.live.wallet.typed_data(o, False, False)), signature=o["signature"]) == ADDR
-    assert mkt["strategy"] == "MARKET" and mkt["slippageBps"] == 100 and mkt["isMinAmountOut"] is True and mkt["amount"] == str(100 * WEI)
-    assert mkt["pricePerShare"] == str(58 * 10 ** 16) and mkt["order"]["makerAmount"] == str(58 * WEI) and mkt["order"]["takerAmount"] == str(99 * WEI)
+    assert mkt["strategy"] == "LIMIT" and "slippageBps" not in mkt and "isMinAmountOut" not in mkt and "amount" not in mkt
+    assert mkt["pricePerShare"] == str(591 * 10 ** 15) and mkt["order"]["makerAmount"] == str(591 * 10 ** 17) and mkt["order"]["takerAmount"] == str(100 * WEI)
+    assert taker["cap"] == 0.591 and taker["live"]["want"]["cap"] == 0.591 and taker["live"]["usd_cap"] == 59.1 and taker["live"]["shares_requested"] == 100
     assert mkt["order"]["expiration"] == str(NOW // 1000 + 300) and mkt["order"]["tokenId"] == "1011"
     assert maker["live"]["hash"] == o["hash"].lower() and maker["live"]["want"]["outcome"] == "Up" and maker["live"]["usd_cap"] == 55.0
     assert maker["version"]["live"] and maker["version"]["live_account"] == "0x8fd3…7A03"
     assert abs(bot.live_exposure(trades) - (55 + 100 * taker["price"])) < 1e-9  # resting orders count at their price
-    assert L.sim_status(taker) == "市价单等待成交（真实订单 #102 已成交 0/100 份）" and L.sim_status(maker) == "挂单中（真实订单 #101 已成交 0/100 份）"
-    assert "等待 Predict 成交" in bot.sim_wait(taker, world["markets"][0], NOW) and "挂 55.0¢" in bot.sim_wait(maker, world["markets"][0], NOW)
+    assert L.sim_status(taker) == "吃单等待成交（真实订单 #102 已成交 0/100 份）" and L.sim_status(maker) == "挂单中（真实订单 #101 已成交 0/100 份）"
+    assert "限价吃单等待 Predict 成交（封顶 59.1¢" in bot.sim_wait(taker, world["markets"][0], NOW) and "挂 55.0¢" in bot.sim_wait(maker, world["markets"][0], NOW)
     # the edge lasting buys nothing more; the open orders are read back each step
     await step(bot, NOW + 10_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
     assert len(bot.sim_trades()) == 2 and len([1 for kind, _ in fake.calls if kind == "create"]) == 2
 
-    # --- the MARKET order fills in full: a position, with the fill's own record ------------------------------------------------
+    # --- the taker's order fills in full: a position, with the fill's own record -------------------------------------------------
     fake.fill("102", 100, done=True, price=0.585)
     await step(bot, NOW + 20_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 20_000))
     t = bot.sim_trades()[taker_tid]
     assert t["status"] == "filled" and t["shares"] == 100 and t["filled"] == NOW + 20_000 and t["live"]["state"] == "done" and t["live"]["final"] == "filled"
-    assert t["fills"] == [{"at": NOW + 20_000, "shares": 100.0, "fair": 0.70, "how": "真实成交（市价单）", "order_id": "102",
+    assert t["fills"] == [{"at": NOW + 20_000, "shares": 100.0, "fair": 0.70, "how": "真实成交（吃单）", "order_id": "102",
                            "book": m.book_snapshot(world["markets"][0].book)}], t["fills"]
     assert t["avg"] == 0.585 and abs(t["price"] - (0.585 + FEE * 0.415)) < 1e-12 and t["expected_price"] < t["price"]  # the stated average replaces the estimate
     assert L.sim_status(t) == "持仓" and bot.sim_wait(t, None, NOW) == "等 10-05 收盘（10-05 16:10）后 1 小时（10-05 17:10），按官方收盘预结算，再等 Predict 确认"
@@ -440,7 +431,7 @@ async def run():
     assert t["status"] == "filled" and t["shares"] == 30 and t["unfilled"] == 70 and "其余 70 份模拟交易已改为只吃单" in t["note"], t["note"]
     assert t["live"]["cancel_why"] == "模拟交易已改为只吃单" and any("撤单请求已发送" in e["what"] for e in t["live"]["events"])
 
-    # --- a MARKET order Predict leaves open fills nothing: cancelled after LIVE_TAKER_WAIT_SECONDS, the slot freed later --------
+    # --- a taker order Predict leaves open fills nothing: cancelled after LIVE_TAKER_WAIT_SECONDS, the slot freed later ---------
     deep = lambda at, mid="103": m.SimMarket("deep", "deep", "close", "X", 0.70, book([], [("0.58", "100"), ("0.70", "1000")], at, "deep", mid=mid), 0.03, "", ("涨", "跌"),
                                              {"key": "X", "target": "2026-10-05", "line": 1.0, "close_ms": CLOSE})
     fake.markets["103"] = market_json("103")
@@ -452,7 +443,7 @@ async def run():
     await step(bot, NOW + 121_000, deep(NOW + 121_000))  # 61 s: cancelled, no fill: the attempt is kept, the slot is free
     trades = bot.sim_trades()
     assert "deep|up|吃" not in trades and trades["deep|up|吃#1"]["status"] == "cancelled" and "103" in fake.closed
-    assert trades["deep|up|吃#1"]["live"]["final"] == "failed" and "市价单未成交" in trades["deep|up|吃#1"]["note"]
+    assert trades["deep|up|吃#1"]["live"]["final"] == "failed" and "吃单未成交" in trades["deep|up|吃#1"]["note"]
     assert ("deep", "up") in bot.live_backoff and "再试" in bot.live_room(trades, deep(NOW + 121_000), "up", 0.58, 100)
     await step(bot, NOW + 131_000, deep(NOW + 131_000))  # within LIVE_RETRY_SECONDS: refused, and the refusal recorded
     assert "deep|up|吃" not in bot.sim_trades() and any(b["id"] == "deep|up|吃" and "再试" in b["why"] for b in bot.sim_blocks())
@@ -548,7 +539,8 @@ async def run():
     t = bot.sim_trades()["down|down|吃"]
     body = [b for kind, b in fake.calls if kind == "create"][-1]["data"]
     assert t["label"] == "吃No" and body["order"]["tokenId"] == "1092" and body["order"]["side"] == 0 and t["live"]["want"]["neg_risk"]
-    assert body["pricePerShare"] == str(L.market_buy_amounts([(0.65, 30.0), (0.70, 500.0)], 100 * WEI, 100)["price_per_share"])
+    assert body["pricePerShare"] == str(693 * 10 ** 15) and t["cap"] == 0.693 and t["order"] == 100  # 跌 fair 80¢: the cap keeps 10¢ after the fee
+    assert body["order"]["takerAmount"] == str(100 * WEI) and body["order"]["makerAmount"] == str(693 * 10 ** 17)  # only the 65¢ level is under it now; the rest waits
     assert body["order"]["hash"] == bot.live.wallet.order_hash(body["order"], True, False)  # signed for the multi-outcome exchange
 
     # --- settlement: the paper trader's, on the shares really filled; a loss trips the daily limit ------------------------------
@@ -561,7 +553,7 @@ async def run():
     assert trades[maker_tid]["status"] == "settled" and trades[maker_tid]["shares"] == 30 and trades[maker_tid]["payout"] == 0.0
     assert bot.live_daily_pnl(trades, CLOSE + 61 * 60_000) < -50 and bot.live_killed().startswith("今日已结算亏损")
     assert "今日停止开新仓" in bot.live_room(trades, mk, "up", 0.58, 100) and bot.store.get("live:killed")["day"] == "2026-10-05"
-    down_t = trades["down|down|吃#1"]  # its MARKET order had waited too long: cancelled, nothing filled, the attempt kept
+    down_t = trades["down|down|吃#1"]  # its taker order had waited too long: cancelled, nothing filled, the attempt kept
     assert down_t["live"]["final"] == "failed" and ("remove", [down_t["live"]["order_id"]]) in fake.calls and "down|down|吃" not in trades
     assert bot.live_killed() and not m.beijing_day((CLOSE + 25 * 3_600_000) / 1000) == "2026-10-05"
     bot.market.now = CLOSE + 25 * 3_600_000
@@ -621,21 +613,21 @@ async def run():
     assert bot.sim_trades()["late|up|挂"]["live"]["state"] == "open" and "同步真实订单失败" in bot.live_errors[-1]
     fake.fail_open = None
 
-    # --- LIVE_TAKER=limit: a LIMIT order capped at the worst level the paper fill walked --------------------------------------------
-    lbot = make_bot(LIVE_TAKER="limit", SIM_WAYS="taker")
+    # --- the taker's LIMIT order: SIM_SHARES at the cap, whatever the book holds under it ------------------------------------------
+    lbot = make_bot(SIM_WAYS="taker")
     await lbot.live_prepare()
     lbot.live.api.markets["103"] = market_json("103")
     world["markets"] = [deep(NOW)]
     await lbot.live_prefetch(NOW)
     await step(lbot, NOW, deep(NOW))
     body = lbot.live.api.calls[-1][1]["data"]
-    assert body["strategy"] == "LIMIT" and body["pricePerShare"] == str(58 * 10 ** 16) and body["order"]["makerAmount"] == str(58 * WEI)
+    assert body["strategy"] == "LIMIT" and body["pricePerShare"] == str(591 * 10 ** 15) and body["order"]["makerAmount"] == str(591 * 10 ** 17)
     assert body["order"]["expiration"] == str(NOW // 1000 + 300) and "slippageBps" not in body
-    # the book's second level walked: the cap is that level's price
+    # fair 80¢: the cap is 69.3¢, both levels (58¢×40, 62¢×100) are under it, the order still asks for the full 100 at the cap
     world["markets"] = [m.SimMarket("two", "two", "close", "X", 0.80, book([], [("0.58", "40"), ("0.62", "100")], NOW + 10_000, "two", mid="103"), 0.03, "", ("涨", "跌"), {})]
     await step(lbot, NOW + 10_000)
     body = lbot.live.api.calls[-1][1]["data"]
-    assert body["pricePerShare"] == str(62 * 10 ** 16) and body["order"]["takerAmount"] == str(100 * WEI)
+    assert body["pricePerShare"] == str(693 * 10 ** 15) and body["order"]["takerAmount"] == str(100 * WEI) and lbot.sim_trades()["two|up|吃"]["cap"] == 0.693
 
     # a Predict account signs and trades for the smart wallet
     kbot = make_bot(PREDICT_ACCOUNT=PA, SIM_WAYS="maker")

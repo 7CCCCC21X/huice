@@ -5,8 +5,9 @@ The paper trader in main.py (/sim) decides *what* to buy: whenever a card's sugg
 SIM_SHARES of that side, takers across the book, makers resting at the suggested price. This module keeps every one of
 those decisions and sends it to Predict for real:
 
-- a taker becomes a MARKET order (strategy "MARKET", the shares the paper fill got, LIVE_SLIPPAGE_BPS tolerance, the
-  expected cost as the USDT cap) or, with LIVE_TAKER=limit, a LIMIT order capped at the worst level the paper walked;
+- a taker becomes a LIMIT order for SIM_SHARES capped at the dearest acceptable price (main.taker_cap: the price that
+  still leaves the required edge after the fee): what the book holds at or under it fills at once, the rest waits
+  LIVE_TAKER_WAIT_SECONDS and is then cancelled; no MARKET orders;
 - a maker becomes a LIMIT order resting at the suggested price; it is cancelled when the paper trader withdraws it
   (SIM_WAYS / SIM_MARKETS narrowed) and when the market's result is in;
 - fills are read back from Predict (GET /v1/orders), never presumed from the book; settlement and the journal are the
@@ -56,7 +57,7 @@ ZERO_HASH = "0x" + "0" * 64
 PROTOCOL_NAME, PROTOCOL_VERSION = "predict.fun CTF Exchange", "1"
 KERNEL_NAME, KERNEL_VERSION = "Kernel", "0.3.1"
 FAR_FUTURE = 4102444800  # 2100-01-01: a LIMIT order without an expiry, as the SDKs build it
-MARKET_ORDER_SECONDS = 300  # a MARKET order expires five minutes after it is built (the SDKs' rule)
+TAKER_ORDER_SECONDS = 300  # a taker's LIMIT order expires five minutes after it is built (its rest is cancelled sooner)
 API_TIMEOUT = 12
 RPC_TIMEOUT = 15
 MAX_UINT256 = 2 ** 256 - 1
@@ -140,43 +141,6 @@ def limit_amounts(buy: bool, price_wei: int, qty_wei: int) -> dict:
             "amount": qty, "last": price, "slippage_bps": 0, "min_out": False}
 
 
-def walk_book(levels: Any, qty_wei: int) -> tuple[int, int, int]:
-    """(shares taken, Σ price × shares in wei², the last level's price) buying ``qty_wei`` across ``levels``
-    [(price, size)], best first (the SDK's processBook)."""
-    got = cost = last = 0
-    for price, size in levels:
-        remaining = qty_wei - got
-        if remaining <= 0:
-            break
-        p, q = to_wei(price), to_wei(size)
-        take = min(q, remaining)
-        got, cost, last = got + take, cost + p * take, p
-    return got, cost, last
-
-
-def market_buy_amounts(asks: Any, qty_wei: int, slippage_bps: int = 0, min_out: bool = True) -> dict:
-    """A MARKET buy of ``qty_wei`` shares against ``asks``: with ``min_out`` (the SDK's recommended model) the maker
-    amount is the expected cost (the average price × the shares) and the taker amount the least shares accepted
-    (deflated by the slippage), so the USDT at risk is capped at what the book showed."""
-    qty = retain_sig(qty_wei, 5)
-    if qty < 10 ** 16:
-        raise ValueError("数量不足 0.01 份")
-    got, cost, last = walk_book(asks, qty)
-    if got <= 0 or last <= 0:
-        raise ValueError("盘口这一边没有卖单")
-    pps = cost // got
-    if min_out:
-        signed = cost // last
-        taker = max(signed * (10_000 - slippage_bps) // 10_000, 0) if slippage_bps > 0 else signed
-        return {"price_per_share": pps, "maker": cost // WEI, "taker": taker, "amount": got, "last": last,
-                "slippage_bps": slippage_bps, "min_out": True}
-    base = last * got // WEI
-    maker = min(base * (10_000 + slippage_bps) // 10_000, got) if slippage_bps > 0 else base
-    return {"price_per_share": pps, "maker": maker, "taker": got, "amount": got, "last": last,
-            "slippage_bps": slippage_bps, "min_out": False}
-
-
-# --- the wallet: EIP-712 order signing, the sign-in message, transactions ---------------------------------------------
 def _eth() -> Any:
     try:
         import eth_account  # noqa: F401
@@ -785,9 +749,8 @@ class LiveTrader:
                          + ("" if all(self.approvals.values()) else "（python main.py --approve，或在网站交易一次）"))
         else:
             lines.append(f"授权：未读到（{self.approvals_error or '尚未读取'}）")
-        taker = "市价单" if c.live_taker == "market" else "限价单（按吃到的最差一档封顶）"
         lines.append(f"风控：单笔 ≤${c.live_max_order_usd:g}｜持仓+挂单 ≤${c.live_max_open_usd:g}｜日亏损 ≤${c.live_max_daily_loss_usd:g}"
-                     f"｜吃单 {taker}，滑点 {c.live_slippage_bps / 100:g}%，{c.live_taker_wait} 秒未成交撤单"
+                     f"｜吃单 封顶限价单，{c.live_taker_wait} 秒未成交撤单"
                      f"｜自动领取 {'开' if c.live_auto_redeem else '关'}")
         return lines
 
@@ -818,7 +781,7 @@ def sim_status(trade: dict) -> str:
         return "真实下单准备中"
     if state == "placing":
         return "真实下单发送中（待确认）"
-    way = "挂单中" if trade.get("maker") else "市价单等待成交"
+    way = "挂单中" if trade.get("maker") else "吃单等待成交"
     if state == "cancelling":
         way = "撤单中"
     tag = f"真实订单 #{st.get('order_id')}" if st.get("order_id") else "真实订单"
@@ -889,11 +852,13 @@ class LiveBot(core.Bot):
         return "" if not record or record.get("resumed") else str(record.get("why") or "触发日亏损上限")
 
     # --- the gate: why a decision is not sent (recorded like a group-cap refusal) ------------------------------------
-    def sim_group_room(self, trades: dict[str, dict], mk: core.SimMarket, side: str, price: float, shares: float) -> str:
-        why = super().sim_group_room(trades, mk, side, price, shares)
-        return why or self.live_room(trades, mk, side, price, shares)
+    def sim_group_room(self, trades: dict[str, dict], mk: core.SimMarket, side: str, price: float, shares: float,
+                       taker: dict | None = None) -> str:
+        why = super().sim_group_room(trades, mk, side, price, shares, taker)
+        return why or self.live_room(trades, mk, side, price, shares, taker)
 
-    def live_room(self, trades: dict[str, dict], mk: core.SimMarket, side: str, price: float, shares: float) -> str:
+    def live_room(self, trades: dict[str, dict], mk: core.SimMarket, side: str, price: float, shares: float,
+                  taker: dict | None = None) -> str:
         c = self.config
         if c.live_mode == "off":
             return ""  # paper trading, as the base class does it
@@ -908,6 +873,8 @@ class LiveBot(core.Bot):
         held = self.live_backoff.get((mk.market, side))
         if held and time.monotonic() < held[0]:
             return f"{held[1]}，{int(held[0] - time.monotonic()) + 1} 秒后再试"
+        if taker and taker.get("cap"):
+            price, shares = float(taker["cap"]), float(c.sim_shares)  # the LIMIT order asks for SIM_SHARES at the cap: the most it can cost
         notional = float(price) * float(shares)
         if notional < MIN_ORDER_USD - 1e-9:
             return f"本单 ${notional:,.2f} 低于 Predict 最低订单金额 ${MIN_ORDER_USD:g}（提高 SIM_SHARES）"
@@ -976,8 +943,9 @@ class LiveBot(core.Bot):
         outcome, assumed = outcome_for_side(mk.kind, side, info.outcomes, spec)
         settle = mk.settle or {}
         end = int(settle.get("close_ms") or settle.get("deadline") or settle.get("end") or 0)
-        want = {"maker": maker is not None, "side": side, "shares": float(trade["shares"] if taker else trade["order"]),
+        want = {"maker": maker is not None, "side": side, "shares": float(trade["order"]),
                 "price": float(maker.price) if maker is not None else float(taker["avg"]),
+                "cap": float(taker["cap"]) if taker and taker.get("cap") else None,
                 "cost": float(trade["price"]), "token": outcome["token"], "outcome": outcome["name"],
                 "index_set": outcome["index_set"], "assumed": assumed, "fee_bps": info.fee_bps,
                 "neg_risk": info.neg_risk, "yield_bearing": info.yield_bearing, "condition_id": info.condition_id,
@@ -1025,7 +993,9 @@ class LiveBot(core.Bot):
         if st.get("state") == "cancelling":
             return f"{tag} 撤单中（{st.get('cancel_why', '')}），已成交 {shares:g}/{order:g} 份"
         if not trade.get("maker"):
-            return f"{tag} 市价单等待 Predict 成交（{self.config.live_taker_wait} 秒未成交的部分撤掉），已成交 {shares:g}/{order:g} 份"
+            cap = st.get("want", {}).get("cap")
+            return (f"{tag} 限价吃单等待 Predict 成交（封顶 {core.cents(float(cap))}，" if cap else f"{tag} 吃单等待 Predict 成交（") \
+                + f"{self.config.live_taker_wait} 秒未成交的部分撤掉），已成交 {shares:g}/{order:g} 份"
         price = float(trade["price"])
         best = ""
         if mk is not None and not mk.book.stale(now_ms):
@@ -1039,7 +1009,6 @@ class LiveBot(core.Bot):
         if c.live_mode == "off":
             return super().sim_version()
         return {**super().sim_version(), "live": c.live_mode, "live_account": short_addr(self.live.wallet.maker),
-                "live_taker": c.live_taker, "live_slippage_bps": c.live_slippage_bps,
                 "live_max_order_usd": c.live_max_order_usd, "live_max_open_usd": c.live_max_open_usd}
 
     # --- the step: prefetch, decide (the paper trader), place, read back --------------------------------------------
@@ -1086,9 +1055,10 @@ class LiveBot(core.Bot):
                 near = maker is not None and maker.edge >= bar
             bps = mk.book.fee_bps if mk.book.fee_bps is not None else c.predict_fee_bps
             for side in ("up", "down") if c.sim_ways != "maker" else ():
-                q = core.taker_quote(mk.book, side, c.sim_shares, bps)
                 fair = mk.fair_up if side == "up" else 1 - mk.fair_up
-                near = near or (q is not None and fair - q["cost"] >= bar)
+                cap = core.taker_cap(fair, max(mk.need, bar), bps)  # a little under the paper trader's cap: read the market early
+                q = core.taker_quote(mk.book, side, c.sim_shares, bps, cap) if cap > 0 else None
+                near = near or (q is not None and q["got"] >= core.SIM_MIN_SHARES - 1e-9)
             if near:
                 wanted.append(str(mk.book.market_id))
         for mid in list(dict.fromkeys(wanted))[:5]:
@@ -1127,24 +1097,14 @@ class LiveBot(core.Bot):
             if want["maker"]:
                 amounts = limit_amounts(True, to_wei(want["price"]), shares_wei)
                 strategy, expiration = "LIMIT", int(want.get("expires") or FAR_FUTURE)
-            elif c.live_taker == "limit":
-                worst = max((float(p) for p, _ in want["asks"][:1]), default=want["price"])
-                got = 0.0
-                for p, q in want["asks"]:
-                    if got >= want["shares"] - 1e-9:
-                        break
-                    worst, got = float(p), got + float(q)
-                amounts = limit_amounts(True, to_wei(worst), shares_wei)
-                strategy, expiration = "LIMIT", int(now_ms // 1000) + MARKET_ORDER_SECONDS
             else:
-                amounts = market_buy_amounts(want["asks"], shares_wei, c.live_slippage_bps, True)
-                strategy, expiration = "MARKET", int(now_ms // 1000) + MARKET_ORDER_SECONDS
+                # the dearest acceptable price: the book at or under it fills now, the rest waits LIVE_TAKER_WAIT_SECONDS
+                amounts = limit_amounts(True, to_wei(want.get("cap") or want["price"]), shares_wei)
+                strategy, expiration = "LIMIT", int(now_ms // 1000) + TAKER_ORDER_SECONDS
             order = build_order(wallet, want["token"], amounts["maker"], amounts["taker"], want["fee_bps"], expiration)
             digest, signature = wallet.sign_order(order, want["neg_risk"], want["yield_bearing"])
             body: dict = {"data": {"order": {**order, "signature": signature, "hash": digest},
                                    "pricePerShare": str(amounts["price_per_share"]), "strategy": strategy}}
-            if strategy == "MARKET":
-                body["data"].update(slippageBps=amounts["slippage_bps"], isMinAmountOut=amounts["min_out"], amount=str(amounts["amount"]))
             st.update(state="placing", hash=digest.lower(), strategy=strategy, order=order, placing_at=now_ms,
                       price_per_share=from_wei(amounts["price_per_share"]), usd_cap=from_wei(amounts["maker"]),
                       shares_requested=from_wei(amounts["amount"]))
@@ -1165,7 +1125,7 @@ class LiveBot(core.Bot):
         st["events"].append({"at": now_ms, "what": f"已下单 #{result['order_id']}"})
         self.sim_save([(tid, trade)])
         self.live_notify(f"📤 已向 Predict 下单：{trade['item']} {trade['label']} {core.cents(want['price'])}×{want['shares']:g} 份"
-                         f"（{'限价挂单' if strategy == 'LIMIT' else '市价单'}，订单 #{result['order_id']}，"
+                         f"（{'限价挂单' if want['maker'] else '限价吃单'}，订单 #{result['order_id']}，"
                          f"最多花 ${from_wei(amounts['maker']):,.2f}）\n{self.sim_url(trade)}")
 
     def live_fail(self, tid: str, trade: dict, why: str, now_ms: int) -> None:
@@ -1257,7 +1217,7 @@ class LiveBot(core.Bot):
             self.live_misses.pop(tid, None)
             self.live_apply(tid, trade, row, mk, now_ms)
             if not trade.get("maker") and now_ms - int(st.get("placed_at") or now_ms) >= self.config.live_taker_wait * 1000:
-                st.update(state="cancelling", cancel_why=f"市价单 {self.config.live_taker_wait} 秒未全部成交")
+                st.update(state="cancelling", cancel_why=f"吃单 {self.config.live_taker_wait} 秒未全部成交")
                 st["events"].append({"at": now_ms, "what": st["cancel_why"]})
                 await self.live_cancel(tid, trade, by_id, mk, now_ms)
             return
@@ -1298,7 +1258,7 @@ class LiveBot(core.Bot):
         if filled > prev + 1e-9:
             fair = (mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up) if mk is not None else float(trade["fair"])
             trade["fills"].append({"at": now_ms, "shares": filled - prev, "fair": fair,
-                                   "how": "真实成交（" + ("挂单" if trade.get("maker") else "市价单") + "）", "order_id": st.get("order_id"),
+                                   "how": "真实成交（" + ("挂单" if trade.get("maker") else "吃单") + "）", "order_id": st.get("order_id"),
                                    **({"book": core.book_snapshot(mk.book)} if mk is not None else {})})
             trade["shares"] = filled
             if trade.get("filled") is None:
@@ -1331,7 +1291,7 @@ class LiveBot(core.Bot):
             trade.update(status="cancelled", unfilled=order, note=f"挂单结束（{status or '不在盘口'}），一份都没成交")
             self.live_notify(f"ℹ️ {trade['item']} {trade['label']} 挂单结束（{status or '不在盘口'}），一份都没成交。")
         else:
-            self.live_fail(tid, trade, f"市价单未成交（{st.get('cancel_why') or status or '不在盘口'}）", now_ms)
+            self.live_fail(tid, trade, f"吃单未成交（{st.get('cancel_why') or status or '不在盘口'}）", now_ms)
 
     # --- redeeming resolved positions -------------------------------------------------------------------------------------
     async def live_redeem(self, now_ms: int) -> list[str]:
