@@ -153,7 +153,7 @@ WEB_CONTROL_KEY=自己定一个12到64位、不含空格的口令
    ```
 
    哪个是 `False` 就是哪个没填上（变量名拼错、值是空的）。然后给机器人发 `/web`，会给出概率页和控制台两个链接，控制台里输入口令试一下"自检"。
-6. **先 pause 再 on**：把 `LIVE` 改成 `pause` 并 Deploy，机器人会登录 Predict、校验私钥与账户、读余额和授权，但不开新仓；控制台“真实交易”那一排按钮这时才可用。点“自检”和“挂单测试”（或发 `/live check`、`/live test`），四步都成功后再把 `LIVE` 改成 `on`，再 Deploy。之后 Telegram 会收到“真实交易已启动”的汇总。
+6. **先 pause 再 on，不用再改变量**：部署完成后在机器人私聊里发 `/live mode pause`（或在控制台点 pause），机器人会登录 Predict、校验私钥与账户、读余额和授权，但不开新仓；然后点“自检”和“挂单测试”（或发 `/live check`、`/live test`），四步都成功后发 `/live mode on`（或点 on）。模式立即生效并保存，Telegram 会收到切换通知；`/live mode off` 随时回到只记账。
 
 常见错误：变量名大小写不对（全部大写）；`PREDICT_ACCOUNT` 不是 `0x` 开头的 40 位地址；`WEB_CONTROL_KEY` 不足 12 位或含空格（启动直接报错并写明）；`PORT` 不要手填，Railway 自动注入；把值写进了代码或 `.env.example` 并提交到了 GitHub。
 
@@ -231,7 +231,7 @@ WEB_CONTROL_KEY=自己定一个12到64位、不含空格的口令
 | `/diag` | 逐个检测所有数据源，找出哪里出问题（仅管理员，通常 10–30 秒、最长约 2 分钟；在后台进行，期间其他命令照常响应，报告单独发出；探测不会改变后台刷新的源顺序） |
 | `/sim` | 模拟交易：净优势 ≥10¢ 时按建议买 100 份，只记账不下单（`LIVE=on` 时真实下单），看长期是赚还是亏；另列持仓的共同风险（最坏单一事件）、依赖的数据源、组上限拦下的买入和成交后市场走向 |
 | `/web` | 概率网页链接；设置了 `WEB_CONTROL_KEY` 时一并给出控制台链接 |
-| `/live` | 真实交易（`LIVE=on`）：钱包与下单账户、API 登录、USDT/BNB 余额、交易所授权、风控用量、今日盈亏与最近的真实订单；`/live test [市场] [份数] [价格¢]` 挂单测试（极小限价单 → 列表确认 → 撤单 → 最终状态）；`/live pause [原因]` 停止开新仓、`/live resume` 恢复（也解除当日亏损停机）、`/live cancel all` 或 `/live cancel <订单号>` 撤真实挂单、`/live redeem` 领取已结算持仓、`/live check` 自检、`/live orders` / `/live positions` 看 Predict 上的开放订单与持仓 |
+| `/live` | 真实交易：钱包与下单账户、API 登录、USDT/BNB 余额、交易所授权、风控用量、今日盈亏与最近的真实订单；`/live mode off|pause|on` 切换模式（off 只记账；pause 登录可测试不开仓；on 真实下单），立即生效并保存；`/live test [市场] [份数] [价格¢]` 挂单测试（极小限价单 → 列表确认 → 撤单 → 最终状态）；`/live pause [原因]` 停止开新仓、`/live resume` 恢复（也解除当日亏损停机）、`/live cancel all` 或 `/live cancel <订单号>` 撤真实挂单、`/live redeem` 领取已结算持仓、`/live check` 自检、`/live orders` / `/live positions` 看 Predict 上的开放订单与持仓 |
 | `/edge` | 优势提醒门槛：不带参数查看；`/edge 6` 改默认；`/edge 市值阶梯 6` 按栏目（指数 / 合约标的 / 加密 / 价格阶梯 / 市值阶梯）；`/edge 牛来 4` 按市场（名字、别名或代码）；`/edge 牛来 300M 3` 按档位；末尾写 `off` 取消；`/edge 清空` 全部取消。档位 > 市场 > 栏目 > 默认 |
 | `/calib` | 用保存的预测快照和实际收盘给概率模型打分：Brier、对数损失、与 Predict 盘口中间价的对比（模型有没有赢过市场）、校准表（每档带按日数算的 95% 区间）、标准化残差（均方根 1 为校准，>1 说明 σ 偏小）及其按剩余方差份额 R 的分桶、代理系数拟合与逐日向前检验；另有全市场快照（含阶梯各档，每 2 小时一条）按类型打分（只评估，不自动改参数；也可 `python main.py --calib`） |
 | `/test` | 仅测试消息能否发到当前私聊/话题 |
@@ -563,7 +563,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
   1. Predict 账户里有 USDT（BNB 链）。网站账户是一个智能钱包（Predict 账户）：在网站“账户设置”里导出 Privy 钱包私钥，填 `PREDICT_PRIVATE_KEY`，再把账户设置里的**充值地址**填 `PREDICT_ACCOUNT`（两个地址不同是正常的：前者签名，后者持币）。也可以用一个普通钱包直接交易：只填它的私钥、`PREDICT_ACCOUNT` 留空，USDT 和份额都在这个地址上。`--live-check` 的“账户校验”会在链上确认这把私钥确实控制填写的 Predict 账户，对不上会直接说明。
   2. 在 Predict 开发者控制台 <https://developers.predict.fun> 申请 API Key，填 `PREDICT_API_KEY`（请求头 `x-api-key`，主网所有接口都要；登录签名换取的 JWT 由程序自动处理和续期）。
   3. 交易所要先获得 USDT 额度授权（和结果代币操作权）。网站上交易过一次的 Predict 账户通常已经授权；没有的话给签名钱包转约 0.005 BNB 作 gas，运行 `python main.py --approve`（逐项检查、只发缺的那几笔交易）。
-  4. 先把 `LIVE` 设为 `pause`：机器人会登录 Predict、在链上校验私钥与账户、读余额和授权，但不开任何仓；此时在控制台点“自检”“挂单测试”（或发 `/live check`、`/live test`），四步都成功再把 `LIVE` 改成 `on`。没有 Railway CLI 的话这一步就代替了本地的 `python main.py --live-check`。建议先用小的 `SIM_SHARES` 跑几天，看 `/live` 和复盘页里的真实成交是否符合预期。
+  4. 配置好私钥部署后（`LIVE` 保持 `off`），在机器人私聊里发 `/live mode pause`（或控制台点 pause）：机器人登录 Predict、在链上校验私钥与账户、读余额和授权，但不开任何仓；然后 `/live check` 自检、`/live test` 挂单测试（控制台有同样的按钮），四步都成功再发 `/live mode on`。整个过程不用再改 Railway 变量。建议先用小的 `SIM_SHARES` 跑几天，看 `/live` 和复盘页里的真实成交是否符合预期。
 - **吃单 → 市价单**：模拟交易按 `SIM_SHARES` 份走盘口得出的成交数量和均价，变成一张 `MARKET` 策略的买单：数量就是模拟吃到的份数，USDT 上限 = 当时盘口算出的预期成本，`LIVE_SLIPPAGE_BPS`（默认 1%）是允许少收的份数比例（官方 SDK 的 `isMinAmountOut` 模型）。`LIVE_TAKER=limit` 则改为一张限价买单，价格封在模拟吃单走到的最差一档，`LIVE_TAKER_WAIT_SECONDS`（默认 60）后仍未成交的部分撤掉。两种方式下，成交份数以 Predict 回报为准：一份没成交就记为一次失败的尝试（复盘页里编号带 `#1`、`#2`），这个市场这一边 `LIVE_RETRY_SECONDS`（默认 300）内不再下单，之后有机会再下。
 - **挂单 → 限价单**：按建议价挂 `SIM_SHARES` 份，到期时间为市场收盘/截止后两小时（取不到就不设）。成交按 Predict 回报逐笔记录，不再按盘口“推定”。模拟交易撤单的情形（`SIM_WAYS`、`SIM_MARKETS` 缩小、价格阶梯只吃单）、市场出结果、触发日亏损上限、`/live cancel`，都会向 Predict 发撤单；已成交的份数照常持仓结算。
 - **结算与复盘**：和模拟交易相同——先按机器人数据预结算，再以 Predict 的结果确认，`/sim`、网页“模拟交易”栏、复盘页和 CSV 里就是真实的交易，每笔多一组 `live` 记录（订单号、哈希、策略、下单时的盘口与数量、事件时间线、Predict 回报的状态）。市场结算后，赢的一边自动在链上领取 USDT（`LIVE_AUTO_REDEEM=on`，每 10 分钟查一次持仓；签名钱包需有 BNB 付 gas；`/live redeem` 手动领取）。
@@ -575,7 +575,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `LIVE` | `off` | `off` 只记账；`pause` 加载真实交易模块（登录 Predict、链上校验、余额授权、`/live` 自检与挂单测试、撤单、领取都可用）但**不开新仓**；`on` 真实下单。都需要 `SIM=on`、`PREDICT=on`，`pause` / `on` 需要私钥 |
+| `LIVE` | `off` | 真实交易模式的**初始值**：`off` 只记账；`pause` 登录 Predict、链上校验、读余额授权，`/live` 自检与挂单测试、撤单、领取都可用，但**不开新仓**；`on` 真实下单。只要配置了 `PREDICT_PRIVATE_KEY`，真实交易模块就一直加载，运行中用 `/live mode off|pause|on` 或控制台的模式按钮切换，立即生效并保存（重启沿用，环境变量不必再改）。都需要 `SIM=on`、`PREDICT=on` |
 | `PREDICT_PRIVATE_KEY` | 无 | 签名用的私钥，64 位十六进制（0x 可省）。两种填法：**A.** 用 Predict 网站账户交易：网站账户设置里“导出私钥 / Export wallet”得到的 Privy 钱包私钥（它的地址和充值地址不是同一个，这是正常的）；**B.** 用自己的普通钱包交易：那个钱包的私钥，建议新建一个机器人专用钱包 |
 | `PREDICT_ACCOUNT` | 空 | 填法 A 必填：网站账户设置里的**充值地址**（0x 开头 40 位，USDT 和份额都在这个地址上）；填法 B 留空。启动和 `--live-check` 会在链上核对这把私钥是不是该账户的控制钥匙，对不上就不下单并说明原因 |
 | `PREDICT_API_KEY` | 空 | Predict 开发者 API Key，在开发者控制台 <https://developers.predict.fun> 申请；主网所有接口都要它（默认限额每分钟 240 次请求，本机器人远低于此） |
@@ -596,7 +596,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 
 概率网页的链接后面加 `/control`（`/web` 会直接给出），就是控制台。它和概率页共用同一个私密令牌，但**每个操作都要再输一次控制口令**：环境变量 `WEB_CONTROL_KEY`（12～64 个不含空格的 ASCII 字符）。不设置这个变量时控制台只能查看，所有操作都被拒绝；口令连续错 5 次，控制接口锁 10 分钟。口令只存在环境变量里，页面不显示；勾选“在这个浏览器记住口令”才会存进该浏览器的 localStorage。
 
-- **真实交易开关**：暂停开新仓（可填原因）、恢复（也解除当天的亏损停机）、撤掉全部真实挂单或某一张、领取已结算持仓、自检、刷新 Predict 持仓、挂单测试（见「真实交易」）。和 `/live` 的命令是同一套代码，Telegram 里也能看到结果。`LIVE=off` 时这一栏显示未开启。
+- **真实交易开关**：模式按钮 off / pause / on（和 `/live mode` 相同，立即生效并保存；切到 off 会撤掉未成交的真实挂单）、暂停开新仓（可填原因）、恢复（也解除当天的亏损停机）、撤掉全部真实挂单或某一张、领取已结算持仓、自检、刷新 Predict 持仓、挂单测试（见「真实交易」）。没有配置私钥时这一栏不可用。和 `/live` 的命令是同一套代码，Telegram 里也能看到结果。`LIVE=off` 时这一栏显示未开启。
 - **在线改参数**：策略（`SIM_EDGE_CENTS`、`SIM_SHARES`、`SIM_WAYS`、`SIM_MARKETS`、`SIM_GROUP_USD`、`SIM_TAKER_SESSION`、`PREDICT_MIN_EDGE_CENTS`、`PREDICT_TRADE_USD`）和真实交易风控（`LIVE_MAX_ORDER_USD`、`LIVE_MAX_OPEN_USD`、`LIVE_MAX_DAILY_LOSS_USD`、`LIVE_TAKER`、`LIVE_SLIPPAGE_BPS`、`LIVE_TAKER_WAIT_SECONDS`、`LIVE_RETRY_SECONDS`、`LIVE_AUTO_REDEEM`、`LIVE_NOTIFY`）。填的就是环境变量的写法，保存时和启动时一样整体校验（错了会给出同样的提示，什么都不改），通过后**立即生效**，并保存到数据库（`control:env`），重启后仍按网页上的设置运行；某一项留空就恢复为环境变量，“清除全部”回到纯环境变量。页面上每一项都标明现在生效的值和环境变量的值。私钥、API Key、Token、钱包、链等不能在网页上改。
 - **看一眼**：真实订单列表（时间、市场、方向、价格 × 份数、状态、订单号，挂单可直接撤）、最近读到的 Predict 持仓、最近的错误、持仓 + 挂单占用与上限、今日已结算盈亏。每 10 秒自动刷新。
 - 后台任务不会被控制台卡住：操作在收到请求时执行，失败的原因会原样返回到页面。

@@ -747,9 +747,57 @@ async def run():
     assert "LIVE=pause：已登录但不开新仓" in pbot2.sim_text() and "LIVE=pause，不开新仓" in pbot2.status("1:0")
     assert bot.live_status(NOW)["mode"] == "on"
 
+    # --- LIVE=off with a key: the module is loaded, the trader trades on paper; /live mode switches it while running -----------
+    obot = make_bot(LIVE="off", SIM_WAYS="both")
+    assert obot.config.live_mode == "off" and not obot.config.live and obot.live_room({}, hsi(0.70, [], [], NOW), "up", 0.5, 100) == ""
+    assert "LIVE=off" in obot.live_text(NOW) and obot.sim_version() == m.Bot.sim_version(obot) and "LIVE=off" in obot.status("1:0")
+    assert "LIVE=off，只记账" in obot.status("1:0") and "/live mode pause" in obot.sim_text() and "LIVE=off，只记账" in obot.cmd_help(None)
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    await step(obot, NOW, world["markets"][0])
+    ot = obot.sim_trades()
+    assert sorted(ot) == [f"{HSI_SLUG}|up|吃", f"{HSI_SLUG}|up|挂"] and "live" not in ot[f"{HSI_SLUG}|up|吃"] and ot[f"{HSI_SLUG}|up|吃"]["status"] == "filled"
+    assert ot[f"{HSI_SLUG}|up|吃"]["fills"][0]["how"] == "吃单立即成交" and not obot.live.api.calls and not obot.live.ready  # paper, no sign-in
+    await step(obot, NOW + 10_000, hsi(0.70, [("0.54", "200")], [("0.55", "30"), ("0.60", "100")], NOW + 10_000))
+    assert obot.sim_trades()[f"{HSI_SLUG}|up|挂"]["shares"] == 30  # presumed fills, as on paper
+    assert "用法" in await obot.cmd_live(m.Request("/live", ["mode"], 1, 0, 1)) and "用法" in await obot.cmd_live(m.Request("/live", ["mode", "maybe"], 1, 0, 1))
+    assert "已经是 off" in await obot.cmd_live(m.Request("/live", ["mode", "off"], 1, 0, 1))
+    text = await obot.cmd_live(m.Request("/live", ["mode", "pause"], 1, 0, 1))
+    assert "off → pause" in text and "/live test" in text and obot.config.live_mode == "pause" and obot.live.config.live_mode == "pause"
+    assert obot.store.get("control:env") == {"LIVE": "pause"} and obot.live.ready and obot.control_value("LIVE") == "pause"
+    assert "LIVE=pause" in obot.live_room({}, world["markets"][0], "up", 0.58, 100)
+    fake2 = obot.live.api
+    fake2.markets["103"] = market_json("103")
+    text = await obot.cmd_live(m.Request("/live", ["mode", "ON"], 1, 0, 1))
+    assert "pause → on" in text and "⚠️" in text and obot.config.live_mode == "on" and obot.sim_version()["live"] == "on"
+    world["markets"] = [deep(NOW + 20_000)]
+    await obot.live_prefetch(NOW + 20_000)
+    await step(obot, NOW + 20_000)
+    assert obot.sim_trades()["deep|up|吃"]["live"]["state"] == "open" and [k for k, _ in fake2.calls if k == "create"]  # real now
+    fake2.markets["110"] = market_json("110")
+    rest2 = m.SimMarket("rest2", "rest2", "close", "R2", 0.70, book([("0.55", "100")], [("0.60", "100")], NOW + 30_000, "rest2", mid="110"), 0.03, "", ("涨", "跌"), {})
+    await obot.live_prefetch(NOW + 30_000)
+    await step(obot, NOW + 30_000, rest2)
+    assert obot.sim_trades()["rest2|up|挂"]["live"]["state"] == "open"
+    text = await obot.cmd_live(m.Request("/live", ["mode", "off"], 1, 0, 1))
+    assert "on → off" in text and obot.config.live_mode == "off" and obot.store.get("control:env") == {"LIVE": "off"}
+    t2 = obot.sim_trades()["rest2|up|挂"]
+    assert t2["status"] == "cancelled" and t2["live"]["state"] == "cancelling" and "切换到 LIVE=off" in t2["note"]  # withdrawn at once
+    await step(obot, NOW + 40_000)  # the next step sends the cancel and follows the taker to its end, LIVE=off or not
+    assert ("remove", [t2["live"]["order_id"]]) in fake2.calls and obot.sim_trades()["rest2|up|挂"]["live"]["state"] == "done"
+    # the saved mode outlives a restart (the variable is only the initial value)
+    obot2 = L.LiveBot(m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "LIVE": "on",
+                                         "PREDICT_PRIVATE_KEY": KEY}), obot.store, FM(NOW), None)
+    assert obot2.config.live_mode == "off" and obot2.live.config.live_mode == "off"
+    # without a key the base bot explains what to configure
+    assert "PREDICT_PRIVATE_KEY" in m.Bot(m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT"}), m.Store(":memory:"), FM(NOW), None).cmd_live(None)
+    # a key cannot be added from the page or the command
+    r = obot.control_set({"LIVE": "on"})
+    assert r["ok"] and obot.config.live_mode == "on"
+    assert not m.Bot(m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT"}), m.Store(":memory:"), FM(NOW), None).control_set({"LIVE": "pause"})["ok"]
+
     # paper mode: the base bot answers /live with a plain refusal, and trades on paper as before
     pbot = m.Bot(m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"}), m.Store(":memory:"), FM(NOW), None)
-    assert "LIVE=off" in pbot.cmd_live(None) and "LIVE=pause" in pbot.cmd_live(None) and not any(name == "真实交易" for name, _ in pbot.reference_jobs())
+    assert "PREDICT_PRIVATE_KEY" in pbot.cmd_live(None) and "/live mode" in pbot.cmd_live(None) and not any(name == "真实交易" for name, _ in pbot.reference_jobs())
     assert L.sim_status({"status": "filled", "payout": 1, "price": 0.5, "shares": 10}) == "持仓"  # the base words, untouched for paper records
     print("LIVE_OK")
 

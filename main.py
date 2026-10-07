@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.38.0"
+VERSION = "1.39.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -438,6 +438,7 @@ BASELINE_MODES = {
 # saved as the variable's text (control:env), re-read through Config.from_env on top of the environment (the same
 # validation and wording as at start-up), and applied at once; it survives restarts until cleared.
 CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
+    ("LIVE", "真实交易模式", "off 只记账 / pause 登录 Predict、可自检和挂单测试、不开新仓 / on 真实下单（pause、on 需要已配置 PREDICT_PRIVATE_KEY）"),
     ("SIM_EDGE_CENTS", "触发买入的净优势（¢/份）", "0.5～50"),
     ("SIM_SHARES", "每次买多少份", "1～1000000"),
     ("SIM_WAYS", "做哪种单", "taker 只吃单 / maker 只挂单 / both"),
@@ -8369,6 +8370,7 @@ pre{white-space:pre-wrap;word-break:break-all;font:13px/1.5 ui-monospace,Menlo,C
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="journal" href="#">复盘页</a><button id="reload">刷新</button></div></header>
 <section class="card"><label class="f"><span>控制口令</span><input type="password" id="key" autocomplete="off" placeholder="环境变量 WEB_CONTROL_KEY"><small><label><input type="checkbox" id="remember"> 在这个浏览器记住口令</label></small></label><p class="mut" id="authnote"></p></section>
 <section class="card" id="live"><h2>真实交易 <span class="state" id="livestate"></span></h2>
+<div class="row" id="modebtns"><span class="mut" style="align-self:center">模式：</span><button data-mode="off">off 只记账</button><button data-mode="pause">pause 登录不开仓</button><button data-mode="on">on 真实下单</button></div>
 <div class="row" id="livebtns"><button data-act="pause">⏸ 暂停开新仓</button><button data-act="resume" class="pri">▶️ 恢复</button><button data-act="cancelall" class="bad">撤掉全部挂单</button><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button><button data-act="test">挂单测试</button></div>
 <pre id="livelines"></pre><pre id="testlines" class="mut"></pre></section>
 <section class="card"><h2>策略与风控参数</h2><p class="mut">留空 = 用部署时的环境变量；填写后点保存立即生效，并保存到数据库（重启仍有效）。框内灰字是现在生效的值。</p>
@@ -8396,10 +8398,12 @@ function render(){
   $("meta").textContent="v"+data.version+"｜"+data.generated_at+(data.enabled?"":"｜网页控制未开启");
   $("authnote").textContent=data.enabled?"每次操作都会带上口令；口令只在环境变量里，页面不显示。":"未设置 WEB_CONTROL_KEY：只能查看，不能操作。";
   const L=data.live;
-  $("livestate").textContent=L?(L.mode==="pause"?"LIVE=pause：只测试，不开新仓"+(L.ready?"":"｜未就绪："+L.ready_error):L.paused?"已暂停："+L.paused:L.killed?"今日停开新仓："+L.killed:L.ready?"运行中":"未就绪："+L.ready_error):"未开启（LIVE=off）";
-  $("livestate").className="state "+(L?(L.mode==="pause"||L.paused||L.killed?"warn":L.ready?"on":"off"):"");
-  $("livebtns").querySelectorAll("button").forEach(b=>{b.disabled=!L||!data.enabled});
-  $("livelines").textContent=L?[...L.lines,"策略："+data.scope.join("；"),"持仓+挂单 $"+L.exposure.toFixed(2)+" / $"+L.caps.open+"｜今日已结算盈亏 "+money(L.daily_pnl)+"（上限 −$"+L.caps.daily_loss+"）｜挂单中 "+L.resting+"｜今日下单 "+L.placed_today+"｜失败 "+L.failed_today].join("\n"):"LIVE=off：模拟交易只记账，这一排按钮不可用。先把 Railway 变量 LIVE 改成 pause：会登录 Predict、能自检和挂单测试，但不开新仓；确认无误再改成 on。";
+  const liveOn=!!L&&L.mode!=="off";
+  $("livestate").textContent=L?(L.mode==="off"?"LIVE=off：只记账":L.mode==="pause"?"LIVE=pause：只测试，不开新仓"+(L.ready?"":"｜未就绪："+L.ready_error):L.paused?"已暂停："+L.paused:L.killed?"今日停开新仓："+L.killed:L.ready?"LIVE=on：运行中":"未就绪："+L.ready_error):"未加载（没有私钥）";
+  $("livestate").className="state "+(L?(L.mode==="off"?"":L.mode==="pause"||L.paused||L.killed?"warn":L.ready?"on":"off"):"");
+  $("modebtns").querySelectorAll("button").forEach(b=>{b.disabled=!L||!data.enabled;b.className=L&&b.dataset.mode===L.mode?"pri":""});
+  $("livebtns").querySelectorAll("button").forEach(b=>{b.disabled=!liveOn||!data.enabled});
+  $("livelines").textContent=L?(liveOn?[...L.lines,"策略："+data.scope.join("；"),"持仓+挂单 $"+L.exposure.toFixed(2)+" / $"+L.caps.open+"｜今日已结算盈亏 "+money(L.daily_pnl)+"（上限 −$"+L.caps.daily_loss+"）｜挂单中 "+L.resting+"｜今日下单 "+L.placed_today+"｜失败 "+L.failed_today].join("\n"):"LIVE=off：模拟交易只记账。点 pause 会登录 Predict、校验钱包、读余额和授权，可自检和挂单测试，但不开新仓；点 on 才真实下单。切换立即生效并保存。"):"没有配置 PREDICT_PRIVATE_KEY：在 Railway Variables 配置私钥（和 PREDICT_API_KEY）并重新部署后，这里才能切换模式。";
   if(!built){built=true;const box=$("fields");data.settings.forEach(s=>{const lab=el("label","f");lab.append(el("span","",s.label+"（"+s.key+"）"));const inp=el("input");inp.type="text";inp.dataset.key=s.key;inp.autocomplete="off";lab.append(inp);lab.append(el("small","",s.hint+(s.env?"｜环境变量 "+s.env:"")));box.append(lab)})}
   data.settings.forEach(s=>{const inp=document.querySelector('input[data-key="'+s.key+'"]');if(!inp)return;inp.placeholder="当前 "+s.value;if(document.activeElement!==inp)inp.value=s.saved||""});
   $("simline").textContent="记录 "+data.sim.trades+" 笔｜已结算 "+data.sim.settled+" 笔，盈亏 "+money(data.sim.pnl)+"｜持仓 "+data.sim.open+"｜挂单中 "+data.sim.resting+"（成本 $"+data.sim.open_cost.toFixed(2)+"）";
@@ -8411,6 +8415,9 @@ function render(){
   $("posbox").style.display=L?"":"none";$("errbox").style.display=L?"":"none";
   if(L){$("positions").textContent=L.positions.length?L.positions.join("\n")+(L.positions_at?"\n（读取于 "+L.positions_at+"）":""):"没有持仓，或还没读取（点“刷新持仓”）";$("errors").textContent=L.errors.length?L.errors.join("\n"):"无";$("testlines").textContent=L.last_test||""}
 }
+$("modebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b||b.disabled)return;const v=b.dataset.mode;
+  const ask={on:"切到 LIVE=on 后，模拟交易的每个决定都会在 Predict 真实下单。继续？",off:"切到 LIVE=off 会撤掉未成交的真实挂单并回到只记账（已有持仓继续跟踪到结算）。继续？",pause:"切到 LIVE=pause：登录 Predict、可自检和挂单测试，不开新仓。继续？"}[v];
+  if(ask&&!confirm(ask))return;act({action:"mode",value:v})});
 $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.act;
   if(a==="pause"){const why=prompt("暂停原因（可留空）","");if(why===null)return;act({action:"pause",why})}
   else if(a==="test"){if(confirm("在 Predict 上挂一张远离盘口的极小限价单（默认 5 份、不高于 2¢），确认它出现在盘口后立即撤掉，用来验证真实下单链路。最多锁定几美分，极少数情况下可能成交。继续？"))act({action:"test"})}
@@ -11750,8 +11757,8 @@ class Bot:
         return Reply(self.sim_text(), html=True)
 
     def cmd_live(self, req: Request) -> Any:
-        return ("真实交易未开启（LIVE=off）：模拟交易只记账，不会向 Predict 下单。先设 LIVE=pause 可以在不开仓的情况下登录、自检、做挂单测试，"
-                "确认无误再改 LIVE=on。详见 README「真实交易」。")
+        return ("真实交易模块未加载：没有配置 PREDICT_PRIVATE_KEY（和 PREDICT_API_KEY）。在 Railway Variables 配置后重新部署，之后用 "
+                "/live mode pause 登录测试、/live mode on 真实下单，不必再改变量。详见 README「真实交易」。")
 
     def cap_payload(self, cap: "CapMarket", now_ms: int) -> dict:
         """Web card for a market-cap ladder: per threshold the model's P(Yes), the Yes book and its best edge."""
@@ -12625,7 +12632,7 @@ class Bot:
         """A control setting's value in force, as the variable would be written."""
         c = self.config
         flag = lambda value: "on" if value else "off"
-        values = {"SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": f"{c.sim_shares:g}", "SIM_WAYS": c.sim_ways,
+        values = {"LIVE": c.live_mode, "SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": f"{c.sim_shares:g}", "SIM_WAYS": c.sim_ways,
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
                   "SIM_GROUP_USD": f"{c.sim_group_usd:g}", "SIM_TAKER_SESSION": flag(c.sim_taker_session),
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}",
@@ -13683,8 +13690,10 @@ def main() -> int:
         if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", config.token):
             raise ValueError("请在 Railway Variables 配置 TELEGRAM_BOT_TOKEN，不要写进代码或提交到 GitHub")
         store = Store(config.db_path)
-        if config.live:
-            import live  # real orders for the paper trader's decisions; needs eth-account (requirements.txt)
+        if config.live_key:
+            # the real-trading module whenever a key is configured; LIVE (off / pause / on) is switched while running
+            # (/live mode, the control page) and saved, the variable being its initial value; needs eth-account
+            import live
             bot: Bot = live.LiveBot(config, store, Binance(config), Telegram(config.token))
         else:
             bot = Bot(config, store, Binance(config), Telegram(config.token))

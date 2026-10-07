@@ -20,7 +20,7 @@ assert m.Config.from_env(base).web_control_key == "" and m.Config.from_env(base)
 for bad in ("short", "has space in it yes", "x" * 65, "中文口令中文口令中文口令"):
     try: m.Config.from_env({**base, "WEB_CONTROL_KEY": bad}); assert False, bad
     except ValueError: pass
-assert [k for k, _, _ in m.CONTROL_KEYS][:2] == ["SIM_EDGE_CENTS", "SIM_SHARES"] and m.CONTROL_KEY_SET >= {"LIVE_MAX_ORDER_USD", "LIVE_TAKER"}
+assert [k for k, _, _ in m.CONTROL_KEYS][:3] == ["LIVE", "SIM_EDGE_CENTS", "SIM_SHARES"] and m.CONTROL_KEY_SET >= {"LIVE_MAX_ORDER_USD", "LIVE_TAKER"}
 assert all(len(row) == 3 and row[0] == row[0].upper() for row in m.CONTROL_KEYS)
 
 
@@ -85,11 +85,11 @@ async def run():
     store = m.Store(":memory:")
     bot = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY}), store, FM(NOW), None)
     assert bot.control_value("SIM_EDGE_CENTS") == "10" and bot.control_value("SIM_MARKETS") == "close" and bot.control_value("LIVE_TAKER") == "market"
-    assert bot.control_value("LIVE_AUTO_REDEEM") == "on" and bot.control_value("nope") == ""
+    assert bot.control_value("LIVE_AUTO_REDEEM") == "on" and bot.control_value("nope") == "" and bot.control_value("LIVE") == "off"
     web = m.WebServer(bot, 0, TOKEN); web.CACHE_SECONDS = {}; port = await web.start()
     st, head, body = await request(port, f"GET /p/{TOKEN}/control HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     assert st == 200 and "<title>交易控制台</title>" in body.decode() and "text/html" in head and "Content-Security-Policy" in head
-    assert 'data-act="test"' in body.decode() and 'id="testlines"' in body.decode()
+    assert 'data-act="test"' in body.decode() and 'id="testlines"' in body.decode() and 'data-mode="pause"' in body.decode()
     data = await get_json(port, "control.json")
     assert data["enabled"] and data["mode"] == "paper" and data["live"] is None and data["version"] == m.VERSION
     s = {x["key"]: x for x in data["settings"]}
@@ -134,8 +134,9 @@ async def run():
     # reset: back to the environment, nothing saved
     st, j = await post(port, {"key": KEY, "action": "reset"})
     assert st == 200 and j["ok"] and store.get("control:env") is None and bot.config.sim_edge == 0.10 and bot.config.live_max_order_usd == 100
-    # a live action on a paper bot
+    # a live action on a paper bot; the mode cannot be switched on without a key
     st, j = await post(port, {"key": KEY, "action": "pause"}); assert st == 400 and "LIVE=off" in j["message"]
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"LIVE": "pause"}}); assert st == 400 and "PREDICT_PRIVATE_KEY" in j["message"]
     st, j = await post(port, {"key": KEY, "action": "bogus"}); assert st == 400
     # too many wrong keys lock the route for a while, the right key included
     for _ in range(5):
@@ -202,6 +203,11 @@ async def run():
     st, j = await post(port3, {"key": KEY, "action": "check"}); assert st == 200 and "自检" in j["message"]
     st, j = await post(port3, {"key": KEY, "action": "redeem"}); assert st == 200 and "没有可领取" in j["message"]
     st, j = await post(port3, {"key": KEY, "action": "bogus"}); assert st == 400 and j["message"] == "未知操作"
+    st, j = await post(port3, {"key": KEY, "action": "mode", "value": "pause"})
+    assert st == 200 and "on → pause" in j["message"] and lbot.config.live_mode == "pause" and (await get_json(port3, "control.json"))["live"]["mode"] == "pause"
+    st, j = await post(port3, {"key": KEY, "action": "mode", "value": "nope"}); assert st == 400 and "用法" in j["message"]
+    st, j = await post(port3, {"key": KEY, "action": "mode", "value": "on"}); assert st == 200 and lbot.config.live_mode == "on"
+    assert {x["key"]: x["value"] for x in (await get_json(port3, "control.json"))["settings"]}["LIVE"] == "on"
     st, j = await post(port3, {"key": KEY, "action": "test"}); assert st == 200 and "没有可用的市场" in j["message"]  # no fresh two-sided book here
     assert (await get_json(port3, "control.json"))["live"]["last_test"] == ""
     lbot.sim_markets = lambda now: [m.SimMarket("hsi", "恒生指数", "close", "HSI", 0.7, m.PredictBook("HSI", "hsi", "9", "t", ((D("0.55"), D("300")),), ((D("0.58"), D("400")),), now),
