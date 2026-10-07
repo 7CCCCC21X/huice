@@ -901,6 +901,8 @@ class LiveBot(core.Bot):
         c = self.config
         if not self.live.ready:
             return f"真实交易未就绪：{self.live.not_ready_why}"
+        if c.live_mode == "pause":
+            return "LIVE=pause：只做登录、自检、挂单测试和撤单，不开新仓（改成 LIVE=on 才会下单）"
         if paused := self.live_paused():
             return f"真实交易已暂停（{paused}；/live resume 恢复）"
         if killed := self.live_killed():
@@ -1448,7 +1450,7 @@ class LiveBot(core.Bot):
                          "cancellable": t["status"] == "resting" and st.get("state") in {"open", "placing"} and bool(st.get("order_id")),
                          "url": self.sim_url(t)})
         positions, at = self.live_positions
-        return {"ready": self.live.ready, "ready_error": self.live.not_ready_why, "paused": self.live_paused(), "killed": self.live_killed(),
+        return {"ready": self.live.ready, "ready_error": self.live.not_ready_why, "mode": c.live_mode, "paused": self.live_paused(), "killed": self.live_killed(),
                 "lines": self.live.summary_lines(), "account": short_addr(self.live.wallet.maker),
                 "exposure": self.live_exposure(trades), "daily_pnl": self.live_daily_pnl(trades, now_ms),
                 "caps": {"order": c.live_max_order_usd, "open": c.live_max_open_usd, "daily_loss": c.live_max_daily_loss_usd},
@@ -1595,7 +1597,8 @@ class LiveBot(core.Bot):
     def live_text(self, now_ms: int) -> str:
         trades = self.sim_trades()
         live = [t for t in trades.values() if isinstance(t.get("live"), dict)]
-        state = ("⏸ 已暂停（" + self.live_paused() + "）" if self.live_paused() else "🛑 今日停开新仓（" + self.live_killed() + "）"
+        state = ("🧪 LIVE=pause：只测试，不开新仓" + ("" if self.live.ready else "｜未就绪：" + self.live.not_ready_why) if self.config.live_mode == "pause"
+                 else "⏸ 已暂停（" + self.live_paused() + "）" if self.live_paused() else "🛑 今日停开新仓（" + self.live_killed() + "）"
                  if self.live_killed() else ("🟢 运行中" if self.live.ready else "🔴 未就绪：" + self.live.not_ready_why))
         ways, kinds = core.sim_scope(self.config)
         lines = [f"💰 {core.bold('真实交易')} v{core.VERSION}｜{state}", *self.live.summary_lines(),
@@ -1629,13 +1632,15 @@ class LiveBot(core.Bot):
 
     def sim_text(self) -> str:
         text = super().sim_text()
-        return text.replace("只记账不下单", "真实下单：LIVE=on").replace("🧪", "💰", 1) + "\n\n真实订单与风控：/live"
+        word = "LIVE=pause：已登录但不开新仓" if self.config.live_mode == "pause" else "真实下单：LIVE=on"
+        return text.replace("只记账不下单", word).replace("🧪", "💰", 1) + "\n\n真实订单与风控：/live"
 
     def cmd_help(self, req: core.Request) -> str:
         return super().cmd_help(req).replace("不会自动下单、撤单。", "⚠️ LIVE=on：模拟交易的每个决定都会在 Predict 真实下单、撤单（/live 查看与暂停）。")
 
     def status(self, sub_id: str) -> str:
-        state = "已暂停" if self.live_paused() else "今日停开新仓" if self.live_killed() else ("运行中" if self.live.ready else f"未就绪：{self.live.not_ready_why}")
+        state = ("LIVE=pause，不开新仓" if self.config.live_mode == "pause" else "已暂停" if self.live_paused() else "今日停开新仓" if self.live_killed()
+                 else ("运行中" if self.live.ready else f"未就绪：{self.live.not_ready_why}"))
         return super().status(sub_id).replace("仅价格提醒；不会自动撤单/交易。", f"💰 真实交易 {state}｜/live 查看订单、持仓与风控")
 
     def journal_payload(self) -> dict:
@@ -1646,8 +1651,12 @@ class LiveBot(core.Bot):
 
     async def run(self) -> int:
         lines = await self.live_prepare()
-        LOG.warning("LIVE=on：模拟交易的决定会真实下单。%s", "｜".join(lines))
-        self.live_notify("💰 真实交易已启动\n" + "\n".join(lines), key="start")
+        if self.config.live_mode == "pause":
+            LOG.warning("LIVE=pause：已登录 Predict，可自检、挂单测试、撤单；不开新仓。%s", "｜".join(lines))
+            self.live_notify("🧪 真实交易处于 LIVE=pause：不开新仓，可自检和挂单测试；确认无误后把 LIVE 改成 on。\n" + "\n".join(lines), key="start")
+        else:
+            LOG.warning("LIVE=on：模拟交易的决定会真实下单。%s", "｜".join(lines))
+            self.live_notify("💰 真实交易已启动\n" + "\n".join(lines), key="start")
         return await super().run()
 
 

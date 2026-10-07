@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.37.0"
+VERSION = "1.38.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -517,7 +517,8 @@ class Config:
     edge_alert_cooldown: int = 900  # seconds before the same market and side is announced as new again
     edge_alert_digest: int = 0  # minutes: 新机会 gathered into one message per period, grouped by driver; 0 = one by one
     # Real trading (live.py): LIVE=on sends every paper-trading decision to Predict as a real order.
-    live: bool = False                 # LIVE=on
+    live: bool = False                 # LIVE=on or LIVE=pause: the real-trading module runs (live_mode says whether it opens positions)
+    live_mode: str = "off"             # off | pause (wallet, sign-in, checks, the order test and cancels work; no new positions) | on
     live_key: str = field(default="", repr=False)  # PREDICT_PRIVATE_KEY: the signing wallet's private key (never logged)
     live_account: str = ""             # PREDICT_ACCOUNT: the Predict account (smart wallet / deposit address) the key controls; "" = the key's own address
     live_chain: int = 56               # PREDICT_CHAIN_ID: 56 = BNB mainnet, 97 = BNB testnet
@@ -558,7 +559,9 @@ class Config:
         if not sim_markets or not sim_markets <= set(SIM_KINDS):
             raise ValueError(f"SIM_MARKETS 只能是 all，或 {'、'.join(SIM_KINDS)} 的组合（逗号分隔）")
         off = lambda value: str(value).strip().lower() in {"off", "0", "false", "no"}
-        live = e.get("LIVE", "off").strip().lower() in {"on", "1", "true", "yes"}
+        live_mode = {"on": "on", "1": "on", "true": "on", "yes": "on", "pause": "pause", "paused": "pause", "test": "pause"}.get(
+            e.get("LIVE", "off").strip().lower(), "off")
+        live = live_mode != "off"
         live_key, live_account = e.get("PREDICT_PRIVATE_KEY", "").strip(), e.get("PREDICT_ACCOUNT", "").strip()
         live_chain = bounded_int(e, "PREDICT_CHAIN_ID", 56, 1, 10**9)
         live_taker = (e.get("LIVE_TAKER") or "market").strip().lower()
@@ -647,7 +650,8 @@ class Config:
             web_port=0 if e.get("WEB", "on").strip().lower() in {"off", "0", "false", "no"}
             else bounded_int(e, "WEB_PORT", int(e.get("PORT") or 0), 0, 65535),
             web_token=e.get("WEB_TOKEN", "").strip(),
-            live=live, live_key=live_key, live_account=live_account, live_chain=live_chain, live_rpc=live_rpc, live_taker=live_taker,
+            live=live, live_mode=live_mode, live_key=live_key, live_account=live_account, live_chain=live_chain, live_rpc=live_rpc,
+            live_taker=live_taker,
             live_slippage_bps=bounded_int(e, "LIVE_SLIPPAGE_BPS", 100, 0, 5000),
             live_taker_wait=bounded_int(e, "LIVE_TAKER_WAIT_SECONDS", 60, 5, 3600),
             live_retry=bounded_int(e, "LIVE_RETRY_SECONDS", 300, 10, 86400),
@@ -8392,10 +8396,10 @@ function render(){
   $("meta").textContent="v"+data.version+"｜"+data.generated_at+(data.enabled?"":"｜网页控制未开启");
   $("authnote").textContent=data.enabled?"每次操作都会带上口令；口令只在环境变量里，页面不显示。":"未设置 WEB_CONTROL_KEY：只能查看，不能操作。";
   const L=data.live;
-  $("livestate").textContent=L?(L.paused?"已暂停："+L.paused:L.killed?"今日停开新仓："+L.killed:L.ready?"运行中":"未就绪："+L.ready_error):"未开启（LIVE=off）";
-  $("livestate").className="state "+(L?(L.paused||L.killed?"warn":L.ready?"on":"off"):"");
+  $("livestate").textContent=L?(L.mode==="pause"?"LIVE=pause：只测试，不开新仓"+(L.ready?"":"｜未就绪："+L.ready_error):L.paused?"已暂停："+L.paused:L.killed?"今日停开新仓："+L.killed:L.ready?"运行中":"未就绪："+L.ready_error):"未开启（LIVE=off）";
+  $("livestate").className="state "+(L?(L.mode==="pause"||L.paused||L.killed?"warn":L.ready?"on":"off"):"");
   $("livebtns").querySelectorAll("button").forEach(b=>{b.disabled=!L||!data.enabled});
-  $("livelines").textContent=L?[...L.lines,"策略："+data.scope.join("；"),"持仓+挂单 $"+L.exposure.toFixed(2)+" / $"+L.caps.open+"｜今日已结算盈亏 "+money(L.daily_pnl)+"（上限 −$"+L.caps.daily_loss+"）｜挂单中 "+L.resting+"｜今日下单 "+L.placed_today+"｜失败 "+L.failed_today].join("\n"):"LIVE=off：模拟交易只记账。开启方法见 README「真实交易」。";
+  $("livelines").textContent=L?[...L.lines,"策略："+data.scope.join("；"),"持仓+挂单 $"+L.exposure.toFixed(2)+" / $"+L.caps.open+"｜今日已结算盈亏 "+money(L.daily_pnl)+"（上限 −$"+L.caps.daily_loss+"）｜挂单中 "+L.resting+"｜今日下单 "+L.placed_today+"｜失败 "+L.failed_today].join("\n"):"LIVE=off：模拟交易只记账，这一排按钮不可用。先把 Railway 变量 LIVE 改成 pause：会登录 Predict、能自检和挂单测试，但不开新仓；确认无误再改成 on。";
   if(!built){built=true;const box=$("fields");data.settings.forEach(s=>{const lab=el("label","f");lab.append(el("span","",s.label+"（"+s.key+"）"));const inp=el("input");inp.type="text";inp.dataset.key=s.key;inp.autocomplete="off";lab.append(inp);lab.append(el("small","",s.hint+(s.env?"｜环境变量 "+s.env:"")));box.append(lab)})}
   data.settings.forEach(s=>{const inp=document.querySelector('input[data-key="'+s.key+'"]');if(!inp)return;inp.placeholder="当前 "+s.value;if(document.activeElement!==inp)inp.value=s.saved||""});
   $("simline").textContent="记录 "+data.sim.trades+" 笔｜已结算 "+data.sim.settled+" 笔，盈亏 "+money(data.sim.pnl)+"｜持仓 "+data.sim.open+"｜挂单中 "+data.sim.resting+"（成本 $"+data.sim.open_cost.toFixed(2)+"）";
@@ -11746,7 +11750,8 @@ class Bot:
         return Reply(self.sim_text(), html=True)
 
     def cmd_live(self, req: Request) -> Any:
-        return "真实交易未开启（LIVE=off）：模拟交易只记账，不会向 Predict 下单。开启方法见 README「真实交易」。"
+        return ("真实交易未开启（LIVE=off）：模拟交易只记账，不会向 Predict 下单。先设 LIVE=pause 可以在不开仓的情况下登录、自检、做挂单测试，"
+                "确认无误再改 LIVE=on。详见 README「真实交易」。")
 
     def cap_payload(self, cap: "CapMarket", now_ms: int) -> dict:
         """Web card for a market-cap ladder: per threshold the model's P(Yes), the Yes book and its best edge."""

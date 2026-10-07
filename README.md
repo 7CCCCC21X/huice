@@ -153,7 +153,7 @@ WEB_CONTROL_KEY=自己定一个12到64位、不含空格的口令
    ```
 
    哪个是 `False` 就是哪个没填上（变量名拼错、值是空的）。然后给机器人发 `/web`，会给出概率页和控制台两个链接，控制台里输入口令试一下"自检"。
-6. **开真实交易**：确认 `python main.py --live-check`（或控制台"自检"）全部 OK、`/live test` 挂单测试四步都成功后，把 `LIVE` 改成 `on`，再 Deploy。之后 Telegram 会收到"真实交易已启动"的汇总。
+6. **先 pause 再 on**：把 `LIVE` 改成 `pause` 并 Deploy，机器人会登录 Predict、校验私钥与账户、读余额和授权，但不开新仓；控制台“真实交易”那一排按钮这时才可用。点“自检”和“挂单测试”（或发 `/live check`、`/live test`），四步都成功后再把 `LIVE` 改成 `on`，再 Deploy。之后 Telegram 会收到“真实交易已启动”的汇总。
 
 常见错误：变量名大小写不对（全部大写）；`PREDICT_ACCOUNT` 不是 `0x` 开头的 40 位地址；`WEB_CONTROL_KEY` 不足 12 位或含空格（启动直接报错并写明）；`PORT` 不要手填，Railway 自动注入；把值写进了代码或 `.env.example` 并提交到了 GitHub。
 
@@ -563,7 +563,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
   1. Predict 账户里有 USDT（BNB 链）。网站账户是一个智能钱包（Predict 账户）：在网站“账户设置”里导出 Privy 钱包私钥，填 `PREDICT_PRIVATE_KEY`，再把账户设置里的**充值地址**填 `PREDICT_ACCOUNT`（两个地址不同是正常的：前者签名，后者持币）。也可以用一个普通钱包直接交易：只填它的私钥、`PREDICT_ACCOUNT` 留空，USDT 和份额都在这个地址上。`--live-check` 的“账户校验”会在链上确认这把私钥确实控制填写的 Predict 账户，对不上会直接说明。
   2. 在 Predict 开发者控制台 <https://developers.predict.fun> 申请 API Key，填 `PREDICT_API_KEY`（请求头 `x-api-key`，主网所有接口都要；登录签名换取的 JWT 由程序自动处理和续期）。
   3. 交易所要先获得 USDT 额度授权（和结果代币操作权）。网站上交易过一次的 Predict 账户通常已经授权；没有的话给签名钱包转约 0.005 BNB 作 gas，运行 `python main.py --approve`（逐项检查、只发缺的那几笔交易）。
-  4. 运行 `python main.py --live-check`：登录、余额、授权、开放订单和持仓逐项打印，全部 OK 再把 `LIVE=on` 加进 Railway Variables。建议先用小的 `SIM_SHARES` 跑几天，看 `/live` 和复盘页里的真实成交是否符合预期。
+  4. 先把 `LIVE` 设为 `pause`：机器人会登录 Predict、在链上校验私钥与账户、读余额和授权，但不开任何仓；此时在控制台点“自检”“挂单测试”（或发 `/live check`、`/live test`），四步都成功再把 `LIVE` 改成 `on`。没有 Railway CLI 的话这一步就代替了本地的 `python main.py --live-check`。建议先用小的 `SIM_SHARES` 跑几天，看 `/live` 和复盘页里的真实成交是否符合预期。
 - **吃单 → 市价单**：模拟交易按 `SIM_SHARES` 份走盘口得出的成交数量和均价，变成一张 `MARKET` 策略的买单：数量就是模拟吃到的份数，USDT 上限 = 当时盘口算出的预期成本，`LIVE_SLIPPAGE_BPS`（默认 1%）是允许少收的份数比例（官方 SDK 的 `isMinAmountOut` 模型）。`LIVE_TAKER=limit` 则改为一张限价买单，价格封在模拟吃单走到的最差一档，`LIVE_TAKER_WAIT_SECONDS`（默认 60）后仍未成交的部分撤掉。两种方式下，成交份数以 Predict 回报为准：一份没成交就记为一次失败的尝试（复盘页里编号带 `#1`、`#2`），这个市场这一边 `LIVE_RETRY_SECONDS`（默认 300）内不再下单，之后有机会再下。
 - **挂单 → 限价单**：按建议价挂 `SIM_SHARES` 份，到期时间为市场收盘/截止后两小时（取不到就不设）。成交按 Predict 回报逐笔记录，不再按盘口“推定”。模拟交易撤单的情形（`SIM_WAYS`、`SIM_MARKETS` 缩小、价格阶梯只吃单）、市场出结果、触发日亏损上限、`/live cancel`，都会向 Predict 发撤单；已成交的份数照常持仓结算。
 - **结算与复盘**：和模拟交易相同——先按机器人数据预结算，再以 Predict 的结果确认，`/sim`、网页“模拟交易”栏、复盘页和 CSV 里就是真实的交易，每笔多一组 `live` 记录（订单号、哈希、策略、下单时的盘口与数量、事件时间线、Predict 回报的状态）。市场结算后，赢的一边自动在链上领取 USDT（`LIVE_AUTO_REDEEM=on`，每 10 分钟查一次持仓；签名钱包需有 BNB 付 gas；`/live redeem` 手动领取）。
@@ -575,7 +575,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `LIVE` | `off` | `on` 真实下单（需要 `SIM=on`、`PREDICT=on`） |
+| `LIVE` | `off` | `off` 只记账；`pause` 加载真实交易模块（登录 Predict、链上校验、余额授权、`/live` 自检与挂单测试、撤单、领取都可用）但**不开新仓**；`on` 真实下单。都需要 `SIM=on`、`PREDICT=on`，`pause` / `on` 需要私钥 |
 | `PREDICT_PRIVATE_KEY` | 无 | 签名用的私钥，64 位十六进制（0x 可省）。两种填法：**A.** 用 Predict 网站账户交易：网站账户设置里“导出私钥 / Export wallet”得到的 Privy 钱包私钥（它的地址和充值地址不是同一个，这是正常的）；**B.** 用自己的普通钱包交易：那个钱包的私钥，建议新建一个机器人专用钱包 |
 | `PREDICT_ACCOUNT` | 空 | 填法 A 必填：网站账户设置里的**充值地址**（0x 开头 40 位，USDT 和份额都在这个地址上）；填法 B 留空。启动和 `--live-check` 会在链上核对这把私钥是不是该账户的控制钥匙，对不上就不下单并说明原因 |
 | `PREDICT_API_KEY` | 空 | Predict 开发者 API Key，在开发者控制台 <https://developers.predict.fun> 申请；主网所有接口都要它（默认限额每分钟 240 次请求，本机器人远低于此） |

@@ -32,6 +32,11 @@ for bad in ({"LIVE": "on"}, {"LIVE": "on", "PREDICT_PRIVATE_KEY": "abc"}, {"PRED
     try: m.Config.from_env({**base, **bad}); assert False, bad
     except ValueError: pass
 assert not m.Config.from_env({**base, "PREDICT_PRIVATE_KEY": KEY}).live  # a key alone does not switch live trading on
+pc = m.Config.from_env({**base, "LIVE": "pause", "PREDICT_PRIVATE_KEY": KEY})
+assert pc.live and pc.live_mode == "pause" and m.Config.from_env({**base, "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY}).live_mode == "on"
+assert m.Config.from_env(base).live_mode == "off" and m.Config.from_env({**base, "LIVE": "test", "PREDICT_PRIVATE_KEY": KEY}).live_mode == "pause"
+try: m.Config.from_env({**base, "LIVE": "pause"}); assert False  # a key is needed in pause mode too
+except ValueError: pass
 assert not m.Config.from_env(base).sim_taker_session and m.Config.from_env({**base, "SIM_TAKER_SESSION": "on"}).sim_taker_session
 assert "SIM_TAKER_SESSION" in m.CONTROL_KEY_SET
 
@@ -725,9 +730,26 @@ async def run():
     assert "未就绪" in await tbot.live_action("test", [], NOW)
     tbot.live.ready_error = ""
 
+    # --- LIVE=pause: signed in, checks and the order test work, nothing opens ------------------------------------------------
+    pbot2 = make_bot(LIVE="pause", SIM_WAYS="both")
+    await pbot2.live_prepare()
+    assert pbot2.live.ready and pbot2.config.live_mode == "pause"
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    await pbot2.live_prefetch(NOW)
+    why = pbot2.live_room({}, world["markets"][0], "up", 0.58, 100)
+    assert why.startswith("LIVE=pause") and "不开新仓" in why
+    await step(pbot2, NOW, world["markets"][0])
+    assert not pbot2.sim_trades() and not [1 for kind, _ in pbot2.live.api.calls if kind == "create"]  # refused, not even on paper
+    assert any(b["id"].startswith(HSI_SLUG) and "LIVE=pause" in b["why"] for b in pbot2.sim_blocks())
+    text = await pbot2.live_action("test", [], NOW)
+    assert "1/4 下单成功" in text and "3/4 撤单：已撤" in text  # the order test is allowed: it is how the mode is meant to be used
+    assert "LIVE=pause" in pbot2.live_text(NOW) and "不开新仓" in pbot2.live_status(NOW)["ready_error"] + pbot2.live_text(NOW) and pbot2.live_status(NOW)["mode"] == "pause"
+    assert "LIVE=pause：已登录但不开新仓" in pbot2.sim_text() and "LIVE=pause，不开新仓" in pbot2.status("1:0")
+    assert bot.live_status(NOW)["mode"] == "on"
+
     # paper mode: the base bot answers /live with a plain refusal, and trades on paper as before
     pbot = m.Bot(m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"}), m.Store(":memory:"), FM(NOW), None)
-    assert "LIVE=off" in pbot.cmd_live(None) and not any(name == "真实交易" for name, _ in pbot.reference_jobs())
+    assert "LIVE=off" in pbot.cmd_live(None) and "LIVE=pause" in pbot.cmd_live(None) and not any(name == "真实交易" for name, _ in pbot.reference_jobs())
     assert L.sim_status({"status": "filled", "payout": 1, "price": 0.5, "shares": 10}) == "持仓"  # the base words, untouched for paper records
     print("LIVE_OK")
 
