@@ -13521,6 +13521,10 @@ class Bot:
         self.username = me.get("username", "")
         LOG.info("Starting @%s; symbols=%s; administrator_configured=%s", self.username,
                  ",".join(self.config.symbols), bool(self.config.admin_id))
+        # which secrets are set, never their values (Railway logs are not a place for a key)
+        LOG.info("secrets configured: telegram_token=%s predict_api_key=%s predict_private_key=%s predict_account=%s web_control_key=%s live=%s",
+                 bool(self.config.token), bool(self.config.predict_api_key), bool(self.config.live_key), bool(self.config.live_account),
+                 bool(self.config.web_control_key), self.config.live)
         await self.register_menu()
         if not self.config.admin_id:
             LOG.warning("ADMIN_USER_ID 尚未配置：只能使用 /id；没有任何自动订阅")

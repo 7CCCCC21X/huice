@@ -574,6 +574,17 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 - **看一眼**：真实订单列表（时间、市场、方向、价格 × 份数、状态、订单号，挂单可直接撤）、最近读到的 Predict 持仓、最近的错误、持仓 + 挂单占用与上限、今日已结算盈亏。每 10 秒自动刷新。
 - 后台任务不会被控制台卡住：操作在收到请求时执行，失败的原因会原样返回到页面。
 
+### 密钥与安全
+
+- **密钥只走环境变量**：代码里没有任何写死的 Token、API Key 或私钥，全部用 `os.environ` 读取；`.gitignore` 排除 `.env`、`.env.*`、`*.sqlite3`，仓库里只有 `.env.example`（全是占位符）。
+- **Railway 上建议 Seal 掉**（Variables → 变量右侧 `…` → Seal）：`TELEGRAM_BOT_TOKEN`、`PREDICT_PRIVATE_KEY`、`PREDICT_API_KEY`、`WEB_CONTROL_KEY`，以及自己指定了的 `WEB_TOKEN`。Seal 后网页、API、CLI 都读不回原值，PR 环境也不会复制，机器人运行时照常读取。
+- **机器人专用钱包，只放要用的钱**：`PREDICT_PRIVATE_KEY` 能动用它对应账户里的全部 USDT 和份额——用 Predict 账户时就是网站导出的那把 Privy 钥匙、控制整个网站账户，所以账户里只留交易要用的额度（比如 `LIVE_MAX_OPEN_USD` 的一到两倍），其余放主钱包；用普通钱包时同理，另备约 0.01 BNB 付授权/领取的 gas。**不要**把主钱包私钥或助记词放到任何服务器。`PREDICT_API_KEY` 本身只用于访问接口，下单仍需私钥签名。
+- **程序不会打印密钥**：启动日志只写“secrets configured: … True/False”；`Config` 的 `repr` 不含私钥、口令和环境快照；`clean_error` 把错误文本里的 Telegram Token 和 URL 打码后才进日志和聊天；`--live-check`、`/live`、控制台只显示钱包地址，不显示密钥；挂单测试失败时给出的请求体不含签名。请求头里的 API Key / JWT 只发往 `api.predict.fun`。
+- **数据库里没有密钥**：Volume 上的 SQLite 存的是交易记录、设置、订阅和网页的私密令牌（`web_token`），不存私钥、API Key、JWT。
+- **网页**：概率页只读；控制台每个操作都要 `WEB_CONTROL_KEY`，常量时间比对，错 5 次锁 10 分钟；勾选“记住口令”才会存进那个浏览器的 localStorage。网页链接本身含私密令牌，不要转发。
+- **Predict 这边**：下单只买结果代币（BUY），不卖出、不转账、不提现，私钥能做的链上动作只有授权交易所和领取已结算份额；接口若将来提供 IP 白名单，可配合 Railway 的固定出口 IP（Pro 计划）再收一层。
+- **额度**：`LIVE_MAX_ORDER_USD`、`LIVE_MAX_OPEN_USD`、`LIVE_MAX_DAILY_LOSS_USD` 是程序内的上限，钱包里只放这么多钱才是硬上限。
+
 ### 上证指数与 A50 夜盘
 
 `/status` 顶部、KOSPI 下方显示上证指数、富时中国 A50 期货和上证的收盘概率；宇树、长鑫等沪市标的的提醒里也带上证行：
