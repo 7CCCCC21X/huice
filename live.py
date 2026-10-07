@@ -37,6 +37,7 @@ import dataclasses
 import datetime as dt
 import decimal
 import json
+import math
 import random
 import re
 import time
@@ -48,6 +49,7 @@ import main as core
 LOG = core.LOG
 D = Decimal
 WEI = 10 ** 18
+MIN_ORDER_USD = 1.0  # Predict refuses an order "with a value of" under 0.9 USD; a round dollar keeps clear of its rounding
 MAX_SALT = 2_147_483_648
 ZERO_ADDRESS = "0x" + "0" * 40
 ZERO_HASH = "0x" + "0" * 64
@@ -913,6 +915,8 @@ class LiveBot(core.Bot):
         if held and time.monotonic() < held[0]:
             return f"{held[1]}，{int(held[0] - time.monotonic()) + 1} 秒后再试"
         notional = float(price) * float(shares)
+        if notional < MIN_ORDER_USD - 1e-9:
+            return f"本单 ${notional:,.2f} 低于 Predict 最低订单金额 ${MIN_ORDER_USD:g}（提高 SIM_SHARES）"
         if notional > c.live_max_order_usd + 1e-9:
             return f"单笔 ${notional:,.2f} 超过 LIVE_MAX_ORDER_USD ${c.live_max_order_usd:g}"
         exposure = self.live_exposure(trades)
@@ -1523,11 +1527,11 @@ class LiveBot(core.Bot):
                 "last_test": str((self.store.get("live:test") or {}).get("text") or "")}
 
     # --- the order test: a tiny resting order, listed, cancelled ------------------------------------------------------------
-    LIVE_TEST_SHARES = 5.0
+    LIVE_TEST_SHARES = 5.0  # the floor; the exchange's minimum order value usually asks for more (50 shares at 2¢)
     LIVE_TEST_PRICE = 0.02  # never above this, and always under the best bid: it rests, it does not trade
 
     async def live_test(self, args: list[str], now_ms: int) -> str:
-        """The real order path checked end to end at the cost of a few cents at most: a LIMIT buy of a few shares far
+        """The real order path checked end to end with a dollar or so locked for minutes at most: a LIMIT buy far
         under the market (it rests; it is withdrawn at once; it expires in ten minutes by itself), then the open-order
         list, the cancel and the final state, each step reported with what Predict answered. Arguments: a market name
         to pick it, a share count, a price in cents (a price at or above the best bid may trade)."""
@@ -1536,9 +1540,9 @@ class LiveBot(core.Bot):
         words = [a.strip() for a in args if a and a.strip()]
         numbers = [w for w in words if re.fullmatch(r"\d+(\.\d+)?", w)]
         want = next((w.lower() for w in words if w not in numbers), "")
-        shares = float(numbers[0]) if numbers else self.LIVE_TEST_SHARES
+        shares_given = float(numbers[0]) if numbers else None
         cents_given = float(numbers[1]) if len(numbers) > 1 else None
-        if shares < 0.01 or shares > 1000:
+        if shares_given is not None and (shares_given < 0.01 or shares_given > 1000):
             return "测试份数应在 0.01～1000 之间"
         markets = [mk for mk in self.sim_markets(now_ms) if mk.book.bid and mk.book.ask and not mk.book.stale(now_ms) and not core.book_crossed(mk.book)]
         if want:
@@ -1560,6 +1564,10 @@ class LiveBot(core.Bot):
         if price < 0.001:
             return f"{mk.item} 的最高买价只有 {core.cents(best_bid)}，放不下更低的测试挂单；换个市场：/live test <市场名>"
         caution = "（价格不低于盘口最高买价，可能成交）" if price >= best_bid - 1e-9 else ""
+        least = math.ceil(MIN_ORDER_USD / price - 1e-9)  # the exchange's minimum order value, in shares at this price
+        shares = max(shares_given if shares_given is not None else self.LIVE_TEST_SHARES, least)
+        sized = (f"（{shares_given:g} 份不足 Predict 最低订单金额 ${MIN_ORDER_USD:g}，改为 {shares:g} 份）"
+                 if shares_given is not None and shares > shares_given else "")
         try:
             amounts = limit_amounts(True, to_wei(price), to_wei(shares))
             order = build_order(self.live.wallet, outcome["token"], amounts["maker"], amounts["taker"], info.fee_bps, int(now_ms // 1000) + 600)
@@ -1568,7 +1576,7 @@ class LiveBot(core.Bot):
             return f"构造测试订单失败：{core.clean_error(error) or type(error).__name__}"
         body = {"data": {"order": {**order, "signature": signature, "hash": digest}, "pricePerShare": str(amounts["price_per_share"]), "strategy": "LIMIT"}}
         lines = [f"🧪 挂单测试 {core.stamp(now_ms)}：{mk.item}（市场 {info.market_id}）买 {outcome['name']} {core.cents(price)}×{shares:g} 份，"
-                 f"最多花 ${from_wei(amounts['maker']):.2f}，10 分钟后自动过期{caution}"]
+                 f"最多花 ${from_wei(amounts['maker']):.2f}，10 分钟后自动过期{caution}{sized}"]
         record = {"at": now_ms, "market": mk.item, "market_id": info.market_id, "price": price, "shares": shares, "hash": digest, "order_id": ""}
         try:
             result = await self.live.api.create_order(body)

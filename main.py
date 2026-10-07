@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.39.0"
+VERSION = "1.40.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -819,6 +819,10 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
             pass
         if telegram:  # Telegram says exactly what is wrong (blocked, kicked, retry after N) and how long to wait
             text = TELEGRAM_HINTS.get(error.code) or description or "接口请求失败"
+        elif host.endswith("predict.fun"):  # Predict says what is wrong (minimum order value, closed market…): its words first
+            text = description or HTTP_HINTS.get(error.code) or "接口请求失败"
+            if error.code == 403:
+                text += "（Predict 不向受限地区开放交易：部署在美国等受限地区时读取正常、下单 403，把服务换到允许的地区）"
         else:
             if "binance" in host and error.code in {418, 429}:
                 retry = max(retry, 120 if error.code == 418 else 30)
@@ -8420,7 +8424,7 @@ $("modebtns").addEventListener("click",e=>{const b=e.target.closest("button");if
   if(ask&&!confirm(ask))return;act({action:"mode",value:v})});
 $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.act;
   if(a==="pause"){const why=prompt("暂停原因（可留空）","");if(why===null)return;act({action:"pause",why})}
-  else if(a==="test"){if(confirm("在 Predict 上挂一张远离盘口的极小限价单（默认 5 份、不高于 2¢），确认它出现在盘口后立即撤掉，用来验证真实下单链路。最多锁定几美分，极少数情况下可能成交。继续？"))act({action:"test"})}
+  else if(a==="test"){if(confirm("在 Predict 上挂一张远离盘口的限价单（不高于 2¢，份数按 Predict 最低订单金额 $1 取，2¢ 时 50 份），确认它出现在盘口后立即撤掉，用来验证真实下单链路。最多锁定约 1 美元，极少数情况下可能成交。继续？"))act({action:"test"})}
   else if(a==="cancelall"){if(confirm("撤掉 Predict 上全部真实挂单？已成交的份数继续持有。"))act({action:"cancel",id:"all"})}
   else act({action:a})});
 $("save").addEventListener("click",()=>{const values={};document.querySelectorAll("#fields input").forEach(i=>{values[i.dataset.key]=i.value.trim()});act({action:"set",values})});

@@ -220,7 +220,7 @@ async def run():
         return {"order_id": "500", "hash": body["data"]["order"]["hash"], "code": None}
     fake.create_order = create_order
     st, j = await post(port3, {"key": KEY, "action": "test", "args": ["恒生", "2"]})
-    assert st == 200 and "1/4 下单成功：订单 #500" in j["message"] and "3/4 撤单：已撤" in j["message"] and "2.0¢×2 份" in j["message"], j
+    assert st == 200 and "1/4 下单成功：订单 #500" in j["message"] and "3/4 撤单：已撤" in j["message"] and "2.0¢×50 份" in j["message"] and "2 份不足 Predict 最低订单金额 $1，改为 50 份" in j["message"], j
     assert (await get_json(port3, "control.json"))["live"]["last_test"] == j["message"]
     # the Telegram command still works through the same code
     reply = await lbot.cmd_live(m.Request("/live", [], 1, 0, 1))

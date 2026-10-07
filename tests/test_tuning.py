@@ -8,7 +8,7 @@ Interface: a ladder level whose book failed keeps its last one; Binance spot bac
 run in parallel with the global lock only reserving slots; command-poll sends are queued; long messages are measured as
 Telegram counts them and cut between blocks; a stuck sampling loop ends the process; a closed US market is polled
 slowly; data.json carries no server-side edge chips."""
-import asyncio, math, random, sys, time, datetime as dt
+import asyncio, io, json, math, random, sys, time, datetime as dt, urllib.error
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -232,6 +232,25 @@ async def run():
     assert m.http_error_text({"statusCode": 400, "message": "Market is closed", "error": "Bad Request"}) == "Market is closed"
     assert m.http_error_text({"message": ["a must be x", "b too"]}) == "a must be x；b too" and m.http_error_text({"error": {"message": "nope"}}) == "nope"
     assert m.http_error_text([1]) == "" and m.http_error_text({"description": "Bad Request: chat not found"}) == "Bad Request: chat not found"
+    # Predict's own words come first (its 403 is the region check on trading, with a hint); other hosts keep the hints
+    def refusing(code, body):
+        def fake_open(req, timeout=15, context=None):
+            raise urllib.error.HTTPError(req.full_url, code, "x", {"Content-Type": "application/json"}, io.BytesIO(json.dumps(body).encode()))
+        return fake_open
+    real_open = m.urllib.request.urlopen
+    try:
+        for url, code, body, want in (("https://api.predict.fun/v1/orders", 400, {"message": "order must have a value of at least 0.9 USD"}, "HTTP 400: order must have a value of at least 0.9 USD"),
+                                      ("https://api.predict.fun/v1/orders", 403, {"message": "Forbidden"}, "HTTP 403: Forbidden（Predict 不向受限地区开放交易"),
+                                      ("https://api-testnet.predict.fun/v1/orders", 403, {}, "HTTP 403: 访问被拒绝；请核对权限与服务地区（Predict 不向受限地区"),
+                                      ("https://api.binance.com/api/v3/x", 403, {"msg": "banned"}, "HTTP 403: 访问被拒绝；请核对权限与服务地区"),
+                                      ("https://api.predict.fun/v1/markets/1", 429, {"message": "Too Many Requests"}, "HTTP 429: Too Many Requests")):
+            m.urllib.request.urlopen = refusing(code, body)
+            try:
+                m._http_get(url, {"a": 1} if "orders" in url else None); assert False, url
+            except m.RemoteError as error:
+                assert str(error).startswith(want), (url, str(error))
+    finally:
+        m.urllib.request.urlopen = real_open
 
     # --- Binance spot: a rate limit pauses every spot request; a plain failure still moves to the next host ---------------
     calls = []

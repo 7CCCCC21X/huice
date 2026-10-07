@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.39.0
+版本：1.40.0
 
 ## 已完成
 
+- 1.40.0（最低订单金额与 Predict 错误原话）：`MIN_ORDER_USD = 1`（接口拒绝低于 0.9 USD 的订单）：`live_room` 拦下金额不足的决定并写明原因；`live_test` 的份数按最低金额自动取（`ceil($1 / 价格)`，默认 2¢ 时 50 份；指定份数不足时提高并在首行说明），参数只在给出时校验范围。`_http_get` 对 predict.fun 域名优先用服务器自己的错误文本，403 附地区限制提示（原先 403 的通用提示盖掉了原话）。控制台挂单测试的确认文案、README（挂单测试、地区与最低金额一节、`/live` 行）、.env.example 同步。tests/test_trading.py：默认 50 份 $1.00、不足时改为 4 份并说明、正好够时不改、`live_room` 最低金额拦截；tests/test_control.py：页面测试 2 份改为 50 份；tests/test_tuning.py：`_http_get` 对 Predict 400/403/429 与 Binance 403 的文本。
 - 1.39.0（运行中切换 LIVE）：`main()` 只要配置了 `PREDICT_PRIVATE_KEY` 就运行 `LiveBot`；`LIVE` 成为控制项（`CONTROL_KEYS` 首项，`control_value`），`/live mode off|pause|on`（`live_set_mode` → `control_set({"LIVE": …}) → apply_config`，重启沿用）和控制台的模式按钮（`live_control` 的 `mode`）切换。off 时 `live_room` 放行、`sim_open` 返回纸面记录、`sim_version` 同基类、不预取不登录；`live_sync` 对已有真实订单仍登录并跟踪到结束；`live_mode_changed`：→off 撤掉未成交真实挂单并通知，→pause/on 下一步登录并通知；`live_place_pending` 在 off 时把待下单记录记为未发。`/live`、`/sim`、`/status`、`/help`、启动日志按模式措辞；无私钥的基类 `/live` 说明要配什么。README：LIVE 为初始值、准备步骤与 4b 教程改为用 `/live mode` 切换。tests/test_trading.py：off 模式下纸面成交与推定成交、不登录、`/live mode` 用法与三态切换、切 on 后真实下单、切 off 撤挂单并继续跟踪、重启沿用保存的模式、无私钥时拒绝；tests/test_control.py：LIVE 控制项与页面 mode 动作。
 - 1.38.0（LIVE=pause）：`Config.live_mode`（off / pause / on，`test`、`paused` 视为 pause；`live` = 非 off）。pause 时 `LiveBot` 正常加载（登录、链上账户校验、余额授权、`/live check`、`/live test`、撤单、领取、同步与结算都可用），`live_room` 一律拒绝开新仓并记为拦下；控制台徽标、`/live`、`/sim`、`/status`、启动通知都标明“LIVE=pause：只测试，不开新仓”；纸面模式的 `/live` 和控制台提示改成先 pause 再 on。README 的准备步骤与 4b 教程改为 off → pause → on。tests/test_trading.py：配置三态、pause 下决定被拦下且不留纸面记录、挂单测试照常、各处文案。
 - 1.37.0（开盘后才吃单、挂单测试）：`SIM_TAKER_SESSION=on`（`Config.sim_taker_session`，控制台可改）：`SimMarket.in_session`（日涨跌卡片 = `CloseOdds.direct`，加密市场 None），`sim_step` 的吃单循环在 `in_session is False` 时跳过，挂单照常；`/sim` 说明行与 `sim_version` 注明。`LiveBot.live_test`（`/live test [市场] [份数] [价格¢]`、控制台“挂单测试”按钮、`live_control` 的 `test`）：挑双边有报价的新鲜市场（优先日涨跌，可按名字），买涨方向挂远低于最高买价的限价单（默认 5 份、≤2¢、10 分钟过期），依次 `create_order` → `orders(OPEN)` 查列出 → `remove_orders` → `order()` 最终状态，逐步报告；失败附不含签名的请求体；结果存 `live:test`，`/live` 与控制台显示最近一次，不计入模拟交易记录。tests/test_trading.py：开关的配置与控制键、盘后不吃单只挂单、盘中与加密市场照常、`sim_markets` 的 in_session 来自 direct、挂单测试的请求体与四步报告、参数（市场名、份数、价格）、拒绝时的报告、放不下更低价、未就绪；tests/test_control.py：按钮与 last_test、通过页面触发。

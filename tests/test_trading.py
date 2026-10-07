@@ -704,9 +704,11 @@ async def run():
     text = await tbot.live_action("test", [], NOW)
     body = [b for k, b in tfake.calls if k == "create"][-1]["data"]
     assert body["strategy"] == "LIMIT" and body["order"]["tokenId"] == "1011" and body["pricePerShare"] == str(2 * 10 ** 16)  # 2¢: under the 55¢ bid
-    assert body["order"]["takerAmount"] == str(5 * WEI) and body["order"]["makerAmount"] == str(10 * 10 ** 16) and body["order"]["expiration"] == str(NOW // 1000 + 600)
-    assert text.startswith("🧪 挂单测试") and "恒生指数" in text and "2.0¢×5 份" in text and "最多花 $0.10" in text, text
-    assert "1/4 下单成功：订单 #" in text and "2/4 开放订单列表：已列出" in text and "3/4 撤单：已撤" in text and "4/4 最终状态：CANCELLED，成交 0/5 份" in text, text
+    assert body["order"]["takerAmount"] == str(50 * WEI) and body["order"]["makerAmount"] == str(WEI) and body["order"]["expiration"] == str(NOW // 1000 + 600)  # 50 × 2¢ = the $1 minimum
+    assert text.startswith("🧪 挂单测试") and "恒生指数" in text and "2.0¢×50 份" in text and "最多花 $1.00" in text and "改为" not in text, text
+    assert "1/4 下单成功：订单 #" in text and "2/4 开放订单列表：已列出" in text and "3/4 撤单：已撤" in text and "4/4 最终状态：CANCELLED，成交 0/50 份" in text, text
+    assert "低于 Predict 最低订单金额 $1" in tbot.live_room({}, world["markets"][0], "up", 0.58, 1)  # a real decision under the minimum is refused, not sent
+    assert "最低订单金额" not in tbot.live_room({}, world["markets"][0], "up", 0.58, 2)
     assert ("remove", [tbot.store.get("live:test")["order_id"]]) in tfake.calls and tbot.store.get("live:test")["text"] == text
     assert tbot.live_status(NOW)["last_test"] == text and "最近挂单测试：" in tbot.live_text(NOW) and "deep2|up|吃" not in tbot.sim_trades()
     assert len([1 for kind, _ in tfake.calls if kind == "create"]) == 1 and not tbot.sim_trades()  # a test is never a paper record
@@ -716,7 +718,10 @@ async def run():
     tfake.markets["103"] = market_json("103")
     text = await tbot.live_action("test", ["btc", "3", "30"], NOW)
     body = [b for k, b in tfake.calls if k == "create"][-1]["data"]
-    assert "BTC 先触" in text and body["order"]["takerAmount"] == str(3 * WEI) and body["pricePerShare"] == str(30 * 10 ** 16) and "可能成交" in text
+    assert "BTC 先触" in text and body["order"]["takerAmount"] == str(4 * WEI) and body["pricePerShare"] == str(30 * 10 ** 16) and "可能成交" in text
+    assert "3 份不足 Predict 最低订单金额 $1，改为 4 份" in text and "30.0¢×4 份" in text and "最多花 $1.20" in text, text  # raised to the minimum, and said so
+    text = await tbot.live_action("test", ["btc", "4", "30"], NOW)
+    assert "改为" not in text and "30.0¢×4 份" in text, text
     assert "没有可用的市场" in await tbot.live_action("test", ["nothing-like-this"], NOW) and "0.01～1000" in await tbot.live_action("test", ["5000"], NOW)
     # a refusal is reported with the request body (without the signature) so the API's complaint can be read against it
     tfake.fail_create = "HTTP 400: order value below minimum"
