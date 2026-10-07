@@ -298,7 +298,6 @@ class PredictApi:
         self.auth_error = ""
         self.gate = asyncio.Semaphore(self.PARALLEL)
         self.blocked_until = 0.0
-        self.lookup: str = ""  # how a closed order is found: "id" (GET /orders/{id}) or "scan" (the status lists)
         self.calls = 0
 
     def headers(self) -> dict[str, str]:
@@ -411,28 +410,23 @@ class PredictApi:
         return self.rows(await self.authed("GET", f"/orders?{query}"))
 
     async def order(self, order_id: str, hash_: str = "") -> dict | None:
-        """One order, open or closed; None when Predict knows nothing of it. GET /v1/orders/{id} when the API serves
-        it, else the status lists (FILLED, CANCELLED, EXPIRED, INVALIDATED, OPEN)."""
-        if self.lookup != "scan" and order_id:
+        """One order, open or closed, by its hash: GET /v1/orders/{hash} is the API's only single-order read (there is
+        no read by id, and its list filter takes no status but OPEN that we know of). None when Predict knows nothing of
+        it (404). Without a hash only the open list can be searched, by id."""
+        if hash_:
             try:
-                data = await self.authed("GET", f"/orders/{core.urllib.parse.quote(str(order_id))}")
-                row = data.get("data", data) if isinstance(data, dict) else None
-                if isinstance(row, dict) and (row.get("id") is not None or row.get("order")):
-                    self.lookup = "id"
-                    return row
-                if isinstance(row, list):
-                    found = next((r for r in row if isinstance(r, dict) and str(r.get("id")) == str(order_id)), None)
-                    if found:
-                        self.lookup = "id"
-                        return found
+                data = await self.authed("GET", f"/orders/{core.urllib.parse.quote(str(hash_))}")
             except core.RemoteError as error:
-                if http_status(error) not in {400, 404, 405}:
-                    raise
-            if self.lookup != "id":
-                self.lookup = "scan"  # the API has no such endpoint: the lists from now on
-        for status in ("FILLED", "CANCELLED", "EXPIRED", "INVALIDATED", "OPEN"):
-            for row in await self.orders(status):
-                if str(row.get("id")) == str(order_id) or (hash_ and order_hash_of(row) == hash_):
+                if http_status(error) == 404:
+                    return None
+                raise
+            row = data.get("data", data) if isinstance(data, dict) else None
+            if isinstance(row, list):
+                row = next((r for r in row if isinstance(r, dict) and (order_hash_of(r) == hash_.lower() or (order_id and str(r.get("id")) == str(order_id)))), None)
+            return row if isinstance(row, dict) and (row.get("id") is not None or row.get("order") or row.get("status")) else None
+        if order_id:
+            for row in await self.orders("OPEN"):
+                if str(row.get("id")) == str(order_id):
                     return row
         return None
 

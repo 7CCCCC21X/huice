@@ -183,18 +183,21 @@ async def api_checks():
     assert await api.remove_orders(["1", "2"]) == {"removed": ["1"], "noop": ["2"]}
     server["answers"]["/orders/remove"] = {"success": True, "data": {"removed": [], "noop": ["9"]}}
     assert await api.remove_orders(["9"]) == {"removed": [], "noop": ["9"]}
-    # one order: by id when the API serves it, else found in the status lists (remembered)
-    server["answers"]["/orders/55"] = {"success": True, "data": {"id": "55", "status": "FILLED"}}
-    assert (await api.order("55"))["status"] == "FILLED" and api.lookup == "id"
-    api.lookup = ""
-    server["fail"]["/orders/66"] = ["HTTP 404: no"]
-    server["answers"]["/orders?status=FILLED"] = {"data": []}
-    server["answers"]["/orders?status=CANCELLED"] = {"data": [{"id": "66", "status": "CANCELLED", "order": {"hash": "0xcc"}}]}
-    assert (await api.order("66"))["status"] == "CANCELLED" and api.lookup == "scan"
+    # one order: by its hash (GET /orders/{hash}, the API's single-order read); 404 = unknown; other failures surface;
+    # without a hash only the open list is searched, by id — never a made-up status filter (the API rejects those)
+    server["answers"]["/orders/0xaa"] = {"success": True, "data": {"id": "55", "status": "FILLED", "order": {"hash": "0xaa"}}}
+    assert (await api.order("55", "0xaa"))["status"] == "FILLED" and server["calls"][-1][0] == "/orders/0xaa"
+    server["fail"]["/orders/0xbb"] = ["HTTP 404: not found"]
+    assert await api.order("66", "0xbb") is None
+    server["fail"]["/orders/0xdd"] = ["HTTP 500: boom"]
+    try: await api.order("66", "0xdd"); assert False
+    except m.RemoteError as e: assert "500" in str(e)
+    server["answers"]["/orders/0xee"] = {"success": True, "data": {}}
+    assert await api.order("", "0xee") is None  # an empty answer is no order
+    server["answers"]["/orders?status=OPEN"] = {"data": [{"id": "66", "status": "OPEN", "order": {"hash": "0xcc"}}]}
     server["calls"].clear()
-    assert (await api.order("", "0xcc"))["id"] == "66" and not any(p.startswith("/orders/") for p, _, _ in server["calls"])  # by hash: no id call
-    server["answers"]["/orders?status=EXPIRED"] = server["answers"]["/orders?status=INVALIDATED"] = {"data": []}
-    assert await api.order("77") is None
+    assert (await api.order("66"))["id"] == "66" and [p for p, _, _ in server["calls"]] == ["/orders?status=OPEN"]
+    assert await api.order("77") is None and all(p in {"/orders?status=OPEN"} for p, _, _ in server["calls"])
     server["answers"]["/positions"] = {"success": True, "data": [{"id": "p1"}]}
     assert await api.positions() == [{"id": "p1"}]
     server["answers"]["/markets/101"] = {"success": True, "data": {"id": 101, "outcomes": []}}
