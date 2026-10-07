@@ -130,6 +130,33 @@ EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:6888
 
 `TELEGRAM_CHAT_ID` 不需要填写。程序不根据环境变量自动创建订阅；实际发到哪里，由管理员在那个私聊/群组话题里发送 `/subscribe` 决定。
 
+#### 4b. 真实交易与控制台的变量（逐步）
+
+只做提醒和模拟交易不需要这一节。要用真实交易或网页控制台，在上面那段后面再加这几行（Raw Editor 里每行一个 `变量名=值`，等号两边不要空格，值不要加引号）：
+
+```env
+LIVE=off
+PREDICT_API_KEY=替换成developers.predict.fun申请的Key
+PREDICT_PRIVATE_KEY=替换成签名钱包私钥（64位十六进制，0x可省）
+PREDICT_ACCOUNT=替换成网站账户设置里的充值地址（用普通钱包交易就留空）
+WEB_CONTROL_KEY=自己定一个12到64位、不含空格的口令
+```
+
+1. **打开**：Railway → 项目 → 点机器人这个服务 → 顶部 **Variables** → 右上 **Raw Editor**（逐个加也可以：**New Variable**，左边变量名、右边值）。
+2. **粘贴并替换**：`LIVE` 先保持 `off`，其余按上表替换。`PREDICT_API_KEY` 在 <https://developers.predict.fun> 申请；`PREDICT_PRIVATE_KEY` / `PREDICT_ACCOUNT` 的两种填法见「[真实交易](#真实交易liveon)」的变量表（网站账户：导出的 Privy 私钥 + 充值地址；普通钱包：私钥 + `PREDICT_ACCOUNT` 留空）。
+3. **应用**：Raw Editor 点 **Update Variables**，回到服务页面点右上角 **Deploy / Apply changes**，Railway 会重新部署。
+4. **Seal**：Variables 列表里把鼠标移到 `TELEGRAM_BOT_TOKEN`、`PREDICT_PRIVATE_KEY`、`PREDICT_API_KEY`、`WEB_CONTROL_KEY` 每一行上，点右侧 **⋯ → Seal**。Seal 后值不再显示、API 和 CLI 也读不回；以后要改只能直接写一个新值覆盖。
+5. **核对**：部署日志里找这一行（只显示有没有，不显示值）：
+
+   ```text
+   secrets configured: telegram_token=True predict_api_key=True predict_private_key=True predict_account=True web_control_key=True live=False
+   ```
+
+   哪个是 `False` 就是哪个没填上（变量名拼错、值是空的）。然后给机器人发 `/web`，会给出概率页和控制台两个链接，控制台里输入口令试一下"自检"。
+6. **开真实交易**：确认 `python main.py --live-check`（或控制台"自检"）全部 OK、`/live test` 挂单测试四步都成功后，把 `LIVE` 改成 `on`，再 Deploy。之后 Telegram 会收到"真实交易已启动"的汇总。
+
+常见错误：变量名大小写不对（全部大写）；`PREDICT_ACCOUNT` 不是 `0x` 开头的 40 位地址；`WEB_CONTROL_KEY` 不足 12 位或含空格（启动直接报错并写明）；`PORT` 不要手填，Railway 自动注入；把值写进了代码或 `.env.example` 并提交到了 GitHub。
+
 ### 5. 挂载持久磁盘
 
 在 Railway 给**这个机器人服务**添加一个 **Volume**，挂载目录填写：
