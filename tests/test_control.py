@@ -110,6 +110,8 @@ async def run():
     assert s["SIM_GROUP_USD"]["zero"] == "不限" and s["LIVE_MAX_DAILY_LOSS_USD"]["presets"][0] == "0"
     assert s["SIM_MAKER_AFTER_HOURS_CENTS"]["zero"] == "关" and s["SIM_MAKER_AFTER_HOURS_CENTS"]["value"] == "0" and "10" in s["SIM_MAKER_AFTER_HOURS_CENTS"]["presets"]
     assert s["SIM_MAKER_DEEP_CENTS"]["zero"] == "关" and s["SIM_MAKER_DEEP_CENTS"]["value"] == "0" and "25" in s["SIM_MAKER_DEEP_CENTS"]["presets"]
+    assert s["SIM_MAKER_DEEP_MARKETS"]["kind"] == "detail" and s["SIM_MAKER_DEEP_MARKETS"]["value"] == "" and s["SIM_MAKER_AFTER_HOURS_MARKETS"]["kind"] == "detail"
+    assert "全部市场" in body.decode() and ".sw.on" in body.decode() and "绿色 = 开" in body.decode()
     assert s["SIM_SKIP"]["kind"] == "detail" and s["SIM_SKIP"]["value"] == "" and s["SIM_SKIP"]["group"] == "策略"
     assert isinstance(data["catalog"], list) and all({"kind", "key", "name", "skipped"} <= set(r) for r in data["catalog"]) and "展开详细选项" in body.decode()
     # every setting has a widget, every group is one the page knows, and every preset / option is a value the Config accepts
@@ -117,7 +119,7 @@ async def run():
     withkey = {**base, "PREDICT_PRIVATE_KEY": "a" * 64}
     for key, form in m.CONTROL_FORMS.items():
         if form["kind"] == "detail":  # SIM_SKIP: drawn inside the SIM_MARKETS card from the catalog, no presets or options of its own
-            assert "presets" not in form and "options" not in form and key == "SIM_SKIP", key
+            assert "presets" not in form and "options" not in form and key in {"SIM_SKIP", "SIM_MAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_DEEP_MARKETS"}, key
             continue
         assert form["kind"] in {"choice", "multi", "number"} and (form["kind"] == "number") == ("presets" in form) and (form["kind"] != "number") == ("options" in form), key
         for value in (form.get("presets") or [o[0] for o in form.get("options", [])]):
@@ -163,6 +165,10 @@ async def run():
     assert st == 400 and "SIM_SKIP" in j["message"] and bot.config.sim_skip == {"HSI", "BNB"}
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SKIP": ""}})
     assert st == 200 and bot.config.sim_skip == frozenset() and bot.control_value("SIM_SKIP") == ""
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_MARKETS": "hsi, kospi", "SIM_MAKER_AFTER_HOURS_MARKETS": "sse"}})
+    assert st == 200 and bot.config.sim_maker_deep_markets == {"HSI", "KOSPI"} and bot.control_value("SIM_MAKER_DEEP_MARKETS") == "HSI,KOSPI" and bot.config.sim_maker_after_hours_markets == {"SSE"}
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_AFTER_HOURS_MARKETS": ""}})
+    assert st == 200 and bot.config.sim_maker_deep_markets == frozenset() and bot.config.sim_maker_after_hours_markets == frozenset()
     # a new bot on the same store starts with the saved settings; a saved value that stopped validating is ignored
     again = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY}), store, FM(NOW), None)
     assert again.config.sim_edge == 0.12 and again.config.live_max_order_usd == 40 and again.config.sim_markets == frozenset(m.SIM_KINDS)

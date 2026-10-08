@@ -33,8 +33,10 @@ c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MARKETS": "all", "SIM_W
 assert c.sim_markets == frozenset(m.SIM_KINDS) and c.sim_ways == "taker" and m.sim_scope(c) == ("只吃单", "全部市场")
 assert c.sim_skip == frozenset()  # the detail chips: SIM_SKIP names markets left out of the chosen kinds, upper-cased, blanks dropped
 assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_SKIP": " hsi, bnb ,HSI,"}).sim_skip == frozenset({"HSI", "BNB"})
+c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEP_MARKETS": " hsi, kospi ", "SIM_MAKER_AFTER_HOURS_MARKETS": "sse"})
+assert c.sim_maker_deep_markets == {"HSI", "KOSPI"} and c.sim_maker_after_hours_markets == {"SSE"} and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).sim_maker_deep_markets == frozenset()
 for bad in ({"SIM_EDGE_CENTS": "0"}, {"SIM_EDGE_CENTS": "60"}, {"SIM_SHARES": "0"}, {"SIM_WAYS": "none"}, {"SIM_MARKETS": "index"},
-            {"SIM_SKIP": "x" * 41}, {"SIM_SKIP": ",".join(f"k{i}" for i in range(201))}):
+            {"SIM_SKIP": "x" * 41}, {"SIM_SKIP": ",".join(f"k{i}" for i in range(201))}, {"SIM_MAKER_DEEP_MARKETS": "x" * 41}):
     try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
     except ValueError: pass
 
@@ -728,7 +730,7 @@ async def maker_rules():
     assert dbot.config.sim_maker_deep == 0.25 and dbot.control_value("SIM_MAKER_DEEP_CENTS") == "25" and dbot.sim_version()["sim_maker_deep"] == 0.25
     assert "挂单平时只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后" in dbot.sim_text() and "挂单平时" not in bot.sim_text()
     assert "低价挂单模式：价差超过 10¢ 或单边的盘口也挂，挂在有效买1 之上 1¢ 优先成交，但只挂按挂价算净优势 ≥ 25.0¢ 的，这种单净优势降到 24.0¢ 以下撤掉" in dbot.sim_text()
-    assert dbot.sim_deep_book(wide(0.38, NOW).book) and not dbot.sim_deep_book(tight(0.70, NOW).book) and not bot.sim_deep_book(wide(0.38, NOW).book)
+    assert dbot.sim_deep_book(wide(0.38, NOW)) and not dbot.sim_deep_book(tight(0.70, NOW)) and not bot.sim_deep_book(wide(0.38, NOW))
     assert dbot.sim_maker_mode(wide(0.38, NOW)) == (0.25, "价差 33.0¢ 的盘口", "低价挂单撤单线") and dbot.sim_maker_mode(tight(0.70, NOW)) == (0.10, "", "撤单线")
     assert abs(dbot.sim_maker_line(wide(0.38, NOW)) - 0.24) < 1e-12 and dbot.sim_maker_line(tight(0.70, NOW)) == 0.05
     r = dbot.sim_maker_reason(wide(0.38, NOW), {}, NOW)[0]
@@ -779,6 +781,19 @@ async def maker_rules():
     assert bbot.sim_maker_mode(closed_wide) == (0.30, "盘后、价差 33.0¢ 的盘口", "盘后低价挂单撤单线") and abs(bbot.sim_maker_line(closed_wide) - 0.29) < 1e-12
     assert bbot.sim_maker_reason(closed_wide, {}, NOW) == (None, "盘后、价差 33.0¢ 的盘口只挂净优势 ≥ 30.0¢ 的，现 27.0¢")  # at 6¢
     assert bbot.sim_maker_reason(m.dataclasses.replace(closed_wide, fair_up=0.36), {}, NOW)[0] is not None  # 30¢ clears both
+    # each mode can be limited to chosen markets (the detail chips under its card): elsewhere it is as if the mode were off
+    nbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_MARKETS": "kospi",
+                                    "SIM_MAKER_AFTER_HOURS_CENTS": "10", "SIM_MAKER_AFTER_HOURS_MARKETS": "KOSPI,SSE"}), m.Store(":memory:"), FM(NOW), None)
+    nbot.predict.market_meta["101"] = (active, time.monotonic())
+    assert nbot.control_value("SIM_MAKER_DEEP_MARKETS") == "KOSPI" and nbot.control_value("SIM_MAKER_AFTER_HOURS_MARKETS") == "KOSPI,SSE"
+    assert not nbot.sim_deep_book(wide(0.38, NOW)) and nbot.sim_maker_reason(wide(0.38, NOW), {}, NOW) == (None, "买卖价差 33.0¢ 超过 10.0¢（低价挂单模式未选这个市场）")
+    assert not nbot.sim_after_hours(after(0.70, NOW)) and nbot.sim_maker_reason(after(0.70, NOW), {}, NOW) == (None, "标的未开盘，不挂单（盘后挂单模式未选这个市场）")
+    assert nbot.sim_version()["sim_maker_deep_markets"] == ["KOSPI"] and nbot.sim_version()["sim_maker_after_hours_markets"] == ["KOSPI", "SSE"]
+    assert "以下撤掉（SIM_MAKER_DEEP_CENTS），只做 KOSPI" in nbot.sim_text() and "以下撤掉（SIM_MAKER_AFTER_HOURS_CENTS），只做 KOSPI、SSE" in nbot.sim_text()
+    kospi_wide, kospi_after = m.dataclasses.replace(wide(0.38, NOW), key="KOSPI"), m.dataclasses.replace(after(0.70, NOW), key="kospi")
+    assert nbot.sim_deep_book(kospi_wide) and nbot.sim_maker_reason(kospi_wide, {}, NOW)[0] is not None  # chosen (keys compare upper-cased)
+    assert nbot.sim_after_hours(kospi_after) and nbot.sim_maker_reason(kospi_after, {}, NOW)[0] is not None
+    assert "sim_maker_deep_markets" not in dbot.sim_version() and dbot.sim_maker_reason(wide(0.38, NOW), {}, NOW)[0] is not None  # no list: every market
     # a part fill, then the 买1 moves: the filled shares stay a position under the slot, the rest lapses, no fresh order
     await step(bot, NOW + 130_000, hsi(0.70, [("0.565", "150")], [("0.57", "40"), ("0.58", "400")], NOW + 130_000))  # a seller at 57¢: 40 presumed
     assert bot.sim_trades()[tid]["shares"] == 40 and bot.sim_trades()[tid]["status"] == "resting"
