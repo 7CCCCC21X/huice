@@ -812,6 +812,40 @@ class LiveTrader:
         return lines
 
 
+    def summary_info(self) -> list[dict]:
+        """The facts of summary_lines as label / value / tone rows (tone "", ok, warn or bad) for the page's grid."""
+        c = self.config
+        rows = [{"k": "钱包", "v": f"{self.wallet.kind}，下单账户 {short_addr(self.wallet.maker)}"
+                 + (f"，签名钱包 {short_addr(self.wallet.signer)}" if self.wallet.predict_account else "")
+                 + f"，{CHAIN_NAMES.get(c.live_chain, c.live_chain)}", "tone": ""}]
+        if self.ready_error:
+            rows.append({"k": "API", "v": f"未就绪：{self.ready_error}", "tone": "bad"})
+        else:
+            rows.append({"k": "API", "v": "已登录" + (f"，token 至 {core.stamp(self.api.jwt_exp * 1000, seconds=False)}" if self.api.jwt_exp else "")
+                         + ("" if c.predict_api_key else "，未设置 PREDICT_API_KEY"), "tone": "ok" if c.predict_api_key else "warn"})
+        if self.wallet.predict_account:
+            rows.append({"k": "账户校验", "v": f"✗ {self.account_error}" if self.account_error else "✓ 私钥是这个 Predict 账户的控制钥匙",
+                         "tone": "bad" if self.account_error else "ok"})
+        if self.balance:
+            rows.append({"k": "余额", "v": f"USDT {from_wei(self.balance[0]):,.2f}，BNB {from_wei(self.balance[1]):.4f}（gas），"
+                                          f"读取于 {core.stamp(self.balance[2] * 1000)}", "tone": ""})
+        else:
+            rows.append({"k": "余额", "v": f"未读到（{self.balance_error or '尚未读取'}）", "tone": "warn"})
+        if self.approvals:
+            ok = all(self.approvals.values())
+            rows.append({"k": "授权", "v": "交易所 USDT 额度 " + ("✓" if self.approvals.get("CTF_EXCHANGE") else "✗")
+                         + "，多结果交易所 " + ("✓" if self.approvals.get("NEG_RISK_CTF_EXCHANGE") else "✗")
+                         + ("" if ok else "（python main.py --approve，或在网站交易一次）"), "tone": "ok" if ok else "bad"})
+        else:
+            rows.append({"k": "授权", "v": f"未读到（{self.approvals_error or '尚未读取'}）", "tone": "warn"})
+        rows.append({"k": "风控", "v": f"单笔 ≤${c.live_max_order_usd:g}，持仓+挂单 ≤${c.live_max_open_usd:g}，日亏损 "
+                     + (f"≤${c.live_max_daily_loss_usd:g}" if c.live_max_daily_loss_usd else "不限")
+                     + f"，吃单封顶限价单 {c.live_taker_wait} 秒未成交撤单，自动领取{'开' if c.live_auto_redeem else '关'}", "tone": ""})
+        if not c.live_allowed:
+            rows.append({"k": "硬开关", "v": "部署变量 LIVE_TRADING_ALLOWED=off，不会真实下单（最多 pause）；数据库里保存的模式改不了它", "tone": "warn"})
+        return rows
+
+
 def short_addr(address: str) -> str:
     return f"{address[:6]}…{address[-4:]}" if len(address) > 12 else address
 
@@ -1642,7 +1676,7 @@ class LiveBot(core.Bot):
                          "url": self.sim_url(t)})
         positions, at = self.live_positions
         return {"ready": self.live.ready, "ready_error": self.live.not_ready_why, "mode": c.live_mode, "paused": self.live_paused(), "killed": self.live_killed(),
-                "lines": self.live.summary_lines(), "account": short_addr(self.live.wallet.maker),
+                "lines": self.live.summary_lines(), "info": self.live.summary_info(), "account": short_addr(self.live.wallet.maker),
                 "exposure": self.live_exposure(trades), "daily_pnl": self.live_daily_pnl(trades, now_ms),
                 "caps": {"order": c.live_max_order_usd, "open": c.live_max_open_usd, "daily_loss": c.live_max_daily_loss_usd},
                 "resting": sum(t["status"] == "resting" for _, t in live),

@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.54.0
+版本：1.54.1
 
 ## 已完成
 
+- 1.54.1（真实交易信息改分项表）：`LiveTrader.summary_info()` 把 summary_lines 的内容整理成 {k, v, tone} 行（tone：""、ok、warn、bad），`live_status` 多 `info`（`lines` 仍给 Telegram）；页面 `renderLive` 以标签 / 值网格展示（钱包、API、账户校验、余额、授权、风控、策略、占用、今日、订单、订单同步、注意），按 tone 着色，占用接近上限、今日亏损、未确认订单各自标色；`renderTest` 把最近挂单测试显示为一行标题（含 ✓ / ✗）加可展开的步骤列表（localStorage `ctltest`）。测试：test_control（`info` 行）、cards.py（网格标签）。
 - 1.54.0（控制台 UI：订单标签、状态条、可收起、按钮分组）：`Bot.control_records(trades)` 把每条记录（挂单中 / 持仓全部、历史最近 200 条，按时间倒序）整理成页面行：组别、状态（失败单写“失败”）、原因（撤单原因 / 失败原因 / 未成交说明）、真实订单号与状态、能否撤；`control.json` 多 `records`。页面：顶部常驻状态条（模式、持仓、挂单中、已结算与盈亏、额度、今日盈亏、刷新时间）；“订单与持仓”区块四个标签带数量（记在 localStorage `ctlrectab`）、市场筛选框、状态彩色徽标与原因、纸面模式也列出记录；真实交易按钮分操作 / 撤单 / 工具三行；订单、Predict 持仓、最近错误可收起（各自记住）。测试：test_control（`records` 行字段、页面元素）、cards.py（标签计数、筛选、收起、状态条）。
 - 1.53.0（盘后吃单模式、盘后最高买价）：`SIM_TAKER_AFTER_HOURS_CENTS`（0～50，默认 0 = 关；控制项预设 0/10/15/20/30，常用开关“盘后吃单”默认 15¢，吃单关着时标黄、打开时顺带打开吃单）：`Bot.sim_taker_after_hours(mk)`、`sim_taker_bar(mk)` = 盘后 max(SIM_EDGE_CENTS, 该项)；`sim_step` / `sim_checks` 在该模式下盘后也吃，不再因 SIM_TAKER_SESSION 拒绝。`SIM_AFTER_HOURS_MAX_PRICE_CENTS`（0～99，默认 60）：`sim_after_hours_price(mk)` 盘后（日涨跌卡片标的未开盘）给出价格上限；`sim_taker_cap(mk, side, bps, slack)` 统一算吃单封顶价（门槛、盘后门槛、价格上限取低者；live_prefetch 也用它，留 3¢ 提前量）；`sim_maker_reason` 盘后跳过挂价高于上限的一边（“盘后只挂 60.0¢ 以下的，可挂的价位 70.0¢ 高于它”），`sim_requote_reason` 收盘后撤掉高于上限的挂单；挂单检查吃单列盘后前缀“盘后：”；`/sim` 说明行、`sim_version`（默认 60¢ 也记）。测试：test_sim（解析、盘后门槛 15¢ 吃 / 不吃、盘中照旧、价格上限挡住 65¢ 的卖单、挂单 70¢ 盘后不挂、收盘撤掉、说明行）、test_control（表单）、cards.py（开关）。
 - 1.52.2（低价挂单被顶下买1 就重挂）：`Bot.front_reference(book, side, own, own_price)` = 别人持有不少于 1 份（`SIM_MAKER_FRONT_MIN`，自己的单扣掉，不足 1 份的零星单不理）的最高买价；`sim_maker_price(…, deep=True, own, own_price)` 挂在 max(该价, 有效买1) 之上 1¢。`sim_requote_reason` 对低价挂单：有人挂到它之上或同价（目标价高于挂价）且目标价仍留足模式门槛就撤了重挂（“买1 被顶到 22.0¢，改挂 23.0¢”），留不足就原地不动；下面的买单撤走（目标价低 1¢ 以上）就降下来（“买1 移到 5.0¢，改挂 6.0¢”）；平时跟买1 的单改跟规则不变。测试：test_sim（零星 0.5 份不理；同价 20 份顶上来 → 7¢；再被顶到 13¢ 时 14¢ 留不足 25¢ 原地不动；300 份同价 → 8¢；买单撤走降到 6¢）。

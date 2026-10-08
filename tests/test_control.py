@@ -244,6 +244,7 @@ async def run():
     data = await get_json(port3, "control.json")
     live = data["live"]
     assert data["mode"] == "live" and live["ready"] and live["paused"] == "" and live["killed"] == "" and live["orders"] == []
+    assert [r["k"] for r in live["info"]][:2] == ["钱包", "API"] and live["info"][0]["v"].startswith("普通钱包，下单账户") and all({"k", "v", "tone"} <= set(r) for r in live["info"])
     assert live["lines"][0].startswith("钱包：普通钱包") and live["caps"] == {"order": 100, "open": 500, "daily_loss": 200} and live["exposure"] == 0
     assert live["account"] == "0x8fd3…7A03" and live["positions"] == [] and live["errors"] == []
     st, j = await post(port3, {"key": KEY, "action": "pause", "why": "维护"})

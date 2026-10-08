@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.54.0"
+VERSION = "1.54.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -8539,6 +8539,11 @@ button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
 .st{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:var(--chip);color:var(--muted);white-space:nowrap}
 .st.rest{background:var(--chip);color:var(--best);border:1px solid var(--best)}.st.pos,.st.win{background:var(--down-bg);color:var(--down)}.st.loss,.st.fail{background:var(--up-bg);color:var(--up)}
 .why{color:var(--muted);font-size:12px;white-space:normal;margin-top:2px}#recq{max-width:280px}
+.kv{display:grid;grid-template-columns:5.2em 1fr;gap:5px 10px;font-size:13px;margin-top:10px;align-items:baseline}.kv .k{color:var(--muted)}
+.kv .v{min-width:0;overflow-wrap:anywhere}.kv .v.ok{color:var(--down)}.kv .v.bad{color:var(--up)}.kv .v.warn{color:var(--warn)}
+.test{margin-top:10px;border:1px solid var(--line);border-radius:12px;padding:8px 12px;background:var(--bg);font-size:13px}
+.test .ttl{display:flex;justify-content:space-between;align-items:center;gap:8px}.test .ttl b{font-weight:600;overflow-wrap:anywhere}
+.test ol{margin:6px 0 0;padding-left:1.4em}.test li{margin:2px 0;overflow-wrap:anywhere}.test li.ok{color:var(--down)}.test li.bad{color:var(--up)}
 @media (min-width:640px){label.f{grid-template-columns:260px 1fr;align-items:center}label.f small{grid-column:2}}
 </style></head>
 <body><div class="wrap">
@@ -8553,7 +8558,7 @@ button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
 <div class="row"><span class="lbl">撤单</span><button data-act="cancelall" class="bad">撤掉本策略挂单</button><button data-act="cancelaccount" class="bad">撤掉账户全部挂单</button></div>
 <div class="row"><span class="lbl">工具</span><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button><button data-act="test">挂单测试</button></div>
 </div>
-<pre id="livelines"></pre><pre id="testlines" class="mut"></pre></section>
+<div id="livelines" class="kv"></div><div id="testlines" class="test" style="display:none"></div></section>
 <section class="card" id="quick"><h2>常用开关</h2><p class="mut"><b>绿色 = 开，灰色 = 关</b>。点一下切换，立即生效并保存；带数值的开关用上次的值（没有就用默认值），数值和适用的市场在下面的参数卡片里改。</p><div class="opts" id="quickbtns"></div></section>
 <section class="card" id="settings"><div class="hd"><h2>策略与风控参数</h2><button id="fold" class="lnk">收起</button></div>
 <div id="setbody"><p class="mut">点一个选项就立即生效，并保存到数据库（重启仍有效）；数字项点预设值，或填自定义值后按保存。标“环境变量”的是部署时的值，标“已保存”的是在这里改过的，“恢复环境变量”撤销单项。</p>
@@ -8600,7 +8605,7 @@ function render(){
   if(L&&L.allowed===false)$("livestate").textContent+="｜硬开关 LIVE_TRADING_ALLOWED=off";
   $("modebtns").querySelectorAll("button").forEach(b=>{b.disabled=!L||!data.enabled;b.className=L&&b.dataset.mode===L.mode?"pri":""});
   $("livebtns").querySelectorAll("button").forEach(b=>{b.disabled=!liveOn||!data.enabled});
-  $("livelines").textContent=L?(liveOn?[...L.lines,"策略："+data.scope.join("；"),"持仓+挂单 $"+L.exposure.toFixed(2)+" / $"+L.caps.open+"｜今日已结算盈亏 "+money(L.daily_pnl)+"（上限 −$"+L.caps.daily_loss+"）｜挂单中 "+L.resting+"｜未确认 "+L.unconfirmed+"｜今日下单 "+L.placed_today+"｜失败 "+L.failed_today+(L.synced_at?"｜订单同步 "+L.synced_at:""),...(L.unknown_open&&L.unknown_open.length?["⚠️ 账户上有 "+L.unknown_open.length+" 张本机器人没有记录的挂单（#"+L.unknown_open.map(u=>u.id).join("、#")+"）：不计入这里的额度；“撤掉账户全部挂单”可一起撤"]:[])].join("\n"):"LIVE=off：模拟交易只记账。点 pause 会登录 Predict、校验钱包、读余额和授权，可自检和挂单测试，但不开新仓；点 on 才真实下单。切换立即生效并保存。"):"没有配置 PREDICT_PRIVATE_KEY：在 Railway Variables 配置私钥（和 PREDICT_API_KEY）并重新部署后，这里才能切换模式。";
+  renderLive(L,liveOn);
   renderSettings();renderQuick();
   $("simline").textContent="记录 "+data.sim.trades+" 笔｜已结算 "+data.sim.settled+" 笔，盈亏 "+money(data.sim.pnl)+"｜持仓 "+data.sim.open+"｜挂单中 "+data.sim.resting+"（成本 $"+data.sim.open_cost.toFixed(2)+"）";
   renderRecords();renderFolds();renderBar();
@@ -8614,7 +8619,7 @@ function render(){
   else cb.append(el("p","mut","现在没有可看的市场（还没有盘口，或模拟交易已关闭）。"));
   $("checksn").textContent=data.checks&&data.checks.length?"（"+data.checks.length+" 个市场）":"";renderChecksFold();
   $("posbox").style.display=L?"":"none";$("errbox").style.display=L?"":"none";
-  if(L){$("positions").textContent=L.positions.length?L.positions.join("\n")+(L.positions_at?"\n（读取于 "+L.positions_at+"）":""):"没有持仓，或还没读取（点“刷新持仓”）";$("errors").textContent=L.errors.length?L.errors.join("\n"):"无";$("testlines").textContent=L.last_test||""}
+  if(L){$("positions").textContent=L.positions.length?L.positions.join("\n")+(L.positions_at?"\n（读取于 "+L.positions_at+"）":""):"没有持仓，或还没读取（点“刷新持仓”）";$("errors").textContent=L.errors.length?L.errors.join("\n"):"无";renderTest(L.last_test||"")}else renderTest("")
 }
 function switchMode(v){if(data.live&&v===data.live.mode)return;
   const ask={on:"切到 LIVE=on 后，模拟交易的每个决定都会在 Predict 真实下单。继续？",off:"切到 LIVE=off 会撤掉未成交的真实挂单并回到只记账（已有持仓继续跟踪到结算）。继续？",pause:"切到 LIVE=pause：登录 Predict、可自检和挂单测试，不开新仓。继续？"}[v];
@@ -8708,6 +8713,24 @@ function renderRecords(){const rows=data.records||[];const tabs=$("rectabs");tab
     tr.append(el("td","",r.order_id?"#"+r.order_id:r.live_state||(data.live&&data.live.mode!=="off"?"":"纸面")));
     const td=el("td");if(r.cancellable&&data.live){const b=el("button","bad","撤单");b.disabled=!data.enabled;b.addEventListener("click",()=>{if(confirm("撤掉这张真实挂单（#"+r.order_id+"）？"))act({action:"cancel",id:r.order_id})});td.append(b)}tr.append(td);t.append(tr)});
   o.append(t)}
+// the real-trading facts as a label / value grid, coloured by state; the last order test as a foldable step list
+function kvRow(k,v,tone){return [el("div","k",k),el("div","v"+(tone?" "+tone:""),v)]}
+function renderLive(L,liveOn){const box=$("livelines");box.replaceChildren();
+  if(!L){box.append(...kvRow("说明","没有配置 PREDICT_PRIVATE_KEY：在 Railway Variables 配置私钥（和 PREDICT_API_KEY）并重新部署后，这里才能切换模式。",""));return}
+  if(!liveOn){box.append(...kvRow("说明","LIVE=off：模拟交易只记账。点 pause 会登录 Predict、校验钱包、读余额和授权，可自检和挂单测试，但不开新仓；点 on 才真实下单。切换立即生效并保存。",""));return}
+  (L.info||[]).forEach(r=>box.append(...kvRow(r.k,r.v,r.tone)));
+  box.append(...kvRow("策略",data.scope.join("；"),""));
+  box.append(...kvRow("占用","持仓+挂单 $"+L.exposure.toFixed(2)+"，上限 $"+L.caps.open,L.exposure>=L.caps.open*0.9?"warn":""));
+  box.append(...kvRow("今日","已结算盈亏 "+money(L.daily_pnl)+(L.caps.daily_loss?"，亏损上限 $"+L.caps.daily_loss:"，亏损不设上限"),L.daily_pnl<0?"bad":""));
+  box.append(...kvRow("订单","挂单中 "+L.resting+"，未确认 "+L.unconfirmed+"，今日下单 "+L.placed_today+"，失败 "+L.failed_today,L.unconfirmed?"warn":""));
+  if(L.synced_at)box.append(...kvRow("订单同步",L.synced_at,""));
+  if(L.unknown_open&&L.unknown_open.length)box.append(...kvRow("注意","账户上有 "+L.unknown_open.length+" 张本机器人没有记录的挂单（#"+L.unknown_open.map(u=>u.id).join("、#")+"）：不计入这里的额度；“撤掉账户全部挂单”可一起撤","warn"))}
+let testOpen=false;try{testOpen=localStorage.getItem("ctltest")==="1"}catch(e){}
+function renderTest(text){const box=$("testlines");box.replaceChildren();box.style.display=text?"":"none";if(!text)return;
+  const lines=text.split("\n").filter(x=>x.trim());const title=lines[0].replace(/^🧪\s*/,"");const steps=lines.slice(1);const isBad=s=>/失败|✗|超时|错误|无法/.test(s);
+  const t=el("div","ttl");t.append(el("b","",(steps.some(isBad)?"✗ ":"✓ ")+title));
+  const tg=el("button","lnk",testOpen?"收起步骤":"展开步骤");tg.addEventListener("click",()=>{testOpen=!testOpen;try{localStorage.setItem("ctltest",testOpen?"1":"0")}catch(e){}renderTest(text)});t.append(tg);box.append(t);
+  if(testOpen){const ol=el("ol");steps.forEach(s=>{const m=s.match(/^\d+\/\d+\s*(.*)$/);ol.append(el("li",isBad(s)?"bad":"ok",m?m[1]:s))});box.append(ol)}}
 // the sticky bar: the mode, the counts, the limits, when the page last refreshed
 function renderBar(){const L=data.live,b=$("bar");b.replaceChildren();const liveOn=!!L&&L.mode!=="off";
   const chip=(k,v)=>{const s=el("span");s.append(el("span","k",k+" "),el("b","",String(v)));return s};
