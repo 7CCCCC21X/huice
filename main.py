@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.52.2"
+VERSION = "1.53.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -446,6 +446,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_SKIP", "不做的市场（详细选项）", "逗号分隔的市场代码；在“做哪些市场”卡片展开详细选项点选，空 = 所选类型里的市场都做"),
     ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "0 = 不限"),
     ("SIM_TAKER_SESSION", "只在标的开盘时段吃单", "开 = 指数/个股日涨跌的吃单只在标的开盘时段（卡片按现货定价时）进行，盘后只挂单；挂单不受影响"),
+    ("SIM_TAKER_AFTER_HOURS_CENTS", "盘后吃单模式（¢/份）", "0～50：开盘前、收盘后也吃指数/个股日涨跌的单，但只吃净优势不低于这个数的（不低于触发门槛）；0 = 关（按上一项）"),
+    ("SIM_AFTER_HOURS_MAX_PRICE_CENTS", "盘后只买这个价以下的（¢）", "1～99：指数/个股日涨跌开盘前、收盘后，吃单只买这个价以下的卖单、挂单只挂这个价以下的，挂着的高于它就撤；默认 60；0 = 不限"),
     ("SIM_QUIET_MINUTES", "结束前多少分钟不交易", "0～1440：从标的收盘 / 市场截止前这么多分钟起不开新单，未成交的挂单撤掉；0 = 不限"),
     ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
     ("SIM_MAKER_EXIT_CENTS", "挂单撤单线（¢/份）", "0～50：挂着的单净优势降到这个数以下就撤掉（不会高于触发门槛）；0 = 不撤"),
@@ -520,6 +522,10 @@ class Config:
     sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
     sim_skip: frozenset = frozenset()              # SIM_SKIP: market keys (HSI, UNITREEUSDT, BNB…) left out within those kinds (the page's detail chips)
     sim_group_usd: float = 300.0  # the most one driver's positions may lose on a single move (paper $); 0 = no limit
+    sim_taker_after_hours: float = 0.0  # SIM_TAKER_AFTER_HOURS_CENTS / 100: after-hours taker mode — a daily card is also taken outside its
+    # underlying's session, but only with this much net edge (never under sim_edge). 0 = off (SIM_TAKER_SESSION decides)
+    sim_after_hours_max_price: float = 0.60  # SIM_AFTER_HOURS_MAX_PRICE_CENTS / 100: outside the session a daily card's orders, taker and
+    # maker, only at or under this price (a dear share bought on a proxy price has little to win and much to lose); 0 = no limit
     sim_taker_session: bool = False  # SIM_TAKER_SESSION: a daily card is taken only while its underlying trades (priced from the spot); makers always
     sim_quiet_minutes: int = 0        # SIM_QUIET_MINUTES: from this many minutes before a market's end (the underlying's close, a deadline) no new
     # paper order; a resting one is withdrawn (the real one cancelled). 0 = off
@@ -663,6 +669,8 @@ class Config:
             sim_maker_after_hours_markets=market_keys("SIM_MAKER_AFTER_HOURS_MARKETS"), sim_maker_deep_markets=market_keys("SIM_MAKER_DEEP_MARKETS"),
             sim_group_usd=parse_bounded(e, "SIM_GROUP_USD", "300", 0, 10_000_000),
             sim_taker_session=not off(e.get("SIM_TAKER_SESSION", "off")),
+            sim_taker_after_hours=parse_bounded(e, "SIM_TAKER_AFTER_HOURS_CENTS", "0", 0, 50) / 100,
+            sim_after_hours_max_price=parse_bounded(e, "SIM_AFTER_HOURS_MAX_PRICE_CENTS", "60", 0, 99) / 100,
             sim_quiet_minutes=bounded_int(e, "SIM_QUIET_MINUTES", 0, 0, 1440),
             sim_maker_min_bid=parse_bounded(e, "SIM_MAKER_MIN_BID", "100", 0, 10_000_000),
             sim_maker_exit=parse_bounded(e, "SIM_MAKER_EXIT_CENTS", "5", 0, 50) / 100,
@@ -6904,6 +6912,8 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_MARKETS": {"kind": "multi", "group": "策略", "options": [[k, n] for k, n in SIM_KINDS.items()]},
     "SIM_SKIP": {"kind": "detail", "group": "策略"},  # drawn inside the SIM_MARKETS card: one chip per market of the chosen kinds
     "SIM_TAKER_SESSION": {"kind": "choice", "group": "策略", "options": [["off", "全天都吃单"], ["on", "只在开盘时段吃单"]]},
+    "SIM_TAKER_AFTER_HOURS_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "10", "15", "20", "30"], "unit": "¢", "zero": "关"},
+    "SIM_AFTER_HOURS_MAX_PRICE_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "40", "50", "60", "70", "80"], "unit": "¢", "zero": "不限"},
     "SIM_QUIET_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "5", "10", "15", "30", "60"], "unit": "分钟", "zero": "不限"},
     "SIM_MAKER_MIN_BID": {"kind": "number", "group": "策略", "presets": ["0", "20", "50", "100", "200", "500"], "unit": "份", "zero": "不限、不改跟"},
     "SIM_MAKER_EXIT_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "2", "3", "5", "8"], "unit": "¢", "zero": "不撤"},
@@ -8340,7 +8350,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_after_hours:"盘后挂单门槛",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_skip:"详细选项排除的市场",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_skip:"详细选项排除的市场",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
   trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
@@ -8665,7 +8675,7 @@ $("fold").addEventListener("click",()=>{folded=!folded;try{localStorage.setItem(
 function renderChecksFold(){$("checksbody").style.display=checksFolded?"none":"";$("foldchecks").textContent=checksFolded?"展开":"收起"}
 $("foldchecks").addEventListener("click",()=>{checksFolded=!checksFolded;try{localStorage.setItem("ctlchecks",checksFolded?"1":"0")}catch(e){}renderChecksFold()});
 // the quick switches: the few settings that are turned on and off most, one tap each, their value from the cards below
-const QUICK_DEFAULT={SIM_MAKER_AFTER_HOURS_CENTS:"10",SIM_MAKER_DEEP_CENTS:"25",SIM_QUIET_MINUTES:"15"};
+const QUICK_DEFAULT={SIM_TAKER_AFTER_HOURS_CENTS:"15",SIM_MAKER_AFTER_HOURS_CENTS:"10",SIM_MAKER_DEEP_CENTS:"25",SIM_QUIET_MINUTES:"15"};
 function quickChip(label,on,key,fn,warn){const b=el("button","opt sw "+(warn?"warn":on?"on":"off"),label+(on?" · 开":" · 关")+(warn?"（"+warn+"）":""));b.dataset.q=key;b.title=key;b.disabled=!data.enabled;b.addEventListener("click",fn);return b}
 function renderQuick(){const q=$("quickbtns");q.replaceChildren();if(!data.settings)return;const v={};data.settings.forEach(s=>v[s.key]=s.value);
   const ways=v.SIM_WAYS||"taker";
@@ -8674,11 +8684,11 @@ function renderQuick(){const q=$("quickbtns");q.replaceChildren();if(!data.setti
   q.append(quickChip("挂单",ways!=="taker","SIM_WAYS:maker",()=>setWays(ways!=="maker",ways==="taker")));
   [["SIM_TAKER_SESSION","只在开盘时段吃单"],["SIM_MAKER_SESSION","只在开盘时段挂单"],["SIM_MAKER_POINTS","只挂积分已激活的"]].forEach(([k,lab])=>{
     const on=v[k]==="on";q.append(quickChip(lab,on,k,()=>act({action:"set",values:{[k]:on?"off":"on"}})))});
-  [["SIM_MAKER_AFTER_HOURS_CENTS","盘后挂单","¢"],["SIM_MAKER_DEEP_CENTS","低价挂单","¢"],["SIM_QUIET_MINUTES","结束前不交易","分钟"]].forEach(([k,lab,unit])=>{
+  [["SIM_TAKER_AFTER_HOURS_CENTS","盘后吃单","¢"],["SIM_MAKER_AFTER_HOURS_CENTS","盘后挂单","¢"],["SIM_MAKER_DEEP_CENTS","低价挂单","¢"],["SIM_QUIET_MINUTES","结束前不交易","分钟"]].forEach(([k,lab,unit])=>{
     const on=!!v[k]&&v[k]!=="0";let last="";try{last=localStorage.getItem("ctlq_"+k)||""}catch(e){}
-    const needsMaker=MAKER_MODES.has(k)&&ways==="taker";  // a resting-order mode while 只吃单: say so, and turning it on turns 挂单 on too
+    const needsMaker=MAKER_MODES.has(k)&&ways==="taker",needsTaker=k==="SIM_TAKER_AFTER_HOURS_CENTS"&&ways==="maker";  // a mode of a way that is off: say so, turning it on turns the way on too
     q.append(quickChip(on?lab+" "+v[k]+unit:lab,on,k,()=>{if(on){try{localStorage.setItem("ctlq_"+k,v[k])}catch(e){}act({action:"set",values:{[k]:"0"}})}
-      else act({action:"set",values:{[k]:last||QUICK_DEFAULT[k],...(needsMaker?{SIM_WAYS:"both"}:{})}})},on&&needsMaker?"挂单没开，不生效":""));
+      else act({action:"set",values:{[k]:last||QUICK_DEFAULT[k],...(needsMaker||needsTaker?{SIM_WAYS:"both"}:{})}})},on&&needsMaker?"挂单没开，不生效":on&&needsTaker?"吃单没开，不生效":""));
     if(k==="SIM_MAKER_DEEP_CENTS"){const o=v.SIM_MAKER_DEEP_ONLY==="on";  // only the deep-bid orders: turning it on turns the mode (and 挂单) on too
       q.append(quickChip("只挂低价挂单",o,"SIM_MAKER_DEEP_ONLY",()=>act({action:"set",values:{SIM_MAKER_DEEP_ONLY:o?"off":"on",...(!o&&!on?{SIM_MAKER_DEEP_CENTS:last||QUICK_DEFAULT[k]}:{}),...(!o&&ways==="taker"?{SIM_WAYS:"both"}:{})}}),
         o&&!on?"低价挂单没开，不生效":o&&ways==="taker"?"挂单没开，不生效":""))}})}
@@ -11338,6 +11348,8 @@ class Bot:
                 **({"sim_maker_exit": self.sim_maker_exit()} if self.sim_maker_exit() > 0 else {}),
                 **({"sim_maker_session": True} if c.sim_maker_session else {}),
                 **({"sim_maker_after_hours": c.sim_maker_after_hours} if c.sim_maker_after_hours > 0 else {}),
+                **({"sim_taker_after_hours": c.sim_taker_after_hours} if c.sim_taker_after_hours > 0 else {}),
+                **({"sim_after_hours_max_price": c.sim_after_hours_max_price} if c.sim_after_hours_max_price > 0 else {}),
                 **({"sim_maker_deep": c.sim_maker_deep} if c.sim_maker_deep > 0 else {}),
                 **({"sim_maker_spread": c.sim_maker_spread} if c.sim_maker_spread > 0 else {}),
                 **({"sim_maker_deep_only": True} if c.sim_maker_deep_only and c.sim_maker_deep > 0 else {}),
@@ -11580,7 +11592,8 @@ class Bot:
         wide = self.sim_deep_book(mk)  # a book the ordinary rule refuses: the deep-bid mode takes it, a cent in front, at its bar
         front_ok = c.sim_maker_deep > 0 and self.sim_mode_market(mk, c.sim_maker_deep_markets) and not book_crossed(mk.book)
         only = front_ok and c.sim_maker_deep_only  # SIM_MAKER_DEEP_ONLY: the joining orders are not placed at all
-        best, joined = None, None  # joined: the best edge a joining order would have had, for the reason under "only"
+        limit = self.sim_after_hours_price(mk)  # after hours only at or under SIM_AFTER_HOURS_MAX_PRICE_CENTS
+        best, joined, dear = None, None, None  # joined / dear: what was passed over, for the reason when nothing is left
         for side, name in (("up", "涨"), ("down", "跌")):
             own, own_price = self.sim_own_resting(trades, mk.market, side)
             level = maker_level(mk.book, side, c.sim_maker_min_bid, own, own_price)
@@ -11595,10 +11608,15 @@ class Bot:
                 joined = max(joined if joined is not None else -1.0, fair - level[0])
                 continue
             price, queued = front if use_front else level
+            if limit is not None and price > limit + 1e-9:
+                dear = max(dear if dear is not None else -1.0, price)
+                continue
             edge = fair - price
             if best is None or edge > best.edge:
                 best = BookEdge(name, True, price, edge, queued, edge, front=use_front)
         if best is None:
+            if dear is not None and joined is None:
+                return None, f"盘后只挂 {cents(limit)} 以下的，可挂的价位 {cents(dear)} 高于它"
             if joined is not None:
                 return None, f"只挂低价挂单：买1 之上 1¢ 的净优势不到 {cents(c.sim_maker_deep)}（跟买1 也只有 {cents(joined)}）"
             return None, f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟" if c.sim_maker_min_bid > 0 else "没有可跟的买价"
@@ -11607,7 +11625,8 @@ class Bot:
         bar, mode, _ = self.sim_maker_mode(mk)
         if best.edge < bar - 1e-9:
             return None, (f"{mode}只挂净优势 ≥ {cents(bar)} 的，现 {cents(best.edge)}" if mode
-                          else f"净优势 {cents(best.edge)} 低于触发门槛 {cents(bar)}")
+                          else f"净优势 {cents(best.edge)} 低于触发门槛 {cents(bar)}") \
+                + (f"；{cents(dear)} 的价位高于盘后上限 {cents(limit)}" if dear is not None else "")
         held = trades.get(f"{mk.market}|{'up' if best.side == '涨' else 'down'}|挂")
         if held is not None and not sim_position(held):  # a position from an earlier order does not hold the slot
             return None, f"已有{sim_status(held)}：{cents(float(held.get('price') or 0))}×{float(held.get('order') or 0):g} 份"
@@ -11647,23 +11666,24 @@ class Bot:
                 taker_why = f"卡片暂不建议（{mk.hold}）"
             elif mk.book.stale(now_ms):
                 taker_why = "盘口过期"
-            elif c.sim_taker_session and mk.in_session is False:
+            elif c.sim_taker_session and mk.in_session is False and not self.sim_taker_after_hours(mk):
                 taker_why = "标的未开盘，不吃单"
             else:
                 parts = []
                 for side in ("up", "down"):
                     name = mk.sides[0 if side == "up" else 1]
                     fair = mk.fair_up if side == "up" else 1 - mk.fair_up
-                    cap = taker_cap(fair, max(mk.need, c.sim_edge), bps)
+                    cap = self.sim_taker_cap(mk, side, bps)
                     q = taker_quote(mk.book, side, c.sim_shares, bps, cap) if cap > 0 else None
                     held = trades.get(f"{mk.market}|{side}|吃")
                     if cap <= 0:
-                        parts.append(f"{name}：无封顶价（公平价 {cents(fair)} 留不出 {cents(max(mk.need, c.sim_edge))}）")
+                        parts.append(f"{name}：无封顶价（公平价 {cents(fair)} 留不出 {cents(max(mk.need, self.sim_taker_bar(mk)))}）")
                     elif q is None or q["got"] < SIM_MIN_SHARES - 1e-9:
                         parts.append(f"{name}：封顶 {cents(cap)}，之下没有卖单")
                     else:
                         parts.append(f"{name}：封顶 {cents(cap)}，可买 {q['got']:g} 份" + (f"（已有{sim_status(held)}）" if held else ""))
-                taker_text = "；".join(parts)
+                after = mk.in_session is False and (self.sim_taker_after_hours(mk) or self.sim_after_hours_price(mk) is not None)
+                taker_text = ("盘后：" if after else "") + "；".join(parts)
             rows.append({"item": mk.item, "kind": SIM_KINDS.get(mk.kind, mk.kind), "market": mk.market,
                          "url": predict_url(mk.book.slug or mk.market.partition("#")[0], c.predict_ref), "fair": mk.fair_up,
                          "bid": [float(mk.book.bid[0]), float(mk.book.bid[1])] if mk.book.bid else None,
@@ -11683,6 +11703,31 @@ class Bot:
         SIM_MAKER_AFTER_HOURS_MARKETS names them. Crypto markets have no session: never."""
         c = self.config
         return mk.in_session is False and c.sim_maker_after_hours > 0 and self.sim_mode_market(mk, c.sim_maker_after_hours_markets)
+
+    def sim_taker_after_hours(self, mk: SimMarket) -> bool:
+        """Whether this market is taken under the after-hours taker mode now: a daily card outside its underlying's session
+        while SIM_TAKER_AFTER_HOURS_CENTS is set."""
+        return mk.in_session is False and self.config.sim_taker_after_hours > 0
+
+    def sim_taker_bar(self, mk: SimMarket) -> float:
+        """The net edge a taker needs on this market now: SIM_EDGE_CENTS, after hours in the after-hours taker mode
+        SIM_TAKER_AFTER_HOURS_CENTS (never under SIM_EDGE_CENTS)."""
+        c = self.config
+        return max(c.sim_edge, c.sim_taker_after_hours) if self.sim_taker_after_hours(mk) else c.sim_edge
+
+    def sim_after_hours_price(self, mk: SimMarket) -> float | None:
+        """Outside its session a daily card's orders, taker and maker, only at or under SIM_AFTER_HOURS_MAX_PRICE_CENTS: a
+        dear share bought on a proxy price has little to win and much to lose. None in session, or with no limit."""
+        c = self.config
+        return c.sim_after_hours_max_price if mk.in_session is False and c.sim_after_hours_max_price > 0 else None
+
+    def sim_taker_cap(self, mk: SimMarket, side: str, bps: float, slack: float = 0.0) -> float:
+        """The dearest price a taker of ``side`` pays on this market now: the cap that keeps max(the card's error, the
+        taker's bar − ``slack``) after the fee, and after hours never over the after-hours price limit."""
+        fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+        cap = taker_cap(fair, max(mk.need, self.sim_taker_bar(mk) - slack), bps)
+        limit = self.sim_after_hours_price(mk)
+        return min(cap, limit) if limit is not None and cap > 0 else cap
 
     def sim_deep_book(self, mk: SimMarket) -> bool:
         """Whether this market's book is quoted on under the deep-bid mode (SIM_MAKER_DEEP_CENTS, on the chosen markets
@@ -11759,6 +11804,8 @@ class Bot:
             return ""
         if c.sim_maker_session and mk.in_session is False and not self.sim_after_hours(mk):
             return "标的未开盘，不挂单"
+        if (limit := self.sim_after_hours_price(mk)) is not None and float(trade.get("price") or 0) > limit + 1e-9:
+            return f"盘后只挂 {cents(limit)} 以下的，{cents(float(trade.get('price') or 0))} 的单撤掉"
         if abs(float(trade.get("order") or 0) - c.sim_shares) > 1e-9:
             return f"每次份数已改为 {c.sim_shares:g} 份，按新份数重挂"
         if c.sim_maker_points and mk.book.market_id and self.points_status(mk.book.market_id, mk.book, now_ms, PREDICT_POINTS_STALE_SECONDS)["points_active"] is False:
@@ -12094,12 +12141,13 @@ class Bot:
             bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
             quotes = []
             # SIM_TAKER_SESSION: a daily card after hours is priced from a proxy; its taker waits for the session
-            takers = ways != "maker" and not (self.config.sim_taker_session and mk.in_session is False)
+            takers = ways != "maker" and not (self.config.sim_taker_session and mk.in_session is False and not self.sim_taker_after_hours(mk))
             for side in ("up", "down") if takers else ():
                 fair = mk.fair_up if side == "up" else 1 - mk.fair_up
-                # the dearest price that still leaves the edge the trade is about (the card's error and SIM_EDGE_CENTS):
-                # every ask at or under it is bought, up to SIM_SHARES; nothing above it, however much is wanted
-                cap = taker_cap(fair, max(mk.need, bar), bps)
+                # the dearest price that still leaves the edge the trade is about (the card's error and SIM_EDGE_CENTS, after
+                # hours the after-hours bar, never over the after-hours price limit): every ask at or under it is bought, up
+                # to SIM_SHARES; nothing above it, however much is wanted
+                cap = self.sim_taker_cap(mk, side, bps)
                 q = taker_quote(mk.book, side, self.config.sim_shares, bps, cap) if cap > 0 else None
                 if q and q["got"] >= SIM_MIN_SHARES - 1e-9:  # under a share is dust, not a trade: the slot stays free
                     quotes.append((round(fair - q["cost"], 4), side, q))
@@ -12258,7 +12306,10 @@ class Bot:
         r = self.sim_report(recent=10)
         t, edge, shares = r["total"], r["edge"] * 100, f"{r['shares']:g}"
         how = [f"吃单：算出仍留足净优势的最高价位（封顶价），盘口在它之下有多少买多少，最多 {shares} 份"] if r["ways"] != "只挂单" else []
-        if how and self.config.sim_taker_session:
+        if how and self.config.sim_taker_after_hours > 0:
+            taker_bar = max(self.config.sim_edge, self.config.sim_taker_after_hours)
+            how.append(f"盘后吃单模式：指数/个股日涨跌开盘前、收盘后也吃，但只吃净优势 ≥ {cents(taker_bar)} 的（SIM_TAKER_AFTER_HOURS_CENTS）")
+        elif how and self.config.sim_taker_session:
             how.append("指数/个股日涨跌只在标的开盘时段吃单（SIM_TAKER_SESSION=on），盘后只挂单")
         if self.config.sim_quiet_minutes:
             how.append(f"每个市场结束前 {self.config.sim_quiet_minutes} 分钟起不开新单、撤掉未成交挂单（SIM_QUIET_MINUTES）")
@@ -12289,6 +12340,10 @@ class Bot:
                 how.append("只挂积分已激活的市场，积分停了就撤")
         elif self.config.sim_maker_after_hours > 0 or self.config.sim_maker_deep > 0:
             how.append("盘后挂单 / 低价挂单模式已设置，但现在只吃单，不会挂单；要挂单把“做哪种单”改为挂单或两者（SIM_WAYS=maker / both）")
+        if self.config.sim_after_hours_max_price > 0:
+            ways_parts = ([] if r["ways"] == "只挂单" else ["吃单只买这个价以下的卖单"]) + ([] if r["ways"] == "只吃单" else ["挂单只挂这个价以下的、挂着的高于它就撤"])
+            how.append(f"指数/个股日涨跌开盘前、收盘后只买 {cents(self.config.sim_after_hours_max_price)} 以下的：" + "，".join(ways_parts)
+                       + "（SIM_AFTER_HOURS_MAX_PRICE_CENTS）")
         if self.config.sim_skip:
             how.append(f"详细选项排除了 {len(self.config.sim_skip)} 个市场（{'、'.join(sorted(self.config.sim_skip)[:8])}{'…' if len(self.config.sim_skip) > 8 else ''}）")
         lines = [f"🧪 {bold('模拟交易')}（净优势 ≥{edge:g}¢ 时按卡片建议买 {shares} 份，只记账不下单）",
@@ -13310,7 +13365,8 @@ class Bot:
         flag = lambda value: "on" if value else "off"
         values = {"LIVE": c.live_mode, "SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": f"{c.sim_shares:g}", "SIM_WAYS": c.sim_ways,
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
-                  "SIM_GROUP_USD": f"{c.sim_group_usd:g}", "SIM_TAKER_SESSION": flag(c.sim_taker_session), "SIM_SKIP": ",".join(sorted(c.sim_skip)),
+                  "SIM_GROUP_USD": f"{c.sim_group_usd:g}", "SIM_TAKER_SESSION": flag(c.sim_taker_session),
+                  "SIM_TAKER_AFTER_HOURS_CENTS": f"{c.sim_taker_after_hours * 100:g}", "SIM_AFTER_HOURS_MAX_PRICE_CENTS": f"{c.sim_after_hours_max_price * 100:g}", "SIM_SKIP": ",".join(sorted(c.sim_skip)),
                   "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes), "SIM_MAKER_MIN_BID": f"{c.sim_maker_min_bid:g}",
                   "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points),
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",

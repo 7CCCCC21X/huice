@@ -1122,7 +1122,7 @@ class LiveBot(core.Bot):
             if time.monotonic() - self.live.approvals_mono >= self.LIVE_APPROVALS_SECONDS or not self.live.approvals:
                 with contextlib.suppress(Exception):
                     await self.live.refresh_approvals()
-        bar, c, trades = self.config.sim_edge - 0.03, self.config, self.sim_trades()
+        c, trades = self.config, self.sim_trades()
         wanted, self.live_wanted = list(self.live_wanted), set()
         for mk in self.sim_markets(now_ms):
             if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or core.book_crossed(mk.book):
@@ -1136,7 +1136,7 @@ class LiveBot(core.Bot):
             bps = mk.book.fee_bps if mk.book.fee_bps is not None else c.predict_fee_bps
             for side in ("up", "down") if c.sim_ways != "maker" else ():
                 fair = mk.fair_up if side == "up" else 1 - mk.fair_up
-                cap = core.taker_cap(fair, max(mk.need, bar), bps)  # a little under the paper trader's cap: read the market early
+                cap = self.sim_taker_cap(mk, side, bps, slack=0.03)  # a little under the paper trader's cap: read the market early
                 q = core.taker_quote(mk.book, side, c.sim_shares, bps, cap) if cap > 0 else None
                 near = near or (q is not None and q["got"] >= core.SIM_MIN_SHARES - 1e-9)
             if near:

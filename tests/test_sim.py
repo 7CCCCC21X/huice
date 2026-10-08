@@ -32,6 +32,12 @@ assert not c.sim and abs(c.sim_edge - 0.15) < 1e-12 and c.sim_shares == 250 and 
 assert m.sim_scope(c) == ("挂单和吃单", "价格阶梯、市值阶梯")
 c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MARKETS": "all", "SIM_WAYS": ""})
 assert c.sim_markets == frozenset(m.SIM_KINDS) and c.sim_ways == "taker" and m.sim_scope(c) == ("只吃单", "全部市场")
+assert c.sim_taker_after_hours == 0 and c.sim_after_hours_max_price == 0.60  # after-hours taker mode off; 60¢ the most paid after hours
+c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_TAKER_AFTER_HOURS_CENTS": "15", "SIM_AFTER_HOURS_MAX_PRICE_CENTS": "0"})
+assert abs(c.sim_taker_after_hours - 0.15) < 1e-12 and c.sim_after_hours_max_price == 0
+for bad in ({"SIM_TAKER_AFTER_HOURS_CENTS": "51"}, {"SIM_AFTER_HOURS_MAX_PRICE_CENTS": "100"}):
+    try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
+    except ValueError: pass
 assert c.sim_skip == frozenset()  # the detail chips: SIM_SKIP names markets left out of the chosen kinds, upper-cased, blanks dropped
 assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_SKIP": " hsi, bnb ,HSI,"}).sim_skip == frozenset({"HSI", "BNB"})
 c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEP_MARKETS": " hsi, kospi ", "SIM_MAKER_AFTER_HOURS_MARKETS": "sse"})
@@ -153,7 +159,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR, "sim_maker_spread": 0.10} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
+                                "beta_error": m.MODEL_BETA_ERROR, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert len(bot.sim_trades()) == 2
@@ -801,7 +807,8 @@ async def maker_rules():
     bbot.predict.market_meta["101"] = (active, time.monotonic())
     closed_wide = m.dataclasses.replace(wide(0.33, NOW), in_session=False)
     assert bbot.sim_maker_mode(closed_wide) == (0.30, "盘后、价差 33.0¢ 的盘口", "盘后低价挂单撤单线") and abs(bbot.sim_maker_line(closed_wide) - 0.29) < 1e-12
-    assert bbot.sim_maker_reason(closed_wide, {}, NOW) == (None, "盘后、价差 33.0¢ 的盘口只挂净优势 ≥ 30.0¢ 的，现 27.0¢")  # at 6¢
+    why = bbot.sim_maker_reason(closed_wide, {}, NOW)  # at 6¢; the 跌 side (a cent over its 62¢ 买1) is over the 60¢ after-hours limit
+    assert why[0] is None and why[1].startswith("盘后、价差 33.0¢ 的盘口只挂净优势 ≥ 30.0¢ 的，现 27.0¢；") and why[1].endswith("的价位高于盘后上限 60.0¢"), why
     assert bbot.sim_maker_reason(m.dataclasses.replace(closed_wide, fair_up=0.36), {}, NOW)[0] is not None  # 30¢ clears both
     # each mode can be limited to chosen markets (the detail chips under its card): elsewhere it is as if the mode were off
     nbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_MARKETS": "kospi",
@@ -872,6 +879,45 @@ async def maker_rules():
     await step(obot2, NOW + 30_000, tight(0.81, NOW + 30_000, asks=(("0.60", "400"),)))  # 23¢: under the line, on a book the ordinary rule accepts
     trades = obot2.sim_trades()
     assert tid not in trades and trades[f"{tid}#2"]["note"] == "撤单：低价挂单只挂净优势 ≥ 25.0¢ 的，现 23.0¢ 低于低价挂单撤单线 24.0¢，一份都没成交", trades[f"{tid}#2"]["note"]
+    # --- the after-hours taker mode and the after-hours price limit (10-08): outside the session a daily card is taken only
+    # with SIM_TAKER_AFTER_HOURS_CENTS of edge, and nothing, taker or maker, is bought over SIM_AFTER_HOURS_MAX_PRICE_CENTS
+    hbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+                                    "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_TAKER_SESSION": "on", "SIM_TAKER_AFTER_HOURS_CENTS": "15",
+                                    "SIM_MAKER_SESSION": "off"}), m.Store(":memory:"), FM(NOW), None)
+    hbot.sim_markets = lambda now: world["markets"]
+    hbot.predict.market_meta["101"] = (active, time.monotonic())
+    assert hbot.control_value("SIM_TAKER_AFTER_HOURS_CENTS") == "15" and hbot.control_value("SIM_AFTER_HOURS_MAX_PRICE_CENTS") == "60"
+    assert hbot.sim_version()["sim_taker_after_hours"] == 0.15 and hbot.sim_version()["sim_after_hours_max_price"] == 0.60
+    assert "盘后吃单模式：指数/个股日涨跌开盘前、收盘后也吃，但只吃净优势 ≥ 15.0¢ 的" in hbot.sim_text() and "只在标的开盘时段吃单" not in hbot.sim_text()
+    assert "开盘前、收盘后只买 60.0¢ 以下的：吃单只买这个价以下的卖单，挂单只挂这个价以下的" in hbot.sim_text()
+    closed = lambda fair, bids, asks, at: m.dataclasses.replace(hsi(fair, list(bids), list(asks), at), in_session=False)
+    opened = lambda fair, bids, asks, at: m.dataclasses.replace(hsi(fair, list(bids), list(asks), at), in_session=True)
+    bps = hbot.config.predict_fee_bps
+    assert hbot.sim_taker_bar(closed(0.80, [], [], NOW)) == 0.15 and hbot.sim_taker_bar(opened(0.80, [], [], NOW)) == 0.10 and hbot.sim_after_hours_price(opened(0.80, [], [], NOW)) is None
+    assert hbot.sim_after_hours_price(closed(0.80, [], [], NOW)) == 0.60 and hbot.sim_taker_cap(closed(0.95, [], [], NOW), "up", bps) == 0.60  # capped by the limit
+    assert abs(hbot.sim_taker_cap(opened(0.95, [], [], NOW), "up", bps) - m.taker_cap(0.95, 0.10, bps)) < 1e-12  # in session: the ordinary cap
+    tk = f"{HSI_SLUG}|up|吃"
+    await step(hbot, NOW, closed(0.68, [("0.50", "300")], [("0.55", "100")], NOW))  # ~11¢ after the fee: enough in session, not after hours
+    assert tk not in hbot.sim_trades() and [r["taker"] for r in hbot.sim_checks(NOW)][0].startswith("盘后：涨：封顶 5")
+    await step(hbot, NOW + 10_000, closed(0.80, [("0.50", "300")], [("0.55", "100")], NOW + 10_000))  # ~23¢: taken after hours
+    t = hbot.sim_trades()[tk]
+    assert t["status"] == "filled" and t["shares"] == 100 and t["version"]["sim_taker_after_hours"] == 0.15, t
+    # a 65¢ ask with 30¢ of edge: not after hours (over the 60¢ limit), bought in session
+    pricey = lambda at, in_session: m.dataclasses.replace(hsi(0.95, [("0.60", "300")], [("0.65", "100")], at, key="X2"), market="x2", in_session=in_session)
+    await step(hbot, NOW + 20_000, pricey(NOW + 20_000, False))
+    assert "x2|up|吃" not in hbot.sim_trades() and [r["taker"] for r in hbot.sim_checks(NOW + 20_000)] == ["盘后：涨：封顶 60.0¢，之下没有卖单；跌：无封顶价（公平价 5.0¢ 留不出 15.0¢）"]
+    await step(hbot, NOW + 30_000, pricey(NOW + 30_000, True))
+    assert hbot.sim_trades()["x2|up|吃"]["status"] == "filled" and abs(hbot.sim_trades()["x2|up|吃"]["best"] - 0.65) < 1e-9
+    # a resting order over the limit: not placed after hours (the cheap side has no edge), placed in session, withdrawn at the close
+    dear = lambda at, in_session: m.dataclasses.replace(hsi(0.10, [("0.05", "300")], [("0.30", "200")], at, key="X3"), market="x3", in_session=in_session)
+    assert hbot.sim_maker_reason(dear(NOW, False), {}, NOW) == (None, "净优势 5.0¢ 低于触发门槛 10.0¢；70.0¢ 的价位高于盘后上限 60.0¢")  # the cheap side has no edge
+    assert hbot.sim_maker_reason(m.dataclasses.replace(dear(NOW, False), book=book([], [("0.30", "200")], NOW, mid="101")), {}, NOW) == (None, "盘后只挂 60.0¢ 以下的，可挂的价位 70.0¢ 高于它")
+    assert hbot.sim_maker_reason(dear(NOW, True), {}, NOW)[0].price == 0.70
+    await step(hbot, NOW + 40_000, dear(NOW + 40_000, True))
+    assert hbot.sim_trades()["x3|down|挂"]["price"] == 0.70
+    await step(hbot, NOW + 50_000, dear(NOW + 50_000, False))
+    trades = hbot.sim_trades()
+    assert "x3|down|挂" not in trades and trades["x3|down|挂#1"]["note"] == "撤单：盘后只挂 60.0¢ 以下的，70.0¢ 的单撤掉，一份都没成交", trades["x3|down|挂#1"]["note"]
     sbot2 = both5(SIM_MAKER_SPREAD_CENTS="10")
     sbot2.predict.market_meta["101"] = (active, time.monotonic())
     assert sbot2.sim_maker_reason(five, {}, NOW) == (None, "买卖价差 90.0¢ 超过 10.0¢") and sbot2.sim_version()["sim_maker_spread"] == 0.10
