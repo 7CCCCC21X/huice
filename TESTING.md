@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.54.1
+版本：1.54.2
 
 ## 已完成
 
+- 1.54.2（换日后不再吃前一天的盘口）：10-08 15:00 收盘，日涨跌卡片换到 10-09 的市场（Predict 还没上），而 10-08 的盘口在下一次 Predict 刷新前仍缓存着，`sim_markets` 只比对 `predict.slugs`（刷新时才更新）与盘口的 slug，两者仍是 10-08 的，于是用 10-09 的公平价（涨 46¢）对着 10-08 的 1¢ 卖单吃了三个市场各 100 份。现在 `sim_markets` 直接按卡片定价的那个收盘日算 slug（`predict_slug(stem, odds.target)`），盘口 slug 不一致就不交易，和 Predict 刷新节奏无关。测试：test_trading（盘口还是前一日的 slug → 该市场不进 sim_markets；slug 对上才进）。
 - 1.54.1（真实交易信息改分项表）：`LiveTrader.summary_info()` 把 summary_lines 的内容整理成 {k, v, tone} 行（tone：""、ok、warn、bad），`live_status` 多 `info`（`lines` 仍给 Telegram）；页面 `renderLive` 以标签 / 值网格展示（钱包、API、账户校验、余额、授权、风控、策略、占用、今日、订单、订单同步、注意），按 tone 着色，占用接近上限、今日亏损、未确认订单各自标色；`renderTest` 把最近挂单测试显示为一行标题（含 ✓ / ✗）加可展开的步骤列表（localStorage `ctltest`）。测试：test_control（`info` 行）、cards.py（网格标签）。
 - 1.54.0（控制台 UI：订单标签、状态条、可收起、按钮分组）：`Bot.control_records(trades)` 把每条记录（挂单中 / 持仓全部、历史最近 200 条，按时间倒序）整理成页面行：组别、状态（失败单写“失败”）、原因（撤单原因 / 失败原因 / 未成交说明）、真实订单号与状态、能否撤；`control.json` 多 `records`。页面：顶部常驻状态条（模式、持仓、挂单中、已结算与盈亏、额度、今日盈亏、刷新时间）；“订单与持仓”区块四个标签带数量（记在 localStorage `ctlrectab`）、市场筛选框、状态彩色徽标与原因、纸面模式也列出记录；真实交易按钮分操作 / 撤单 / 工具三行；订单、Predict 持仓、最近错误可收起（各自记住）。测试：test_control（`records` 行字段、页面元素）、cards.py（标签计数、筛选、收起、状态条）。
 - 1.53.0（盘后吃单模式、盘后最高买价）：`SIM_TAKER_AFTER_HOURS_CENTS`（0～50，默认 0 = 关；控制项预设 0/10/15/20/30，常用开关“盘后吃单”默认 15¢，吃单关着时标黄、打开时顺带打开吃单）：`Bot.sim_taker_after_hours(mk)`、`sim_taker_bar(mk)` = 盘后 max(SIM_EDGE_CENTS, 该项)；`sim_step` / `sim_checks` 在该模式下盘后也吃，不再因 SIM_TAKER_SESSION 拒绝。`SIM_AFTER_HOURS_MAX_PRICE_CENTS`（0～99，默认 60）：`sim_after_hours_price(mk)` 盘后（日涨跌卡片标的未开盘）给出价格上限；`sim_taker_cap(mk, side, bps, slack)` 统一算吃单封顶价（门槛、盘后门槛、价格上限取低者；live_prefetch 也用它，留 3¢ 提前量）；`sim_maker_reason` 盘后跳过挂价高于上限的一边（“盘后只挂 60.0¢ 以下的，可挂的价位 70.0¢ 高于它”），`sim_requote_reason` 收盘后撤掉高于上限的挂单；挂单检查吃单列盘后前缀“盘后：”；`/sim` 说明行、`sim_version`（默认 60¢ 也记）。测试：test_sim（解析、盘后门槛 15¢ 吃 / 不吃、盘中照旧、价格上限挡住 65¢ 的卖单、挂单 70¢ 盘后不挂、收盘撤掉、说明行）、test_control（表单）、cards.py（开关）。

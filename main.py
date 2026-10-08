@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.54.1"
+VERSION = "1.54.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -11438,8 +11438,15 @@ class Bot:
         if self.config.probability:
             for title, odds in self.odds_items(now_ms):
                 key = self.predict_key(title)
-                slug, book = self.predict.slugs.get(key), self.predict.books.get(key)
-                if not isinstance(odds, CloseOdds) or not slug or book is None or book.slug != slug:
+                if not isinstance(odds, CloseOdds):
+                    continue
+                # the book must be the market of the close the card prices now. At the close the card moves on to the next
+                # session's market, which Predict may not list yet, while the finished day's book is still cached until the
+                # next Predict refresh: judged against tomorrow's fair price its 1¢ asks looked like a bargain (10-08, three
+                # markets). So the slug comes from the card's target, not from the refresher's last target list.
+                stem = self.config.predict_slugs.get(key)
+                slug, book = predict_slug(stem, odds.target) if stem else "", self.predict.books.get(key)
+                if not slug or book is None or book.slug != slug:
                     continue
                 name, _, symbol = title.partition("｜")
                 close_ms, _ = self.target_close(title, odds.target)

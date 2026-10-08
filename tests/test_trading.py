@@ -694,6 +694,14 @@ async def run():
     cbot.predict.books["SSE"] = m.PredictBook("SSE", sse_slug, "901", "t", ((D("0.40"), D("100")),), ((D("0.45"), D("100")),), sat)
     smk = next(x for x in cbot.sim_markets(sat) if x.kind == "close" and x.key == "SSE")
     assert smk.in_session is True and smk.evidence["basis"]["direct"]
+    # the day moved on but the Predict refresh has not: yesterday's book (and the refresher's slug list) are still the old
+    # market — not the one the card prices now, so it is not traded (10-08: 1¢ asks of a finished day bought at tomorrow's fair)
+    old_slug = "sse-composite-index-up-or-down-on-september-25-2026"
+    cbot.predict.slugs["SSE"] = old_slug
+    cbot.predict.books["SSE"] = m.PredictBook("SSE", old_slug, "900", "t", ((D("0.01"), D("1000")),), ((D("0.01"), D("100")),), sat)
+    assert not [x for x in cbot.sim_markets(sat) if x.kind == "close" and x.key == "SSE"]
+    cbot.predict.books["SSE"] = m.PredictBook("SSE", sse_slug, "901", "t", ((D("0.40"), D("100")),), ((D("0.45"), D("100")),), sat)
+    assert next(x for x in cbot.sim_markets(sat) if x.kind == "close" and x.key == "SSE").market == sse_slug  # the right day's book: traded
 
     # --- SIM_QUIET_MINUTES: from N minutes before a market's end no new order (refusals recorded), a resting one is withdrawn ----
     assert m.Config.from_env({**base, "SIM_QUIET_MINUTES": "15"}).sim_quiet_minutes == 15 and m.Config.from_env(base).sim_quiet_minutes == 0
