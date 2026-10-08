@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.50.0"
+VERSION = "1.50.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -8500,6 +8500,7 @@ pre{white-space:pre-wrap;word-break:break-all;font:13px/1.5 ui-monospace,Menlo,C
 .opts{display:flex;flex-wrap:wrap;gap:6px}.opt{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:10px;padding:6px 11px;font-size:14px}
 .opt.sel{background:var(--best);color:var(--on-accent);border-color:var(--best)}.opt.off{opacity:.55;text-decoration:line-through}.detail{margin-top:8px}
 .sw.on{background:var(--down-bg);color:var(--down);border-color:var(--down);font-weight:600}.sw.off{background:var(--chip);color:var(--muted)}
+.sw.warn{background:var(--warn-bg);color:var(--warn);border-color:var(--warn);font-weight:600}.badge.warn{background:var(--warn-bg);color:var(--warn)}
 .custom{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px}.custom input[type=text]{width:130px;padding:5px 9px;font-size:14px}
 .badge{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--chip);color:var(--muted);vertical-align:middle}.badge.saved{background:var(--down-bg);color:var(--down)}
 button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
@@ -8533,6 +8534,7 @@ try{adv=localStorage.getItem("ctladv")==="1";folded=localStorage.getItem("ctlfol
 // the detail chips under a card: SIM_MARKETS excludes single markets (SIM_SKIP); a maker mode's card picks the markets it applies to
 const DETAIL={SIM_MARKETS:{key:"SIM_SKIP",mode:"exclude"},SIM_MAKER_AFTER_HOURS_CENTS:{key:"SIM_MAKER_AFTER_HOURS_MARKETS",mode:"include",kinds:["close"]},
   SIM_MAKER_DEEP_CENTS:{key:"SIM_MAKER_DEEP_MARKETS",mode:"include"}};
+const MAKER_MODES=new Set(["SIM_MAKER_AFTER_HOURS_CENTS","SIM_MAKER_DEEP_CENTS"]);  // resting-order modes: nothing happens while 做哪种单 = 只吃单
 try{const k=sessionStorage.getItem("ctlkey");if(k){$("key").value=k;$("remember").checked=true}}catch(e){}
 function keep(){try{if($("remember").checked)sessionStorage.setItem("ctlkey",$("key").value);else sessionStorage.removeItem("ctlkey")}catch(e){}}
 $("remember").addEventListener("change",keep);$("key").addEventListener("input",keep);$("key").addEventListener("change",load);
@@ -8593,7 +8595,9 @@ function card(s){
   const c=el("div","set");c.dataset.key=s.key;
   const t=el("div","ttl");t.append(el("b","",s.label));
   const now=el("span","now","当前 "+(s.kind==="number"?fmt(s,s.value):s.value)+" ");
-  now.append(s.saved?el("span","badge saved","已保存"):el("span","badge",s.env?"环境变量 "+s.env:"默认值"));t.append(now);c.append(t);
+  now.append(s.saved?el("span","badge saved","已保存"):el("span","badge",s.env?"环境变量 "+s.env:"默认值"));
+  if(MAKER_MODES.has(s.key)&&s.value!=="0"&&(data.settings.find(x=>x.key==="SIM_WAYS")||{}).value==="taker")now.append(" ",el("span","badge warn","挂单没开，不生效"));
+  t.append(now);c.append(t);
   c.append(el("div","hint",s.hint));
   const sel=selected(s),o=el("div","opts");
   (s.kind==="number"?s.presets.map(v=>[v,fmt(s,v)+(s.zero&&v==="0"?"（"+s.zero+"）":"")]):s.options).forEach(([v,cap])=>{
@@ -8644,7 +8648,7 @@ function renderChecksFold(){$("checksbody").style.display=checksFolded?"none":""
 $("foldchecks").addEventListener("click",()=>{checksFolded=!checksFolded;try{localStorage.setItem("ctlchecks",checksFolded?"1":"0")}catch(e){}renderChecksFold()});
 // the quick switches: the few settings that are turned on and off most, one tap each, their value from the cards below
 const QUICK_DEFAULT={SIM_MAKER_AFTER_HOURS_CENTS:"10",SIM_MAKER_DEEP_CENTS:"25",SIM_QUIET_MINUTES:"15"};
-function quickChip(label,on,key,fn){const b=el("button","opt sw "+(on?"on":"off"),label+(on?" · 开":" · 关"));b.dataset.q=key;b.title=key;b.disabled=!data.enabled;b.addEventListener("click",fn);return b}
+function quickChip(label,on,key,fn,warn){const b=el("button","opt sw "+(warn?"warn":on?"on":"off"),label+(on?" · 开":" · 关")+(warn?"（"+warn+"）":""));b.dataset.q=key;b.title=key;b.disabled=!data.enabled;b.addEventListener("click",fn);return b}
 function renderQuick(){const q=$("quickbtns");q.replaceChildren();if(!data.settings)return;const v={};data.settings.forEach(s=>v[s.key]=s.value);
   const ways=v.SIM_WAYS||"taker";
   const setWays=(taker,maker)=>{if(!taker&&!maker){toast("吃单和挂单至少保留一种",false);return}act({action:"set",values:{SIM_WAYS:taker&&maker?"both":taker?"taker":"maker"}})};
@@ -8654,7 +8658,9 @@ function renderQuick(){const q=$("quickbtns");q.replaceChildren();if(!data.setti
     const on=v[k]==="on";q.append(quickChip(lab,on,k,()=>act({action:"set",values:{[k]:on?"off":"on"}})))});
   [["SIM_MAKER_AFTER_HOURS_CENTS","盘后挂单","¢"],["SIM_MAKER_DEEP_CENTS","低价挂单","¢"],["SIM_QUIET_MINUTES","结束前不交易","分钟"]].forEach(([k,lab,unit])=>{
     const on=!!v[k]&&v[k]!=="0";let last="";try{last=localStorage.getItem("ctlq_"+k)||""}catch(e){}
-    q.append(quickChip(on?lab+" "+v[k]+unit:lab,on,k,()=>{if(on){try{localStorage.setItem("ctlq_"+k,v[k])}catch(e){}act({action:"set",values:{[k]:"0"}})}else act({action:"set",values:{[k]:last||QUICK_DEFAULT[k]}})}))})}
+    const needsMaker=MAKER_MODES.has(k)&&ways==="taker";  // a resting-order mode while 只吃单: say so, and turning it on turns 挂单 on too
+    q.append(quickChip(on?lab+" "+v[k]+unit:lab,on,k,()=>{if(on){try{localStorage.setItem("ctlq_"+k,v[k])}catch(e){}act({action:"set",values:{[k]:"0"}})}
+      else act({action:"set",values:{[k]:last||QUICK_DEFAULT[k],...(needsMaker?{SIM_WAYS:"both"}:{})}})},on&&needsMaker?"挂单没开，不生效":""))})}
 $("adv").addEventListener("click",()=>{adv=!adv;try{localStorage.setItem("ctladv",adv?"1":"0")}catch(e){}renderSettings()});
 $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.act;
   if(a==="pause"){const why=prompt("暂停原因（可留空）","");if(why===null)return;act({action:"pause",why})}
@@ -11531,7 +11537,7 @@ class Bot:
         if str(mk.key).upper() in c.sim_skip:
             return None, "详细选项里已排除这个市场"
         if c.sim_ways == "taker":
-            return None, "SIM_WAYS=taker：只吃单"
+            return None, "SIM_WAYS=taker：只吃单" + ("（盘后挂单 / 低价挂单模式要先打开挂单）" if c.sim_maker_after_hours > 0 or c.sim_maker_deep > 0 else "")
         if not mk.makers:
             return None, f"{SIM_KINDS.get(mk.kind, mk.kind)}只做吃单"
         if mk.hold:
@@ -12204,6 +12210,8 @@ class Bot:
                 how.append("指数/个股日涨跌只在标的开盘时段挂单，开盘前、收盘后撤掉")
             if self.config.sim_maker_points:
                 how.append("只挂积分已激活的市场，积分停了就撤")
+        elif self.config.sim_maker_after_hours > 0 or self.config.sim_maker_deep > 0:
+            how.append("盘后挂单 / 低价挂单模式已设置，但现在只吃单，不会挂单；要挂单把“做哪种单”改为挂单或两者（SIM_WAYS=maker / both）")
         if self.config.sim_skip:
             how.append(f"详细选项排除了 {len(self.config.sim_skip)} 个市场（{'、'.join(sorted(self.config.sim_skip)[:8])}{'…' if len(self.config.sim_skip) > 8 else ''}）")
         lines = [f"🧪 {bold('模拟交易')}（净优势 ≥{edge:g}¢ 时按卡片建议买 {shares} 份，只记账不下单）",

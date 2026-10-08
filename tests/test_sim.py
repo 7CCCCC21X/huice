@@ -794,6 +794,12 @@ async def maker_rules():
     assert nbot.sim_deep_book(kospi_wide) and nbot.sim_maker_reason(kospi_wide, {}, NOW)[0] is not None  # chosen (keys compare upper-cased)
     assert nbot.sim_after_hours(kospi_after) and nbot.sim_maker_reason(kospi_after, {}, NOW)[0] is not None
     assert "sim_maker_deep_markets" not in dbot.sim_version() and dbot.sim_maker_reason(wide(0.38, NOW), {}, NOW)[0] is not None  # no list: every market
+    # a maker mode set while SIM_WAYS=taker (the 10-08 case: 低价挂单 25¢ on, 挂单 off) places nothing: the order check and /sim say so
+    tbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEP_CENTS": "25"}), m.Store(":memory:"), FM(NOW), None)
+    assert tbot.sim_maker_reason(wide(0.38, NOW), {}, NOW) == (None, "SIM_WAYS=taker：只吃单（盘后挂单 / 低价挂单模式要先打开挂单）")
+    assert "低价挂单模式已设置，但现在只吃单，不会挂单" in tbot.sim_text()
+    plain = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}), m.Store(":memory:"), FM(NOW), None)
+    assert plain.sim_maker_reason(wide(0.38, NOW), {}, NOW) == (None, "SIM_WAYS=taker：只吃单") and "不会挂单" not in plain.sim_text()
     # a part fill, then the 买1 moves: the filled shares stay a position under the slot, the rest lapses, no fresh order
     await step(bot, NOW + 130_000, hsi(0.70, [("0.565", "150")], [("0.57", "40"), ("0.58", "400")], NOW + 130_000))  # a seller at 57¢: 40 presumed
     assert bot.sim_trades()[tid]["shares"] == 40 and bot.sim_trades()[tid]["status"] == "resting"
