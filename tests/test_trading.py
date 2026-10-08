@@ -192,8 +192,12 @@ async def api_checks():
     server["calls"].clear()
     assert (await api.order("66"))["id"] == "66" and [p for p, _, _ in server["calls"]] == ["/orders?status=OPEN&first=50"]
     assert await api.order("77") is None and all(p in {"/orders?status=OPEN&first=50"} for p, _, _ in server["calls"])
-    server["answers"]["/positions"] = {"success": True, "data": [{"id": "p1"}]}
-    assert await api.positions() == [{"id": "p1"}]
+    server["answers"]["/positions?first=50"] = {"success": True, "data": [{"id": "p1"}], "cursor": {"after": "c1"}}  # every page is read
+    server["answers"]["/positions?first=50&after=c1"] = {"success": True, "data": [{"id": "p2"}]}
+    assert await api.positions() == [{"id": "p1"}, {"id": "p2"}] and api.positions_complete
+    api.ORDERS_PAGES_MAX, pages_max = 1, api.ORDERS_PAGES_MAX
+    assert await api.positions() == [{"id": "p1"}] and not api.positions_complete  # cut short: said so
+    api.ORDERS_PAGES_MAX = pages_max
     server["answers"]["/markets/101"] = {"success": True, "data": {"id": 101, "outcomes": []}}
     assert (await api.market("101"))["id"] == 101
     # no wallet: no sign-in, a plain reason
@@ -1243,6 +1247,48 @@ async def audit_fixes():
     pbot.live_daily_pnl = lambda trades, now_ms: -60.0
     pending = {"live": {"want": {"shares": 100.0, "price": 0.5}, "events": [{"at": NOW}], "state": "pending"}, "order": 100.0, "price": 0.5, "opened": NOW, "maker": False}
     assert "已达 LIVE_MAX_DAILY_LOSS_USD" in pbot.live_send_block(pending, {}, NOW)
+    # a taker's fill without an average price from Predict is costed at the cap (the most it could have paid), flagged until a price is read
+    fbot = make_bot(SIM_WAYS="taker")
+    await fbot.live_prepare(); ffake = fbot.live.api
+    await fbot.live_prefetch(NOW)
+    await step(fbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    ftid = f"{HSI_SLUG}|up|吃"
+    ft = fbot.sim_trades()[ftid]
+    assert ft["cost_confirmed"] is False and abs(ft["live"]["want"]["cap"] - 0.59) < 1e-9, ft["live"]["want"]
+    ffake.fill(ft["live"]["order_id"], 100, done=True)  # Predict's record: amount, amountFilled, status — no price
+    await step(fbot, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000))
+    ft = fbot.sim_trades()[ftid]
+    assert ft["status"] == "filled" and ft["cost_confirmed"] is False and abs(ft["avg"] - 0.59) < 1e-9 and abs(ft["price"] - (0.59 + m.taker_fee(0.59, 200))) < 1e-9, ft
+    assert any(r["id"] == ftid and r["cost_pending"] for r in fbot.control_records(fbot.sim_trades()))
+    gbot = make_bot(SIM_WAYS="taker")
+    await gbot.live_prepare(); gfake = gbot.live.api
+    await gbot.live_prefetch(NOW)
+    await step(gbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    gfake.fill(gbot.sim_trades()[ftid]["live"]["order_id"], 100, done=True, price="0.58")
+    await step(gbot, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000))
+    gt = gbot.sim_trades()[ftid]
+    assert gt["cost_confirmed"] is True and abs(gt["avg"] - 0.58) < 1e-9 and not any(r["cost_pending"] for r in gbot.control_records(gbot.sim_trades()))
+    mt = next(t for t in ubot.sim_trades().values() if t.get("maker"))
+    assert mt["cost_confirmed"] is True  # a maker fills at its own price
+    # readiness needs the on-chain account check to have succeeded, not merely no error text; the balance must be known and fresh
+    abot = make_bot(PREDICT_ACCOUNT=PA)
+    assert not abot.live.ready and "尚未登录" in abot.live.not_ready_why
+    await abot.live_prepare()
+    assert abot.live.ready and abot.live.account_checked
+    async def boom(account): raise m.RemoteError("RPC 超时")
+    abot.live.chain.account_owner = boom
+    await abot.live_prepare()
+    assert not abot.live.ready and "无法在链上核对" in abot.live.not_ready_why
+    bbot = make_bot()
+    await bbot.live_prepare()
+    bmk = hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)
+    bbot.live.balance = None
+    assert "余额尚未读到" in bbot.live_room({}, bmk, "up", 0.55, 100)
+    bbot.live.balance, bbot.live.balance_error = (1000 * WEI, 10 ** 17, time.time() - 700), "RPC 超时"
+    assert "余额刷新失败" in bbot.live_room({}, bmk, "up", 0.55, 100)
+    bbot.live.balance_error = ""
+    assert "余额" not in bbot.live_room({}, bmk, "up", 0.55, 100)
+    assert bbot.live_status(NOW)["gate"] == "" and bbot.live_status(NOW)["orders_complete"] and bbot.live_status(NOW)["balance_age_s"] >= 700
     print("AUDIT_FIXES_OK")
 
 

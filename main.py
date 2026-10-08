@@ -20,6 +20,7 @@ import http.client
 import inspect
 import json
 import hmac
+import ipaddress
 import logging
 import math
 import os
@@ -45,7 +46,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.57.0"
+VERSION = "1.57.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7895,6 +7896,7 @@ function simCard(c,it){
   const mo=t.markout||{},mks=["1m","5m","30m"].filter(k=>mo[k]);
   if(mks.length){const d=$("div","simln");d.title="成交后 1 / 5 / 30 分钟，盘口中间价减成交价（每份）的平均：持续为负说明挂单常被更快的人吃掉旧报价，赚到的积分要先补这个";
     d.append($("span","mut","成交后市场走向："));mks.forEach(k=>{const x=$("span","",k.replace("m"," 分钟")+" "+sg(mo[k].avg)+"（"+mo[k].n+" 笔）");x.style.color=col(mo[k].avg);d.append(x)});c.append(d)}
+  if(s.private){c.append($("p","mut","真实交易的逐笔记录只在复盘页显示（需要控制口令）"));return c}
   const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   det.append($("summary","","最近 "+s.rows.length+" 笔"));const list=$("div","simrows");
   s.rows.forEach(r=>{const a=$("a","simrow");a.href=jl.href+"#"+encodeURIComponent(r.id);a.title=(r.note?r.note+"；":"")+"点开看这笔的完整复盘";
@@ -8507,16 +8509,26 @@ function render(){
   list.replaceChildren(...(shown.length?shown.map(row):[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有模拟交易")]))}
 let okAt=0,dead=false;
 function two(n){return String(n).padStart(2,"0")}
+function ctlKey(){try{return sessionStorage.getItem("ctlkey")||""}catch(e){return ""}}
+function askKey(msg){const k=prompt(msg+"\n这是实盘账户的交易记录，需要控制口令（环境变量 WEB_CONTROL_KEY）：","");if(k===null||!k.trim()){load.keyBad=true;return false}
+  try{sessionStorage.setItem("ctlkey",k.trim())}catch(e){}load.keyBad=false;return true}
 async function load(){
-  if(dead||load.busy)return;load.busy=true;
-  try{const r=await fetch(base+"/journal.json",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();okAt=Date.now();
+  if(dead||load.busy||load.keyBad)return;load.busy=true;let again=false;
+  try{const key=ctlKey();const r=await fetch(base+"/journal.json",{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
+    if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}if(r.status===403&&askKey(j.message||"需要控制口令"))again=true;throw new Error(j.message||("HTTP "+r.status))}
+    if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();okAt=Date.now();
     document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"));
     render();const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}
   catch(e){const at=okAt?new Date(okAt):null,hms=at?two(at.getHours())+":"+two(at.getMinutes())+":"+two(at.getSeconds()):"";
     if(e.message==="HTTP 404")dead=true;
     document.getElementById("meta").replaceChildren($("span","bad","⚠️ 读取失败："+(dead?"链接已失效，请在 Telegram 重新发送 /web；本页不再自动刷新":e.message)+
       (okAt?"；下面显示的是 "+hms+" 的旧数据":"")))}
-  finally{load.busy=false}}
+  finally{load.busy=false}
+  if(again)load()}
+["csv","json"].forEach(id=>{const a=document.getElementById(id);a.addEventListener("click",async e=>{const key=ctlKey();if(!key)return;e.preventDefault();  // with a key: fetched with it, saved as a file
+  try{const r=await fetch(a.href,{cache:"no-store",headers:{"X-Control-Key":key}});if(!r.ok)throw new Error("HTTP "+r.status);const u=URL.createObjectURL(await r.blob());
+    const t=document.createElement("a");t.href=u;t.download=a.getAttribute("download");document.body.append(t);t.click();t.remove();setTimeout(()=>URL.revokeObjectURL(u),5000)}
+  catch(err){alert("导出失败："+err.message)}})});
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
 const THEMES={auto:["◐","自动"],light:["☀","浅色"],dark:["☾","深色"]};let theme="auto";try{const t=JSON.parse(localStorage.getItem("theme"));if(typeof t==="string"&&Object.prototype.hasOwnProperty.call(THEMES,t))theme=t}catch(e){}
 function applyTheme(){const r=document.documentElement;if(theme==="auto")delete r.dataset.theme;else r.dataset.theme=theme;const b=document.getElementById("theme");b.textContent=THEMES[theme][0]+" "+THEMES[theme][1];b.title="主题："+THEMES[theme][1]+"（点击切换）"}
@@ -8741,7 +8753,7 @@ function renderRecords(){if(!data)return;const rows=data.records||[];const tabs=
   shown.forEach(r=>{const tr=el("tr");tr.append(el("td","",r.opened));
     const tdm=el("td");const a=el("a","",r.item);a.href=r.url;a.target="_blank";a.rel="noopener";tdm.append(a);tr.append(tdm);
     tr.append(el("td","",r.label));tr.append(el("td","",(r.price*100).toFixed(1)+"¢×"+r.order+(r.shares&&r.group!=="resting"&&r.shares!==r.order?"（成交 "+r.shares+"）":"")));
-    const tds=el("td");tds.append(el("span",stClass(r),r.status+(r.state?"·"+r.state:"")));if(r.why)tds.append(el("div","why",r.why));tr.append(tds);
+    const tds=el("td");tds.append(el("span",stClass(r),r.status+(r.state?"·"+r.state:"")));if(r.cost_pending)tds.append(el("div","why","成本待对账：按封顶价计，等 Predict 回报成交均价"));if(r.why)tds.append(el("div","why",r.why));tr.append(tds);
     tr.append(el("td","",r.order_id?"#"+r.order_id:r.live_state||(data.live&&data.live.mode!=="off"?"":"纸面")));
     const td=el("td");if(r.cancellable&&data.live){const b=el("button","bad","撤单");b.disabled=!data.enabled;b.addEventListener("click",()=>{if(confirm("撤掉这张真实挂单（#"+r.order_id+"）？"))act({action:"cancel",id:r.order_id})});td.append(b)}tr.append(td);t.append(tr)});
   o.append(t)}
@@ -8860,6 +8872,7 @@ class WebServer:
     CACHE_SECONDS = {"data.json": 1.0, "journal.json": 5.0, "live.json": 1.0, "control.json": 1.0}  # several tabs (or a scanner) share one build per interval
     CONTROL_BODY_MAX = 16384   # bytes a control request may carry
     CONTROL_TRIES = 5          # wrong keys within CONTROL_LOCK_SECONDS that lock the control route for as long
+    CONTROL_GLOBAL_TRIES = 50  # wrong keys from every address together that lock the route for everyone (addresses can be forged)
     CONTROL_LOCK_SECONDS = 600
     STREAM_SECONDS = 1.0        # an event stream looks for a change this often
     STREAM_PING_SECONDS = 20    # a comment keeps a quiet stream (and any proxy in front of it) open
@@ -8873,6 +8886,8 @@ class WebServer:
         self.pages = {"page": WEB_PAGE.encode("utf-8"), "journal": JOURNAL_PAGE.encode("utf-8"), "control": CONTROL_PAGE.encode("utf-8")}
         self.control_failures: dict[str, list[float]] = {}  # client -> monotonic times of wrong keys (CONTROL_TRIES in CONTROL_LOCK_SECONDS locks)
         self.control_lock_until: dict[str, float] = {}      # client -> locked until (monotonic); one viewer's guesses lock no one else
+        self.control_global_fails: list[float] = []         # every wrong key, whatever the address: CONTROL_GLOBAL_TRIES lock the route for all
+        self.control_global_lock_until = 0.0
         self.cache: dict[str, tuple[float, bytes]] = {}  # name -> (expires, body): the JSON is built once per interval
         self.gzipped: dict[bytes, bytes] = {body: gzip.compress(body, compresslevel=9) for body in self.pages.values()}
 
@@ -8933,19 +8948,61 @@ class WebServer:
 
     @staticmethod
     def client_of(head: str, writer: asyncio.StreamWriter | None) -> str:
-        """Who is asking, for the per-client lock: the first address in X-Forwarded-For (Railway's edge sets it), else
-        the peer's address."""
-        match = re.search(r"(?im)^x-forwarded-for:[ \t]*([^,\r\n]+)", head)
-        if match and match.group(1).strip():
-            return match.group(1).strip()[:64]
+        """Who is asking, for the per-client lock: the last address in X-Forwarded-For (the one the proxy in front of
+        us appended; earlier entries are whatever the client sent), honoured only when the peer is that proxy (a
+        private or loopback address); else the peer's own address."""
         peer = writer.get_extra_info("peername") if writer is not None else None
-        return str(peer[0]) if isinstance(peer, tuple) and peer else "-"
+        peer_ip = str(peer[0]) if isinstance(peer, tuple) and peer else ""
+        try:
+            proxied = not peer_ip or ipaddress.ip_address(peer_ip).is_private or ipaddress.ip_address(peer_ip).is_loopback
+        except ValueError:
+            proxied = False
+        match = re.search(r"(?im)^x-forwarded-for:[ \t]*([^\r\n]+)", head)
+        if proxied and match:
+            last = match.group(1).split(",")[-1].strip()
+            if last:
+                return last[:64]
+        return peer_ip or "-"
+
+    def journal_locked(self) -> bool:
+        """The review data (every trade with its fills, costs and real order records) needs the control key once a
+        real-trading key is configured: the page token alone shows the odds, never an account's activity."""
+        return bool(self.bot.config.web_control_key) and bool(getattr(self.bot.config, "live_key", ""))
+
+    def key_check(self, head: str, client: str) -> tuple[int, str] | None:
+        """None when X-Control-Key carries the configured key; else (status, message), the failure counted."""
+        configured = self.bot.config.web_control_key
+        if not configured:
+            return None
+        now = time.monotonic()
+        if now < self.control_global_lock_until:
+            return 429, f"口令错误次数过多（全站），{int(self.control_global_lock_until - now) + 1} 秒后再试"
+        if now < self.control_lock_until.get(client, 0.0):
+            return 429, f"口令错误次数过多，{int(self.control_lock_until[client] - now) + 1} 秒后再试"
+        match = re.search(r"(?im)^x-control-key:[ \t]*(\S+)[ \t]*\r?$", head)
+        key = match.group(1) if match else ""
+        if not key:
+            return 403, "需要控制口令：输入口令后才显示账户、订单、持仓和设置"
+        if not key.isascii() or not hmac.compare_digest(key, configured):
+            self.control_key_failed(client, now)
+            return 403, "口令错误"
+        self.control_failures.pop(client, None)
+        return None
+
+    def journal_keyed(self, path: str, head: str, client: str) -> tuple[int, str, bytes]:
+        failed = self.key_check(head, client)
+        if failed:
+            return failed[0], "application/json; charset=utf-8", json.dumps({"ok": False, "locked": True, "message": failed[1]}, ensure_ascii=False).encode("utf-8")
+        return self.route("GET", path)
 
     def control_key_failed(self, client: str, now: float) -> None:
         fails = [t for t in self.control_failures.get(client, []) if now - t < self.CONTROL_LOCK_SECONDS] + [now]
         if len(fails) >= self.CONTROL_TRIES:
             self.control_lock_until[client], fails = now + self.CONTROL_LOCK_SECONDS, []
         self.control_failures[client] = fails
+        self.control_global_fails = [t for t in self.control_global_fails if now - t < self.CONTROL_LOCK_SECONDS] + [now]
+        if len(self.control_global_fails) >= self.CONTROL_GLOBAL_TRIES:  # whatever the addresses claim: the route as a whole locks
+            self.control_global_lock_until, self.control_global_fails = now + self.CONTROL_LOCK_SECONDS, []
         if len(self.control_failures) > 500:  # a scanner with many addresses: forget the oldest
             for old in list(self.control_failures)[:-500]:
                 self.control_failures.pop(old, None)
@@ -8959,20 +9016,10 @@ class WebServer:
                                           json.dumps({"ok": False, "locked": True, "message": message}, ensure_ascii=False).encode("utf-8"))
         full = lambda: (200, "application/json; charset=utf-8", self.cached(
             "control.json", lambda: json.dumps(self.bot.control_payload(), ensure_ascii=False, default=str).encode("utf-8")))
-        configured = self.bot.config.web_control_key
-        if not configured:
+        if not self.bot.config.web_control_key:
             return full()  # no key configured: the page is view-only and says so
-        now = time.monotonic()
-        if now < self.control_lock_until.get(client, 0.0):
-            return answer(429, f"口令错误次数过多，{int(self.control_lock_until[client] - now) + 1} 秒后再试")
-        match = re.search(r"(?im)^x-control-key:[ \t]*(\S+)[ \t]*\r?$", head)
-        key = match.group(1) if match else ""
-        if not key:
-            return answer(403, "需要控制口令：输入口令后才显示账户、订单、持仓和设置")
-        if not key.isascii() or not hmac.compare_digest(key, configured):
-            self.control_key_failed(client, now)
-            return answer(403, "口令错误")
-        self.control_failures.pop(client, None)
+        if failed := self.key_check(head, client):
+            return answer(*failed)
         return full()
 
     async def control(self, reader: asyncio.StreamReader, head: str, client: str = "-") -> tuple[int, str, bytes]:
@@ -8995,6 +9042,8 @@ class WebServer:
         if not configured:
             return answer(403, False, "网页控制未开启：请在环境变量设置 WEB_CONTROL_KEY（12～64 个字符）后重启")
         now = time.monotonic()
+        if now < self.control_global_lock_until:
+            return answer(429, False, f"口令错误次数过多（全站），{int(self.control_global_lock_until - now) + 1} 秒后再试")
         if now < self.control_lock_until.get(client, 0.0):
             return answer(429, False, f"口令错误次数过多，{int(self.control_lock_until[client] - now) + 1} 秒后再试")
         key = str(data.get("key") or "")
@@ -9023,6 +9072,8 @@ class WebServer:
                 status, ctype, body = await self.control(reader, rest, self.client_of(rest, writer))
             elif method.upper() in {"GET", "HEAD"} and self.is_control(path, "control.json"):
                 status, ctype, body = self.control_json(rest, self.client_of(rest, writer))
+            elif method.upper() in {"GET", "HEAD"} and self.journal_locked() and (self.is_control(path, "journal.json") or self.is_control(path, "journal.csv")):
+                status, ctype, body = self.journal_keyed(path, rest, self.client_of(rest, writer))
             else:
                 status, ctype, body = self.route(method.upper(), path)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
@@ -11050,7 +11101,7 @@ class Bot:
             items.extend(self.safe_card(c.spec.name, c.spec.key, "crypto", self.cap_payload, c, now_ms) for c in self.caps.values())
         if self.config.sim and self.config.predict:
             items.append(self.safe_card("模拟交易", "SIM", "sim", lambda: {"name": "模拟交易", "symbol": "SIM", "group": "sim",
-                                                                          "kind": "sim", "sim": self.sim_report()}))
+                                                                          "kind": "sim", "sim": self.sim_report(public=True)}))
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
                 "today": f"{today:%m-%d} {WEEKDAYS[today.weekday()]}",
@@ -12467,9 +12518,12 @@ class Bot:
             marks[label] = {"at": now_ms, "after_s": (now_ms - int(filled)) // 1000, "mid": mid, "move": mid - paid,
                             "fair": fair, "fair_move": fair - float(trade.get("fill_fair", trade["fair"]))}
 
-    def sim_report(self, recent: int = 30) -> dict:
-        """The paper trader's record for the page: totals, by market kind and by maker / taker, the latest trades."""
+    def sim_report(self, recent: int = 30, public: bool = False) -> dict:
+        """The paper trader's record for the page: totals, by market kind and by maker / taker, the latest trades —
+        on the public odds page (``public``) without the trade list once a real-trading key is configured: that is an
+        account's activity, shown on the review page behind the control key."""
         trades = sorted(self.sim_trades().items(), key=lambda kv: kv[1].get("opened", 0))
+        private = public and bool(getattr(self.config, "live_key", ""))
         rows = [{"id": tid, "opened": stamp(t["opened"], seconds=False), "item": t["item"], "label": t["label"],
                  "maker": t["maker"], "price": t["price"], "shares": t["shares"], "order": t.get("order", t["shares"]),
                  "edge": t["edge"], "status": t["status"], "text": sim_status(t), "state": sim_state(t),
@@ -12484,7 +12538,7 @@ class Bot:
                 "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
                           for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
                 "groups": sim_groups(values), "sources": sim_sources(values), "blocks": self.sim_blocks(),
-                "group_cap": self.config.sim_group_usd, "rows": rows}
+                "group_cap": self.config.sim_group_usd, "rows": [] if private else rows, "private": private}
 
     def sim_text(self) -> str:
         r = self.sim_report(recent=10)
@@ -13603,6 +13657,7 @@ class Bot:
                          "label": str(t.get("label") or ""), "side": str(t.get("side") or ""), "maker": bool(t.get("maker")),
                          "price": float(t.get("price") or 0), "order": float(t.get("order") or 0), "shares": float(t.get("shares") or 0),
                          "status": "失败" if failed else sim_status(t), "state": sim_state(t), "group": group, "why": why, "failed": failed,
+                         "cost_pending": t.get("cost_confirmed") is False and float(t.get("shares") or 0) > 0,
                          "order_id": str(st.get("order_id") or ""), "live_state": str(st.get("state") or ""),
                          "cancellable": status == "resting" and st.get("state") in {"open", "placing"} and bool(st.get("order_id")),
                          "url": self.sim_url(t)})

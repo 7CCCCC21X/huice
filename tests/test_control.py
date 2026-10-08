@@ -274,6 +274,27 @@ async def run():
     st, j = await post(port, {"key": KEY, "action": "reset"}, headers="X-Forwarded-For: 10.9.8.7\r\n"); assert st == 200
     web.control_lock_until = {}  # the lock lapses
     st, j = await post(port, {"key": KEY, "action": "reset"}); assert st == 200
+    # fifty wrong keys from "different" addresses lock the route for everyone for a while (addresses can be forged)
+    for i in range(50):
+        st, _ = await post(port, {"key": "wrong-key-123456", "action": "reset"}, headers=f"X-Forwarded-For: 10.0.{i // 250}.{i % 250 + 1}\r\n"); assert st in {403, 429}
+    st, j = await post(port, {"key": KEY, "action": "reset"}); assert st == 429 and "全站" in j["message"], (st, j)
+    st, _, _ = await request(port, f"GET /p/{TOKEN}/control.json HTTP/1.1\r\nHost: x\r\nX-Control-Key: {KEY}\r\n\r\n".encode()); assert st == 429
+    web.control_global_lock_until, web.control_global_fails, web.control_lock_until, web.control_failures = 0.0, [], {}, {}
+    st, j = await post(port, {"key": KEY, "action": "reset"}); assert st == 200
+    # the review data needs the key once a real-trading key is configured (it is an account's activity); the odds page withholds the trade list
+    assert (await get_json(port, "data.json", key=""))["items"] and not next(c for c in (await get_json(port, "data.json", key=""))["items"] if c.get("kind") == "sim")["sim"]["private"]
+    lbot = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY, "PREDICT_PRIVATE_KEY": "0x" + "a" * 64}), m.Store(":memory:"), FM(NOW), None)
+    webl = m.WebServer(lbot, 0, TOKEN); webl.CACHE_SECONDS = {}; portl = await webl.start()
+    st, _, body = await request(portl, f"GET /p/{TOKEN}/journal.json HTTP/1.1\r\nHost: x\r\n\r\n".encode()); assert st == 403 and b'"locked": true' in body, body[:200]
+    st, _, body = await request(portl, f"GET /p/{TOKEN}/journal.csv HTTP/1.1\r\nHost: x\r\n\r\n".encode()); assert st == 403
+    st, _, body = await request(portl, f"GET /p/{TOKEN}/journal.json HTTP/1.1\r\nHost: x\r\nX-Control-Key: wrong-key-123456\r\n\r\n".encode()); assert st == 403
+    st, _, body = await request(portl, f"GET /p/{TOKEN}/journal.json HTTP/1.1\r\nHost: x\r\nX-Control-Key: {KEY}\r\n\r\n".encode()); assert st == 200 and b'"trades"' in body
+    st, _, body = await request(portl, f"GET /p/{TOKEN}/journal.csv HTTP/1.1\r\nHost: x\r\nX-Control-Key: {KEY}\r\n\r\n".encode()); assert st == 200 and body.startswith("\ufeff编号".encode())
+    st, _, body = await request(portl, f"GET /p/{TOKEN}/journal HTTP/1.1\r\nHost: x\r\n\r\n".encode()); assert st == 200 and b"askKey" in body  # the page itself asks for the key
+    simcard = next(c for c in (await get_json(portl, "data.json", key=""))["items"] if c.get("kind") == "sim")["sim"]
+    assert simcard["private"] is True and simcard["rows"] == [] and "total" in simcard
+    assert lbot.journal_payload()["trades"] == [] and lbot.sim_report()["private"] is False  # the review payload itself is unchanged (served behind the key)
+    await webl.stop()
     # a request body over the limit, and one that lies about its length
     st, j = await post(port, json.dumps({"key": KEY, "action": "set", "values": {"SIM_SHARES": "9" * 20000}}).encode()); assert st == 400 and "过大" in j["message"]
     await web.stop()

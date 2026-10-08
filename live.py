@@ -293,6 +293,7 @@ class PredictApi:
         self.gate = asyncio.Semaphore(self.PARALLEL)
         self.blocked_until = 0.0
         self.calls = 0
+        self.orders_complete = self.positions_complete = True  # the last list read came whole (every page)
 
     def headers(self) -> dict[str, str]:
         out = {}
@@ -402,23 +403,29 @@ class PredictApi:
     ORDERS_PAGE = 50      # orders per page (the API pages with first / after and answers a cursor)
     ORDERS_PAGES_MAX = 20  # ...and this many pages at most in one read (1000 orders)
 
-    async def orders(self, status: str = "OPEN", **params: Any) -> list[dict]:
-        """Every order of a status: the pages are followed by their cursor, so a long list is never cut off (an
-        open order missing from a cut list would look cancelled)."""
+    async def paged(self, path: str, query: dict) -> tuple[list[dict], bool]:
+        """Every page of a list (first / after, the cursor the answer gives): (rows, complete). Not complete when the
+        page cap was reached with a cursor still on offer — the caller must not take the list for the whole truth."""
         rows, after = [], ""
         for _ in range(self.ORDERS_PAGES_MAX):
-            query = {"status": status, "first": self.ORDERS_PAGE, **{k: v for k, v in params.items() if v not in (None, "")}}
+            q = {**query, "first": self.ORDERS_PAGE}
             if after:
-                query["after"] = after
-            data = await self.authed("GET", f"/orders?{core.urllib.parse.urlencode(query)}")
+                q["after"] = after
+            data = await self.authed("GET", f"{path}?{core.urllib.parse.urlencode(q)}")
             page = self.rows(data)
             rows.extend(page)
             cursor = data.get("cursor") if isinstance(data, dict) else None
             if isinstance(cursor, dict):
                 cursor = cursor.get("after") or cursor.get("next") or cursor.get("endCursor")
             if not cursor or not page or str(cursor) == after:
-                break
+                return rows, True
             after = str(cursor)
+        return rows, False
+
+    async def orders(self, status: str = "OPEN", **params: Any) -> list[dict]:
+        """Every order of a status: the pages are followed by their cursor, so a long list is never cut off (an
+        open order missing from a cut list would look cancelled); ``orders_complete`` says whether it was."""
+        rows, self.orders_complete = await self.paged("/orders", {"status": status, **{k: v for k, v in params.items() if v not in (None, "")}})
         return rows
 
     async def order(self, order_id: str, hash_: str = "") -> dict | None:
@@ -443,7 +450,8 @@ class PredictApi:
         return None
 
     async def positions(self) -> list[dict]:
-        return self.rows(await self.authed("GET", "/positions"))
+        rows, self.positions_complete = await self.paged("/positions", {})  # every page: a long list cut short would hide positions (and redemptions)
+        return rows
 
 
 def order_hash_of(row: dict) -> str:
@@ -509,6 +517,7 @@ class Chain:
         self.rpc_url, self.wallet = rpc_url, wallet
         self.addresses = wallet.addresses
         self.error = ""
+        self.send_lock = asyncio.Lock()  # one transaction at a time: two senders reading the same pending nonce would collide
 
     async def rpc(self, method: str, params: list) -> Any:
         try:
@@ -568,14 +577,15 @@ class Chain:
             data = self.encode("execute(bytes32,bytes)", ["bytes32", "bytes"], [bytes(32), execution])
             to, value = self.wallet.predict_account, 0
         sender = self.wallet.signer
-        nonce = int(str(await self.rpc("eth_getTransactionCount", [sender, "pending"])), 16)
-        gas_price = int(str(await self.rpc("eth_gasPrice", [])), 16)
-        estimate = await self.rpc("eth_estimateGas", [{"from": sender, "to": to, "data": "0x" + data.hex(), "value": hex(value)}])
-        gas = int(str(estimate), 16) * 125 // 100
-        tx = {"chainId": self.wallet.chain_id, "nonce": nonce, "gasPrice": gas_price, "gas": gas, "to": to,
-              "value": value, "data": "0x" + data.hex()}
-        raw = self.wallet.sign_transaction(tx)
-        return str(await self.rpc("eth_sendRawTransaction", ["0x" + raw.hex()]))
+        async with self.send_lock:
+            nonce = int(str(await self.rpc("eth_getTransactionCount", [sender, "pending"])), 16)
+            gas_price = int(str(await self.rpc("eth_gasPrice", [])), 16)
+            estimate = await self.rpc("eth_estimateGas", [{"from": sender, "to": to, "data": "0x" + data.hex(), "value": hex(value)}])
+            gas = int(str(estimate), 16) * 125 // 100
+            tx = {"chainId": self.wallet.chain_id, "nonce": nonce, "gasPrice": gas_price, "gas": gas, "to": to,
+                  "value": value, "data": "0x" + data.hex()}
+            raw = self.wallet.sign_transaction(tx)
+            return str(await self.rpc("eth_sendRawTransaction", ["0x" + raw.hex()]))
 
     async def wait(self, tx_hash: str, timeout: float = 120.0) -> dict:
         """The receipt once mined; RemoteError when it reverted or did not come in time."""
@@ -718,6 +728,7 @@ class LiveTrader:
         self.ready_error = "尚未登录 Predict"
         self.ready_at = 0.0
         self.account_error = ""  # a Predict account the key does not control (checked on-chain): nothing is sent
+        self.account_checked = False  # the on-chain check has succeeded (a plain wallet needs none): "no error" alone is not readiness
         self.balance: tuple[int, int, float] | None = None  # (USDT wei, BNB wei, when)
         self.balance_error = ""
         self.approvals: dict[str, bool] = {}  # exchange key -> allowance in place (read from the chain)
@@ -728,22 +739,24 @@ class LiveTrader:
 
     @property
     def ready(self) -> bool:
-        return not self.ready_error and not self.account_error
+        return not self.ready_error and not self.account_error and self.account_checked
 
     @property
     def not_ready_why(self) -> str:
-        return self.ready_error or self.account_error
+        return self.ready_error or self.account_error or ("账户校验尚未完成" if not self.account_checked else "")
 
     async def verify_account(self) -> None:
         """PREDICT_ACCOUNT must be a Predict account whose signer is PREDICT_PRIVATE_KEY (the validator says who): a
         mismatch would have every order refused, so it blocks trading until fixed. A plain wallet needs no check."""
         if not self.wallet.predict_account:
-            self.account_error = ""
+            self.account_error, self.account_checked = "", True
             return
         try:
             owner = await self.chain.account_owner(self.wallet.predict_account)
         except Exception as error:
-            raise core.RemoteError(f"无法在链上核对 PREDICT_ACCOUNT 的控制钥匙：{core.clean_error(error) or type(error).__name__}") from None
+            self.account_error = f"无法在链上核对 PREDICT_ACCOUNT 的控制钥匙：{core.clean_error(error) or type(error).__name__}"
+            self.account_checked = False  # not verified: not ready, whatever the sign-in said
+            raise core.RemoteError(self.account_error) from None
         if int(owner, 16) == 0:
             self.account_error = f"链上没有 Predict 账户 {short_addr(self.wallet.predict_account)} 的签名记录：地址填错，或账户还没在链上激活（先在网站交易一次）"
         elif owner.lower() != self.wallet.signer.lower():
@@ -751,6 +764,7 @@ class LiveTrader:
                                   f"（链上记录的是 {short_addr(checksum(owner))}）：请导出该账户的 Privy 钱包私钥")
         else:
             self.account_error = ""
+        self.account_checked = not self.account_error
         if self.account_error:
             raise core.RemoteError(self.account_error)
 
@@ -984,6 +998,8 @@ class LiveBot(core.Bot):
             return ""  # paper trading, as the base class does it
         if not self.live.ready:
             return f"真实交易未就绪：{self.live.not_ready_why}"
+        if gate := self.live_balance_gate():
+            return gate
         if c.live_mode == "pause":
             return "LIVE=pause：只做登录、自检、挂单测试和撤单，不开新仓（改成 LIVE=on 才会下单）"
         if not c.live_allowed:
@@ -1094,6 +1110,7 @@ class LiveBot(core.Bot):
                 "asks": [[p, q] for p, q in core.side_levels(mk.book, side)][:core.PREDICT_DEPTH],
                 "expires": (end // 1000 + 7200) if end and end // 1000 + 7200 > now_ms // 1000 + 120 else FAR_FUTURE}
         trade.update(status="resting", shares=0.0, filled=None, fills=[], expected_price=float(trade["price"]),
+                     cost_confirmed=maker is not None,  # a maker fills at its price; a taker's cost waits for Predict's average
                      live={"state": "pending", "want": want, "attempt": 1, "order_id": "", "hash": "", "placed_at": None,
                            "events": [{"at": now_ms, "what": "决定下单"}]})
         if taker:
@@ -1237,6 +1254,18 @@ class LiveBot(core.Bot):
                     self.live_fail(tid, trade, f"未下单：{why}", now_ms)
                     continue
                 await self.live_place(tid, trade, now_ms)
+
+    LIVE_BALANCE_STALE_S = 600  # after a failed refresh, a balance read longer ago than this is no ground for a new order
+
+    def live_balance_gate(self) -> str:
+        """Why the balance cannot vouch for a new order: never read, or the last refresh failed and the last good read
+        is old. A stale figure is not "enough USDT"."""
+        b = self.live.balance
+        if b is None:
+            return "余额尚未读到，暂不开新仓"
+        if self.live.balance_error and time.time() - b[2] > self.LIVE_BALANCE_STALE_S:
+            return f"余额刷新失败（{self.live.balance_error}），上次成功读取已超过 {self.LIVE_BALANCE_STALE_S // 60} 分钟，暂不开新仓"
+        return ""
 
     def live_send_hold(self, now_ms: int) -> str:
         """Why no new order goes out right now, although nothing is wrong with the order itself: the account's open
@@ -1472,6 +1501,8 @@ class LiveBot(core.Bot):
                 st["events"].append({"at": now_ms, "what": f"开放订单列表没有它，但按哈希查到仍为 {str(final.get('status') or '?')}：继续跟踪"})
             await self.live_taker_due(tid, trade, by_id, mk, now_ms)
             return
+        if not getattr(self.live.api, "orders_complete", True):
+            return  # the list was cut short: its silence says nothing; the hash read above is all there is to go on
         self.live_misses[tid] = self.live_misses.get(tid, 0) + 1
         if self.live_misses[tid] < self.LIVE_MISSES or now_ms - int(st.get("placed_at") or now_ms) < self.LIVE_MISS_WINDOW_MS:
             return  # a fresh order may take Predict a moment to show on its reads: the looks only count after a minute
@@ -1650,7 +1681,13 @@ class LiveBot(core.Bot):
         price = order_price(row)
         if price is not None and not trade.get("maker"):
             fee = core.taker_fee(price, int(st["want"].get("fee_bps") or 0))
-            trade.update(avg=price, fee=fee, price=price + fee, slip=price - float(trade.get("best", price)))
+            trade.update(avg=price, fee=fee, price=price + fee, slip=price - float(trade.get("best", price)), cost_confirmed=True)
+        elif not trade.get("maker") and filled > 1e-9 and not trade.get("cost_confirmed") and st["want"].get("cap"):
+            # Predict's record states no average price: the fill is costed at the cap — the most the LIMIT could have
+            # paid — until a price is read back, never at the estimate made before the order (which may be lower)
+            cap = float(st["want"]["cap"])
+            fee = core.taker_fee(cap, int(st["want"].get("fee_bps") or 0))
+            trade.update(avg=cap, fee=fee, price=cap + fee, slip=cap - float(trade.get("best", cap)), cost_confirmed=False)
         prev = float(trade.get("shares") or 0)
         if filled > prev + 1e-9:
             fair = (mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up) if mk is not None else float(trade["fair"])
@@ -1894,6 +1931,9 @@ class LiveBot(core.Bot):
                 "unknown": self.live_unknown_rows(live, now_ms),
                 "oldest_cancel_s": max([(now_ms - int((t.get("withdrawn") or {}).get("at") or now_ms)) // 1000 for _, t in live if t["live"].get("state") == "cancelling"], default=None),
                 "unknown_open": [dict(u) for u in self.live_unknown_open], "allowed": c.live_allowed,
+                "orders_complete": bool(getattr(self.live.api, "orders_complete", True)), "positions_complete": bool(getattr(self.live.api, "positions_complete", True)),
+                "gate": (f"未就绪：{self.live.not_ready_why}" if not self.live.ready else self.live_balance_gate() or self.live_send_hold(now_ms)),
+                "balance_age_s": int(time.time() - self.live.balance[2]) if self.live.balance else None, "balance_error": self.live.balance_error,
                 "placed_today": sum(int(t["opened"]) >= since for _, t in live),
                 "failed_today": sum(int(t["opened"]) >= since and t["live"].get("final") == "failed" for _, t in live),
                 "orders": rows, "positions": [self.position_line(r) for r in positions[:30]],
