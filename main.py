@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.46.1"
+VERSION = "1.47.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -442,7 +442,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_EDGE_CENTS", "触发买入的净优势（¢/份）", "0.5～50"),
     ("SIM_SHARES", "每次最多买多少份", "1～1000000：吃单在封顶价之下有多少买多少、最多这么多；挂单按这个数量挂"),
     ("SIM_WAYS", "做哪种单", "吃单 = 算出仍留足净优势的最高价位（封顶价），盘口在它之下的立即买（真实交易用封顶限价单）；挂单 = 按建议价挂着等成交"),
-    ("SIM_MARKETS", "做哪些市场", "可多选；全选 = all"),
+    ("SIM_MARKETS", "做哪些市场", "可多选；全选 = all；展开详细选项可按市场逐个排除"),
+    ("SIM_SKIP", "不做的市场（详细选项）", "逗号分隔的市场代码；在“做哪些市场”卡片展开详细选项点选，空 = 所选类型里的市场都做"),
     ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "0 = 不限"),
     ("SIM_TAKER_SESSION", "只在标的开盘时段吃单", "开 = 指数/个股日涨跌的吃单只在标的开盘时段（卡片按现货定价时）进行，盘后只挂单；挂单不受影响"),
     ("SIM_QUIET_MINUTES", "结束前多少分钟不交易", "0～1440：从标的收盘 / 市场截止前这么多分钟起不开新单，未成交的挂单撤掉；0 = 不限"),
@@ -511,6 +512,7 @@ class Config:
     sim_shares: float = 100.0  # shares per simulated buy
     sim_ways: str = "taker"  # which suggestions it takes: taker (吃单), maker (挂单) or both
     sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
+    sim_skip: frozenset = frozenset()              # SIM_SKIP: market keys (HSI, UNITREEUSDT, BNB…) left out within those kinds (the page's detail chips)
     sim_group_usd: float = 300.0  # the most one driver's positions may lose on a single move (paper $); 0 = no limit
     sim_taker_session: bool = False  # SIM_TAKER_SESSION: a daily card is taken only while its underlying trades (priced from the spot); makers always
     sim_quiet_minutes: int = 0        # SIM_QUIET_MINUTES: from this many minutes before a market's end (the underlying's close, a deadline) no new
@@ -568,6 +570,9 @@ class Config:
         sim_markets = frozenset(SIM_KINDS) if "all" in wanted else frozenset(wanted)
         if not sim_markets or not sim_markets <= set(SIM_KINDS):
             raise ValueError(f"SIM_MARKETS 只能是 all，或 {'、'.join(SIM_KINDS)} 的组合（逗号分隔）")
+        sim_skip = frozenset(k.strip().upper() for k in (e.get("SIM_SKIP") or "").split(",") if k.strip())
+        if len(sim_skip) > 200 or any(len(k) > 40 for k in sim_skip):
+            raise ValueError("SIM_SKIP 应是逗号分隔的市场代码（最多 200 个，每个不超过 40 字符）")
         off = lambda value: str(value).strip().lower() in {"off", "0", "false", "no"}
         live_mode = {"on": "on", "1": "on", "true": "on", "yes": "on", "pause": "pause", "paused": "pause", "test": "pause"}.get(
             e.get("LIVE", "off").strip().lower(), "off")
@@ -637,7 +642,7 @@ class Config:
             sim=e.get("SIM", "on").strip().lower() not in {"off", "0", "false", "no"},
             sim_edge=parse_bounded(e, "SIM_EDGE_CENTS", "10", 0.5, 50) / 100,
             sim_shares=parse_bounded(e, "SIM_SHARES", "100", 1, 1_000_000),
-            sim_ways=sim_ways, sim_markets=sim_markets,
+            sim_ways=sim_ways, sim_markets=sim_markets, sim_skip=sim_skip,
             sim_group_usd=parse_bounded(e, "SIM_GROUP_USD", "300", 0, 10_000_000),
             sim_taker_session=not off(e.get("SIM_TAKER_SESSION", "off")),
             sim_quiet_minutes=bounded_int(e, "SIM_QUIET_MINUTES", 0, 0, 1440),
@@ -6874,6 +6879,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_SHARES": {"kind": "number", "group": "策略", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "SIM_WAYS": {"kind": "choice", "group": "策略", "options": [["taker", "只吃单"], ["maker", "只挂单"], ["both", "挂单和吃单"]]},
     "SIM_MARKETS": {"kind": "multi", "group": "策略", "options": [[k, n] for k, n in SIM_KINDS.items()]},
+    "SIM_SKIP": {"kind": "detail", "group": "策略"},  # drawn inside the SIM_MARKETS card: one chip per market of the chosen kinds
     "SIM_TAKER_SESSION": {"kind": "choice", "group": "策略", "options": [["off", "全天都吃单"], ["on", "只在开盘时段吃单"]]},
     "SIM_QUIET_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "5", "10", "15", "30", "60"], "unit": "分钟", "zero": "不限"},
     "SIM_MAKER_MIN_BID": {"kind": "number", "group": "策略", "presets": ["0", "20", "50", "100", "200", "500"], "unit": "份", "zero": "不限、不改跟"},
@@ -8294,7 +8300,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_points:"只挂积分已激活的",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_points:"只挂积分已激活的",sim_skip:"详细选项排除的市场",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
   trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
@@ -8470,7 +8476,7 @@ pre{white-space:pre-wrap;word-break:break-all;font:13px/1.5 ui-monospace,Menlo,C
 .set .ttl{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:2px 10px}.set .ttl b{font-weight:600;font-size:14px}.set .now{font-size:12px;color:var(--muted)}
 .set .hint{color:var(--muted);font-size:12px;margin:2px 0 8px}
 .opts{display:flex;flex-wrap:wrap;gap:6px}.opt{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:10px;padding:6px 11px;font-size:14px}
-.opt.sel{background:var(--best);color:var(--on-accent);border-color:var(--best)}
+.opt.sel{background:var(--best);color:var(--on-accent);border-color:var(--best)}.opt.off{opacity:.55;text-decoration:line-through}.detail{margin-top:8px}
 .custom{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px}.custom input[type=text]{width:130px;padding:5px 9px;font-size:14px}
 .badge{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--chip);color:var(--muted);vertical-align:middle}.badge.saved{background:var(--down-bg);color:var(--down)}
 button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
@@ -8496,8 +8502,8 @@ button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
 const base=location.pathname.replace(/\/control\/?$/,"");
 const $=id=>document.getElementById(id);
 $("back").href=base;$("journal").href=base+"/journal";
-let data=null,busy=false,adv=false,folded=false;
-try{adv=localStorage.getItem("ctladv")==="1";folded=localStorage.getItem("ctlfold")==="1"}catch(e){}
+let data=null,busy=false,adv=false,folded=false,detailOpen=false;
+try{adv=localStorage.getItem("ctladv")==="1";folded=localStorage.getItem("ctlfold")==="1";detailOpen=localStorage.getItem("ctldetail")==="1"}catch(e){}
 try{const k=sessionStorage.getItem("ctlkey");if(k){$("key").value=k;$("remember").checked=true}}catch(e){}
 function keep(){try{if($("remember").checked)sessionStorage.setItem("ctlkey",$("key").value);else sessionStorage.removeItem("ctlkey")}catch(e){}}
 $("remember").addEventListener("change",keep);$("key").addEventListener("input",keep);$("key").addEventListener("change",load);
@@ -8553,6 +8559,7 @@ function pick(s,v){
     const keys=s.options.map(o=>o[0]).filter(k=>sel.has(k));return act({action:"set",values:{[s.key]:keys.length===s.options.length?"all":keys.join(",")}})}
   if(v!==s.value)act({action:"set",values:{[s.key]:v}})}
 function card(s){
+  if(s.kind==="detail")return null;  // drawn inside another card (SIM_SKIP: the market chips under 做哪些市场)
   const c=el("div","set");c.dataset.key=s.key;
   const t=el("div","ttl");t.append(el("b","",s.label));
   const now=el("span","now","当前 "+(s.kind==="number"?fmt(s,s.value):s.value)+" ");
@@ -8562,6 +8569,17 @@ function card(s){
   (s.kind==="number"?s.presets.map(v=>[v,fmt(s,v)+(s.zero&&v==="0"?"（"+s.zero+"）":"")]):s.options).forEach(([v,cap])=>{
     const b=el("button","opt"+(sel.has(v)?" sel":""),cap);b.dataset.v=v;b.disabled=!data.enabled;b.addEventListener("click",()=>pick(s,v));o.append(b)});
   c.append(o);
+  if(s.key==="SIM_MARKETS"){const sk=((data.settings.find(x=>x.key==="SIM_SKIP")||{}).value||"");const skip=new Set(sk?sk.split(","):[]);
+    const d=el("div","detail");const tg=el("button","lnk",(detailOpen?"收起详细选项":"展开详细选项")+"（按市场逐个选，已排除 "+skip.size+" 个）");
+    tg.addEventListener("click",()=>{detailOpen=!detailOpen;try{localStorage.setItem("ctldetail",detailOpen?"1":"0")}catch(e){}renderSettings()});d.append(tg);
+    if(detailOpen){const sel=selected(s);let any=false;s.options.forEach(([k,name])=>{if(!sel.has(k))return;const items=(data.catalog||[]).filter(x=>x.kind===k);if(!items.length)return;any=true;
+      d.append(el("div","grp",name));const row=el("div","opts");items.forEach(it=>{const K=String(it.key).toUpperCase();const on=!skip.has(K);const b=el("button","opt"+(on?" sel":" off"),it.name+(on?"":"（不做）"));b.disabled=!data.enabled;b.title=it.key;
+        b.addEventListener("click",()=>{const next=new Set(skip);if(on)next.add(K);else next.delete(K);act({action:"set",values:{SIM_SKIP:[...next].sort().join(",")}})});row.append(b)});d.append(row)});
+      const listed=new Set((data.catalog||[]).filter(x=>sel.has(x.kind)).map(x=>String(x.key).toUpperCase()));const extra=[...skip].filter(k=>!listed.has(k)).sort();
+      if(extra.length){d.append(el("div","grp","已排除、当前没列出的（点一下恢复）"));const row=el("div","opts");extra.forEach(K=>{const b=el("button","opt off",K+"（不做）");b.disabled=!data.enabled;
+        b.addEventListener("click",()=>{const next=new Set(skip);next.delete(K);act({action:"set",values:{SIM_SKIP:[...next].sort().join(",")}})});row.append(b)});d.append(row)}
+      if(!any&&!extra.length)d.append(el("div","mut","所选类型下还没有可列出的市场（等卡片加载后再看）"))}
+    c.append(d)}
   const cu=el("div","custom");
   if(s.kind==="number"){const inp=el("input");inp.type="text";inp.inputMode="decimal";inp.placeholder="自定义";inp.dataset.key=s.key;inp.autocomplete="off";inp.disabled=!data.enabled;
     const go=el("button","opt","保存");go.disabled=!data.enabled;go.addEventListener("click",()=>{const v=inp.value.trim();if(v)act({action:"set",values:{[s.key]:v}})});
@@ -8576,7 +8594,7 @@ function renderSettings(){
   if(a&&a.tagName==="INPUT"&&box.contains(a))return;  // someone is typing a value: leave the cards as they are
   box.replaceChildren();
   GROUPS.forEach(([g,title])=>{if(g==="高级"&&!adv)return;const items=data.settings.filter(s=>s.group===g);if(!items.length)return;
-    box.append(el("div","grp",title));items.forEach(s=>box.append(card(s)))})}
+    box.append(el("div","grp",title));items.forEach(s=>{const k=card(s);if(k)box.append(k)})})}
 $("fold").addEventListener("click",()=>{folded=!folded;try{localStorage.setItem("ctlfold",folded?"1":"0")}catch(e){}renderSettings()});
 $("adv").addEventListener("click",()=>{adv=!adv;try{localStorage.setItem("ctladv",adv?"1":"0")}catch(e){}renderSettings()});
 $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.act;
@@ -11233,7 +11251,8 @@ class Bot:
                 **({"sim_maker_min_bid": c.sim_maker_min_bid} if c.sim_maker_min_bid > 0 else {}),
                 **({"sim_maker_exit": self.sim_maker_exit()} if self.sim_maker_exit() > 0 else {}),
                 **({"sim_maker_session": True} if c.sim_maker_session else {}),
-                **({"sim_maker_points": True} if c.sim_maker_points else {})}
+                **({"sim_maker_points": True} if c.sim_maker_points else {}),
+                **({"sim_skip": sorted(c.sim_skip)} if c.sim_skip else {})}
 
     def evidence(self, build: Any) -> "LazyEvidence":
         """A SimMarket's evidence, built on first access: when a trade is opened or filled, not for every market on
@@ -11399,6 +11418,8 @@ class Bot:
             return "模拟交易已改为只吃单"
         if kind not in self.config.sim_markets:
             return f"模拟交易范围已不含{SIM_KINDS.get(kind, kind)}"
+        if str(trade.get("key") or "").upper() in self.config.sim_skip:
+            return f"详细选项已排除{trade.get('item') or trade.get('key')}"
         if (kind == "range" and not RANGE_SIM_MAKERS) or (mk is not None and not mk.makers):
             return f"{SIM_KINDS.get(kind, kind)}只做吃单"
         return ""
@@ -11413,6 +11434,29 @@ class Bot:
                 return max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0), float(t.get("price") or 0)
         return 0.0, None
 
+    def sim_in_scope(self, mk: SimMarket) -> bool:
+        """Whether the paper trader trades this market: its kind is on (SIM_MARKETS) and it is not left out by name (SIM_SKIP)."""
+        return mk.kind in self.config.sim_markets and str(mk.key).upper() not in self.config.sim_skip
+
+    def sim_catalog(self, now_ms: int) -> list[dict]:
+        """Every market the bot prices, by kind and key, for the page's detail chips: the daily cards (indexes and the
+        configured contracts), the touch, monthly, flip, price-ladder and market-cap markets."""
+        rows = []
+        if self.config.probability:
+            for title, _ in self.odds_items(now_ms):
+                rows.append({"kind": "close", "key": self.predict_key(title), "name": title.partition("｜")[0]})
+        rows += [{"kind": "touch", "key": t.spec.key, "name": f"{t.spec.symbol.removesuffix('USDT')} 先触"} for t in self.touches.values()]
+        rows += [{"kind": "updown", "key": u.spec.key, "name": u.spec.name} for u in self.updowns.values()]
+        rows += [{"kind": "flip", "key": f.spec.key, "name": f.spec.name} for f in self.flips.values()]
+        rows += [{"kind": "range", "key": r.spec.key, "name": r.spec.name} for r in self.ranges.values()]
+        rows += [{"kind": "ladder", "key": cap.spec.key, "name": cap.spec.name} for cap in self.caps.values()]
+        seen, out = set(), []
+        for row in rows:
+            if row["key"] and (row["kind"], row["key"]) not in seen:
+                seen.add((row["kind"], row["key"]))
+                out.append({**row, "skipped": str(row["key"]).upper() in self.config.sim_skip})
+        return out
+
     def sim_maker_reason(self, mk: SimMarket, trades: dict[str, dict], now_ms: int) -> tuple[BookEdge | None, str]:
         """The resting order the paper trader places on this market now (the side, the valid 买1 it joins — maker_level:
         the first level holding SIM_MAKER_MIN_BID shares besides ours — and the edge), or why none, in the order check's
@@ -11421,6 +11465,8 @@ class Bot:
         c = self.config
         if mk.kind not in c.sim_markets:
             return None, "不在 SIM_MARKETS 范围"
+        if str(mk.key).upper() in c.sim_skip:
+            return None, "详细选项里已排除这个市场"
         if c.sim_ways == "taker":
             return None, "SIM_WAYS=taker：只吃单"
         if not mk.makers:
@@ -11480,6 +11526,8 @@ class Bot:
             taker_text = taker_why = ""
             if mk.kind not in c.sim_markets:
                 taker_why = "不在 SIM_MARKETS 范围"
+            elif str(mk.key).upper() in c.sim_skip:
+                taker_why = "详细选项里已排除这个市场"
             elif c.sim_ways == "maker":
                 taker_why = "SIM_WAYS=maker：只挂单"
             elif mk.hold:
@@ -11820,7 +11868,7 @@ class Bot:
         ways, kinds = self.config.sim_ways, self.config.sim_markets
         changed: list[tuple[str, dict]] = []  # written once, in one transaction
         for mk in markets.values():
-            if mk.hold or mk.book.stale(now_ms) or mk.kind not in kinds or book_crossed(mk.book):
+            if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
                 continue  # positions filled in other kinds (SIM_MARKETS narrowed) still settle below; resting ones are withdrawn
             maker = self.sim_maker_reason(mk, trades, now_ms)[0]  # the side and the valid 买1 it joins, past every gate (session, points, depth, bar, slot)
             if maker is not None:
@@ -12015,6 +12063,8 @@ class Bot:
                 how.append("指数/个股日涨跌只在标的开盘时段挂单，开盘前、收盘后撤掉")
             if self.config.sim_maker_points:
                 how.append("只挂积分已激活的市场，积分停了就撤")
+        if self.config.sim_skip:
+            how.append(f"详细选项排除了 {len(self.config.sim_skip)} 个市场（{'、'.join(sorted(self.config.sim_skip)[:8])}{'…' if len(self.config.sim_skip) > 8 else ''}）")
         lines = [f"🧪 {bold('模拟交易')}（净优势 ≥{edge:g}¢ 时按卡片建议买 {shares} 份，只记账不下单）",
                  f"范围：{r['scope']}；{r['ways']}。" + "；".join(how) + "。先按机器人数据预结算，再以 Predict 的结果确认。"]
         if not t["trades"]:
@@ -13034,7 +13084,7 @@ class Bot:
         flag = lambda value: "on" if value else "off"
         values = {"LIVE": c.live_mode, "SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": f"{c.sim_shares:g}", "SIM_WAYS": c.sim_ways,
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
-                  "SIM_GROUP_USD": f"{c.sim_group_usd:g}", "SIM_TAKER_SESSION": flag(c.sim_taker_session),
+                  "SIM_GROUP_USD": f"{c.sim_group_usd:g}", "SIM_TAKER_SESSION": flag(c.sim_taker_session), "SIM_SKIP": ",".join(sorted(c.sim_skip)),
                   "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes), "SIM_MAKER_MIN_BID": f"{c.sim_maker_min_bid:g}",
                   "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points),
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}",
@@ -13057,7 +13107,7 @@ class Bot:
                               "saved": str(saved.get(key, "")) if isinstance(saved, dict) else "", "env": self.config.env.get(key, ""),
                               **CONTROL_FORMS.get(key, {"kind": "number", "group": "高级", "presets": [], "unit": ""})}
                              for key, label, hint in CONTROL_KEYS],
-                "scope": sim_scope(self.config), "checks": self.sim_checks(now_ms),
+                "scope": sim_scope(self.config), "checks": self.sim_checks(now_ms), "catalog": self.sim_catalog(now_ms),
                 "sim": {"trades": stats["trades"], "settled": stats["settled"], "pnl": stats["pnl"], "open": stats["open"],
                         "resting": stats["resting"], "open_cost": stats["open_cost"]}}
 

@@ -31,7 +31,10 @@ assert not c.sim and abs(c.sim_edge - 0.15) < 1e-12 and c.sim_shares == 250 and 
 assert m.sim_scope(c) == ("挂单和吃单", "价格阶梯、市值阶梯")
 c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MARKETS": "all", "SIM_WAYS": ""})
 assert c.sim_markets == frozenset(m.SIM_KINDS) and c.sim_ways == "taker" and m.sim_scope(c) == ("只吃单", "全部市场")
-for bad in ({"SIM_EDGE_CENTS": "0"}, {"SIM_EDGE_CENTS": "60"}, {"SIM_SHARES": "0"}, {"SIM_WAYS": "none"}, {"SIM_MARKETS": "index"}):
+assert c.sim_skip == frozenset()  # the detail chips: SIM_SKIP names markets left out of the chosen kinds, upper-cased, blanks dropped
+assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_SKIP": " hsi, bnb ,HSI,"}).sim_skip == frozenset({"HSI", "BNB"})
+for bad in ({"SIM_EDGE_CENTS": "0"}, {"SIM_EDGE_CENTS": "60"}, {"SIM_SHARES": "0"}, {"SIM_WAYS": "none"}, {"SIM_MARKETS": "index"},
+            {"SIM_SKIP": "x" * 41}, {"SIM_SKIP": ",".join(f"k{i}" for i in range(201))}):
     try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
     except ValueError: pass
 
@@ -480,6 +483,20 @@ async def run():
     await step(mbot, NOW, hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW), far)
     assert sorted(mbot.sim_trades()) == ["will-bnb-hit-700-or-900|up|挂"], sorted(mbot.sim_trades())
     assert "范围：先触价；只挂单。挂单只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后" in mbot.cmd_sim(None).text
+    # the detail chips (SIM_SKIP): a market left out by key is neither taken nor quoted on, whatever its kind; keys compare upper-cased
+    kbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                    "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_SKIP": "hsi", **LEGACY}), m.Store(":memory:"), FM(NOW), None)
+    kbot.sim_markets = lambda now: world["markets"]
+    skipped = hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW)
+    assert not kbot.sim_in_scope(skipped) and kbot.sim_in_scope(far) and kbot.sim_maker_reason(skipped, {}, NOW) == (None, "详细选项里已排除这个市场")
+    await step(kbot, NOW, skipped, far)
+    assert all(k.startswith("will-bnb-hit-700-or-900|") for k in kbot.sim_trades()) and kbot.sim_trades(), sorted(kbot.sim_trades())
+    rows = {r["market"]: r for r in kbot.sim_checks(NOW)}
+    assert rows[HSI_SLUG]["maker_why"] == rows[HSI_SLUG]["taker_why"] == "详细选项里已排除这个市场" and rows["will-bnb-hit-700-or-900"]["taker_why"] != "详细选项里已排除这个市场"
+    assert "详细选项排除了 1 个市场（HSI）" in kbot.cmd_sim(None).text and kbot.sim_version()["sim_skip"] == ["HSI"] and "sim_skip" not in mbot.sim_version()
+    cat = kbot.sim_catalog(NOW)  # every market the bot prices, for the page's chips: the contract's daily card here, flagged when skipped
+    assert {(r["kind"], r["key"], r["name"], r["skipped"]) for r in cat} >= {("close", "UNITREEUSDT", "宇树 UNITREE", False)}, cat
+    assert len({(r["kind"], r["key"]) for r in cat}) == len(cat) and all(r["skipped"] == (r["key"].upper() in {"HSI"}) for r in cat), cat
 
     # --- a resting order is placed only on a book it could fill in: two-sided, no wider than SIM_MAKER_SPREAD ---------------
     assert m.SIM_MAKER_SPREAD == 0.10 and m.sim_maker_block(book([("0.55", "100")], [("0.58", "100")])) == ""
@@ -509,9 +526,13 @@ async def run():
         b.store.put("sim:sol#12|down|挂", resting("sol#12", "range", 30.0))
     gbot.store.put("sim:hsi-x|up|挂", resting("hsi-x", "close"))  # a kind and a way gbot still trades
     mbot.store.put("sim:hsi-y|up|挂", resting("hsi-y", "close"))  # mbot trades touch markets only
+    kbot.store.put("sim:hsi-z|up|挂", {**resting("hsi-z", "close"), "key": "hsi"})  # kbot leaves HSI out by the detail chips
+    kbot.store.put("sim:hsi-w|up|挂", {**resting("hsi-w", "close"), "key": "KOSPI"})
     world["markets"] = []
-    for b in (dbot, gbot, mbot):
+    for b in (dbot, gbot, mbot, kbot):
         await step(b, NOW + 60_000)
+    k = kbot.sim_trades()
+    assert k["hsi-z|up|挂"]["withdrawn"]["why"] == "详细选项已排除hsi-z" and k["hsi-w|up|挂"]["status"] == "resting" and "withdrawn" not in k["hsi-w|up|挂"]
     t = dbot.sim_trades()["sol#11|down|挂"]
     assert t["status"] == "cancelled" and t["note"] == "撤单：模拟交易已改为只吃单，一份都没成交", t
     assert t["withdrawn"] == {"at": NOW + 60_000, "why": "模拟交易已改为只吃单", "unfilled": 100.0} and t["unfilled"] == 100

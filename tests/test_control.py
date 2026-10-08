@@ -108,10 +108,15 @@ async def run():
     assert s["SIM_MARKETS"]["kind"] == "multi" and [o[0] for o in s["SIM_MARKETS"]["options"]] == list(m.SIM_KINDS) and s["SIM_MARKETS"]["options"][0][1] == "指数/个股日涨跌"
     assert s["SIM_TAKER_SESSION"]["options"] == [["off", "全天都吃单"], ["on", "只在开盘时段吃单"]] and s["LIVE"]["options"][1][0] == "pause" and s["LIVE_NOTIFY"]["group"] == "高级"
     assert s["SIM_GROUP_USD"]["zero"] == "不限" and s["LIVE_MAX_DAILY_LOSS_USD"]["presets"][0] == "0"
+    assert s["SIM_SKIP"]["kind"] == "detail" and s["SIM_SKIP"]["value"] == "" and s["SIM_SKIP"]["group"] == "策略"
+    assert isinstance(data["catalog"], list) and all({"kind", "key", "name", "skipped"} <= set(r) for r in data["catalog"]) and "展开详细选项" in body.decode()
     # every setting has a widget, every group is one the page knows, and every preset / option is a value the Config accepts
     assert set(m.CONTROL_FORMS) == set(m.CONTROL_KEY_SET) and {f["group"] for f in m.CONTROL_FORMS.values()} == {"策略", "风控", "高级"}
     withkey = {**base, "PREDICT_PRIVATE_KEY": "a" * 64}
     for key, form in m.CONTROL_FORMS.items():
+        if form["kind"] == "detail":  # SIM_SKIP: drawn inside the SIM_MARKETS card from the catalog, no presets or options of its own
+            assert "presets" not in form and "options" not in form and key == "SIM_SKIP", key
+            continue
         assert form["kind"] in {"choice", "multi", "number"} and (form["kind"] == "number") == ("presets" in form) and (form["kind"] != "number") == ("options" in form), key
         for value in (form.get("presets") or [o[0] for o in form.get("options", [])]):
             m.Config.from_env({**withkey, key: value})  # raises when a preset is out of range
@@ -147,6 +152,15 @@ async def run():
     assert s["SIM_WAYS"]["saved"] == "" and s["SIM_WAYS"]["value"] == "taker" and s["SIM_EDGE_CENTS"]["saved"] == "12" and s["SIM_MARKETS"]["value"] == "all"
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MARKETS": "all"}})
     assert st == 200 and j["message"] == "已保存，设置没有变化。"
+    # the detail chips: SIM_SKIP names single markets left out (upper-cased, deduplicated), the catalog flags them, "" clears it
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SKIP": " hsi, bnb ,HSI"}})
+    assert st == 200 and bot.config.sim_skip == {"HSI", "BNB"} and bot.control_value("SIM_SKIP") == "BNB,HSI", (st, j)
+    data = await get_json(port, "control.json")
+    assert {x["key"]: x for x in data["settings"]}["SIM_SKIP"]["value"] == "BNB,HSI" and all(r["skipped"] == (r["key"].upper() in {"HSI", "BNB"}) for r in data["catalog"])
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SKIP": "x" * 41}})
+    assert st == 400 and "SIM_SKIP" in j["message"] and bot.config.sim_skip == {"HSI", "BNB"}
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SKIP": ""}})
+    assert st == 200 and bot.config.sim_skip == frozenset() and bot.control_value("SIM_SKIP") == ""
     # a new bot on the same store starts with the saved settings; a saved value that stopped validating is ignored
     again = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY}), store, FM(NOW), None)
     assert again.config.sim_edge == 0.12 and again.config.live_max_order_usd == 40 and again.config.sim_markets == frozenset(m.SIM_KINDS)

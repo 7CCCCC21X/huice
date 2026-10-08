@@ -1125,7 +1125,7 @@ class LiveBot(core.Bot):
         bar, c, trades = self.config.sim_edge - 0.03, self.config, self.sim_trades()
         wanted, self.live_wanted = list(self.live_wanted), set()
         for mk in self.sim_markets(now_ms):
-            if mk.hold or mk.book.stale(now_ms) or mk.kind not in c.sim_markets or core.book_crossed(mk.book):
+            if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or core.book_crossed(mk.book):
                 continue
             info = self.live.markets.get(str(mk.book.market_id))
             if info and time.monotonic() - info.at < 3600:
