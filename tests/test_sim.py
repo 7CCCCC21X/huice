@@ -866,7 +866,20 @@ async def maker_rules():
     t = bot.sim_trades()[tid]
     assert t["status"] == "filled" and t["shares"] == 40 and t["unfilled"] == 60 and "买1 移到 59.0¢，改跟" in t["note"] and f"{tid}#5" not in bot.sim_trades()
     await step(bot, NOW + 150_000, hsi(0.70, [("0.59", "200"), ("0.565", "150")], [("0.60", "400")], NOW + 150_000))
-    assert bot.sim_trades()[tid]["shares"] == 40 and len([k for k in bot.sim_trades() if k.startswith(tid)]) == 5  # the position holds the slot
+    trades = bot.sim_trades()  # the position no longer holds the slot (10-08): it moves to #5, a fresh order joins the new 买1
+    assert trades[f"{tid}#5"]["shares"] == 40 and trades[f"{tid}#5"]["status"] == "filled" and m.sim_position(trades[f"{tid}#5"])
+    assert trades[tid]["status"] == "resting" and trades[tid]["price"] == 0.59 and trades[tid]["queue_ahead"] == 200 and len([k for k in trades if k.startswith(tid)]) == 6
+    world["markets"] = [hsi(0.70, [("0.59", "200"), ("0.565", "150")], [("0.60", "400")], NOW + 150_000)]
+    assert bot.sim_maker_reason(world["markets"][0], trades, NOW + 150_000) == (None, "已有挂单中：59.0¢×100 份")  # the resting one does hold it
+    # a full fill: sellers through 59¢ for the whole order; the next step rests another order behind the 买1, the position at #6
+    await step(bot, NOW + 160_000, hsi(0.70, [("0.585", "200")], [("0.59", "120"), ("0.60", "400")], NOW + 160_000))  # 买1 within a cent: not re-quoted
+    assert bot.sim_trades()[tid]["status"] == "filled" and bot.sim_trades()[tid]["shares"] == 100
+    world["markets"] = [hsi(0.70, [("0.59", "200"), ("0.565", "150")], [("0.60", "400")], NOW + 170_000)]
+    assert [r["maker"] for r in bot.sim_checks(NOW + 170_000)] == ["挂涨 59.0¢×100 份（净优势 11.0¢，排在 200 份之后）；已有持仓 100 份，再挂一笔"]
+    await step(bot, NOW + 170_000)
+    trades = bot.sim_trades()
+    assert trades[f"{tid}#6"]["shares"] == 100 and trades[f"{tid}#6"]["status"] == "filled" and trades[tid]["status"] == "resting" and trades[tid]["price"] == 0.59
+    assert len([k for k in trades if k.startswith(tid)]) == 7 and not m.sim_position(trades[tid]) and not m.sim_position(trades[f"{tid}#4"])
     # the exit line never sits above the bar: SIM_EDGE_CENTS=3 with the 5¢ default → 2.5¢
     low = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_EDGE_CENTS": "3"}), m.Store(":memory:"), FM(NOW), None)
     why = low.sim_requote_reason({"maker": True, "side": "up", "price": 0.69, "order": 100, "shares": 0}, hsi(0.70, [("0.69", "300")], [("0.72", "400")], NOW), NOW)

@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.52.0"
+VERSION = "1.52.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -6938,6 +6938,13 @@ def book_crossed(book: PredictBook) -> bool:
     return bool(book.bid and book.ask and float(book.bid[0]) >= float(book.ask[0]) - 1e-9)
 
 
+def sim_position(trade: Mapping) -> bool:
+    """A resting order's filled shares, held to the result. Since 1.52.1 such a position no longer holds its slot: the
+    next order on that market and side rests beside it (the position moves to tid#n), as many times as the group cap
+    and the real-trading limits allow."""
+    return bool(trade.get("maker")) and trade.get("status") == "filled" and float(trade.get("shares") or 0) > 1e-9 and not trade.get("final")
+
+
 def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
     """Why no resting paper order is placed on this book (one-sided, crossed, or a spread wider than ``spread``); ""
     when it may be. ``spread`` 0 (SIM_MAKER_SPREAD_CENTS=0, the default) limits nothing: a one-sided book or any gap is
@@ -11601,7 +11608,7 @@ class Bot:
             return None, (f"{mode}只挂净优势 ≥ {cents(bar)} 的，现 {cents(best.edge)}" if mode
                           else f"净优势 {cents(best.edge)} 低于触发门槛 {cents(bar)}")
         held = trades.get(f"{mk.market}|{'up' if best.side == '涨' else 'down'}|挂")
-        if held is not None:
+        if held is not None and not sim_position(held):  # a position from an earlier order does not hold the slot
             return None, f"已有{sim_status(held)}：{cents(float(held.get('price') or 0))}×{float(held.get('order') or 0):g} 份"
         return best, ""
 
@@ -11625,6 +11632,9 @@ class Bot:
                 maker_text = (f"挂{mk.sides[0 if side == 'up' else 1]} {cents(maker.price)}×{c.sim_shares:g} 份（净优势 {cents(maker.edge)}，"
                               + ("买1 之上 1¢，" if maker.front else "") + (f"排在 {maker.size:g} 份之后）" if maker.size > 0 else "排在最前）"))
                 maker_why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, maker.price, c.sim_shares)
+                held = trades.get(f"{mk.market}|{side}|挂")
+                if held is not None and sim_position(held):
+                    maker_text += f"；已有持仓 {float(held.get('shares') or 0):g} 份，再挂一笔"
             taker_text = taker_why = ""
             if mk.kind not in c.sim_markets:
                 taker_why = "不在 SIM_MARKETS 范围"
@@ -12045,11 +12055,16 @@ class Bot:
             if maker is not None:
                 side = "up" if maker.side == "涨" else "down"
                 tid = f"{mk.market}|{side}|挂"
-                if tid not in trades:  # one position per market, side and way of trading, however long the edge lasts
+                held = trades.get(tid)  # one order per market, side and way at a time; a position from a filled one lets the next in
+                if held is None or sim_position(held):
                     why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, maker.price, self.config.sim_shares)
                     if why:
                         self.sim_note_block(tid, mk, "挂" + mk.sides[0 if side == "up" else 1], maker.price, why, now_ms)
                     else:
+                        if held is not None:  # the position moves to tid#n (it settles there); the slot takes the fresh order
+                            new_tid = self.sim_rekey(tid, held)
+                            trades[new_tid] = trades.pop(tid)
+                            changed = [(new_tid if k == tid else k, t) for k, t in changed]
                         trades[tid] = self.sim_open(mk, side, now_ms, maker=maker)
                         changed.append((tid, trades[tid]))
             bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
