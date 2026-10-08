@@ -655,6 +655,62 @@ async def maker_rules():
     assert tid not in bot.sim_trades()
     await step(bot, NOW + 120_000, m.dataclasses.replace(closed, in_session=True))
     assert bot.sim_trades()[tid]["price"] == 0.57
+    # --- the after-hours maker mode (SIM_MAKER_AFTER_HOURS_CENTS): after the close a daily card is still quoted on, but only
+    # with that much edge (never under the ordinary bar); a cent of slack keeps an order from being withdrawn and re-placed on
+    # a few tenths; the close re-judges every resting order, the open brings back the ordinary bar and exit line
+    assert cfg.sim_maker_after_hours == 0 and bot.control_value("SIM_MAKER_AFTER_HOURS_CENTS") == "0" and "sim_maker_after_hours" not in bot.sim_version()
+    for bad in ({"SIM_MAKER_AFTER_HOURS_CENTS": "51"}, {"SIM_MAKER_AFTER_HOURS_CENTS": "-1"}, {"SIM_MAKER_AFTER_HOURS_CENTS": "x"}):
+        try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
+        except ValueError: pass
+    abot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+                                    "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_EDGE_CENTS": "5", "SIM_MAKER_EXIT_CENTS": "2",
+                                    "SIM_MAKER_AFTER_HOURS_CENTS": "10"}), m.Store(":memory:"), FM(NOW), None)
+    abot.sim_markets = lambda now: world["markets"]
+    abot.predict.market_meta["101"] = (active, time.monotonic())
+    assert abot.config.sim_maker_after_hours == 0.10 and abot.control_value("SIM_MAKER_AFTER_HOURS_CENTS") == "10" and abot.sim_version()["sim_maker_after_hours"] == 0.10
+    assert "盘后挂单模式：指数/个股日涨跌开盘前、收盘后也挂，但只挂净优势 ≥ 10.0¢ 的，降到 9.0¢ 以下撤掉" in abot.sim_text() and "开盘前、收盘后撤掉" not in abot.sim_text()
+    after = lambda fair, at: m.dataclasses.replace(hsi(fair, [("0.57", "150"), ("0.55", "300")], [("0.58", "400")], at), in_session=False)
+    open_ = lambda fair, at: m.dataclasses.replace(after(fair, at), in_session=True)
+    crypto = m.SimMarket("will-bnb-hit-700-or-900", "BNB 先触 700/900", "touch", "BNB", 0.70, book([("0.55", "100")], [("0.58", "100")], NOW), 0.03, "",
+                         ("$900", "$700"), {"deadline": NOW + 3_600_000}, {})  # in_session None: no session, never "after hours"
+    assert abot.sim_after_hours(after(0.70, NOW)) and not abot.sim_after_hours(open_(0.70, NOW)) and not abot.sim_after_hours(crypto)
+    assert abot.sim_maker_bar(after(0.70, NOW)) == 0.10 and abot.sim_maker_bar(open_(0.70, NOW)) == 0.05 and abot.sim_maker_bar(crypto) == 0.05
+    assert abot.sim_maker_reason(after(0.64, NOW), {}, NOW) == (None, "盘后只挂净优势 ≥ 10.0¢ 的，现 7.0¢")  # 7¢ clears the 5¢ bar in session only
+    assert abot.sim_maker_reason(open_(0.64, NOW), {}, NOW)[0] is not None and bot.sim_maker_reason(after(0.70, NOW), {}, NOW) == (None, "标的未开盘，不挂单")
+    await step(abot, NOW, after(0.64, NOW))
+    assert tid not in abot.sim_trades() and [r["maker_why"] for r in abot.sim_checks(NOW)] == ["盘后只挂净优势 ≥ 10.0¢ 的，现 7.0¢"]
+    await step(abot, NOW + 10_000, after(0.70, NOW + 10_000))  # 13¢: placed after hours
+    t = abot.sim_trades()[tid]
+    assert t["price"] == 0.57 and abs(t["edge"] - 0.13) < 1e-9 and t["version"]["sim_maker_after_hours"] == 0.10, t
+    await step(abot, NOW + 20_000, after(0.665, NOW + 20_000))  # 9.5¢: within the cent of slack under the bar, it stands
+    assert abot.sim_trades()[tid]["status"] == "resting"
+    await step(abot, NOW + 30_000, after(0.655, NOW + 30_000))  # 8.5¢: under the after-hours line
+    trades = abot.sim_trades()
+    assert tid not in trades and trades[f"{tid}#1"]["note"] == "撤单：盘后只挂净优势 ≥ 10.0¢ 的，现 8.5¢ 低于盘后撤单线 9.0¢，一份都没成交", trades[f"{tid}#1"]["note"]
+    # in session the ordinary bar: a 7¢ order is placed; the close re-judges it by the after-hours line and withdraws it
+    await step(abot, NOW + 40_000, open_(0.64, NOW + 40_000))
+    assert abot.sim_trades()[tid]["status"] == "resting"
+    await step(abot, NOW + 50_000, after(0.64, NOW + 50_000))
+    trades = abot.sim_trades()
+    assert tid not in trades and trades[f"{tid}#2"]["note"] == "撤单：盘后只挂净优势 ≥ 10.0¢ 的，现 7.0¢ 低于盘后撤单线 9.0¢，一份都没成交"
+    # a 12¢ order survives the close; the open brings back the ordinary exit line (2¢ here): a 3¢ edge stands in session
+    await step(abot, NOW + 60_000, open_(0.69, NOW + 60_000))
+    await step(abot, NOW + 70_000, after(0.69, NOW + 70_000))
+    assert abot.sim_trades()[tid]["status"] == "resting" and "withdrawn" not in abot.sim_trades()[tid]
+    await step(abot, NOW + 80_000, open_(0.60, NOW + 80_000))
+    assert abot.sim_trades()[tid]["status"] == "resting" and len([k for k in abot.sim_trades() if k.startswith(tid)]) == 3
+    # the mode applies whatever SIM_MAKER_SESSION says (盘前盘后也挂 still needs the after-hours edge after hours), and an
+    # after-hours bar under the ordinary one never loosens it
+    obot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+                                    "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_EDGE_CENTS": "5", "SIM_MAKER_SESSION": "off",
+                                    "SIM_MAKER_AFTER_HOURS_CENTS": "10"}), m.Store(":memory:"), FM(NOW), None)
+    obot.predict.market_meta["101"] = (active, time.monotonic())
+    assert obot.sim_maker_reason(after(0.64, NOW), {}, NOW) == (None, "盘后只挂净优势 ≥ 10.0¢ 的，现 7.0¢") and obot.sim_maker_reason(after(0.70, NOW), {}, NOW)[0] is not None
+    lbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_EDGE_CENTS": "10", "SIM_MAKER_AFTER_HOURS_CENTS": "5"}),
+                 m.Store(":memory:"), FM(NOW), None)
+    lbot.predict.market_meta["101"] = (active, time.monotonic())
+    assert lbot.sim_maker_bar(after(0.70, NOW)) == 0.10 and abs(lbot.sim_maker_after_hours_line(after(0.70, NOW)) - 0.09) < 1e-12
+    assert lbot.sim_maker_reason(after(0.66, NOW), {}, NOW) == (None, "盘后只挂净优势 ≥ 10.0¢ 的，现 9.0¢")
     # a part fill, then the 买1 moves: the filled shares stay a position under the slot, the rest lapses, no fresh order
     await step(bot, NOW + 130_000, hsi(0.70, [("0.565", "150")], [("0.57", "40"), ("0.58", "400")], NOW + 130_000))  # a seller at 57¢: 40 presumed
     assert bot.sim_trades()[tid]["shares"] == 40 and bot.sim_trades()[tid]["status"] == "resting"
