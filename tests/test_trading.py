@@ -355,7 +355,7 @@ async def step(bot, at, *markets):
 def make_bot(**env):
     cfg = m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
                              "SIM_WAYS": "both", "SIM_MARKETS": "all", "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT_API_KEY": "k",
-                             "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off",  # resting orders rest as placed, unless a test says otherwise
+                             "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off", "SIM_MAKER_SPREAD_CENTS": "10",  # resting orders rest as placed, unless a test says otherwise
                              "LIVE_MAX_ORDER_USD": "100", "LIVE_MAX_OPEN_USD": "250", "LIVE_MAX_DAILY_LOSS_USD": "50", **env})
     bot = L.LiveBot(cfg, m.Store(":memory:"), FM(NOW), None)
     bot.live.api, bot.live.chain = FakeApi(), FakeChain()

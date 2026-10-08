@@ -340,7 +340,7 @@ async def run():
 
     # --- a crossed snapshot fills no resting paper order ----------------------------------------------------------------------
     scfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
-                              "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off"})  # resting orders rest as placed
+                              "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off", "SIM_MAKER_SPREAD_CENTS": "10"})  # resting orders rest as placed
     sbot = m.Bot(scfg, m.Store(":memory:"), FM(NOW), None)
     world = {"markets": []}
     sbot.sim_markets = lambda now: world["markets"]

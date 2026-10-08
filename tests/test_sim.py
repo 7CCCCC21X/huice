@@ -18,7 +18,8 @@ NOW = BJ(10, 5, 10, 0)
 HSI_SLUG = "hang-seng-index-up-or-down-on-october-5-2026"
 KOSPI_SLUG = "kospi-composite-index-up-or-down-on-october-5-2026"
 CLOSE = BJ(10, 5, 16, 10)
-LEGACY = {"SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off"}  # the resting-order rules off: orders rest as placed
+LEGACY = {"SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off",
+          "SIM_MAKER_SPREAD_CENTS": "10"}  # the resting-order rules off and the old 10¢ spread rule on: orders rest as placed
 FEE = 0.02  # Predict: 2% × min(p, 1 − p) when the market states no rate
 
 # --- settings ----------------------------------------------------------------------------------------------------------
@@ -152,7 +153,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR} and maker["market_id"] == "101"
+                                "beta_error": m.MODEL_BETA_ERROR, "sim_maker_spread": 0.10} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert len(bot.sim_trades()) == 2
@@ -505,6 +506,9 @@ async def run():
     assert m.sim_maker_block(book([("0.55", "100")], [])) == "盘口只有一边" and m.sim_maker_block(book([], [("0.58", "100")])) == "盘口只有一边"
     assert m.sim_maker_block(book([("0.003", "50")], [("0.80", "100")])) == "买卖价差 79.7¢ 超过 10.0¢"
     assert m.sim_maker_block(book([("0.60", "50")], [("0.58", "100")])).startswith("盘口交叉") and not m.book_crossed(book([("0.55", "1")], [("0.58", "1")]))
+    # SIM_MAKER_SPREAD_CENTS=0 (the default since 1.51.0): any gap and a one-sided book are quoted on, a crossed book never
+    assert m.sim_maker_block(book([("0.003", "50")], [("0.80", "100")]), 0) == "" and m.sim_maker_block(book([("0.55", "100")], []), 0) == ""
+    assert m.sim_maker_block(book([("0.60", "50")], [("0.58", "100")]), 0).startswith("盘口交叉") and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).sim_maker_spread == 0
     gbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
                                     "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}), m.Store(":memory:"), FM(NOW), None)
     gbot.sim_markets = lambda now: world["markets"]
@@ -600,8 +604,8 @@ async def browser_check(bot):
 async def maker_rules():
     """The resting-order rules on by default: the valid 买1, following it, the exit line, the session, the freed slot."""
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
-                             "WEB_PORT": "8080", "SIM_WAYS": "maker", "SIM_MARKETS": "all"})
-    assert cfg.sim_maker_min_bid == 100 and cfg.sim_maker_exit == 0.05 and cfg.sim_maker_session
+                             "WEB_PORT": "8080", "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_MAKER_SPREAD_CENTS": "10"})  # the 10¢ spread rule on
+    assert cfg.sim_maker_min_bid == 100 and cfg.sim_maker_exit == 0.05 and cfg.sim_maker_session and cfg.sim_maker_spread == 0.10
     for bad in ({"SIM_MAKER_MIN_BID": "-1"}, {"SIM_MAKER_EXIT_CENTS": "51"}, {"SIM_MAKER_EXIT_CENTS": "x"}):
         try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
         except ValueError: pass
@@ -616,7 +620,7 @@ async def maker_rules():
     b = book([("0.56", "5"), ("0.55", "300"), ("0.53", "500")], [("0.58", "400")])
     assert m.maker_level(b, "up", 100) == (0.55, 300.0) and m.maker_level(b, "up", 0) == (0.56, 5.0) and m.maker_level(b, "up", 400) == (0.53, 500.0)
     assert m.maker_level(b, "up", 1000) is None and m.maker_level(b, "up", 100, own=250.0, own_price=0.55) == (0.53, 500.0)
-    assert m.maker_level(b, "down", 100) == (1 - 0.58, 400.0)  # 跌 bids are 1 − the asks
+    assert m.maker_level(b, "down", 100) == (0.42, 400.0)  # 跌 bids are 1 − the asks, as a clean price
     # a 5-share 买1 is not followed: the order joins the 300 at 55¢ behind them
     await step(bot, NOW, hsi(0.70, [("0.56", "5"), ("0.55", "300")], [("0.58", "400")], NOW))
     tid = f"{HSI_SLUG}|up|挂"
@@ -724,12 +728,13 @@ async def maker_rules():
     tight = lambda fair, at, asks=(("0.58", "400"),): hsi(fair, [("0.57", "150"), ("0.55", "300")], list(asks), at)
     assert bot.sim_maker_reason(wide(0.38, NOW), {}, NOW) == (None, "买卖价差 33.0¢ 超过 10.0¢")  # the ordinary rule: nobody sells into it
     dbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
-                                    "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_MAKER_DEEP_CENTS": "25"}), m.Store(":memory:"), FM(NOW), None)
+                                    "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_SPREAD_CENTS": "10"}),
+                 m.Store(":memory:"), FM(NOW), None)
     dbot.sim_markets = lambda now: world["markets"]
     dbot.predict.market_meta["101"] = (active, time.monotonic())
     assert dbot.config.sim_maker_deep == 0.25 and dbot.control_value("SIM_MAKER_DEEP_CENTS") == "25" and dbot.sim_version()["sim_maker_deep"] == 0.25
     assert "挂单平时只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后" in dbot.sim_text() and "挂单平时" not in bot.sim_text()
-    assert "低价挂单模式：价差超过 10¢ 或单边的盘口也挂，挂在有效买1 之上 1¢ 优先成交，但只挂按挂价算净优势 ≥ 25.0¢ 的，这种单净优势降到 24.0¢ 以下撤掉" in dbot.sim_text()
+    assert "低价挂单模式：按挂价算净优势 ≥ 25.0¢ 的单挂在有效买1 之上 1¢ 优先成交，价差超过上限的盘口也挂、只挂这种单，这种单净优势降到 24.0¢ 以下撤掉" in dbot.sim_text()
     assert dbot.sim_deep_book(wide(0.38, NOW)) and not dbot.sim_deep_book(tight(0.70, NOW)) and not bot.sim_deep_book(wide(0.38, NOW))
     assert dbot.sim_maker_mode(wide(0.38, NOW)) == (0.25, "价差 33.0¢ 的盘口", "低价挂单撤单线") and dbot.sim_maker_mode(tight(0.70, NOW)) == (0.10, "", "撤单线")
     assert abs(dbot.sim_maker_line(wide(0.38, NOW)) - 0.24) < 1e-12 and dbot.sim_maker_line(tight(0.70, NOW)) == 0.05
@@ -743,9 +748,9 @@ async def maker_rules():
     assert dbot.sim_maker_reason(wide(0.38, NOW, asks=()), {}, NOW)[0] is not None and dbot.sim_maker_mode(wide(0.38, NOW, asks=()))[1] == "单边盘口"
     assert dbot.sim_maker_reason(wide(0.38, NOW, bids=(("0.40", "300"),)), {}, NOW)[1].startswith("盘口交叉")  # a crossed book: never
     world["markets"] = [wide(0.38, NOW)]
-    assert [r["maker"] for r in dbot.sim_checks(NOW)] == ["挂涨 6.0¢×100 份（净优势 32.0¢，排在最前）"]
+    assert [r["maker"] for r in dbot.sim_checks(NOW)] == ["挂涨 6.0¢×100 份（净优势 32.0¢，买1 之上 1¢，排在最前）"]
     world["markets"] = [thin]
-    assert [r["maker"] for r in dbot.sim_checks(NOW)] == ["挂涨 6.0¢×100 份（净优势 32.0¢，排在 20 份之后）"]
+    assert [r["maker"] for r in dbot.sim_checks(NOW)] == ["挂涨 6.0¢×100 份（净优势 32.0¢，买1 之上 1¢，排在 20 份之后）"]
     await step(dbot, NOW, wide(0.38, NOW))
     t = dbot.sim_trades()[tid]
     assert t["price"] == 0.06 and t["queue_ahead"] == 0 and t["deep"] is True and abs(t["edge"] - 0.32) < 1e-9 and t["version"]["sim_maker_deep"] == 0.25, t
@@ -774,8 +779,8 @@ async def maker_rules():
     await step(dbot, NOW + 50_000, tight(0.61, NOW + 50_000, asks=(("0.90", "400"),)))  # 4¢: the ordinary exit line
     assert tid not in dbot.sim_trades() and dbot.sim_trades()[f"{tid}#3"]["note"].startswith("撤单：净优势降到 4.0¢，低于撤单线 5.0¢")
     # after hours with both modes the higher bar wins (the after-hours 30¢ here) and the order check names both
-    bbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_AFTER_HOURS_CENTS": "30"}),
-                 m.Store(":memory:"), FM(NOW), None)
+    bbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_AFTER_HOURS_CENTS": "30",
+                                    "SIM_MAKER_SPREAD_CENTS": "10"}), m.Store(":memory:"), FM(NOW), None)
     bbot.predict.market_meta["101"] = (active, time.monotonic())
     closed_wide = m.dataclasses.replace(wide(0.33, NOW), in_session=False)
     assert bbot.sim_maker_mode(closed_wide) == (0.30, "盘后、价差 33.0¢ 的盘口", "盘后低价挂单撤单线") and abs(bbot.sim_maker_line(closed_wide) - 0.29) < 1e-12
@@ -783,7 +788,8 @@ async def maker_rules():
     assert bbot.sim_maker_reason(m.dataclasses.replace(closed_wide, fair_up=0.36), {}, NOW)[0] is not None  # 30¢ clears both
     # each mode can be limited to chosen markets (the detail chips under its card): elsewhere it is as if the mode were off
     nbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_MARKETS": "kospi",
-                                    "SIM_MAKER_AFTER_HOURS_CENTS": "10", "SIM_MAKER_AFTER_HOURS_MARKETS": "KOSPI,SSE"}), m.Store(":memory:"), FM(NOW), None)
+                                    "SIM_MAKER_AFTER_HOURS_CENTS": "10", "SIM_MAKER_AFTER_HOURS_MARKETS": "KOSPI,SSE", "SIM_MAKER_SPREAD_CENTS": "10"}),
+                 m.Store(":memory:"), FM(NOW), None)
     nbot.predict.market_meta["101"] = (active, time.monotonic())
     assert nbot.control_value("SIM_MAKER_DEEP_MARKETS") == "KOSPI" and nbot.control_value("SIM_MAKER_AFTER_HOURS_MARKETS") == "KOSPI,SSE"
     assert not nbot.sim_deep_book(wide(0.38, NOW)) and nbot.sim_maker_reason(wide(0.38, NOW), {}, NOW) == (None, "买卖价差 33.0¢ 超过 10.0¢（低价挂单模式未选这个市场）")
@@ -800,6 +806,36 @@ async def maker_rules():
     assert "低价挂单模式已设置，但现在只吃单，不会挂单" in tbot.sim_text()
     plain = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}), m.Store(":memory:"), FM(NOW), None)
     assert plain.sim_maker_reason(wide(0.38, NOW), {}, NOW) == (None, "SIM_WAYS=taker：只吃单") and "不会挂单" not in plain.sim_text()
+    # --- no spread limit by default (SIM_MAKER_SPREAD_CENTS=0): the 10-08 ask "价差大也挂，比如两边都是 5，公平价 40" — bids 5¢ on
+    # both sides (涨 5¢×300; 跌 5¢ = a 95¢ ask ×200), fair 40¢: the 跌 bid is joined at 5¢ with 55¢ of edge; the deep-bid mode
+    # then puts it a cent in front, on this and any book, when the edge there clears its bar
+    both5 = lambda **env: m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", **env}), m.Store(":memory:"), FM(NOW), None)
+    ubot = both5()
+    ubot.predict.market_meta["101"] = (active, time.monotonic())
+    five = m.dataclasses.replace(hsi(0.40, [("0.05", "300")], [("0.95", "200")], NOW), in_session=True)
+    assert ubot.config.sim_maker_spread == 0 and m.sim_maker_block(five.book, 0) == "" and not ubot.sim_deep_book(five)
+    r = ubot.sim_maker_reason(five, {}, NOW)[0]
+    assert r is not None and (r.side, r.price, r.size, r.front) == ("跌", 0.05, 200.0, False) and abs(r.edge - 0.55) < 1e-9, r
+    assert ubot.sim_maker_reason(wide(0.38, NOW, asks=()), {}, NOW)[0].price == 0.05  # one-sided: joined too
+    assert "挂单不限价差，单边盘口也挂，跟有效买1（SIM_MAKER_SPREAD_CENTS=0）" in ubot.sim_text() and "sim_maker_spread" not in ubot.sim_version()
+    fbot = both5(SIM_MAKER_DEEP_CENTS="25")
+    fbot.predict.market_meta["101"] = (active, time.monotonic())
+    r = fbot.sim_maker_reason(five, {}, NOW)[0]
+    assert (r.side, r.price, r.size, r.front) == ("跌", 0.06, 0.0, True) and abs(r.edge - 0.54) < 1e-9, r  # a cent in front: 54¢ still clears 25¢
+    r = fbot.sim_maker_reason(tight(0.70, NOW, asks=(("0.60", "400"),)), {}, NOW)[0]  # 买1 57¢×150, 13¢ of edge: too little for the cent, joins
+    assert (r.price, r.size, r.front) == (0.57, 150.0, False), r
+    r = fbot.sim_maker_reason(tight(0.90, NOW, asks=(("0.60", "400"),)), {}, NOW)[0]  # 33¢ of edge at 57¢: a cent in front at 58¢
+    assert (r.price, r.size, r.front) == (0.58, 0.0, True) and abs(r.edge - 0.32) < 1e-9, r
+    assert fbot.sim_maker_reason(tight(0.90, NOW), {}, NOW)[0].price == 0.57  # the ask sits at 58¢: never at the ask, joins
+    fbot.sim_markets = lambda now: world["markets"]
+    await step(fbot, NOW, five)
+    t = fbot.sim_trades()[f"{HSI_SLUG}|down|挂"]
+    assert t["price"] == 0.06 and t["deep"] is True and t["queue_ahead"] == 0 and abs(t["edge"] - 0.54) < 1e-9, t
+    assert "低价挂单模式：按挂价算净优势 ≥ 25.0¢ 的单挂在有效买1 之上 1¢ 优先成交，这种单净优势降到 24.0¢ 以下撤掉" in fbot.sim_text()
+    sbot2 = both5(SIM_MAKER_SPREAD_CENTS="10")
+    sbot2.predict.market_meta["101"] = (active, time.monotonic())
+    assert sbot2.sim_maker_reason(five, {}, NOW) == (None, "买卖价差 90.0¢ 超过 10.0¢") and sbot2.sim_version()["sim_maker_spread"] == 0.10
+    assert "挂单只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后" in sbot2.sim_text()
     # a part fill, then the 买1 moves: the filled shares stay a position under the slot, the rest lapses, no fresh order
     await step(bot, NOW + 130_000, hsi(0.70, [("0.565", "150")], [("0.57", "40"), ("0.58", "400")], NOW + 130_000))  # a seller at 57¢: 40 presumed
     assert bot.sim_trades()[tid]["shares"] == 40 and bot.sim_trades()[tid]["status"] == "resting"
