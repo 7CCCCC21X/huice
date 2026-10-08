@@ -709,8 +709,59 @@ async def maker_rules():
     lbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_EDGE_CENTS": "10", "SIM_MAKER_AFTER_HOURS_CENTS": "5"}),
                  m.Store(":memory:"), FM(NOW), None)
     lbot.predict.market_meta["101"] = (active, time.monotonic())
-    assert lbot.sim_maker_bar(after(0.70, NOW)) == 0.10 and abs(lbot.sim_maker_after_hours_line(after(0.70, NOW)) - 0.09) < 1e-12
+    assert lbot.sim_maker_bar(after(0.70, NOW)) == 0.10 and abs(lbot.sim_maker_line(after(0.70, NOW)) - 0.09) < 1e-12
     assert lbot.sim_maker_reason(after(0.66, NOW), {}, NOW) == (None, "盘后只挂净优势 ≥ 10.0¢ 的，现 9.0¢")
+    # --- the deep-bid mode (SIM_MAKER_DEEP_CENTS): a wide or one-sided book, where no ordinary resting order goes, is quoted
+    # on at the valid 买1 when the edge is that large — the 10-08 book: fair 38¢, bids 5¢×300 / 1¢×1000, asks 38¢×1 / 40¢×100 …
+    assert cfg.sim_maker_deep == 0 and bot.control_value("SIM_MAKER_DEEP_CENTS") == "0" and "sim_maker_deep" not in bot.sim_version()
+    for bad in ({"SIM_MAKER_DEEP_CENTS": "91"}, {"SIM_MAKER_DEEP_CENTS": "-1"}):
+        try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
+        except ValueError: pass
+    wide = lambda fair, at, bids=(("0.05", "300"), ("0.01", "1000")), asks=(("0.38", "1"), ("0.40", "100"), ("0.98", "500"), ("0.99", "1200")): \
+        m.dataclasses.replace(hsi(fair, list(bids), list(asks), at), in_session=True)
+    tight = lambda fair, at, asks=(("0.58", "400"),): hsi(fair, [("0.57", "150"), ("0.55", "300")], list(asks), at)
+    assert bot.sim_maker_reason(wide(0.38, NOW), {}, NOW) == (None, "买卖价差 33.0¢ 超过 10.0¢")  # the ordinary rule: nobody sells into it
+    dbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+                                    "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_MAKER_DEEP_CENTS": "25"}), m.Store(":memory:"), FM(NOW), None)
+    dbot.sim_markets = lambda now: world["markets"]
+    dbot.predict.market_meta["101"] = (active, time.monotonic())
+    assert dbot.config.sim_maker_deep == 0.25 and dbot.control_value("SIM_MAKER_DEEP_CENTS") == "25" and dbot.sim_version()["sim_maker_deep"] == 0.25
+    assert "挂单平时只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后" in dbot.sim_text() and "挂单平时" not in bot.sim_text()
+    assert "低价挂单模式：价差超过 10¢ 或单边的盘口也跟有效买1 挂，但只挂净优势 ≥ 25.0¢ 的，这种单净优势降到 24.0¢ 以下撤掉" in dbot.sim_text()
+    assert dbot.sim_deep_book(wide(0.38, NOW).book) and not dbot.sim_deep_book(tight(0.70, NOW).book) and not bot.sim_deep_book(wide(0.38, NOW).book)
+    assert dbot.sim_maker_mode(wide(0.38, NOW)) == (0.25, "价差 33.0¢ 的盘口", "低价挂单撤单线") and dbot.sim_maker_mode(tight(0.70, NOW)) == (0.10, "", "撤单线")
+    assert abs(dbot.sim_maker_line(wide(0.38, NOW)) - 0.24) < 1e-12 and dbot.sim_maker_line(tight(0.70, NOW)) == 0.05
+    r = dbot.sim_maker_reason(wide(0.38, NOW), {}, NOW)[0]
+    assert r is not None and (r.side, r.price, r.size) == ("涨", 0.05, 300.0) and abs(r.edge - 0.33) < 1e-9, r  # joins the 300 at 5¢: 33¢ of edge
+    assert dbot.sim_maker_reason(wide(0.29, NOW), {}, NOW) == (None, "价差 33.0¢ 的盘口只挂净优势 ≥ 25.0¢ 的，现 24.0¢")
+    assert dbot.sim_maker_reason(wide(0.38, NOW, asks=()), {}, NOW)[0] is not None and dbot.sim_maker_mode(wide(0.38, NOW, asks=()))[1] == "单边盘口"
+    assert dbot.sim_maker_reason(wide(0.38, NOW, bids=(("0.40", "300"),)), {}, NOW)[1].startswith("盘口交叉")  # a crossed book: never
+    world["markets"] = [wide(0.38, NOW)]
+    assert [r["maker"] for r in dbot.sim_checks(NOW)] == ["挂涨 5.0¢×100 份（净优势 33.0¢，排在 300 份之后）"]
+    await step(dbot, NOW, wide(0.38, NOW))
+    t = dbot.sim_trades()[tid]
+    assert t["price"] == 0.05 and t["queue_ahead"] == 300 and t["deep"] is True and abs(t["edge"] - 0.33) < 1e-9 and t["version"]["sim_maker_deep"] == 0.25, t
+    await step(dbot, NOW + 10_000, wide(0.295, NOW + 10_000))  # 24.5¢: within the cent of slack under the bar
+    assert dbot.sim_trades()[tid]["status"] == "resting"
+    await step(dbot, NOW + 20_000, wide(0.28, NOW + 20_000))  # 23¢: under the deep-bid line
+    trades = dbot.sim_trades()
+    assert tid not in trades and trades[f"{tid}#1"]["note"] == "撤单：价差 33.0¢ 的盘口只挂净优势 ≥ 25.0¢ 的，现 23.0¢ 低于低价挂单撤单线 24.0¢，一份都没成交", trades[f"{tid}#1"]["note"]
+    # a tight book keeps the ordinary bar and exit line, and an order placed there stands when the book thins out later
+    await step(dbot, NOW + 30_000, tight(0.70, NOW + 30_000))
+    t = dbot.sim_trades()[tid]
+    assert t["price"] == 0.57 and "deep" not in t and abs(t["edge"] - 0.13) < 1e-9
+    await step(dbot, NOW + 40_000, tight(0.70, NOW + 40_000, asks=(("0.90", "400"),)))  # the asks pulled: a 33¢ spread now
+    assert dbot.sim_trades()[tid]["status"] == "resting" and "withdrawn" not in dbot.sim_trades()[tid]
+    await step(dbot, NOW + 50_000, tight(0.61, NOW + 50_000, asks=(("0.90", "400"),)))  # 4¢: the ordinary exit line
+    assert tid not in dbot.sim_trades() and dbot.sim_trades()[f"{tid}#2"]["note"].startswith("撤单：净优势降到 4.0¢，低于撤单线 5.0¢")
+    # after hours with both modes the higher bar wins (the after-hours 30¢ here) and the order check names both
+    bbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_AFTER_HOURS_CENTS": "30"}),
+                 m.Store(":memory:"), FM(NOW), None)
+    bbot.predict.market_meta["101"] = (active, time.monotonic())
+    closed_wide = m.dataclasses.replace(wide(0.33, NOW), in_session=False)
+    assert bbot.sim_maker_mode(closed_wide) == (0.30, "盘后、价差 33.0¢ 的盘口", "盘后低价挂单撤单线") and abs(bbot.sim_maker_line(closed_wide) - 0.29) < 1e-12
+    assert bbot.sim_maker_reason(closed_wide, {}, NOW) == (None, "盘后、价差 33.0¢ 的盘口只挂净优势 ≥ 30.0¢ 的，现 28.0¢")
+    assert bbot.sim_maker_reason(m.dataclasses.replace(closed_wide, fair_up=0.36), {}, NOW)[0] is not None  # 31¢ clears both
     # a part fill, then the 买1 moves: the filled shares stay a position under the slot, the rest lapses, no fresh order
     await step(bot, NOW + 130_000, hsi(0.70, [("0.565", "150")], [("0.57", "40"), ("0.58", "400")], NOW + 130_000))  # a seller at 57¢: 40 presumed
     assert bot.sim_trades()[tid]["shares"] == 40 and bot.sim_trades()[tid]["status"] == "resting"

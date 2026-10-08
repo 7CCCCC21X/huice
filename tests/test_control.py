@@ -109,6 +109,7 @@ async def run():
     assert s["SIM_TAKER_SESSION"]["options"] == [["off", "全天都吃单"], ["on", "只在开盘时段吃单"]] and s["LIVE"]["options"][1][0] == "pause" and s["LIVE_NOTIFY"]["group"] == "高级"
     assert s["SIM_GROUP_USD"]["zero"] == "不限" and s["LIVE_MAX_DAILY_LOSS_USD"]["presets"][0] == "0"
     assert s["SIM_MAKER_AFTER_HOURS_CENTS"]["zero"] == "关" and s["SIM_MAKER_AFTER_HOURS_CENTS"]["value"] == "0" and "10" in s["SIM_MAKER_AFTER_HOURS_CENTS"]["presets"]
+    assert s["SIM_MAKER_DEEP_CENTS"]["zero"] == "关" and s["SIM_MAKER_DEEP_CENTS"]["value"] == "0" and "25" in s["SIM_MAKER_DEEP_CENTS"]["presets"]
     assert s["SIM_SKIP"]["kind"] == "detail" and s["SIM_SKIP"]["value"] == "" and s["SIM_SKIP"]["group"] == "策略"
     assert isinstance(data["catalog"], list) and all({"kind", "key", "name", "skipped"} <= set(r) for r in data["catalog"]) and "展开详细选项" in body.decode()
     # every setting has a widget, every group is one the page knows, and every preset / option is a value the Config accepts
