@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.55.0"
+VERSION = "1.55.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -461,6 +461,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_MAKER_POINTS", "只挂积分已激活的市场", "开 = 挂单只挂 Predict 积分正在发放（积分已激活）的市场，积分停了就撤；积分状态未知时不挂"),
     ("PREDICT_MIN_EDGE_CENTS", "卡片建议至少要有的净优势（¢）", "0～50，模型误差之上"),
     ("PREDICT_TRADE_USD", "卡片吃单按多少美元走盘口", "1～1000000"),
+    ("SIM_SECONDS", "检查订单的频率（秒）", "3～60：每隔这么多秒看一轮盘口——决定挂单 / 吃单 / 撤单，并读回真实订单的状态（成交、撤单）；越小反应越快、请求越多"),
+    ("PREDICT_POLL_SECONDS", "盘口刷新间隔（秒）", "3～3600：每隔这么多秒读一遍 Predict 的订单簿；设得比检查频率还短没有意义，太短会被 Predict 限流（429，之后 20 秒内不再请求）"),
     ("LIVE_MAX_ORDER_USD", "真实交易单笔上限（$）", "1～1000000"),
     ("LIVE_MAX_OPEN_USD", "持仓 + 挂单上限（$）", "1～100000000"),
     ("LIVE_MAX_DAILY_LOSS_USD", "当日已结算亏损停机线（$）", "0 = 不限"),
@@ -510,7 +512,7 @@ class Config:
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
-    predict_poll: int = 15   # seconds between orderbook refreshes
+    predict_poll: int = 10   # seconds between orderbook refreshes (PREDICT_POLL_SECONDS)
     predict_ref: str = "B00EA"  # referral code appended to Predict market links (?ref=); empty = none
     predict_fee_bps: int = 200   # taker fee rate when a market states none (Predict: 2% × min(p, 1 − p); makers 0)
     predict_trade_usd: float = 100.0  # trade size a taker edge is priced for (walks the book's depth)
@@ -518,6 +520,7 @@ class Config:
     sim: bool = True         # paper trading: a simulated buy whenever a suggestion's net edge reaches sim_edge
     sim_edge: float = 0.10   # net edge (per $1 share) that triggers a simulated buy
     sim_shares: float = 100.0  # shares per simulated buy
+    sim_seconds: int = 5     # seconds between the trader's looks: the books judged, orders placed / withdrawn, real orders read back (SIM_SECONDS)
     sim_ways: str = "taker"  # which suggestions it takes: taker (吃单), maker (挂单) or both
     sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
     sim_skip: frozenset = frozenset()              # SIM_SKIP: market keys (HSI, UNITREEUSDT, BNB…) left out within those kinds (the page's detail chips)
@@ -657,12 +660,13 @@ class Config:
             predict=e.get("PREDICT", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
-            predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 15, 5, 3600),
+            predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 10, 3, 3600),
             predict_ref=parse_ref_code(e.get("PREDICT_REF_CODE", "B00EA")),
             predict_fee_bps=bounded_int(e, "PREDICT_FEE_BPS", 200, 0, 1000),
             predict_trade_usd=parse_bounded(e, "PREDICT_TRADE_USD", "100", 1, 1_000_000),
             predict_min_edge=parse_bounded(e, "PREDICT_MIN_EDGE_CENTS", "2", 0, 50) / 100,
             sim=e.get("SIM", "on").strip().lower() not in {"off", "0", "false", "no"},
+            sim_seconds=bounded_int(e, "SIM_SECONDS", 5, 3, 60),
             sim_edge=parse_bounded(e, "SIM_EDGE_CENTS", "10", 0.5, 50) / 100,
             sim_shares=parse_bounded(e, "SIM_SHARES", "100", 1, 1_000_000),
             sim_ways=sim_ways, sim_markets=sim_markets, sim_skip=sim_skip,
@@ -6932,6 +6936,8 @@ CONTROL_FORMS: dict[str, dict] = {
     "LIVE_MAX_DAILY_LOSS_USD": {"kind": "number", "group": "风控", "presets": ["0", "50", "100", "200", "500"], "unit": "$", "zero": "不限"},
     "PREDICT_MIN_EDGE_CENTS": {"kind": "number", "group": "高级", "presets": ["0", "1", "2", "3", "5"], "unit": "¢"},
     "PREDICT_TRADE_USD": {"kind": "number", "group": "高级", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
+    "SIM_SECONDS": {"kind": "number", "group": "高级", "presets": ["3", "5", "10", "15"], "unit": "秒"},
+    "PREDICT_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["3", "5", "10", "15", "30"], "unit": "秒"},
     "LIVE_TAKER_WAIT_SECONDS": {"kind": "number", "group": "高级", "presets": ["15", "30", "60", "120"], "unit": "秒"},
     "LIVE_RETRY_SECONDS": {"kind": "number", "group": "高级", "presets": ["60", "300", "600", "1800"], "unit": "秒"},
     "LIVE_AUTO_REDEEM": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
@@ -8568,7 +8574,7 @@ button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
 <div id="recbody"><div id="simline" class="mut"></div><div class="tabs" id="rectabs"></div>
 <div class="row"><input type="text" id="recq" placeholder="按市场筛选，如 海力士 / BTC" autocomplete="off"></div><div id="orders"></div></div></section>
 <section class="card" id="checksbox"><div class="hd"><h2>挂单检查 <span class="mut" id="checksn"></span></h2><button id="foldchecks" class="lnk">收起</button></div>
-<div id="checksbody"><p class="mut">每个市场现在会挂什么、为什么不挂；吃单的封顶价和封顶价之下能买到多少。每 10 秒看一轮：盘口每 15 秒刷新，积分和费率每 10 分钟读一次。</p><div id="checks"></div></div></section>
+<div id="checksbody"><p class="mut" id="checksnote">每个市场现在会挂什么、为什么不挂；吃单的封顶价和封顶价之下能买到多少。</p><div id="checks"></div></div></section>
 <section class="card" id="posbox"><div class="hd"><h2>Predict 持仓</h2><button id="foldpos" class="lnk">收起</button></div><div id="posbody"><div id="positions" class="mut"></div></div></section>
 <section class="card" id="errbox"><div class="hd"><h2>最近错误</h2><button id="folderr" class="lnk">收起</button></div><div id="errbody"><pre id="errors"></pre></div></section>
 </div><div id="toast"></div>
@@ -8609,7 +8615,7 @@ function render(){
   renderLive(L,liveOn);
   renderSettings();renderQuick();
   $("simline").textContent="记录 "+data.sim.trades+" 笔｜已结算 "+data.sim.settled+" 笔，盈亏 "+money(data.sim.pnl)+"｜持仓 "+data.sim.open+"｜挂单中 "+data.sim.resting+"（成本 $"+data.sim.open_cost.toFixed(2)+"）";
-  renderRecords();renderFolds();renderBar();
+  renderRecords();renderFolds();renderBar();renderCadence(data.cadence);
   const cb=$("checks");cb.replaceChildren();
   if(data.checks&&data.checks.length){const t=el("table");const h=el("tr");["市场","公平价 · 买1 / 卖1","开盘","积分","挂单","吃单"].forEach(x=>h.append(el("th","",x)));t.append(h);
     const lvl=x=>x?(x[0]*100).toFixed(1)+"¢×"+x[1]:"—";
@@ -8688,6 +8694,7 @@ function renderSettings(){
   GROUPS.forEach(([g,title])=>{if(g==="高级"&&!adv)return;const items=data.settings.filter(s=>s.group===g);if(!items.length)return;
     box.append(el("div","grp",title));items.forEach(s=>{const k=card(s);if(k)box.append(k)})})}
 $("fold").addEventListener("click",()=>{folded=!folded;try{localStorage.setItem("ctlfold",folded?"1":"0")}catch(e){}renderSettings()});
+function renderCadence(c){if(!c)return;$("checksnote").textContent="每个市场现在会挂什么、为什么不挂；吃单的封顶价和封顶价之下能买到多少。每 "+c.sim+" 秒看一轮：盘口每 "+c.book+" 秒刷新，积分和费率每 10 分钟读一次（参数里的“检查订单的频率”“盘口刷新间隔”可改）。"}
 function renderChecksFold(){$("checksbody").style.display=checksFolded?"none":"";$("foldchecks").textContent=checksFolded?"展开":"收起"}
 $("foldchecks").addEventListener("click",()=>{checksFolded=!checksFolded;try{localStorage.setItem("ctlchecks",checksFolded?"1":"0")}catch(e){}renderChecksFold()});
 // the other sections fold the same way, each remembered on its own
@@ -8767,7 +8774,7 @@ $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if
   else act({action:a})});
 $("reset").addEventListener("click",()=>{if(confirm("清除网页上保存的全部设置，恢复为环境变量？"))act({action:"reset"})});
 $("reload").addEventListener("click",load);
-load();setInterval(()=>{if(!busy&&document.visibilityState==="visible")load()},10000);
+load();setInterval(()=>{if(!busy&&document.visibilityState==="visible")load()},5000);
 </script></body></html>
 """
 
@@ -11224,7 +11231,6 @@ class Bot:
         meta = (self.predict.market_meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
         return "RESOLVED" in str(meta.get("status", "")).upper()
 
-    SIM_SECONDS = 10                  # the paper trader looks at the books this often (they refresh every 15 s)
     SIM_SETTLE_MS = 60 * 60_000       # a daily market is settled this long after its close: the official close is in
 
     def sim_trades(self) -> dict[str, dict]:
@@ -12234,7 +12240,7 @@ class Bot:
         SIM_MAKER_SPREAD, fills only as far as sellers show at or through its price, and is withdrawn once the trader no
         longer places such orders. Every position is pre-settled on the bot's own data, then confirmed (or corrected) by
         Predict's result. Nothing is ever sent to Predict."""
-        if time.monotonic() - self.sim_ran < self.SIM_SECONDS:
+        if time.monotonic() - self.sim_ran < self.config.sim_seconds:
             return False
         self.sim_ran = time.monotonic()
         self.sim_note_closes()
@@ -13483,6 +13489,7 @@ class Bot:
     def apply_config(self, config: Config) -> None:
         """A changed configuration takes effect: every loop reads self.config at use."""
         self.config = config
+        self.predict.config = config  # the orderbook feed keeps its own reference (PREDICT_POLL_SECONDS)
 
     def control_value(self, key: str) -> str:
         """A control setting's value in force, as the variable would be written."""
@@ -13497,7 +13504,7 @@ class Bot:
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
                   "SIM_MAKER_SPREAD_CENTS": f"{c.sim_maker_spread * 100:g}", "SIM_MAKER_DEEP_ONLY": flag(c.sim_maker_deep_only),
                   "SIM_MAKER_AFTER_HOURS_MARKETS": ",".join(sorted(c.sim_maker_after_hours_markets)), "SIM_MAKER_DEEP_MARKETS": ",".join(sorted(c.sim_maker_deep_markets)),
-                  "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}",
+                  "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}", "SIM_SECONDS": str(c.sim_seconds), "PREDICT_POLL_SECONDS": str(c.predict_poll),
                   "PREDICT_TRADE_USD": f"{c.predict_trade_usd:g}", "LIVE_MAX_ORDER_USD": f"{c.live_max_order_usd:g}",
                   "LIVE_MAX_OPEN_USD": f"{c.live_max_open_usd:g}", "LIVE_MAX_DAILY_LOSS_USD": f"{c.live_max_daily_loss_usd:g}",
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait),
@@ -13542,6 +13549,7 @@ class Bot:
                               **CONTROL_FORMS.get(key, {"kind": "number", "group": "高级", "presets": [], "unit": ""})}
                              for key, label, hint in CONTROL_KEYS],
                 "scope": sim_scope(self.config), "checks": self.sim_checks(now_ms), "catalog": self.sim_catalog(now_ms),
+                "cadence": {"sim": self.config.sim_seconds, "book": self.config.predict_poll},
                 "records": self.control_records(self.sim_trades()),
                 "sim": {"trades": stats["trades"], "settled": stats["settled"], "pnl": stats["pnl"], "open": stats["open"],
                         "resting": stats["resting"], "open_cost": stats["open_cost"]}}

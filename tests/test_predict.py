@@ -7,7 +7,12 @@ D = m.D
 
 # config + slugs
 c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"})
-assert c.predict and c.predict_poll == 15 and c.predict_api_key == "" and c.predict_ref == "B00EA"
+assert c.predict and c.predict_poll == 10 and c.predict_api_key == "" and c.predict_ref == "B00EA" and c.sim_seconds == 5
+assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_SECONDS": "60", "PREDICT_POLL_SECONDS": "3"}).sim_seconds == 60
+assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_SECONDS": "60", "PREDICT_POLL_SECONDS": "3"}).predict_poll == 3
+for bad in ({"SIM_SECONDS": "2"}, {"SIM_SECONDS": "61"}, {"PREDICT_POLL_SECONDS": "2"}):
+    try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
+    except ValueError as error: assert "必须在" in str(error), (bad, error)
 assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_REF_CODE": ""}).predict_ref == ""
 assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_REF_CODE": " AB12 "}).predict_ref == "AB12"
 try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_REF_CODE": "a&b=c"}); assert False

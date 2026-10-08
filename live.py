@@ -884,7 +884,7 @@ core.sim_status = sim_status  # the base class looks the function up by name at 
 
 class LiveBot(core.Bot):
     """The paper trader, with every decision sent to Predict for real (see the module docstring)."""
-    LIVE_SYNC_SECONDS = 10      # open live orders are read back from Predict this often (the paper step's cadence)
+    # open live orders are read back from Predict on every paper step (SIM_SECONDS)
     LIVE_BALANCE_SECONDS = 60   # the USDT / BNB balances are re-read this often while trading
     LIVE_APPROVALS_SECONDS = 600
     LIVE_REDEEM_SECONDS = 600   # resolved positions are looked for this often
@@ -1128,7 +1128,7 @@ class LiveBot(core.Bot):
 
     # --- the step: prefetch, decide (the paper trader), place, read back --------------------------------------------
     async def sim_step(self, now_ms: int) -> Any:
-        if time.monotonic() - self.sim_ran < self.SIM_SECONDS:
+        if time.monotonic() - self.sim_ran < self.config.sim_seconds:
             return False
         try:
             if self.config.live_mode != "off":

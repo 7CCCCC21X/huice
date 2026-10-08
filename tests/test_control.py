@@ -137,6 +137,9 @@ async def run():
     assert s["SIM_TAKER_AFTER_HOURS_CENTS"]["zero"] == "关" and s["SIM_TAKER_AFTER_HOURS_CENTS"]["value"] == "0" and s["SIM_AFTER_HOURS_MAX_PRICE_CENTS"]["value"] == "60" and s["SIM_AFTER_HOURS_MAX_PRICE_CENTS"]["zero"] == "不限"
     assert s["SIM_MAKER_DEEP_ONLY"]["options"] == [["off", "两种都挂"], ["on", "只挂低价挂单"]] and s["SIM_MAKER_DEEP_ONLY"]["value"] == "off"
     assert s["SIM_MAKER_SPREAD_CENTS"]["zero"] == "不限" and s["SIM_MAKER_SPREAD_CENTS"]["value"] == "0" and "10" in s["SIM_MAKER_SPREAD_CENTS"]["presets"]
+    assert s["SIM_SECONDS"]["kind"] == "number" and s["SIM_SECONDS"]["group"] == "高级" and s["SIM_SECONDS"]["value"] == "5" and s["SIM_SECONDS"]["unit"] == "秒" and "3" in s["SIM_SECONDS"]["presets"]
+    assert s["PREDICT_POLL_SECONDS"]["kind"] == "number" and s["PREDICT_POLL_SECONDS"]["value"] == "10" and "5" in s["PREDICT_POLL_SECONDS"]["presets"] and data["cadence"] == {"sim": 5, "book": 10}
+    assert 'id="checksnote"' in body.decode() and "renderCadence" in body.decode()
     assert s["SIM_MAKER_DEEP_MARKETS"]["kind"] == "detail" and s["SIM_MAKER_DEEP_MARKETS"]["value"] == "" and s["SIM_MAKER_AFTER_HOURS_MARKETS"]["kind"] == "detail"
     assert "全部市场" in body.decode() and ".sw.on" in body.decode() and "绿色 = 开" in body.decode() and "挂单没开，不生效" in body.decode()
     assert s["SIM_SKIP"]["kind"] == "detail" and s["SIM_SKIP"]["value"] == "" and s["SIM_SKIP"]["group"] == "策略"
@@ -183,6 +186,13 @@ async def run():
     assert s["SIM_WAYS"]["saved"] == "" and s["SIM_WAYS"]["value"] == "taker" and s["SIM_EDGE_CENTS"]["saved"] == "12" and s["SIM_MARKETS"]["value"] == "all"
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MARKETS": "all"}})
     assert st == 200 and j["message"] == "已保存，设置没有变化。"
+    # the cadence: the trader and the orderbook feed (its own reference to the config) both run on the new numbers at once
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SECONDS": "3", "PREDICT_POLL_SECONDS": "5"}})
+    assert st == 200 and bot.config.sim_seconds == 3 and bot.predict.config.predict_poll == 5 and (await get_json(port, "control.json"))["cadence"] == {"sim": 3, "book": 5}, (st, j)
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SECONDS": "2"}})
+    assert st == 400 and j == {"ok": False, "message": "SIM_SECONDS 必须在 3～60 之间"} and bot.config.sim_seconds == 3, (st, j)
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SECONDS": "", "PREDICT_POLL_SECONDS": ""}})
+    assert st == 200 and bot.config.sim_seconds == 5 and bot.predict.config.predict_poll == 10, (st, j)
     # the detail chips: SIM_SKIP names single markets left out (upper-cased, deduplicated), the catalog flags them, "" clears it
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SKIP": " hsi, bnb ,HSI"}})
     assert st == 200 and bot.config.sim_skip == {"HSI", "BNB"} and bot.control_value("SIM_SKIP") == "BNB,HSI", (st, j)
