@@ -8542,7 +8542,7 @@ button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
 .kv{display:grid;grid-template-columns:5.2em 1fr;gap:5px 10px;font-size:13px;margin-top:10px;align-items:baseline}.kv .k{color:var(--muted)}
 .kv .v{min-width:0;overflow-wrap:anywhere}.kv .v.ok{color:var(--down)}.kv .v.bad{color:var(--up)}.kv .v.warn{color:var(--warn)}
 .test{margin-top:10px;border:1px solid var(--line);border-radius:12px;padding:8px 12px;background:var(--bg);font-size:13px}
-.test .ttl{display:flex;justify-content:space-between;align-items:center;gap:8px}.test .ttl b{font-weight:600;overflow-wrap:anywhere}
+.test .ttl{display:flex;justify-content:space-between;align-items:center;gap:8px}.test .ttl b{font-weight:600;overflow-wrap:anywhere}.test .ttl .lnk{white-space:nowrap;flex:none}
 .test ol{margin:6px 0 0;padding-left:1.4em}.test li{margin:2px 0;overflow-wrap:anywhere}.test li.ok{color:var(--down)}.test li.bad{color:var(--up)}
 @media (min-width:640px){label.f{grid-template-columns:260px 1fr;align-items:center}label.f small{grid-column:2}}
 </style></head>
