@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.53.0"
+VERSION = "1.54.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -8532,25 +8532,39 @@ pre{white-space:pre-wrap;word-break:break-all;font:13px/1.5 ui-monospace,Menlo,C
 .custom{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px}.custom input[type=text]{width:130px;padding:5px 9px;font-size:14px}
 .badge{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--chip);color:var(--muted);vertical-align:middle}.badge.saved{background:var(--down-bg);color:var(--down)}
 button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
+.bar{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center;padding:8px 16px;margin:0 -16px 8px;background:var(--bg);border-bottom:1px solid var(--line);font-size:13px}
+.bar .k{color:var(--muted)}.bar b{font-weight:600}
+.lbl{color:var(--muted);font-size:13px;align-self:center;min-width:2.6em}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}.tab{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:999px;padding:5px 12px;font-size:13px}.tab.sel{background:var(--text);color:var(--bg);border-color:var(--text)}
+.st{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:var(--chip);color:var(--muted);white-space:nowrap}
+.st.rest{background:var(--chip);color:var(--best);border:1px solid var(--best)}.st.pos,.st.win{background:var(--down-bg);color:var(--down)}.st.loss,.st.fail{background:var(--up-bg);color:var(--up)}
+.why{color:var(--muted);font-size:12px;white-space:normal;margin-top:2px}#recq{max-width:280px}
 @media (min-width:640px){label.f{grid-template-columns:260px 1fr;align-items:center}label.f small{grid-column:2}}
 </style></head>
 <body><div class="wrap">
 <header><div><h1>交易控制台</h1><div class="meta" id="meta">加载中…</div></div>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="journal" href="#">复盘页</a><button id="reload">刷新</button></div></header>
+<div class="bar" id="bar"><span class="mut">加载中…</span></div>
 <section class="card"><label class="f"><span>控制口令</span><input type="password" id="key" autocomplete="off" placeholder="环境变量 WEB_CONTROL_KEY"><small><label><input type="checkbox" id="remember"> 在这个标签页保留口令（关闭标签页即清除）</label></small></label><p class="mut" id="authnote"></p></section>
 <section class="card" id="live"><h2>真实交易 <span class="state" id="livestate"></span></h2>
-<div class="row" id="modebtns"><span class="mut" style="align-self:center">模式：</span><button data-mode="off">off 只记账</button><button data-mode="pause">pause 登录不开仓</button><button data-mode="on">on 真实下单</button></div>
-<div class="row" id="livebtns"><button data-act="pause">⏸ 暂停开新仓</button><button data-act="resume" class="pri">▶️ 恢复</button><button data-act="cancelall" class="bad">撤掉本策略挂单</button><button data-act="cancelaccount" class="bad">撤掉账户全部挂单</button><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button><button data-act="test">挂单测试</button></div>
+<div class="row" id="modebtns"><span class="lbl">模式</span><button data-mode="off">off 只记账</button><button data-mode="pause">pause 登录不开仓</button><button data-mode="on">on 真实下单</button></div>
+<div id="livebtns">
+<div class="row"><span class="lbl">操作</span><button data-act="pause">⏸ 暂停开新仓</button><button data-act="resume" class="pri">▶️ 恢复</button></div>
+<div class="row"><span class="lbl">撤单</span><button data-act="cancelall" class="bad">撤掉本策略挂单</button><button data-act="cancelaccount" class="bad">撤掉账户全部挂单</button></div>
+<div class="row"><span class="lbl">工具</span><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button><button data-act="test">挂单测试</button></div>
+</div>
 <pre id="livelines"></pre><pre id="testlines" class="mut"></pre></section>
 <section class="card" id="quick"><h2>常用开关</h2><p class="mut"><b>绿色 = 开，灰色 = 关</b>。点一下切换，立即生效并保存；带数值的开关用上次的值（没有就用默认值），数值和适用的市场在下面的参数卡片里改。</p><div class="opts" id="quickbtns"></div></section>
 <section class="card" id="settings"><div class="hd"><h2>策略与风控参数</h2><button id="fold" class="lnk">收起</button></div>
 <div id="setbody"><p class="mut">点一个选项就立即生效，并保存到数据库（重启仍有效）；数字项点预设值，或填自定义值后按保存。标“环境变量”的是部署时的值，标“已保存”的是在这里改过的，“恢复环境变量”撤销单项。</p>
 <div id="cards"></div><div class="row"><button id="adv">显示高级参数</button><button id="reset">清除全部，按环境变量运行</button></div></div></section>
-<section class="card"><h2>模拟交易 / 真实订单</h2><div id="simline" class="mut"></div><div id="orders"></div></section>
+<section class="card" id="recbox"><div class="hd"><h2>订单与持仓</h2><button id="foldrec" class="lnk">收起</button></div>
+<div id="recbody"><div id="simline" class="mut"></div><div class="tabs" id="rectabs"></div>
+<div class="row"><input type="text" id="recq" placeholder="按市场筛选，如 海力士 / BTC" autocomplete="off"></div><div id="orders"></div></div></section>
 <section class="card" id="checksbox"><div class="hd"><h2>挂单检查 <span class="mut" id="checksn"></span></h2><button id="foldchecks" class="lnk">收起</button></div>
 <div id="checksbody"><p class="mut">每个市场现在会挂什么、为什么不挂；吃单的封顶价和封顶价之下能买到多少。每 10 秒看一轮：盘口每 15 秒刷新，积分和费率每 10 分钟读一次。</p><div id="checks"></div></div></section>
-<section class="card" id="posbox"><h2>Predict 持仓</h2><div id="positions" class="mut"></div></section>
-<section class="card" id="errbox"><h2>最近错误</h2><pre id="errors"></pre></section>
+<section class="card" id="posbox"><div class="hd"><h2>Predict 持仓</h2><button id="foldpos" class="lnk">收起</button></div><div id="posbody"><div id="positions" class="mut"></div></div></section>
+<section class="card" id="errbox"><div class="hd"><h2>最近错误</h2><button id="folderr" class="lnk">收起</button></div><div id="errbody"><pre id="errors"></pre></div></section>
 </div><div id="toast"></div>
 <script>
 const base=location.pathname.replace(/\/control\/?$/,"");
@@ -8589,11 +8603,7 @@ function render(){
   $("livelines").textContent=L?(liveOn?[...L.lines,"策略："+data.scope.join("；"),"持仓+挂单 $"+L.exposure.toFixed(2)+" / $"+L.caps.open+"｜今日已结算盈亏 "+money(L.daily_pnl)+"（上限 −$"+L.caps.daily_loss+"）｜挂单中 "+L.resting+"｜未确认 "+L.unconfirmed+"｜今日下单 "+L.placed_today+"｜失败 "+L.failed_today+(L.synced_at?"｜订单同步 "+L.synced_at:""),...(L.unknown_open&&L.unknown_open.length?["⚠️ 账户上有 "+L.unknown_open.length+" 张本机器人没有记录的挂单（#"+L.unknown_open.map(u=>u.id).join("、#")+"）：不计入这里的额度；“撤掉账户全部挂单”可一起撤"]:[])].join("\n"):"LIVE=off：模拟交易只记账。点 pause 会登录 Predict、校验钱包、读余额和授权，可自检和挂单测试，但不开新仓；点 on 才真实下单。切换立即生效并保存。"):"没有配置 PREDICT_PRIVATE_KEY：在 Railway Variables 配置私钥（和 PREDICT_API_KEY）并重新部署后，这里才能切换模式。";
   renderSettings();renderQuick();
   $("simline").textContent="记录 "+data.sim.trades+" 笔｜已结算 "+data.sim.settled+" 笔，盈亏 "+money(data.sim.pnl)+"｜持仓 "+data.sim.open+"｜挂单中 "+data.sim.resting+"（成本 $"+data.sim.open_cost.toFixed(2)+"）";
-  const o=$("orders");o.replaceChildren();
-  if(L&&L.orders.length){const t=el("table");const h=el("tr");["时间","市场","方向","价格×份数","状态","订单",""].forEach(x=>h.append(el("th","",x)));t.append(h);
-    L.orders.forEach(r=>{const tr=el("tr");[r.opened,r.item,r.label,(r.price*100).toFixed(1)+"¢×"+r.order,r.status+(r.state?"·"+r.state:"")+(r.why?"｜"+r.why:""),r.order_id?"#"+r.order_id:r.live_state].forEach(x=>tr.append(el("td","",x)));
-      const td=el("td");if(r.cancellable){const b=el("button","bad","撤单");b.disabled=!data.enabled;b.addEventListener("click",()=>{if(confirm("撤掉这张真实挂单（#"+r.order_id+"）？"))act({action:"cancel",id:r.order_id})});td.append(b)}tr.append(td);t.append(tr)});o.append(t)}
-  else o.append(el("p","mut",L?"还没有真实订单。":"真实订单只在 LIVE=on 时出现；模拟交易的记录看复盘页。"));
+  renderRecords();renderFolds();renderBar();
   const cb=$("checks");cb.replaceChildren();
   if(data.checks&&data.checks.length){const t=el("table");const h=el("tr");["市场","公平价 · 买1 / 卖1","开盘","积分","挂单","吃单"].forEach(x=>h.append(el("th","",x)));t.append(h);
     const lvl=x=>x?(x[0]*100).toFixed(1)+"¢×"+x[1]:"—";
@@ -8674,6 +8684,38 @@ function renderSettings(){
 $("fold").addEventListener("click",()=>{folded=!folded;try{localStorage.setItem("ctlfold",folded?"1":"0")}catch(e){}renderSettings()});
 function renderChecksFold(){$("checksbody").style.display=checksFolded?"none":"";$("foldchecks").textContent=checksFolded?"展开":"收起"}
 $("foldchecks").addEventListener("click",()=>{checksFolded=!checksFolded;try{localStorage.setItem("ctlchecks",checksFolded?"1":"0")}catch(e){}renderChecksFold()});
+// the other sections fold the same way, each remembered on its own
+const FOLDS=[["foldrec","recbody","ctlfoldrec"],["foldpos","posbody","ctlfoldpos"],["folderr","errbody","ctlfolderr"]];const folds={};
+FOLDS.forEach(([b,body,key])=>{try{folds[b]=localStorage.getItem(key)==="1"}catch(e){}
+  $(b).addEventListener("click",()=>{folds[b]=!folds[b];try{localStorage.setItem(key,folds[b]?"1":"0")}catch(e){}renderFolds()})});
+function renderFolds(){FOLDS.forEach(([b,body])=>{$(body).style.display=folds[b]?"none":"";$(b).textContent=folds[b]?"展开":"收起"})}
+// the records: resting orders, positions, history (withdrawn, failed, lapsed, settled), under tabs with counts and a market filter
+let recTab="resting",recQ="";try{recTab=localStorage.getItem("ctlrectab")||"resting"}catch(e){}
+const TABS=[["resting","挂单中"],["position","持仓"],["history","历史"],["all","全部"]];
+$("recq").addEventListener("input",()=>{recQ=$("recq").value.trim().toLowerCase();renderRecords()});
+function stClass(r){if(r.group==="resting")return "st rest";if(r.group==="position")return "st pos";if(r.failed)return "st fail";if(r.status.startsWith("赢"))return "st win";if(r.status.startsWith("输"))return "st loss";return "st"}
+function renderRecords(){const rows=data.records||[];const tabs=$("rectabs");tabs.replaceChildren();
+  TABS.forEach(([k,lab])=>{const n=k==="all"?rows.length:rows.filter(r=>r.group===k).length;const b=el("button","tab"+(recTab===k?" sel":""),lab+"（"+n+"）");b.dataset.tab=k;
+    b.addEventListener("click",()=>{recTab=k;try{localStorage.setItem("ctlrectab",k)}catch(e){}renderRecords()});tabs.append(b)});
+  const shown=rows.filter(r=>(recTab==="all"||r.group===recTab)&&(!recQ||(r.item+" "+r.label).toLowerCase().includes(recQ)));
+  const o=$("orders");o.replaceChildren();
+  if(!shown.length){o.append(el("p","mut",rows.length?"这一栏没有记录。":"还没有记录：等有卡片的净优势达到门槛就开始。"));return}
+  const t=el("table");const h=el("tr");["时间","市场","方向","价格×份数","状态","订单",""].forEach(x=>h.append(el("th","",x)));t.append(h);
+  shown.forEach(r=>{const tr=el("tr");tr.append(el("td","",r.opened));
+    const tdm=el("td");const a=el("a","",r.item);a.href=r.url;a.target="_blank";a.rel="noopener";tdm.append(a);tr.append(tdm);
+    tr.append(el("td","",r.label));tr.append(el("td","",(r.price*100).toFixed(1)+"¢×"+r.order+(r.shares&&r.group!=="resting"&&r.shares!==r.order?"（成交 "+r.shares+"）":"")));
+    const tds=el("td");tds.append(el("span",stClass(r),r.status+(r.state?"·"+r.state:"")));if(r.why)tds.append(el("div","why",r.why));tr.append(tds);
+    tr.append(el("td","",r.order_id?"#"+r.order_id:r.live_state||(data.live&&data.live.mode!=="off"?"":"纸面")));
+    const td=el("td");if(r.cancellable&&data.live){const b=el("button","bad","撤单");b.disabled=!data.enabled;b.addEventListener("click",()=>{if(confirm("撤掉这张真实挂单（#"+r.order_id+"）？"))act({action:"cancel",id:r.order_id})});td.append(b)}tr.append(td);t.append(tr)});
+  o.append(t)}
+// the sticky bar: the mode, the counts, the limits, when the page last refreshed
+function renderBar(){const L=data.live,b=$("bar");b.replaceChildren();const liveOn=!!L&&L.mode!=="off";
+  const chip=(k,v)=>{const s=el("span");s.append(el("span","k",k+" "),el("b","",String(v)));return s};
+  const mode=L?(L.mode==="off"?"LIVE=off 只记账":L.mode==="pause"?"LIVE=pause 不开仓":L.paused?"已暂停":L.killed?"今日停开新仓":L.ready?"LIVE=on 运行中":"LIVE=on 未就绪"):"纸面模拟";
+  b.append(el("span","state "+(L?(L.mode==="off"?"":L.mode==="pause"||L.paused||L.killed?"warn":L.ready?"on":"off"):""),mode));
+  b.append(chip("持仓",data.sim.open),chip("挂单中",data.sim.resting),chip("已结算",data.sim.settled+" 笔 "+money(data.sim.pnl)));
+  if(liveOn)b.append(chip("持仓+挂单","$"+L.exposure.toFixed(2)+" / $"+L.caps.open),chip("今日",money(L.daily_pnl)));
+  b.append(chip("刷新于",new Date().toTimeString().slice(0,8)))}
 // the quick switches: the few settings that are turned on and off most, one tap each, their value from the cards below
 const QUICK_DEFAULT={SIM_TAKER_AFTER_HOURS_CENTS:"15",SIM_MAKER_AFTER_HOURS_CENTS:"10",SIM_MAKER_DEEP_CENTS:"25",SIM_QUIET_MINUTES:"15"};
 function quickChip(label,on,key,fn,warn){const b=el("button","opt sw "+(warn?"warn":on?"on":"off"),label+(on?" · 开":" · 关")+(warn?"（"+warn+"）":""));b.dataset.q=key;b.title=key;b.disabled=!data.enabled;b.addEventListener("click",fn);return b}
@@ -13379,6 +13421,30 @@ class Bot:
                   "LIVE_RETRY_SECONDS": str(c.live_retry), "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify)}
         return values.get(key, "")
 
+    def control_records(self, trades: dict[str, dict], history: int = 200) -> list[dict]:
+        """The page's record list: every resting order and position, and the last ``history`` finished ones (withdrawn,
+        failed, lapsed, settled), newest first — with the group the page files them under (resting / position / history),
+        the status and the reason, and the real order's id and state when one was sent."""
+        rows = []
+        for tid, t in trades.items():
+            st = t.get("live") if isinstance(t.get("live"), dict) else {}
+            status = t.get("status")
+            group = "resting" if status == "resting" else "position" if status == "filled" else "history"
+            when = int((t.get("settled") or (t.get("withdrawn") or {}).get("at") or t.get("opened") or 0) if group == "history" else (t.get("opened") or 0))
+            failed = st.get("final") == "failed"
+            why = str((t.get("withdrawn") or {}).get("why") or st.get("error") or (t.get("note") if status in {"expired", "cancelled"} else "") or "")
+            rows.append({"id": tid, "opened": stamp(int(t.get("opened") or 0), seconds=False), "when": when, "item": str(t.get("item") or ""),
+                         "label": str(t.get("label") or ""), "side": str(t.get("side") or ""), "maker": bool(t.get("maker")),
+                         "price": float(t.get("price") or 0), "order": float(t.get("order") or 0), "shares": float(t.get("shares") or 0),
+                         "status": "失败" if failed else sim_status(t), "state": sim_state(t), "group": group, "why": why, "failed": failed,
+                         "order_id": str(st.get("order_id") or ""), "live_state": str(st.get("state") or ""),
+                         "cancellable": status == "resting" and st.get("state") in {"open", "placing"} and bool(st.get("order_id")),
+                         "url": self.sim_url(t)})
+        rows.sort(key=lambda r: r["when"], reverse=True)
+        kept = [r for r in rows if r["group"] != "history"] + [r for r in rows if r["group"] == "history"][:history]
+        kept.sort(key=lambda r: r["when"], reverse=True)
+        return kept
+
     def control_payload(self) -> dict:
         """What the control page shows: whether it may act, each setting (in force, saved, from the environment), the
         paper trader's totals; the live bot adds its own block."""
@@ -13393,6 +13459,7 @@ class Bot:
                               **CONTROL_FORMS.get(key, {"kind": "number", "group": "高级", "presets": [], "unit": ""})}
                              for key, label, hint in CONTROL_KEYS],
                 "scope": sim_scope(self.config), "checks": self.sim_checks(now_ms), "catalog": self.sim_catalog(now_ms),
+                "records": self.control_records(self.sim_trades()),
                 "sim": {"trades": stats["trades"], "settled": stats["settled"], "pnl": stats["pnl"], "open": stats["open"],
                         "resting": stats["resting"], "open_cost": stats["open_cost"]}}
 

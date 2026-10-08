@@ -101,6 +101,30 @@ async def run():
     data = await get_json(port, "control.json")
     assert data["enabled"] and data["mode"] == "paper" and data["live"] is None and data["version"] == m.VERSION and data["checks"] == []
     assert 'id="checks"' in body.decode() and 'id="foldchecks"' in body.decode() and "常用开关" in body.decode() and 'id="quickbtns"' in body.decode()
+    assert 'id="rectabs"' in body.decode() and 'id="recq"' in body.decode() and 'id="bar"' in body.decode() and 'id="foldrec"' in body.decode() and 'id="foldpos"' in body.decode()
+    assert data["records"] == [] and isinstance(data["records"], list)
+    # the record rows the page files under its tabs: resting / position / history, newest first, with the reason and the real order
+    rb = m.Bot(m.Config.from_env(base), m.Store(":memory:"), FM(NOW), None)
+    rec = lambda market, side, label, maker, status, price, shares, opened, **extra: {
+        "v": 2, "market": market, "slug": market, "market_id": "1", "item": {"m1": "甲", "m2": "乙", "m3": "丙", "m4": "丁"}[market], "kind": "close", "key": "A",
+        "side": side, "label": label, "maker": maker, "fair": 0.6, "opened": opened, "settle": {}, "order": 100.0, "fills": [], "revisions": [],
+        "entry": {}, "version": {}, "price": price, "signal": 0.1, "edge": 0.1, "shares": shares, "status": status, "filled": None, **extra}
+    rb.store.put("sim:m1|up|挂", rec("m1", "up", "挂涨", True, "resting", 0.21, 0.0, NOW - 60_000, live={"state": "open", "order_id": "77", "events": []}))
+    rb.store.put("sim:m1|down|吃", rec("m1", "down", "吃跌", False, "filled", 0.55, 100.0, NOW - 120_000))
+    rb.store.put("sim:m2|up|挂#1", rec("m2", "up", "挂涨", True, "cancelled", 0.22, 0.0, NOW - 90_000, note="撤单：买1 被顶到 22.0¢，改挂 23.0¢，一份都没成交",
+                                       withdrawn={"at": NOW - 30_000, "why": "买1 被顶到 22.0¢，改挂 23.0¢", "unfilled": 100.0}))
+    rb.store.put("sim:m3|up|吃", rec("m3", "up", "吃涨", False, "settled", 0.40, 100.0, NOW - 200_000, payout=1.0, settled=NOW - 10_000, confirm="confirmed", note="收盘涨"))
+    rb.store.put("sim:m4|up|挂#1", rec("m4", "up", "挂涨", True, "cancelled", 0.30, 0.0, NOW - 50_000, note="下单失败：HTTP 400",
+                                       live={"state": "done", "final": "failed", "error": "下单失败：HTTP 400", "order_id": "", "events": []}))
+    rows = rb.control_records(rb.sim_trades())
+    assert [r["id"] for r in rows] == ["m3|up|吃", "m2|up|挂#1", "m4|up|挂#1", "m1|up|挂", "m1|down|吃"], [r["id"] for r in rows]
+    assert [r["group"] for r in rows] == ["history", "history", "history", "resting", "position"]
+    assert [r["status"] for r in rows] == ["赢 +$60.00", "已撤单", "失败", "挂单中（真实订单 #77 已成交 0/100 份）", "持仓"] and rows[0]["state"] == "已确认" and rows[3]["state"] == "", [(r["status"], r["state"]) for r in rows]
+    assert [r["why"] for r in rows] == ["", "买1 被顶到 22.0¢，改挂 23.0¢", "下单失败：HTTP 400", "", ""] and rows[2]["failed"] and not rows[1]["failed"]
+    assert rows[3]["cancellable"] and rows[3]["order_id"] == "77" and rows[3]["live_state"] == "open" and not rows[4]["cancellable"] and rows[4]["order_id"] == ""
+    assert rows[0]["item"] == "丙" and rows[0]["price"] == 0.40 and rows[0]["shares"] == 100.0 and rows[0]["url"].startswith("http")
+    assert {r["id"] for r in rb.control_payload()["records"]} == {r["id"] for r in rows}
+    assert len(rb.control_records(rb.sim_trades(), history=1)) == 3 and rb.control_records(rb.sim_trades(), history=1)[0]["id"] == "m3|up|吃"  # the history is capped, newest kept
     s = {x["key"]: x for x in data["settings"]}
     assert {k: s["SIM_EDGE_CENTS"][k] for k in ("key", "label", "hint", "value", "saved", "env")} == {"key": "SIM_EDGE_CENTS", "label": "触发买入的净优势（¢/份）", "hint": "0.5～50", "value": "10", "saved": "", "env": ""}
     assert s["SIM_EDGE_CENTS"]["kind"] == "number" and s["SIM_EDGE_CENTS"]["group"] == "策略" and "10" in s["SIM_EDGE_CENTS"]["presets"] and s["SIM_EDGE_CENTS"]["unit"] == "¢"
