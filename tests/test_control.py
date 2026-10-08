@@ -141,6 +141,8 @@ async def run():
     assert s["PREDICT_POLL_SECONDS"]["kind"] == "number" and s["PREDICT_POLL_SECONDS"]["value"] == "10" and "5" in s["PREDICT_POLL_SECONDS"]["presets"] and data["cadence"] == {"sim": 5, "book": 10}
     assert 'id="checksnote"' in body.decode() and "renderCadence" in body.decode()
     assert s["SIM_MAKER_DEEP_MARKETS"]["kind"] == "detail" and s["SIM_MAKER_DEEP_MARKETS"]["value"] == "" and s["SIM_MAKER_AFTER_HOURS_MARKETS"]["kind"] == "detail"
+    assert s["SIM_MAKER_DEEP_ONLY_MARKETS"]["kind"] == "detail" and s["SIM_MAKER_DEEP_ONLY_MARKETS"]["value"] == "" and s["SIM_MAKER_DEEP_ONLY_MARKETS"]["group"] == "策略"
+    assert all(x in body.decode() for x in ('id="exbox"', "renderExceptions", 'data-act="stop"', 'class="cols"', "const drafts", "lockView", "REC_LABELS")), "the page's new parts"
     assert "全部市场" in body.decode() and ".sw.on" in body.decode() and "绿色 = 开" in body.decode() and "挂单没开，不生效" in body.decode()
     assert s["SIM_SKIP"]["kind"] == "detail" and s["SIM_SKIP"]["value"] == "" and s["SIM_SKIP"]["group"] == "策略"
     assert isinstance(data["catalog"], list) and all({"kind", "key", "name", "skipped"} <= set(r) for r in data["catalog"]) and "展开详细选项" in body.decode()
@@ -149,7 +151,7 @@ async def run():
     withkey = {**base, "PREDICT_PRIVATE_KEY": "a" * 64}
     for key, form in m.CONTROL_FORMS.items():
         if form["kind"] == "detail":  # SIM_SKIP: drawn inside the SIM_MARKETS card from the catalog, no presets or options of its own
-            assert "presets" not in form and "options" not in form and key in {"SIM_SKIP", "SIM_MAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_DEEP_MARKETS"}, key
+            assert "presets" not in form and "options" not in form and key in {"SIM_SKIP", "SIM_MAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_DEEP_MARKETS", "SIM_MAKER_DEEP_ONLY_MARKETS"}, key
             continue
         assert form["kind"] in {"choice", "multi", "number"} and (form["kind"] == "number") == ("presets" in form) and (form["kind"] != "number") == ("options" in form), key
         for value in (form.get("presets") or [o[0] for o in form.get("options", [])]):
@@ -206,6 +208,9 @@ async def run():
     assert st == 200 and bot.config.sim_maker_deep_markets == {"HSI", "KOSPI"} and bot.control_value("SIM_MAKER_DEEP_MARKETS") == "HSI,KOSPI" and bot.config.sim_maker_after_hours_markets == {"SSE"}
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_AFTER_HOURS_MARKETS": ""}})
     assert st == 200 and bot.config.sim_maker_deep_markets == frozenset() and bot.config.sim_maker_after_hours_markets == frozenset()
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_ONLY_MARKETS": "kospi, hsi"}})
+    assert st == 200 and bot.config.sim_maker_deep_only_markets == {"HSI", "KOSPI"} and bot.control_value("SIM_MAKER_DEEP_ONLY_MARKETS") == "HSI,KOSPI", (st, j)
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_ONLY_MARKETS": ""}}); assert st == 200 and bot.config.sim_maker_deep_only_markets == frozenset()
     # 一键搭配: the strategy settings only, each combination valid on its own, saved like any set; the page lists them
     data = await get_json(port, "control.json")
     assert [p["name"] for p in data["presets"]] == ["steady", "balanced", "bold"] and all({"name", "label", "hint", "values"} <= set(p) for p in data["presets"])

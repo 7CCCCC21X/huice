@@ -46,7 +46,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.57.1"
+VERSION = "1.58.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -459,6 +459,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_MAKER_AFTER_HOURS_CENTS", "盘后挂单模式（¢/份）", "0～50：开盘前、收盘后也挂指数/个股日涨跌的单，但只挂净优势不低于这个数的（不低于触发门槛），挂着的降到它 1¢ 以下撤掉，开盘后按平时的门槛；0 = 关（按上一项）"),
     ("SIM_MAKER_AFTER_HOURS_MARKETS", "盘后挂单模式只做这些市场（详细选项）", "逗号分隔的市场代码；在“盘后挂单模式”卡片展开详细选项点选，空 = 所有指数/个股日涨跌市场"),
     ("SIM_MAKER_DEEP_MARKETS", "低价挂单模式只做这些市场（详细选项）", "逗号分隔的市场代码；在“低价挂单模式”卡片展开详细选项点选，空 = 范围内的所有市场"),
+    ("SIM_MAKER_DEEP_ONLY_MARKETS", "只挂低价挂单只在这些市场（详细选项）", "逗号分隔的市场代码；在“只挂低价挂单”卡片展开详细选项点选，空 = 低价挂单模式所做的所有市场；没选的市场两种单都挂"),
     ("SIM_MAKER_POINTS", "只挂积分已激活的市场", "开 = 挂单只挂 Predict 积分正在发放（积分已激活）的市场，积分停了就撤；积分状态未知时不挂"),
     ("PREDICT_MIN_EDGE_CENTS", "卡片建议至少要有的净优势（¢）", "0～50，模型误差之上"),
     ("PREDICT_TRADE_USD", "卡片吃单按多少美元走盘口", "1～1000000"),
@@ -481,19 +482,19 @@ CONTROL_PRESETS: tuple[tuple[str, str, str, dict[str, str]], ...] = (
      "只挂单、只在开盘时段；低价挂单 25¢ 兜底；买1 要够 100 份才跟；结束前 15 分钟停；每 5 秒看一轮、盘口 10 秒刷新",
      {"SIM_WAYS": "maker", "SIM_EDGE_CENTS": "10", "SIM_TAKER_SESSION": "on", "SIM_TAKER_AFTER_HOURS_CENTS": "0",
       "SIM_AFTER_HOURS_MAX_PRICE_CENTS": "60", "SIM_MAKER_SESSION": "on", "SIM_MAKER_AFTER_HOURS_CENTS": "0", "SIM_MAKER_AFTER_HOURS_MARKETS": "",
-      "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_ONLY": "off", "SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_MIN_BID": "100",
+      "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_ONLY": "off", "SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_DEEP_ONLY_MARKETS": "", "SIM_MAKER_MIN_BID": "100",
       "SIM_MAKER_EXIT_CENTS": "5", "SIM_MAKER_SPREAD_CENTS": "0", "SIM_QUIET_MINUTES": "15", "SIM_SECONDS": "5", "PREDICT_POLL_SECONDS": "10"}),
     ("balanced", "均衡",
      "挂单加吃单，门槛 10¢；盘后只做三大指数（挂单 15¢、吃单 20¢、只买 60¢ 以下）；低价挂单 25¢；买1 够 50 份就跟；结束前 10 分钟停；每 5 秒看一轮、盘口 10 秒刷新",
      {"SIM_WAYS": "both", "SIM_EDGE_CENTS": "10", "SIM_TAKER_SESSION": "on", "SIM_TAKER_AFTER_HOURS_CENTS": "20",
       "SIM_AFTER_HOURS_MAX_PRICE_CENTS": "60", "SIM_MAKER_SESSION": "on", "SIM_MAKER_AFTER_HOURS_CENTS": "15", "SIM_MAKER_AFTER_HOURS_MARKETS": "HSI,KOSPI,SSE",
-      "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_ONLY": "off", "SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_MIN_BID": "50",
+      "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_ONLY": "off", "SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_DEEP_ONLY_MARKETS": "", "SIM_MAKER_MIN_BID": "50",
       "SIM_MAKER_EXIT_CENTS": "5", "SIM_MAKER_SPREAD_CENTS": "0", "SIM_QUIET_MINUTES": "10", "SIM_SECONDS": "5", "PREDICT_POLL_SECONDS": "10"}),
     ("bold", "进取",
      "挂单加吃单，门槛 8¢；盘后所有日涨跌市场都做（挂单 10¢、吃单 15¢、只买 60¢ 以下）；低价挂单 20¢；买1 够 20 份就跟，撤单线 4¢；结束前 5 分钟停；每 3 秒看一轮、盘口 5 秒刷新",
      {"SIM_WAYS": "both", "SIM_EDGE_CENTS": "8", "SIM_TAKER_SESSION": "on", "SIM_TAKER_AFTER_HOURS_CENTS": "15",
       "SIM_AFTER_HOURS_MAX_PRICE_CENTS": "60", "SIM_MAKER_SESSION": "on", "SIM_MAKER_AFTER_HOURS_CENTS": "10", "SIM_MAKER_AFTER_HOURS_MARKETS": "",
-      "SIM_MAKER_DEEP_CENTS": "20", "SIM_MAKER_DEEP_ONLY": "off", "SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_MIN_BID": "20",
+      "SIM_MAKER_DEEP_CENTS": "20", "SIM_MAKER_DEEP_ONLY": "off", "SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_DEEP_ONLY_MARKETS": "", "SIM_MAKER_MIN_BID": "20",
       "SIM_MAKER_EXIT_CENTS": "4", "SIM_MAKER_SPREAD_CENTS": "0", "SIM_QUIET_MINUTES": "5", "SIM_SECONDS": "3", "PREDICT_POLL_SECONDS": "5"}),
 )
 
@@ -568,6 +569,7 @@ class Config:
     # before the open and after the close, but only with this much net edge (never under sim_edge); withdrawn a cent under it. 0 = off
     sim_maker_after_hours_markets: frozenset = frozenset()  # SIM_MAKER_AFTER_HOURS_MARKETS: the after-hours mode only on these daily cards; empty = all
     sim_maker_deep_markets: frozenset = frozenset()         # SIM_MAKER_DEEP_MARKETS: the deep-bid mode only on these markets; empty = every market in scope
+    sim_maker_deep_only_markets: frozenset = frozenset()    # SIM_MAKER_DEEP_ONLY_MARKETS: deep-only on these markets only; empty = wherever the deep-bid mode is on
     sim_maker_points: bool = True     # SIM_MAKER_POINTS: resting orders only on markets whose Predict points pay now (rewards.current); withdrawn when they stop
     touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
     auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
@@ -695,6 +697,7 @@ class Config:
             sim_shares=parse_bounded(e, "SIM_SHARES", "100", 1, 1_000_000),
             sim_ways=sim_ways, sim_markets=sim_markets, sim_skip=sim_skip,
             sim_maker_after_hours_markets=market_keys("SIM_MAKER_AFTER_HOURS_MARKETS"), sim_maker_deep_markets=market_keys("SIM_MAKER_DEEP_MARKETS"),
+            sim_maker_deep_only_markets=market_keys("SIM_MAKER_DEEP_ONLY_MARKETS"),
             sim_group_usd=parse_bounded(e, "SIM_GROUP_USD", "300", 0, 10_000_000),
             sim_taker_session=not off(e.get("SIM_TAKER_SESSION", "off")),
             sim_taker_after_hours=parse_bounded(e, "SIM_TAKER_AFTER_HOURS_CENTS", "0", 0, 50) / 100,
@@ -6953,6 +6956,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_MAKER_DEEP_ONLY": {"kind": "choice", "group": "策略", "options": [["off", "两种都挂"], ["on", "只挂低价挂单"]]},
     "SIM_MAKER_AFTER_HOURS_MARKETS": {"kind": "detail", "group": "策略"},  # drawn inside the SIM_MAKER_AFTER_HOURS_CENTS card
     "SIM_MAKER_DEEP_MARKETS": {"kind": "detail", "group": "策略"},         # drawn inside the SIM_MAKER_DEEP_CENTS card
+    "SIM_MAKER_DEEP_ONLY_MARKETS": {"kind": "detail", "group": "策略"},    # drawn inside the SIM_MAKER_DEEP_ONLY card
     "SIM_MAKER_POINTS": {"kind": "choice", "group": "策略", "options": [["off", "都挂"], ["on", "只挂积分已激活的"]]},
     "SIM_GROUP_USD": {"kind": "number", "group": "策略", "presets": ["0", "100", "300", "500", "1000"], "unit": "$", "zero": "不限"},
     "LIVE_MAX_ORDER_USD": {"kind": "number", "group": "风控", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
@@ -7994,7 +7998,7 @@ function priceLadderBook(c,it,L,live){
         const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)),$("span","pv",sg(e.edge)));a.append(line);
         if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(ok&&!maker&&e.short)a.append($("span","pwhy","深度不足"));
         else if(!ok&&e.edge>0)a.append($("span","pwhy","低于门槛"));  // a positive edge the model's own error swallows: say so without a hover
-        const bar=r.need!=null?"未过建议门槛 "+cent(r.need)+"（"+(r.swing!=null&&r.swing>=r.need-1e-9&&r.swing>0?"σ ×/÷1.25 的模型误差":"最低净优势")+"）":"未过建议门槛";
+        const bar=r.need!=null?"未过建议门槛 "+cent(r.need)+"（"+(r.swing!=null&&r.swing>=r.need-1e-9&&r.swing>0?"σ ×/÷1.25 的敏感性范围":"最低净优势")+"）":"未过建议门槛";
         a.title=e.label+" @ "+cent(e.price)+"；净优势 "+sg(e.edge)+(maker?"，挂单排队，成交不保证":"，约 "+qty(e.size)+" 份；已扣手续费与滑点")+(r.error?"；"+r.error:r.hold?"；"+r.hold:r.stale?"；盘口过期":!ok?"；"+bar:"");return a};
       g.append(target,model,action(true),action(false));
       if(openChip[rk]){const d=$("div","lrow");d.append(rowNote(r,L,it));if(v.edges.length)d.append(chips(rk+"/",v,{...ctxOf(r),hot:hotFor(it,r.label)}));g.append(d)}});
@@ -8033,7 +8037,7 @@ function rowNote(r,L,it){  // one line about a ladder level itself, above its fo
   if(L.kind==="price"&&r.dist!=null&&Math.abs(r.dist)<0.02&&L.range_word)parts.push("离档位很近，差几分钱的触及以 Predict 为准");
   if(r.fair!=null)parts.push("模型 Yes "+cent(r.fair));
   if(r.bid!=null||r.ask!=null)parts.push("Yes 盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1)));
-  if(r.need!=null&&r.fair!=null&&!r.touched)parts.push("建议门槛 "+cent(r.need)+(r.swing!=null&&r.swing>=r.need-1e-9&&r.swing>0?"（σ ×/÷1.25 的模型误差）":"（最低净优势）"));
+  if(r.need!=null&&r.fair!=null&&!r.touched)parts.push("建议门槛 "+cent(r.need)+(r.swing!=null&&r.swing>=r.need-1e-9&&r.swing>0?"（σ ×/÷1.25 的敏感性范围）":"（最低净优势）"));
   d.append($("b","",r.label),$("span","",parts.length?"："+parts.join(" · "):""));
   if(r.points_active!==undefined){const point=r.points_note||"积分状态暂缺",why=r.maker_note||r.points_why;d.append($("div","",point+(r.points_active===true&&r.points_rate!=null?" · "+qty(r.points_rate)+" PP/小时":"")));
     if(r.points_ok===false&&why&&why!==point)d.append($("div","warn",why))}
@@ -8077,7 +8081,7 @@ function card(it,g){
   const o=$("div","odds"),a=$("b",style==="us"?"d":"u"),b=$("b",style==="us"?"u":"d");
   const lb=it.labels||["涨","跌"];a.append($("span","lbl",lb[0]),pct(it.fair_up)+"¢");b.append(pct(it.fair_down)+"¢",$("span","lbl",lb[1]));
   const bar=$("div","bar");[[it.up,upColor()],[it.flat,"var(--flat)"],[it.down,downColor()]].forEach(([w,col])=>{const i=$("i");i.style.width=(w*100)+"%";i.style.background=col;bar.append(i)});
-  const sw=it.predict&&it.predict.swing;if(sw>0)o.title="模型误差约 ±"+cent(sw)+"（σ ×/÷1.25、代理系数、漂移口径各变一次取最大）：优势不超过它的方向不算建议；/calib 看模型是否真的赢过市场";
+  const sw=it.predict&&it.predict.swing;if(sw>0)o.title="模型敏感性范围约 ±"+cent(sw)+"（σ ×/÷1.25、代理系数、漂移口径各变一次取最大；参数敏感性，不是统计置信区间）：优势不超过它的方向不算建议；/calib 看模型是否真的赢过市场";
   o.append(a,bar,b);c.append(o);const ch=changedAt[fk];if(ch&&Date.now()-ch.at<2500)o.classList.add(ch.up===(style!=="us")?"chg-r":"chg-g");  // a moved fair price flashes once, in the scheme's colour
   const unit=it.unit?" "+it.unit:"";
   if(it.touch){const t=it.touch,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
@@ -8548,7 +8552,13 @@ CONTROL_PAGE = r"""<!doctype html>
 @media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--line:#262c34;--chip:#20252c;--best:#79a7f7;--on-accent:#0d1014;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--up-bg:#3a1b1f;--down-bg:#11301f;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25)}}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
-.wrap{max-width:860px;margin:0 auto;padding:12px 16px 40px}
+.wrap{max-width:1360px;margin:0 auto;padding:12px 16px 40px}
+.cols{display:grid;grid-template-columns:minmax(0,1fr);gap:0 16px;align-items:start}@media(min-width:1000px){.cols{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}
+.ex{padding:6px 10px;border-left:3px solid var(--warn);margin:6px 0;font-size:13px;overflow-wrap:anywhere}.ex.bad{border-color:var(--up)}.ex b{font-weight:600}.ex button{margin-top:6px}
+body.locked .acct{display:none}
+.draft{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:var(--warn-bg);color:var(--warn);margin-left:6px;align-self:center}
+@media(max-width:560px){#orders table{min-width:0}#orders tr:first-child{display:none}#orders tr{display:block;border-bottom:1px solid var(--line);padding:6px 0}#orders td{display:inline-block;border:0;padding:2px 8px 2px 0;vertical-align:top}
+  #orders td::before{content:attr(data-l);color:var(--muted);font-size:11px;margin-right:4px}#orders td:empty,#orders td[data-l=""]:not(:has(button)){display:none}}
 header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 16px;padding:4px 0 10px}
 h1{font-size:20px;font-weight:750;margin:0}h2{font-size:16px;margin:0 0 8px}
 .meta{color:var(--muted);font-size:13px}.mut{color:var(--muted);font-size:13px}
@@ -8593,25 +8603,29 @@ button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="journal" href="#">复盘页</a><button id="reload">刷新</button></div></header>
 <div class="bar" id="bar"><span class="mut">加载中…</span></div>
 <section class="card"><label class="f"><span>控制口令</span><input type="password" id="key" autocomplete="off" placeholder="环境变量 WEB_CONTROL_KEY"><small><label><input type="checkbox" id="remember"> 在这个标签页保留口令（关闭标签页即清除）</label></small></label><p class="mut" id="authnote"></p></section>
-<section class="card" id="live"><h2>真实交易 <span class="state" id="livestate"></span></h2>
+<div class="cols"><div class="col">
+<section class="card acct" id="live"><h2>真实交易 <span class="state" id="livestate"></span></h2>
 <div class="row" id="modebtns"><span class="lbl">模式</span><button data-mode="off">off 只记账</button><button data-mode="pause">pause 登录不开仓</button><button data-mode="on">on 真实下单</button></div>
 <div id="livebtns">
-<div class="row"><span class="lbl">操作</span><button data-act="pause">⏸ 暂停开新仓</button><button data-act="resume" class="pri">▶️ 恢复</button></div>
+<div class="row"><span class="lbl">操作</span><button data-act="pause">⏸ 暂停开新仓</button><button data-act="resume" class="pri">▶️ 恢复</button><button data-act="stop" class="bad">⛔ 紧急停止并撤单</button></div>
 <div class="row"><span class="lbl">撤单</span><button data-act="cancelall" class="bad">撤掉本策略挂单</button><button data-act="cancelaccount" class="bad">撤掉账户全部挂单</button></div>
 <div class="row"><span class="lbl">工具</span><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button><button data-act="test">挂单测试</button></div>
 </div>
 <div id="livelines" class="kv"></div><div id="testlines" class="test" style="display:none"></div></section>
-<section class="card" id="quick"><h2>常用开关</h2><p class="mut"><b>绿色 = 开，灰色 = 关</b>。点一下切换，立即生效并保存；带数值的开关用上次的值（没有就用默认值），数值和适用的市场在下面的参数卡片里改。</p><div class="opts" id="quickbtns"></div><div class="row" id="presetrow"><span class="lbl">一键搭配</span><span class="btns" id="presetbtns"></span></div><p class="mut" id="presetnote"></p></section>
-<section class="card" id="settings"><div class="hd"><h2>策略与风控参数</h2><button id="fold" class="lnk">收起</button></div>
-<div id="setbody"><p class="mut">点一个选项就立即生效，并保存到数据库（重启仍有效）；数字项点预设值，或填自定义值后按保存。标“环境变量”的是部署时的值，标“已保存”的是在这里改过的，“恢复环境变量”撤销单项。</p>
-<div id="cards"></div><div class="row"><button id="adv">显示高级参数</button><button id="reset">清除全部，按环境变量运行</button></div></div></section>
-<section class="card" id="recbox"><div class="hd"><h2>订单与持仓</h2><button id="foldrec" class="lnk">收起</button></div>
+<section class="card acct" id="exbox"><h2>待处理 <span class="mut" id="exn"></span></h2><div id="exlist" class="mut">加载中…</div></section>
+<section class="card acct" id="recbox"><div class="hd"><h2>订单与持仓</h2><button id="foldrec" class="lnk">收起</button></div>
 <div id="recbody"><div id="simline" class="mut"></div><div class="tabs" id="rectabs"></div>
 <div class="row"><input type="text" id="recq" placeholder="按市场筛选，如 海力士 / BTC" autocomplete="off"></div><div id="orders"></div></div></section>
-<section class="card" id="checksbox"><div class="hd"><h2>挂单检查 <span class="mut" id="checksn"></span></h2><button id="foldchecks" class="lnk">收起</button></div>
+<section class="card acct" id="checksbox"><div class="hd"><h2>挂单检查 <span class="mut" id="checksn"></span></h2><button id="foldchecks" class="lnk">收起</button></div>
 <div id="checksbody"><p class="mut" id="checksnote">每个市场现在会挂什么、为什么不挂；吃单的封顶价和封顶价之下能买到多少。</p><div id="checks"></div></div></section>
-<section class="card" id="posbox"><div class="hd"><h2>Predict 持仓</h2><button id="foldpos" class="lnk">收起</button></div><div id="posbody"><div id="positions" class="mut"></div></div></section>
-<section class="card" id="errbox"><div class="hd"><h2>最近错误</h2><button id="folderr" class="lnk">收起</button></div><div id="errbody"><pre id="errors"></pre></div></section>
+</div><div class="col">
+<section class="card acct" id="quick"><h2>常用开关</h2><p class="mut"><b>绿色 = 开，灰色 = 关</b>。点一下切换，立即生效并保存；带数值的开关用上次的值（没有就用默认值），数值和适用的市场在下面的参数卡片里改。</p><div class="opts" id="quickbtns"></div><div class="row" id="presetrow"><span class="lbl">一键搭配</span><span class="btns" id="presetbtns"></span></div><p class="mut" id="presetnote"></p></section>
+<section class="card acct" id="settings"><div class="hd"><h2>策略与风控参数</h2><button id="fold" class="lnk">收起</button></div>
+<div id="setbody"><p class="mut">点一个选项就立即生效，并保存到数据库（重启仍有效）；数字项点预设值，或填自定义值后按保存。标“环境变量”的是部署时的值，标“已保存”的是在这里改过的，“恢复环境变量”撤销单项。</p>
+<div id="cards"></div><div class="row"><button id="adv">显示高级参数</button><button id="reset">清除全部，按环境变量运行</button></div></div></section>
+<section class="card acct" id="posbox"><div class="hd"><h2>Predict 持仓</h2><button id="foldpos" class="lnk">收起</button></div><div id="posbody"><div id="positions" class="mut"></div></div></section>
+<section class="card acct" id="errbox"><div class="hd"><h2>最近错误</h2><button id="folderr" class="lnk">收起</button></div><div id="errbody"><pre id="errors"></pre></div></section>
+</div></div>
 </div><div id="toast"></div>
 <script>
 const base=location.pathname.replace(/\/control\/?$/,"");
@@ -8621,21 +8635,27 @@ let data=null,busy=false,adv=false,folded=false,detailOpen={},checksFolded=false
 try{adv=localStorage.getItem("ctladv")==="1";folded=localStorage.getItem("ctlfold")==="1";checksFolded=localStorage.getItem("ctlchecks")==="1";
   const v=JSON.parse(localStorage.getItem("ctldetail")||"{}");detailOpen=v&&typeof v==="object"?v:{SIM_MARKETS:!!v}}catch(e){}
 // the detail chips under a card: SIM_MARKETS excludes single markets (SIM_SKIP); a maker mode's card picks the markets it applies to
+const drafts={};  // custom values typed but not saved yet, per setting: a re-render (the poll) must not wipe them
 const DETAIL={SIM_MARKETS:{key:"SIM_SKIP",mode:"exclude"},SIM_MAKER_AFTER_HOURS_CENTS:{key:"SIM_MAKER_AFTER_HOURS_MARKETS",mode:"include",kinds:["close"]},
-  SIM_MAKER_DEEP_CENTS:{key:"SIM_MAKER_DEEP_MARKETS",mode:"include"}};
+  SIM_MAKER_DEEP_CENTS:{key:"SIM_MAKER_DEEP_MARKETS",mode:"include"},SIM_MAKER_DEEP_ONLY:{key:"SIM_MAKER_DEEP_ONLY_MARKETS",mode:"include"}};
 const MAKER_MODES=new Set(["SIM_MAKER_AFTER_HOURS_CENTS","SIM_MAKER_DEEP_CENTS"]);  // resting-order modes: nothing happens while 做哪种单 = 只吃单
 try{const k=sessionStorage.getItem("ctlkey");if(k){$("key").value=k;$("remember").checked=true}}catch(e){}
 function keep(){try{if($("remember").checked)sessionStorage.setItem("ctlkey",$("key").value);else sessionStorage.removeItem("ctlkey")}catch(e){}}
 let keyBad=false;  // the poll stops re-sending a key the server refused: five tries lock the client out for ten minutes
 $("remember").addEventListener("change",keep);$("key").addEventListener("input",()=>{keyBad=false;keep()});$("key").addEventListener("change",load);
 function toast(t,ok){const el=$("toast");el.textContent=t;el.className=ok?"ok":"bad";el.style.display="block";clearTimeout(toast.t);toast.t=setTimeout(()=>{el.style.display="none"},7000)}
-async function load(){const key=$("key").value.trim();
-  try{const r=await fetch(base+"/control.json",{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
-    if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}$("meta").textContent=(j.message||("HTTP "+r.status))+"｜账户、订单与设置只在口令正确时显示"+(key?"｜改一下口令或点“刷新”再试":"");data=null;if(key)keyBad=true;return}
-    if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();keyBad=false;render()}catch(e){$("meta").textContent="加载失败："+e.message}}
-async function act(body){if(busy)return;const key=$("key").value.trim();if(!key){toast("请先输入控制口令",false);return}
-  busy=true;try{const r=await fetch(base+"/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key,...body})});
-  let j={};try{j=await r.json()}catch(e){}toast(j.message||("HTTP "+r.status),!!j.ok);await load()}catch(e){toast("请求失败："+e.message,false)}finally{busy=false}}
+let seq=0,okAt="";
+function lockView(on){document.body.classList.toggle("locked",on);if(on){["modebtns","livebtns","presetbtns"].forEach(id=>$(id).querySelectorAll("button").forEach(b=>b.disabled=true));$("bar").replaceChildren(el("span","mut","需要正确的口令才显示账户数据"))}}
+async function load(){const key=$("key").value.trim();const my=++seq;const ctl=new AbortController();const timer=setTimeout(()=>ctl.abort(),8000);
+  try{const r=await fetch(base+"/control.json",{cache:"no-store",headers:key?{"X-Control-Key":key}:{},signal:ctl.signal});
+    if(my!==seq)return;  // a later request already answered: this answer is stale and must not overwrite it
+    if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}$("meta").textContent=(j.message||("HTTP "+r.status))+"｜账户、订单与设置只在口令正确时显示"+(key?"｜改一下口令或点“刷新”再试":"");data=null;if(key)keyBad=true;lockView(true);return}
+    if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();if(my!==seq)return;data=j;keyBad=false;okAt=new Date().toTimeString().slice(0,8);lockView(false);render()}
+  catch(e){if(my!==seq)return;$("meta").textContent="加载失败："+(e.name==="AbortError"?"请求超时":e.message)+(okAt?"｜下面显示的是 "+okAt+" 的数据":"")}
+  finally{clearTimeout(timer)}}
+async function act(body){if(busy)return false;const key=$("key").value.trim();if(!key){toast("请先输入控制口令",false);return false}
+  busy=true;let ok=false;try{const r=await fetch(base+"/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key,...body})});
+  let j={};try{j=await r.json()}catch(e){}ok=!!j.ok;toast(j.message||("HTTP "+r.status),ok);await load()}catch(e){toast("请求失败："+e.message,false)}finally{busy=false}return ok}
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
 function money(x){return (x>=0?"+$":"−$")+Math.abs(x).toFixed(2)}
 function render(){
@@ -8648,7 +8668,7 @@ function render(){
   if(L&&L.allowed===false)$("livestate").textContent+="｜硬开关 LIVE_TRADING_ALLOWED=off";
   $("modebtns").querySelectorAll("button").forEach(b=>{b.disabled=!L||!data.enabled;b.className=L&&b.dataset.mode===L.mode?"pri":""});
   $("livebtns").querySelectorAll("button").forEach(b=>{b.disabled=!liveOn||!data.enabled});
-  renderLive(L,liveOn);
+  renderLive(L,liveOn);renderExceptions(L,liveOn);
   renderSettings();renderQuick();renderPresets();
   $("simline").textContent="记录 "+data.sim.trades+" 笔｜已结算 "+data.sim.settled+" 笔，盈亏 "+money(data.sim.pnl)+"｜持仓 "+data.sim.open+"｜挂单中 "+data.sim.resting+"（成本 $"+data.sim.open_cost.toFixed(2)+"）";
   renderRecords();renderFolds();renderBar();renderCadence(data.cadence);
@@ -8716,8 +8736,10 @@ function card(s){
     c.append(d)}
   const cu=el("div","custom");
   if(s.kind==="number"){const inp=el("input");inp.type="text";inp.inputMode="decimal";inp.placeholder="自定义";inp.dataset.key=s.key;inp.autocomplete="off";inp.disabled=!data.enabled;
-    const go=el("button","opt","保存");go.disabled=!data.enabled;go.addEventListener("click",()=>{const v=inp.value.trim();if(v)act({action:"set",values:{[s.key]:v}})});
-    inp.addEventListener("keydown",e=>{if(e.key==="Enter"){go.click();inp.blur()}});cu.append(inp,go)}
+    inp.value=drafts[s.key]||"";const mark=el("span","draft","未保存");mark.style.display=drafts[s.key]?"":"none";
+    inp.addEventListener("input",()=>{if(inp.value.trim())drafts[s.key]=inp.value;else delete drafts[s.key];mark.style.display=drafts[s.key]?"":"none"});
+    const go=el("button","opt","保存");go.disabled=!data.enabled;go.addEventListener("click",async()=>{const v=inp.value.trim();if(v&&await act({action:"set",values:{[s.key]:v}}))delete drafts[s.key]});
+    inp.addEventListener("keydown",e=>{if(e.key==="Enter"){go.click();inp.blur()}});cu.append(inp,go,mark)}
   if(s.saved){const back=el("button","lnk","恢复环境变量");back.disabled=!data.enabled;back.addEventListener("click",()=>act({action:"set",values:{[s.key]:""}}));cu.append(back)}
   if(cu.childNodes.length)c.append(cu);
   return c}
@@ -8743,6 +8765,7 @@ let recTab="resting",recQ="";try{recTab=localStorage.getItem("ctlrectab")||"rest
 const TABS=[["resting","挂单中"],["position","持仓"],["history","历史"],["all","全部"]];
 $("recq").addEventListener("input",()=>{recQ=$("recq").value.trim().toLowerCase();renderRecords()});
 function stClass(r){if(r.group==="resting")return "st rest";if(r.group==="position")return "st pos";if(r.failed)return "st fail";if(r.status.startsWith("赢"))return "st win";if(r.status.startsWith("输"))return "st loss";return "st"}
+const REC_LABELS=["时间","市场","方向","价格×份数","状态","订单",""];
 function renderRecords(){if(!data)return;const rows=data.records||[];const tabs=$("rectabs");tabs.replaceChildren();
   TABS.forEach(([k,lab])=>{const n=k==="all"?rows.length:rows.filter(r=>r.group===k).length;const b=el("button","tab"+(recTab===k?" sel":""),lab+"（"+n+"）");b.dataset.tab=k;
     b.addEventListener("click",()=>{recTab=k;try{localStorage.setItem("ctlrectab",k)}catch(e){}renderRecords()});tabs.append(b)});
@@ -8755,10 +8778,31 @@ function renderRecords(){if(!data)return;const rows=data.records||[];const tabs=
     tr.append(el("td","",r.label));tr.append(el("td","",(r.price*100).toFixed(1)+"¢×"+r.order+(r.shares&&r.group!=="resting"&&r.shares!==r.order?"（成交 "+r.shares+"）":"")));
     const tds=el("td");tds.append(el("span",stClass(r),r.status+(r.state?"·"+r.state:"")));if(r.cost_pending)tds.append(el("div","why","成本待对账：按封顶价计，等 Predict 回报成交均价"));if(r.why)tds.append(el("div","why",r.why));tr.append(tds);
     tr.append(el("td","",r.order_id?"#"+r.order_id:r.live_state||(data.live&&data.live.mode!=="off"?"":"纸面")));
-    const td=el("td");if(r.cancellable&&data.live){const b=el("button","bad","撤单");b.disabled=!data.enabled;b.addEventListener("click",()=>{if(confirm("撤掉这张真实挂单（#"+r.order_id+"）？"))act({action:"cancel",id:r.order_id})});td.append(b)}tr.append(td);t.append(tr)});
+    const td=el("td");if(r.cancellable&&data.live){const b=el("button","bad","撤单");b.disabled=!data.enabled;b.addEventListener("click",()=>{if(confirm("撤掉这张真实挂单（#"+r.order_id+"）？"))act({action:"cancel",id:r.order_id})});td.append(b)}tr.append(td);
+    [...tr.children].forEach((c,i)=>{c.dataset.l=REC_LABELS[i]||""});t.append(tr)});
   o.append(t)}
 // the real-trading facts as a label / value grid, coloured by state; the last order test as a foldable step list
 function kvRow(k,v,tone){return [el("div","k",k),el("div","v"+(tone?" "+tone:""),v)]}
+// what needs a human or is holding new orders: unknown orders (with the release button), unconfirmed cancels, a stale sync, the balance, cut lists
+function renderExceptions(L,liveOn){const box=$("exlist");box.replaceChildren();const items=[];
+  if(L&&liveOn){
+    if(L.gate)items.push(["warn","新单受限："+L.gate]);
+    (L.unknown||[]).forEach(u=>{const d=el("div");d.append(el("b","",u.item+" "+u.label+(u.order_id?"（订单 #"+u.order_id+"）":"（没拿到订单号）")+"：状态未知"),
+        el("div","why",u.why+"｜自 "+u.since+"（"+u.age_s+" 秒）"+(u.deadline?"｜"+u.deadline+" 后自动按未成交结束":"｜没有到期时间，要人工确认")+"｜占用 $"+Number(u.reserved).toFixed(2)));
+      const b=el("button","bad","已在 Predict 核对不存在，释放额度");b.disabled=!data.enabled;
+      b.addEventListener("click",()=>{if(confirm("确认已在 Predict 网站核对过这张订单"+(u.order_id?"（#"+u.order_id+"）":"")+"不存在？释放后它若再出现在盘口会自动恢复跟踪。"))act({action:"release",id:u.order_id||u.id})});d.append(b);items.push(["bad",d])});
+    if(L.oldest_cancel_s!=null&&L.oldest_cancel_s>60)items.push(["warn","有撤单请求发出 "+L.oldest_cancel_s+" 秒仍未得到 Predict 确认：额度照旧占用，每轮重试"]);
+    if(L.sync_age_s!=null&&L.sync_age_s>150)items.push(["warn","账户订单已 "+L.sync_age_s+" 秒没有同步成功"]);
+    if(L.balance_error)items.push(["warn","余额刷新失败："+L.balance_error+(L.balance_age_s!=null?"（上次成功读取 "+L.balance_age_s+" 秒前）":"")]);
+    if(L.orders_complete===false)items.push(["warn","Predict 的订单列表没有读完整（超过翻页上限）：缺席的订单不按消失处理"]);
+    if(L.positions_complete===false)items.push(["warn","Predict 的持仓列表没有读完整（超过翻页上限）"]);
+    if(L.unknown_open&&L.unknown_open.length)items.push(["warn","账户上有 "+L.unknown_open.length+" 张本机器人没有记录的挂单（#"+L.unknown_open.map(u=>u.id).join("、#")+"）：不计入这里的额度；“撤掉账户全部挂单”可一起撤"]);
+    if(L.killed)items.push(["bad","今日停止开新仓："+L.killed]);
+    if(L.paused)items.push(["warn","已暂停开新仓："+L.paused]);
+    if(L.allowed===false)items.push(["warn","部署变量 LIVE_TRADING_ALLOWED=off：不会真实下单"])}
+  $("exn").textContent=items.length?"（"+items.length+"）":"";
+  if(!items.length){box.append(el("span","mut",liveOn?"没有待处理的异常。":"真实交易未开启（LIVE=off）。"));return}
+  items.forEach(([tone,x])=>{const d=el("div","ex "+tone);if(typeof x==="string")d.textContent=x;else d.append(x);box.append(d)})}
 function renderLive(L,liveOn){const box=$("livelines");box.replaceChildren();
   if(!L){box.append(...kvRow("说明","没有配置 PREDICT_PRIVATE_KEY：在 Railway Variables 配置私钥（和 PREDICT_API_KEY）并重新部署后，这里才能切换模式。",""));return}
   if(!liveOn){box.append(...kvRow("说明","LIVE=off：模拟交易只记账。点 pause 会登录 Predict、校验钱包、读余额和授权，可自检和挂单测试，但不开新仓；点 on 才真实下单。切换立即生效并保存。",""));return}
@@ -8778,10 +8822,10 @@ function renderTest(text){const box=$("testlines");box.replaceChildren();box.sty
 // the sticky bar: the mode, the counts, the limits, when the page last refreshed
 function renderBar(){const L=data.live,b=$("bar");b.replaceChildren();const liveOn=!!L&&L.mode!=="off";
   const chip=(k,v)=>{const s=el("span");s.append(el("span","k",k+" "),el("b","",String(v)));return s};
-  const mode=L?(L.mode==="off"?"LIVE=off 只记账":L.mode==="pause"?"LIVE=pause 不开仓":L.paused?"已暂停":L.killed?"今日停开新仓":L.ready?"LIVE=on 运行中":"LIVE=on 未就绪"):"纸面模拟";
-  b.append(el("span","state "+(L?(L.mode==="off"?"":L.mode==="pause"||L.paused||L.killed?"warn":L.ready?"on":"off"):""),mode));
+  const mode=L?(L.mode==="off"?"LIVE=off 只记账":L.mode==="pause"?"LIVE=pause 不开仓":L.paused?"已暂停":L.killed?"今日停开新仓":L.ready?(L.gate?"LIVE=on 新单受限":"LIVE=on 运行中"):"LIVE=on 未就绪"):"纸面模拟";
+  b.append(el("span","state "+(L?(L.mode==="off"?"":L.mode==="pause"||L.paused||L.killed||(L.ready&&L.gate)?"warn":L.ready?"on":"off"):""),mode));
   b.append(chip("持仓",data.sim.open),chip("挂单中",data.sim.resting),chip("已结算",data.sim.settled+" 笔 "+money(data.sim.pnl)));
-  if(liveOn)b.append(chip("持仓+挂单","$"+L.exposure.toFixed(2)+" / $"+L.caps.open),chip("今日",money(L.daily_pnl)));
+  if(liveOn)b.append(chip("持仓+挂单","$"+L.exposure.toFixed(2)+" / $"+L.caps.open),chip("今日",money(L.daily_pnl)),chip("未确认",L.unconfirmed),chip("对账",L.sync_age_s!=null?L.sync_age_s+" 秒前":"—"));
   b.append(chip("刷新于",new Date().toTimeString().slice(0,8)))}
 // the quick switches: the few settings that are turned on and off most, one tap each, their value from the cards below
 const QUICK_DEFAULT={SIM_TAKER_AFTER_HOURS_CENTS:"15",SIM_MAKER_AFTER_HOURS_CENTS:"10",SIM_MAKER_DEEP_CENTS:"25",SIM_QUIET_MINUTES:"15"};
@@ -8812,6 +8856,7 @@ function renderPresets(){const box=$("presetbtns");box.replaceChildren();if(!dat
 $("adv").addEventListener("click",()=>{adv=!adv;try{localStorage.setItem("ctladv",adv?"1":"0")}catch(e){}renderSettings()});
 $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.act;
   if(a==="pause"){const why=prompt("暂停原因（可留空）","");if(why===null)return;act({action:"pause",why})}
+  else if(a==="stop"){if(confirm("紧急停止：暂停开新仓，并撤掉本策略在 Predict 上的全部挂单（以 Predict 的确认为准，确认前额度仍占用；已成交的持仓继续持有，领取不受影响）。继续？"))act({action:"stop"})}
   else if(a==="test"){if(confirm("在 Predict 上挂一张远离盘口的限价单（不高于 2¢，份数按 Predict 最低订单金额 $1 取，2¢ 时 50 份），确认它出现在盘口后立即撤掉，用来验证真实下单链路。最多锁定约 1 美元，极少数情况下可能成交。继续？"))act({action:"test"})}
   else if(a==="cancelall"){if(confirm("撤掉本策略在 Predict 上的全部真实挂单？已成交的份数继续持有；以 Predict 的确认为准，确认前额度仍占用。"))act({action:"cancel",id:"all"})}
   else if(a==="cancelaccount"){if(confirm("撤掉这个 Predict 账户上的全部挂单，包括手动单和本机器人没有记录的单？"))act({action:"cancel",id:"account"})}
@@ -11512,6 +11557,7 @@ class Bot:
                 **({"sim_maker_deep_only": True} if c.sim_maker_deep_only and c.sim_maker_deep > 0 else {}),
                 **({"sim_maker_after_hours_markets": sorted(c.sim_maker_after_hours_markets)} if c.sim_maker_after_hours_markets else {}),
                 **({"sim_maker_deep_markets": sorted(c.sim_maker_deep_markets)} if c.sim_maker_deep_markets else {}),
+                **({"sim_maker_deep_only_markets": sorted(c.sim_maker_deep_only_markets)} if c.sim_maker_deep_only_markets and c.sim_maker_deep_only else {}),
                 **({"sim_maker_points": True} if c.sim_maker_points else {}),
                 **({"sim_skip": sorted(c.sim_skip)} if c.sim_skip else {})}
 
@@ -11761,7 +11807,7 @@ class Bot:
             return None, why + ("（低价挂单模式未选这个市场）" if unchosen else "")
         wide = self.sim_deep_book(mk)  # a book the ordinary rule refuses: the deep-bid mode takes it, a cent in front, at its bar
         front_ok = c.sim_maker_deep > 0 and self.sim_mode_market(mk, c.sim_maker_deep_markets) and not book_crossed(mk.book)
-        only = front_ok and c.sim_maker_deep_only  # SIM_MAKER_DEEP_ONLY: the joining orders are not placed at all
+        only = front_ok and c.sim_maker_deep_only and self.sim_mode_market(mk, c.sim_maker_deep_only_markets)  # SIM_MAKER_DEEP_ONLY (on its markets): the joining orders are not placed at all
         deep_bar = self.sim_maker_mode(mk, True)[0] if front_ok or wide else c.sim_maker_deep  # the deep-bid orders' bar here: SIM_MAKER_DEEP_CENTS, or the after-hours bar when higher
         limit = self.sim_after_hours_price(mk)  # after hours only at or under SIM_AFTER_HOURS_MAX_PRICE_CENTS
         cands, joined, dear = [], None, None  # joined / dear: what was passed over, for the reason when nothing is left
@@ -12031,7 +12077,7 @@ class Bot:
         if exit_edge > 0 and edge < exit_edge - 1e-9:
             return f"净优势降到 {cents(edge)}，低于撤单线 {cents(exit_edge)}"
         only = (c.sim_maker_deep > 0 and c.sim_maker_deep_only and self.sim_mode_market(mk, c.sim_maker_deep_markets)
-                and not book_crossed(mk.book))
+                and self.sim_mode_market(mk, c.sim_maker_deep_only_markets) and not book_crossed(mk.book))
         if only and not trade.get("deep"):
             return "已改为只挂低价挂单，平时的挂单撤掉"
         deep = bool(trade.get("deep")) and (self.sim_deep_book(mk) or only)
@@ -13634,6 +13680,7 @@ class Bot:
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
                   "SIM_MAKER_SPREAD_CENTS": f"{c.sim_maker_spread * 100:g}", "SIM_MAKER_DEEP_ONLY": flag(c.sim_maker_deep_only),
                   "SIM_MAKER_AFTER_HOURS_MARKETS": ",".join(sorted(c.sim_maker_after_hours_markets)), "SIM_MAKER_DEEP_MARKETS": ",".join(sorted(c.sim_maker_deep_markets)),
+                  "SIM_MAKER_DEEP_ONLY_MARKETS": ",".join(sorted(c.sim_maker_deep_only_markets)),
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}", "SIM_SECONDS": str(c.sim_seconds), "PREDICT_POLL_SECONDS": str(c.predict_poll),
                   "PREDICT_TRADE_USD": plain(c.predict_trade_usd), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),

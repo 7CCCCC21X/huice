@@ -2044,6 +2044,10 @@ class LiveBot(core.Bot):
                 return {"ok": False, "message": text.removeprefix("❌ ")}
         elif action == "release":
             text = await self.live_action("release", [str(data.get("id") or "")], now_ms)
+        elif action == "stop":  # the emergency stop: no new orders, every resting order of the strategy asked to be withdrawn
+            first = await self.live_action("pause", ["紧急停止"], now_ms)
+            second = await self.live_cancel_command(["all"], now_ms)
+            text = f"{first}\n{second}"
         elif action in {"resume", "redeem", "check", "orders", "positions"}:
             text = await self.live_action(action, [], now_ms)
         else:

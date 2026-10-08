@@ -1289,6 +1289,14 @@ async def audit_fixes():
     bbot.live.balance_error = ""
     assert "余额" not in bbot.live_room({}, bmk, "up", 0.55, 100)
     assert bbot.live_status(NOW)["gate"] == "" and bbot.live_status(NOW)["orders_complete"] and bbot.live_status(NOW)["balance_age_s"] >= 700
+    # the emergency stop: paused, every resting order of the strategy asked to be withdrawn, Predict's confirmation reported
+    sbot2 = make_bot(SIM_WAYS="maker")
+    await sbot2.live_prepare(); await sbot2.live_prefetch(NOW)
+    await step(sbot2, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    soid = sbot2.sim_trades()[f"{HSI_SLUG}|up|挂"]["live"]["order_id"]
+    result = await sbot2.live_control("stop", {})
+    assert result["ok"] and sbot2.live_paused() == "紧急停止" and ("remove", [soid]) in sbot2.live.api.calls and "Predict 确认撤掉 1 笔" in result["message"], result
+    assert sbot2.sim_trades()[f"{HSI_SLUG}|up|挂"]["live"]["state"] == "done" and sbot2.live_reserved(sbot2.sim_trades()[f"{HSI_SLUG}|up|挂"]) == 0
     print("AUDIT_FIXES_OK")
 
 

@@ -1141,6 +1141,13 @@ async def review_fixes():
     assert gbot.sim_requote_reason(gbot.sim_trades()[tid], pulled, NOW + 5_000) == ""
     await step(gbot, NOW + 5_000, pulled)
     assert gbot.sim_trades()[tid]["status"] == "resting" and gbot.sim_trades()[tid]["price"] == 0.55
+    # (8) deep-only on the chosen markets only (SIM_MAKER_DEEP_ONLY_MARKETS): elsewhere both kinds of order are placed
+    obot = mk_bot(SIM_MAKER_DEEP_CENTS="25", SIM_MAKER_DEEP_ONLY="on", SIM_MAKER_DEEP_ONLY_MARKETS="kospi"); obot.sim_markets = lambda now: world["markets"]
+    assert obot.config.sim_maker_deep_only_markets == {"KOSPI"} and obot.sim_version()["sim_maker_deep_only_markets"] == ["KOSPI"]
+    await step(obot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    t = obot.sim_trades()[tid]
+    assert t["price"] == 0.55 and "deep" not in t and "sweep" not in t, t  # HSI is not on the list: the ordinary order joins the 买1
+    assert obot.sim_requote_reason(t, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000), NOW + 5_000) == ""
     print("REVIEW_FIXES_OK")
 
 
