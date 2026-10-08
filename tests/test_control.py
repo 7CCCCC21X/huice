@@ -100,7 +100,7 @@ async def run():
     assert st == 403 and json.loads(raw)["message"] == "口令错误"
     data = await get_json(port, "control.json")
     assert data["enabled"] and data["mode"] == "paper" and data["live"] is None and data["version"] == m.VERSION and data["checks"] == []
-    assert 'id="checks"' in body.decode()
+    assert 'id="checks"' in body.decode() and 'id="foldchecks"' in body.decode() and "常用开关" in body.decode() and 'id="quickbtns"' in body.decode()
     s = {x["key"]: x for x in data["settings"]}
     assert {k: s["SIM_EDGE_CENTS"][k] for k in ("key", "label", "hint", "value", "saved", "env")} == {"key": "SIM_EDGE_CENTS", "label": "触发买入的净优势（¢/份）", "hint": "0.5～50", "value": "10", "saved": "", "env": ""}
     assert s["SIM_EDGE_CENTS"]["kind"] == "number" and s["SIM_EDGE_CENTS"]["group"] == "策略" and "10" in s["SIM_EDGE_CENTS"]["presets"] and s["SIM_EDGE_CENTS"]["unit"] == "¢"

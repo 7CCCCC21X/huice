@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.49.1"
+VERSION = "1.49.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -8502,11 +8502,13 @@ button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
 <div class="row" id="modebtns"><span class="mut" style="align-self:center">模式：</span><button data-mode="off">off 只记账</button><button data-mode="pause">pause 登录不开仓</button><button data-mode="on">on 真实下单</button></div>
 <div class="row" id="livebtns"><button data-act="pause">⏸ 暂停开新仓</button><button data-act="resume" class="pri">▶️ 恢复</button><button data-act="cancelall" class="bad">撤掉本策略挂单</button><button data-act="cancelaccount" class="bad">撤掉账户全部挂单</button><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button><button data-act="test">挂单测试</button></div>
 <pre id="livelines"></pre><pre id="testlines" class="mut"></pre></section>
+<section class="card" id="quick"><h2>常用开关</h2><p class="mut">点一下切换，立即生效并保存；带数值的开关用上次的值（没有就用默认值），数值在下面的参数卡片里改。</p><div class="opts" id="quickbtns"></div></section>
 <section class="card" id="settings"><div class="hd"><h2>策略与风控参数</h2><button id="fold" class="lnk">收起</button></div>
 <div id="setbody"><p class="mut">点一个选项就立即生效，并保存到数据库（重启仍有效）；数字项点预设值，或填自定义值后按保存。标“环境变量”的是部署时的值，标“已保存”的是在这里改过的，“恢复环境变量”撤销单项。</p>
 <div id="cards"></div><div class="row"><button id="adv">显示高级参数</button><button id="reset">清除全部，按环境变量运行</button></div></div></section>
 <section class="card"><h2>模拟交易 / 真实订单</h2><div id="simline" class="mut"></div><div id="orders"></div></section>
-<section class="card"><h2>挂单检查</h2><p class="mut">每个市场现在会挂什么、为什么不挂；吃单的封顶价和封顶价之下能买到多少。每 10 秒看一轮：盘口每 15 秒刷新，积分和费率每 10 分钟读一次。</p><div id="checks"></div></section>
+<section class="card" id="checksbox"><div class="hd"><h2>挂单检查 <span class="mut" id="checksn"></span></h2><button id="foldchecks" class="lnk">收起</button></div>
+<div id="checksbody"><p class="mut">每个市场现在会挂什么、为什么不挂；吃单的封顶价和封顶价之下能买到多少。每 10 秒看一轮：盘口每 15 秒刷新，积分和费率每 10 分钟读一次。</p><div id="checks"></div></div></section>
 <section class="card" id="posbox"><h2>Predict 持仓</h2><div id="positions" class="mut"></div></section>
 <section class="card" id="errbox"><h2>最近错误</h2><pre id="errors"></pre></section>
 </div><div id="toast"></div>
@@ -8514,8 +8516,8 @@ button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
 const base=location.pathname.replace(/\/control\/?$/,"");
 const $=id=>document.getElementById(id);
 $("back").href=base;$("journal").href=base+"/journal";
-let data=null,busy=false,adv=false,folded=false,detailOpen=false;
-try{adv=localStorage.getItem("ctladv")==="1";folded=localStorage.getItem("ctlfold")==="1";detailOpen=localStorage.getItem("ctldetail")==="1"}catch(e){}
+let data=null,busy=false,adv=false,folded=false,detailOpen=false,checksFolded=false;
+try{adv=localStorage.getItem("ctladv")==="1";folded=localStorage.getItem("ctlfold")==="1";detailOpen=localStorage.getItem("ctldetail")==="1";checksFolded=localStorage.getItem("ctlchecks")==="1"}catch(e){}
 try{const k=sessionStorage.getItem("ctlkey");if(k){$("key").value=k;$("remember").checked=true}}catch(e){}
 function keep(){try{if($("remember").checked)sessionStorage.setItem("ctlkey",$("key").value);else sessionStorage.removeItem("ctlkey")}catch(e){}}
 $("remember").addEventListener("change",keep);$("key").addEventListener("input",keep);$("key").addEventListener("change",load);
@@ -8540,7 +8542,7 @@ function render(){
   $("modebtns").querySelectorAll("button").forEach(b=>{b.disabled=!L||!data.enabled;b.className=L&&b.dataset.mode===L.mode?"pri":""});
   $("livebtns").querySelectorAll("button").forEach(b=>{b.disabled=!liveOn||!data.enabled});
   $("livelines").textContent=L?(liveOn?[...L.lines,"策略："+data.scope.join("；"),"持仓+挂单 $"+L.exposure.toFixed(2)+" / $"+L.caps.open+"｜今日已结算盈亏 "+money(L.daily_pnl)+"（上限 −$"+L.caps.daily_loss+"）｜挂单中 "+L.resting+"｜未确认 "+L.unconfirmed+"｜今日下单 "+L.placed_today+"｜失败 "+L.failed_today+(L.synced_at?"｜订单同步 "+L.synced_at:""),...(L.unknown_open&&L.unknown_open.length?["⚠️ 账户上有 "+L.unknown_open.length+" 张本机器人没有记录的挂单（#"+L.unknown_open.map(u=>u.id).join("、#")+"）：不计入这里的额度；“撤掉账户全部挂单”可一起撤"]:[])].join("\n"):"LIVE=off：模拟交易只记账。点 pause 会登录 Predict、校验钱包、读余额和授权，可自检和挂单测试，但不开新仓；点 on 才真实下单。切换立即生效并保存。"):"没有配置 PREDICT_PRIVATE_KEY：在 Railway Variables 配置私钥（和 PREDICT_API_KEY）并重新部署后，这里才能切换模式。";
-  renderSettings();
+  renderSettings();renderQuick();
   $("simline").textContent="记录 "+data.sim.trades+" 笔｜已结算 "+data.sim.settled+" 笔，盈亏 "+money(data.sim.pnl)+"｜持仓 "+data.sim.open+"｜挂单中 "+data.sim.resting+"（成本 $"+data.sim.open_cost.toFixed(2)+"）";
   const o=$("orders");o.replaceChildren();
   if(L&&L.orders.length){const t=el("table");const h=el("tr");["时间","市场","方向","价格×份数","状态","订单",""].forEach(x=>h.append(el("th","",x)));t.append(h);
@@ -8555,6 +8557,7 @@ function render(){
       tr.append(el("td",r.points_active===true?"ok":"",r.points||"—"));tr.append(el("td",r.maker&&!r.maker_why?"ok":r.maker?"":"no",r.maker?r.maker+(r.maker_why?"｜拦下："+r.maker_why:""):r.maker_why));
       tr.append(el("td",r.taker_why?"no":"",r.taker||r.taker_why));t.append(tr)});cb.append(t)}
   else cb.append(el("p","mut","现在没有可看的市场（还没有盘口，或模拟交易已关闭）。"));
+  $("checksn").textContent=data.checks&&data.checks.length?"（"+data.checks.length+" 个市场）":"";renderChecksFold();
   $("posbox").style.display=L?"":"none";$("errbox").style.display=L?"":"none";
   if(L){$("positions").textContent=L.positions.length?L.positions.join("\n")+(L.positions_at?"\n（读取于 "+L.positions_at+"）":""):"没有持仓，或还没读取（点“刷新持仓”）";$("errors").textContent=L.errors.length?L.errors.join("\n"):"无";$("testlines").textContent=L.last_test||""}
 }
@@ -8608,6 +8611,21 @@ function renderSettings(){
   GROUPS.forEach(([g,title])=>{if(g==="高级"&&!adv)return;const items=data.settings.filter(s=>s.group===g);if(!items.length)return;
     box.append(el("div","grp",title));items.forEach(s=>{const k=card(s);if(k)box.append(k)})})}
 $("fold").addEventListener("click",()=>{folded=!folded;try{localStorage.setItem("ctlfold",folded?"1":"0")}catch(e){}renderSettings()});
+function renderChecksFold(){$("checksbody").style.display=checksFolded?"none":"";$("foldchecks").textContent=checksFolded?"展开":"收起"}
+$("foldchecks").addEventListener("click",()=>{checksFolded=!checksFolded;try{localStorage.setItem("ctlchecks",checksFolded?"1":"0")}catch(e){}renderChecksFold()});
+// the quick switches: the few settings that are turned on and off most, one tap each, their value from the cards below
+const QUICK_DEFAULT={SIM_MAKER_AFTER_HOURS_CENTS:"10",SIM_MAKER_DEEP_CENTS:"25",SIM_QUIET_MINUTES:"15"};
+function quickChip(label,on,key,fn){const b=el("button","opt"+(on?" sel":""),label);b.dataset.q=key;b.title=key;b.disabled=!data.enabled;b.addEventListener("click",fn);return b}
+function renderQuick(){const q=$("quickbtns");q.replaceChildren();if(!data.settings)return;const v={};data.settings.forEach(s=>v[s.key]=s.value);
+  const ways=v.SIM_WAYS||"taker";
+  const setWays=(taker,maker)=>{if(!taker&&!maker){toast("吃单和挂单至少保留一种",false);return}act({action:"set",values:{SIM_WAYS:taker&&maker?"both":taker?"taker":"maker"}})};
+  q.append(quickChip("吃单",ways!=="maker","SIM_WAYS:taker",()=>setWays(ways==="maker",ways!=="taker")));
+  q.append(quickChip("挂单",ways!=="taker","SIM_WAYS:maker",()=>setWays(ways!=="maker",ways==="taker")));
+  [["SIM_TAKER_SESSION","只在开盘时段吃单"],["SIM_MAKER_SESSION","只在开盘时段挂单"],["SIM_MAKER_POINTS","只挂积分已激活的"]].forEach(([k,lab])=>{
+    const on=v[k]==="on";q.append(quickChip(lab,on,k,()=>act({action:"set",values:{[k]:on?"off":"on"}})))});
+  [["SIM_MAKER_AFTER_HOURS_CENTS","盘后挂单","¢"],["SIM_MAKER_DEEP_CENTS","低价挂单","¢"],["SIM_QUIET_MINUTES","结束前不交易","分钟"]].forEach(([k,lab,unit])=>{
+    const on=!!v[k]&&v[k]!=="0";let last="";try{last=localStorage.getItem("ctlq_"+k)||""}catch(e){}
+    q.append(quickChip(on?lab+" "+v[k]+unit:lab,on,k,()=>{if(on){try{localStorage.setItem("ctlq_"+k,v[k])}catch(e){}act({action:"set",values:{[k]:"0"}})}else act({action:"set",values:{[k]:last||QUICK_DEFAULT[k]}})}))})}
 $("adv").addEventListener("click",()=>{adv=!adv;try{localStorage.setItem("ctladv",adv?"1":"0")}catch(e){}renderSettings()});
 $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.act;
   if(a==="pause"){const why=prompt("暂停原因（可留空）","");if(why===null)return;act({action:"pause",why})}

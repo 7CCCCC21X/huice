@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.49.1
+版本：1.49.2
 
 ## 已完成
 
+- 1.49.2（控制台：常用开关、挂单检查可收起）：真实交易卡片下新增“常用开关”卡片（`renderQuick`）：吃单 / 挂单两枚按钮映射 `SIM_WAYS`（都关时提示“至少保留一种”，不发请求）、只在开盘时段吃单 / 挂单、只挂积分已激活的（on/off 直接翻转）、盘后挂单 / 低价挂单 / 结束前不交易（关 ↔ 上次的值，关掉时把值记进 localStorage `ctlq_<KEY>`，没有就用默认 10¢ / 25¢ / 15 分钟，按钮上带当前值）；“挂单检查”卡片标题带市场数，右侧“收起 / 展开”按钮，状态记在 localStorage `ctlchecks`。测试：test_control（页面含常用开关与收起按钮）、cards.py（点常用开关改 SIM_WAYS / 盘后挂单，至少保留一种的提示，挂单检查收起并在刷新后记住）。
 - 1.49.1（低价挂单挂在买1 之上 1¢）：`Bot.sim_maker_price(book, side, level, deep)`：低价挂单模式下的单挂在有效买1 之上 1¢（`SIM_MAKER_DEEP_STEP`）、排在最前（该价位已有的零星买单算在前面），不会挂到卖1 或更高（那样就改为跟买1）；平时的单照旧跟买1 排队。净优势按挂价算；`sim_requote_reason` 的改跟规则对这种单以“买1 + 1¢”为目标（“买1 移到 7.0¢，改挂 8.0¢”），盘口收窄后它仍按自己的挂价算、不因此撤；挂单检查表排在最前时写“排在最前”。测试：test_sim maker_rules（38¢ 公平价、买1 5¢×300 → 挂 6¢、32¢ 优势、排在最前；6¢ 已有 20 份零星买单时排在 20 份后；买1 挪到 7¢ 改挂 8¢；1¢ 余量；盘后+低价）。
 - 1.49.0（低价挂单模式）：`SIM_MAKER_DEEP_CENTS`（0～90，默认 0 = 关；`Config.sim_maker_deep`，控制项预设 0/15/20/25/30/40）：`Bot.sim_deep_book(book)` = 该项 > 0 且 `sim_maker_block` 挡下的盘口（价差超过 10¢ 或单边），盘口交叉的永不；`sim_maker_mode(mk, deep=None)` 统一算门槛与模式名（平时 SIM_EDGE_CENTS；盘后 max(·, 盘后门槛)，“盘后”；深价盘口 max(·, 该项)，“价差 33.0¢ 的盘口” / “单边盘口”；两者都有时取高者、名字并列），`sim_maker_bar` / `sim_maker_line`（模式门槛 − 1¢ `SIM_MAKER_MODE_SLACK`，不低于平时撤单线）取代 1.48.0 的 `sim_maker_after_hours_line`；`sim_maker_reason` 在该模式下跳过盘口形状的拒绝、按模式门槛判并跟有效买1；`sim_open` 给这种单记 `deep: true`，`sim_requote_reason` 只对这种单按低价挂单撤单线重判（平时的单遇到盘口变宽照旧不撤）；`/sim` 说明行、`sim_version`、复盘标签。测试：test_sim maker_rules（10-08 的盘口：公平价 38¢、买1 5¢×300、卖1 38¢×1 → 排在 300 份后挂 5¢、33¢ 优势；门槛不够不挂、单边挂、交叉不挂、1¢ 余量、跌破撤单、紧盘口照旧、平时的单盘口变宽不撤、盘后+低价取高者）、test_control 表单。
 - 1.48.0（盘后挂单模式）：`SIM_MAKER_AFTER_HOURS_CENTS`（0～50，默认 0 = 关；`Config.sim_maker_after_hours`，控制项预设 0/5/8/10/15/20）：`Bot.sim_after_hours(mk)` = 日涨跌卡片标的未开盘（`in_session is False`）且该项 > 0；`sim_maker_bar(mk)` = 盘后取 max(SIM_EDGE_CENTS, 该项)，平时 SIM_EDGE_CENTS；`sim_maker_after_hours_line(mk)` = 盘后门槛 − 1¢，不低于平时撤单线（1.49.0 起并入 `sim_maker_line`）。`sim_maker_reason` 盘后不再因 SIM_MAKER_SESSION 拒绝，改按盘后门槛判（“盘后只挂净优势 ≥ 10.0¢ 的，现 7.0¢”）；`sim_requote_reason` 盘后按盘后撤单线重判挂着的单（收盘时不够的撤掉，“…低于盘后撤单线 9.0¢”），开盘后恢复平时规则；加密市场无时段、不受影响。`/sim` 说明行、`sim_version`、复盘标签。测试：test_sim maker_rules（解析与上限、盘后不够不挂 / 够就挂、1¢ 余量、收盘重判、开盘恢复、SIM_MAKER_SESSION=off 时也按盘后门槛、说明行）、test_control 表单预设。
