@@ -117,6 +117,18 @@ def from_wei(value: Any) -> float:
     return int(value) / WEI
 
 
+PRICE_TICK_WEI = 10 ** 16  # Predict prices carry at most two decimals (whole cents): the API refuses a third
+
+
+def tick_price(price_wei: int) -> int:
+    """A price on Predict's tick: rounded down to the cent, except a value a hair under a cent boundary (a float's
+    1 − 0.87 = 0.12999…), which is that cent."""
+    ticks, rem = divmod(max(price_wei, 0), PRICE_TICK_WEI)
+    if rem and PRICE_TICK_WEI - rem <= 10 ** 9:
+        ticks += 1
+    return ticks * PRICE_TICK_WEI
+
+
 def retain_sig(num: int, digits: int) -> int:
     """Keep ``digits`` significant digits of an integer (the rest become zeros): prices keep 3, quantities 5."""
     if num == 0:
@@ -133,7 +145,9 @@ def limit_amounts(buy: bool, price_wei: int, qty_wei: int) -> dict:
     """A LIMIT order's amounts: BUY offers price × shares USDT for the shares, SELL the other way round."""
     if price_wei <= 0:
         raise ValueError("价格必须大于 0")
-    price, qty = retain_sig(price_wei, 3), retain_sig(qty_wei, 5)
+    price, qty = tick_price(price_wei), retain_sig(qty_wei, 5)  # the price on the cent tick, the quantity to 5 significant digits (the SDK's rule)
+    if price <= 0:
+        raise ValueError("价格低于 1¢")
     if qty < 10 ** 16:
         raise ValueError("数量不足 0.01 份")
     notional = price * qty // WEI
@@ -1674,8 +1688,8 @@ class LiveBot(core.Bot):
         if outcome is None:
             return f"{mk.item}：无法确定结果代币（{note}）"
         best_bid = float(mk.book.bid[0])
-        price = round(cents_given / 100, 3) if cents_given is not None else min(self.LIVE_TEST_PRICE, round(best_bid - 0.01, 3))
-        if price < 0.001:
+        price = core.floor_price(cents_given / 100) if cents_given is not None else min(self.LIVE_TEST_PRICE, core.floor_price(best_bid - 0.01))
+        if price < 0.01:
             return f"{mk.item} 的最高买价只有 {core.cents(best_bid)}，放不下更低的测试挂单；换个市场：/live test <市场名>"
         caution = "（价格不低于盘口最高买价，可能成交）" if price >= best_bid - 1e-9 else ""
         least = math.ceil(MIN_ORDER_USD / price - 1e-9)  # the exchange's minimum order value, in shares at this price

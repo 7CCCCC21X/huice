@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.46.0"
+VERSION = "1.46.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4049,13 +4049,18 @@ def taker_fee(price: float, bps: int) -> float:
     return bps / 10_000 * min(price, 1 - price)
 
 
+PRICE_DECIMALS = 2  # Predict's price tick: whole cents (the API refuses a third decimal: "max allowed is 2 decimal points")
+
+
 def floor_price(price: float) -> float:
-    """A price rounded down to Predict's tick (three significant digits), at most 99.9¢; 0 under 0.1¢."""
-    price = min(max(price, 0.0), 0.999)
-    if price < 0.001:
-        return 0.0
-    tick = D(10) ** (math.floor(math.log10(price)) - 2)
-    return float((D(str(price)) / tick).to_integral_value(rounding=decimal.ROUND_FLOOR) * tick)
+    """A price rounded down to Predict's tick (whole cents), at most 99¢; 0 under 1¢. A value a hair under a cent
+    boundary (a float's 1 − 0.87 = 0.12999…) is that cent."""
+    tick = D(10) ** -PRICE_DECIMALS
+    scaled = D(str(min(max(price, 0.0), 0.99))) / tick
+    ticks = scaled.to_integral_value(rounding=decimal.ROUND_FLOOR)
+    if scaled - ticks > D("0.999999"):
+        ticks += 1
+    return float(ticks * tick)
 
 
 def taker_cap(fair: float, required: float, bps: int) -> float:

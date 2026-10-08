@@ -55,10 +55,11 @@ assert abs(q["avg"] - avg) < 1e-12 and q["got"] == 100 and abs(q["fee"] - FEE * 
 assert q["levels"] == [[0.58, 30.0], [0.66, 70.0]] and q["best"] == 0.58 and abs(q["cost"] - (avg + q["fee"])) < 1e-12
 assert m.taker_quote(book([], [("0.58", "40")]), "up", 100, 200)["short"] and m.taker_quote(book([], []), "up", 100, 200) is None
 # the cap: the dearest price that keeps the required edge after the fee (rate × min(p, 1 − p)), on Predict's three-digit tick
-assert m.taker_cap(0.70, 0.10, 200) == 0.591 and m.taker_cap(0.30, 0.10, 200) == 0.196 and m.taker_cap(0.10, 0.10, 200) == 0 and m.taker_cap(0.05, 0.10, 200) == 0
-assert m.taker_cap(0.995, 0.001, 0) == 0.994 and m.floor_price(0.59184) == 0.591 and m.floor_price(0.059184) == 0.0591 and m.floor_price(1.2) == 0.999 and m.floor_price(0.0001) == 0
-q = m.taker_quote(book([], [("0.58", "30"), ("0.66", "500")]), "up", 100, 200, cap=0.591)  # with a cap only the levels under it are walked
-assert q["got"] == 30 and q["levels"] == [[0.58, 30.0]] and q["short"] and q["cap"] == 0.591 and m.taker_quote(book([], [("0.60", "30")]), "up", 100, 200, cap=0.591) is None
+assert m.taker_cap(0.70, 0.10, 200) == 0.59 and m.taker_cap(0.30, 0.10, 200) == 0.19 and m.taker_cap(0.10, 0.10, 200) == 0 and m.taker_cap(0.05, 0.10, 200) == 0
+assert m.taker_cap(0.995, 0.001, 0) == 0.99 and m.floor_price(0.59184) == 0.59 and m.floor_price(0.059184) == 0.05 and m.floor_price(1.2) == 0.99 and m.floor_price(0.0001) == 0
+assert m.floor_price(1 - 0.87) == 0.13 and m.floor_price(0.1299) == 0.12  # a float a hair under the cent is that cent; a real 0.1299 is not
+q = m.taker_quote(book([], [("0.58", "30"), ("0.66", "500")]), "up", 100, 200, cap=0.59)  # with a cap only the levels under it are walked
+assert q["got"] == 30 and q["levels"] == [[0.58, 30.0]] and q["short"] and q["cap"] == 0.59 and m.taker_quote(book([], [("0.60", "30")]), "up", 100, 200, cap=0.59) is None
 # a resting buy: sellers at or through its price are what fills it; the most seen, never a sum of looks
 order = {"price": 0.55, "side": "up", "order": 100.0, "shares": 0.0}
 got, seen = m.maker_fill(order, book([("0.54", "10")], [("0.55", "30"), ("0.56", "500")]))
@@ -159,10 +160,10 @@ async def run():
     assert t["shares"] == 100 and abs(t["edge"] - (0.70 - 0.58 - fee)) < 1e-12, t
     card = next(e for e in t["entry"]["card"] if e["label"] == "吃涨")
     assert abs(card["edge"] - (0.70 - 0.625 - FEE * 0.375)) < 1e-12 and card["size"] == 160, card
-    # only the levels under the cap (59.1¢: the dearest price keeping 10¢ after the fee) are bought: 10 at 58¢, none at 69¢
+    # only the levels under the cap (59¢: the dearest price keeping 10¢ after the fee) are bought: 10 at 58¢, none at 69¢
     await step(bot, NOW + 80_000, same([("0.58", "10"), ("0.69", "1000")], NOW + 80_000, "shallow"))
     t = bot.sim_trades()["shallow|up|吃"]
-    assert t["shares"] == 10 and t["order"] == 100 and t["cap"] == 0.591 and t["fills"][0]["short"] and t["fills"][0]["levels"] == [[0.58, 10.0]], t
+    assert t["shares"] == 10 and t["order"] == 100 and t["cap"] == 0.59 and t["fills"][0]["short"] and t["fills"][0]["levels"] == [[0.58, 10.0]], t
     # a thin book fills what it holds (whatever is there, up to the order), and says so
     await step(bot, NOW + 90_000, same([("0.58", "60")], NOW + 90_000, "thin"))
     t = bot.sim_trades()["thin|up|吃"]
@@ -215,10 +216,10 @@ async def run():
     t = bot.sim_trades()
     down_maker, down_taker = t[f"{KOSPI_SLUG}|down|挂"], t[f"{KOSPI_SLUG}|down|吃"]
     assert down_maker["label"] == "挂跌" and abs(down_maker["price"] - 0.62) < 1e-9 and down_maker["queue_ahead"] == 100
-    # the 跌 cap (fair 80¢, 10¢ required after the fee) is 69.3¢: the 65¢ level (30 shares) is bought, the 70¢ level is not
+    # the 跌 cap (fair 80¢, 10¢ required after the fee) is 69¢: the 65¢ level (30 shares) is bought, the 70¢ level is not
     k_cost = 0.65 + FEE * min(0.65, 1 - 0.65)
     assert down_taker["shares"] == 30 and down_taker["order"] == 100 and abs(down_taker["price"] - k_cost) < 1e-12 and down_taker["slip"] == 0
-    assert down_taker["cap"] == 0.693 and down_taker["fills"][0]["short"] and down_taker["fills"][0]["levels"] == [[0.65, 30.0]], down_taker["fills"]
+    assert down_taker["cap"] == 0.69 and down_taker["fills"][0]["short"] and down_taker["fills"][0]["levels"] == [[0.65, 30.0]], down_taker["fills"]
     await step(bot, NOW + 460_000, kospi([("0.39", "25")], [("0.41", "100")], NOW + 460_000))  # a 跌 seller at 61¢ ≤ 62¢
     assert bot.sim_trades()[f"{KOSPI_SLUG}|down|挂"]["shares"] == 25
     wait = {x["id"]: x["wait"] for x in bot.journal_payload()["trades"]}
