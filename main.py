@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.56.0"
+VERSION = "1.56.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -8614,12 +8614,13 @@ const DETAIL={SIM_MARKETS:{key:"SIM_SKIP",mode:"exclude"},SIM_MAKER_AFTER_HOURS_
 const MAKER_MODES=new Set(["SIM_MAKER_AFTER_HOURS_CENTS","SIM_MAKER_DEEP_CENTS"]);  // resting-order modes: nothing happens while 做哪种单 = 只吃单
 try{const k=sessionStorage.getItem("ctlkey");if(k){$("key").value=k;$("remember").checked=true}}catch(e){}
 function keep(){try{if($("remember").checked)sessionStorage.setItem("ctlkey",$("key").value);else sessionStorage.removeItem("ctlkey")}catch(e){}}
-$("remember").addEventListener("change",keep);$("key").addEventListener("input",keep);$("key").addEventListener("change",load);
+let keyBad=false;  // the poll stops re-sending a key the server refused: five tries lock the client out for ten minutes
+$("remember").addEventListener("change",keep);$("key").addEventListener("input",()=>{keyBad=false;keep()});$("key").addEventListener("change",load);
 function toast(t,ok){const el=$("toast");el.textContent=t;el.className=ok?"ok":"bad";el.style.display="block";clearTimeout(toast.t);toast.t=setTimeout(()=>{el.style.display="none"},7000)}
 async function load(){const key=$("key").value.trim();
   try{const r=await fetch(base+"/control.json",{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
-    if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}$("meta").textContent=(j.message||("HTTP "+r.status))+"｜账户、订单与设置只在口令正确时显示";data=null;return}
-    if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();render()}catch(e){$("meta").textContent="加载失败："+e.message}}
+    if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}$("meta").textContent=(j.message||("HTTP "+r.status))+"｜账户、订单与设置只在口令正确时显示"+(key?"｜改一下口令或点“刷新”再试":"");data=null;if(key)keyBad=true;return}
+    if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();keyBad=false;render()}catch(e){$("meta").textContent="加载失败："+e.message}}
 async function act(body){if(busy)return;const key=$("key").value.trim();if(!key){toast("请先输入控制口令",false);return}
   busy=true;try{const r=await fetch(base+"/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key,...body})});
   let j={};try{j=await r.json()}catch(e){}toast(j.message||("HTTP "+r.status),!!j.ok);await load()}catch(e){toast("请求失败："+e.message,false)}finally{busy=false}}
@@ -8704,11 +8705,11 @@ function card(s){
   const cu=el("div","custom");
   if(s.kind==="number"){const inp=el("input");inp.type="text";inp.inputMode="decimal";inp.placeholder="自定义";inp.dataset.key=s.key;inp.autocomplete="off";inp.disabled=!data.enabled;
     const go=el("button","opt","保存");go.disabled=!data.enabled;go.addEventListener("click",()=>{const v=inp.value.trim();if(v)act({action:"set",values:{[s.key]:v}})});
-    inp.addEventListener("keydown",e=>{if(e.key==="Enter")go.click()});cu.append(inp,go)}
+    inp.addEventListener("keydown",e=>{if(e.key==="Enter"){go.click();inp.blur()}});cu.append(inp,go)}
   if(s.saved){const back=el("button","lnk","恢复环境变量");back.disabled=!data.enabled;back.addEventListener("click",()=>act({action:"set",values:{[s.key]:""}}));cu.append(back)}
   if(cu.childNodes.length)c.append(cu);
   return c}
-function renderSettings(){
+function renderSettings(){if(!data)return;
   const box=$("cards"),a=document.activeElement;
   $("setbody").style.display=folded?"none":"";$("fold").textContent=folded?"展开":"收起";$("reset").disabled=!data.enabled;
   $("adv").textContent=(adv?"收起高级参数":"显示高级参数")+"（"+data.settings.filter(s=>s.group==="高级").length+"）";
@@ -8730,7 +8731,7 @@ let recTab="resting",recQ="";try{recTab=localStorage.getItem("ctlrectab")||"rest
 const TABS=[["resting","挂单中"],["position","持仓"],["history","历史"],["all","全部"]];
 $("recq").addEventListener("input",()=>{recQ=$("recq").value.trim().toLowerCase();renderRecords()});
 function stClass(r){if(r.group==="resting")return "st rest";if(r.group==="position")return "st pos";if(r.failed)return "st fail";if(r.status.startsWith("赢"))return "st win";if(r.status.startsWith("输"))return "st loss";return "st"}
-function renderRecords(){const rows=data.records||[];const tabs=$("rectabs");tabs.replaceChildren();
+function renderRecords(){if(!data)return;const rows=data.records||[];const tabs=$("rectabs");tabs.replaceChildren();
   TABS.forEach(([k,lab])=>{const n=k==="all"?rows.length:rows.filter(r=>r.group===k).length;const b=el("button","tab"+(recTab===k?" sel":""),lab+"（"+n+"）");b.dataset.tab=k;
     b.addEventListener("click",()=>{recTab=k;try{localStorage.setItem("ctlrectab",k)}catch(e){}renderRecords()});tabs.append(b)});
   const shown=rows.filter(r=>(recTab==="all"||r.group===recTab)&&(!recQ||(r.item+" "+r.label).toLowerCase().includes(recQ)));
@@ -8773,7 +8774,7 @@ function renderBar(){const L=data.live,b=$("bar");b.replaceChildren();const live
 // the quick switches: the few settings that are turned on and off most, one tap each, their value from the cards below
 const QUICK_DEFAULT={SIM_TAKER_AFTER_HOURS_CENTS:"15",SIM_MAKER_AFTER_HOURS_CENTS:"10",SIM_MAKER_DEEP_CENTS:"25",SIM_QUIET_MINUTES:"15"};
 function quickChip(label,on,key,fn,warn){const b=el("button","opt sw "+(warn?"warn":on?"on":"off"),label+(on?" · 开":" · 关")+(warn?"（"+warn+"）":""));b.dataset.q=key;b.title=key;b.disabled=!data.enabled;b.addEventListener("click",fn);return b}
-function renderQuick(){const q=$("quickbtns");q.replaceChildren();if(!data.settings)return;const v={};data.settings.forEach(s=>v[s.key]=s.value);
+function renderQuick(){const q=$("quickbtns");q.replaceChildren();if(!data||!data.settings)return;const v={};data.settings.forEach(s=>v[s.key]=s.value);
   const ways=v.SIM_WAYS||"taker";
   const setWays=(taker,maker)=>{if(!taker&&!maker){toast("吃单和挂单至少保留一种",false);return}act({action:"set",values:{SIM_WAYS:taker&&maker?"both":taker?"taker":"maker"}})};
   q.append(quickChip("吃单",ways!=="maker","SIM_WAYS:taker",()=>setWays(ways==="maker",ways!=="taker")));
@@ -8788,7 +8789,7 @@ function renderQuick(){const q=$("quickbtns");q.replaceChildren();if(!data.setti
     if(k==="SIM_MAKER_DEEP_CENTS"){const o=v.SIM_MAKER_DEEP_ONLY==="on";  // only the deep-bid orders: turning it on turns the mode (and 挂单) on too
       q.append(quickChip("只挂低价挂单",o,"SIM_MAKER_DEEP_ONLY",()=>act({action:"set",values:{SIM_MAKER_DEEP_ONLY:o?"off":"on",...(!o&&!on?{SIM_MAKER_DEEP_CENTS:last||QUICK_DEFAULT[k]}:{}),...(!o&&ways==="taker"?{SIM_WAYS:"both"}:{})}}),
         o&&!on?"低价挂单没开，不生效":o&&ways==="taker"?"挂单没开，不生效":""))}})}
-function renderPresets(){const box=$("presetbtns");box.replaceChildren();if(!data.presets)return;const v={},lab={};(data.settings||[]).forEach(s=>{v[s.key]=s.value;lab[s.key]=s.label});
+function renderPresets(){const box=$("presetbtns");box.replaceChildren();if(!data||!data.presets)return;const v={},lab={};(data.settings||[]).forEach(s=>{v[s.key]=s.value;lab[s.key]=s.label});
   let current="";data.presets.forEach(p=>{const keys=Object.keys(p.values),match=keys.every(k=>(v[k]||"")===(p.values[k]||""));if(match)current=p.label;
     const b=el("button",match?"pri":"",p.label+(match?" · 当前":""));b.title=p.hint;b.disabled=!data.enabled;
     b.addEventListener("click",()=>{const lines=keys.filter(k=>(v[k]||"")!==(p.values[k]||"")).map(k=>(lab[k]||k)+"："+(v[k]||"空")+" → "+(p.values[k]||"空"));
@@ -8803,9 +8804,9 @@ $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if
   else if(a==="cancelall"){if(confirm("撤掉本策略在 Predict 上的全部真实挂单？已成交的份数继续持有；以 Predict 的确认为准，确认前额度仍占用。"))act({action:"cancel",id:"all"})}
   else if(a==="cancelaccount"){if(confirm("撤掉这个 Predict 账户上的全部挂单，包括手动单和本机器人没有记录的单？"))act({action:"cancel",id:"account"})}
   else act({action:a})});
-$("reset").addEventListener("click",()=>{if(confirm("清除网页上保存的全部设置，恢复为环境变量？"))act({action:"reset"})});
-$("reload").addEventListener("click",load);
-load();setInterval(()=>{if(!busy&&document.visibilityState==="visible")load()},5000);
+$("reset").addEventListener("click",()=>{if(confirm("清除网页上保存的全部设置，恢复为环境变量？真实交易模式也回到环境变量的 LIVE 值（回到 off 会撤掉未成交的真实挂单），挂着的单按恢复后的设置重新判断。"))act({action:"reset"})});
+$("reload").addEventListener("click",()=>{keyBad=false;load()});
+load();setInterval(()=>{if(!busy&&!keyBad&&document.visibilityState==="visible")load()},5000);
 </script></body></html>
 """
 
@@ -9002,6 +9003,8 @@ class WebServer:
             return answer(403, False, "口令错误")
         self.control_failures.pop(client, None)
         result = await self.bot.control_action(data)
+        self.cache.pop("control.json", None)  # the page's next poll shows the change, not a copy built just before it
+        self.cache.pop("live.json", None)
         return answer(200 if result.get("ok") else 400, bool(result.get("ok")), str(result.get("message") or ""))
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -11708,6 +11711,7 @@ class Bot:
         wide = self.sim_deep_book(mk)  # a book the ordinary rule refuses: the deep-bid mode takes it, a cent in front, at its bar
         front_ok = c.sim_maker_deep > 0 and self.sim_mode_market(mk, c.sim_maker_deep_markets) and not book_crossed(mk.book)
         only = front_ok and c.sim_maker_deep_only  # SIM_MAKER_DEEP_ONLY: the joining orders are not placed at all
+        deep_bar = self.sim_maker_mode(mk, True)[0] if front_ok or wide else c.sim_maker_deep  # the deep-bid orders' bar here: SIM_MAKER_DEEP_CENTS, or the after-hours bar when higher
         limit = self.sim_after_hours_price(mk)  # after hours only at or under SIM_AFTER_HOURS_MAX_PRICE_CENTS
         cands, joined, dear = [], None, None  # joined / dear: what was passed over, for the reason when nothing is left
         for side, name in (("up", "涨"), ("down", "跌")):
@@ -11717,12 +11721,15 @@ class Bot:
                 continue
             fair = mk.fair_up if side == "up" else 1 - mk.fair_up
             front = self.sim_maker_price(mk.book, side, level, True, own, own_price)
+            in_front = front[0] > level[0] + 1e-9  # a cent over the 买1 is possible (the best ask is not right there)
+            front_edge = fair - front[0] >= deep_bar - 1e-9
             # the deep-bid placement, a cent in front of the 买1: on a book the ordinary rule refuses, and on any book when
-            # the edge there still clears SIM_MAKER_DEEP_CENTS (a cent is worth being filled first); otherwise join the level
-            use_front = wide or (front_ok and fair - front[0] >= c.sim_maker_deep - 1e-9)
+            # the edge there still clears the deep-bid bar (a cent is worth being filled first); otherwise join the level
+            # (under SIM_MAKER_DEEP_ONLY a sweep order instead, on a wide book too)
+            use_front = in_front and ((wide and (front_edge or not only)) or (front_ok and front_edge))
             sweep = None
             if only and not use_front:  # the front has no edge: a sweep order deep under it, or nothing
-                sweep = self.sweep_price(mk.book, side, fair, c.sim_maker_deep, own, own_price)
+                sweep = self.sweep_price(mk.book, side, fair, deep_bar, own, own_price)
                 if sweep is None:
                     joined = max(joined if joined is not None else -1.0, fair - level[0])
                     continue
@@ -11738,7 +11745,7 @@ class Bot:
             if dear is not None and joined is None:
                 return None, f"盘后只挂 {cents(limit)} 以下的，可挂的价位 {cents(dear)} 高于它"
             if joined is not None:
-                return None, f"只挂低价挂单：买1 之上 1¢ 的净优势不到 {cents(c.sim_maker_deep)}（跟买1 也只有 {cents(joined)}）"
+                return None, f"只挂低价挂单：买1 之上 1¢ 的净优势不到 {cents(deep_bar)}（跟买1 也只有 {cents(joined)}）"
             return None, f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟" if c.sim_maker_min_bid > 0 else "没有可跟的买价"
         if best.edge <= mk.need:
             return None, f"净优势 {cents(best.edge)} 不超过模型误差 {cents(mk.need)}"
@@ -11983,18 +11990,20 @@ class Bot:
         placed_bar = float((trade.get("version") or {}).get("sim_edge") or c.sim_edge)
         if abs(placed_bar - c.sim_edge) > 1e-12 and edge < c.sim_edge - 1e-9:
             return f"触发门槛已改为 {cents(c.sim_edge)}，现净优势 {cents(edge)} 不达标"  # a changed setting re-judges the order by the entry bar
-        if c.sim_maker_min_bid > 0:
+        deep_order = bool(trade.get("deep"))
+        if c.sim_maker_min_bid > 0 or deep_order:  # SIM_MAKER_MIN_BID=0: an ordinary order is not re-quoted; a deep-bid order keeps its place whatever the setting
             own = max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0) if isinstance(trade.get("live"), dict) else 0.0
-            level = maker_level(mk.book, side, c.sim_maker_min_bid, own, price)
+            level = maker_level(mk.book, side, max(c.sim_maker_min_bid, SIM_MAKER_FRONT_MIN) if deep_order else c.sim_maker_min_bid, own, price)
             if level is None:
-                return f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟"
-            if not trade.get("deep"):
+                return f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟" if c.sim_maker_min_bid > 0 else ""  # nobody else bids: a deep-bid order stays
+            if not deep_order:
                 if abs(level[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
-                    # the 买1 moved up to where no fresh order would be placed (the entry bar, the model's error, the
-                    # after-hours price limit): the order stays where it is, still with its edge, rather than being
-                    # withdrawn for a replacement that never comes (10-08: a 55¢ bid with 11¢ left was withdrawn to
-                    # "follow" a 57¢ level worth 9¢, and nothing took its place)
-                    if level[0] > price and (fair - level[0] < bar - 1e-9 or fair - level[0] <= mk.need
+                    # the 买1 moved up to where no fresh order would be placed (the bar a fresh order faces on this book — the
+                    # deep-bid bar on a wide one — the model's error, the after-hours price limit): the order stays where it
+                    # is, still with its edge, rather than being withdrawn for a replacement that never comes (10-08: a 55¢
+                    # bid with 11¢ left was withdrawn to "follow" a 57¢ level worth 9¢, and nothing took its place)
+                    fresh_bar = self.sim_maker_mode(mk)[0]
+                    if level[0] > price and (fair - level[0] < fresh_bar - 1e-9 or fair - level[0] <= mk.need
                                              or (limit is not None and level[0] > limit + 1e-9)):
                         return ""
                     return f"买1 移到 {cents(level[0])}，改跟"
@@ -12006,9 +12015,10 @@ class Bot:
             if trade.get("sweep"):  # a sweep order: to the front once that has the edge, else a cent over the next bid under the threshold
                 if fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9:
                     return f"盘口离公平价远了，击穿单改挂到买1 之上 1¢（{cents(target)}）"
-                sweep = self.sweep_price(mk.book, side, fair, c.sim_maker_deep, own, price)
+                deep_bar = self.sim_maker_mode(mk, True)[0]
+                sweep = self.sweep_price(mk.book, side, fair, deep_bar, own, price)
                 if sweep is None:
-                    return f"公平价 {cents(fair)} 留不出 {cents(c.sim_maker_deep)}，击穿单撤掉"
+                    return f"公平价 {cents(fair)} 留不出 {cents(deep_bar)}，击穿单撤掉"
                 if abs(sweep[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
                     return f"下面的买单变了，击穿单改挂 {cents(sweep[0])}"
                 return ""
@@ -12332,21 +12342,27 @@ class Bot:
         opened, rekeys = {tid for tid, _ in changed}, []
         for tid, trade in trades.items():
             if trade.get("final") or tid in opened:
-                continue  # settled and confirmed: nothing below applies (and no JSON round trip for it every 10 seconds)
+                continue  # settled and confirmed: nothing below applies (and no JSON round trip for it every step)
+            if trade["status"] in {"expired", "cancelled"} and float(trade.get("shares") or 0) <= 1e-9:
+                continue  # withdrawn or lapsed before anything filled: nothing to fill, mark out or settle (the journal keeps it)
             before = json.dumps(trade, sort_keys=True, default=str)
             mk = markets.get(trade["market"])
+            fresh = mk is not None and not mk.book.stale(now_ms) and not book_crossed(mk.book)
+            if trade["status"] == "resting" and fresh:
+                # the sellers this snapshot shows at or through its price fill it first: a dump that swept the order also
+                # moved the 买1 (or the edge), which judged first would withdraw it as unfilled. A crossed snapshot opens
+                # nothing (above) and fills nothing either: its "sellers through the price" are a feed caught mid-update,
+                # and a presumed fill is never taken back
+                self.sim_fill(trade, mk, now_ms)
             if trade["status"] == "resting":
-                why, requote = self.sim_withdraw_reason(trade, mk, now_ms), False
-                if not why:
-                    why, requote = self.sim_requote_reason(trade, mk, now_ms), True
+                why = self.sim_withdraw_reason(trade, mk, now_ms) or self.sim_requote_reason(trade, mk, now_ms)
                 if why:
                     self.sim_withdraw(trade, why, now_ms)
-                    if requote and float(trade.get("shares") or 0) <= 1e-9:
-                        rekeys.append(tid)  # nothing filled: the slot is free for a fresh order; the record keeps the attempt
-                elif mk is not None and not mk.book.stale(now_ms) and not book_crossed(mk.book):
-                    # a crossed snapshot opens nothing (above) and fills nothing either: its "sellers through the price"
-                    # are a feed caught mid-update, and a presumed fill is never taken back
-                    self.sim_fill(trade, mk, now_ms)
+                    if float(trade.get("shares") or 0) <= 1e-9:
+                        # nothing filled: the slot is free for a fresh order, the record keeps the attempt — whatever the
+                        # reason: withdrawn for a setting that is later flipped back (SIM_WAYS, SIM_MARKETS, SIM_SKIP), the
+                        # record would otherwise hold the slot for the market's life ("已有已撤单")
+                        rekeys.append(tid)
             if mk is not None and not mk.book.stale(now_ms) and not book_crossed(mk.book):
                 self.sim_markout(trade, mk, now_ms)
             if not trade.get("final") and (trade["status"] in {"resting", "filled"} or trade.get("confirm") == "local"):
@@ -13511,17 +13527,38 @@ class Bot:
 
     # --- the control page (/p/<token>/control): settings while running, the real-trading switches ------------------
     @staticmethod
+    def control_prune(env: Mapping[str, str], saved: Mapping[str, str]) -> tuple[Config, dict[str, str]]:
+        """The configuration from the environment with the saved control settings on top. A saved value that no longer
+        validates (a bound tightened since it was saved) is dropped and the rest kept — never the whole page's settings
+        for one bad one, and never a save refused for a key the user did not touch. (config, dropped key -> why)."""
+        saved, dropped = dict(saved), {}
+        while True:
+            try:
+                return Config.from_env({**env, **saved}), dropped
+            except ValueError as error:
+                text = clean_error(error)
+                bad = next((k for k in sorted(saved, key=len, reverse=True) if k in text), None)  # the message names its key
+                if bad is None:
+                    raise
+                dropped[bad] = text
+                saved.pop(bad)
+
+    @staticmethod
     def control_config(config: Config, store: Store) -> Config:
         """The configuration with the control page's saved changes (control:env) applied on top of the environment;
-        saved values that no longer validate are ignored with a warning, never a crash at start-up."""
+        saved values that no longer validate are dropped (and forgotten) with a warning, never a crash at start-up."""
         saved = store.get("control:env")
         if not isinstance(saved, dict) or not saved:
             return config
+        kept = {k: str(v) for k, v in saved.items() if k in CONTROL_KEY_SET}
         try:
-            applied = Config.from_env({**config.env, **{k: str(v) for k, v in saved.items() if k in CONTROL_KEY_SET}})
+            applied, dropped = Bot.control_prune(config.env, kept)
         except ValueError as error:
             LOG.warning("网页控制台保存的设置无效，已忽略：%s", clean_error(error))
             return config
+        if dropped:
+            LOG.warning("网页控制台保存的设置里有无效项，已忽略：%s", "；".join(f"{k}：{why}" for k, why in dropped.items()))
+            store.put("control:env", {k: v for k, v in kept.items() if k not in dropped})  # the page shows what is in force
         return dataclasses.replace(applied, env=config.env)  # env stays the environment itself, never the merged values
 
     def apply_config(self, config: Config) -> None:
@@ -13533,18 +13570,19 @@ class Bot:
         """A control setting's value in force, as the variable would be written."""
         c = self.config
         flag = lambda value: "on" if value else "off"
-        values = {"LIVE": c.live_mode, "SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": f"{c.sim_shares:g}", "SIM_WAYS": c.sim_ways,
+        plain = lambda value: f"{value:.10g}"  # 1000000, never 1e+06
+        values = {"LIVE": c.live_mode, "SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": plain(c.sim_shares), "SIM_WAYS": c.sim_ways,
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
-                  "SIM_GROUP_USD": f"{c.sim_group_usd:g}", "SIM_TAKER_SESSION": flag(c.sim_taker_session),
+                  "SIM_GROUP_USD": plain(c.sim_group_usd), "SIM_TAKER_SESSION": flag(c.sim_taker_session),
                   "SIM_TAKER_AFTER_HOURS_CENTS": f"{c.sim_taker_after_hours * 100:g}", "SIM_AFTER_HOURS_MAX_PRICE_CENTS": f"{c.sim_after_hours_max_price * 100:g}", "SIM_SKIP": ",".join(sorted(c.sim_skip)),
-                  "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes), "SIM_MAKER_MIN_BID": f"{c.sim_maker_min_bid:g}",
+                  "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes), "SIM_MAKER_MIN_BID": plain(c.sim_maker_min_bid),
                   "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points),
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
                   "SIM_MAKER_SPREAD_CENTS": f"{c.sim_maker_spread * 100:g}", "SIM_MAKER_DEEP_ONLY": flag(c.sim_maker_deep_only),
                   "SIM_MAKER_AFTER_HOURS_MARKETS": ",".join(sorted(c.sim_maker_after_hours_markets)), "SIM_MAKER_DEEP_MARKETS": ",".join(sorted(c.sim_maker_deep_markets)),
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}", "SIM_SECONDS": str(c.sim_seconds), "PREDICT_POLL_SECONDS": str(c.predict_poll),
-                  "PREDICT_TRADE_USD": f"{c.predict_trade_usd:g}", "LIVE_MAX_ORDER_USD": f"{c.live_max_order_usd:g}",
-                  "LIVE_MAX_OPEN_USD": f"{c.live_max_open_usd:g}", "LIVE_MAX_DAILY_LOSS_USD": f"{c.live_max_daily_loss_usd:g}",
+                  "PREDICT_TRADE_USD": plain(c.predict_trade_usd), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
+                  "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait),
                   "LIVE_RETRY_SECONDS": str(c.live_retry), "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify)}
         return values.get(key, "")
@@ -13615,12 +13653,15 @@ class Bot:
     def control_set(self, values: dict) -> dict:
         """Save the settings given (an empty value clears that one), validated together like the environment."""
         saved = {k: str(v) for k, v in (self.store.get("control:env") or {}).items() if k in CONTROL_KEY_SET}
+        if str(values.get("LIVE") or "").strip().lower() == "on" and not self.config.live_allowed:
+            return {"ok": False, "message": "部署变量 LIVE_TRADING_ALLOWED=off 禁止真实下单（硬开关）：不能保存 LIVE=on"}
         changed = []
         for key, _, _ in CONTROL_KEYS:
             if key not in values:
                 continue
             value = str(values[key]).strip()
-            if value and len(value) > 200:
+            limit = 2000 if CONTROL_FORMS.get(key, {}).get("kind") == "detail" else 200  # a detail list names up to 200 markets
+            if value and len(value) > limit:
                 return {"ok": False, "message": f"{key} 太长"}
             if value != saved.get(key, ""):
                 changed.append(key)
@@ -13632,9 +13673,14 @@ class Bot:
         if unknown:
             return {"ok": False, "message": "不能在网页上改的变量：" + "、".join(str(k)[:40] for k in unknown[:5])}
         try:
-            config = dataclasses.replace(Config.from_env({**self.config.env, **saved}), env=self.config.env)
+            config, dropped = self.control_prune(self.config.env, saved)
         except ValueError as error:
             return {"ok": False, "message": clean_error(error)}
+        if any(k in values for k in dropped):
+            return {"ok": False, "message": "；".join(why for k, why in dropped.items() if k in values)}
+        for key in dropped:  # a saved value that stopped validating since: dropped, the save goes on
+            saved.pop(key, None)
+        config = dataclasses.replace(config, env=self.config.env)
         before = {key: self.control_value(key) for key, _, _ in CONTROL_KEYS}
         self.store.put("control:env", saved)
         self.apply_config(config)

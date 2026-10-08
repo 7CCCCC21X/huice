@@ -248,6 +248,17 @@ def build_order(wallet: Wallet, token_id: str, maker_amount: int, taker_amount: 
 
 
 # --- the REST API (api.predict.fun/v1): sign-in, orders, positions -----------------------------------------------------
+def answer_shape(answer: Any) -> str:
+    """An API answer's field names (one level into "data"), for an error that must not quote its values."""
+    if not isinstance(answer, dict):
+        return type(answer).__name__
+    inner = answer.get("data")
+    names = sorted(str(k) for k in answer)
+    if isinstance(inner, dict):
+        names.append("data{" + ",".join(sorted(str(k) for k in inner)) + "}")
+    return ",".join(names)[:160]
+
+
 def http_status(error: BaseException) -> int:
     match = re.match(r"HTTP (\d{3})", str(error))
     return int(match.group(1)) if match else 0
@@ -336,12 +347,12 @@ class PredictApi:
             data = await self.call("GET", "/auth/message")
             message = str(((data or {}).get("data") or {}).get("message") or "")
             if not message:
-                raise core.RemoteError("登录消息格式异常：" + core.brief_error(json.dumps(data, ensure_ascii=False), 80))
+                raise core.RemoteError("登录消息格式异常（应答字段：" + answer_shape(data) + "）")
             answer = await self.call("POST", "/auth", {"signer": self.wallet.maker, "signature": self.wallet.sign_text(message),
                                                       "message": message})
             token = str(((answer or {}).get("data") or {}).get("token") or "")
             if not token:
-                raise core.RemoteError("登录未返回 token：" + core.brief_error(json.dumps(answer, ensure_ascii=False), 80))
+                raise core.RemoteError("登录未返回 token（应答字段：" + answer_shape(answer) + "）")  # never the answer itself: a token under another name would be logged
         except core.RemoteError as error:
             self.auth_error = core.clean_error(error)
             raise
@@ -891,7 +902,10 @@ class LiveBot(core.Bot):
     LIVE_NOTE_SECONDS = 600     # the same failure is announced at most this often
     LIVE_PLACING_GRACE_MS = 120_000  # a record left in "placing" is reconciled by its hash after this long
     LIVE_IDLE_LIST_MS = 60_000      # the open-order list is re-read this often even with nothing in flight (orders this bot did not place)
-    LIVE_MISSES = 3             # an open order Predict stops listing without a final record counts as cancelled after this many looks
+    LIVE_MISSES = 3             # an open order Predict stops listing without a final record counts as cancelled after this many looks...
+    LIVE_MISS_WINDOW_MS = 60_000    # ...and never within a minute of its placement (Predict's reads may lag a fresh order)
+    LIVE_CANCEL_RETRY_MS = 30_000   # a cancel Predict did not confirm, the order still listed: asked again after this long
+    LIVE_MARKET_RETRY_SECONDS = 60  # a market whose details could not be read is asked for again after this long, not every step
 
     def __init__(self, config: core.Config, store: core.Store, market: Any, telegram: Any):
         super().__init__(config, store, market, telegram)
@@ -908,6 +922,7 @@ class LiveBot(core.Bot):
         self.live_positions: tuple[list[dict], float] = ([], 0.0)
         self.live_errors: list[str] = []  # the latest failures, newest last, for /live
         self.live_wanted: set[str] = set()  # market ids a decision waited for (details read next step, whatever the edge)
+        self.live_market_retry: dict[str, float] = {}  # market id -> monotonic time its details are asked for again after a failure
         self.live_unknown_open: list[dict] = []  # open orders on the account this bot has no record of (manual, or lost)
         self.live_synced_at = 0  # when the open-order list was last read in full
         self.live_list_at_ms = -10 ** 15  # ...on the bot's clock, for the idle re-read
@@ -1080,7 +1095,9 @@ class LiveBot(core.Bot):
 
     def sim_withdraw_reason(self, trade: dict, mk: core.SimMarket | None, now_ms: int | None = None) -> str:
         if isinstance(trade.get("live"), dict) and not trade.get("maker"):
-            return ""  # a taker order in flight rests only until LIVE_TAKER_WAIT_SECONDS: SIM_WAYS / SIM_MARKETS do not withdraw it
+            # a taker order in flight rests only until LIVE_TAKER_WAIT_SECONDS: SIM_WAYS / SIM_MARKETS do not withdraw it —
+            # a market at its end does (a bid left on a finished market is a free option for whoever holds the losing side)
+            return self.sim_quiet(trade.get("settle") or (mk.settle if mk is not None else None), self.market.now_ms() if now_ms is None else now_ms)
         return super().sim_withdraw_reason(trade, mk, now_ms)
 
     def sim_withdraw(self, trade: dict, why: str, now_ms: int) -> None:
@@ -1137,6 +1154,7 @@ class LiveBot(core.Bot):
             self.live_note_error(f"读取市场信息失败：{core.clean_error(error) or type(error).__name__}")
         result = await super().sim_step(now_ms)
         try:
+            self.live_check_kill(self.sim_trades(), now_ms)  # the settlements of this step count before anything goes out
             await self.live_place_pending(now_ms)
             await self.live_sync(now_ms)
         except Exception as error:
@@ -1175,10 +1193,13 @@ class LiveBot(core.Bot):
                 near = near or (q is not None and q["got"] >= core.SIM_MIN_SHARES - 1e-9)
             if near:
                 wanted.append(str(mk.book.market_id))
-        for mid in list(dict.fromkeys(wanted))[:5]:
+        due = [mid for mid in dict.fromkeys(wanted) if time.monotonic() >= self.live_market_retry.get(mid, 0.0)]
+        for mid in due[:5]:
             try:
                 await self.live.market(mid)
+                self.live_market_retry.pop(mid, None)
             except Exception as error:
+                self.live_market_retry[mid] = time.monotonic() + self.LIVE_MARKET_RETRY_SECONDS  # again in a minute, not every step
                 self.live_note_error(f"市场 {mid} 详情读取失败：{core.clean_error(error) or type(error).__name__}")
 
     async def live_ensure_ready(self) -> None:
@@ -1238,6 +1259,12 @@ class LiveBot(core.Bot):
         goes out: a crash in between is reconciled by the hash, never by sending again."""
         st, want = trade["live"], trade["live"]["want"]
         c, wallet = self.config, self.live.wallet
+        if (left := getattr(self.live.api, "blocked_until", 0.0) - time.monotonic()) > 0:
+            return self.live_defer(tid, trade, f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", now_ms)
+        try:
+            await self.live.api.ensure_auth()  # a sign-in failure is "not sent", never "result unknown"
+        except Exception as error:
+            return self.live_defer(tid, trade, f"登录失败：{core.clean_error(error) or type(error).__name__}", now_ms)
         try:
             shares_wei = to_wei(want["shares"])
             if want["maker"]:
@@ -1259,6 +1286,10 @@ class LiveBot(core.Bot):
         except Exception as error:
             text = core.clean_error(error) or type(error).__name__
             definite = isinstance(error, OrderRejected) or 400 <= http_status(error) < 500
+            if isinstance(error, core.RemoteError) and error.retry_after and http_status(error) == 0:
+                # refused by the client itself (a cooldown that began between the check above and the request): nothing went out
+                st.update(state="pending", hash="")
+                return self.live_defer(tid, trade, text, now_ms)
             if st.get("state") == "placing" and not definite:
                 # the request may have reached Predict (a timeout, a dropped connection, a 5xx from a proxy, an answer
                 # without an order id): never send it again; the sync step finds the order by its hash, or gives the
@@ -1271,10 +1302,23 @@ class LiveBot(core.Bot):
             return
         st.update(state="open", order_id=result["order_id"], placed_at=now_ms, code=result.get("code"))
         st["events"].append({"at": now_ms, "what": f"已下单 #{result['order_id']}"})
+        api_hash = str(result.get("hash") or "").lower()
+        if api_hash and api_hash != st["hash"]:  # Predict's own hash is what its reads answer to: tracked by that one
+            st["events"].append({"at": now_ms, "what": f"Predict 返回的订单哈希与本地算的不同（{api_hash[:12]}… / {st['hash'][:12]}…），按它的跟踪"})
+            st["local_hash"], st["hash"] = st["hash"], api_hash
         self.sim_save([(tid, trade)])
         self.live_notify(f"📤 已向 Predict 下单：{trade['item']} {trade['label']} {core.cents(want['price'])}×{want['shares']:g} 份"
                          f"（{'限价挂单' if want['maker'] else '限价吃单'}，订单 #{result['order_id']}，"
                          f"最多花 ${from_wei(amounts['maker']):,.2f}）\n{self.sim_url(trade)}")
+
+    def live_defer(self, tid: str, trade: dict, why: str, now_ms: int) -> None:
+        """A pending order that cannot go out right now (the API in a cooldown, the sign-in failing): it stays pending and
+        is tried again next step, until the decision is too old to send (live_send_block)."""
+        st = trade["live"]
+        if st.get("last_error") != why:
+            st["last_error"] = why
+            st["events"].append({"at": now_ms, "what": f"暂未发送：{why}"})
+            self.sim_save([(tid, trade)])
 
     def live_fail(self, tid: str, trade: dict, why: str, now_ms: int) -> None:
         """An order that never went out (or filled nothing): the record is kept under a numbered key so the journal
@@ -1295,6 +1339,7 @@ class LiveBot(core.Bot):
     # --- reading back: fills, cancels, the final state of each order ---------------------------------------------------
     async def live_sync(self, now_ms: int) -> None:
         trades = self.sim_trades()
+        self.live_check_kill(trades, now_ms)  # first, and never behind the open-order read: a list that cannot be read must not keep the switch from tripping
         active = {tid: t for tid, t in trades.items() if isinstance(t.get("live"), dict) and t["live"].get("state") in PLACING
                   and t["live"].get("state") != "pending"}
         if active and not self.live.ready:
@@ -1303,7 +1348,6 @@ class LiveBot(core.Bot):
             return
         if active or now_ms - self.live_list_at_ms >= self.LIVE_IDLE_LIST_MS:
             await self.live_sync_orders(active, now_ms)  # with nothing in flight the list is still read now and then: orders this bot did not place
-        self.live_check_kill(trades, now_ms)
         if self.config.live_auto_redeem and time.monotonic() - self.live_last_redeem >= self.LIVE_REDEEM_SECONDS:
             self.live_last_redeem = time.monotonic()
             try:
@@ -1376,30 +1420,44 @@ class LiveBot(core.Bot):
         if row is not None:
             self.live_misses.pop(tid, None)
             self.live_apply(tid, trade, row, mk, now_ms)
-            if not trade.get("maker") and now_ms - int(st.get("placed_at") or now_ms) >= self.config.live_taker_wait * 1000:
-                st.update(state="cancelling", cancel_why=f"吃单 {self.config.live_taker_wait} 秒未全部成交")
-                st["events"].append({"at": now_ms, "what": st["cancel_why"]})
-                await self.live_cancel(tid, trade, by_id, mk, now_ms)
+            await self.live_taker_due(tid, trade, by_id, mk, now_ms)
             return
         final = await self.live.api.order(st["order_id"], st.get("hash", ""))
         if final is not None:
             self.live_misses.pop(tid, None)
             if order_final(final, float(trade.get("order") or 0)):
                 self.live_finish(tid, trade, final, mk, now_ms)
-            else:  # Predict's own record says it is still open (the list missed it): its fills, and on with the tracking
-                self.live_apply(tid, trade, final, mk, now_ms)
-                if not st.get("list_missed"):
-                    st["list_missed"] = now_ms
-                    st["events"].append({"at": now_ms, "what": f"开放订单列表没有它，但按哈希查到仍为 {str(final.get('status') or '?')}：继续跟踪"})
+                return
+            self.live_apply(tid, trade, final, mk, now_ms)  # Predict's own record says it is still open (the list missed it): its fills, and on with the tracking
+            if not st.get("list_missed"):
+                st["list_missed"] = now_ms
+                st["events"].append({"at": now_ms, "what": f"开放订单列表没有它，但按哈希查到仍为 {str(final.get('status') or '?')}：继续跟踪"})
+            await self.live_taker_due(tid, trade, by_id, mk, now_ms)
             return
         self.live_misses[tid] = self.live_misses.get(tid, 0) + 1
-        if self.live_misses[tid] >= self.LIVE_MISSES:
-            # Predict has answered "no such order" this many looks in a row: a removal is still asked for (if it exists
-            # after all, it must not fill), then the record ends as unknown
-            with contextlib.suppress(Exception):
-                await self.live.api.remove_orders([st["order_id"]])
-            st["events"].append({"at": now_ms, "what": f"连续 {self.LIVE_MISSES} 次查不到这张单，已补发撤单请求"})
-            self.live_finish(tid, trade, {"status": "UNKNOWN"}, mk, now_ms)
+        if self.live_misses[tid] < self.LIVE_MISSES or now_ms - int(st.get("placed_at") or now_ms) < self.LIVE_MISS_WINDOW_MS:
+            return  # a fresh order may take Predict a moment to show on its reads: the looks only count after a minute
+        # Predict has answered "no such order" this many looks in a row, a minute or more after the placement: a removal is
+        # still asked for (if it exists after all, it must not fill — and the answer says whether it did), then the record ends
+        try:
+            result = await self.live.api.remove_orders([st["order_id"]])
+        except Exception as error:
+            st["last_error"] = core.clean_error(error) or type(error).__name__
+            return  # the removal could not be asked for: again next look, the order stays reserved meanwhile
+        if st["order_id"] in (result.get("removed") or []):
+            st["events"].append({"at": now_ms, "what": f"连续 {self.LIVE_MISSES} 次查不到这张单，补发的撤单请求撤掉了它（它其实还在）"})
+            self.live_finish(tid, trade, {"status": "CANCELLED"}, mk, now_ms)
+            return
+        st["events"].append({"at": now_ms, "what": f"连续 {self.LIVE_MISSES} 次查不到这张单，已补发撤单请求"})
+        self.live_finish(tid, trade, {"status": "UNKNOWN"}, mk, now_ms)
+
+    async def live_taker_due(self, tid: str, trade: dict, by_id: dict, mk: Any, now_ms: int) -> None:
+        """A taker's LIMIT order still open after LIVE_TAKER_WAIT_SECONDS: the rest is cancelled."""
+        st = trade["live"]
+        if not trade.get("maker") and now_ms - int(st.get("placed_at") or now_ms) >= self.config.live_taker_wait * 1000:
+            st.update(state="cancelling", cancel_why=f"吃单 {self.config.live_taker_wait} 秒未全部成交")
+            st["events"].append({"at": now_ms, "what": st["cancel_why"]})
+            await self.live_cancel(tid, trade, by_id, mk, now_ms)
 
     async def live_cancel(self, tid: str, trade: dict, by_id: dict, mk: Any, now_ms: int) -> None:
         """A withdrawn record's real order is removed from Predict and the record ends only on Predict's final word
@@ -1423,8 +1481,12 @@ class LiveBot(core.Bot):
             st["cancel_sent"], gone_now = now_ms, st["order_id"] in result["removed"]
             st["cancel_confirmed"] = bool(gone_now)
             st["events"].append({"at": now_ms, "what": f"撤单请求已发送（{'Predict 确认已撤' if gone_now else 'Predict 称无需撤/已不在盘口'}）"})
-        if st["order_id"] in by_id and not gone_now:
-            return  # still listed: the fills so far, the next look will see it gone
+        if st["order_id"] in by_id and not gone_now and not st.get("cancel_confirmed"):
+            self.live_apply(tid, trade, by_id[st["order_id"]], mk, now_ms)  # still listed: its fills so far count while it rests
+            if now_ms - int(st.get("cancel_sent") or now_ms) >= self.LIVE_CANCEL_RETRY_MS:
+                st["cancel_sent"] = 0  # listed this long after a removal Predict did not confirm: asked again next look
+                st["events"].append({"at": now_ms, "what": "撤单请求发出后仍在盘口，再发一次"})
+            return
         final = await self.live.api.order(st["order_id"], st.get("hash", ""))
         order = float(trade.get("order") or 0)
         if final is not None and not order_final(final, order) and not st.get("cancel_confirmed"):

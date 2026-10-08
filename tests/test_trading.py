@@ -500,8 +500,10 @@ async def run():
     await step(bot, NOW + 380_000, ghost(NOW + 380_000))
     oid = bot.sim_trades()["ghost|up|吃"]["live"]["order_id"]
     fake.open.pop(oid)
-    for i in range(3):
+    for i in range(3):  # three "no such order" answers within a minute of the placement: not yet (Predict's reads may lag a fresh order)
         await step(bot, NOW + 390_000 + i * 10_000, ghost(NOW + 390_000 + i * 10_000))
+    assert bot.sim_trades()["ghost|up|吃"]["live"]["state"] == "open" and bot.live_misses["ghost|up|吃"] == 3
+    await step(bot, NOW + 445_000, ghost(NOW + 445_000))  # a minute on: the next answer ends it
     ghost_t = bot.sim_trades()["ghost|up|吃#1"]
     assert ghost_t["live"]["final"] == "failed" and any("UNKNOWN" in e["what"] for e in ghost_t["live"]["events"]) and "ghost|up|吃" not in bot.sim_trades()
 
@@ -728,8 +730,8 @@ async def run():
     await qbot.live_prefetch(late)
     await step(qbot, late, hsi(0.70, [("0.55", "300")], [("0.58", "400")], late), other)
     qt = qbot.sim_trades()
-    assert sorted(qt) == [f"{HSI_SLUG}|up|吃#1", f"{HSI_SLUG}|up|挂"], sorted(qt)  # nothing new on either market (the unfilled market order lapsed after LIVE_TAKER_WAIT_SECONDS, as always)
-    maker_rec = qt[f"{HSI_SLUG}|up|挂"]
+    assert sorted(qt) == [f"{HSI_SLUG}|up|吃#1", f"{HSI_SLUG}|up|挂#1"], sorted(qt)  # nothing new on either market (the unfilled market order lapsed after LIVE_TAKER_WAIT_SECONDS, as always; the maker withdrawn with nothing filled moved to #1)
+    maker_rec = qt[f"{HSI_SLUG}|up|挂#1"]
     assert maker_rec["status"] == "cancelled" and maker_rec["note"] == "撤单：结束前 15 分钟不交易，一份都没成交" and maker_rec["withdrawn"]["why"] == "结束前 15 分钟不交易"
     assert maker_rec["live"]["state"] == "done" and maker_rec["live"]["cancel_why"] == "结束前 15 分钟不交易"  # the real order: cancel sent and confirmed in the same step
     assert ("remove", [maker_rec["live"]["order_id"]]) in qbot.live.api.calls
@@ -1050,4 +1052,100 @@ async def run():
     print("LIVE_OK")
 
 
+async def review_fixes():
+    """The 10-08 review of the order lifecycle: the kill switch before anything goes out and whatever the list read; a
+    placement the client refuses stays pending; a cancel Predict does not confirm is re-asked and the fills meanwhile
+    count; a vanished order that the removal finds after all; a taker order withdrawn at the market's end; the hard
+    switch on a raw LIVE=on; a failed market read not repeated every step."""
+    # kill switch: tripped by this step's settlements before the pending order goes out, with the open-order read failing
+    kbot = make_bot(SIM_WAYS="taker")
+    await kbot.live_prepare(); kfake = kbot.live.api
+    await kbot.live_prefetch(NOW)
+    kbot.live_daily_pnl = lambda trades, now_ms: -60.0  # today's settled losses, past the $50 cap
+    kfake.fail_open = "HTTP 500: down"
+    await step(kbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    assert kbot.live_killed() and not [c for c in kfake.calls if c[0] == "create"], kfake.calls
+    kt = kbot.sim_trades()[f"{HSI_SLUG}|up|吃#1"]
+    assert kt["live"]["final"] == "failed" and "今日停止开新仓" in kt["note"], kt["note"]
+    kfake.fail_open = None
+    # a cooldown: the order is not signed and sent into it; it stays pending and goes out once the cooldown is over
+    cbot = make_bot(SIM_WAYS="taker")
+    await cbot.live_prepare(); cfake = cbot.live.api
+    await cbot.live_prefetch(NOW)
+    cfake.blocked_until = time.monotonic() + 30
+    await step(cbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    ct = cbot.sim_trades()[f"{HSI_SLUG}|up|吃"]
+    assert ct["live"]["state"] == "pending" and not cfake.calls and any(e["what"].startswith("暂未发送：Predict 接口限流冷却中") for e in ct["live"]["events"]), ct["live"]
+    await step(cbot, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000))
+    assert cbot.sim_trades()[f"{HSI_SLUG}|up|吃"]["live"]["state"] == "pending" and not [c for c in cfake.calls if c[0] == "create"]
+    cfake.blocked_until = 0.0
+    await step(cbot, NOW + 10_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
+    assert cbot.sim_trades()[f"{HSI_SLUG}|up|吃"]["live"]["state"] == "open" and len([c for c in cfake.calls if c[0] == "create"]) == 1
+    # a cancel answered "noop" while the order stays listed: its fills count, the removal is asked again after a while
+    nbot = make_bot(SIM_WAYS="maker")
+    await nbot.live_prepare(); nfake = nbot.live.api
+    await nbot.live_prefetch(NOW)
+    await step(nbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    ntid = f"{HSI_SLUG}|up|挂"
+    oid = nbot.sim_trades()[ntid]["live"]["order_id"]
+    async def noop(ids):
+        nfake.calls.append(("remove", list(ids))); return {"removed": [], "noop": list(ids)}
+    nfake.remove_orders = noop
+    nbot.control_set({"SIM_MARKETS": "touch"})  # the paper trader withdraws it (and opens nothing else here)
+    await step(nbot, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000))
+    nt = nbot.sim_trades()[f"{ntid}#1"]
+    assert nt["live"]["state"] == "cancelling" and [c for c in nfake.calls if c[0] == "remove"] == [("remove", [oid])], (nt["live"], nfake.calls)
+    nfake.fill(oid, 40)
+    await step(nbot, NOW + 10_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
+    nt = nbot.sim_trades()[f"{ntid}#1"]
+    assert nt["shares"] == 40 and nt["live"]["state"] == "cancelling" and len([c for c in nfake.calls if c[0] == "remove"]) == 1, nt["live"]
+    await step(nbot, NOW + 40_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 40_000))  # 35 s after the first ask: again
+    await step(nbot, NOW + 45_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 45_000))
+    assert len([c for c in nfake.calls if c[0] == "remove"]) == 2 and any("再发一次" in e["what"] for e in nbot.sim_trades()[f"{ntid}#1"]["live"]["events"])
+    assert abs(nbot.live_exposure(nbot.sim_trades()) - 55.0) < 1e-9  # 40 filled at 55¢ plus 60 still reserved
+    # a vanished order the removal then finds: cancelled (it existed), never "unknown"
+    vbot = make_bot(SIM_WAYS="taker")
+    await vbot.live_prepare(); vfake = vbot.live.api
+    await vbot.live_prefetch(NOW)
+    await step(vbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    vtid = f"{HSI_SLUG}|up|吃"
+    async def no_list(status="OPEN", **params): return []
+    async def no_order(oid, hash_=""): return None
+    vfake.orders, vfake.order = no_list, no_order  # hidden from every read, yet the removal reaches it
+    for at in (NOW + 10_000, NOW + 20_000, NOW + 30_000):
+        await step(vbot, at, hsi(0.70, [("0.55", "300")], [("0.58", "400")], at))
+    assert vbot.sim_trades()[vtid]["live"]["state"] == "open"
+    await step(vbot, NOW + 65_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 65_000))
+    vt = vbot.sim_trades()[f"{vtid}#1"]
+    assert vt["live"]["final"] == "failed" and any("它其实还在" in e["what"] for e in vt["live"]["events"]) and not any("UNKNOWN" in e["what"] for e in vt["live"]["events"]), vt["live"]["events"]
+    # a taker order still resting when the market ends is withdrawn (a bid left on a finished market is a free option)
+    tbot = make_bot(SIM_WAYS="taker", LIVE_TAKER_WAIT_SECONDS="3600")
+    await tbot.live_prepare(); tfake = tbot.live.api
+    await tbot.live_prefetch(CLOSE - 30_000)
+    await step(tbot, CLOSE - 30_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], CLOSE - 30_000))
+    assert tbot.sim_trades()[f"{HSI_SLUG}|up|吃"]["live"]["state"] == "open"
+    await step(tbot, CLOSE + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], CLOSE + 5_000))
+    tt = tbot.sim_trades()[f"{HSI_SLUG}|up|吃#1"]
+    assert tt["live"]["cancel_why"] == "已到结束时间，等结果出来：不开新单，挂单撤掉" and ("remove", [tt["live"]["order_id"]]) in tfake.calls, tt["live"]
+    # the hard switch: a raw LIVE=on is not even saved
+    hbot = make_bot(LIVE_TRADING_ALLOWED="off", LIVE="pause")
+    result = hbot.control_set({"LIVE": "on"})
+    assert not result["ok"] and "LIVE_TRADING_ALLOWED" in result["message"] and hbot.store.get("control:env") is None
+    # a market whose details cannot be read is asked for again a minute later, not every step
+    rbot = make_bot(SIM_WAYS="taker")
+    await rbot.live_prepare(); rfake = rbot.live.api
+    rfake.markets.pop("101")
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    await rbot.live_prefetch(NOW)
+    await rbot.live_prefetch(NOW)
+    assert "市场 101 详情读取失败" in rbot.live_errors[-1] and len([e for e in rbot.live_errors if "101" in e]) == 1 and "101" in rbot.live_market_retry, rbot.live_errors
+    rbot.live_market_retry["101"] = 0.0
+    rfake.markets["101"] = market_json("101")
+    await rbot.live_prefetch(NOW)
+    assert "101" in rbot.live.markets and "101" not in rbot.live_market_retry
+    assert L.answer_shape({"success": True, "data": {"token": "secret", "x": 1}}) == "data,success,data{token,x}" and "secret" not in L.answer_shape({"data": {"token": "secret"}})
+    print("REVIEW_FIXES_OK")
+
+
 asyncio.run(run())
+asyncio.run(review_fixes())

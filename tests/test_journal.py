@@ -93,7 +93,7 @@ async def run():
     waits = {t["id"]: t["wait"] for t in data["trades"]}  # every open trade says what it waits for; a settled one nothing
     assert waits["hype-flip#1|up|挂"] == "挂 20.0¢，最低卖价 30.0¢（高出 10.0¢）：要有人卖到挂价或更低才算成交；现在公平价 30.0¢", waits
     assert waits[hsi_maker] == "" and data["total"]["cancelled"] == 1  # the KOSPI maker, nothing filled, withdrawn at the close (1.54.3)
-    assert trades[f"{KOSPI_SLUG}|down|挂"]["status"] == "cancelled" and trades[f"{KOSPI_SLUG}|down|挂"]["withdrawn"]["why"] == "已到结束时间，等结果出来：不开新单，挂单撤掉"
+    assert trades[f"{KOSPI_SLUG}|down|挂#1"]["status"] == "cancelled" and trades[f"{KOSPI_SLUG}|down|挂#1"]["withdrawn"]["why"] == "已到结束时间，等结果出来：不开新单，挂单撤掉"
     status, ctype, body = web.route("GET", f"/p/{TOKEN}/journal.csv")
     text = body.decode("utf-8")
     assert status == 200 and ctype == "text/csv; charset=utf-8" and text.startswith("﻿编号,下单时间,市场")

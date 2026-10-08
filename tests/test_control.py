@@ -228,6 +228,29 @@ async def run():
     st, j = await post(port, {"key": KEY, "action": "preset", "name": "nope"}); assert st == 400 and j == {"ok": False, "message": "没有这个搭配"}
     st, j = await post(port, {"key": KEY, "action": "preset"}); assert st == 400 and not j["ok"]
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_EDGE_CENTS": "12", "SIM_WAYS": "both", "SIM_SECONDS": "", "PREDICT_POLL_SECONDS": ""}}); assert st == 200  # what the checks below expect
+    # a long detail list (every market but one) is accepted; the cards' numbers are plain, never 1e+06
+    many = ",".join(f"MARKET{i:02d}X" for i in range(30))  # 30 keys, 269 characters
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_MARKETS": many}}); assert st == 200 and len(bot.config.sim_maker_deep_markets) == 30, (st, j)
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_MARKETS": "", "LIVE_MAX_OPEN_USD": "100000000"}})
+    assert st == 200 and bot.control_value("LIVE_MAX_OPEN_USD") == "100000000" and "1e+08" not in j["message"], j
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"LIVE_MAX_OPEN_USD": "40"}}); assert st == 200
+    # a saved value that stopped validating (a bound tightened since) is dropped on its own: the rest stays, later saves go on
+    store.put("control:env", {**store.get("control:env"), "SIM_SECONDS": "2"})
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SHARES": "50"}})
+    assert st == 200 and bot.config.sim_shares == 50 and "SIM_SECONDS" not in store.get("control:env") and bot.config.sim_seconds == 5, (st, j)
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SHARES": ""}}); assert st == 200
+    store.put("control:env", {**store.get("control:env"), "SIM_SECONDS": "2"})
+    pruned = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY}), store, FM(NOW), None)
+    assert pruned.config.sim_edge == 0.12 and pruned.config.sim_seconds == 5 and "SIM_SECONDS" not in store.get("control:env")  # only the bad value dropped, and forgotten
+    assert store.get("control:env")["SIM_EDGE_CENTS"] == "12"
+    # the page's poll is served the change, not a copy built just before it
+    web.CACHE_SECONDS = {"control.json": 60.0}
+    assert {x["key"]: x for x in (await get_json(port, "control.json"))["settings"]}["SIM_QUIET_MINUTES"]["value"] != "15"  # a copy is built and cached now
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_QUIET_MINUTES": "15"}}); assert st == 200
+    assert {x["key"]: x for x in (await get_json(port, "control.json"))["settings"]}["SIM_QUIET_MINUTES"]["value"] == "15"
+    web.CACHE_SECONDS = {}
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_QUIET_MINUTES": ""}}); assert st == 200
+    assert "keyBad" in body.decode() and 'if(!data)return' in body.decode()
     # a new bot on the same store starts with the saved settings; a saved value that stopped validating is ignored
     again = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY}), store, FM(NOW), None)
     assert again.config.sim_edge == 0.12 and again.config.live_max_order_usd == 40 and again.config.sim_markets == frozenset(m.SIM_KINDS)

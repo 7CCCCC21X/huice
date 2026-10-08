@@ -547,8 +547,9 @@ async def run():
     for b in (dbot, gbot, mbot, kbot):
         await step(b, NOW + 60_000)
     k = kbot.sim_trades()
-    assert k["hsi-z|up|挂"]["withdrawn"]["why"] == "详细选项已排除hsi-z" and k["hsi-w|up|挂"]["status"] == "resting" and "withdrawn" not in k["hsi-w|up|挂"]
-    t = dbot.sim_trades()["sol#11|down|挂"]
+    assert k["hsi-z|up|挂#1"]["withdrawn"]["why"] == "详细选项已排除hsi-z" and "hsi-z|up|挂" not in k  # withdrawn with nothing filled: the slot is free
+    assert k["hsi-w|up|挂"]["status"] == "resting" and "withdrawn" not in k["hsi-w|up|挂"]
+    t = dbot.sim_trades()["sol#11|down|挂#1"]
     assert t["status"] == "cancelled" and t["note"] == "撤单：模拟交易已改为只吃单，一份都没成交", t
     assert t["withdrawn"] == {"at": NOW + 60_000, "why": "模拟交易已改为只吃单", "unfilled": 100.0} and t["unfilled"] == 100
     assert m.sim_status(t) == "已撤单" and m.sim_state(t) == "" and not dbot.sim_due(t, BJ(12, 1, 0, 0))  # nothing to confirm, ever
@@ -556,17 +557,17 @@ async def run():
     assert t["status"] == "filled" and t["shares"] == 30 and t["unfilled"] == 70 and m.sim_status(t) == "持仓"
     assert t["note"] == "撤单：模拟交易已改为只吃单；已推定成交的 30 份继续持有，其余 70 份作废", t["note"]
     g = gbot.sim_trades()
-    assert g["sol#11|down|挂"]["withdrawn"]["why"] == "价格阶梯只做吃单" and g["sol#12|down|挂"]["status"] == "filled"
+    assert g["sol#11|down|挂#1"]["withdrawn"]["why"] == "价格阶梯只做吃单" and g["sol#12|down|挂"]["status"] == "filled"
     assert g["hsi-x|up|挂"]["status"] == "resting" and "withdrawn" not in g["hsi-x|up|挂"]  # still traded: it stands
-    assert mbot.sim_trades()["hsi-y|up|挂"]["withdrawn"]["why"] == "模拟交易范围已不含指数/个股日涨跌"
+    assert mbot.sim_trades()["hsi-y|up|挂#1"]["withdrawn"]["why"] == "模拟交易范围已不含指数/个股日涨跌"
     await step(dbot, NOW + 120_000)  # withdrawn once: the record does not change again
-    assert dbot.sim_trades()["sol#11|down|挂"]["withdrawn"]["at"] == NOW + 60_000
+    assert dbot.sim_trades()["sol#11|down|挂#1"]["withdrawn"]["at"] == NOW + 60_000
     tot = dbot.sim_report()["total"]
     assert tot["cancelled"] == 1 and tot["resting"] == 0 and tot["open"] == 2 and tot["partial"] == 1 and tot["expired"] == 0, tot
     fresh = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}), m.Store(":memory:"), FM(NOW), None)
     assert "｜撤单 1 笔" in dbot.cmd_sim(None).text and "撤单" not in fresh.cmd_sim(None).text  # counted only when there are any
     j = {x["id"]: x for x in dbot.journal_payload()["trades"]}
-    assert j["sol#11|down|挂"]["wait"] == "" and j["sol#11|down|挂"]["text"] == "已撤单"
+    assert j["sol#11|down|挂#1"]["wait"] == "" and j["sol#11|down|挂#1"]["text"] == "已撤单"
     assert j["sol#12|down|挂"]["wait"] == "碰到档位即 Yes；否则等窗口结束 11-01 11:59 后按 No（11-01 12:59 起）"
     assert "已撤单" in dbot.journal_csv() and json.dumps(dbot.journal_payload())
 
@@ -1085,6 +1086,65 @@ async def follow_guard():
     print("FOLLOW_GUARD_OK")
 
 
+async def review_fixes():
+    """The 10-08 review: a sweep through a resting order is credited before the withdrawal is judged; a withdrawal for a
+    setting frees the slot; the deep-bid rules under SIM_MAKER_MIN_BID=0, a bar above SIM_MAKER_DEEP_CENTS, a wide book
+    under deep-only, and a front the ask forbids."""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+           "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off"}
+    mk_bot = lambda **extra: m.Bot(m.Config.from_env({**env, **extra}), m.Store(":memory:"), FM(NOW), None)
+    tid = f"{HSI_SLUG}|up|挂"
+    # (1) a dump through the order: 900 shares offered at 53¢ fill the 55¢ order (300 queued ahead of it) — not "买1 移到 50¢，改跟"
+    bot = mk_bot(); bot.sim_markets = lambda now: world["markets"]
+    await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    assert bot.sim_trades()[tid]["price"] == 0.55 and bot.sim_trades()[tid]["queue_ahead"] == 300
+    await step(bot, NOW + 5_000, hsi(0.70, [("0.50", "300")], [("0.53", "900")], NOW + 5_000))
+    t = bot.sim_trades()[tid]
+    assert t["status"] == "filled" and t["shares"] == 100 and f"{tid}#1" not in bot.sim_trades(), (t["status"], t["shares"], t.get("note"))
+    # (2) withdrawn for a setting (SIM_MARKETS narrowed): the record moves to #n, the slot is free once the setting is back
+    bot2 = mk_bot(); bot2.sim_markets = lambda now: world["markets"]
+    await step(bot2, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    bot2.apply_config(m.Config.from_env({**env, "SIM_MARKETS": "touch"}))
+    await step(bot2, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000))
+    assert sorted(bot2.sim_trades()) == [f"{tid}#1"] and bot2.sim_trades()[f"{tid}#1"]["note"] == "撤单：模拟交易范围已不含指数/个股日涨跌，一份都没成交", bot2.sim_trades()
+    bot2.apply_config(m.Config.from_env(env))
+    await step(bot2, NOW + 10_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
+    assert bot2.sim_trades()[tid]["status"] == "resting" and bot2.sim_trades()[tid]["price"] == 0.55  # placed again, not "已有已撤单"
+    # (3) SIM_MAKER_MIN_BID=0: a deep-bid order pushed off the front still goes back over the pusher
+    dbot = mk_bot(SIM_MAKER_MIN_BID="0", SIM_MAKER_DEEP_CENTS="25", SIM_MAKER_SPREAD_CENTS="10"); dbot.sim_markets = lambda now: world["markets"]
+    wide = lambda bids, at: hsi(0.38, bids, [("0.40", "100"), ("0.98", "500")], at)
+    await step(dbot, NOW, wide([("0.05", "300"), ("0.01", "1000")], NOW))
+    assert dbot.sim_trades()[tid]["price"] == 0.06 and dbot.sim_trades()[tid]["deep"] is True
+    assert dbot.sim_requote_reason(dbot.sim_trades()[tid], wide([("0.06", "20"), ("0.05", "300"), ("0.01", "1000")], NOW + 5_000), NOW + 5_000) == "买1 被顶到 6.0¢，改挂 7.0¢"
+    # (4) deep-only with the after-hours bar above SIM_MAKER_DEEP_CENTS: the sweep order is priced off the bar in force
+    abot = mk_bot(SIM_MAKER_DEEP_CENTS="25", SIM_MAKER_DEEP_ONLY="on", SIM_MAKER_AFTER_HOURS_CENTS="30"); abot.sim_markets = lambda now: world["markets"]
+    closed = lambda bids, at: m.dataclasses.replace(hsi(0.50, bids, [("0.53", "1720"), ("0.99", "1000")], at), in_session=False)
+    await step(abot, NOW, closed([("0.48", "3430"), ("0.22", "50")], NOW))
+    t = abot.sim_trades()[tid]
+    assert t["price"] == 0.01 and t["sweep"] is True and abs(t["edge"] - 0.49) < 1e-9, t  # fair − 30¢ = 20¢: the 22¢ bid is above it, nothing under → 1¢ (not 23¢, refused by the 30¢ bar)
+    assert abot.sim_requote_reason(t, closed([("0.48", "3430"), ("0.22", "50")], NOW + 5_000), NOW + 5_000) == ""
+    # (5) deep-only on a wide book (SIM_MAKER_SPREAD_CENTS > 0): a sweep order when the front has no edge, not nothing
+    sbot = mk_bot(SIM_MAKER_DEEP_CENTS="25", SIM_MAKER_DEEP_ONLY="on", SIM_MAKER_SPREAD_CENTS="10"); sbot.sim_markets = lambda now: world["markets"]
+    await step(sbot, NOW, hsi(0.50, [("0.30", "300")], [("0.60", "200")], NOW))
+    t = sbot.sim_trades()[tid]
+    assert t["price"] == 0.01 and t["sweep"] is True, t  # the front (31¢) has 19¢ < 25¢; the sweep goes under fair − 25¢
+    # (6) a front the ask forbids joins the level as an ordinary order: no deep flag, the ordinary bar and rules
+    fbot = mk_bot(SIM_MAKER_DEEP_CENTS="25"); fbot.sim_markets = lambda now: world["markets"]
+    await step(fbot, NOW, hsi(0.90, [("0.57", "150")], [("0.58", "400")], NOW))
+    t = fbot.sim_trades()[tid]
+    assert t["price"] == 0.57 and "deep" not in t and t["queue_ahead"] == 150, t
+    # (7) the follow guard on a book the deep-bid mode would quote on: the replacement would need the deep-bid bar
+    gbot = mk_bot(SIM_MAKER_DEEP_CENTS="25", SIM_MAKER_SPREAD_CENTS="10"); gbot.sim_markets = lambda now: world["markets"]
+    await step(gbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    assert gbot.sim_trades()[tid]["price"] == 0.55 and "deep" not in gbot.sim_trades()[tid]
+    pulled = hsi(0.70, [("0.57", "200"), ("0.55", "300")], [("0.90", "400")], NOW + 5_000)  # the ask pulled to 90¢: a wide book, where a fresh order needs 25¢
+    assert gbot.sim_requote_reason(gbot.sim_trades()[tid], pulled, NOW + 5_000) == ""
+    await step(gbot, NOW + 5_000, pulled)
+    assert gbot.sim_trades()[tid]["status"] == "resting" and gbot.sim_trades()[tid]["price"] == 0.55
+    print("REVIEW_FIXES_OK")
+
+
 asyncio.run(run())
 asyncio.run(maker_rules())
 asyncio.run(follow_guard())
+asyncio.run(review_fixes())
