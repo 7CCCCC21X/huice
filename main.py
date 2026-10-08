@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.55.1"
+VERSION = "1.56.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -472,6 +472,29 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_NOTIFY", "真实订单的 Telegram 通知", "开 = 真实下单、成交、撤单、失败都发 Telegram 通知"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
+# One-click combinations for the control page (一键搭配): the strategy settings only. What to trade (SIM_MARKETS, SIM_SKIP),
+# the size (SIM_SHARES, SIM_GROUP_USD), the points gate and the real-trading limits stay as they are. Values as the
+# variables would be written; "" clears the saved value (back to the environment, usually the default).
+CONTROL_PRESETS: tuple[tuple[str, str, str, dict[str, str]], ...] = (
+    ("steady", "稳健",
+     "只挂单、只在开盘时段；低价挂单 25¢ 兜底；买1 要够 100 份才跟；结束前 15 分钟停；每 5 秒看一轮、盘口 10 秒刷新",
+     {"SIM_WAYS": "maker", "SIM_EDGE_CENTS": "10", "SIM_TAKER_SESSION": "on", "SIM_TAKER_AFTER_HOURS_CENTS": "0",
+      "SIM_AFTER_HOURS_MAX_PRICE_CENTS": "60", "SIM_MAKER_SESSION": "on", "SIM_MAKER_AFTER_HOURS_CENTS": "0", "SIM_MAKER_AFTER_HOURS_MARKETS": "",
+      "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_ONLY": "off", "SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_MIN_BID": "100",
+      "SIM_MAKER_EXIT_CENTS": "5", "SIM_MAKER_SPREAD_CENTS": "0", "SIM_QUIET_MINUTES": "15", "SIM_SECONDS": "5", "PREDICT_POLL_SECONDS": "10"}),
+    ("balanced", "均衡",
+     "挂单加吃单，门槛 10¢；盘后只做三大指数（挂单 15¢、吃单 20¢、只买 60¢ 以下）；低价挂单 25¢；买1 够 50 份就跟；结束前 10 分钟停；每 5 秒看一轮、盘口 10 秒刷新",
+     {"SIM_WAYS": "both", "SIM_EDGE_CENTS": "10", "SIM_TAKER_SESSION": "on", "SIM_TAKER_AFTER_HOURS_CENTS": "20",
+      "SIM_AFTER_HOURS_MAX_PRICE_CENTS": "60", "SIM_MAKER_SESSION": "on", "SIM_MAKER_AFTER_HOURS_CENTS": "15", "SIM_MAKER_AFTER_HOURS_MARKETS": "HSI,KOSPI,SSE",
+      "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_ONLY": "off", "SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_MIN_BID": "50",
+      "SIM_MAKER_EXIT_CENTS": "5", "SIM_MAKER_SPREAD_CENTS": "0", "SIM_QUIET_MINUTES": "10", "SIM_SECONDS": "5", "PREDICT_POLL_SECONDS": "10"}),
+    ("bold", "进取",
+     "挂单加吃单，门槛 8¢；盘后所有日涨跌市场都做（挂单 10¢、吃单 15¢、只买 60¢ 以下）；低价挂单 20¢；买1 够 20 份就跟，撤单线 4¢；结束前 5 分钟停；每 3 秒看一轮、盘口 5 秒刷新",
+     {"SIM_WAYS": "both", "SIM_EDGE_CENTS": "8", "SIM_TAKER_SESSION": "on", "SIM_TAKER_AFTER_HOURS_CENTS": "15",
+      "SIM_AFTER_HOURS_MAX_PRICE_CENTS": "60", "SIM_MAKER_SESSION": "on", "SIM_MAKER_AFTER_HOURS_CENTS": "10", "SIM_MAKER_AFTER_HOURS_MARKETS": "",
+      "SIM_MAKER_DEEP_CENTS": "20", "SIM_MAKER_DEEP_ONLY": "off", "SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_MIN_BID": "20",
+      "SIM_MAKER_EXIT_CENTS": "4", "SIM_MAKER_SPREAD_CENTS": "0", "SIM_QUIET_MINUTES": "5", "SIM_SECONDS": "3", "PREDICT_POLL_SECONDS": "5"}),
+)
 
 
 @dataclass(frozen=True)
@@ -8566,7 +8589,7 @@ button.lnk{border:none;background:none;color:var(--best);padding:4px 6px}
 <div class="row"><span class="lbl">工具</span><button data-act="redeem">领取已结算</button><button data-act="check">自检</button><button data-act="positions">刷新持仓</button><button data-act="test">挂单测试</button></div>
 </div>
 <div id="livelines" class="kv"></div><div id="testlines" class="test" style="display:none"></div></section>
-<section class="card" id="quick"><h2>常用开关</h2><p class="mut"><b>绿色 = 开，灰色 = 关</b>。点一下切换，立即生效并保存；带数值的开关用上次的值（没有就用默认值），数值和适用的市场在下面的参数卡片里改。</p><div class="opts" id="quickbtns"></div></section>
+<section class="card" id="quick"><h2>常用开关</h2><p class="mut"><b>绿色 = 开，灰色 = 关</b>。点一下切换，立即生效并保存；带数值的开关用上次的值（没有就用默认值），数值和适用的市场在下面的参数卡片里改。</p><div class="opts" id="quickbtns"></div><div class="row" id="presetrow"><span class="lbl">一键搭配</span><span class="btns" id="presetbtns"></span></div><p class="mut" id="presetnote"></p></section>
 <section class="card" id="settings"><div class="hd"><h2>策略与风控参数</h2><button id="fold" class="lnk">收起</button></div>
 <div id="setbody"><p class="mut">点一个选项就立即生效，并保存到数据库（重启仍有效）；数字项点预设值，或填自定义值后按保存。标“环境变量”的是部署时的值，标“已保存”的是在这里改过的，“恢复环境变量”撤销单项。</p>
 <div id="cards"></div><div class="row"><button id="adv">显示高级参数</button><button id="reset">清除全部，按环境变量运行</button></div></div></section>
@@ -8613,7 +8636,7 @@ function render(){
   $("modebtns").querySelectorAll("button").forEach(b=>{b.disabled=!L||!data.enabled;b.className=L&&b.dataset.mode===L.mode?"pri":""});
   $("livebtns").querySelectorAll("button").forEach(b=>{b.disabled=!liveOn||!data.enabled});
   renderLive(L,liveOn);
-  renderSettings();renderQuick();
+  renderSettings();renderQuick();renderPresets();
   $("simline").textContent="记录 "+data.sim.trades+" 笔｜已结算 "+data.sim.settled+" 笔，盈亏 "+money(data.sim.pnl)+"｜持仓 "+data.sim.open+"｜挂单中 "+data.sim.resting+"（成本 $"+data.sim.open_cost.toFixed(2)+"）";
   renderRecords();renderFolds();renderBar();renderCadence(data.cadence);
   const cb=$("checks");cb.replaceChildren();
@@ -8765,6 +8788,14 @@ function renderQuick(){const q=$("quickbtns");q.replaceChildren();if(!data.setti
     if(k==="SIM_MAKER_DEEP_CENTS"){const o=v.SIM_MAKER_DEEP_ONLY==="on";  // only the deep-bid orders: turning it on turns the mode (and 挂单) on too
       q.append(quickChip("只挂低价挂单",o,"SIM_MAKER_DEEP_ONLY",()=>act({action:"set",values:{SIM_MAKER_DEEP_ONLY:o?"off":"on",...(!o&&!on?{SIM_MAKER_DEEP_CENTS:last||QUICK_DEFAULT[k]}:{}),...(!o&&ways==="taker"?{SIM_WAYS:"both"}:{})}}),
         o&&!on?"低价挂单没开，不生效":o&&ways==="taker"?"挂单没开，不生效":""))}})}
+function renderPresets(){const box=$("presetbtns");box.replaceChildren();if(!data.presets)return;const v={},lab={};(data.settings||[]).forEach(s=>{v[s.key]=s.value;lab[s.key]=s.label});
+  let current="";data.presets.forEach(p=>{const keys=Object.keys(p.values),match=keys.every(k=>(v[k]||"")===(p.values[k]||""));if(match)current=p.label;
+    const b=el("button",match?"pri":"",p.label+(match?" · 当前":""));b.title=p.hint;b.disabled=!data.enabled;
+    b.addEventListener("click",()=>{const lines=keys.filter(k=>(v[k]||"")!==(p.values[k]||"")).map(k=>(lab[k]||k)+"："+(v[k]||"空")+" → "+(p.values[k]||"空"));
+      if(!lines.length){toast("当前参数已经是「"+p.label+"」",true);return}
+      if(confirm("套用「"+p.label+"」？"+p.hint+"。\n\n会改这些（现在 → 之后）：\n"+lines.join("\n")+"\n\n不改做哪些市场、份数、组上限、积分开关和真实交易额度；挂着的单按新规则重新判断。"))act({action:"preset",name:p.name})});
+    box.append(b)});
+  $("presetnote").textContent=(current?"当前参数 = "+current+"。":"当前参数不是三种搭配中的任何一种。")+"三种搭配只改策略参数（怎么挂、怎么吃、盘后、低价挂单、撤单线、结束前几分钟停、检查频率），不改做哪些市场、份数、组上限、积分开关和真实交易额度；点一下会先列出要改的项再确认。"}
 $("adv").addEventListener("click",()=>{adv=!adv;try{localStorage.setItem("ctladv",adv?"1":"0")}catch(e){}renderSettings()});
 $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.act;
   if(a==="pause"){const why=prompt("暂停原因（可留空）","");if(why===null)return;act({action:"pause",why})}
@@ -11959,6 +11990,13 @@ class Bot:
                 return f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟"
             if not trade.get("deep"):
                 if abs(level[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
+                    # the 买1 moved up to where no fresh order would be placed (the entry bar, the model's error, the
+                    # after-hours price limit): the order stays where it is, still with its edge, rather than being
+                    # withdrawn for a replacement that never comes (10-08: a 55¢ bid with 11¢ left was withdrawn to
+                    # "follow" a 57¢ level worth 9¢, and nothing took its place)
+                    if level[0] > price and (fair - level[0] < bar - 1e-9 or fair - level[0] <= mk.need
+                                             or (limit is not None and level[0] > limit + 1e-9)):
+                        return ""
                     return f"买1 移到 {cents(level[0])}，改跟"
                 return ""
             # a deep-bid order keeps a cent over the best bid of anyone else: pushed off the front (a bid at or over its
@@ -13550,6 +13588,7 @@ class Bot:
                              for key, label, hint in CONTROL_KEYS],
                 "scope": sim_scope(self.config), "checks": self.sim_checks(now_ms), "catalog": self.sim_catalog(now_ms),
                 "cadence": {"sim": self.config.sim_seconds, "book": self.config.predict_poll},
+                "presets": [{"name": n, "label": l, "hint": h, "values": dict(v)} for n, l, h, v in CONTROL_PRESETS],
                 "records": self.control_records(self.sim_trades()),
                 "sim": {"trades": stats["trades"], "settled": stats["settled"], "pnl": stats["pnl"], "open": stats["open"],
                         "resting": stats["resting"], "open_cost": stats["open_cost"]}}
@@ -13563,6 +13602,14 @@ class Bot:
             self.store.delete_keys(["control:env"])
             self.apply_config(Config.from_env(self.config.env))
             return {"ok": True, "message": "已清除网页上保存的设置，全部按环境变量运行。"}
+        if action == "preset":  # 一键搭配: one of CONTROL_PRESETS, saved like any set
+            preset = next((p for p in CONTROL_PRESETS if p[0] == str(data.get("name") or "")), None)
+            if preset is None:
+                return {"ok": False, "message": "没有这个搭配"}
+            result = self.control_set(dict(preset[3]))
+            if result.get("ok"):
+                result["message"] = f"已套用「{preset[1]}」。" + result["message"]
+            return result
         return await self.live_control(action, data)
 
     def control_set(self, values: dict) -> dict:

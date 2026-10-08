@@ -1048,5 +1048,43 @@ async def maker_rules():
     print("MAKER_RULES_OK")
 
 
+async def follow_guard():
+    """An ordinary resting order follows the valid 买1 only to a level a fresh order would be placed at: when the 买1
+    moves up to where the edge no longer clears the bar, the order stays (it still has its edge) instead of being
+    withdrawn for nothing."""
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                             "WEB_PORT": "8080", "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off"})
+    bot = m.Bot(cfg, m.Store(":memory:"), FM(NOW), None)
+    bot.sim_markets = lambda now: world["markets"]
+    tid = f"{HSI_SLUG}|up|挂"
+    await step(bot, NOW, hsi(0.66, [("0.55", "300")], [("0.60", "400")], NOW))  # 买1 55¢: 11¢ ≥ the 10¢ bar
+    assert bot.sim_trades()[tid]["price"] == 0.55
+    # the 买1 moves up to 57¢ (9¢ there, under the bar): the 55¢ order stays
+    mk = hsi(0.66, [("0.57", "200"), ("0.55", "300")], [("0.60", "400")], NOW + 5_000)
+    assert bot.sim_requote_reason(bot.sim_trades()[tid], mk, NOW + 5_000) == ""
+    await step(bot, NOW + 5_000, mk)
+    assert list(bot.sim_trades()) == [tid] and bot.sim_trades()[tid]["status"] == "resting" and bot.sim_trades()[tid]["price"] == 0.55
+    # ...and to 56¢ (10¢ there, at the bar): followed, re-placed there next step
+    await step(bot, NOW + 10_000, hsi(0.66, [("0.56", "200"), ("0.55", "300")], [("0.60", "400")], NOW + 10_000))
+    assert bot.sim_trades()[f"{tid}#1"]["note"] == "撤单：买1 移到 56.0¢，改跟，一份都没成交"
+    await step(bot, NOW + 15_000, hsi(0.66, [("0.56", "200"), ("0.55", "300")], [("0.60", "400")], NOW + 15_000))
+    assert bot.sim_trades()[tid]["price"] == 0.56
+    # the 买1 moving down is always followed (more edge at the new level)
+    await step(bot, NOW + 20_000, hsi(0.66, [("0.54", "200")], [("0.60", "400")], NOW + 20_000))
+    assert bot.sim_trades()[f"{tid}#2"]["note"] == "撤单：买1 移到 54.0¢，改跟，一份都没成交"
+    # after hours with the price limit: a 买1 above the limit is not followed either
+    abot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+                                    "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off", "SIM_MAKER_AFTER_HOURS_CENTS": "10",
+                                    "SIM_AFTER_HOURS_MAX_PRICE_CENTS": "60"}), m.Store(":memory:"), FM(NOW), None)
+    abot.sim_markets = lambda now: world["markets"]
+    closed = lambda fair, bids, at: m.dataclasses.replace(hsi(fair, bids, [("0.70", "400")], at), in_session=False)
+    await step(abot, NOW, closed(0.80, [("0.59", "300")], NOW))  # 59¢ ≤ 60¢, 21¢ of edge
+    assert abot.sim_trades()[tid]["price"] == 0.59
+    await step(abot, NOW + 5_000, closed(0.80, [("0.61", "300"), ("0.59", "300")], NOW + 5_000))  # 61¢ is over the limit: stays at 59¢
+    assert list(abot.sim_trades()) == [tid] and abot.sim_trades()[tid]["price"] == 0.59
+    print("FOLLOW_GUARD_OK")
+
+
 asyncio.run(run())
 asyncio.run(maker_rules())
+asyncio.run(follow_guard())

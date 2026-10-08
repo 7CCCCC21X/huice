@@ -206,6 +206,28 @@ async def run():
     assert st == 200 and bot.config.sim_maker_deep_markets == {"HSI", "KOSPI"} and bot.control_value("SIM_MAKER_DEEP_MARKETS") == "HSI,KOSPI" and bot.config.sim_maker_after_hours_markets == {"SSE"}
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_AFTER_HOURS_MARKETS": ""}})
     assert st == 200 and bot.config.sim_maker_deep_markets == frozenset() and bot.config.sim_maker_after_hours_markets == frozenset()
+    # 一键搭配: the strategy settings only, each combination valid on its own, saved like any set; the page lists them
+    data = await get_json(port, "control.json")
+    assert [p["name"] for p in data["presets"]] == ["steady", "balanced", "bold"] and all({"name", "label", "hint", "values"} <= set(p) for p in data["presets"])
+    assert 'id="presetbtns"' in body.decode() and "renderPresets" in body.decode()
+    for name, label, hint, values in m.CONTROL_PRESETS:
+        assert set(values) <= m.CONTROL_KEY_SET and not any(k.startswith("LIVE") for k in values), name
+        assert not ({"SIM_MARKETS", "SIM_SKIP", "SIM_SHARES", "SIM_GROUP_USD", "SIM_MAKER_POINTS"} & set(values)), name
+        m.Config.from_env({**base, **{k: x for k, x in values.items() if x}})
+    st, j = await post(port, {"key": KEY, "action": "preset", "name": "balanced"})
+    assert st == 200 and j["message"].startswith("已套用「均衡」。已保存并生效：") and bot.config.sim_ways == "both" and bot.config.sim_maker_after_hours == 0.15, (st, j)
+    assert bot.config.sim_maker_after_hours_markets == {"HSI", "KOSPI", "SSE"} and bot.config.sim_taker_after_hours == 0.20 and bot.config.sim_maker_min_bid == 50
+    assert bot.config.sim_quiet_minutes == 10 and bot.config.sim_maker_deep == 0.25 and not bot.config.sim_maker_deep_only and bot.config.sim_edge == 0.10
+    assert store.get("control:env")["SIM_MAKER_AFTER_HOURS_MARKETS"] == "HSI,KOSPI,SSE" and "SIM_MAKER_DEEP_MARKETS" not in store.get("control:env")  # "" clears
+    st, j = await post(port, {"key": KEY, "action": "preset", "name": "balanced"}); assert st == 200 and j["message"] == "已套用「均衡」。已保存，设置没有变化。"
+    st, j = await post(port, {"key": KEY, "action": "preset", "name": "steady"})
+    assert st == 200 and bot.config.sim_ways == "maker" and bot.config.sim_maker_after_hours == 0 and bot.config.sim_taker_after_hours == 0
+    assert bot.config.sim_quiet_minutes == 15 and bot.config.sim_maker_min_bid == 100 and bot.config.sim_maker_after_hours_markets == frozenset()
+    st, j = await post(port, {"key": KEY, "action": "preset", "name": "bold"})
+    assert st == 200 and bot.config.sim_edge == 0.08 and bot.config.sim_maker_exit == 0.04 and bot.config.sim_seconds == 3 and bot.predict.config.predict_poll == 5
+    st, j = await post(port, {"key": KEY, "action": "preset", "name": "nope"}); assert st == 400 and j == {"ok": False, "message": "没有这个搭配"}
+    st, j = await post(port, {"key": KEY, "action": "preset"}); assert st == 400 and not j["ok"]
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_EDGE_CENTS": "12", "SIM_WAYS": "both", "SIM_SECONDS": "", "PREDICT_POLL_SECONDS": ""}}); assert st == 200  # what the checks below expect
     # a new bot on the same store starts with the saved settings; a saved value that stopped validating is ignored
     again = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY}), store, FM(NOW), None)
     assert again.config.sim_edge == 0.12 and again.config.live_max_order_usd == 40 and again.config.sim_markets == frozenset(m.SIM_KINDS)
