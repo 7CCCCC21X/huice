@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.54.2"
+VERSION = "1.54.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -11574,13 +11574,19 @@ class Bot:
             trade["status"] = "filled"
 
     def sim_quiet(self, settle: Mapping | None, now_ms: int) -> str:
-        """SIM_QUIET_MINUTES: why no new paper order is placed on a market now — its end is this close, or past with the
-        result pending. "" when the option is off, the end is not known, or it is further away."""
-        minutes = self.config.sim_quiet_minutes
-        end = sim_end_ms(settle) if minutes else None
-        if end is None or now_ms < end - minutes * 60_000:
+        """Why no new paper order is placed on a market now, and a resting one is withdrawn: its end (the underlying's
+        close, a deadline) is past with the result pending — whatever the settings: a bid left on a finished market is a
+        free option for whoever holds the losing side — or, with SIM_QUIET_MINUTES, that close. "" when the end is not
+        known or further away."""
+        end = sim_end_ms(settle)
+        if end is None:
             return ""
-        return f"结束前 {minutes} 分钟不交易"
+        if now_ms >= end:
+            return "已到结束时间，等结果出来：不开新单，挂单撤掉"
+        minutes = self.config.sim_quiet_minutes
+        if minutes and now_ms >= end - minutes * 60_000:
+            return f"结束前 {minutes} 分钟不交易"
+        return ""
 
     def sim_withdraw_reason(self, trade: dict, mk: SimMarket | None, now_ms: int | None = None) -> str:
         """Why a resting paper order is withdrawn now rather than left to the result: the trader no longer places such

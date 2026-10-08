@@ -714,7 +714,9 @@ async def run():
     await qbot.live_prepare()
     assert qbot.control_value("SIM_QUIET_MINUTES") == "15" and qbot.sim_version()["sim_quiet_minutes"] == 15 and "sim_quiet_minutes" not in bot.sim_version()
     assert qbot.sim_quiet(SETTLE_HSI, CLOSE - 15 * 60_000 - 1) == "" and qbot.sim_quiet(SETTLE_HSI, CLOSE - 15 * 60_000) == "结束前 15 分钟不交易"
-    assert qbot.sim_quiet(SETTLE_HSI, CLOSE + 1) != "" and qbot.sim_quiet({}, CLOSE) == "" and bot.sim_quiet(SETTLE_HSI, CLOSE) == ""  # past the end: still quiet; no end / option off: not
+    assert qbot.sim_quiet(SETTLE_HSI, CLOSE + 1) != "" and qbot.sim_quiet({}, CLOSE) == ""  # past the end: still quiet; no end known: not
+    # the end itself stops every bot, option or not (10-08 review): a bid left on a finished market is the other side's free option
+    assert bot.sim_quiet(SETTLE_HSI, CLOSE - 1) == "" and bot.sim_quiet(SETTLE_HSI, CLOSE) == "已到结束时间，等结果出来：不开新单，挂单撤掉" and bot.sim_quiet({}, CLOSE + 1) == ""
     early = CLOSE - 60 * 60_000
     await qbot.live_prefetch(early)
     await step(qbot, early, hsi(0.70, [("0.55", "300")], [("0.58", "400")], early))

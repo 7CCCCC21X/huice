@@ -299,11 +299,14 @@ async def run():
     sse_slug = "sse-composite-index-up-or-down-on-october-5-2026"
     sse = m.SimMarket(sse_slug, "上证指数", "close", "SSE", 0.70, book([], [("0.55", "500")], CLOSE + 93 * 60_000, sse_slug, "SSE", mid="103"),
                       0.02, "", ("涨", "跌"), {"key": "SSE", "target": "2026-10-05", "line": 3850.0, "close_ms": BJ(10, 5, 15, 0)})
-    await step(bot, CLOSE + 93 * 60_000, sse)
+    # (opened by hand: since 1.54.3 nothing is bought on a market past its close, and this one closed at 15:00)
+    q = m.taker_quote(sse.book, "up", 100, bot.config.predict_fee_bps, 0.60)
+    bot.sim_save([(f"{sse_slug}|up|吃", bot.sim_open(sse, "up", CLOSE + 93 * 60_000, taker=q))]); bot.sim_cache = None
+    assert bot.sim_trades()[f"{sse_slug}|up|吃"]["status"] == "filled"
     bot.note_outcome("SSE", "2026-10-05", 3851.0, "腾讯实时（日K未出）")
     world["markets"] = []
     answers["103"] = m.RemoteError("HTTP 500")
-    bot.sim_checked.clear()  # (it was already asked once, when it opened past its close)
+    bot.sim_checked.clear()
     await step(bot, CLOSE + 94 * 60_000)
     t = bot.sim_trades()[f"{sse_slug}|up|吃"]
     assert t["payout"] == 1.0 and t["confirm"] == "local" and t["final_error"] == "HTTP 500"
@@ -392,7 +395,7 @@ async def run():
     assert abs(tot["pnl"] - sum((t["payout"] - t["price"]) * t["shares"] for t in settled)) < 1e-9
     assert abs(tot["expected"] - sum(t["edge"] * t["shares"] for t in settled)) < 1e-9
     assert abs(tot["expected_fill"] - sum(m.sim_fill_expectation(t) for t in settled)) < 1e-9 and tot["expected_fill"] < tot["expected"]
-    assert tot["partial"] == 1 and tot["expired"] == 1 and tot["open"] == 4  # PONS's maker never filled; deep/thin/shallow/dust still held
+    assert tot["partial"] == 1 and tot["expired"] == 0 and tot["cancelled"] == 1 and tot["open"] == 4, tot  # PONS's maker never filled: withdrawn at the end (1.54.3); deep/thin/shallow/dust still held
     row = next(x for x in r["rows"] if x["id"] == f"{KOSPI_SLUG}|down|吃")
     assert row["state"] == "结果不一致" and row["order"] == 100 and row["url"].startswith(m.PREDICT_SITE)
     json.dumps(r)
@@ -560,7 +563,8 @@ async def run():
     assert dbot.sim_trades()["sol#11|down|挂"]["withdrawn"]["at"] == NOW + 60_000
     tot = dbot.sim_report()["total"]
     assert tot["cancelled"] == 1 and tot["resting"] == 0 and tot["open"] == 2 and tot["partial"] == 1 and tot["expired"] == 0, tot
-    assert "｜撤单 1 笔" in dbot.cmd_sim(None).text and "撤单" not in bot.cmd_sim(None).text  # counted only when there are any
+    fresh = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}), m.Store(":memory:"), FM(NOW), None)
+    assert "｜撤单 1 笔" in dbot.cmd_sim(None).text and "撤单" not in fresh.cmd_sim(None).text  # counted only when there are any
     j = {x["id"]: x for x in dbot.journal_payload()["trades"]}
     assert j["sol#11|down|挂"]["wait"] == "" and j["sol#11|down|挂"]["text"] == "已撤单"
     assert j["sol#12|down|挂"]["wait"] == "碰到档位即 Yes；否则等窗口结束 11-01 11:59 后按 No（11-01 12:59 起）"
