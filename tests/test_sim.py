@@ -741,8 +741,11 @@ async def maker_rules():
     r = dbot.sim_maker_reason(wide(0.38, NOW), {}, NOW)[0]
     assert r is not None and (r.side, r.price, r.size) == ("涨", 0.06, 0.0) and abs(r.edge - 0.32) < 1e-9, r  # a cent above the 300 at 5¢, at the front: 32¢
     assert m.Bot.sim_maker_price(wide(0.38, NOW).book, "up", (0.05, 300.0), False) == (0.05, 300.0)  # the ordinary order joins the level
-    thin = wide(0.38, NOW, bids=(("0.06", "20"), ("0.05", "300"), ("0.01", "1000")))  # 20 thin shares already at 6¢: behind them
-    assert m.maker_level(thin.book, "up", 100) == (0.05, 300.0) and dbot.sim_maker_reason(thin, {}, NOW)[0].size == 20.0 and dbot.sim_maker_reason(thin, {}, NOW)[0].price == 0.06
+    thin = wide(0.38, NOW, bids=(("0.06", "20"), ("0.05", "300"), ("0.01", "1000")))  # 20 thin shares at 6¢ over the valid 买1: a cent over them
+    assert m.maker_level(thin.book, "up", 100) == (0.05, 300.0) and m.Bot.front_reference(thin.book, "up") == 0.06
+    assert dbot.sim_maker_reason(thin, {}, NOW)[0].size == 0.0 and dbot.sim_maker_reason(thin, {}, NOW)[0].price == 0.07
+    assert m.Bot.front_reference(wide(0.38, NOW, bids=(("0.09", "0.5"), ("0.05", "300"))).book, "up") == 0.05  # sub-share dust is not a bid
+    assert m.Bot.front_reference(thin.book, "up", own=20.0, own_price=0.06) == 0.05  # our own real order at 6¢ is not someone else
     assert m.Bot.sim_maker_price(book([("0.05", "300")], [("0.06", "50")]), "up", (0.05, 300.0), True) == (0.05, 300.0)  # never at the ask: joins
     assert dbot.sim_maker_reason(wide(0.30, NOW), {}, NOW) == (None, "价差 33.0¢ 的盘口只挂净优势 ≥ 25.0¢ 的，现 24.0¢")  # judged at 6¢
     assert dbot.sim_maker_reason(wide(0.38, NOW, asks=()), {}, NOW)[0] is not None and dbot.sim_maker_mode(wide(0.38, NOW, asks=()))[1] == "单边盘口"
@@ -750,26 +753,40 @@ async def maker_rules():
     world["markets"] = [wide(0.38, NOW)]
     assert [r["maker"] for r in dbot.sim_checks(NOW)] == ["挂涨 6.0¢×100 份（净优势 32.0¢，买1 之上 1¢，排在最前）"]
     world["markets"] = [thin]
-    assert [r["maker"] for r in dbot.sim_checks(NOW)] == ["挂涨 6.0¢×100 份（净优势 32.0¢，买1 之上 1¢，排在 20 份之后）"]
+    assert [r["maker"] for r in dbot.sim_checks(NOW)] == ["挂涨 7.0¢×100 份（净优势 31.0¢，买1 之上 1¢，排在最前）"]
     await step(dbot, NOW, wide(0.38, NOW))
     t = dbot.sim_trades()[tid]
     assert t["price"] == 0.06 and t["queue_ahead"] == 0 and t["deep"] is True and abs(t["edge"] - 0.32) < 1e-9 and t["version"]["sim_maker_deep"] == 0.25, t
-    # a thin bid shows up at 6¢ (a paper order is never in the book; a real one is excluded as our own): the valid 买1 is
-    # still the 300 at 5¢, the order stays where it is
-    await step(dbot, NOW + 5_000, wide(0.38, NOW + 5_000, bids=(("0.06", "20"), ("0.05", "300"), ("0.01", "1000"))))
+    # sub-share dust over the order is ignored; a 20-share bid at its price (a paper order is not in the book, so all of
+    # it is someone else's) has pushed it off the front: re-quoted a cent over, on the next step
+    await step(dbot, NOW + 5_000, wide(0.38, NOW + 5_000, bids=(("0.09", "0.5"), ("0.05", "300"), ("0.01", "1000"))))
     assert dbot.sim_trades()[tid]["status"] == "resting" and dbot.sim_trades()[tid]["price"] == 0.06
-    await step(dbot, NOW + 10_000, wide(0.305, NOW + 10_000))  # 24.5¢ at 6¢: within the cent of slack under the bar
+    await step(dbot, NOW + 6_000, wide(0.38, NOW + 6_000, bids=(("0.06", "20"), ("0.05", "300"), ("0.01", "1000"))))
+    trades = dbot.sim_trades()
+    assert tid not in trades and trades[f"{tid}#1"]["note"] == "撤单：买1 被顶到 6.0¢，改挂 7.0¢，一份都没成交", trades[f"{tid}#1"]["note"]
+    await step(dbot, NOW + 7_000, wide(0.38, NOW + 7_000, bids=(("0.06", "20"), ("0.05", "300"), ("0.01", "1000"))))
+    assert dbot.sim_trades()[tid]["price"] == 0.07 and dbot.sim_trades()[tid]["queue_ahead"] == 0 and dbot.sim_trades()[tid]["deep"] is True
+    await step(dbot, NOW + 10_000, wide(0.315, NOW + 10_000, bids=(("0.06", "20"), ("0.05", "300"), ("0.01", "1000"))))  # 24.5¢ at 7¢: within the slack
     assert dbot.sim_trades()[tid]["status"] == "resting"
-    # the 买1 moves to 7¢: withdrawn, placed again a cent above it on the next step
+    # pushed again, but a cent over the new bid would leave under 25¢: it stays where it is rather than chase
+    await step(dbot, NOW + 12_000, wide(0.38, NOW + 12_000, bids=(("0.13", "40"), ("0.06", "20"), ("0.05", "300"))))
+    assert dbot.sim_trades()[tid]["status"] == "resting" and dbot.sim_trades()[tid]["price"] == 0.07
+    # 300 shares land at its price: pushed, re-placed a cent over them on the next step
     await step(dbot, NOW + 15_000, wide(0.38, NOW + 15_000, bids=(("0.07", "300"), ("0.01", "1000"))))
     trades = dbot.sim_trades()
-    assert tid not in trades and trades[f"{tid}#1"]["note"] == "撤单：买1 移到 7.0¢，改挂 8.0¢，一份都没成交", trades[f"{tid}#1"]["note"]
+    assert tid not in trades and trades[f"{tid}#2"]["note"] == "撤单：买1 被顶到 7.0¢，改挂 8.0¢，一份都没成交", trades[f"{tid}#2"]["note"]
     await step(dbot, NOW + 16_000, wide(0.38, NOW + 16_000, bids=(("0.07", "300"), ("0.01", "1000"))))
     trades = dbot.sim_trades()
     assert trades[tid]["price"] == 0.08 and trades[tid]["queue_ahead"] == 0 and abs(trades[tid]["edge"] - 0.30) < 1e-9 and trades[tid]["deep"] is True
-    await step(dbot, NOW + 20_000, wide(0.31, NOW + 20_000, bids=(("0.07", "300"), ("0.01", "1000"))))  # 23¢ at 8¢: under the deep-bid line
+    # the bids under it fall away: down to a cent over what is left
+    await step(dbot, NOW + 17_000, wide(0.38, NOW + 17_000, bids=(("0.05", "300"), ("0.01", "1000"))))
     trades = dbot.sim_trades()
-    assert tid not in trades and trades[f"{tid}#2"]["note"] == "撤单：价差 31.0¢ 的盘口只挂净优势 ≥ 25.0¢ 的，现 23.0¢ 低于低价挂单撤单线 24.0¢，一份都没成交", trades[f"{tid}#2"]["note"]
+    assert tid not in trades and trades[f"{tid}#3"]["note"] == "撤单：买1 移到 5.0¢，改挂 6.0¢，一份都没成交", trades[f"{tid}#3"]["note"]
+    await step(dbot, NOW + 18_000, wide(0.38, NOW + 18_000))
+    assert dbot.sim_trades()[tid]["price"] == 0.06
+    await step(dbot, NOW + 20_000, wide(0.29, NOW + 20_000))  # 23¢ at 6¢: under the deep-bid line
+    trades = dbot.sim_trades()
+    assert tid not in trades and trades[f"{tid}#4"]["note"] == "撤单：价差 33.0¢ 的盘口只挂净优势 ≥ 25.0¢ 的，现 23.0¢ 低于低价挂单撤单线 24.0¢，一份都没成交", trades[f"{tid}#4"]["note"]
     # a tight book keeps the ordinary bar and exit line, and an order placed there stands when the book thins out later
     await step(dbot, NOW + 30_000, tight(0.70, NOW + 30_000))
     t = dbot.sim_trades()[tid]
@@ -777,7 +794,7 @@ async def maker_rules():
     await step(dbot, NOW + 40_000, tight(0.70, NOW + 40_000, asks=(("0.90", "400"),)))  # the asks pulled: a 33¢ spread now
     assert dbot.sim_trades()[tid]["status"] == "resting" and "withdrawn" not in dbot.sim_trades()[tid]
     await step(dbot, NOW + 50_000, tight(0.61, NOW + 50_000, asks=(("0.90", "400"),)))  # 4¢: the ordinary exit line
-    assert tid not in dbot.sim_trades() and dbot.sim_trades()[f"{tid}#3"]["note"].startswith("撤单：净优势降到 4.0¢，低于撤单线 5.0¢")
+    assert tid not in dbot.sim_trades() and dbot.sim_trades()[f"{tid}#5"]["note"].startswith("撤单：净优势降到 4.0¢，低于撤单线 5.0¢")
     # after hours with both modes the higher bar wins (the after-hours 30¢ here) and the order check names both
     bbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_AFTER_HOURS_CENTS": "30",
                                     "SIM_MAKER_SPREAD_CENTS": "10"}), m.Store(":memory:"), FM(NOW), None)

@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.52.1"
+VERSION = "1.52.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -451,7 +451,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_MAKER_EXIT_CENTS", "挂单撤单线（¢/份）", "0～50：挂着的单净优势降到这个数以下就撤掉（不会高于触发门槛）；0 = 不撤"),
     ("SIM_MAKER_SESSION", "只在标的开盘时段挂单", "开 = 指数/个股日涨跌的挂单只在标的开盘时段挂着，开盘前、收盘后全部撤掉；加密市场不受影响"),
     ("SIM_MAKER_SPREAD_CENTS", "挂单价差上限（¢）", "0～99：平时只在买卖价差不超过这个数的双边盘口挂单；0 = 不限，价差再宽、只有单边的盘口也跟有效买1 挂（门槛不变）"),
-    ("SIM_MAKER_DEEP_CENTS", "低价挂单模式（¢/份）", "0～90：按挂价算净优势不低于这个数（不低于触发门槛）的单挂在有效买1 之上 1¢、排在最前，多付 1¢ 换先成交；价差超过上限的盘口也挂、只挂这种单，在那种盘口上净优势降到它 1¢ 以下撤掉；不分时段，盘后另要满足盘后门槛；0 = 关"),
+    ("SIM_MAKER_DEEP_CENTS", "低价挂单模式（¢/份）", "0～90：按挂价算净优势不低于这个数（不低于触发门槛）的单挂在最高买价之上 1¢、排在最前，多付 1¢ 换先成交；有人（至少 1 份）挂到它之上或同价就撤了重挂到他之上 1¢，挂价留不足这个数就原地不动；价差超过上限的盘口也挂、只挂这种单，在那种盘口上净优势降到它 1¢ 以下撤掉；不分时段，盘后另要满足盘后门槛；0 = 关"),
     ("SIM_MAKER_DEEP_ONLY", "只挂低价挂单", "开 = 低价挂单模式开着时只挂这种单（买1 之上 1¢、净优势不低于低价挂单门槛），平时跟买1 排队的挂单不挂、挂着的撤掉；关 = 两种都挂"),
     ("SIM_MAKER_AFTER_HOURS_CENTS", "盘后挂单模式（¢/份）", "0～50：开盘前、收盘后也挂指数/个股日涨跌的单，但只挂净优势不低于这个数的（不低于触发门槛），挂着的降到它 1¢ 以下撤掉，开盘后按平时的门槛；0 = 关（按上一项）"),
     ("SIM_MAKER_AFTER_HOURS_MARKETS", "盘后挂单模式只做这些市场（详细选项）", "逗号分隔的市场代码；在“盘后挂单模式”卡片展开详细选项点选，空 = 所有指数/个股日涨跌市场"),
@@ -6961,7 +6961,8 @@ def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
 
 SIM_MAKER_FOLLOW = 0.01  # a resting order follows the valid 买1 once it has moved this far (1¢) from the order's price
 SIM_MAKER_MODE_SLACK = 0.01  # under the after-hours / deep-bid modes a resting order is kept while its edge is within a cent under the mode's bar
-SIM_MAKER_DEEP_STEP = 0.01  # a deep-bid order goes this far above the valid 买1: at the front of the book, filled before the queue there
+SIM_MAKER_DEEP_STEP = 0.01  # a deep-bid order goes this far above the best bid: at the front of the book, filled before the queue there
+SIM_MAKER_FRONT_MIN = 1.0  # a bid of at least this many shares by others, at or over a deep-bid order, is in front of it: re-quoted over; smaller dust is ignored
 SIM_STALE_WITHDRAW_MS = 5 * 60_000  # a resting order whose book has not refreshed this long is withdrawn: no pricing basis is left
 
 
@@ -11586,7 +11587,7 @@ class Bot:
             if level is None:
                 continue
             fair = mk.fair_up if side == "up" else 1 - mk.fair_up
-            front = self.sim_maker_price(mk.book, side, level, True)
+            front = self.sim_maker_price(mk.book, side, level, True, own, own_price)
             # the deep-bid placement, a cent in front of the 买1: on a book the ordinary rule refuses, and on any book when
             # the edge there still clears SIM_MAKER_DEEP_CENTS (a cent is worth being filled first); otherwise join the level
             use_front = wide or (front_ok and fair - front[0] >= c.sim_maker_deep - 1e-9)
@@ -11712,14 +11713,26 @@ class Bot:
         return self.sim_maker_mode(mk)[0]
 
     @staticmethod
-    def sim_maker_price(book: PredictBook, side: str, level: tuple[float, float], deep: bool) -> tuple[float, float]:
+    def front_reference(book: PredictBook, side: str, own: float = 0.0, own_price: float | None = None) -> float | None:
+        """The best bid of ``side`` by anyone else holding at least SIM_MAKER_FRONT_MIN shares (our own ``own`` shares at
+        ``own_price`` taken out; sub-share dust ignored): what a deep-bid order has to sit a cent over to be first."""
+        for price, size in own_levels(book, side):
+            others = size - (own if own_price is not None and abs(price - own_price) < 1e-9 else 0.0)
+            if others >= SIM_MAKER_FRONT_MIN - 1e-9:
+                return price
+        return None
+
+    @classmethod
+    def sim_maker_price(cls, book: PredictBook, side: str, level: tuple[float, float], deep: bool,
+                        own: float = 0.0, own_price: float | None = None) -> tuple[float, float]:
         """Where a resting buy of ``side`` goes, with the shares queued ahead of it there: joining the valid 买1 (behind
-        its queue), or in the deep-bid mode a cent above it (SIM_MAKER_DEEP_STEP) at the front of the book, so a seller
-        dumping into the thin book hits it first — behind whatever thin bids already sit at that price, and never at or
-        through the best ask (then it joins the level after all)."""
+        its queue), or in the deep-bid mode a cent (SIM_MAKER_DEEP_STEP) over the best bid anyone else holds
+        (front_reference: the valid 买1 or a smaller bid above it, dust aside), at the front of the book, so a seller
+        dumping into the thin book hits it first — and never at or through the best ask (then it joins the level)."""
         if not deep:
             return level
-        price = round(level[0] + SIM_MAKER_DEEP_STEP, 2)
+        reference = cls.front_reference(book, side, own, own_price)
+        price = round((level[0] if reference is None else max(reference, level[0])) + SIM_MAKER_DEEP_STEP, 2)
         asks = side_levels(book, side)
         if asks and price >= asks[0][0] - 1e-9:
             return level
@@ -11755,7 +11768,8 @@ class Bot:
         if mk.hold or mk.book.stale(now_ms) or book_crossed(mk.book):
             return ""  # no fresh view of the market: the order stands
         side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)
-        edge = (mk.fair_up if side == "up" else 1 - mk.fair_up) - price
+        fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+        edge = fair - price
         exit_edge = self.sim_maker_exit()
         if exit_edge > 0 and edge < exit_edge - 1e-9:
             return f"净优势降到 {cents(edge)}，低于撤单线 {cents(exit_edge)}"
@@ -11775,9 +11789,19 @@ class Bot:
             level = maker_level(mk.book, side, c.sim_maker_min_bid, own, price)
             if level is None:
                 return f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟"
-            target = self.sim_maker_price(mk.book, side, level, bool(trade.get("deep")))[0]  # a deep-bid order keeps its cent above the 买1
-            if abs(target - price) >= SIM_MAKER_FOLLOW - 1e-9:
-                return f"买1 移到 {cents(level[0])}，改跟" if not trade.get("deep") else f"买1 移到 {cents(level[0])}，改挂 {cents(target)}"
+            if not trade.get("deep"):
+                if abs(level[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
+                    return f"买1 移到 {cents(level[0])}，改跟"
+                return ""
+            # a deep-bid order keeps a cent over the best bid of anyone else: pushed off the front (a bid at or over its
+            # price, dust aside) it goes back over the pusher while the edge there still clears the mode's bar, otherwise it
+            # stays where it is; the bids under it falling away, it comes down to a cent over what is left
+            target = self.sim_maker_price(mk.book, side, level, True, own, price)[0]
+            if target > price + 1e-9:
+                if fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9:
+                    return f"买1 被顶到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}"
+            elif price - target >= SIM_MAKER_FOLLOW - 1e-9:
+                return f"买1 移到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}"
         return ""
 
     def sim_rekey(self, tid: str, trade: dict) -> str:
