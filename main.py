@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.54.3"
+VERSION = "1.55.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -454,7 +454,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_MAKER_SESSION", "只在标的开盘时段挂单", "开 = 指数/个股日涨跌的挂单只在标的开盘时段挂着，开盘前、收盘后全部撤掉；加密市场不受影响"),
     ("SIM_MAKER_SPREAD_CENTS", "挂单价差上限（¢）", "0～99：平时只在买卖价差不超过这个数的双边盘口挂单；0 = 不限，价差再宽、只有单边的盘口也跟有效买1 挂（门槛不变）"),
     ("SIM_MAKER_DEEP_CENTS", "低价挂单模式（¢/份）", "0～90：按挂价算净优势不低于这个数（不低于触发门槛）的单挂在最高买价之上 1¢、排在最前，多付 1¢ 换先成交；有人（至少 1 份）挂到它之上或同价就撤了重挂到他之上 1¢，挂价留不足这个数就原地不动；价差超过上限的盘口也挂、只挂这种单，在那种盘口上净优势降到它 1¢ 以下撤掉；不分时段，盘后另要满足盘后门槛；0 = 关"),
-    ("SIM_MAKER_DEEP_ONLY", "只挂低价挂单", "开 = 低价挂单模式开着时只挂这种单（买1 之上 1¢、净优势不低于低价挂单门槛），平时跟买1 排队的挂单不挂、挂着的撤掉；关 = 两种都挂"),
+    ("SIM_MAKER_DEEP_ONLY", "只挂低价挂单", "开 = 低价挂单模式开着时只挂这种单：买1 之上 1¢ 够门槛就挂在那里；不够就挂击穿单——挂在“公平价减门槛”之下、下一档买单之上 1¢（没有就 1¢），前面有单也挂，订单簿被击穿才成交；平时跟买1 排队的挂单不挂、挂着的撤掉。关 = 两种都挂"),
     ("SIM_MAKER_AFTER_HOURS_CENTS", "盘后挂单模式（¢/份）", "0～50：开盘前、收盘后也挂指数/个股日涨跌的单，但只挂净优势不低于这个数的（不低于触发门槛），挂着的降到它 1¢ 以下撤掉，开盘后按平时的门槛；0 = 关（按上一项）"),
     ("SIM_MAKER_AFTER_HOURS_MARKETS", "盘后挂单模式只做这些市场（详细选项）", "逗号分隔的市场代码；在“盘后挂单模式”卡片展开详细选项点选，空 = 所有指数/个股日涨跌市场"),
     ("SIM_MAKER_DEEP_MARKETS", "低价挂单模式只做这些市场（详细选项）", "逗号分隔的市场代码；在“低价挂单模式”卡片展开详细选项点选，空 = 范围内的所有市场"),
@@ -4058,6 +4058,7 @@ class BookEdge:
     slip: float = 0.0   # taker: average fill price − best price for the trade size
     short: bool = False  # taker: the visible book cannot fill the whole trade size
     front: bool = False  # maker: placed a cent in front of the valid 买1 (the deep-bid mode), not behind its queue
+    sweep: bool = False  # maker: a sweep order — deep under the book's front (SIM_MAKER_DEEP_ONLY), filled only when a seller sweeps through
 
     @property
     def label(self) -> str:
@@ -11547,7 +11548,7 @@ class Bot:
         if maker is not None:
             queue = next((q for p, q in own_levels(mk.book, side) if abs(p - maker.price) < 1e-9), 0.0)
             trade.update(price=maker.price, signal=maker.edge, shares=0.0, status="resting", filled=None,
-                         queue_ahead=queue, queue_min=queue, **({"deep": True} if maker.front else {}))
+                         queue_ahead=queue, queue_min=queue, **({"deep": True} if maker.front else {}), **({"sweep": True} if maker.sweep else {}))
         else:
             trade.update(price=taker["cost"], avg=taker["avg"], fee=taker["fee"], best=taker["best"],
                          slip=taker["avg"] - taker["best"], signal=fair - taker["cost"], shares=taker["got"], status="filled", cap=taker.get("cap"),
@@ -11671,7 +11672,7 @@ class Bot:
         front_ok = c.sim_maker_deep > 0 and self.sim_mode_market(mk, c.sim_maker_deep_markets) and not book_crossed(mk.book)
         only = front_ok and c.sim_maker_deep_only  # SIM_MAKER_DEEP_ONLY: the joining orders are not placed at all
         limit = self.sim_after_hours_price(mk)  # after hours only at or under SIM_AFTER_HOURS_MAX_PRICE_CENTS
-        best, joined, dear = None, None, None  # joined / dear: what was passed over, for the reason when nothing is left
+        cands, joined, dear = [], None, None  # joined / dear: what was passed over, for the reason when nothing is left
         for side, name in (("up", "涨"), ("down", "跌")):
             own, own_price = self.sim_own_resting(trades, mk.market, side)
             level = maker_level(mk.book, side, c.sim_maker_min_bid, own, own_price)
@@ -11682,16 +11683,20 @@ class Bot:
             # the deep-bid placement, a cent in front of the 买1: on a book the ordinary rule refuses, and on any book when
             # the edge there still clears SIM_MAKER_DEEP_CENTS (a cent is worth being filled first); otherwise join the level
             use_front = wide or (front_ok and fair - front[0] >= c.sim_maker_deep - 1e-9)
-            if only and not use_front:
-                joined = max(joined if joined is not None else -1.0, fair - level[0])
-                continue
-            price, queued = front if use_front else level
+            sweep = None
+            if only and not use_front:  # the front has no edge: a sweep order deep under it, or nothing
+                sweep = self.sweep_price(mk.book, side, fair, c.sim_maker_deep, own, own_price)
+                if sweep is None:
+                    joined = max(joined if joined is not None else -1.0, fair - level[0])
+                    continue
+            price, queued = (sweep[0], sweep[1]) if sweep else front if use_front else level
             if limit is not None and price > limit + 1e-9:
                 dear = max(dear if dear is not None else -1.0, price)
                 continue
             edge = fair - price
-            if best is None or edge > best.edge:
-                best = BookEdge(name, True, price, edge, queued, edge, front=use_front)
+            cands.append(BookEdge(name, True, price, edge, queued, edge, front=use_front or sweep is not None, sweep=sweep is not None))
+        cands.sort(key=lambda b: b.edge, reverse=True)
+        best = cands[0] if cands else None
         if best is None:
             if dear is not None and joined is None:
                 return None, f"盘后只挂 {cents(limit)} 以下的，可挂的价位 {cents(dear)} 高于它"
@@ -11705,10 +11710,16 @@ class Bot:
             return None, (f"{mode}只挂净优势 ≥ {cents(bar)} 的，现 {cents(best.edge)}" if mode
                           else f"净优势 {cents(best.edge)} 低于触发门槛 {cents(bar)}") \
                 + (f"；{cents(dear)} 的价位高于盘后上限 {cents(limit)}" if dear is not None else "")
+        # the side with the most edge first; when its order is already resting, the other side, if it clears the bar on its
+        # own (both sides cheap enough is a pair: whichever fills has the edge it was judged on)
+        for cand in cands:
+            if cand.edge <= mk.need or cand.edge < bar - 1e-9:
+                break
+            held = trades.get(f"{mk.market}|{'up' if cand.side == '涨' else 'down'}|挂")
+            if held is None or sim_position(held):  # a position from an earlier order does not hold the slot
+                return cand, ""
         held = trades.get(f"{mk.market}|{'up' if best.side == '涨' else 'down'}|挂")
-        if held is not None and not sim_position(held):  # a position from an earlier order does not hold the slot
-            return None, f"已有{sim_status(held)}：{cents(float(held.get('price') or 0))}×{float(held.get('order') or 0):g} 份"
-        return best, ""
+        return None, f"已有{sim_status(held)}：{cents(float(held.get('price') or 0))}×{float(held.get('order') or 0):g} 份"
 
     def sim_maker_candidate(self, mk: SimMarket, trades: dict[str, dict], now_ms: int | None = None) -> BookEdge | None:
         return self.sim_maker_reason(mk, trades, self.market.now_ms() if now_ms is None else now_ms)[0]
@@ -11727,8 +11738,10 @@ class Bot:
             maker_text = ""
             if maker is not None:
                 side = "up" if maker.side == "涨" else "down"
+                ahead = sum(q for p, q in own_levels(mk.book, side) if p > maker.price + 1e-9) if maker.sweep else 0.0
                 maker_text = (f"挂{mk.sides[0 if side == 'up' else 1]} {cents(maker.price)}×{c.sim_shares:g} 份（净优势 {cents(maker.edge)}，"
-                              + ("买1 之上 1¢，" if maker.front else "") + (f"排在 {maker.size:g} 份之后）" if maker.size > 0 else "排在最前）"))
+                              + (f"击穿单，前面 {ahead:g} 份）" if maker.sweep else ("买1 之上 1¢，" if maker.front else "")
+                                 + (f"排在 {maker.size:g} 份之后）" if maker.size > 0 else "排在最前）")))
                 maker_why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, maker.price, c.sim_shares)
                 held = trades.get(f"{mk.market}|{side}|挂")
                 if held is not None and sim_position(held):
@@ -11845,6 +11858,30 @@ class Bot:
                 return price
         return None
 
+    @staticmethod
+    def sweep_price(book: PredictBook, side: str, fair: float, deep: float, own: float = 0.0,
+                    own_price: float | None = None) -> tuple[float, float, float] | None:
+        """A deep-bid order's place when the front of the book has no edge (SIM_MAKER_DEEP_ONLY): a cent over the best bid
+        of anyone else under the threshold price (fair − SIM_MAKER_DEEP_CENTS, floored to the cent), 1¢ when there is none
+        — behind the book's front, filled only when a seller sweeps through it. (price, shares of others at that price,
+        shares ahead of it), or None when the threshold price is under 1¢ or the asks reach it."""
+        top = floor_price(fair - deep) if fair - deep >= 0.01 - 1e-9 else 0.0
+        if top < 0.01 - 1e-9:
+            return None
+        others_at = lambda p, q: q - (own if own_price is not None and abs(p - own_price) < 1e-9 else 0.0)
+        price = 0.01
+        for p, q in own_levels(book, side):
+            if others_at(p, q) >= SIM_MAKER_FRONT_MIN - 1e-9 and p <= top - SIM_MAKER_DEEP_STEP + 1e-9:
+                price = round(p + SIM_MAKER_DEEP_STEP, 2)
+                break
+        price = min(price, top)
+        asks = side_levels(book, side)
+        if asks and price >= asks[0][0] - 1e-9:
+            return None
+        queued = sum(others_at(p, q) for p, q in own_levels(book, side) if abs(p - price) < 1e-9)
+        ahead = sum(others_at(p, q) for p, q in own_levels(book, side) if p > price + 1e-9)
+        return price, max(queued, 0.0), max(ahead, 0.0)
+
     @classmethod
     def sim_maker_price(cls, book: PredictBook, side: str, level: tuple[float, float], deep: bool,
                         own: float = 0.0, own_price: float | None = None) -> tuple[float, float]:
@@ -11922,6 +11959,15 @@ class Bot:
             # price, dust aside) it goes back over the pusher while the edge there still clears the mode's bar, otherwise it
             # stays where it is; the bids under it falling away, it comes down to a cent over what is left
             target = self.sim_maker_price(mk.book, side, level, True, own, price)[0]
+            if trade.get("sweep"):  # a sweep order: to the front once that has the edge, else a cent over the next bid under the threshold
+                if fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9:
+                    return f"盘口离公平价远了，击穿单改挂到买1 之上 1¢（{cents(target)}）"
+                sweep = self.sweep_price(mk.book, side, fair, c.sim_maker_deep, own, price)
+                if sweep is None:
+                    return f"公平价 {cents(fair)} 留不出 {cents(c.sim_maker_deep)}，击穿单撤掉"
+                if abs(sweep[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
+                    return f"下面的买单变了，击穿单改挂 {cents(sweep[0])}"
+                return ""
             if target > price + 1e-9:
                 if fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9:
                     return f"买1 被顶到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}"
@@ -12401,7 +12447,8 @@ class Bot:
                 how.append(f"低价挂单模式：按挂价算净优势 ≥ {cents(deep_bar)} 的单挂在有效买1 之上 1¢ 优先成交"
                            + ("，价差超过上限的盘口也挂、只挂这种单，" if spread > 0 else "，")
                            + f"这种单净优势降到 {cents(max(deep_bar - SIM_MAKER_MODE_SLACK, self.sim_maker_exit()))} 以下撤掉（SIM_MAKER_DEEP_CENTS）"
-                           + ("；只挂低价挂单，平时跟买1 排队的挂单不挂（SIM_MAKER_DEEP_ONLY）" if self.config.sim_maker_deep_only else "")
+                           + ("；只挂低价挂单：买1 之上 1¢ 够门槛就挂在那里，不够就挂击穿单（公平价减门槛之下、下一档买单之上 1¢，前面有单也挂，"
+                              "订单簿被击穿才成交），平时跟买1 排队的挂单不挂（SIM_MAKER_DEEP_ONLY）" if self.config.sim_maker_deep_only else "")
                            + (f"，只做 {'、'.join(sorted(self.config.sim_maker_deep_markets))}" if self.config.sim_maker_deep_markets else ""))
             if self.config.sim_maker_min_bid > 0:
                 how.append(f"只跟不少于 {self.config.sim_maker_min_bid:g} 份的买1，买1 移动 1¢ 以上就撤了改跟")

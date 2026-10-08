@@ -866,9 +866,10 @@ async def maker_rules():
     obot2.predict.market_meta["101"] = (active, time.monotonic())
     assert obot2.config.sim_maker_deep_only and obot2.control_value("SIM_MAKER_DEEP_ONLY") == "on" and obot2.sim_version()["sim_maker_deep_only"] is True
     assert "sim_maker_deep_only" not in fbot.sim_version() and "sim_maker_deep_only" not in both5(SIM_MAKER_DEEP_ONLY="on").sim_version()  # needs the mode
-    assert obot2.sim_maker_reason(tight(0.70, NOW, asks=(("0.60", "400"),)), {}, NOW) == (None, "只挂低价挂单：买1 之上 1¢ 的净优势不到 25.0¢（跟买1 也只有 13.0¢）")
+    r = obot2.sim_maker_reason(tight(0.70, NOW, asks=(("0.60", "400"),)), {}, NOW)[0]  # the front (58¢) has 12¢: a sweep order at 1¢ instead (1.55.0)
+    assert r is not None and (r.price, r.sweep, r.front) == (0.01, True, True) and abs(r.edge - 0.69) < 1e-9, r
     assert obot2.sim_maker_reason(five, {}, NOW)[0].front and obot2.sim_maker_reason(tight(0.90, NOW, asks=(("0.60", "400"),)), {}, NOW)[0].price == 0.58
-    assert "；只挂低价挂单，平时跟买1 排队的挂单不挂（SIM_MAKER_DEEP_ONLY）" in obot2.sim_text() and "只挂低价挂单" not in fbot.sim_text()
+    assert "；只挂低价挂单：买1 之上 1¢ 够门槛就挂在那里，不够就挂击穿单" in obot2.sim_text() and "只挂低价挂单" not in fbot.sim_text()
     obot2.sim_markets = lambda now: world["markets"]
     obot2.config = m.dataclasses.replace(obot2.config, sim_maker_deep_only=False)
     await step(obot2, NOW, tight(0.70, NOW, asks=(("0.60", "400"),)))  # an ordinary joining order first…
@@ -922,6 +923,57 @@ async def maker_rules():
     await step(hbot, NOW + 50_000, dear(NOW + 50_000, False))
     trades = hbot.sim_trades()
     assert "x3|down|挂" not in trades and trades["x3|down|挂#1"]["note"] == "撤单：盘后只挂 60.0¢ 以下的，70.0¢ 的单撤掉，一份都没成交", trades["x3|down|挂#1"]["note"]
+    # the sweep order (10-08): with only the deep-bid orders wanted and the front of the book too close to the fair price, the
+    # order goes deep under it — a cent over the next bid under fair − 25¢ — and waits for the book to be swept
+    hynix = lambda fair, at, bids=(("0.48", "3430"), ("0.01", "1000")), asks=(("0.53", "1720"), ("0.99", "1000")): \
+        m.dataclasses.replace(hsi(fair, list(bids), list(asks), at), in_session=False)  # before the open: the after-hours rules too
+    assert m.Bot.sweep_price(hynix(0.50, NOW).book, "up", 0.50, 0.25) == (0.02, 0.0, 3430.0)
+    assert m.Bot.sweep_price(hynix(0.50, NOW, bids=(("0.48", "3430"),)).book, "up", 0.50, 0.25) == (0.01, 0.0, 3430.0)  # nothing under: 1¢
+    assert m.Bot.sweep_price(hynix(0.50, NOW, bids=(("0.48", "3430"), ("0.10", "200"), ("0.01", "1000"))).book, "up", 0.50, 0.25) == (0.11, 0.0, 3430.0)
+    assert m.Bot.sweep_price(hynix(0.50, NOW, bids=(("0.48", "3430"), ("0.25", "50"), ("0.02", "20"))).book, "up", 0.50, 0.25) == (0.03, 0.0, 3480.0)  # 25¢ sits at the threshold: under it
+    assert m.Bot.sweep_price(hynix(0.50, NOW).book, "up", 0.50, 0.25, own=100.0, own_price=0.02) == (0.02, 0.0, 3430.0)  # our own order at 2¢ is not someone else
+    assert m.Bot.sweep_price(hynix(0.25, NOW).book, "up", 0.25, 0.25) is None and m.Bot.sweep_price(hynix(0.26, NOW).book, "up", 0.26, 0.25) == (0.01, 1000.0, 3430.0)  # 1¢ is all that is left: behind the 1,000 there
+    wbot = both5(SIM_MAKER_DEEP_CENTS="25", SIM_MAKER_DEEP_ONLY="on", SIM_MAKER_AFTER_HOURS_CENTS="10")
+    wbot.predict.market_meta["101"] = (active, time.monotonic())
+    r = wbot.sim_maker_reason(hynix(0.50, NOW), {}, NOW)[0]
+    assert r is not None and (r.side, r.price, r.sweep, r.front, r.size) == ("涨", 0.02, True, True, 0.0) and abs(r.edge - 0.48) < 1e-9, r
+    assert "击穿单" in wbot.sim_text() and "只挂低价挂单" in wbot.sim_text()
+    wbot.sim_markets = lambda now: world["markets"]
+    world["markets"] = [hynix(0.50, NOW)]
+    assert [x["maker"] for x in wbot.sim_checks(NOW)] == ["挂涨 2.0¢×100 份（净优势 48.0¢，击穿单，前面 3430 份）"]
+    await step(wbot, NOW, hynix(0.50, NOW))
+    t = wbot.sim_trades()[tid]
+    assert t["price"] == 0.02 and t["sweep"] is True and t["deep"] is True and t["queue_ahead"] == 0 and abs(t["edge"] - 0.48) < 1e-9, t
+    await step(wbot, NOW + 10_000, hynix(0.50, NOW + 10_000, bids=(("0.48", "3430"),)))  # the 1¢ bid gone: down to 1¢
+    trades = wbot.sim_trades()
+    assert tid not in trades and trades[f"{tid}#1"]["note"] == "撤单：下面的买单变了，击穿单改挂 1.0¢，一份都没成交", trades[f"{tid}#1"]["note"]
+    await step(wbot, NOW + 11_000, hynix(0.50, NOW + 11_000, bids=(("0.48", "3430"),)))
+    assert wbot.sim_trades()[tid]["price"] == 0.01 and wbot.sim_trades()[tid]["sweep"] is True
+    await step(wbot, NOW + 20_000, hynix(0.50, NOW + 20_000, bids=(("0.48", "3430"), ("0.10", "200"))))  # a 10¢ bid: a cent over it
+    assert wbot.sim_trades()[f"{tid}#2"]["note"] == "撤单：下面的买单变了，击穿单改挂 11.0¢，一份都没成交"
+    await step(wbot, NOW + 21_000, hynix(0.50, NOW + 21_000, bids=(("0.48", "3430"), ("0.10", "200"))))
+    assert wbot.sim_trades()[tid]["price"] == 0.11
+    await step(wbot, NOW + 30_000, hynix(0.50, NOW + 30_000, bids=(("0.20", "3430"), ("0.10", "200"))))  # the front at 21¢ clears 25¢: to the front
+    assert wbot.sim_trades()[f"{tid}#3"]["note"] == "撤单：盘口离公平价远了，击穿单改挂到买1 之上 1¢（21.0¢），一份都没成交"
+    await step(wbot, NOW + 31_000, hynix(0.50, NOW + 31_000, bids=(("0.20", "3430"), ("0.10", "200"))))
+    t = wbot.sim_trades()[tid]
+    assert t["price"] == 0.21 and t["deep"] is True and "sweep" not in t
+    await step(wbot, NOW + 40_000, hynix(0.50, NOW + 40_000))  # the wall is back at 48¢ over it: the front order stays, 29¢ of edge behind the wall
+    assert wbot.sim_trades()[tid]["price"] == 0.21 and wbot.sim_trades()[tid]["status"] == "resting"
+    await step(wbot, NOW + 50_000, hynix(0.25, NOW + 50_000))  # the fair price down to 25¢: under the deep-bid line
+    trades = wbot.sim_trades()
+    assert tid not in trades and trades[f"{tid}#4"]["note"] == "撤单：净优势降到 4.0¢，低于撤单线 5.0¢，一份都没成交", trades[f"{tid}#4"]["note"]  # the ordinary exit line comes first
+    await step(wbot, NOW + 60_000, hynix(0.50, NOW + 60_000))  # a sweep order again at 2¢; the fair price collapsing withdraws it
+    assert wbot.sim_trades()[tid]["price"] == 0.02 and wbot.sim_trades()[tid]["sweep"] is True
+    await step(wbot, NOW + 70_000, hynix(0.25, NOW + 70_000))
+    trades = wbot.sim_trades()
+    assert tid not in trades and trades[f"{tid}#5"]["note"] == "撤单：盘后、低价挂单只挂净优势 ≥ 25.0¢ 的，现 23.0¢ 低于盘后低价挂单撤单线 24.0¢，一份都没成交", trades[f"{tid}#5"]["note"]  # the line fires first
+    r = wbot.sim_maker_reason(hynix(0.25, NOW + 70_000), {}, NOW + 70_000)[0]  # 涨 has no price with 25¢ left; 跌 (fair 75¢) at the front, 48¢
+    assert r is not None and (r.side, r.price, r.sweep, r.front) == ("跌", 0.48, False, True) and abs(r.edge - 0.27) < 1e-9, r
+    assert wbot.sim_maker_reason(hynix(0.25, NOW + 70_000), {f"{HSI_SLUG}|down|挂": {"status": "resting", "price": 0.48, "order": 100.0, "maker": True}}, NOW + 70_000) \
+        == (None, "已有挂单中：48.0¢×100 份")  # 跌 held, 涨 nothing: the held one is the reason
+    # both sides cheap enough is a pair: with 涨 resting, a later step rested 跌 too (1.55.0: the other side when the best is held)
+    assert any(k.startswith(f"{HSI_SLUG}|down|挂") for k in wbot.sim_trades())
     sbot2 = both5(SIM_MAKER_SPREAD_CENTS="10")
     sbot2.predict.market_meta["101"] = (active, time.monotonic())
     assert sbot2.sim_maker_reason(five, {}, NOW) == (None, "买卖价差 90.0¢ 超过 10.0¢") and sbot2.sim_version()["sim_maker_spread"] == 0.10
