@@ -780,7 +780,7 @@ async def run():
     s_trades = sbot.sim_trades()
     assert s_trades[f"{HSI_SLUG}|up|挂"]["status"] == "cancelled" and s_trades[f"{HSI_SLUG}|up|挂"]["live"]["state"] == "cancelling"
     assert abs(sbot.live_exposure(s_trades) - 114.0) < 1e-9 and sbot.live_status(NOW)["unconfirmed"] == 2
-    assert sbot.live_status(NOW)["orders"][0]["live_state"] == "cancelling"  # the active orders come first
+    assert sbot.live_status(NOW)["orders"][0]["live_state"] == "cancelling" and "why" in sbot.live_status(NOW)["orders"][0]  # the active orders come first
     sfake.fail_open = None
     await step(sbot, NOW + 10_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
     s_trades = sbot.sim_trades()

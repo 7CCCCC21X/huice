@@ -832,6 +832,29 @@ async def maker_rules():
     t = fbot.sim_trades()[f"{HSI_SLUG}|down|挂"]
     assert t["price"] == 0.06 and t["deep"] is True and t["queue_ahead"] == 0 and abs(t["edge"] - 0.54) < 1e-9, t
     assert "低价挂单模式：按挂价算净优势 ≥ 25.0¢ 的单挂在有效买1 之上 1¢ 优先成交，这种单净优势降到 24.0¢ 以下撤掉" in fbot.sim_text()
+    # SIM_MAKER_DEEP_ONLY: only the deep-bid orders — a joining order is not placed, a resting one is withdrawn, and a
+    # deep-bid order is held to the mode's line on any book
+    obot2 = both5(SIM_MAKER_DEEP_CENTS="25", SIM_MAKER_DEEP_ONLY="on")
+    obot2.predict.market_meta["101"] = (active, time.monotonic())
+    assert obot2.config.sim_maker_deep_only and obot2.control_value("SIM_MAKER_DEEP_ONLY") == "on" and obot2.sim_version()["sim_maker_deep_only"] is True
+    assert "sim_maker_deep_only" not in fbot.sim_version() and "sim_maker_deep_only" not in both5(SIM_MAKER_DEEP_ONLY="on").sim_version()  # needs the mode
+    assert obot2.sim_maker_reason(tight(0.70, NOW, asks=(("0.60", "400"),)), {}, NOW) == (None, "只挂低价挂单：买1 之上 1¢ 的净优势不到 25.0¢（跟买1 也只有 13.0¢）")
+    assert obot2.sim_maker_reason(five, {}, NOW)[0].front and obot2.sim_maker_reason(tight(0.90, NOW, asks=(("0.60", "400"),)), {}, NOW)[0].price == 0.58
+    assert "；只挂低价挂单，平时跟买1 排队的挂单不挂（SIM_MAKER_DEEP_ONLY）" in obot2.sim_text() and "只挂低价挂单" not in fbot.sim_text()
+    obot2.sim_markets = lambda now: world["markets"]
+    obot2.config = m.dataclasses.replace(obot2.config, sim_maker_deep_only=False)
+    await step(obot2, NOW, tight(0.70, NOW, asks=(("0.60", "400"),)))  # an ordinary joining order first…
+    assert obot2.sim_trades()[tid]["price"] == 0.57 and "deep" not in obot2.sim_trades()[tid]
+    obot2.config = m.dataclasses.replace(obot2.config, sim_maker_deep_only=True)
+    await step(obot2, NOW + 10_000, tight(0.70, NOW + 10_000, asks=(("0.60", "400"),)))  # …withdrawn once only the deep-bid ones are wanted
+    trades = obot2.sim_trades()
+    assert tid not in trades and trades[f"{tid}#1"]["note"] == "撤单：已改为只挂低价挂单，平时的挂单撤掉，一份都没成交", trades[f"{tid}#1"]["note"]
+    await step(obot2, NOW + 20_000, tight(0.90, NOW + 20_000, asks=(("0.60", "400"),)))  # 33¢ at 57¢: a cent in front at 58¢
+    t = obot2.sim_trades()[tid]
+    assert t["price"] == 0.58 and t["deep"] is True and abs(t["edge"] - 0.32) < 1e-9, t
+    await step(obot2, NOW + 30_000, tight(0.81, NOW + 30_000, asks=(("0.60", "400"),)))  # 23¢: under the line, on a book the ordinary rule accepts
+    trades = obot2.sim_trades()
+    assert tid not in trades and trades[f"{tid}#2"]["note"] == "撤单：低价挂单只挂净优势 ≥ 25.0¢ 的，现 23.0¢ 低于低价挂单撤单线 24.0¢，一份都没成交", trades[f"{tid}#2"]["note"]
     sbot2 = both5(SIM_MAKER_SPREAD_CENTS="10")
     sbot2.predict.market_meta["101"] = (active, time.monotonic())
     assert sbot2.sim_maker_reason(five, {}, NOW) == (None, "买卖价差 90.0¢ 超过 10.0¢") and sbot2.sim_version()["sim_maker_spread"] == 0.10

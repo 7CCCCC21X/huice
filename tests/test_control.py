@@ -110,6 +110,7 @@ async def run():
     assert s["SIM_GROUP_USD"]["zero"] == "不限" and s["LIVE_MAX_DAILY_LOSS_USD"]["presets"][0] == "0"
     assert s["SIM_MAKER_AFTER_HOURS_CENTS"]["zero"] == "关" and s["SIM_MAKER_AFTER_HOURS_CENTS"]["value"] == "0" and "10" in s["SIM_MAKER_AFTER_HOURS_CENTS"]["presets"]
     assert s["SIM_MAKER_DEEP_CENTS"]["zero"] == "关" and s["SIM_MAKER_DEEP_CENTS"]["value"] == "0" and "25" in s["SIM_MAKER_DEEP_CENTS"]["presets"]
+    assert s["SIM_MAKER_DEEP_ONLY"]["options"] == [["off", "两种都挂"], ["on", "只挂低价挂单"]] and s["SIM_MAKER_DEEP_ONLY"]["value"] == "off"
     assert s["SIM_MAKER_SPREAD_CENTS"]["zero"] == "不限" and s["SIM_MAKER_SPREAD_CENTS"]["value"] == "0" and "10" in s["SIM_MAKER_SPREAD_CENTS"]["presets"]
     assert s["SIM_MAKER_DEEP_MARKETS"]["kind"] == "detail" and s["SIM_MAKER_DEEP_MARKETS"]["value"] == "" and s["SIM_MAKER_AFTER_HOURS_MARKETS"]["kind"] == "detail"
     assert "全部市场" in body.decode() and ".sw.on" in body.decode() and "绿色 = 开" in body.decode() and "挂单没开，不生效" in body.decode()

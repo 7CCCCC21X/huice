@@ -1637,6 +1637,7 @@ class LiveBot(core.Bot):
                          "price": float(t["price"]), "order": float(t.get("order") or 0), "shares": float(t.get("shares") or 0),
                          "status": sim_status(t), "state": core.sim_state(t), "order_id": str(st.get("order_id") or ""),
                          "live_state": str(st.get("state") or ""), "maker": bool(t.get("maker")),
+                         "why": str((t.get("withdrawn") or {}).get("why") or st.get("error") or ""),  # why it was withdrawn / failed
                          "cancellable": t["status"] == "resting" and st.get("state") in {"open", "placing"} and bool(st.get("order_id")),
                          "url": self.sim_url(t)})
         positions, at = self.live_positions

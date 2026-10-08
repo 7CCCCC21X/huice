@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.51.0
+版本：1.52.0
 
 ## 已完成
 
+- 1.52.0（只挂低价挂单、撤单原因上表）：`SIM_MAKER_DEEP_ONLY`（off/on，默认 off；控制项选择卡，常用开关“只挂低价挂单”，打开时顺带打开低价挂单与挂单，低价挂单或挂单关着时标黄）：开着时 `sim_maker_reason` 只给买1 之上 1¢、净优势 ≥ 低价挂单门槛的单，跟买1 排队的不挂（“只挂低价挂单：买1 之上 1¢ 的净优势不到 25.0¢（跟买1 也只有 13.0¢）”）；`sim_requote_reason` 撤掉平时的挂单（“已改为只挂低价挂单，平时的挂单撤掉”），低价挂单在任何盘口都按低价挂单撤单线重判（`sim_maker_mode` 在非宽价差盘口上名为“低价挂单”）；`/sim` 说明行、`sim_version`。控制台真实订单表状态后带撤单 / 失败原因（`live_status` 行的 `why`）。测试：test_sim（不挂、挂、撤、撤单线）、test_control（表单）、cards.py（开关）。
 - 1.51.0（价差不限、大优势抢先挂）：`SIM_MAKER_SPREAD_CENTS`（0～99，默认 0 = 不限；`Config.sim_maker_spread`，控制项预设 0/5/10/20/30）：`sim_maker_block(book, spread)` 在 spread=0 时只拒绝盘口交叉，单边、再宽的价差都挂（跟有效买1，门槛不变）；默认从固定 10¢ 改为不限。低价挂单模式改为“净优势 ≥ N¢ 的单挂在有效买1 之上 1¢”，任何盘口都适用（`BookEdge.front`，记录 `deep: true`），价差超过上限的盘口仍只挂这种单、按模式门槛与撤单线；挂单检查写“买1 之上 1¢，排在最前”。`/sim` 说明行按上限写；复盘页说明不再写死 10¢。测试：test_sim（spread=0 的 sim_maker_block；用户例子：两边都是 5¢、公平价 40¢ → 挂跌 5¢ 净优势 55¢，低价挂单开时 6¢ 排在最前；旧规则的用例显式传 SIM_MAKER_SPREAD_CENTS=10）、test_control（表单）。
 - 1.50.1（挂单模式开着但只吃单：说清楚、顺带打开挂单）：`sim_maker_reason` 在 SIM_WAYS=taker 且设置了盘后 / 低价挂单模式时写“SIM_WAYS=taker：只吃单（盘后挂单 / 低价挂单模式要先打开挂单）”；`/sim` 说明行加“…已设置，但现在只吃单，不会挂单”。控制台：常用开关里这两个模式在“挂单”关着时标黄“挂单没开，不生效”（`.sw.warn`），从常用开关打开模式时同一请求把 SIM_WAYS 设为 both；参数卡片标题带黄色“挂单没开，不生效”徽标（`.badge.warn`）。测试：test_sim（原因与说明行）、test_control（页面文案）、cards.py（关掉挂单后模式标黄，再打开模式时挂单一起打开）。
 - 1.50.0（常用开关颜色分开关、挂单模式可选市场）：常用开关按钮绿色 = 开、灰色 = 关，文字带“· 开 / · 关”（`.sw.on` / `.sw.off`）。`SIM_MAKER_AFTER_HOURS_MARKETS`、`SIM_MAKER_DEEP_MARKETS`（逗号分隔的市场代码，不分大小写，空 = 全部；`Config.market_keys` 与 SIM_SKIP 同一解析，控制项 kind=detail）：`Bot.sim_mode_market(mk, markets)`；`sim_after_hours` / `sim_deep_book(mk)`（改为收 SimMarket）只在选中的市场上为真，其它市场上这个模式等于没开，挂单检查写“标的未开盘，不挂单（盘后挂单模式未选这个市场）” / “买卖价差 … 超过 10.0¢（低价挂单模式未选这个市场）”；`/sim` 说明行“只做 A、B”，`sim_version` 记录。控制台：详细选项芯片通用化（`DETAIL`：做哪些市场 = 排除式，两个模式卡片 = 选择式，带“全部市场”芯片，全选即存空，至少保留一个；已选但当前没列出的另起一行可去掉；各卡片展开状态分别记在 localStorage `ctldetail`）。测试：test_sim（解析、未选市场的两种原因、选中市场正常挂、说明行与版本）、test_control（表单、设置与清空）、cards.py（低价挂单卡片点市场芯片与全部市场、开关颜色）。
