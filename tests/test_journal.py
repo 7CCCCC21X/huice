@@ -87,6 +87,9 @@ async def run():
     web = m.WebServer(bot, 0, TOKEN)
     status, ctype, body = web.route("GET", f"/p/{TOKEN}/journal")
     assert status == 200 and ctype.startswith("text/html") and "模拟交易复盘" in body.decode()
+    assert 'id="ctl"' in body.decode() and 'href=base+"/control"' in body.decode()  # the control page is one tap away from the review page
+    status, _, page = web.route("GET", f"/p/{TOKEN}")
+    assert status == 200 and 'id="ctl"' in page.decode() and 'id="jrn"' in page.decode()  # ...and from the odds page's header (the phone too)
     status, ctype, body = web.route("GET", f"/p/{TOKEN}/journal.json")
     data = json.loads(body)
     assert status == 200 and ctype.startswith("application/json") and len(data["trades"]) == 6 and data["total"]["mismatch"] == 1

@@ -46,7 +46,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.58.0"
+VERSION = "1.58.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7615,7 +7615,7 @@ button.tog{font-family:inherit;padding:4px 11px}.tog.on{border-color:var(--best)
 h2{margin:12px 2px 6px}.legend{margin-bottom:4px}.edge{min-height:40px}.pb{padding-top:6px}.odds{margin-top:0}.tag,.cd{padding:1px 7px}.quote a.open{padding:3px 10px}.skel{height:150px}}
 #fsent{height:1px;margin-top:-1px}
 </style></head><body><div class="wrap">
-<header><div class="ttl"><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></div><div class="hr"><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button><button type="button" class="tog" id="edit" title="调整卡片和栏目顺序、隐藏卡片或栏目、改高亮门槛">✎ 自定义</button></div></header>
+<header><div class="ttl"><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></div><div class="hr"><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button><button type="button" class="tog" id="edit" title="调整卡片和栏目顺序、隐藏卡片或栏目、改高亮门槛">✎ 自定义</button><a class="tog" id="ctl" href="#" title="交易控制台：真实交易、订单、参数">⚙ 控制台</a><a class="tog" id="jrn" href="#" title="模拟交易复盘：每笔证据、导出">📒 复盘</a></div></header>
 <div class="legend" id="legend"></div>
 <div id="fsent" aria-hidden="true"></div>
 <div class="fbar" id="fbar"><div class="fchips" id="fchips"></div>
@@ -8226,6 +8226,7 @@ function setEditing(on){
   if(on)drawPanel();if(last)render(last)}
 document.getElementById("edit").addEventListener("click",()=>setEditing(!editing));
 document.getElementById("journal").href=location.pathname.replace(/\\/$/,"")+"/journal";
+document.getElementById("jrn").href=location.pathname.replace(/\\/$/,"")+"/journal";document.getElementById("ctl").href=location.pathname.replace(/\\/$/,"")+"/control";
 document.getElementById("done").addEventListener("click",()=>setEditing(false));
 document.getElementById("hotin").addEventListener("change",e=>{const v=Math.round(Number(e.target.value));
   if(e.target.value.trim()!==""&&Number.isFinite(v)){hotCents=Math.min(50,Math.max(1,v));HOT=hotCents/100;keep("hot",hotCents)}
@@ -8361,7 +8362,7 @@ dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1>模拟交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
-<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="csv" href="journal.csv" download="模拟交易日记.csv">导出 CSV</a><a class="btn" id="json" href="journal.json" download="模拟交易日记.json">导出 JSON</a></div>
+<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="模拟交易日记.csv">导出 CSV</a><a class="btn" id="json" href="journal.json" download="模拟交易日记.json">导出 JSON</a></div>
 <p class="small mut" id="intro"></p>
 <div class="tiles" id="tiles"></div>
 <h2 id="h-groups" hidden>分组</h2><div class="tbl" id="groups" hidden></div>
@@ -8393,7 +8394,7 @@ const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms
 const CENT_KEYS=new Set(["fair_up"]);
 let data=null,stateF="all",wayF="all",kindF="all",openId=decodeURIComponent(location.hash.slice(1)||"");
 const base=location.pathname.replace(/\/journal\/?$/,"");
-document.getElementById("back").href=base;
+document.getElementById("back").href=base;document.getElementById("ctl").href=base+"/control";
 document.getElementById("csv").href=base+"/journal.csv";document.getElementById("json").href=base+"/journal.json";  // also right under /journal/
 function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
   if(MS_KEYS.has(k))return v?when(v):"—";if(k==="high_at")return v?when(v*1000):"—";if(CENT_KEYS.has(k))return cent(v);
