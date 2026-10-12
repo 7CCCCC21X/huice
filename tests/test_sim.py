@@ -1305,6 +1305,18 @@ async def faster():
     fbot.sim_wake = False
     assert await fbot.refresh_books(NOW) == m.Refreshed("ok") and seen["hot"] == {"HSI", "NIULAI"} and fbot.sim_wake is True
     assert "HSI" in seen["targets"]
+    # a feed refresh that moved a fair price wakes the trader too (1.63.0); an unchanged one, or a feed the odds do not hang on, does not
+    fbot.sim_wake, fbot.fair_sig = False, None
+    fbot.note_job("恒指期货", NOW)
+    assert fbot.sim_wake and fbot.fair_sig and ("pons#77", 0.3) in fbot.fair_sig  # the first signature counts as a change
+    fbot.sim_wake = False
+    fbot.note_job("恒指期货", NOW)
+    assert not fbot.sim_wake, "nothing moved"
+    world["markets"][0] = hsi(0.71, [(0.55, 100)], [(0.62, 100)], NOW)
+    fbot.note_job("汇率", NOW)
+    assert not fbot.sim_wake, "not a feed the fair prices hang on"
+    fbot.note_job("上证/A50", NOW)
+    assert fbot.sim_wake and ("hang-seng-index-up-or-down-on-october-5-2026", 0.71) in fbot.fair_sig
     print("FASTER_OK")
 
 

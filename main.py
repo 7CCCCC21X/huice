@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.62.0"
+VERSION = "1.63.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -2329,7 +2329,7 @@ class IndexFutures:
     """Hang Seng Index futures (main contract, incl. the 17:15-03:00 after-hours session) with the
     cash index for the 高水/低水 basis. Eastmoney first, Sina as fallback; read-only, best effort."""
     REFRESH_SECONDS = 60   # between sessions
-    SESSION_SECONDS = 20   # while the cash index or a futures session trades (etnet is a scraped page, not a feed)
+    SESSION_SECONDS = 10   # while the cash index or a futures session trades (etnet is a scraped page, not a feed: not faster)
     EM = "https://push2.eastmoney.com/api/qt/stock/get?fltt=2&invt=2&fields=f43,f44,f45,f46,f57,f58,f60,f86&secid="
     # etnet is the HKEX-designated free real-time site the user checks against; Sina hf_HSI is a CFD,
     # not the HKEX contract (it prints decimals), so it is only a last-resort, clearly labelled fallback.
@@ -3117,7 +3117,7 @@ class CnIndex:
     Sina, Yahoo 000001.SS): a realtime "last price" says nothing reliable about which session it closed.
     """
     REFRESH_SECONDS = 60      # between sessions
-    SESSION_SECONDS = 10      # while Shanghai trades (its own index) or an A50 session runs (the after-hours proxy)
+    SESSION_SECONDS = 5       # while Shanghai trades (its own index) or an A50 session runs (the after-hours proxy)
     DAILY_SECONDS = 600       # re-read the daily bars this often once the expected close is confirmed
     PENDING_SECONDS = 60      # ...and this often while the close the calendar expects is not confirmed yet
     STALE_MS = 10 * 60_000    # a live quote older than this is not used for new probabilities
@@ -4117,8 +4117,9 @@ PREDICT_SITE = "https://predict.fun/zh-cn/market/"
 PREDICT_ITEMS = (("HSI", "恒生指数", "hk"), ("KOSPI", "KOSPI", "kr"), ("SSE", "上证指数", "sh"))
 PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
-PREDICT_PARALLEL = 8            # Predict requests in flight at once, on Predict's own thread pool (predict_blocking)
-PREDICT_POOL_WORKERS = 12       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
+PREDICT_PARALLEL = 16           # Predict requests in flight at once, on Predict's own thread pool (predict_blocking): the
+                                # hot round (a dozen markets, each answer about a second) goes out in one batch
+PREDICT_POOL_WORKERS = 20       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
                                 # feeds' pool, where a 502-ing scraper held threads for the 12-second timeout (a round took 60 s)
 _PREDICT_POOL: ThreadPoolExecutor | None = None
 
@@ -4536,6 +4537,7 @@ class PredictFeed:
         self.fees: dict[str, tuple[int | None, float]] = {}      # market id -> (feeRateBps or None, when read)
         self.refreshed = -1e9
         self.key_refreshed: dict[str, float] = {}                # item key -> monotonic time of its last refresh (the cold cadence)
+        self.cold_task: asyncio.Task | None = None               # the cold keys' round, running beside the hot one
         self.gate = asyncio.Semaphore(PREDICT_PARALLEL)          # requests in flight, on Predict's own pool
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
 
@@ -4768,6 +4770,16 @@ class PredictFeed:
         else:
             self.errors.pop(key, None)
 
+    async def refresh_cold(self, due: dict[str, str]) -> None:
+        """The cold keys' round (refresh): marked as refreshed first, so a slow round is not started twice."""
+        now = time.monotonic()
+        for key in due:
+            self.key_refreshed[key] = now
+        try:
+            await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in due.items()))
+        except Exception as error:  # refresh_one answers its own failures; anything else is logged, never raised into the loop
+            LOG.warning("Predict 冷门盘口刷新异常：%s", clean_error(error) or type(error).__name__)
+
     def yes_book(self, row: "LadderRow") -> tuple["PredictBook | None", str]:
         """The row's book priced as "Yes", whatever the market's outcome order."""
         if row.book is None:
@@ -4828,11 +4840,14 @@ class PredictFeed:
                 table.pop(slug, None)
         now = time.monotonic()
         cold = getattr(self.config, "predict_cold_poll", 0) or 0
-        due = {key: slug for key, slug in targets.items()
-               if hot is None or key in hot or key not in self.books and key not in self.ladders or now - self.key_refreshed.get(key, -1e9) >= cold}
+        due = {key: slug for key, slug in targets.items() if hot is None or key in hot or (key not in self.books and key not in self.ladders)}
+        cold_due = {key: slug for key, slug in targets.items() if key not in due and now - self.key_refreshed.get(key, -1e9) >= cold}
         await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in due.items()))
         for key in due:
             self.key_refreshed[key] = now
+        if cold_due and (self.cold_task is None or self.cold_task.done()):
+            # beside the hot round, never in it: forty ladder levels must not hold the daily cards' books back
+            self.cold_task = asyncio.create_task(self.refresh_cold(cold_due), name="predict-cold")
         for key in [k for k in self.key_refreshed if k not in targets]:
             self.key_refreshed.pop(key, None)
         # a market not listed yet is an answer, not a failure
@@ -8518,7 +8533,7 @@ if("IntersectionObserver" in window)new IntersectionObserver(([e])=>fbarEl.class
 const totop=document.getElementById("totop");addEventListener("scroll",()=>totop.classList.toggle("show",scrollY>600),{passive:true});
 totop.addEventListener("click",()=>scrollTo({top:0,behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth"}));
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
-load();connectLive();setInterval(()=>{if(document.visibilityState!=="hidden")load()},10000);setInterval(tick,1000);  // a hidden tab waits: visibilitychange fetches at once on return
+load();connectLive();setInterval(()=>{if(document.visibilityState!=="hidden")load()},5000);setInterval(tick,1000);  // a hidden tab waits: visibilitychange fetches at once on return
 </script></body></html>"""
 
 
@@ -9052,7 +9067,7 @@ function renderSettings(){if(!data)return;
   GROUPS.forEach(([g,title])=>{if(g==="高级"&&!adv)return;const items=data.settings.filter(s=>s.group===g);if(!items.length)return;
     box.append(el("div","grp",title));items.forEach(s=>{const k=card(s);if(k)box.append(k)})})}
 $("fold").addEventListener("click",()=>{folded=!folded;try{localStorage.setItem("ctlfold",folded?"1":"0")}catch(e){}renderSettings()});
-function renderCadence(c){if(!c)return;$("checksnote").textContent="每个市场现在会挂什么、为什么不挂；吃单的封顶价和封顶价之下能买到多少。盘口每 "+c.book+" 秒刷新（没人靠近的冷门市场每 "+(c.cold||c.book)+" 秒），刷新完立刻看一轮，最多每 "+c.sim+" 秒一轮；积分和费率每 10 分钟读一次（参数里的“检查订单的频率”“盘口刷新间隔”“冷门盘口刷新间隔”可改）。"}
+function renderCadence(c){if(!c)return;$("checksnote").textContent="每个市场现在会挂什么、为什么不挂；吃单的封顶价和封顶价之下能买到多少。盘口每 "+c.book+" 秒刷新（没人靠近的冷门市场每 "+(c.cold||c.book)+" 秒，另开一轮不占热门市场的时间），盘口刷新完或公平价变动时立刻看一轮，最多每 "+c.sim+" 秒一轮；积分和费率每 10 分钟读一次（参数里的“检查订单的频率”“盘口刷新间隔”“冷门盘口刷新间隔”可改）。"}
 function renderChecksFold(){$("checksbody").style.display=checksFolded?"none":"";$("foldchecks").textContent=checksFolded?"展开":"收起"}
 $("foldchecks").addEventListener("click",()=>{checksFolded=!checksFolded;try{localStorage.setItem("ctlchecks",checksFolded?"1":"0")}catch(e){}renderChecksFold()});
 // the other sections fold the same way, each remembered on its own
@@ -9211,7 +9226,7 @@ class WebServer:
     trade, ?id=<trade> one whole record, ?full=1 every whole record = the JSON export) and journal.csv, /p/<token>/control
     (the control page) with control.json and the one POST route (control, keyed by WEB_CONTROL_KEY). Everything else is 404, the token is compared in constant
     time, and responses are no-store with a restrictive CSP. Text bodies are gzip-compressed for a client that accepts it
-    (the page is ~80 KB, data.json is fetched every 10 seconds by every open tab).
+    (the page is ~80 KB, data.json is fetched every 5 seconds by every open tab).
     """
     MAX_HEADER_BYTES = 8192
     GZIP_MIN_BYTES = 512  # below this a gzip header costs about as much as it saves
@@ -10074,7 +10089,8 @@ class Bot:
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.sim_ran = -1e9  # monotonic time of the paper trader's last look
-        self.sim_wake = False  # a round of books just came in: the next look does not wait for SIM_SECONDS
+        self.sim_wake = False  # a round of books just came in, or a fair price moved: the next look does not wait for SIM_SECONDS
+        self.fair_sig: tuple | None = None  # the fair prices as of the last feed refresh (note_job): a change wakes the trader
         self.sim_checked: dict[str, float] = {}  # market id -> monotonic time Predict was last asked for its result
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
         self.reference_pool: ThreadPoolExecutor | None = None
@@ -14977,6 +14993,25 @@ class Bot:
         return result
 
     PREDICT_HOT_GAP = 0.05  # a market whose nearer side is within this of the taker's cap is refreshed every round
+    WAKE_JOBS = frozenset({"恒指期货", "上证/A50", "KOSPI", "Hyperliquid", "股票实时", "交易所收盘", "概率输入",
+                           "先触市场", "涨跌市场", "反超市场", "市值阶梯", "价格阶梯"})  # the feeds the fair prices hang on
+
+    def fair_signature(self, now_ms: int) -> tuple:
+        """Every priced market's fair price, to the tenth of a cent: the trader looks again when it changes."""
+        return tuple(sorted((mk.market, round(mk.fair_up, 3)) for mk in self.sim_markets(now_ms)))
+
+    def note_job(self, name: str, now_ms: int) -> None:
+        """A reference feed just refreshed (reference_loop): when a fair price moved, the trader looks now — the books of
+        the last round are at most a few seconds old — instead of at its next timer or book round."""
+        if name not in self.WAKE_JOBS or not (self.config.sim and self.config.predict) or self.sim_wake:
+            return
+        try:
+            sig = self.fair_signature(now_ms)
+        except Exception as error:
+            self.log_limited("fair-sig", f"公平价签名计算失败：{clean_error(error) or type(error).__name__}")
+            return
+        if sig != self.fair_sig:
+            self.fair_sig, self.sim_wake = sig, True
 
     def predict_hot_keys(self, now_ms: int) -> set[str]:
         """The item keys the orderbook feed refreshes every round: every market but the ladders (a handful), and a
@@ -15071,6 +15106,7 @@ class Bot:
                     state["running_since"] = 0.0
                 if ran:
                     state.update(ms=int((time.monotonic() - started) * 1000), runs=state["runs"] + 1)
+                    self.note_job(name, self.market.now_ms())  # a fair price that moved: the trader looks now
                 await self.wait(REFERENCE_TICK)
         finally:
             HTTP_POOL.reset(token)

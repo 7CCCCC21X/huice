@@ -121,12 +121,12 @@ async def run():
     except ValueError as e: assert "15:00" in str(e)
     # refresh cadence: 10 s while Shanghai or the A50 trades, 60 s between sessions (HSI 20 s / KOSPI 10 s in session)
     f = m.CnIndex(True, cn)
-    assert f.cadence(bj(2026, 9, 26, 18, 30)) == 60 and f.cadence(bj(2026, 9, 28, 10, 0)) == 10 and f.cadence(bj(2026, 9, 28, 22, 0)) == 10
-    assert f.cadence(bj(2026, 9, 28, 16, 35)) == 60 and f.cadence(bj(2026, 11, 9, 20, 0)) == 60 and f.cadence(bj(2026, 10, 1, 10, 0)) == 10
+    assert f.cadence(bj(2026, 9, 26, 18, 30)) == 60 and f.cadence(bj(2026, 9, 28, 10, 0)) == 5 and f.cadence(bj(2026, 9, 28, 22, 0)) == 5  # 1.63.0: 5 s in session
+    assert f.cadence(bj(2026, 9, 28, 16, 35)) == 60 and f.cadence(bj(2026, 11, 9, 20, 0)) == 60 and f.cadence(bj(2026, 10, 1, 10, 0)) == 5
     k = m.KospiIndex(True, c.holidays["kr"])
     assert k.cadence(bj(2026, 9, 28, 10, 0)) == 10 and k.cadence(bj(2026, 9, 28, 15, 0)) == 60 and k.cadence(bj(2026, 9, 26, 10, 0)) == 60
     h = m.IndexFutures(True, c.holidays["hk"])
-    assert h.cadence(bj(2026, 9, 28, 10, 0)) == 20 and h.cadence(bj(2026, 9, 28, 22, 0)) == 20 and h.cadence(bj(2026, 9, 28, 16, 50)) == 60 and h.cadence(bj(2026, 9, 26, 10, 0)) == 60
+    assert h.cadence(bj(2026, 9, 28, 10, 0)) == 10 and h.cadence(bj(2026, 9, 28, 22, 0)) == 10 and h.cadence(bj(2026, 9, 28, 16, 50)) == 60 and h.cadence(bj(2026, 9, 26, 10, 0)) == 60  # 1.63.0: the futures page every 10 s
     # the 15:00 close is caught at once: a refresh fires right after it, whatever the cadence says (not on a holiday)
     assert await f.refresh(bj(2026, 9, 30, 14, 59) + 50_000) is not False
     assert await f.refresh(bj(2026, 9, 30, 14, 59) + 55_000) is False

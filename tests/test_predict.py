@@ -121,7 +121,10 @@ async def run():
     assert any(want["HSI"] in str(v) for _, v in calls[n:]), "HSI (no book) is still asked every round"
     bot.predict.key_refreshed["CXMTUSDT"] -= 61; n = len(calls); bot.predict.refreshed = -1e9
     await bot.predict.refresh(targets, hot={"SSE"})
+    assert not any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:]), "the cold round runs beside the hot one, not in it (1.63.0)"
+    await bot.predict.cold_task
     assert any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:]), "cold, and due again"
+    assert m.time.monotonic() - bot.predict.key_refreshed["CXMTUSDT"] < 5
     assert cfg.predict_cold_poll == 60 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_COLD_POLL_SECONDS": "80"}).predict_cold_poll == 80
     try:
         m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_COLD_POLL_SECONDS": "500"}); raise AssertionError("over PREDICT_STALE_MS")
