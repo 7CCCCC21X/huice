@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.65.1"
+VERSION = "1.65.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -11132,7 +11132,11 @@ class Bot:
     @staticmethod
     def kospi_close_ms(q: IndexQuote) -> int:
         kst = dt.timezone(dt.timedelta(hours=9))
-        day = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst).date()
+        return Bot.kospi_day_close_ms(dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst).date())
+
+    @staticmethod
+    def kospi_day_close_ms(day: dt.date) -> int:
+        kst = dt.timezone(dt.timedelta(hours=9))
         return int(dt.datetime.combine(day, CALENDAR.close_time("kr", day), kst).timestamp() * 1000)
 
     @staticmethod
@@ -11408,15 +11412,20 @@ class Bot:
             return "KOSPI 报价时间未知，无法确认是哪一天的收盘；暂不输出概率"
         quoted_day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
         hl, anchor = self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
-        remaining, target = session_remaining("kr", now_ms, quoted_day, holidays)
         expected = expected_close_date("kr", now_ms, holidays)
+        if (quoted_day == local.date() and expected < local.date()
+                and local.time() < CALENDAR.sessions("kr", local.date())[0][0]):
+            # before today's open Naver stamps its quote with today's date, yet the figure is the last close (the
+            # session has not printed anything): the market it prices is still today's close against that last close
+            quoted_day = expected
+        remaining, target = session_remaining("kr", now_ms, quoted_day, holidays)
         if quoted_day < expected or (quoted_day == local.date() and local.time() < CALENDAR.kr_time(KRX_SETTLED, local.date())):
             return f"KOSPI 基准停在 {stamp(k.quoted_ms, seconds=False)}，应为 {expected.strftime('%m-%d')} 收盘；暂不输出概率"
         if hl is None:
             return "缺少 HL KR200 代理"
         if now_ms - hl.fetched_ms > self.HL_STALE_MS:
             return f"HL KR200 报价已超 10 分钟未更新（最后 {stamp(hl.fetched_ms, seconds=False)}），暂不输出新概率"
-        if not (anchor and anchor[0] == self.kospi_close_ms(k)):
+        if not (anchor and anchor[0] == self.kospi_day_close_ms(quoted_day)):  # the close the quote stands for (before the open: the last one)
             # Never divide the perp by the KOSPI200 cash level: their basis would be read as a move.
             why = f"：{brief_error(self.kospi_anchor_error, 90)}" if self.kospi_anchor_error else ""
             return f"缺少 HL KR200 在 {quoted_day.strftime('%m-%d')} 15:30 的同源锚点{why}；暂不输出概率"
@@ -12842,6 +12851,7 @@ class Bot:
         answers = await asyncio.gather(*(self.predict.market_details(mid) for mid in due), return_exceptions=True)
         for mid, details in zip(due, answers):
             tids = wanted[mid]
+            tids = [tid for tid in tids if tid in trades]  # a record the step moved meanwhile (sim_rekey): next round
             if isinstance(details, BaseException):
                 for tid in tids:
                     trades[tid]["final_error"] = clean_error(details) or type(details).__name__
@@ -12883,6 +12893,10 @@ class Bot:
         self.sim_note_closes()
         markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
         trades = self.sim_trades()
+        # Predict's final words on the decided markets: asked now, answered while the decisions below are made (the
+        # requests run on threads; a second of them no longer adds to the step)
+        confirm = asyncio.create_task(self.sim_confirm(trades, now_ms))
+        await asyncio.sleep(0)
         costs, bar = self.edge_costs(), self.config.sim_edge
         ways, kinds = self.config.sim_ways, self.config.sim_markets
         changed: list[tuple[str, dict]] = []  # written once, in one transaction
@@ -12976,7 +12990,7 @@ class Bot:
             changed = [(new_tid if k == tid else k, t) for k, t in changed]
         if changed:
             self.sim_save(changed)
-        await self.sim_confirm(trades, now_ms)
+        await confirm
         return Refreshed("ok")
 
     def sim_url(self, trade: dict) -> str:

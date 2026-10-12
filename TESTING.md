@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.65.1
+版本：1.65.2
 
 ## 已完成
 
+- 1.65.2（决策阶段不再等 Predict 核对；KOSPI 开盘前照常出概率）：（1）`sim_step` 先把 `sim_confirm` 起成任务（`asyncio.sleep(0)` 让它把请求发出去），决策算完再 `await`，核对的网络时间与计算重叠；`sim_confirm` 对这一步里被挪动（`sim_rekey`）的记录跳过、下一轮再核。（2）`kospi_odds`：开盘前 Naver 的报价带当天日期、数值仍是上一收盘，原来按“基准停在今天、应为昨收”拒绝输出，07:20～09:00 KST 没有 KOSPI 概率；现在当天还没收盘、时间在当天开盘前时把报价当作上一收盘处理，照常用 HL KR200 代理出盘后概率。测试 `tests/test_kospi.py`。
 - 1.65.1（一步里的串行请求并行）：/diag 分阶段计时显示收盘后一步“决策 7.2s、下单 4.4s”：`sim_confirm` 对每个待确认市场逐个读 Predict 详情（每个约 1 秒），改为一次 `gather`；`live_place_pending` 逐张下单改为并行（风控判断仍逐张、带着全部待发记录算）。`/diag` 的探测改用自己的线程池（`diag_pool`，8 线程），探测耗时不再混入行情源的排队时间。
 - 1.65.0（关闭行情源）：`SOURCES_OFF`（`Config.sources_off`，逗号分隔的 eastmoney / sina / tencent / yahoo / naver / etnet，不认识的报错；控制台高级组“关闭的行情源”选择卡，当前只提供“关闭东方财富”）。`SourceHealth.off` 由 `Bot.__init__` / `apply_config` 维护：`order()` 先剔除关掉的源（所有走 `pick_quote` / `SOURCE_HEALTH.order` 的行情、日 K、波动率、现货源），`enabled()` 给恒指期货的 `read_families` 用，`disabled()` 让 A50 锚点查找改用新浪 5 分钟 K，`off_names()` 让 /diag 不再探测它们。测试 `tests/test_diag.py`、`tests/test_control.py`。
 - 1.64.0（链上操作移出交易一步）：/diag 里“模拟交易 上次用时 25.4s”——自动领取每 10 分钟一轮，十几个已结算持仓逐个 estimateGas 失败（BNB 不足）各花 1～2 秒，整步被拖住。（1）`live_sync` 把自动领取放进后台任务 `live_redeem_round`（`live_redeem_task`，不重叠），余额 / 授权刷新同样（`live_account_round` / `live_account_task`；从未读到过时仍当场读，余额门和授权检查要用）；（2）`live_redeem`：失败的持仓一小时内不再试（`live_redeem_failed`，`LIVE_REDEEM_RETRY_SECONDS`），BNB 低于 0.0005（`LIVE_REDEEM_MIN_BNB_WEI`）时一个都不试、每小时提醒一次“充值后自动恢复”；（3）`KEEPALIVE_PER_HOST` 8→24：并行 16 时原来每轮有 8 条连接池装不下、每轮重新握手（/diag 新建 1091 次）；（4）参考数据线程池 8→16：行情源节奏加快后 /diag 的 45 个探测曾把池子堵到 21 秒超时。测试 `tests/test_trading.py`（回退、燃气门、后台领取）。

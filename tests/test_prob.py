@@ -172,6 +172,15 @@ async def run():
     bot.hl.quotes["KR200"] = dataclasses.replace(hl, fetched_ms=now - 11 * 60_000)
     assert "HL KR200 报价已超 10 分钟未更新" in bot.kospi_odds(now)
     bot.hl.quotes["KR200"] = hl
+    # before the open (1.65.2) Naver stamps its quote with the day while the figure is still the last close: the odds
+    # stay, against that close and its anchor, instead of "基准停在今天"
+    pre = kr(2026, 9, 28, 8, 21)
+    bot.kospi.quote = dataclasses.replace(k, quoted_ms=pre)
+    bot.hl.quotes["KR200"] = dataclasses.replace(hl, fetched_ms=pre - 5_000)
+    po = bot.kospi_odds(pre)
+    assert isinstance(po, m.CloseOdds) and po.target == dt.date(2026, 9, 28) and po.mode == "盘后" and f"{po.fair_up * 100:.1f}" == "28.2", po
+    assert "基准停在" in bot.kospi_odds(kr(2026, 9, 28, 9, 30)) or isinstance(bot.kospi_odds(kr(2026, 9, 28, 9, 30)), str)  # in session, a pre-open print is not today's: no odds from it
+    bot.kospi.quote, bot.hl.quotes["KR200"] = k, hl
     diag = "\n".join(bot.diag_state(now))
     assert "KR200 锚点：1,126.6 @" in diag and "（15:30 一分钟K·HL）" in diag and "KOSPI 波动率：3.02%（PROB_VOL 手动设定）" in diag, diag
     assert "KOSPI 概率：涨 28.2¢" in diag, diag
