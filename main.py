@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.65.0"
+VERSION = "1.65.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -10118,6 +10118,7 @@ class Bot:
         self.sim_checked: dict[str, float] = {}  # market id -> monotonic time Predict was last asked for its result
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
         self.reference_pool: ThreadPoolExecutor | None = None
+        self.diag_pool: ThreadPoolExecutor | None = None  # /diag's probes run here, not on the feeds' pool
         self.reference_state: dict[str, dict] = {}  # per background feed: last success, last error, duration
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
         self.kospi_anchor_note, self.kospi_anchor_error = "", ""
@@ -12834,15 +12835,16 @@ class Bot:
                         mid = str(market["id"]) if market else ""
                 if mid:
                     wanted.setdefault(mid, []).append(tid)
-        for mid, tids in wanted.items():
-            if time.monotonic() - self.sim_checked.get(mid, -1e9) < self.SIM_CONFIRM_SECONDS:
-                continue
+        due = [mid for mid in wanted if time.monotonic() - self.sim_checked.get(mid, -1e9) >= self.SIM_CONFIRM_SECONDS]
+        for mid in due:
             self.sim_checked[mid] = time.monotonic()
-            try:
-                details = await self.predict.market_details(mid)
-            except Exception as error:
+        # every market's details side by side (a second each from Predict; seven after a close cost the step seven seconds)
+        answers = await asyncio.gather(*(self.predict.market_details(mid) for mid in due), return_exceptions=True)
+        for mid, details in zip(due, answers):
+            tids = wanted[mid]
+            if isinstance(details, BaseException):
                 for tid in tids:
-                    trades[tid]["final_error"] = clean_error(error) or type(error).__name__
+                    trades[tid]["final_error"] = clean_error(details) or type(details).__name__
                 self.sim_save((tid, trades[tid]) for tid in tids)
                 continue
             resolved = details.get("resolved")
@@ -14813,7 +14815,9 @@ class Bot:
             async with gate:
                 return await run_probe(group, name, fetch, check)
 
-        token = HTTP_POOL.set(self.reference_pool)  # keep probe requests off the Binance/Telegram pool
+        if self.diag_pool is None:
+            self.diag_pool = ThreadPoolExecutor(max_workers=DIAG_PARALLEL * 2, thread_name_prefix="diag")
+        token = HTTP_POOL.set(self.diag_pool)  # the probes' own threads: a probe's time is the source's, not the feeds' queue
         try:
             return list(await asyncio.gather(*(one(*p) for p in self.diag_probes(now_ms))))
         finally:
@@ -15155,7 +15159,7 @@ class Bot:
             state["error_at"] = now
 
     def start_reference_tasks(self) -> None:
-        self.reference_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="reference")  # the feeds' faster cadences, and /diag's burst
+        self.reference_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="reference")  # the feeds' faster cadences
         self.reference_tasks = [asyncio.create_task(self.reference_loop(name, job), name=f"reference:{name}")
                                 for name, job in self.reference_jobs()]
 

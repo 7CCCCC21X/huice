@@ -1270,17 +1270,20 @@ class LiveBot(core.Bot):
 
     async def live_place_pending(self, now_ms: int) -> None:
         trades = self.sim_trades()
+        sending = []
         for tid, trade in trades.items():
             st = trade.get("live")
             if isinstance(st, dict) and st.get("state") == "pending" and trade["status"] == "resting":
                 if hold := self.live_send_hold(now_ms):
                     self.live_defer(tid, trade, hold, now_ms)  # waits (pending) rather than failing: the condition passes by itself
                     continue
-                why = self.live_send_block(trade, trades, now_ms)
+                why = self.live_send_block(trade, trades, now_ms)  # judged with every pending record counted (live_reserved)
                 if why:
                     self.live_fail(tid, trade, f"未下单：{why}", now_ms)
                     continue
-                await self.live_place(tid, trade, now_ms)
+                sending.append((tid, trade))
+        # side by side (the API gate bounds them): two orders after a close took 4 s one after the other
+        await asyncio.gather(*(self.live_place(tid, trade, now_ms) for tid, trade in sending))
 
     LIVE_BALANCE_STALE_S = 600  # after a failed refresh, a balance read longer ago than this is no ground for a new order
 
