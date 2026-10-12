@@ -942,6 +942,7 @@ class LiveBot(core.Bot):
         self.live_account_task: asyncio.Task | None = None  # the balances / approvals refresh, likewise
         self.live_redeem_failed: dict[str, float] = {}      # position key -> monotonic time its redeem failed
         self.live_gas_noted = -1e9
+        self.live_step_ms: dict[str, int] = {}  # the last step's phases (预取 / 决策 / 下单 / 同步), for /diag
         self.live_last_signin = -1e9
         self.live_positions: tuple[list[dict], float] = ([], 0.0)
         self.live_errors: list[str] = []  # the latest failures, newest last, for /live
@@ -1182,18 +1183,29 @@ class LiveBot(core.Bot):
     async def sim_step(self, now_ms: int) -> Any:
         if not self.sim_step_due():
             return False
+        marks, t0 = {}, time.monotonic()
+
+        def mark(phase: str) -> None:
+            nonlocal t0
+            now = time.monotonic()
+            marks[phase], t0 = int((now - t0) * 1000), now
         try:
             if self.config.live_mode != "off":
                 await self.live_prefetch(now_ms)
         except Exception as error:
             self.live_note_error(f"读取市场信息失败：{core.clean_error(error) or type(error).__name__}")
+        mark("预取")
         result = await super().sim_step(now_ms)
+        mark("决策")
         try:
             self.live_check_kill(self.sim_trades(), now_ms)  # the settlements of this step count before anything goes out
             await self.live_place_pending(now_ms)
+            mark("下单")
             await self.live_sync(now_ms)
+            mark("同步")
         except Exception as error:
             self.live_note_error(f"同步真实订单失败：{core.clean_error(error) or type(error).__name__}")
+        self.live_step_ms = marks
         return result
 
     async def live_prefetch(self, now_ms: int) -> None:

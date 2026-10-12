@@ -14818,7 +14818,9 @@ class Bot:
                     mark, what = "✅", f"{ago}成功"
                 err = f"｜{'未取得' if status == 'partial' else '最近错误'}：{brief_error(state['error'], 80)}" if state["error"] else ""
                 busy = f"｜本轮进行中 {running:.0f}s" if running >= 1 else ""
-                lines.append(f"  {mark} {name}：{what}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{busy}{err}")
+                phases = getattr(self, "live_step_ms", None) if name == "模拟交易" else None  # the real-trading step, by phase
+                detail = ("｜" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in phases.items())) if phases else ""
+                lines.append(f"  {mark} {name}：{what}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{busy}{detail}{err}")
         else:
             lines.append("🔄 后台刷新：未启动（命令行诊断或测试环境）")
         cooling = SOURCE_HEALTH.lines()
