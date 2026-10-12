@@ -1,7 +1,8 @@
-"""The paper trades' review page (/p/<token>/journal): totals with the expectation at the order and at the fills and how
-results were confirmed, filters, one trade's whole record (why the model priced it, the prices behind it, proxy and
-anchor, how it filled, how it was settled, version), deep links, and the CSV / JSON exports. The browser part needs
-Playwright + Chromium and is skipped without them."""
+"""The trades' review page (/p/<token>/journal): the tiles (today, 7 days, lifetime, open), the folded statistics and
+risks, filters with counts, the list by day (light rows: the open trades and the last JOURNAL_HISTORY finished ones,
+the rest on request), one trade's whole record fetched when it is opened (why the model priced it, the prices behind
+it, proxy and anchor, how it filled, how it was settled, version), deep links, and the CSV / JSON exports. The browser
+part needs Playwright + Chromium and is skipped without them."""
 import asyncio, csv, io, json, os, sys, urllib.parse, urllib.request, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP, except to 127.0.0.1)
@@ -84,9 +85,9 @@ async def run():
     assert trades[hsi_maker]["confirm"] == "confirmed" and trades[f"{KOSPI_SLUG}|down|吃"]["confirm"] == "mismatch"
     assert trades["hype-flip#1|up|挂"]["status"] == "resting" and len(trades) == 6, sorted(trades)
     # the routes: the page, its data and the two exports; the token guards them all
-    web = m.WebServer(bot, 0, TOKEN)
+    web = m.WebServer(bot, 0, TOKEN); web.CACHE_SECONDS = {}
     status, ctype, body = web.route("GET", f"/p/{TOKEN}/journal")
-    assert status == 200 and ctype.startswith("text/html") and "模拟交易复盘" in body.decode()
+    assert status == 200 and ctype.startswith("text/html") and "交易复盘" in body.decode()
     assert 'id="ctl"' in body.decode() and 'href=base+"/control"' in body.decode()  # the control page is one tap away from the review page
     status, _, page = web.route("GET", f"/p/{TOKEN}")
     assert status == 200 and 'id="ctl"' in page.decode() and 'id="jrn"' in page.decode()  # ...and from the odds page's header (the phone too)
@@ -97,6 +98,21 @@ async def run():
     assert waits["hype-flip#1|up|挂"] == "挂 20.0¢，最低卖价 30.0¢（高出 10.0¢）：要有人卖到挂价或更低才算成交；现在公平价 30.0¢", waits
     assert waits[hsi_maker] == "" and data["total"]["cancelled"] == 1  # the KOSPI maker, nothing filled, withdrawn at the close (1.54.3)
     assert trades[f"{KOSPI_SLUG}|down|挂#1"]["status"] == "cancelled" and trades[f"{KOSPI_SLUG}|down|挂#1"]["withdrawn"]["why"] == "已到结束时间，等结果出来：不开新单，挂单撤掉"
+    # the list rows are light (1.59.1): the whole record comes when a trade is opened (?id=) and for the exports (?full=1)
+    assert all("entry" not in t and "fills" not in t for t in data["trades"]) and data["more"] == 0 and data["mode"] == "paper" and data["history"] == 300
+    assert [r["name"] for r in data["recent"]] == ["今天", "近 7 天"] and data["recent"][0]["settled"] == data["total"]["settled"] > 0
+    status, _, body = web.route("GET", f"/p/{TOKEN}/journal.json", "full=1")
+    full = json.loads(body)
+    assert status == 200 and len(full["trades"]) == 6 and sum("entry" in t for t in full["trades"]) == 5 and full["more"] == 0
+    status, _, body = web.route("GET", f"/p/{TOKEN}/journal.json", "id=" + urllib.parse.quote(hsi_maker, safe=""))
+    one = json.loads(body)["trade"]
+    assert status == 200 and one["id"] == hsi_maker and one["entry"]["basis"]["ref"] == 24600.0 and one["fills"] and one["real"] is False
+    assert web.route("GET", f"/p/{TOKEN}/journal.json", "id=nope")[0] == 404
+    bot.JOURNAL_HISTORY = 2  # the page lists the open trades and the last two finished ones; ?all=1 every one
+    part = json.loads(web.route("GET", f"/p/{TOKEN}/journal.json")[2])
+    assert [t["id"] for t in part["trades"]][:1] == ["hype-flip#1|up|挂"] and len(part["trades"]) == 3 and part["more"] == 3 and part["history"] == 2, part["trades"]
+    assert len(json.loads(web.route("GET", f"/p/{TOKEN}/journal.json", "all=1")[2])["trades"]) == 6
+    bot.JOURNAL_HISTORY = m.Bot.JOURNAL_HISTORY
     status, ctype, body = web.route("GET", f"/p/{TOKEN}/journal.csv")
     text = body.decode("utf-8")
     assert status == 200 and ctype == "text/csv; charset=utf-8" and text.startswith("﻿编号,下单时间,市场")
@@ -122,7 +138,8 @@ async def browser_check(bot, data):
         return
     web = m.WebServer(bot, 0, TOKEN); web.CACHE_SECONDS = {}; port = await web.start()
     url = f"http://127.0.0.1:{port}/p/{TOKEN}/journal"
-    hsi_maker, mismatch = f"{HSI_SLUG}|up|挂", f"{KOSPI_SLUG}|down|吃"
+    hsi_maker, old = f"{HSI_SLUG}|up|挂", "old|up|挂"
+    bot.JOURNAL_HISTORY = 2  # the page lists the open trades and the last two finished ones; the rest on request
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})
@@ -132,30 +149,40 @@ async def browser_check(bot, data):
         await page.wait_for_selector("#list .tr")
         assert await page.get_attribute("#back", "href") == f"/p/{TOKEN}"
         # the exports are addressed from the page's own path, so they also work when the page was opened as /journal/
-        assert await page.get_attribute("#csv", "href") == f"/p/{TOKEN}/journal.csv" and await page.get_attribute("#json", "href") == f"/p/{TOKEN}/journal.json"
+        assert await page.get_attribute("#csv", "href") == f"/p/{TOKEN}/journal.csv" and await page.get_attribute("#json", "href") == f"/p/{TOKEN}/journal.json?full=1"
+        assert await page.inner_text("#title") == "模拟交易复盘"  # a bot without a trading key: paper
         tiles = await page.inner_text("#tiles")
         tot = data["total"]
-        for want in ("已结算", f"{tot['settled']} 笔", "模型预期（下单时）", "模型预期（成交时）", f"已确认 {tot['confirmed']}",
-                     f"结果不一致 {tot['mismatch']}", "挂单中 1"):
+        for want in ("今天", "近 7 天", "累计", f"已结算 {tot['settled']} 笔", f"结果不一致 {tot['mismatch']}", "进行中", "挂单中 1"):
             assert want in tiles, (want, tiles)
-        assert await page.locator("#list .tr").count() == 6
-        # filters: by how the result stands, by way of trading
-        await page.click("#filters button:text-is('结果不一致')")
+        # the statistics, the groups and the common risks are folded away; one tap shows them
+        assert await page.is_hidden("#statsbody") and "模型预期" in await page.inner_text("#statsum")
+        await page.click("#statshd")
+        assert await page.is_visible("#statsbody") and "模型预期（下单时）" in await page.inner_text("#statsbody") and await page.is_visible("#groups")
+        await page.click("#statshd")
+        assert await page.is_hidden("#statsbody")
+        # three rows at first (the resting order and the last two finished ones), every one on request, by day
+        assert await page.locator("#list .tr").count() == 3 and "更早的 3 笔可载入" in await page.inner_text("#meta")
+        await page.click("#more button:has-text('载入更早的 3 笔')")
+        await page.wait_for_selector("#list .tr >> nth=5")
+        assert await page.locator("#list .tr").count() == 6 and await page.locator("#list .day").count() == 2  # 10-05, and the old record's 10-04
+        # filters: by how the result stands, by way of trading; a chip nobody matches is not shown; 全部 clears them all
+        await page.click("#filters [data-f=bad]")
         assert await page.locator("#list .tr").count() == 1
-        await page.click("#filters button:text-is('未成交/撤单')")
+        await page.click("#filters [data-f=exp]")
         assert await page.locator("#list .tr").count() == 1  # the KOSPI maker: no seller ever reached it
-        await page.click("#filters button:text-is('挂单中')")
+        await page.click("#filters [data-f=rest]")
         assert await page.locator("#list .tr").count() == 1 and "⏳ 挂 20.0¢，最低卖价 30.0¢（高出 10.0¢）" in await page.inner_text("#list .tr .t3")
-        await page.click("#filters button:text-is('持仓')")
-        assert await page.locator("#list .tr").count() == sum(t["status"] == "filled" for t in data["trades"])
-        await page.click("#filters button:text-is('全部') >> nth=0")
-        await page.click("#filters button:text-is('吃单')")
+        assert await page.locator("#filters [data-f=open]").count() == (1 if any(t["status"] == "filled" for t in data["trades"]) else 0)
+        await page.click("#filters [data-f=all]")
+        await page.click("#filters [data-f=taker]")
         assert await page.locator("#list .tr").count() == 2
-        await page.click("#filters button:text-is('全部') >> nth=0"); await page.click("#filters button:text-is('全部') >> nth=1")
+        await page.click("#filters [data-f=taker]")  # the same chip again: off
         assert await page.locator("#list .tr").count() == 6
-        # one trade's whole record
+        # one trade's whole record, fetched when it is opened
         await page.click(f"#list .tr:has-text('恒生指数 挂涨') button.row")
         det = page.locator("#list .tr.open .det")
+        await det.locator("h3").first.wait_for()
         heads = await det.locator("h3").all_inner_texts()
         assert heads == ["判断依据（下单时）", "判断依据（成交时）", "行情来源", "代理与锚点", "成交证据", "结算证据", "版本与设置"], heads
         text = await det.inner_text()
@@ -165,30 +192,34 @@ async def browser_check(bot, data):
         assert urllib.parse.unquote(await page.evaluate("location.hash"))[1:] == hsi_maker
         # a mismatch says so and keeps the revision
         await page.click(f"#list .tr:has-text('KOSPI 吃跌') button.row")
+        await page.wait_for_selector("#list .tr.open .det h3")
         text = await page.locator("#list .tr.open .det").inner_text()
         assert "本地结果与 Predict 不一致，已按 Predict 的结果重新结算" in text and "Predict 最终结果" in text and "0.5 → 1" in text, text
         assert await page.locator("#list .tr.open").count() == 1  # one record open at a time
         # an old record says what it lacks
         await page.click(f"#list .tr:has-text('上证指数 挂涨') button.row")
+        await page.wait_for_selector("#list .tr.open .det .note")
         assert "旧版本记下的交易" in await page.locator("#list .tr.open .det").inner_text()
         await page.click(f"#list .tr:has-text('HYPE 反超 SOL') button.row")
+        await page.wait_for_selector("#list .tr.open .det h3")
         assert "现在等什么\n挂 20.0¢，最低卖价 30.0¢" in await page.locator("#list .tr.open .det").inner_text()
         assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll"
         if os.environ.get("WEB_SCREENSHOT"):
             await page.screenshot(path=os.environ["WEB_SCREENSHOT"], full_page=True)
-        # a link to one trade opens it straight away
+        # a link to one trade opens it straight away — even one the first page does not list (the whole list is fetched)
         page2 = await browser.new_page(viewport={"width": 1100, "height": 900})
-        await page2.goto(url + "#" + urllib.parse.quote(mismatch, safe=""))
-        await page2.wait_for_selector("#list .tr.open")
-        assert "KOSPI 吃跌" in await page2.inner_text("#list .tr.open .row")
+        await page2.goto(url + "#" + urllib.parse.quote(old, safe=""))
+        await page2.wait_for_selector("#list .tr.open .det .note")
+        assert "上证指数 挂涨" in await page2.inner_text("#list .tr.open .row") and await page2.locator("#list .tr").count() == 6
         # the exports, as a browser fetches them
         csv_text = await page2.evaluate("fetch('journal.csv').then(r => r.text())")
         assert csv_text.startswith("﻿编号") or csv_text.startswith("编号"), csv_text[:20]
-        got = await page2.evaluate("fetch('journal.json').then(r => r.json()).then(d => d.trades.length)")
-        assert got == 6
+        got = await page2.evaluate("fetch('journal.json?full=1').then(r => r.json()).then(d => [d.trades.length, d.trades.filter(t => t.entry).length])")
+        assert got == [6, 5]
         await page2.close()
         assert not errors, errors
         await browser.close()
+    bot.JOURNAL_HISTORY = m.Bot.JOURNAL_HISTORY
     await web.stop()
 
 

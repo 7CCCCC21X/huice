@@ -46,7 +46,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.59.0"
+VERSION = "1.59.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -8332,7 +8332,7 @@ JOURNAL_PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>模拟交易复盘</title>
+<title>交易复盘</title>
 <script>try{var t=JSON.parse(localStorage.getItem("theme"));if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}catch(e){}</script>
 <style>
 :root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;--muted:#636b77;--faint:#98a0ab;--line:#e2e6ec;--line2:#edf0f4;--chip:#eef1f5;--chip2:#e2e6ed;--best:#2a66e0;--on-accent:#fff;--best-bg:#e8f0fe;--best-soft:#cfdefb;--warn:#b86e00;--warn-bg:#fff4df;--up:#dd3a40;--down:#17a05b;--hot:#e4262d;--hot-bg:#fdeaea;--shadow:0 1px 2px rgba(18,26,40,.05),0 2px 8px rgba(18,26,40,.05);--shadow2:0 8px 24px rgba(18,26,40,.12);--r:14px}
@@ -8344,24 +8344,34 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--best);outline-offse
 .wrap{max-width:1100px;margin:0 auto;padding:12px 16px 40px}
 header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 12px;padding:4px 0 6px}
 .ttl{display:flex;flex-direction:column;gap:2px;min-width:0}
-h1{font-size:20px;font-weight:750;letter-spacing:-.01em;margin:0;line-height:1.3}h2{font-size:13px;font-weight:700;color:var(--text);letter-spacing:.02em;margin:18px 2px 8px}
+h1{font-size:20px;font-weight:750;letter-spacing:-.01em;margin:0;line-height:1.3}h2{font-size:13px;font-weight:700;color:var(--text);letter-spacing:.02em;margin:0}
 .meta{color:var(--muted);font-size:12px;display:flex;flex-wrap:wrap;gap:2px 10px;font-variant-numeric:tabular-nums}
 .tog{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:12.5px;line-height:1.4;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:4px 11px 4px 9px;cursor:pointer;user-select:none;white-space:nowrap;transition:border-color .15s,color .15s}.tog:hover{border-color:var(--best-soft);color:var(--text)}
 a{color:var(--best)}.mut{color:var(--muted)}.small{font-size:12.5px}.warn{color:var(--warn)}.bad{color:var(--hot)}.ok{color:var(--best)}
 .btns{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
-.btn{display:inline-flex;align-items:center;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:999px;padding:5px 13px;font:inherit;font-size:13px;text-decoration:none;cursor:pointer;box-shadow:var(--shadow);transition:border-color .15s,color .15s}.btn:hover{border-color:var(--best);color:var(--best)}
-.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:10px;margin:8px 0}
+.btn{display:inline-flex;align-items:center;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:999px;padding:5px 13px;font:inherit;font-size:13px;text-decoration:none;cursor:pointer;box-shadow:var(--shadow);transition:border-color .15s,color .15s}.btn:hover{border-color:var(--best);color:var(--best)}.btn:disabled{opacity:.6;cursor:default}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin:8px 0}
 .tile{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:10px 13px;min-width:0;box-shadow:var(--shadow)}
 .tile .k{font-size:12px;color:var(--muted)}.tile .v{font-size:20px;font-weight:750;letter-spacing:-.01em;font-variant-numeric:tabular-nums;white-space:nowrap;line-height:1.3}
 .tile .s{font-size:12px;color:var(--muted);margin-top:2px}
+.box{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);margin:10px 0;padding:0 14px}
+.box .hd{display:flex;align-items:center;gap:10px;padding:10px 0;cursor:pointer;user-select:none}
+.box .hd .sum{flex:1 1 auto;min-width:0;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
+.lnk{border:0;background:none;color:var(--best);font:inherit;font-size:12.5px;cursor:pointer;padding:2px 4px;white-space:nowrap}
+.box .body{padding:2px 0 12px;border-top:1px solid var(--line2)}
+.box h3{font-size:12.5px;color:var(--muted);font-weight:600;margin:14px 0 6px}
+.box p{margin:4px 0}
 .tbl{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
 table{border-collapse:collapse;font-size:12.5px;width:100%;font-variant-numeric:tabular-nums}
 td,th{border-bottom:1px solid var(--line2);padding:6px 10px;text-align:left;vertical-align:top;white-space:nowrap}
-th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;background:var(--chip)}tr:last-child td{border-bottom:0}tr:hover td{background:var(--chip)}td.wrap{white-space:normal;min-width:140px}
-.filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0;font-size:12.5px;color:var(--muted)}
+th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;background:var(--chip)}tr:last-child td{border-bottom:0}tr:hover td{background:var(--chip)}td.wrap{white-space:normal;min-width:160px}
+.filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:12px 0 8px}
 .chip{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:4px 11px;font:inherit;font-size:12.5px;color:var(--muted);cursor:pointer;transition:border-color .15s,color .15s,background .15s}
 .chip:hover{border-color:var(--best-soft);color:var(--text)}.chip.on{border-color:var(--best);color:var(--on-accent);background:var(--best)}
+.chip .n{margin-left:5px;font-size:11px;opacity:.7;font-variant-numeric:tabular-nums}.chip.on .n{opacity:.9}
+.sep{display:inline-block;width:1px;height:16px;background:var(--line);margin:0 4px}
 .list{display:flex;flex-direction:column;gap:8px}
+.day{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:4px 10px;margin:8px 2px 0;font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}.day .dn{color:var(--text);font-weight:650}.list>.day:first-child{margin-top:0}
 .tr{background:var(--card);border:1px solid var(--line);border-radius:var(--r);min-width:0;box-shadow:var(--shadow);transition:box-shadow .2s,border-color .2s}
 .tr:hover{box-shadow:var(--shadow2)}.tr.open{border-color:var(--best);box-shadow:0 0 0 1px var(--best),var(--shadow)}
 .row{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:2px 12px;padding:10px 14px;cursor:pointer;width:100%;border-radius:var(--r);
@@ -8371,23 +8381,28 @@ th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;back
 .row .r{text-align:right;font-variant-numeric:tabular-nums;flex:0 0 auto}.row .r b{display:block;font-size:16px;font-weight:750}
 .badge{font-size:11.5px;border-radius:999px;padding:1px 8px;background:var(--chip);color:var(--muted);white-space:nowrap;font-weight:600}
 .badge.ok{color:var(--best);background:var(--best-bg)}.badge.bad{color:var(--on-accent);background:var(--hot)}.badge.pre{color:var(--warn);background:var(--warn-bg)}
+.tag{font-size:10.5px;border-radius:6px;padding:0 5px;background:var(--chip2);color:var(--muted);font-weight:600;vertical-align:1px;white-space:nowrap}
+.morebar{display:flex;justify-content:center;margin:12px 0}
 .det{border-top:1px solid var(--line2);padding:10px 14px 14px;display:flex;flex-direction:column;gap:14px;min-width:0}
-.sec h3{font-size:13px;margin:0 0 6px;display:flex;align-items:center;gap:8px}.sec h3:before{content:"";width:3px;height:14px;border-radius:2px;background:var(--best)}
+.sec h3{font-size:13px;margin:0 0 6px;display:flex;align-items:center;gap:8px;color:var(--text)}.sec h3:before{content:"";width:3px;height:14px;border-radius:2px;background:var(--best)}
 .sec .sub{font-size:12px;color:var(--muted);margin:8px 0 4px}
 dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:0;font-size:12.5px;padding:8px 11px;background:var(--chip);border-radius:10px}dt{color:var(--muted);white-space:nowrap}
 dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .note{font-size:12.5px;background:var(--chip);border-radius:10px;padding:8px 10px;border-left:3px solid var(--warn)}.note.bad{border-left-color:var(--hot)}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 </style></head><body><div class="wrap">
-<header><div class="ttl"><h1>模拟交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
-<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="模拟交易日记.csv">导出 CSV</a><a class="btn" id="json" href="journal.json" download="模拟交易日记.json">导出 JSON</a></div>
-<p class="small mut" id="intro"></p>
+<header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
+<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
 <div class="tiles" id="tiles"></div>
-<h2 id="h-groups" hidden>分组</h2><div class="tbl" id="groups" hidden></div>
-<h2 id="h-risk" hidden>共同风险</h2><div id="risk" hidden></div>
-<h2>交易</h2><div class="filters" id="filters"></div>
+<section class="box" id="statsbox"><div class="hd" id="statshd"><h2>统计与风险</h2><span class="sum" id="statsum"></span><button type="button" class="lnk" id="foldstats">展开</button></div>
+<div class="body" id="statsbody" hidden><div id="stats"></div>
+<h3 id="h-groups" hidden>分组</h3><div class="tbl" id="groups" hidden></div>
+<h3 id="h-risk" hidden>共同风险</h3><div id="risk" hidden></div>
+<h3>规则</h3><p class="small mut" id="intro"></p></div></section>
+<div class="filters" id="filters"></div>
 <div class="list" id="list"></div>
-<footer>只记账，不会向 Predict 下单。挂单的成交是按盘口快照推定的（推定成交），不代表真实成交。</footer>
+<div class="morebar" id="more" hidden></div>
+<footer id="foot"></footer>
 </div>
 <script>
 const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
@@ -8395,6 +8410,9 @@ const cent=x=>x==null||!isFinite(x)?"—":(x*100).toFixed(1)+"¢",sg=x=>x==null|
 const money=x=>(x>=0?"+$":"−$")+Math.abs(x).toFixed(2),usd=x=>"$"+Number(x).toFixed(2);
 const num=x=>x==null||x===""?"—":typeof x==="number"?x.toLocaleString("en-US",{maximumFractionDigits:6}):String(x);
 const when=ms=>ms?new Date(ms).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false,month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}):"—";
+const HMF=new Intl.DateTimeFormat("zh-CN",{timeZone:"Asia/Shanghai",hourCycle:"h23",hour:"2-digit",minute:"2-digit"}),DAYF=new Intl.DateTimeFormat("zh-CN",{timeZone:"Asia/Shanghai",year:"numeric",month:"2-digit",day:"2-digit"}),
+  MDF=new Intl.DateTimeFormat("zh-CN",{timeZone:"Asia/Shanghai",month:"2-digit",day:"2-digit"}),WDF=new Intl.DateTimeFormat("zh-CN",{timeZone:"Asia/Shanghai",weekday:"short"});
+const hm=ms=>ms?HMF.format(new Date(ms)):"—",dayKey=ms=>DAYF.format(new Date(ms||0)),dayName=ms=>{const d=new Date(ms||0);return MDF.format(d).replace("/","-")+" "+WDF.format(d)};
 const span=ms=>{if(ms==null||!isFinite(ms))return"—";const a=Math.abs(ms),s=Math.round(a/1000);
   const t=s<90?s+" 秒":s<5400?Math.round(s/60)+" 分钟":s<172800?(s/3600).toFixed(1)+" 小时":(s/86400).toFixed(1)+" 天";return ms<0?t+"后":t};
 const KINDS={close:"指数/个股日涨跌",touch:"先触价",updown:"月度涨跌",flip:"反超",range:"价格阶梯",ladder:"市值阶梯"};
@@ -8405,22 +8423,29 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_skip:"详细选项排除的市场",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
-  trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",rule:"规则",close:"收盘",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_skip:"详细选项排除的市场",
+  sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
+  min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
 const CENT_KEYS=new Set(["fair_up"]);
-let data=null,stateF="all",wayF="all",kindF="all",openId=decodeURIComponent(location.hash.slice(1)||"");
+const STATES=[["all","全部",t=>true],["open","持仓",t=>t.status==="filled"],["rest","挂单中",t=>t.status==="resting"],["done","已结算",t=>t.status==="settled"],
+  ["bad","结果不一致",t=>t.confirm==="mismatch"],["exp","未成交/撤单",t=>t.status==="expired"||t.status==="cancelled"]];
+const PAGE=50;  // rows shown at a time; the rest on request
+let data=null,stateF="all",wayF="all",kindF="all",openId=decodeURIComponent(location.hash.slice(1)||""),shown=PAGE,allLoaded=false,statsOpen=false;
+const details={};  // trade id -> its whole record, fetched when the trade is opened
+try{statsOpen=localStorage.getItem("jrnstats")==="1"}catch(e){}
 const base=location.pathname.replace(/\/journal\/?$/,"");
 document.getElementById("back").href=base;document.getElementById("ctl").href=base+"/control";
-document.getElementById("csv").href=base+"/journal.csv";document.getElementById("json").href=base+"/journal.json";  // also right under /journal/
+document.getElementById("csv").href=base+"/journal.csv";document.getElementById("json").href=base+"/journal.json?full=1";  // also right under /journal/
 function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
   if(MS_KEYS.has(k))return v?when(v):"—";if(k==="high_at")return v?when(v*1000):"—";if(CENT_KEYS.has(k))return cent(v);
   if(k==="sigma_daily"||k==="sigma")return (v*100).toFixed(2)+"%";if(k==="history")return JSON.stringify(v);
   if(typeof v==="object")return JSON.stringify(v);return num(v)}
 function dl(obj,skip){const d=$("dl");Object.entries(obj||{}).forEach(([k,v])=>{if(skip&&skip.includes(k))return;d.append($("dt","",LABELS[k]||k),$("dd","",val(k,v)))});return d}
+const WRAP=new Set(["说明","事件","原因","依据"]);
 function table(head,rows){const w=$("div","tbl"),t=$("table"),h=$("tr");head.forEach(x=>h.append($("th","",x)));t.append(h);
-  rows.forEach(r=>{const tr=$("tr");r.forEach((x,i)=>{const td=$("td",i===r.length-1&&head[i]==="说明"?"wrap":"");td.append(x instanceof Node?x:String(x??"—"));tr.append(td)});t.append(tr)});w.append(t);return w}
+  rows.forEach(r=>{const tr=$("tr");r.forEach((x,i)=>{const td=$("td",i===r.length-1&&WRAP.has(head[i])?"wrap":"");td.append(x instanceof Node?x:String(x??"—"));tr.append(td)});t.append(tr)});w.append(t);return w}
 function sec(title,...kids){const s=$("div","sec"),h=$("h3","",title);s.append(h,...kids.filter(Boolean));return s}
 function cat(t){if(t.status==="resting")return"rest";if(t.status==="filled")return"open";if(t.status==="expired"||t.status==="cancelled")return"exp";
   return t.confirm==="confirmed"?"ok":t.confirm==="mismatch"?"bad":"pre"}
@@ -8435,6 +8460,7 @@ function bookTable(b){if(!b)return null;const n=Math.max((b.bids||[]).length,(b.
     table(["买价","买量","卖价","卖量"],rows));return w}
 function detail(t){
   const d=$("div","det"),e=t.entry||{};
+  if(t.error){const n=$("div","note bad","读取这笔的完整记录失败："+t.error+" ");const b=$("button","lnk","重试");b.type="button";b.addEventListener("click",()=>{delete details[t.id];render()});n.append(b);d.append(n);return d}
   if(t.legacy)d.append($("div","note warn","这是旧版本记下的交易：当时没有保存判断依据、行情来源和盘口快照，只有价格、成交和结果。"));
   // 1. why the model priced it so
   const basis=$("div");if(e.basis){basis.append(dl(e.basis));if(e.basis.close_ms)basis.append($("div","sub","下单时距收盘/截止 "+span(e.basis.close_ms-t.opened)))}
@@ -8451,9 +8477,9 @@ function detail(t){
   const fx=$("div"),fl=$("dl"),add=(k,v)=>fl.append($("dt","",k),$("dd","",v));
   add("下单份数",num(t.order));add("成交份数",num(t.shares)+(t.unfilled?"（未成交 "+num(t.unfilled)+" 份已作废）":""));
   if(t.withdrawn)add("撤单",when(t.withdrawn.at)+"："+(t.withdrawn.why||"")+"，没成交的 "+num(t.withdrawn.unfilled)+" 份作废");
-  if(t.maker){add("成交方式","推定成交：盘口出现卖到挂价或更低的卖单才算，按看到的数量、取最多看到的一次");
-    if(t.queue_ahead!=null)add("排队假设","排在挂单时该价位已有的 "+num(t.queue_ahead)+" 份之后；之后最少剩 "+num(t.queue_min)+" 份")}
-  else{add("成交方式","吃单立即成交");add("成交均价",cent(t.avg));add("最优价",cent(t.best));add("深度滑点",sg(t.slip));add("手续费",cent(t.fee)+" /份")}
+  if(t.maker){add("成交方式",t.real?"真实挂单：成交份数来自 Predict 的订单记录，不按盘口推定":"推定成交：盘口出现卖到挂价或更低的卖单才算，按看到的数量、取最多看到的一次");
+    if(!t.real&&t.queue_ahead!=null)add("排队假设","排在挂单时该价位已有的 "+num(t.queue_ahead)+" 份之后；之后最少剩 "+num(t.queue_min)+" 份")}
+  else{add("成交方式",t.real?"真实吃单：封顶限价单"+(t.cap!=null?"，封顶价 "+cent(t.cap):""):"吃单立即成交");add("成交均价",cent(t.avg));add("最优价",cent(t.best));add("深度滑点",sg(t.slip));add("手续费",cent(t.fee)+" /份")}
   fx.append(fl);
   if((t.fills||[]).length)fx.append($("div","sub","成交记录"),table(["时间","份数","当时公平价","依据"],t.fills.map(f=>[when(f.at),num(f.shares),cent(f.fair),
     f.levels?"吃过："+f.levels.map(l=>cent(l[0])+"×"+num(l[1])).join("、")+(f.short?"（盘口不够）":""):
@@ -8465,7 +8491,15 @@ function detail(t){
   if(e.card&&e.card.length)fx.append($("div","sub","下单时卡片上的四个方向（按 $"+((t.version||{}).trade_usd||"")+" 计）"),
     table(["方向","价格","净优势","建议"],e.card.map(c=>[c.label,cent(c.price),sg(c.edge),c.best?"✓ 加框":""])));
   d.append(sec("成交证据",fx));
-  // 5. how it was settled
+  // 5. the real order, when one was sent: its id, state and every event in order
+  if(t.live&&typeof t.live==="object"){const lv=t.live,ld=$("dl"),p=(k,v)=>ld.append($("dt","",k),$("dd","",v));
+    const ST={pending:"准备发送",placing:"发送中（待确认）",open:"已挂出",cancelling:"撤单中",unknown:"状态未知（对账中）",done:"已结束"},FN={filled:"已成交",cancelled:"已撤单",failed:"失败",expired:"未成交"};
+    p("订单号",lv.order_id?"#"+lv.order_id:"—");p("状态",(ST[lv.state]||lv.state||"—")+(lv.final?" · "+(FN[lv.final]||lv.final):""));
+    if(lv.placed_at)p("下单时间",when(lv.placed_at));if(lv.attempt>1)p("尝试次数",num(lv.attempt));
+    if(t.cost_confirmed===false&&t.shares>0)p("成本","待对账：按封顶价计，读到 Predict 的成交均价后改为实际值");if(lv.error)p("错误",String(lv.error));
+    const ev=$("div");ev.append(ld);if((lv.events||[]).length)ev.append($("div","sub","订单事件"),table(["时间","事件"],lv.events.map(x=>[when(x.at),x.what||""])));
+    d.append(sec("真实订单",ev))}
+  // 6. how it was settled
   const st=$("div"),sl=$("dl"),put=(k,v)=>sl.append($("dt","",k),$("dd","",v));
   const res=r=>r==null?"—":r.up===1?"涨 / Yes":r.up===0?"跌 / No":"50/50";
   if(t.local){put("本地预结算",res(t.local)+" · "+(t.local.note||""));put("预结算时间",when(t.local.at))}
@@ -8478,37 +8512,67 @@ function detail(t){
   if((t.revisions||[]).length)st.append($("div","sub","修订记录"),table(["时间","依据","回款/份","说明"],t.revisions.map(r=>[when(r.at),r.by,num(r.from)+" → "+num(r.to),r.note||""])));
   if(t.confirm==="mismatch")st.prepend($("div","note bad","本地结果与 Predict 不一致，已按 Predict 的结果重新结算"));
   d.append(sec("结算证据",st));
-  // 6. version
+  // 7. version
   if(t.version)d.append(sec("版本与设置",dl(t.version)));
   const a=$("a","btn","打开 Predict 市场 ↗");a.href=t.url;a.target="_blank";a.rel="noopener noreferrer";d.append(a);
   return d}
 function row(t){
-  const w=$("div","tr"+(openId===t.id?" open":"")),b=$("button","row");b.type="button";b.setAttribute("aria-expanded",openId===t.id?"true":"false");
-  const l=$("div","l"),r=$("div","r");
-  l.append($("div","t1",t.item+" "+t.label+" @ "+cent(t.price)+" × "+num(t.shares)+(t.maker&&t.shares<t.order?"/"+num(t.order):"")));
-  l.append($("div","t2",when(t.opened)+" · "+(KINDS[t.kind]||t.kind)+(t.driver_name?" · "+t.driver_name:"")+" · 下单时 "+sg(t.edge)+" · 成交时 "+sg(perShare(t))+" /份"));
+  const open=openId===t.id,w=$("div","tr"+(open?" open":"")),b=$("button","row");b.type="button";b.setAttribute("aria-expanded",open?"true":"false");
+  const l=$("div","l"),r=$("div","r"),t1=$("div","t1");
+  t1.append(t.item+" "+t.label+" @ "+cent(t.price)+" × "+num(t.shares)+(t.maker&&t.shares<t.order?"/"+num(t.order):""));
+  if(data.live&&!t.real)t1.append(" ",$("span","tag","模拟"));if(t.deep)t1.append(" ",$("span","tag","低价挂单"));
+  l.append(t1);
+  const bits=[hm(t.opened),t.maker?"挂单":"吃单","优势 "+sg(t.edge)];
+  if(t.maker&&t.shares>0)bits.push("成交时 "+sg(perShare(t)));
+  if(t.order_id)bits.push("#"+t.order_id);if(t.cost_confirmed===false&&t.shares>0)bits.push("成本待对账");
+  l.append($("div","t2",bits.join(" · ")));
   if(t.wait)l.append($("div","t3","⏳ "+t.wait));
   const pn=$("b","",t.pnl==null?"":money(t.pnl));if(t.pnl!=null)pn.className=t.pnl>=0?"ok":"bad";r.append(pn,badge(t));
-  b.append(l,r);b.addEventListener("click",()=>{openId=openId===t.id?"":t.id;history.replaceState(null,"",openId?"#"+encodeURIComponent(openId):location.pathname);render()});
-  w.append(b);if(openId===t.id)w.append(detail(t));return w}
-function tiles(){
-  const s=data.total,el=document.getElementById("tiles"),tile=(k,v,sub,cls)=>{const x=$("div","tile");x.append($("div","k",k));const vv=$("div","v",v);if(cls)vv.className+=" "+cls;x.append(vv);if(sub)x.append(typeof sub==="string"?$("div","s",sub):sub);return x};
-  const conf=$("div","s");conf.append("预结算 "+s.local+" · ",$("span",s.mismatch?"bad":"","结果不一致 "+s.mismatch));
-  el.replaceChildren(tile("已结算",s.settled+" 笔","赢 "+s.wins+" · 输 "+s.losses+" · 平 "+s.ties),
-    tile("盈亏",money(s.pnl),"成本 "+usd(s.cost)+(s.cost?" · "+(s.roi>=0?"+":"")+(s.roi*100).toFixed(1)+"%":""),s.pnl>=0?"ok":"bad"),
-    tile("模型预期（下单时）",money(s.expected),"按下单时的净优势 × 份数"),
-    tile("模型预期（成交时）",money(s.expected_fill),"按成交那一刻的公平价；比下单时低很多 = 挂单常在行情转向时被成交"),
-    tile("结算确认","已确认 "+s.confirmed,conf),
-    tile("进行中","持仓 "+s.open,"挂单中 "+s.resting+" · 部分成交 "+s.partial+" · 作废 "+s.expired+(s.cancelled?" · 撤单 "+s.cancelled:"")))}
+  b.append(l,r);b.addEventListener("click",()=>{openId=open?"":t.id;history.replaceState(null,"",openId?"#"+encodeURIComponent(openId):location.pathname);render()});
+  w.append(b);if(open)w.append(detailBox(t));return w}
+function detailBox(t){const d=details[t.id];if(d)return detail(d);loadDetail(t.id);const p=$("div","det");p.append($("p","small mut","读取这笔的完整记录…"));return p}
+async function loadDetail(id){  // one trade's whole record (its snapshots, sources, fills, order events), fetched when it is opened
+  if(loadDetail.busy===id)return;loadDetail.busy=id;
+  try{const key=ctlKey();const r=await fetch(base+"/journal.json?id="+encodeURIComponent(id),{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
+    if(!r.ok){let j={};try{j=await r.json()}catch(e){}throw new Error(j.message||("HTTP "+r.status))}
+    details[id]=(await r.json()).trade}
+  catch(e){details[id]={id:id,error:e.message}}
+  finally{loadDetail.busy=null}
+  if(openId===id)render()}
+function tiles(){  // today, the last 7 days, the lifetime, what is open: the four numbers a glance needs
+  const s=data.total,el=document.getElementById("tiles"),rc={};(data.recent||[]).forEach(r=>{rc[r.name]=r});
+  const tile=(k,v,sub,cls)=>{const x=$("div","tile");x.append($("div","k",k));const vv=$("div","v",v);if(cls)vv.className+=" "+cls;x.append(vv);if(sub)x.append(typeof sub==="string"?$("div","s",sub):sub);return x};
+  const wl=r=>"赢 "+r.wins+" 输 "+r.losses+(r.ties?" 平 "+r.ties:"");
+  const recent=name=>{const r=rc[name];return r&&r.settled?tile(name,money(r.pnl),"已结算 "+r.settled+" 笔 · "+wl(r),r.pnl>=0?"ok":"bad"):tile(name,"—","没有结算的交易")};
+  const sub=$("div","s");sub.append("已结算 "+s.settled+" 笔 · "+wl(s)+" · 成本 "+usd(s.cost)+(s.cost?" · "+(s.roi>=0?"+":"")+(s.roi*100).toFixed(1)+"%":""));
+  if(s.mismatch)sub.append(" · ",$("span","bad","结果不一致 "+s.mismatch));if(s.local)sub.append(" · ",$("span","warn","待确认 "+s.local));
+  el.replaceChildren(recent("今天"),recent("近 7 天"),tile("累计",money(s.pnl),sub,s.pnl>=0?"ok":"bad"),
+    tile("进行中","持仓 "+s.open,"成本 "+usd(s.open_cost)+" · 挂单中 "+s.resting+(s.partial?" · 部分成交 "+s.partial:"")+(s.expired?" · 未成交 "+s.expired:"")+(s.cancelled?" · 撤单 "+s.cancelled:"")))}
+function stats(){  // the model's expectation, how results were confirmed, the markouts, the groups, the common risks, the rules: folded away
+  const s=data.total,d=$("dl"),put=(k,v)=>d.append($("dt","",k),$("dd","",v));
+  put("模型预期（下单时）",money(s.expected)+"　按下单时的净优势 × 份数");
+  put("模型预期（成交时）",money(s.expected_fill)+"　按成交那一刻的公平价；比下单时低很多 = 挂单常在行情转向时被成交");
+  put("结算确认","已确认 "+s.confirmed+" · 预结算 "+s.local+" · 结果不一致 "+s.mismatch+"　先用机器人数据预结算，再以 Predict 的结果确认，不一致时按 Predict 重新结算并留下修订记录");
+  const mo=s.markout||{},ks=["1m","5m","30m"].filter(k=>mo[k]);
+  put("成交后市场走向",ks.length?ks.map(k=>k.replace("m"," 分钟")+" "+sg(mo[k].avg)+"（"+mo[k].n+" 笔）").join("｜")+"　盘口中间价 − 成交价，每份；持续为负 = 挂单常被更快的人吃掉旧报价":"还没有成交后的记录");
+  document.getElementById("stats").replaceChildren(d);
+  const how=[];if(data.ways!=="只挂单")how.push("吃单按这么多份吃到的均价和手续费判断并成交");
+  if(data.ways!=="只吃单")how.push("挂单跟有效买1，排在已有挂单之后"+(data.live?"":"，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交")+"；不再做的挂单撤掉");
+  document.getElementById("intro").textContent="净优势 ≥"+(data.edge*100).toFixed(0)+"¢ 时按卡片建议买 "+data.shares+" 份。"+(data.scope?"范围："+data.scope+"；"+data.ways+"。":"")+how.join("；")+"。";
+  groups();risk();
+  const top=(data.groups||[]).filter(g=>g.positions)[0],sum=document.getElementById("statsum");sum.replaceChildren();
+  if(top){sum.append("最坏单一事件 ");const b=$("b","",money(top.worst));b.className=top.worst<0?"bad":"ok";sum.append(b," · "+top.name+"（"+(top.event||"")+"）")}
+  else sum.textContent="模型预期（成交时）"+money(s.expected_fill);
+  document.getElementById("statsbody").hidden=!statsOpen;document.getElementById("foldstats").textContent=statsOpen?"收起":"展开"}
 function groups(){
   const rows=[...data.kinds,...(data.modes.length>1?data.modes:[])],g=document.getElementById("groups"),h=document.getElementById("h-groups");
   g.hidden=h.hidden=rows.length<2;if(rows.length<2)return;
   g.replaceChildren(table(["分组","已结算","盈亏","下单时预期","成交时预期","不一致"],rows.map(r=>[r.name,r.settled+" 笔",money(r.pnl),money(r.expected),money(r.expected_fill),r.mismatch])).firstChild)}
 function risk(){  // the open positions by the event that settles them (ten markets can be one risk), the sources they rest on, the buys the cap refused
-  const el=document.getElementById("risk"),h=document.getElementById("h-risk"),gs=(data.groups||[]),held=gs.filter(g=>g.positions),src=data.sources||[],bl=data.blocks||[];
+  const el=document.getElementById("risk"),h=document.getElementById("h-risk"),gs=(data.groups||[]),src=data.sources||[],bl=data.blocks||[];
   el.hidden=h.hidden=!gs.length&&!bl.length;if(el.hidden)return;
   const parts=[];
-  if(gs.length){parts.push($("p","small mut","持仓按结算事件分组：同一标的的几档、同一指数同一天的几笔，一次行情一起亏。最坏单一事件 = 对这组最不利的那一个走势（涨到某档、跌到某档、收涨/收跌、都没触及）下的合计盈亏；挂单按未成交份数另计。"+(data.group_cap?"模拟盘每组最坏单一事件不超过 $"+data.group_cap+"（SIM_GROUP_USD），超过的建议不买、记在下面。":"")));
+  if(gs.length){parts.push($("p","small mut","持仓按结算事件分组：同一标的的几档、同一指数同一天的几笔，一次行情一起亏。最坏单一事件 = 对这组最不利的那一个走势（涨到某档、跌到某档、收涨/收跌、都没触及）下的合计盈亏；挂单按未成交份数另计。"+(data.group_cap?"每组最坏单一事件不超过 $"+data.group_cap+"（SIM_GROUP_USD），超过的建议不买、记在下面。":"")));
     parts.push(table(["事件 / 标的","持仓","成本","占持仓","最坏单一事件","合计盈亏","挂单中","市场"],gs.map(g=>{const v=$("b","",g.positions?money(g.worst):"—");v.className=g.worst<0?"bad":"ok";
       const n=$("span","",g.name);n.title=(g.items||[]).join("、");return[n,g.positions+" 笔",usd(g.cost),g.positions?(g.share*100).toFixed(0)+"%":"—",g.event||"—",v,g.resting?g.resting+" 笔（"+usd(g.resting_usd)+"）":"—",(g.items||[]).join("、")]})))}
   if(src.length){parts.push($("div","sub","持仓依赖的数据源（一个源停更或出错，这些仓位的判断一起失效）"));
@@ -8516,42 +8580,64 @@ function risk(){  // the open positions by the event that settles them (ten mark
   if(bl.length){parts.push($("div","sub","组上限拦下的买入（最近一周）"));
     parts.push(table(["时间","市场","方向","价格","原因"],bl.map(b=>[when(b.at),b.item,b.label,cent(b.price),b.why])))}
   el.replaceChildren(...parts)}
-function filters(){
-  const f=document.getElementById("filters"),chip=(t,on,fn)=>{const b=$("button","chip"+(on?" on":""),t);b.type="button";b.addEventListener("click",fn);return b};
-  const sts=[["all","全部"],["open","持仓"],["rest","挂单中"],["pre","预结算"],["ok","已确认"],["bad","结果不一致"],["exp","未成交/撤单"]];
-  const ways=[["all","全部"],["maker","挂单"],["taker","吃单"]];
-  const kinds=[["all","全部"],...Object.entries(KINDS).filter(([k])=>data.trades.some(t=>t.kind===k))];
-  f.replaceChildren($("span","","状态"),...sts.map(([k,t])=>chip(t,stateF===k,()=>{stateF=k;render()})),$("span","","　方式"),
-    ...ways.map(([k,t])=>chip(t,wayF===k,()=>{wayF=k;render()})),...(kinds.length>2?[$("span","","　市场"),...kinds.map(([k,t])=>chip(t,kindF===k,()=>{kindF=k;render()}))]:[]))}
+function filters(){  // one row of chips with counts; a chip nobody matches is not shown, 全部 clears every filter
+  const ts=data.trades,cnt=fn=>ts.filter(fn).length,parts=[];
+  const chip=(key,t,n,on,fn)=>{const b=$("button","chip"+(on?" on":""));b.type="button";b.dataset.f=key;b.append(t,$("span","n",String(n)));b.addEventListener("click",fn);return b};
+  const counts=STATES.map(([k,t,fn])=>[k,t,cnt(fn)]);
+  if(!counts.some(([k,,n])=>k===stateF&&n))stateF="all";
+  counts.forEach(([k,t,n])=>{if(k==="all"||n)parts.push(chip(k,t,n,stateF===k,()=>{stateF=k;if(k==="all")wayF=kindF="all";shown=PAGE;render()}))});
+  const mk=cnt(t=>t.maker),tk=ts.length-mk;if(!(mk&&tk))wayF="all";
+  if(mk&&tk)parts.push($("i","sep"),...[["maker","挂单",mk],["taker","吃单",tk]].map(([k,t,n])=>chip(k,t,n,wayF===k,()=>{wayF=wayF===k?"all":k;shown=PAGE;render()})));
+  const kinds=Object.entries(KINDS).map(([k,t])=>[k,t,cnt(x=>x.kind===k)]).filter(x=>x[2]);if(!kinds.some(([k])=>k===kindF))kindF="all";
+  if(kinds.length>1)parts.push($("i","sep"),...kinds.map(([k,t,n])=>chip("k:"+k,t,n,kindF===k,()=>{kindF=kindF===k?"all":k;shown=PAGE;render()})));
+  document.getElementById("filters").replaceChildren(...parts)}
+function dayHead(ms,items){const h=$("div","day"),done=items.filter(t=>t.pnl!=null),pnl=done.reduce((a,t)=>a+t.pnl,0);
+  const s=$("span","",items.length+" 笔"+(done.length?" · 已结算 "+done.length+" 笔 ":""));if(done.length){const b=$("b","",money(pnl));b.className=pnl>=0?"ok":"bad";s.append(b)}
+  h.append($("b","dn",dayName(ms)),s);return h}
+function more(n){const el=document.getElementById("more");el.replaceChildren();
+  if(shown<n){const b=$("button","btn","再显示 "+Math.min(PAGE,n-shown)+" 笔（还有 "+(n-shown)+" 笔）");b.type="button";b.addEventListener("click",()=>{shown+=PAGE;render()});el.append(b)}
+  else if(data.more>0&&!allLoaded){const b=$("button","btn","载入更早的 "+data.more+" 笔");b.type="button";b.addEventListener("click",()=>{allLoaded=true;b.disabled=true;b.textContent="载入中…";if(load.busy)load.again=true;else load()});el.append(b)}
+  el.hidden=!el.childNodes.length}
+function foot(){document.getElementById("foot").textContent=data.live?"真实订单的成交、撤单与结算以 Predict 的记录为准（点开一笔看订单事件）；标“模拟”的是只记账的模拟交易，其挂单成交按盘口快照推定。"
+  :"只记账，不会向 Predict 下单。挂单的成交是按盘口快照推定的（推定成交），不代表真实成交。"}
 function render(){
   if(!data)return;
-  const how=[];if(data.ways!=="只挂单")how.push("吃单按这么多份吃到的均价和手续费判断并成交");if(data.ways!=="只吃单")how.push("挂单跟有效买1，排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交；不再做的挂单撤掉");
-  document.getElementById("intro").textContent="净优势 ≥"+(data.edge*100).toFixed(0)+"¢ 时按卡片建议买 "+data.shares+" 份。"+(data.scope?"范围："+data.scope+"；"+data.ways+"。":"")+how.join("；")+"。先用机器人数据预结算，再以 Predict 的结果确认，不一致时按 Predict 重新结算并留下修订记录。";
-  tiles();groups();risk();filters();
-  const list=document.getElementById("list"),shown=data.trades.filter(t=>(stateF==="all"||cat(t)===stateF)&&(wayF==="all"||(wayF==="maker")===t.maker)&&(kindF==="all"||t.kind===kindF));
-  list.replaceChildren(...(shown.length?shown.map(row):[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有模拟交易")]))}
+  const name=data.live?"交易复盘":"模拟交易复盘";document.getElementById("title").textContent=name;document.title=name;
+  tiles();stats();filters();foot();
+  const st=(STATES.find(s=>s[0]===stateF)||STATES[0])[2];
+  const all=data.trades.filter(t=>st(t)&&(wayF==="all"||(wayF==="maker")===!!t.maker)&&(kindF==="all"||t.kind===kindF)),page=all.slice(0,shown);
+  const byDay=new Map();all.forEach(t=>{const k=dayKey(t.opened);if(!byDay.has(k))byDay.set(k,[]);byDay.get(k).push(t)});
+  const nodes=[];let day="";page.forEach(t=>{const k=dayKey(t.opened);if(k!==day){day=k;nodes.push(dayHead(t.opened,byDay.get(k)))}nodes.push(row(t))});
+  document.getElementById("list").replaceChildren(...(nodes.length?nodes:[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有交易")]));
+  more(all.length)}
 let okAt=0,dead=false;
 function two(n){return String(n).padStart(2,"0")}
 function ctlKey(){try{return sessionStorage.getItem("ctlkey")||""}catch(e){return ""}}
 function askKey(msg){const k=prompt(msg+"\n这是实盘账户的交易记录，需要控制口令（环境变量 WEB_CONTROL_KEY）：","");if(k===null||!k.trim()){load.keyBad=true;return false}
   try{sessionStorage.setItem("ctlkey",k.trim())}catch(e){}load.keyBad=false;return true}
-async function load(){
+async function load(){  // the list: light rows, the open trades and the last few hundred finished ones (all of them once asked for)
   if(dead||load.busy||load.keyBad)return;load.busy=true;let again=false;
-  try{const key=ctlKey();const r=await fetch(base+"/journal.json",{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
+  const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),20000);
+  try{const key=ctlKey();const r=await fetch(base+"/journal.json"+(allLoaded?"?all=1":""),{cache:"no-store",headers:key?{"X-Control-Key":key}:{},signal:ctl.signal});
     if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}if(r.status===403&&askKey(j.message||"需要控制口令"))again=true;throw new Error(j.message||("HTTP "+r.status))}
-    if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();okAt=Date.now();
-    document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"));
-    render();const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}
+    if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();
+    if(openId&&!allLoaded&&j.more>0&&!j.trades.some(t=>t.id===openId)){allLoaded=true;again=true}  // a link to an older trade: the whole list
+    else{data=j;okAt=Date.now();
+      document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"+(data.more>0?"（更早的 "+data.more+" 笔可载入）":"")));
+      render();if(openId&&details[openId])loadDetail(openId);
+      const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}}
   catch(e){const at=okAt?new Date(okAt):null,hms=at?two(at.getHours())+":"+two(at.getMinutes())+":"+two(at.getSeconds()):"";
     if(e.message==="HTTP 404")dead=true;
-    document.getElementById("meta").replaceChildren($("span","bad","⚠️ 读取失败："+(dead?"链接已失效，请在 Telegram 重新发送 /web；本页不再自动刷新":e.message)+
+    document.getElementById("meta").replaceChildren($("span","bad","⚠️ 读取失败："+(dead?"链接已失效，请在 Telegram 重新发送 /web；本页不再自动刷新":e.name==="AbortError"?"20 秒没有回应":e.message)+
       (okAt?"；下面显示的是 "+hms+" 的旧数据":"")))}
-  finally{load.busy=false}
-  if(again)load()}
+  finally{clearTimeout(timer);load.busy=false}
+  if(again||load.again){load.again=false;load()}}
 ["csv","json"].forEach(id=>{const a=document.getElementById(id);a.addEventListener("click",async e=>{const key=ctlKey();if(!key)return;e.preventDefault();  // with a key: fetched with it, saved as a file
   try{const r=await fetch(a.href,{cache:"no-store",headers:{"X-Control-Key":key}});if(!r.ok)throw new Error("HTTP "+r.status);const u=URL.createObjectURL(await r.blob());
     const t=document.createElement("a");t.href=u;t.download=a.getAttribute("download");document.body.append(t);t.click();t.remove();setTimeout(()=>URL.revokeObjectURL(u),5000)}
   catch(err){alert("导出失败："+err.message)}})});
+document.getElementById("statshd").addEventListener("click",()=>{statsOpen=!statsOpen;try{localStorage.setItem("jrnstats",statsOpen?"1":"0")}catch(e){}
+  document.getElementById("statsbody").hidden=!statsOpen;document.getElementById("foldstats").textContent=statsOpen?"收起":"展开"});
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
 const THEMES={auto:["◐","自动"],light:["☀","浅色"],dark:["☾","深色"]};let theme="auto";try{const t=JSON.parse(localStorage.getItem("theme"));if(typeof t==="string"&&Object.prototype.hasOwnProperty.call(THEMES,t))theme=t}catch(e){}
 function applyTheme(){const r=document.documentElement;if(theme==="auto")delete r.dataset.theme;else r.dataset.theme=theme;const b=document.getElementById("theme");b.textContent=THEMES[theme][0]+" "+THEMES[theme][1];b.title="主题："+THEMES[theme][1]+"（点击切换）"}
@@ -8925,9 +9011,10 @@ class WebServer:
     """Tiny read-only HTTP server (stdlib asyncio) for the probability page.
 
     Routes: /health, /p/<token> (HTML), /p/<token>/data.json (JSON), /p/<token>/events (server-sent events: the daily
-    cards' live numbers whenever they change, checked every second), /p/<token>/journal (the paper trades' review
-    page) with journal.json / journal.csv (exports), /p/<token>/control (the control page) with control.json and the
-    one POST route (control, keyed by WEB_CONTROL_KEY). Everything else is 404, the token is compared in constant
+    cards' live numbers whenever they change, checked every second), /p/<token>/journal (the trades' review page)
+    with journal.json (the list: light rows, the open trades and the last JOURNAL_HISTORY finished ones; ?all=1 every
+    trade, ?id=<trade> one whole record, ?full=1 every whole record = the JSON export) and journal.csv, /p/<token>/control
+    (the control page) with control.json and the one POST route (control, keyed by WEB_CONTROL_KEY). Everything else is 404, the token is compared in constant
     time, and responses are no-store with a restrictive CSP. Text bodies are gzip-compressed for a client that accepts it
     (the page is ~80 KB, data.json is fetched every 10 seconds by every open tab).
     """
@@ -8958,7 +9045,7 @@ class WebServer:
     def cached(self, name: str, build: Any) -> bytes:
         entry = self.cache.get(name)
         if entry is None or time.monotonic() >= entry[0]:
-            entry = self.cache[name] = (time.monotonic() + self.CACHE_SECONDS.get(name, 0.0), build())
+            entry = self.cache[name] = (time.monotonic() + self.CACHE_SECONDS.get(name.partition("?")[0], 0.0), build())
         return entry[1]
 
     def compressed(self, body: bytes) -> bytes:
@@ -8981,7 +9068,7 @@ class WebServer:
             with contextlib.suppress(Exception):
                 await self.server.wait_closed()
 
-    def route(self, method: str, path: str) -> tuple[int, str, bytes]:
+    def route(self, method: str, path: str, query: str = "") -> tuple[int, str, bytes]:
         if method not in {"GET", "HEAD"}:
             return 405, "text/plain; charset=utf-8", b"method not allowed"
         if path in {"/", "/health"}:
@@ -8997,13 +9084,30 @@ class WebServer:
             if parts[2] == "journal":
                 return 200, "text/html; charset=utf-8", self.pages["journal"]
             if parts[2] == "journal.json":
-                return 200, "application/json; charset=utf-8", self.cached(
-                    "journal.json", lambda: json.dumps(self.bot.journal_payload(), ensure_ascii=False, default=str).encode("utf-8"))
+                return self.journal_json(query)
             if parts[2] == "journal.csv":
                 return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
             if parts[2] == "control":
                 return 200, "text/html; charset=utf-8", self.pages["control"]
         return 404, "text/plain; charset=utf-8", b"not found"
+
+    def journal_json(self, query: str) -> tuple[int, str, bytes]:
+        """journal.json: the review page's list (light rows: the open trades and the last JOURNAL_HISTORY finished
+        ones); ?all=1 every trade; ?full=1 every trade's whole record (the JSON export); ?id=<trade> one whole record.
+        The list variants are built once per cache interval; a single record is cheap and built on demand."""
+        params = urllib.parse.parse_qs(query, keep_blank_values=True)
+        flag = lambda key: (params.get(key) or [""])[0].strip().lower() not in {"", "0", "false", "off", "no"}
+        ctype = "application/json; charset=utf-8"
+        tid = (params.get("id") or [""])[0]
+        if tid:
+            row = self.bot.journal_trade(tid)
+            if row is None:
+                return 404, ctype, json.dumps({"ok": False, "message": "没有这笔记录"}, ensure_ascii=False).encode("utf-8")
+            return 200, ctype, json.dumps({"version": VERSION, "trade": row}, ensure_ascii=False, default=str).encode("utf-8")
+        full, everything = flag("full"), flag("all")
+        name = "journal.json" + ("?full" if full else "?all" if everything else "")
+        return 200, ctype, self.cached(name, lambda: json.dumps(
+            self.bot.journal_payload(full=full, history=0 if full or everything else None), ensure_ascii=False, default=str).encode("utf-8"))
 
     def is_control(self, path: str, name: str = "control") -> bool:
         parts = path.strip("/").split("/")
@@ -9053,11 +9157,11 @@ class WebServer:
         self.control_failures.pop(client, None)
         return None
 
-    def journal_keyed(self, path: str, head: str, client: str) -> tuple[int, str, bytes]:
+    def journal_keyed(self, path: str, query: str, head: str, client: str) -> tuple[int, str, bytes]:
         failed = self.key_check(head, client)
         if failed:
             return failed[0], "application/json; charset=utf-8", json.dumps({"ok": False, "locked": True, "message": failed[1]}, ensure_ascii=False).encode("utf-8")
-        return self.route("GET", path)
+        return self.route("GET", path, query)
 
     def control_key_failed(self, client: str, now: float) -> None:
         fails = [t for t in self.control_failures.get(client, []) if now - t < self.CONTROL_LOCK_SECONDS] + [now]
@@ -9128,7 +9232,8 @@ class WebServer:
             request_line, _, rest = head.decode("latin-1").partition("\r\n")
             method, target, _ = request_line.split(" ", 2)
             gzip_ok = accepts_gzip(rest)
-            path = urllib.parse.urlsplit(target).path
+            split = urllib.parse.urlsplit(target)
+            path, query = split.path, split.query
             if method.upper() == "GET" and self.is_stream(path):
                 await self.stream(writer)
                 return
@@ -9137,9 +9242,9 @@ class WebServer:
             elif method.upper() in {"GET", "HEAD"} and self.is_control(path, "control.json"):
                 status, ctype, body = self.control_json(rest, self.client_of(rest, writer))
             elif method.upper() in {"GET", "HEAD"} and self.journal_locked() and (self.is_control(path, "journal.json") or self.is_control(path, "journal.csv")):
-                status, ctype, body = self.journal_keyed(path, rest, self.client_of(rest, writer))
+                status, ctype, body = self.journal_keyed(path, query, rest, self.client_of(rest, writer))
             else:
-                status, ctype, body = self.route(method.upper(), path)
+                status, ctype, body = self.route(method.upper(), path, query)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
             status, ctype, body, method, gzip_ok = 400, "text/plain; charset=utf-8", b"bad request", "GET", False
         except Exception as error:  # Never let a page request touch the bot's loops.
@@ -12745,9 +12850,30 @@ class Bot:
         trades = [t for t in self.sim_trades().values() if t["status"] == "settled" and t.get("settled")]
         return {label: sim_stats([t for t in trades if int(t["settled"]) >= since]) for label, since in windows.items()}
 
-    def journal_payload(self) -> dict:
-        """Every paper trade with its whole record (entry and fill snapshots, fills, local and final settlement,
-        revisions, version), newest first: the review page and the JSON export."""
+    JOURNAL_HISTORY = 300  # finished trades the review page lists at first; the older ones come on request (journal.json?all=1)
+    JOURNAL_LIGHT = ("id", "market", "slug", "item", "kind", "key", "side", "label", "maker", "deep", "sweep", "price", "shares", "order",
+                     "unfilled", "opened", "filled", "settled", "status", "confirm", "payout", "edge", "fair", "note", "driver_name",
+                     "text", "state", "pnl", "expected_fill", "url", "wait", "legacy", "cost_confirmed", "withdrawn", "real")
+
+    def journal_row(self, tid: str, t: dict, mk: "SimMarket | None", now_ms: int, full: bool) -> dict:
+        """One trade for the review page: a list row (JOURNAL_LIGHT — what a line and the filters need, a few hundred
+        bytes) or, when ``full``, the whole record (entry and fill snapshots, sources, settlement evidence, the real
+        order's events, version), fetched when the trade is opened and for the exports."""
+        st = t.get("live") if isinstance(t.get("live"), dict) else {}
+        row = {**t, "id": tid, "driver_name": trade_driver(t)[1], "text": sim_status(t), "state": sim_state(t),
+               "pnl": (t["payout"] - t["price"]) * t["shares"] if t["status"] == "settled" else None,
+               "expected_fill": sim_fill_expectation(t) if float(t.get("shares") or 0) else 0.0, "url": self.sim_url(t),
+               "wait": self.sim_wait(t, mk, now_ms), "real": bool(st)}
+        if full:
+            return row
+        light = {k: row[k] for k in self.JOURNAL_LIGHT if k in row}
+        light["live_state"], light["order_id"] = str(st.get("state") or ""), str(st.get("order_id") or "")
+        return light
+
+    def journal_payload(self, full: bool = False, history: int | None = None) -> dict:
+        """The review page's data and the JSON export: the totals (lifetime, today, the last 7 days), the groups, the
+        common risks, and the trades newest first — as list rows, the open ones and the last ``history`` finished ones
+        (JOURNAL_HISTORY when None, every one when 0), or as whole records when ``full``."""
         now_ms = self.market.now_ms()
         trades = sorted(self.sim_trades().items(), key=lambda kv: kv[1].get("opened", 0), reverse=True)
         values = [t for _, t in trades]
@@ -12757,21 +12883,37 @@ class Bot:
                 markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
             except Exception as error:  # the journal is still served; open trades just cannot say where the book stands
                 LOG.warning("journal: markets unavailable: %s", clean_error(error) or type(error).__name__)
-        rows = [{**t, "id": tid, "driver_name": trade_driver(t)[1], "text": sim_status(t), "state": sim_state(t),
-                 "pnl": (t["payout"] - t["price"]) * t["shares"] if t["status"] == "settled" else None,
-                 "expected_fill": sim_fill_expectation(t) if float(t.get("shares") or 0) else 0.0, "url": self.sim_url(t),
-                 "wait": self.sim_wait(t, markets.get(t["market"]), now_ms)}
-                for tid, t in trades]
+        rows = [self.journal_row(tid, t, markets.get(t["market"]), now_ms, full) for tid, t in trades]
+        limit = self.JOURNAL_HISTORY if history is None else int(history)
+        shown = rows
+        if limit > 0:
+            kept = {r["id"] for r in [r for r in rows if r["status"] not in {"resting", "filled"}][:limit]}
+            shown = [r for r in rows if r["status"] in {"resting", "filled"} or r["id"] in kept]
         return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）",
-                "enabled": self.config.sim and self.config.predict, "edge": self.config.sim_edge,
+                "enabled": self.config.sim and self.config.predict, "mode": "paper",
+                "live_mode": str(getattr(self.config, "live_mode", "off") or "off"), "edge": self.config.sim_edge,
                 "shares": self.config.sim_shares, "ways": sim_scope(self.config)[0], "scope": sim_scope(self.config)[1],
                 "total": sim_stats(values),
+                "recent": [{"name": name, **stats} for name, stats in self.sim_recent_stats().items()],
                 "kinds": [{"key": kind, "name": name, **sim_stats([t for t in values if t["kind"] == kind])}
                           for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
                 "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
                           for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
                 "groups": sim_groups(values), "sources": sim_sources(values), "blocks": self.sim_blocks(),
-                "group_cap": self.config.sim_group_usd, "trades": rows}
+                "group_cap": self.config.sim_group_usd, "history": limit, "more": len(rows) - len(shown), "trades": shown}
+
+    def journal_trade(self, tid: str) -> dict | None:
+        """One trade's whole record (None when there is no such trade): what the review page fetches when a trade is opened."""
+        t = self.sim_trades().get(tid)
+        if t is None:
+            return None
+        now_ms, mk = self.market.now_ms(), None
+        if t["status"] in {"resting", "filled"}:
+            try:
+                mk = next((m for m in self.sim_markets(now_ms) if m.market == t["market"]), None)
+            except Exception as error:
+                LOG.warning("journal: markets unavailable: %s", clean_error(error) or type(error).__name__)
+        return self.journal_row(tid, t, mk, now_ms, True)
 
     JOURNAL_COLUMNS = ("编号", "下单时间", "市场", "类型", "方向", "挂/吃", "下单份数", "成交份数", "成本价", "成交均价", "手续费",
                        "最优价", "滑点", "下单时公平价", "下单时净优势", "下单时预期", "成交时预期", "状态", "确认", "本地结果",
@@ -12788,7 +12930,7 @@ class Bot:
         out = io.StringIO()
         writer = csv.writer(out)
         writer.writerow(self.JOURNAL_COLUMNS)
-        for t in self.journal_payload()["trades"]:
+        for t in self.journal_payload(full=True, history=0)["trades"]:
             entry = t.get("entry") or {}
             sources = "；".join(f"{x.get('what', '')}={x.get('source', '')}"
                                + (f" {x['symbol']}" if x.get("symbol") else "")

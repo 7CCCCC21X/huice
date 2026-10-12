@@ -2184,8 +2184,9 @@ class LiveBot(core.Bot):
                  else ("运行中" if self.live.ready else f"未就绪：{self.live.not_ready_why}"))
         return super().status(sub_id).replace("仅价格提醒；不会自动撤单/交易。", f"💰 真实交易 {state}｜/live 查看订单、持仓与风控")
 
-    def journal_payload(self) -> dict:
-        data = super().journal_payload()
+    def journal_payload(self, full: bool = False, history: int | None = None) -> dict:
+        data = super().journal_payload(full, history)
+        data["mode"] = "live"
         data["live"] = {"enabled": True, "account": short_addr(self.live.wallet.maker), "ready": self.live.ready,
                         "paused": self.live_paused(), "killed": self.live_killed()}
         return data

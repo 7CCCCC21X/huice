@@ -406,11 +406,14 @@ async def run():
     off = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM": "off"}), m.Store(":memory:"), FM(NOW), None)
     assert "模拟交易" not in [name for name, _ in off.reference_jobs()] and not any(i["name"] == "模拟交易" for i in off.odds_payload()["items"])
 
-    # --- the journal: every record whole, and a CSV for spreadsheets ---------------------------------------------------------
+    # --- the journal: light rows for the page, every record whole on request, and a CSV for spreadsheets ---------------------
     j = bot.journal_payload()
     assert j["trades"][0]["opened"] >= j["trades"][-1]["opened"] and len(j["trades"]) == len(bot.sim_trades())
     jt = next(x for x in j["trades"] if x["id"] == hsi_maker)
+    assert jt["state"] == "已确认" and "entry" not in jt and "fills" not in jt and jt["expected_fill"] < 15  # a list row (1.59.1)
+    jt = bot.journal_trade(hsi_maker)
     assert jt["state"] == "已确认" and jt["entry"]["proxy"]["anchor"] == 24500.0 and len(jt["fills"]) == 3 and jt["expected_fill"] < 15
+    assert bot.journal_trade("nope") is None and next(x for x in bot.journal_payload(full=True)["trades"] if x["id"] == hsi_maker)["fills"] == jt["fills"]
     json.dumps(j, default=str)
     raw = bot.journal_csv()
     assert raw.startswith("﻿")
