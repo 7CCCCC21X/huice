@@ -1017,7 +1017,7 @@ class LiveBot(core.Bot):
         if hold := self.live_send_hold(self.market.now_ms()):
             return hold  # no new risk on an account whose orders were not read lately
         if taker and taker.get("cap"):
-            price, shares = float(taker["cap"]), float(c.sim_shares)  # the LIMIT order asks for SIM_SHARES at the cap: the most it can cost
+            price, shares = float(taker["cap"]), float(self.sim_taker_shares(mk))  # the LIMIT order asks for the taker count at the cap: the most it can cost
         notional = float(price) * float(shares)
         if notional < MIN_ORDER_USD - 1e-9:
             return f"本单 ${notional:,.2f} 低于 Predict 最低订单金额 ${MIN_ORDER_USD:g}（提高 SIM_SHARES）"
@@ -1218,7 +1218,7 @@ class LiveBot(core.Bot):
             for side in ("up", "down") if c.sim_ways != "maker" else ():
                 fair = mk.fair_up if side == "up" else 1 - mk.fair_up
                 cap = self.sim_taker_cap(mk, side, bps, slack=0.03)  # a little under the paper trader's cap: read the market early
-                q = core.taker_quote(mk.book, side, c.sim_shares, bps, cap) if cap > 0 else None
+                q = core.taker_quote(mk.book, side, self.sim_taker_shares(mk), bps, cap) if cap > 0 else None
                 near = near or (q is not None and q["got"] >= core.SIM_MIN_SHARES - 1e-9)
             if near:
                 wanted.append(str(mk.book.market_id))

@@ -137,6 +137,7 @@ async def run():
     assert s["SIM_TAKER_AFTER_HOURS_CENTS"]["zero"] == "关" and s["SIM_TAKER_AFTER_HOURS_CENTS"]["value"] == "0" and s["SIM_AFTER_HOURS_MAX_PRICE_CENTS"]["value"] == "60" and s["SIM_AFTER_HOURS_MAX_PRICE_CENTS"]["zero"] == "不限"
     assert s["SIM_MAKER_DEEP_ONLY"]["options"] == [["off", "两种都挂"], ["on", "只挂低价挂单"]] and s["SIM_MAKER_DEEP_ONLY"]["value"] == "off"
     assert s["SIM_MAKER_SPREAD_CENTS"]["zero"] == "不限" and s["SIM_MAKER_SPREAD_CENTS"]["value"] == "0" and "10" in s["SIM_MAKER_SPREAD_CENTS"]["presets"]
+    assert s["SIM_TAKER_SHARES"]["zero"] == "同每次份数" and s["SIM_TAKER_SHARES"]["value"] == "0" and s["SIM_TAKER_AFTER_HOURS_SHARES"]["zero"] == "同盘中吃单"
     assert s["SIM_SECONDS"]["kind"] == "number" and s["SIM_SECONDS"]["group"] == "高级" and s["SIM_SECONDS"]["value"] == "5" and s["SIM_SECONDS"]["unit"] == "秒" and "3" in s["SIM_SECONDS"]["presets"]
     assert s["PREDICT_POLL_SECONDS"]["kind"] == "number" and s["PREDICT_POLL_SECONDS"]["value"] == "10" and "5" in s["PREDICT_POLL_SECONDS"]["presets"] and data["cadence"] == {"sim": 5, "book": 10}
     assert 'id="checksnote"' in body.decode() and "renderCadence" in body.decode()
@@ -211,6 +212,9 @@ async def run():
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_ONLY_MARKETS": "kospi, hsi"}})
     assert st == 200 and bot.config.sim_maker_deep_only_markets == {"HSI", "KOSPI"} and bot.control_value("SIM_MAKER_DEEP_ONLY_MARKETS") == "HSI,KOSPI", (st, j)
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_ONLY_MARKETS": ""}}); assert st == 200 and bot.config.sim_maker_deep_only_markets == frozenset()
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_TAKER_SHARES": "20", "SIM_TAKER_AFTER_HOURS_SHARES": "10"}})
+    assert st == 200 and bot.config.sim_taker_shares == 20 and bot.config.sim_taker_after_hours_shares == 10 and bot.control_value("SIM_TAKER_SHARES") == "20", (st, j)
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_TAKER_SHARES": "", "SIM_TAKER_AFTER_HOURS_SHARES": ""}}); assert st == 200 and bot.config.sim_taker_shares == 0
     # 一键搭配: the strategy settings only, each combination valid on its own, saved like any set; the page lists them
     data = await get_json(port, "control.json")
     assert [p["name"] for p in data["presets"]] == ["steady", "balanced", "bold"] and all({"name", "label", "hint", "values"} <= set(p) for p in data["presets"])

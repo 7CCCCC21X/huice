@@ -1151,7 +1151,32 @@ async def review_fixes():
     print("REVIEW_FIXES_OK")
 
 
+async def taker_shares():
+    """Takers get their own share count: SIM_TAKER_SHARES in session, SIM_TAKER_AFTER_HOURS_SHARES after hours; makers keep SIM_SHARES."""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+           "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off", "SIM_MAKER_SESSION": "off",
+           "SIM_TAKER_SHARES": "20", "SIM_TAKER_AFTER_HOURS_SHARES": "10", "SIM_TAKER_AFTER_HOURS_CENTS": "10"}
+    bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    bot.sim_markets = lambda now: world["markets"]
+    assert bot.sim_version()["sim_taker_shares"] == 20 and bot.sim_version()["sim_taker_after_hours_shares"] == 10 and bot.sim_version()["sim_shares"] == 100
+    live = m.dataclasses.replace(hsi(0.75, [("0.55", "300")], [("0.58", "400")], NOW), in_session=True)
+    assert bot.sim_taker_shares(live) == 20
+    await step(bot, NOW, live)
+    t = bot.sim_trades()
+    assert t[f"{HSI_SLUG}|up|吃"]["order"] == 20 and t[f"{HSI_SLUG}|up|吃"]["shares"] == 20 and t[f"{HSI_SLUG}|up|挂"]["order"] == 100, t  # the maker keeps SIM_SHARES
+    bot2 = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    bot2.sim_markets = lambda now: world["markets"]
+    closed = m.dataclasses.replace(hsi(0.75, [("0.55", "300")], [("0.58", "400")], NOW), in_session=False)
+    assert bot2.sim_taker_shares(closed) == 10
+    await step(bot2, NOW, closed)
+    assert bot2.sim_trades()[f"{HSI_SLUG}|up|吃"]["order"] == 10 and bot2.sim_trades()[f"{HSI_SLUG}|up|吃"]["shares"] == 10
+    bot3 = m.Bot(m.Config.from_env({**env, "SIM_TAKER_SHARES": "0", "SIM_TAKER_AFTER_HOURS_SHARES": "0"}), m.Store(":memory:"), FM(NOW), None)
+    assert bot3.sim_taker_shares(live) == 100 and bot3.sim_taker_shares(closed) == 100 and "sim_taker_shares" not in bot3.sim_version()
+    print("TAKER_SHARES_OK")
+
+
 asyncio.run(run())
 asyncio.run(maker_rules())
 asyncio.run(follow_guard())
 asyncio.run(review_fixes())
+asyncio.run(taker_shares())
