@@ -19,7 +19,7 @@ HSI_SLUG = "hang-seng-index-up-or-down-on-october-5-2026"
 KOSPI_SLUG = "kospi-composite-index-up-or-down-on-october-5-2026"
 CLOSE = BJ(10, 5, 16, 10)
 LEGACY = {"SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off",
-          "SIM_MAKER_SPREAD_CENTS": "10"}  # the resting-order rules off and the old 10¢ spread rule on: orders rest as placed
+          "SIM_MAKER_SPREAD_CENTS": "10", "SIM_TAKER_MAX_SHARES": "0"}  # the resting-order rules off and the old 10¢ spread rule on: orders rest as placed
 FEE = 0.02  # Predict: 2% × min(p, 1 − p) when the market states no rate
 
 # --- settings ----------------------------------------------------------------------------------------------------------
@@ -159,7 +159,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
+                                "beta_error": m.MODEL_BETA_ERROR, "sim_taker_max_shares": 0.0, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert len(bot.sim_trades()) == 2
@@ -1172,6 +1172,31 @@ async def taker_shares():
     assert bot2.sim_trades()[f"{HSI_SLUG}|up|吃"]["order"] == 10 and bot2.sim_trades()[f"{HSI_SLUG}|up|吃"]["shares"] == 10
     bot3 = m.Bot(m.Config.from_env({**env, "SIM_TAKER_SHARES": "0", "SIM_TAKER_AFTER_HOURS_SHARES": "0"}), m.Store(":memory:"), FM(NOW), None)
     assert bot3.sim_taker_shares(live) == 100 and bot3.sim_taker_shares(closed) == 100 and "sim_taker_shares" not in bot3.sim_version()
+    # a side is taken again while the edge lasts, until SIM_TAKER_MAX_SHARES (the last buy takes the remainder); then no more
+    cap_env = {**env, "SIM_TAKER_SHARES": "0", "SIM_TAKER_AFTER_HOURS_SHARES": "0", "SIM_TAKER_MAX_SHARES": "250", "SIM_WAYS": "taker", "SIM_GROUP_USD": "0"}
+    cbot = m.Bot(m.Config.from_env(cap_env), m.Store(":memory:"), FM(NOW), None)
+    cbot.sim_markets = lambda now: world["markets"]
+    deep = lambda at: m.dataclasses.replace(hsi(0.75, [("0.55", "300")], [("0.58", "2000")], at), in_session=True)
+    tid = f"{HSI_SLUG}|up|吃"
+    await step(cbot, NOW, deep(NOW))
+    assert cbot.sim_trades()[tid]["shares"] == 100 and cbot.sim_taker_room(cbot.sim_trades(), deep(NOW), "up") == (100.0, 100.0)
+    await step(cbot, NOW + 5_000, deep(NOW + 5_000))
+    t = cbot.sim_trades()
+    assert t[tid]["shares"] == 100 and t[f"{tid}#1"]["shares"] == 100 and t[f"{tid}#1"]["status"] == "filled"  # the first position moved aside, a second buy
+    await step(cbot, NOW + 10_000, deep(NOW + 10_000))
+    t = cbot.sim_trades()
+    assert t[tid]["shares"] == 50 and t[tid]["order"] == 50 and sorted(k for k in t if k.startswith(tid)) == [tid, f"{tid}#1", f"{tid}#2"]  # the remainder only
+    assert cbot.sim_taker_room(t, deep(NOW + 10_000), "up") == (0.0, 250.0)
+    await step(cbot, NOW + 15_000, deep(NOW + 15_000))
+    assert len([k for k in cbot.sim_trades() if k.startswith(tid)]) == 3  # at the cap: nothing more
+    row = next(r for r in cbot.sim_checks(NOW + 15_000) if r["market"] == HSI_SLUG)
+    assert "这一边吃单已累计 250 份，达到上限 250 份" in row["taker"], row["taker"]
+    obot = m.Bot(m.Config.from_env({**cap_env, "SIM_TAKER_MAX_SHARES": "0"}), m.Store(":memory:"), FM(NOW), None)
+    obot.sim_markets = lambda now: world["markets"]
+    await step(obot, NOW, deep(NOW)); await step(obot, NOW + 5_000, deep(NOW + 5_000))
+    assert [k for k in obot.sim_trades() if k.startswith(tid)] == [tid]  # 0 = once only
+    row = next(r for r in obot.sim_checks(NOW + 5_000) if r["market"] == HSI_SLUG)
+    assert "每边只吃一次" in row["taker"], row["taker"]
     print("TAKER_SHARES_OK")
 
 

@@ -46,7 +46,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.58.2"
+VERSION = "1.59.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -444,6 +444,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_SHARES", "每次最多买多少份", "1～1000000：吃单在封顶价之下有多少买多少、最多这么多；挂单按这个数量挂"),
     ("SIM_TAKER_SHARES", "盘中吃单每次最多买多少份", "0～1000000：开盘时段的吃单单独按这个份数；0 = 同上一项"),
     ("SIM_TAKER_AFTER_HOURS_SHARES", "盘后吃单每次最多买多少份", "0～1000000：开盘前、收盘后的吃单单独按这个份数；0 = 同盘中吃单的份数"),
+    ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
     ("SIM_WAYS", "做哪种单", "吃单 = 算出仍留足净优势的最高价位（封顶价），盘口在它之下的立即买（真实交易用封顶限价单）；挂单 = 按建议价挂着等成交"),
     ("SIM_MARKETS", "做哪些市场", "可多选；全选 = all；展开详细选项可按市场逐个排除"),
     ("SIM_SKIP", "不做的市场（详细选项）", "逗号分隔的市场代码；在“做哪些市场”卡片展开详细选项点选，空 = 所选类型里的市场都做"),
@@ -549,6 +550,7 @@ class Config:
     sim_shares: float = 100.0  # shares per simulated buy
     sim_taker_shares: float = 0.0              # SIM_TAKER_SHARES: shares per taker buy in session; 0 = SIM_SHARES
     sim_taker_after_hours_shares: float = 0.0  # SIM_TAKER_AFTER_HOURS_SHARES: shares per taker buy after hours; 0 = the taker count above
+    sim_taker_max_shares: float = 300.0        # SIM_TAKER_MAX_SHARES: takers buy again on a market's side until this many shares are held there; 0 = once only
     sim_seconds: int = 5     # seconds between the trader's looks: the books judged, orders placed / withdrawn, real orders read back (SIM_SECONDS)
     sim_ways: str = "taker"  # which suggestions it takes: taker (吃单), maker (挂单) or both
     sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
@@ -701,6 +703,7 @@ class Config:
             sim_shares=parse_bounded(e, "SIM_SHARES", "100", 1, 1_000_000),
             sim_taker_shares=parse_bounded(e, "SIM_TAKER_SHARES", "0", 0, 1_000_000),
             sim_taker_after_hours_shares=parse_bounded(e, "SIM_TAKER_AFTER_HOURS_SHARES", "0", 0, 1_000_000),
+            sim_taker_max_shares=parse_bounded(e, "SIM_TAKER_MAX_SHARES", "300", 0, 10_000_000),
             sim_ways=sim_ways, sim_markets=sim_markets, sim_skip=sim_skip,
             sim_maker_after_hours_markets=market_keys("SIM_MAKER_AFTER_HOURS_MARKETS"), sim_maker_deep_markets=market_keys("SIM_MAKER_DEEP_MARKETS"),
             sim_maker_deep_only_markets=market_keys("SIM_MAKER_DEEP_ONLY_MARKETS"),
@@ -6948,6 +6951,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_SHARES": {"kind": "number", "group": "策略", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "SIM_TAKER_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "10", "20", "50", "100", "200"], "unit": "份", "zero": "同每次份数"},
     "SIM_TAKER_AFTER_HOURS_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "10", "20", "50", "100"], "unit": "份", "zero": "同盘中吃单"},
+    "SIM_TAKER_MAX_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "100", "200", "300", "500", "1000"], "unit": "份", "zero": "只吃一次"},
     "SIM_WAYS": {"kind": "choice", "group": "策略", "options": [["taker", "只吃单"], ["maker", "只挂单"], ["both", "挂单和吃单"]]},
     "SIM_MARKETS": {"kind": "multi", "group": "策略", "options": [[k, n] for k, n in SIM_KINDS.items()]},
     "SIM_SKIP": {"kind": "detail", "group": "策略"},  # drawn inside the SIM_MARKETS card: one chip per market of the chosen kinds
@@ -6989,6 +6993,12 @@ SIM_MIN_SHARES = 1.0  # a taker buys only when at least this many shares are the
 def book_crossed(book: PredictBook) -> bool:
     """Bid at or above ask: a snapshot caught mid-update (or a broken feed), not a book anyone could trade."""
     return bool(book.bid and book.ask and float(book.bid[0]) >= float(book.ask[0]) - 1e-9)
+
+
+def sim_in_flight(trade: Mapping) -> bool:
+    """A record whose order may still fill: resting on paper, or a real order not yet at its final word."""
+    st = trade.get("live")
+    return trade.get("status") == "resting" or (isinstance(st, dict) and st.get("state") in {"pending", "placing", "open", "cancelling", "unknown"})
 
 
 def sim_position(trade: Mapping) -> bool:
@@ -7320,7 +7330,7 @@ def taker_quote(book: PredictBook, side: str, shares: float, fee_bps: int, cap: 
         walked.append([price, take])
         left -= take
     fee = taker_fee(avg, fee_bps)
-    return {"avg": avg, "got": got, "fee": fee, "cost": avg + fee, "best": levels[0][0], "short": got < shares - 1e-9,
+    return {"avg": avg, "got": got, "fee": fee, "cost": avg + fee, "best": levels[0][0], "short": got < shares - 1e-9, "want": shares,
             "levels": walked, "cap": cap}
 
 
@@ -11549,7 +11559,7 @@ class Bot:
         """The code and the settings a trade was made under, so a change in results can be traced to a change here."""
         c = self.config
         ways, kinds = sim_scope(c)
-        return {"code": VERSION, "sim_edge": c.sim_edge, "sim_shares": c.sim_shares, "sim_ways": ways, "sim_markets": kinds,
+        return {"code": VERSION, "sim_edge": c.sim_edge, "sim_shares": c.sim_shares, "sim_taker_max_shares": c.sim_taker_max_shares, "sim_ways": ways, "sim_markets": kinds,
                 **({"sim_taker_shares": c.sim_taker_shares} if c.sim_taker_shares else {}),
                 **({"sim_taker_after_hours_shares": c.sim_taker_after_hours_shares} if c.sim_taker_after_hours_shares else {}),
                 "sim_group_usd": c.sim_group_usd, "min_edge": c.predict_min_edge,
@@ -11688,7 +11698,7 @@ class Bot:
                  "kind": mk.kind, "key": mk.key, "side": side, "label": ("挂" if maker else "吃") + mk.sides[0 if side == "up" else 1],
                  "maker": maker is not None, "fair": fair, "opened": now_ms, "settle": mk.settle,
                  "driver": driver, "driver_name": driver_name,  # the event it settles on: positions sharing it lose together
-                 "order": self.sim_taker_shares(mk) if taker is not None else self.config.sim_shares, "fills": [], "revisions": [],
+                 "order": float(taker.get("want") or self.sim_taker_shares(mk)) if taker is not None else self.config.sim_shares, "fills": [], "revisions": [],
                  "entry": {"at": now_ms, "fair": fair, "fair_up": mk.fair_up, "need": mk.need, "book": book_snapshot(mk.book),
                            "card": [edge_json(e, shown, e.label.replace("涨", mk.sides[0]).replace("跌", mk.sides[1]))
                                     for e in edges], **self.evidence_of(mk)},
@@ -11917,14 +11927,19 @@ class Bot:
                     name = mk.sides[0 if side == "up" else 1]
                     fair = mk.fair_up if side == "up" else 1 - mk.fair_up
                     cap = self.sim_taker_cap(mk, side, bps)
-                    q = taker_quote(mk.book, side, self.sim_taker_shares(mk), bps, cap) if cap > 0 else None
+                    room, taken = self.sim_taker_room(trades, mk, side)
+                    q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
                     held = trades.get(f"{mk.market}|{side}|吃")
                     if cap <= 0:
                         parts.append(f"{name}：无封顶价（公平价 {cents(fair)} 留不出 {cents(max(mk.need, self.sim_taker_bar(mk)))}）")
+                    elif room < SIM_MIN_SHARES - 1e-9 and held is not None:
+                        parts.append(f"{name}：" + (f"已有{sim_status(held)}，等它结束" if sim_in_flight(held) else
+                                                    f"这一边吃单已累计 {taken:g} 份，达到上限 {c.sim_taker_max_shares:g} 份" if c.sim_taker_max_shares > 0 else
+                                                    f"已有{sim_status(held)}（每边只吃一次）"))
                     elif q is None or q["got"] < SIM_MIN_SHARES - 1e-9:
                         parts.append(f"{name}：封顶 {cents(cap)}，之下没有卖单")
                     else:
-                        parts.append(f"{name}：封顶 {cents(cap)}，可买 {q['got']:g} 份" + (f"（已有{sim_status(held)}）" if held else ""))
+                        parts.append(f"{name}：封顶 {cents(cap)}，可买 {q['got']:g} 份" + (f"（已吃 {taken:g} 份，上限 {c.sim_taker_max_shares:g}）" if taken > 0 else ""))
                 after = mk.in_session is False and (self.sim_taker_after_hours(mk) or self.sim_after_hours_price(mk) is not None)
                 taker_text = ("盘后：" if after else "") + "；".join(parts)
             rows.append({"item": mk.item, "kind": SIM_KINDS.get(mk.kind, mk.kind), "market": mk.market,
@@ -11954,6 +11969,19 @@ class Bot:
         if mk.in_session is False and c.sim_taker_after_hours_shares > 0:
             return c.sim_taker_after_hours_shares
         return c.sim_taker_shares or c.sim_shares
+
+    def sim_taker_room(self, trades: dict[str, dict], mk: SimMarket, side: str) -> tuple[float, float]:
+        """(shares a taker may buy on this market's side now, shares its takers have already filled there). One taker
+        order at a time: 0 while one is in flight. With SIM_TAKER_MAX_SHARES = 0 nothing after the first; else the
+        per-buy count, capped by what is left under SIM_TAKER_MAX_SHARES (the last buy takes the remainder)."""
+        c = self.config
+        held = trades.get(f"{mk.market}|{side}|吃")
+        taken = sum(float(t.get("shares") or 0) for t in trades.values()
+                    if t.get("market") == mk.market and t.get("side") == side and not t.get("maker"))
+        want = self.sim_taker_shares(mk)
+        if held is not None and (c.sim_taker_max_shares <= 0 or sim_in_flight(held)):
+            return 0.0, taken
+        return (want if c.sim_taker_max_shares <= 0 else min(want, max(c.sim_taker_max_shares - taken, 0.0))), taken
 
     def sim_taker_after_hours(self, mk: SimMarket) -> bool:
         """Whether this market is taken under the after-hours taker mode now: a daily card outside its underlying's session
@@ -12442,19 +12470,24 @@ class Bot:
                 # hours the after-hours bar, never over the after-hours price limit): every ask at or under it is bought, up
                 # to SIM_SHARES; nothing above it, however much is wanted
                 cap = self.sim_taker_cap(mk, side, bps)
-                q = taker_quote(mk.book, side, self.sim_taker_shares(mk), bps, cap) if cap > 0 else None
+                room, _ = self.sim_taker_room(trades, mk, side)  # what this side may still take (SIM_TAKER_MAX_SHARES), 0 with an order in flight
+                q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
                 if q and q["got"] >= SIM_MIN_SHARES - 1e-9:  # under a share is dust, not a trade: the slot stays free
                     quotes.append((round(fair - q["cost"], 4), side, q))
             if quotes:
                 _, side, q = max(quotes, key=lambda x: x[0])
                 tid = f"{mk.market}|{side}|吃"
-                if tid not in trades:
-                    why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, q["cost"], q["got"], taker=q)
-                    if why:
-                        self.sim_note_block(tid, mk, "吃" + mk.sides[0 if side == "up" else 1], q["cost"], why, now_ms)
-                    else:
-                        trades[tid] = self.sim_open(mk, side, now_ms, taker=q)
-                        changed.append((tid, trades[tid]))
+                held = trades.get(tid)  # a finished taker record (a position, a lapsed order): it moves to tid#n, the slot takes the next buy
+                why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, q["cost"], q["got"], taker=q)
+                if why:
+                    self.sim_note_block(tid, mk, "吃" + mk.sides[0 if side == "up" else 1], q["cost"], why, now_ms)
+                else:
+                    if held is not None:
+                        new_tid = self.sim_rekey(tid, held)
+                        trades[new_tid] = trades.pop(tid)
+                        changed = [(new_tid if k == tid else k, t) for k, t in changed]
+                    trades[tid] = self.sim_open(mk, side, now_ms, taker=q)
+                    changed.append((tid, trades[tid]))
         opened, rekeys = {tid for tid, _ in changed}, []
         for tid, trade in trades.items():
             if trade.get("final") or tid in opened:
@@ -13692,6 +13725,7 @@ class Bot:
         plain = lambda value: f"{value:.10g}"  # 1000000, never 1e+06
         values = {"LIVE": c.live_mode, "SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": plain(c.sim_shares), "SIM_WAYS": c.sim_ways,
                   "SIM_TAKER_SHARES": plain(c.sim_taker_shares), "SIM_TAKER_AFTER_HOURS_SHARES": plain(c.sim_taker_after_hours_shares),
+                  "SIM_TAKER_MAX_SHARES": plain(c.sim_taker_max_shares),
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
                   "SIM_GROUP_USD": plain(c.sim_group_usd), "SIM_TAKER_SESSION": flag(c.sim_taker_session),
                   "SIM_TAKER_AFTER_HOURS_CENTS": f"{c.sim_taker_after_hours * 100:g}", "SIM_AFTER_HOURS_MAX_PRICE_CENTS": f"{c.sim_after_hours_max_price * 100:g}", "SIM_SKIP": ",".join(sorted(c.sim_skip)),

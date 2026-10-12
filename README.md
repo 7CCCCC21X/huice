@@ -554,6 +554,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | `SIM_SHARES` | `100` | 每次买多少份 |
 | `SIM_TAKER_SHARES` | `0` | 开盘时段吃单每次最多买多少份；`0` = 同 `SIM_SHARES`。挂单不受影响 |
 | `SIM_TAKER_AFTER_HOURS_SHARES` | `0` | 开盘前、收盘后吃单每次最多买多少份；`0` = 同 `SIM_TAKER_SHARES` |
+| `SIM_TAKER_MAX_SHARES` | `300` | 同一市场同一方向的吃单累计成交到这么多份就不再吃；优势够就一笔接一笔买，最后一笔只吃剩下的份数，一次只发一张吃单；`0` = 每边只吃一次 |
 | `SIM_WAYS` | `taker` | 模拟交易做哪种单：`taker` 只吃单、`maker` 只挂单、`both` 都做 |
 | `SIM_MARKETS` | `close` | 模拟交易做哪些市场：`all`，或 `close`（指数/个股日涨跌）、`touch`、`updown`、`flip`、`range`、`ladder` 的组合 |
 | `SIM_SKIP` | 空 | 详细选项：所选类型里不做的市场，逗号分隔的市场代码（如 `HSI,UNITREEUSDT,BNB`，不分大小写，最多 200 个）。不用手填：控制台“做哪些市场”卡片展开详细选项后逐个点选，被排除的市场不吃单、不挂单，已挂着没成交的撤掉 |

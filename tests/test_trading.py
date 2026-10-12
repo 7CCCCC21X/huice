@@ -359,7 +359,7 @@ async def step(bot, at, *markets):
 def make_bot(**env):
     cfg = m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
                              "SIM_WAYS": "both", "SIM_MARKETS": "all", "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT_API_KEY": "k",
-                             "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off", "SIM_MAKER_SPREAD_CENTS": "10",  # resting orders rest as placed, unless a test says otherwise
+                             "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off", "SIM_MAKER_SPREAD_CENTS": "10", "SIM_TAKER_MAX_SHARES": "0",  # resting orders rest as placed, unless a test says otherwise
                              "LIVE_MAX_ORDER_USD": "100", "LIVE_MAX_OPEN_USD": "250", "LIVE_MAX_DAILY_LOSS_USD": "50", **env})
     bot = L.LiveBot(cfg, m.Store(":memory:"), FM(NOW), None)
     bot.live.api, bot.live.chain = FakeApi(), FakeChain()
@@ -1297,6 +1297,26 @@ async def audit_fixes():
     result = await sbot2.live_control("stop", {})
     assert result["ok"] and sbot2.live_paused() == "紧急停止" and ("remove", [soid]) in sbot2.live.api.calls and "Predict 确认撤掉 1 笔" in result["message"], result
     assert sbot2.sim_trades()[f"{HSI_SLUG}|up|挂"]["live"]["state"] == "done" and sbot2.live_reserved(sbot2.sim_trades()[f"{HSI_SLUG}|up|挂"]) == 0
+    # a side is taken again for real while the edge lasts: one order in flight at a time, the filled position moved aside, the total capped
+    rbot2 = make_bot(SIM_WAYS="taker", SIM_TAKER_MAX_SHARES="250", SIM_GROUP_USD="0", LIVE_MAX_OPEN_USD="1000")
+    await rbot2.live_prepare(); rfake2 = rbot2.live.api
+    await rbot2.live_prefetch(NOW)
+    rtid = f"{HSI_SLUG}|up|吃"
+    deep = lambda at: hsi(0.75, [("0.55", "300")], [("0.58", "2000")], at)
+    await step(rbot2, NOW, deep(NOW))
+    first = rbot2.sim_trades()[rtid]["live"]["order_id"]
+    await step(rbot2, NOW + 5_000, deep(NOW + 5_000))  # the first order still open and unfilled: nothing new on that side
+    assert [k for k in rbot2.sim_trades() if k.startswith(rtid)] == [rtid] and rbot2.sim_taker_room(rbot2.sim_trades(), deep(NOW + 5_000), "up") == (0.0, 0.0)
+    rfake2.fill(first, 100, done=True)
+    await step(rbot2, NOW + 10_000, deep(NOW + 10_000))  # read back as filled...
+    await step(rbot2, NOW + 15_000, deep(NOW + 15_000))  # ...and the next buy goes out, the position moved to #1
+    t = rbot2.sim_trades()
+    assert t[f"{rtid}#1"]["status"] == "filled" and t[f"{rtid}#1"]["shares"] == 100 and t[rtid]["live"]["state"] == "open" and t[rtid]["order"] == 100, sorted(t)
+    rfake2.fill(t[rtid]["live"]["order_id"], 100, done=True)
+    await step(rbot2, NOW + 20_000, deep(NOW + 20_000))
+    await step(rbot2, NOW + 25_000, deep(NOW + 25_000))
+    t = rbot2.sim_trades()
+    assert t[rtid]["order"] == 50 and t[rtid]["live"]["want"]["shares"] == 50 and len([k for k in t if k.startswith(rtid)]) == 3  # the remainder under 250
     print("AUDIT_FIXES_OK")
 
 

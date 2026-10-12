@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.58.2
+版本：1.59.0
 
 ## 已完成
 
+- 1.59.0（吃单可加仓到总份数上限）：`SIM_TAKER_MAX_SHARES`（默认 300，0 = 每边只吃一次）：`Bot.sim_taker_room(trades, mk, side)` 给出这一边现在还能吃多少份（同一时间只发一张吃单，在途时为 0；累计成交接近上限时最后一笔只吃剩下的份数）；`sim_step` 把已结束的吃单记录（持仓、失效的单）挪到 `tid#n` 再开下一笔，`taker_quote` 多 `want`，`sim_open` 的 `order` 按实际要买的份数；挂单检查写“可买 N 份（已吃 M 份，上限 300）”“这一边吃单已累计 M 份，达到上限”“已有…，等它结束”；`sim_version` 记录 `sim_taker_max_shares`（旧测试环境 LEGACY 设 0 保持“只吃一次”）。测试 `tests/test_sim.py` `taker_shares`、`tests/test_control.py`。
 - 1.58.2（吃单份数单独设）：`SIM_TAKER_SHARES`（盘中吃单每次最多买多少份，0 = 同 SIM_SHARES）、`SIM_TAKER_AFTER_HOURS_SHARES`（盘后吃单份数，0 = 同盘中吃单）：`Bot.sim_taker_shares(mk)` 在 `sim_step` / `sim_checks` 的吃单报价、`sim_open` 的 `order`、真实交易的 `live_room` 封顶金额与 `live_prefetch` 里统一使用；挂单仍按 SIM_SHARES。控制项两张数字卡（策略组），`sim_version` 在设了时记录。测试 `tests/test_sim.py` `taker_shares`、`tests/test_control.py`。
 - 1.58.1（页面之间互相有路）：概率页头部加“⚙ 控制台”“📒 复盘”两个按钮，复盘页的按钮行加“⚙ 控制台”——手机上从控制台点“← 概率页”后原来回不去。测试 `tests/test_journal.py`。
 - 1.58.0（外部审查第三批：控制台自保与布局、待处理、紧急停止；只挂低价可选市场）：（1）`SIM_MAKER_DEEP_ONLY_MARKETS`（`Config.sim_maker_deep_only_markets`，详细选项画在“只挂低价挂单”卡片里）：只挂低价只在这些市场生效，其他市场两种单都挂；`sim_maker_reason` / `sim_requote_reason` 的 `only` 都加这一层；三套搭配把它置空；`sim_version` 在开着时记录。（2）控制台 `load()` 带递增序号（晚回来的旧应答不覆盖新状态）、8 秒超时、失败时标明显示的是哪一刻的数据；口令被拒时 `lockView`（body.locked 隐藏 .acct 区域、禁用按钮、状态条提示），输对后恢复。（3）自定义输入的草稿 `drafts`：刷新重绘时保留输入值并标“未保存”，保存成功后才清。（4）两栏布局（`.cols`，≥1000px 两栏）：左栏真实交易、待处理、订单与持仓、挂单检查，右栏常用开关、参数、Predict 持仓、最近错误；手机上订单表改为标签式行（`REC_LABELS` / data-l）。（5）“待处理”卡片 `renderExceptions`：新单受限原因（`gate`）、状态未知的订单（含“已在 Predict 核对不存在，释放额度”→ 动作 `release`）、超过 60 秒未确认的撤单、同步超过 150 秒、余额刷新失败、列表没读完整、无记录挂单、停机 / 暂停、硬开关；状态条多“未确认”“对账 N 秒前”，受限时模式写“新单受限”。（6）操作行新增“紧急停止并撤单”（动作 `stop` = 暂停“紧急停止” + 撤本策略全部挂单，结果以 Predict 确认为准）。（7）概率页把“σ ×/÷1.25 的模型误差”改称“敏感性范围”，提示里注明是参数敏感性、不是统计置信区间。测试：`tests/test_control.py`（新详细选项、页面新部件）、`tests/test_sim.py`（只挂低价限市场）、`tests/test_trading.py`（紧急停止）。未做、留给下一轮：每笔订单的时间线视图、模型 / 数据源 / 执行 / 选择偏差的归因统计、参数修改的预览与版本回滚、交易执行健康检查接口。

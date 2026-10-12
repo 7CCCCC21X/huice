@@ -138,6 +138,7 @@ async def run():
     assert s["SIM_MAKER_DEEP_ONLY"]["options"] == [["off", "两种都挂"], ["on", "只挂低价挂单"]] and s["SIM_MAKER_DEEP_ONLY"]["value"] == "off"
     assert s["SIM_MAKER_SPREAD_CENTS"]["zero"] == "不限" and s["SIM_MAKER_SPREAD_CENTS"]["value"] == "0" and "10" in s["SIM_MAKER_SPREAD_CENTS"]["presets"]
     assert s["SIM_TAKER_SHARES"]["zero"] == "同每次份数" and s["SIM_TAKER_SHARES"]["value"] == "0" and s["SIM_TAKER_AFTER_HOURS_SHARES"]["zero"] == "同盘中吃单"
+    assert s["SIM_TAKER_MAX_SHARES"]["value"] == "300" and s["SIM_TAKER_MAX_SHARES"]["zero"] == "只吃一次" and "300" in s["SIM_TAKER_MAX_SHARES"]["presets"]
     assert s["SIM_SECONDS"]["kind"] == "number" and s["SIM_SECONDS"]["group"] == "高级" and s["SIM_SECONDS"]["value"] == "5" and s["SIM_SECONDS"]["unit"] == "秒" and "3" in s["SIM_SECONDS"]["presets"]
     assert s["PREDICT_POLL_SECONDS"]["kind"] == "number" and s["PREDICT_POLL_SECONDS"]["value"] == "10" and "5" in s["PREDICT_POLL_SECONDS"]["presets"] and data["cadence"] == {"sim": 5, "book": 10}
     assert 'id="checksnote"' in body.decode() and "renderCadence" in body.decode()
