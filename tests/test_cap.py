@@ -548,7 +548,7 @@ async def browser_check():
                                          ["", "No 97.4¢ +2.2¢ 暂不建议"], ["", "No 97.5¢ +2.1¢ 暂不建议"],      # $3B: a prior σ
                                          ["", "—"], ["", "—"]], cells                                          # $5B: no book
         assert cells[10][2] == cells[11][2] == "Predict 暂无盘口", cells[10:]  # not a points-gate tooltip
-        assert cells[0][2] == "挂No @ 63.8¢；净优势 +5.8¢，挂单排队，成交不保证；未过建议门槛 6.7¢（σ ×/÷1.25 的模型误差）", cells[0][2]
+        assert cells[0][2] == "挂No @ 63.8¢；净优势 +5.8¢，挂单排队，成交不保证；未过建议门槛 6.7¢（σ ×/÷1.25 的敏感性范围）", cells[0][2]
         assert cells[8][2].endswith("；σ 是先验值，只作参考"), cells[8][2]
         assert "低于门槛" in await page.inner_text("#g-ladder") and "6.7¢" not in await page.inner_text("#g-ladder .pg")  # the bar itself only in the tooltip / note
         # the red-frame bar can be this card's own (hotmap, per browser): 2¢ makes the $1B 挂No +2.2¢ a red frame and a strip entry

@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.59.1
+版本：1.60.0
 
 ## 已完成
 
+- 1.60.0（概率页显示距吃单还有多少）：`Bot.sim_taker_gap(mk, trades, now_ms)` 按机器人自己的门槛（`sim_taker_bar`，盘后用盘后门槛、不低于卡片误差）、封顶价（`sim_taker_cap`）、份数（`sim_taker_room`）和手续费算每个市场两边的卖1、封顶价、差多少、可买多少，给出状态：`ready`（可吃单）、`near`（差 X¢，取更近的一边）、`blocked`（可买但被结束前窗口 / 组上限拦下）、`held`（在途、每边上限、没卖单、公平价留不出门槛）、`wait`（卡片暂不建议 / 盘口过期 / 未开盘）、`off`（不在范围 / 已排除 / 只挂单，页面不显示）；`sim_taker_gaps(now_ms)` 按 Predict 市场号汇总，`sim_near(gaps, limit)` 排出最近的几个（可买的在前）。`book_block` 带 `market_id`，`odds_payload` 把每个有盘口的卡片（含阶梯每一档）接上 `taker`，“模拟交易”卡多 `near`；页面在盘口四个方向下面画一行“📏 距吃单 3.0¢：吃涨 卖1 62.0¢，封顶 59.0¢”（可吃单 ✅、拦下 ⛔、等待 ⏸，盘后加标），阶梯的吃单格写“距吃单 X¢ / 可吃单”，点开档位的说明行也有；模拟交易卡列“距吃单最近”；`/sim` 多一行“📏 距吃单最近：…”（还没触发过时也有）。测试 `tests/test_sim.py` `taker_gap`、`tests/test_board.py`；顺手把 `tests/test_cap.py` 浏览器检查里 1.58.0 改称“敏感性范围”后没跟上的旧文案改了。
 - 1.59.1（复盘页提速与减杂）：`journal.json` 改为轻量列表（`Bot.journal_row` 按 `JOURNAL_LIGHT` 只带一行和筛选要用的字段，每笔约 0.5 KB 而不是 3 KB；进行中的全部 + 最近 `JOURNAL_HISTORY`=300 笔已结束的，`more` 写明还有多少更早的），`?all=1` 列全部、`?id=编号` 取一笔完整记录（`Bot.journal_trade`）、`?full=1` 全部完整记录（导出 JSON 和 CSV 用它）；`WebServer.route` / `journal_keyed` 带查询串，缓存键按变体区分（`?id=` 不缓存）。页面：四块概览（今天 / 近 7 天 / 累计 / 进行中，`recent` 来自 `sim_recent_stats`）、“统计与风险”折叠（记在 localStorage，标题行常驻最坏单一事件）、筛选条带笔数且只显示有的状态、按日分组（每天的笔数和已结算盈亏）、每页 50 行 + “再显示 / 载入更早”、点开一笔才取完整记录（刷新时顺带更新打开的那笔）、深链接指向更早的记录时自动取全部、真实订单多“真实订单”一组（订单号、状态、事件时间线），有交易私钥时标题“交易复盘”、没发真实订单的记录标“模拟”，页脚按模式措辞；`LiveBot.journal_payload` 透传参数并写 `mode=live`。测试 `tests/test_journal.py`（轻量行 / 完整记录 / 分页 / 深链接 / 折叠 / 筛选）。
 - 1.59.0（吃单可加仓到总份数上限）：`SIM_TAKER_MAX_SHARES`（默认 300，0 = 每边只吃一次）：`Bot.sim_taker_room(trades, mk, side)` 给出这一边现在还能吃多少份（同一时间只发一张吃单，在途时为 0；累计成交接近上限时最后一笔只吃剩下的份数）；`sim_step` 把已结束的吃单记录（持仓、失效的单）挪到 `tid#n` 再开下一笔，`taker_quote` 多 `want`，`sim_open` 的 `order` 按实际要买的份数；挂单检查写“可买 N 份（已吃 M 份，上限 300）”“这一边吃单已累计 M 份，达到上限”“已有…，等它结束”；`sim_version` 记录 `sim_taker_max_shares`（旧测试环境 LEGACY 设 0 保持“只吃一次”）。测试 `tests/test_sim.py` `taker_shares`、`tests/test_control.py`。
 - 1.58.2（吃单份数单独设）：`SIM_TAKER_SHARES`（盘中吃单每次最多买多少份，0 = 同 SIM_SHARES）、`SIM_TAKER_AFTER_HOURS_SHARES`（盘后吃单份数，0 = 同盘中吃单）：`Bot.sim_taker_shares(mk)` 在 `sim_step` / `sim_checks` 的吃单报价、`sim_open` 的 `order`、真实交易的 `live_room` 封顶金额与 `live_prefetch` 里统一使用；挂单仍按 SIM_SHARES。控制项两张数字卡（策略组），`sim_version` 在设了时记录。测试 `tests/test_sim.py` `taker_shares`、`tests/test_control.py`。

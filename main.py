@@ -46,7 +46,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.59.1"
+VERSION = "1.60.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7569,6 +7569,11 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 .tchip{border-radius:999px;padding:1px 8px;background:var(--down-bg);color:var(--down);font-weight:600;font-variant-numeric:tabular-nums}
 .simtop{display:flex;align-items:baseline;gap:8px}.simpnl{font-size:28px;font-weight:800;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
 .simln{display:flex;flex-wrap:wrap;gap:2px 12px;font-size:13px;color:var(--muted)}
+.tk{margin-top:6px;font-size:12px;color:var(--muted);line-height:1.45;display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 6px}
+.tk b{color:var(--text);font-variant-numeric:tabular-nums}.tk.ready{color:var(--best);font-weight:600}.tk.wait,.tk.held{color:var(--faint)}.tk.blocked{color:var(--warn)}
+.tkm{font-size:10.5px;border-radius:6px;padding:0 5px;background:var(--chip);color:var(--muted);font-weight:600}
+.simnear{display:flex;flex-direction:column;gap:2px;font-size:12.5px;margin:4px 0}.simnear .tk{margin:0}.simnear .tk .it{color:var(--text);font-weight:600}
+.pwhy.ok{color:var(--best)}
 .simg{display:grid;grid-template-columns:auto auto auto 1fr;gap:3px 12px;font-size:12.5px;font-variant-numeric:tabular-nums;margin-top:4px;padding:8px 10px;border-radius:10px;background:var(--chip)}.simg .lh{color:var(--faint);font-size:11px}.simg .ln{text-align:right}
 .simrows{display:flex;flex-direction:column;gap:2px;margin-top:4px}
 a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-size:12.5px;color:inherit;text-decoration:none;font-variant-numeric:tabular-nums;padding:4px 6px;margin:0 -6px;border-radius:8px;border-top:1px dashed var(--line)}
@@ -7883,7 +7888,14 @@ function book(p,key){
   if(p.error)w.append($("div","warn small",(has?"刷新失败，显示上次盘口：":"")+p.error));
   const v=bookView(p);
   if(v.edges.length){w.append(chips(key,v,{...ctxOf(p),hot:hotByCard[key]??HOT}));if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}  // framed = suggested, grey = not big enough
+  const tl=takerLine(p.taker);if(tl)w.append(tl);
   return w}
+function takerLine(t){  // 距吃单: how far the trader itself (its own bar, cap, size and fee, not the viewer's amount) is from taking this book
+  if(!t||t.state==="off")return null;
+  const d=$("div","tk "+t.state),icon=t.state==="ready"?"✅ ":t.state==="near"?"📏 ":t.state==="blocked"?"⛔ ":"⏸ ";
+  if(t.state==="near"){const i=t.text.indexOf("：");d.append(icon+"距吃单 ",$("b","",cent(t.gap)),i>=0?t.text.slice(i):"")}else d.append(icon+t.text);
+  if(t.after)d.append($("span","tkm","盘后"));
+  d.title=(t.detail||t.text)+(t.bar!=null?"；机器人的吃单门槛：净优势 ≥"+cent(t.bar)+"，按它自己的份数、封顶价和手续费算，不是上面按试算金额算的四个方向":"");return d}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
 function simCard(c,it){
   // paper trading: would buying every suggestion of 10¢ or more have made money? Results only, nothing is ever ordered
@@ -7892,6 +7904,8 @@ function simCard(c,it){
   const how=[];if(s.ways!=="只挂单")how.push("吃单按这么多份吃到的均价和手续费成交");if(s.ways!=="只吃单")how.push("挂单跟有效买1，只按盘口出现的卖单数量推定成交，出结果时没成交的部分作废，不再做的挂单撤掉");
   c.append($("div","small mut","净优势 ≥"+cents+"¢ 时按卡片建议买 "+s.shares+" 份，只记账不下单。"+(s.scope?"范围："+s.scope+"；"+s.ways+"。":"")+how.join("；")+"。先预结算，再以 Predict 结果确认。"));
   const jl=$("a","simj","完整复盘（每笔证据、导出）↗");jl.href=location.pathname.replace(/\\/$/,"")+"/journal";c.append(jl);
+  if(it.near&&it.near.length){const nd=$("div","simnear");nd.append($("span","mut","距吃单最近（机器人自己的门槛、份数与封顶价）："));
+    it.near.forEach(g=>{const s=$("div","tk "+g.state);s.append($("span","it",g.item)," ",g.short);if(g.after)s.append($("span","tkm","盘后"));s.title=g.text;nd.append(s)});c.append(nd)}
   if(!t.trades){c.append($("p","","还没有触发过：等有卡片的净优势达到 "+cents+"¢ 就开始记录。"));return c}
   const top=$("div","simtop"),big=$("b","simpnl",money(t.pnl));big.style.color=col(t.pnl);
   top.append($("span","mut","已结算盈亏"),big);if(t.cost)top.append($("span","mut",(t.roi>=0?"+":"")+(t.roi*100).toFixed(1)+"%"));c.append(top);
@@ -8014,7 +8028,9 @@ function priceLadderBook(c,it,L,live){
           a.title=r.error||r.hold||(r.stale?"盘口过期，等待新盘口":nobook?"Predict 暂无盘口":r.fair==null?"模型价暂缺，等待行情或 σ":"等待有效盘口");return a}
         if(ok){a.classList.add("pos");if(e.edge>=HOT)a.classList.add("hot")}
         const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)),$("span","pv",sg(e.edge)));a.append(line);
+        const tk=!maker&&r.taker&&(r.taker.state==="near"||r.taker.state==="ready")?r.taker:null;  // 距吃单, the trader's own distance
         if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(ok&&!maker&&e.short)a.append($("span","pwhy","深度不足"));
+        else if(tk)a.append($("span","pwhy"+(tk.state==="ready"?" ok":""),tk.state==="ready"?"可吃单":"距吃单 "+cent(tk.gap)));
         else if(!ok&&e.edge>0)a.append($("span","pwhy","低于门槛"));  // a positive edge the model's own error swallows: say so without a hover
         const bar=r.need!=null?"未过建议门槛 "+cent(r.need)+"（"+(r.swing!=null&&r.swing>=r.need-1e-9&&r.swing>0?"σ ×/÷1.25 的敏感性范围":"最低净优势")+"）":"未过建议门槛";
         a.title=e.label+" @ "+cent(e.price)+"；净优势 "+sg(e.edge)+(maker?"，挂单排队，成交不保证":"，约 "+qty(e.size)+" 份；已扣手续费与滑点")+(r.error?"；"+r.error:r.hold?"；"+r.hold:r.stale?"；盘口过期":!ok?"；"+bar:"");return a};
@@ -8059,6 +8075,7 @@ function rowNote(r,L,it){  // one line about a ladder level itself, above its fo
   d.append($("b","",r.label),$("span","",parts.length?"："+parts.join(" · "):""));
   if(r.points_active!==undefined){const point=r.points_note||"积分状态暂缺",why=r.maker_note||r.points_why;d.append($("div","",point+(r.points_active===true&&r.points_rate!=null?" · "+qty(r.points_rate)+" PP/小时":"")));
     if(r.points_ok===false&&why&&why!==point)d.append($("div","warn",why))}
+  const tl=takerLine(r.taker);if(tl)d.append(tl);
   if(r.error)d.append($("span","warn","⚠️ "+r.error));
   if(r.dir_note)d.append($("span","warn",r.dir_note));
   if(r.hold&&!r.error&&r.hold!==r.dir_note)d.append($("span","warn","暂不建议："+r.hold));
@@ -11269,8 +11286,19 @@ class Bot:
             items.extend(self.safe_card(r.spec.name, r.spec.key, "crypto", self.range_payload, r, now_ms) for r in self.ranges.values())
             items.extend(self.safe_card(c.spec.name, c.spec.key, "crypto", self.cap_payload, c, now_ms) for c in self.caps.values())
         if self.config.sim and self.config.predict:
+            try:
+                gaps = self.sim_taker_gaps(now_ms)
+            except Exception as error:  # the cards stand without it
+                self.log_limited("taker-gap", f"距吃单计算失败：{clean_error(error) or type(error).__name__}")
+                gaps = {}
+            for item in items:  # each priced book block says how far the trader is from taking it (距吃单)
+                ladder = item.get("ladder") if isinstance(item.get("ladder"), dict) else {}
+                for block in [item.get("predict"), *(ladder.get("rows") or [])]:
+                    if isinstance(block, dict) and str(block.get("market_id") or "") in gaps:
+                        block["taker"] = gaps[str(block["market_id"])]
+            near = self.sim_near(gaps)
             items.append(self.safe_card("模拟交易", "SIM", "sim", lambda: {"name": "模拟交易", "symbol": "SIM", "group": "sim",
-                                                                          "kind": "sim", "sim": self.sim_report(public=True)}))
+                                                                          "kind": "sim", "sim": self.sim_report(public=True), "near": near}))
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
                 "today": f"{today:%m-%d} {WEEKDAYS[today.weekday()]}",
@@ -12055,6 +12083,87 @@ class Bot:
                          "maker": maker_text, "maker_why": maker_why, "taker": taker_text, "taker_why": taker_why})
         return rows
 
+    def sim_taker_gap(self, mk: SimMarket, trades: dict[str, dict], now_ms: int) -> dict:
+        """How far the trader is from a taker buy on this market now (距吃单), for the page's card and /sim. The state:
+        "ready" (a side can be bought now: its cap and the shares), "near" (the nearer side's best ask against its cap,
+        the gap the ask must fall), "blocked" (buyable, but the moment forbids: the quiet window, the group cap), "held"
+        (an order in flight, the per-side total, no asks, a fair price that leaves no cap), "wait" (the card's hold, a
+        stale book, the session) and "off" (SIM_MARKETS, SIM_SKIP, SIM_WAYS=maker) — with the words for each, the bar
+        (the trader's own, after hours the after-hours bar, never under the card's error) and both sides' figures."""
+        c = self.config
+        bps = mk.book.fee_bps if mk.book.fee_bps is not None else c.predict_fee_bps
+        need = max(mk.need, self.sim_taker_bar(mk))
+        after = mk.in_session is False and (self.sim_taker_after_hours(mk) or self.sim_after_hours_price(mk) is not None)
+        out: dict[str, Any] = {"item": mk.item, "kind": mk.kind, "bar": need, "after": after, "limit": self.sim_after_hours_price(mk),
+                               "label": "", "gap": None, "sides": [], "detail": ""}
+        if mk.kind not in c.sim_markets or str(mk.key).upper() in c.sim_skip:
+            return {**out, "state": "off", "text": "不在模拟交易范围，不吃单", "short": "不吃单"}
+        if c.sim_ways == "maker":
+            return {**out, "state": "off", "text": "SIM_WAYS=maker：只挂单，不吃单", "short": "只挂单"}
+        why = (f"卡片暂不建议（{mk.hold}）" if mk.hold else "盘口过期" if mk.book.stale(now_ms)
+               else "标的未开盘，不吃单" if c.sim_taker_session and mk.in_session is False and not self.sim_taker_after_hours(mk) else "")
+        sides = []
+        for side in ("up", "down"):
+            label = "吃" + mk.sides[0 if side == "up" else 1]
+            fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+            cap = self.sim_taker_cap(mk, side, bps)
+            levels = side_levels(mk.book, side)
+            ask = levels[0][0] if levels else None
+            room, taken = self.sim_taker_room(trades, mk, side)
+            held = trades.get(f"{mk.market}|{side}|吃")
+            q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
+            got = float(q["got"]) if q and q["got"] >= SIM_MIN_SHARES - 1e-9 else 0.0
+            block = ""
+            if cap <= 0:
+                block = f"公平价 {cents(fair)} 留不出 {cents(need)}"
+            elif room < SIM_MIN_SHARES - 1e-9 and held is not None:
+                block = (f"已有{sim_status(held)}，等它结束" if sim_in_flight(held)
+                         else f"已吃 {taken:g} 份，达到上限 {c.sim_taker_max_shares:g} 份" if c.sim_taker_max_shares > 0
+                         else f"已有{sim_status(held)}（每边只吃一次）")
+            elif ask is None:
+                block = "没有卖单"
+            elif not got and ask <= cap + 1e-9:
+                block = f"封顶 {cents(cap)} 之下只有零星卖单（不足 1 份）"
+            gap = round(ask - cap, 6) if ask is not None and cap > 0 else None
+            sides.append({"side": side, "label": label, "fair": fair, "cap": cap, "ask": ask, "gap": gap, "got": got, "taken": taken,
+                          "block": block, "edge": round(fair - q["cost"], 6) if got else None, "quote": q})
+        out["sides"] = [{k: v for k, v in s.items() if k != "quote"} for s in sides]
+        out["detail"] = "；".join(f"{s['label']}：" + (s["block"] or f"卖1 {cents(s['ask'])}，封顶 {cents(s['cap'])}"
+                                                   + (f"，可买 {s['got']:g} 份" if s["got"] else f"，差 {cents(s['gap'])}")) for s in sides)
+        if why:
+            return {**out, "state": "wait", "text": f"不吃单：{why}", "short": why}
+        ready = [s for s in sides if s["got"]]
+        if ready:
+            s = max(ready, key=lambda x: x["edge"])  # the side the trader takes: the most edge per share
+            hold = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, s["side"], s["quote"]["cost"], s["got"], taker=s["quote"])
+            more = f"（已吃 {s['taken']:g} 份，上限 {c.sim_taker_max_shares:g}）" if s["taken"] > 0 and c.sim_taker_max_shares > 0 else ""
+            if hold:
+                return {**out, "state": "blocked", "label": s["label"], "gap": s["gap"],
+                        "text": f"{s['label']}可买 {s['got']:g} 份，但{hold}", "short": f"{s['label']} 可买，但{hold}"}
+            return {**out, "state": "ready", "label": s["label"], "gap": s["gap"],
+                    "text": f"可吃单：{s['label']} 封顶 {cents(s['cap'])}，可买 {s['got']:g} 份{more}", "short": f"{s['label']} 可买 {s['got']:g} 份"}
+        near = [s for s in sides if s["gap"] is not None and not s["block"]]
+        if near:
+            s = min(near, key=lambda x: x["gap"])
+            return {**out, "state": "near", "label": s["label"], "gap": s["gap"],
+                    "text": f"距吃单 {cents(s['gap'])}：{s['label']} 卖1 {cents(s['ask'])}，封顶 {cents(s['cap'])}", "short": f"{s['label']} 差 {cents(s['gap'])}"}
+        return {**out, "state": "held", "text": out["detail"], "short": sides[0]["block"] or sides[1]["block"] or "没有卖单"}
+
+    def sim_taker_gaps(self, now_ms: int) -> dict[str, dict]:
+        """Every market the trader prices, by Predict market id: how far each is from a taker buy (sim_taker_gap)."""
+        trades = self.sim_trades()
+        return {str(mk.book.market_id): {"market": mk.market, **self.sim_taker_gap(mk, trades, now_ms)}
+                for mk in self.sim_markets(now_ms) if mk.book.market_id not in (None, "")}
+
+    @staticmethod
+    def sim_near(gaps: dict[str, dict], limit: int = 5) -> list[dict]:
+        """The markets nearest a taker buy, the buyable ones first, then those a rule holds for the moment, then by the
+        gap: the page's paper-trading card and /sim."""
+        rank = {"ready": 0, "blocked": 1, "near": 2}
+        rows = sorted((g for g in gaps.values() if g["state"] in rank),
+                      key=lambda g: (rank[g["state"]], g["gap"] if g.get("gap") is not None else 9.0))
+        return [{k: g.get(k) for k in ("item", "label", "state", "gap", "text", "short", "after")} for g in rows[:limit]]
+
     @staticmethod
     def sim_mode_market(mk: SimMarket, markets: frozenset) -> bool:
         """Whether a mode limited to ``markets`` (the detail chips under its card; empty = every market) covers this one."""
@@ -12790,8 +12899,15 @@ class Bot:
             how.append(f"详细选项排除了 {len(self.config.sim_skip)} 个市场（{'、'.join(sorted(self.config.sim_skip)[:8])}{'…' if len(self.config.sim_skip) > 8 else ''}）")
         lines = [f"🧪 {bold('模拟交易')}（净优势 ≥{edge:g}¢ 时按卡片建议买 {shares} 份，只记账不下单）",
                  f"范围：{r['scope']}；{r['ways']}。" + "；".join(how) + "。先按机器人数据预结算，再以 Predict 的结果确认。"]
+        try:  # 距吃单: the markets nearest a taker buy right now, by the trader's own bar, cap and size
+            near = self.sim_near(self.sim_taker_gaps(self.market.now_ms()), 3)
+        except Exception as error:
+            near, _ = [], LOG.warning("sim: 距吃单计算失败：%s", clean_error(error) or type(error).__name__)
+        near_line = ("📏 距吃单最近：" + "｜".join(f"{g['item']} {g['short']}" + ("（盘后）" if g.get("after") else "") for g in near)) if near else ""
         if not t["trades"]:
             lines.append(f"\n还没有触发过：等有卡片的净优势达到 {edge:g}¢ 就开始记录。")
+            if near_line:
+                lines.append(near_line)
             return "\n".join(lines)
         money = lambda x: f"{'+' if x >= 0 else '−'}${abs(x):,.2f}"
         lines += ["", f"已结算 {t['settled']} 笔：赢 {t['wins']}｜输 {t['losses']}｜平 {t['ties']}"
@@ -12807,6 +12923,8 @@ class Bot:
         lines.append("｜".join(f"{label} {s['settled']} 笔 {money(s['pnl'])}（预期 {money(s['expected'])}）"
                                for label, s in self.sim_recent_stats().items()))  # is the model holding up lately?
         lines.extend(self.sim_risk_lines(r))
+        if near_line:
+            lines.append(near_line)
         lines.append("\n最近：")
         lines += [f"{x['opened']} {x['item']} {x['label']} {x['price'] * 100:.1f}¢×{x['shares']:g} → {x['text']}"
                   + (f"·{x['state']}" if x["state"] else "") for x in r["rows"]]
@@ -13724,7 +13842,8 @@ class Bot:
                    asks=[[float(p), float(q)] for p, q in book.asks[:PREDICT_SHOW_DEPTH]],
                    age=max(0, (now_ms - book.fetched_ms) // 1000), stale=book.stale(now_ms), fetched_ms=book.fetched_ms,
                    fee_bps=book.fee_bps if book.fee_bps is not None else self.config.predict_fee_bps, sides=list(sides),
-                   notional=self.config.predict_trade_usd, makers=makers)
+                   notional=self.config.predict_trade_usd, makers=makers,
+                   market_id=str(book.market_id) if book.market_id not in (None, "") else "")
         if "points_active" not in out:  # a price ladder sets its levels' points itself (read every minute, with the maker gate)
             out.update(self.points_status(book.market_id, book, now_ms, PREDICT_POINTS_STALE_SECONDS))
         if fair is None:

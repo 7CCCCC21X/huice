@@ -1203,8 +1203,68 @@ async def taker_shares():
     print("TAKER_SHARES_OK")
 
 
+async def taker_gap():
+    """距吃单 (1.60.0): how far each market is from a taker buy, by the trader's own bar, cap, size and fee — the nearer
+    side's ask against its cap, buyable now, held for the moment, held by an order or the per-side total, waiting on
+    the card, or not taken at all; on the page's cards, the paper-trading card's nearest list and /sim."""
+    gbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                    "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}), m.Store(":memory:"), FM(NOW), None)
+    gbot.sim_markets = lambda now: world["markets"]
+    bps, cap_up, cap_down = 200, m.taker_cap(0.70, 0.10, 200), m.taker_cap(0.30, 0.10, 200)
+    assert cap_up == 0.59 and cap_down == 0.19
+    world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.62, 100)], NOW)]
+    g = gbot.sim_taker_gap(world["markets"][0], {}, NOW)
+    assert g["state"] == "near" and abs(g["gap"] - 0.03) < 1e-9 and g["label"] == "吃涨" and g["bar"] == 0.10 and not g["after"] and g["limit"] is None, g
+    assert g["text"] == "距吃单 3.0¢：吃涨 卖1 62.0¢，封顶 59.0¢" and g["short"] == "吃涨 差 3.0¢", g
+    assert g["detail"] == "吃涨：卖1 62.0¢，封顶 59.0¢，差 3.0¢；吃跌：卖1 45.0¢，封顶 19.0¢，差 26.0¢", g["detail"]
+    up, down = g["sides"]
+    assert (up["ask"], up["cap"], up["block"], up["got"]) == (0.62, 0.59, "", 0.0) and (down["ask"], down["cap"], down["block"]) == (0.45, 0.19, "")
+    gaps = gbot.sim_taker_gaps(NOW)
+    assert list(gaps) == ["101"] and gaps["101"]["market"] == HSI_SLUG and gaps["101"]["item"] == "恒生指数"
+    assert [(n["item"], n["state"], n["short"]) for n in gbot.sim_near(gaps)] == [("恒生指数", "near", "吃涨 差 3.0¢")]
+    card = next(i for i in gbot.odds_payload()["items"] if i["name"] == "模拟交易")
+    assert card["near"][0]["short"] == "吃涨 差 3.0¢" and card["near"][0]["text"] == g["text"]
+    assert "📏 距吃单最近：恒生指数 吃涨 差 3.0¢" in gbot.cmd_sim(None).text
+    # the ask falls to the cap: buyable now; bought (every side once under LEGACY), the other side is the nearer one
+    world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW)]
+    g = gbot.sim_taker_gap(world["markets"][0], {}, NOW)
+    assert g["state"] == "ready" and g["text"] == "可吃单：吃涨 封顶 59.0¢，可买 100 份" and g["short"] == "吃涨 可买 100 份" and abs(g["gap"] + 0.01) < 1e-9, g
+    assert gbot.sim_near(gbot.sim_taker_gaps(NOW))[0]["state"] == "ready"
+    await step(gbot, NOW)
+    assert f"{HSI_SLUG}|up|吃" in gbot.sim_trades()
+    g = gbot.sim_taker_gap(world["markets"][0], gbot.sim_trades(), NOW + 5_000)
+    assert g["state"] == "near" and g["label"] == "吃跌" and g["sides"][0]["block"] == "已有持仓（每边只吃一次）" and g["text"] == "距吃单 26.0¢：吃跌 卖1 45.0¢，封顶 19.0¢", g
+    # a rule holds the buy for the moment: the market's end; the card's hold; no asks on one side, on both; a fair price too low for a cap
+    g = gbot.sim_taker_gap(hsi(0.70, [(0.55, 100)], [(0.58, 100)], CLOSE), {}, CLOSE)
+    assert g["state"] == "blocked" and g["text"] == "吃涨可买 100 份，但已到结束时间，等结果出来：不开新单，挂单撤掉" and g["short"] == "吃涨 可买，但已到结束时间，等结果出来：不开新单，挂单撤掉", g
+    g = gbot.sim_taker_gap(hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW, hold="行情过期"), {}, NOW)
+    assert g["state"] == "wait" and g["text"] == "不吃单：卡片暂不建议（行情过期）" and g["sides"][0]["got"] == 100  # the figures are still there
+    g = gbot.sim_taker_gap(hsi(0.70, [(0.55, 100)], [], NOW), {}, NOW)
+    assert g["state"] == "near" and g["label"] == "吃跌" and g["sides"][0]["block"] == "没有卖单" and g["sides"][0]["gap"] is None
+    g = gbot.sim_taker_gap(hsi(0.70, [], [], NOW), {}, NOW)
+    assert g["state"] == "held" and g["text"] == "吃涨：没有卖单；吃跌：没有卖单" and g["short"] == "没有卖单"
+    g = gbot.sim_taker_gap(hsi(0.08, [(0.55, 100)], [(0.58, 100)], NOW), {}, NOW)
+    assert g["state"] == "ready" and g["label"] == "吃跌" and g["sides"][0]["block"] == "公平价 8.0¢ 留不出 10.0¢" and g["sides"][1]["cap"] == m.taker_cap(0.92, 0.10, 200), g
+    assert gbot.sim_near({"a": g, "b": gbot.sim_taker_gap(hsi(0.70, [(0.55, 100)], [(0.62, 100)], NOW), {}, NOW)})[0]["state"] == "ready"  # buyable first
+    # not taken at all: SIM_WAYS=maker, a kind outside SIM_MARKETS, a skipped key
+    mbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                    "SIM_WAYS": "maker", "SIM_MARKETS": "touch", "SIM_SKIP": "hsi", **LEGACY}), m.Store(":memory:"), FM(NOW), None)
+    g = mbot.sim_taker_gap(hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW), {}, NOW)
+    assert g["state"] == "off" and g["text"] == "不在模拟交易范围，不吃单" and g["sides"] == [] and mbot.sim_near({"x": g}) == []
+    mbot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_WAYS": "maker", "SIM_MARKETS": "all", **LEGACY})
+    assert mbot.sim_taker_gap(hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW), {}, NOW)["text"] == "SIM_WAYS=maker：只挂单，不吃单"
+    # after hours: the after-hours bar and price limit set the cap; the line says so
+    hbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                    "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_TAKER_AFTER_HOURS_CENTS": "15", "SIM_AFTER_HOURS_MAX_PRICE_CENTS": "60", **LEGACY}),
+                 m.Store(":memory:"), FM(NOW), None)
+    g = hbot.sim_taker_gap(m.dataclasses.replace(hsi(0.80, [(0.55, 100)], [(0.62, 100)], NOW), in_session=False), {}, NOW)
+    assert g["after"] and g["bar"] == 0.15 and g["limit"] == 0.60 and g["state"] == "near" and g["text"] == "距吃单 2.0¢：吃涨 卖1 62.0¢，封顶 60.0¢", g
+    print("TAKER_GAP_OK")
+
+
 asyncio.run(run())
 asyncio.run(maker_rules())
 asyncio.run(follow_guard())
 asyncio.run(review_fixes())
 asyncio.run(taker_shares())
+asyncio.run(taker_gap())

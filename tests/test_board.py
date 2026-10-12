@@ -37,6 +37,13 @@ assert p["fetched_ms"] == NOW - 7000 and p["age"] == 7 and p["fee_bps"] == 200 a
 assert p["fair"] == sse["fair_up"] and p["need"] == max(cfg.predict_min_edge, p["swing"]) and p["hold"] == "", p
 assert p["bids"] == [[0.81, 400.0], [0.80, 110.0]] and p["asks"] == [[0.85, 12.0], [0.94, 157.4]]
 assert [(e["label"], e["up"], e["maker"]) for e in p["edges"]] == [("挂涨", True, True), ("挂跌", False, True), ("吃涨", True, False), ("吃跌", False, False)]
+# 距吃单 (1.60.0): the block names its market and says how far the paper trader is from taking it, by its own bar and cap
+tk = p["taker"]
+assert p["market_id"] == "901" and tk["state"] in {"near", "ready"} and tk["bar"] == max(cfg.sim_edge, p["need"]) and tk["label"] in {"吃涨", "吃跌"}, tk
+assert [s["label"] for s in tk["sides"]] == ["吃涨", "吃跌"] and tk["sides"][0]["ask"] == 0.85 and abs(tk["sides"][1]["ask"] - 0.19) < 1e-9
+assert all(abs(s["cap"] - min(m.taker_cap(s["fair"], tk["bar"], 200), 1)) < 1e-12 for s in tk["sides"]), tk["sides"]
+sim_card = next(i for i in payload["items"] if i["name"] == "模拟交易")
+assert sim_card["near"][0]["item"] == "上证指数" and sim_card["near"][0]["state"] == tk["state"] and sim_card["near"][0]["text"] == tk["text"]
 best = m.best_edge(m.book_edges(p["fair"], sse_book, bot.edge_costs()), p["need"])
 assert [e["label"] for e in p["edges"] if e["best"]] == ["挂跌"] == [best.label]
 # a warning on the odds holds the suggestion back: the edges stay, the reason goes with them
