@@ -61,7 +61,9 @@ async def run():
     results = await bot.diagnose()
     by = {(r.group, r.name.split(" ")[0]): r for r in results}
     groups = {r.group for r in results}
-    assert groups == {"币安", "交易所收盘·UNITREE", "上证实时", "上证日K", "A50实时", "A50锚点", "Hyperliquid", "汇率", "美股触及·STRC"}, groups
+    assert groups == {"币安", "交易所收盘·UNITREE", "上证实时", "上证日K", "A50实时", "A50锚点", "Hyperliquid", "汇率", "美股触及·STRC", "Predict"}, groups
+    gql = by[("Predict", "GraphQL")]  # Predict itself is probed (1.61.0): offline it fails like any other request; no book yet, so no orderbook probe
+    assert not gql.ok and gql.detail.startswith("请求失败：") and ("Predict", "REST") not in by, gql
     strc = by[("美股触及·STRC", "Yahoo")]  # the stock market's feed is probed too; offline it fails like any other request
     assert strc.name == "Yahoo 1 分钟 K" and not strc.ok and strc.detail.startswith("请求失败："), strc
 
@@ -86,7 +88,7 @@ async def run():
 
     # report: groups that lost every source are called out first
     text = m.Bot.diag_text(results, bot.diag_state(NOW), "T")
-    assert "🚨 整组全部失败（该数据当前拿不到）：交易所收盘·UNITREE、美股触及·STRC、Hyperliquid、汇率" in text, text
+    assert "🚨 整组全部失败（该数据当前拿不到）：交易所收盘·UNITREE、美股触及·STRC、Hyperliquid、Predict、汇率" in text, text
     partial = [l for l in text.splitlines() if l.startswith("⚠️ 其余失败的源")][0]
     assert partial == ("⚠️ 其余失败的源（同组有别的源顶上）：上证实时·新浪、上证实时·东方财富、上证日K·东方财富日K、"
                        "上证日K·新浪日K、上证日K·Yahoo日K、"

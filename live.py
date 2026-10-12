@@ -312,7 +312,7 @@ class PredictApi:
         self.calls += 1
         async with self.gate:
             try:
-                raw = await core._blocking(core._http_get, self.base + path, payload, timeout, self.headers())
+                raw = await core.predict_blocking(core._http_get, self.base + path, payload, timeout, self.headers())
             except core.RemoteError as error:
                 if error.retry_after or http_status(error) == 429:
                     self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, self.BACKOFF_SECONDS))
@@ -1174,7 +1174,7 @@ class LiveBot(core.Bot):
 
     # --- the step: prefetch, decide (the paper trader), place, read back --------------------------------------------
     async def sim_step(self, now_ms: int) -> Any:
-        if time.monotonic() - self.sim_ran < self.config.sim_seconds:
+        if not self.sim_step_due():
             return False
         try:
             if self.config.live_mode != "off":
@@ -1223,13 +1223,15 @@ class LiveBot(core.Bot):
             if near:
                 wanted.append(str(mk.book.market_id))
         due = [mid for mid in dict.fromkeys(wanted) if time.monotonic() >= self.live_market_retry.get(mid, 0.0)]
-        for mid in due[:5]:
+
+        async def read(mid: str) -> None:
             try:
                 await self.live.market(mid)
                 self.live_market_retry.pop(mid, None)
             except Exception as error:
                 self.live_market_retry[mid] = time.monotonic() + self.LIVE_MARKET_RETRY_SECONDS  # again in a minute, not every step
                 self.live_note_error(f"市场 {mid} 详情读取失败：{core.clean_error(error) or type(error).__name__}")
+        await asyncio.gather(*(read(mid) for mid in due[:5]))  # side by side (the API gate bounds them), not one after another
 
     async def live_ensure_ready(self) -> None:
         """Sign in (and check the account) when not ready, at most once a minute."""

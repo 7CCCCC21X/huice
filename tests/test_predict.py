@@ -114,6 +114,19 @@ async def run():
     await bot.predict.refresh(targets)
     assert not any(want["UNITREEUSDT"] in u for u, _ in calls[n:]) and any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:])
     assert not any("/markets/902/orderbook" in u for u, _ in calls[n:]), "the key that answered is tried first"
+    # tiered polling (1.61.0): the hot keys every round, a cold key only every PREDICT_COLD_POLL_SECONDS; a key with no book yet every round
+    n = len(calls); bot.predict.refreshed = -1e9
+    await bot.predict.refresh(targets, hot={"SSE"})
+    assert any(u.endswith("/markets/901/orderbook") for u, _ in calls[n:]) and not any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:]), calls[n:]
+    assert any(want["HSI"] in str(v) for _, v in calls[n:]), "HSI (no book) is still asked every round"
+    bot.predict.key_refreshed["CXMTUSDT"] -= 61; n = len(calls); bot.predict.refreshed = -1e9
+    await bot.predict.refresh(targets, hot={"SSE"})
+    assert any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:]), "cold, and due again"
+    assert cfg.predict_cold_poll == 60 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_COLD_POLL_SECONDS": "80"}).predict_cold_poll == 80
+    try:
+        m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_COLD_POLL_SECONDS": "500"}); raise AssertionError("over PREDICT_STALE_MS")
+    except ValueError as error:
+        assert "3～80" in str(error)
     # target price (目标价): GraphQL marketData.startPrice on the category's own type
     feed = m.PredictFeed(cfg)
     ks = "kospi-composite-index-up-or-down-on-september-29-2026"

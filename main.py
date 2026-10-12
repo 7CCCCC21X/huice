@@ -46,7 +46,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.60.0"
+VERSION = "1.61.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -468,6 +468,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREDICT_TRADE_USD", "卡片吃单按多少美元走盘口", "1～1000000"),
     ("SIM_SECONDS", "检查订单的频率（秒）", "3～60：每隔这么多秒看一轮盘口——决定挂单 / 吃单 / 撤单，并读回真实订单的状态（成交、撤单）；越小反应越快、请求越多"),
     ("PREDICT_POLL_SECONDS", "盘口刷新间隔（秒）", "3～3600：每隔这么多秒读一遍 Predict 的订单簿；设得比检查频率还短没有意义，太短会被 Predict 限流（429，之后 20 秒内不再请求）"),
+    ("PREDICT_COLD_POLL_SECONDS", "冷门盘口刷新间隔（秒）", "3～80：指数/个股日涨跌、有单的市场、距吃单 5¢ 以内或够挂单门槛的市场每轮都刷；其余（几十个阶梯档位）每隔这么多秒才刷一次，省下的请求让关键市场更快"),
     ("LIVE_MAX_ORDER_USD", "真实交易单笔上限（$）", "1～1000000"),
     ("LIVE_MAX_OPEN_USD", "持仓 + 挂单上限（$）", "1～100000000"),
     ("LIVE_MAX_DAILY_LOSS_USD", "当日已结算亏损停机线（$）", "0 = 不限"),
@@ -541,6 +542,7 @@ class Config:
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
     predict_poll: int = 10   # seconds between orderbook refreshes (PREDICT_POLL_SECONDS)
+    predict_cold_poll: int = 60  # ...for the markets nothing is near on (PREDICT_COLD_POLL_SECONDS; under PREDICT_STALE_MS)
     predict_ref: str = "B00EA"  # referral code appended to Predict market links (?ref=); empty = none
     predict_fee_bps: int = 200   # taker fee rate when a market states none (Predict: 2% × min(p, 1 − p); makers 0)
     predict_trade_usd: float = 100.0  # trade size a taker edge is priced for (walks the book's depth)
@@ -693,6 +695,7 @@ class Config:
             predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
             predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 10, 3, 3600),
+            predict_cold_poll=bounded_int(e, "PREDICT_COLD_POLL_SECONDS", 60, 3, 80),
             predict_ref=parse_ref_code(e.get("PREDICT_REF_CODE", "B00EA")),
             predict_fee_bps=bounded_int(e, "PREDICT_FEE_BPS", 200, 0, 1000),
             predict_trade_usd=parse_bounded(e, "PREDICT_TRADE_USD", "100", 1, 1_000_000),
@@ -887,9 +890,7 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
     telegram = host.endswith("telegram.org")
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as response:
-            raw = response.read(MAX_BODY + 1)
-            if len(raw) > MAX_BODY:
-                raise RemoteError("接口返回的数据过大")
+            raw = _read_body(response, timeout)
             return _inflate(raw, response.headers.get("Content-Encoding", ""))
     except urllib.error.HTTPError as error:
         retry = 0
@@ -923,6 +924,22 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
     except http.client.HTTPException as error:  # IncompleteRead, BadStatusLine, LineTooLong: a broken answer
         detail = clean_error(str(error))[:80]
         raise RemoteError(f"网络错误 ({type(error).__name__}{': ' + detail if detail else ''})") from None
+
+
+def _read_body(response: Any, timeout: float) -> bytes:
+    """The whole body, in pieces: the socket timeout bounds each read, this bounds them all (an answer that trickles in
+    for a minute held a thread of the feeds' pool that long: KOSPI from a 502-ing host took 33 s against a 12 s timeout)."""
+    deadline, chunks, size = time.monotonic() + 2 * timeout + 1, [], 0
+    while True:
+        chunk = response.read(65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > MAX_BODY:
+            raise RemoteError("接口返回的数据过大")
+        if time.monotonic() > deadline:
+            raise RemoteError(f"网络错误 (响应过慢：{int(2 * timeout + 1)} 秒内没有读完)")
 
 
 def _http_json(url: str, payload: dict | None = None, timeout: int = 15) -> Any:
@@ -962,7 +979,8 @@ class SourceHealth:
     answers, and it returns to its normal place once the cooldown ends or any request to it succeeds."""
     FAILS = 2           # consecutive failures before a host is moved to the back
     BASE = 60           # first cooldown (seconds), doubled per further failure
-    MAX = 600           # short enough that a recovered preferred feed (A50 futures vs the CFD) is back soon
+    MAX = 3600          # a host failing for a quarter of an hour (Eastmoney 502-ing an overseas server all evening) stays
+                        # behind for an hour; a recovered preferred feed is back as soon as any request to it succeeds
 
     def __init__(self) -> None:
         self.hosts: dict[str, list] = {}  # host -> [consecutive failures, cool until (monotonic), last error]
@@ -3966,7 +3984,22 @@ PREDICT_SITE = "https://predict.fun/zh-cn/market/"
 PREDICT_ITEMS = (("HSI", "恒生指数", "hk"), ("KOSPI", "KOSPI", "kr"), ("SSE", "上证指数", "sh"))
 PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
-PREDICT_PARALLEL = 6            # Predict requests in flight at once (a hundred ladder books share the feeds' thread pool)
+PREDICT_PARALLEL = 8            # Predict requests in flight at once, on Predict's own thread pool (predict_blocking)
+PREDICT_POOL_WORKERS = 12       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
+                                # feeds' pool, where a 502-ing scraper held threads for the 12-second timeout (a round took 60 s)
+_PREDICT_POOL: ThreadPoolExecutor | None = None
+
+
+def predict_pool() -> ThreadPoolExecutor:
+    global _PREDICT_POOL
+    if _PREDICT_POOL is None:
+        _PREDICT_POOL = ThreadPoolExecutor(max_workers=PREDICT_POOL_WORKERS, thread_name_prefix="predict")
+    return _PREDICT_POOL
+
+
+async def predict_blocking(fn: Any, *args: Any) -> Any:
+    """A blocking Predict request on Predict's own thread pool: never queued behind a hanging quote feed."""
+    return await asyncio.get_running_loop().run_in_executor(predict_pool(), fn, *args)
 PREDICT_BACKOFF_SECONDS = 20    # after a 429 without retry_after: how long every Predict request waits
 PREDICT_META_SECONDS = 600     # outcome names / status of a ladder market are re-read this often
 PREDICT_REWARD_SECONDS = 60    # price-ladder reward metadata is refreshed every minute
@@ -4369,7 +4402,8 @@ class PredictFeed:
         self.ladders: dict[str, list[LadderRow]] = {}            # item key -> one row per market, by threshold
         self.fees: dict[str, tuple[int | None, float]] = {}      # market id -> (feeRateBps or None, when read)
         self.refreshed = -1e9
-        self.gate = asyncio.Semaphore(PREDICT_PARALLEL)          # requests in flight: the other feeds share the thread pool
+        self.key_refreshed: dict[str, float] = {}                # item key -> monotonic time of its last refresh (the cold cadence)
+        self.gate = asyncio.Semaphore(PREDICT_PARALLEL)          # requests in flight, on Predict's own pool
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
 
     def headers(self) -> dict[str, str]:
@@ -4382,7 +4416,7 @@ class PredictFeed:
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
         async with self.gate:
             try:
-                raw = await _blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
+                raw = await predict_blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
             except RemoteError as error:
                 if error.retry_after or "429" in str(error):
                     self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, PREDICT_BACKOFF_SECONDS))
@@ -4636,8 +4670,10 @@ class PredictFeed:
         except (RemoteError, TimeoutError, OSError) as error:
             self.errors[key] = clean_error(error) or type(error).__name__
 
-    async def refresh(self, targets: dict[str, str], force: bool = False) -> Refreshed | bool:
-        """targets: item key -> slug. False = not due yet."""
+    async def refresh(self, targets: dict[str, str], force: bool = False, hot: set[str] | None = None) -> Refreshed | bool:
+        """targets: item key -> slug. False = not due yet. ``hot``: the keys refreshed every round (the daily cards, the
+        markets with orders, those near a trade); the others only every PREDICT_COLD_POLL_SECONDS — a few dozen ladder
+        levels nobody is near cost a round most of its time. None = every key, every round."""
         if not force and time.monotonic() - self.refreshed < self.config.predict_poll:
             return False
         if (left := self.blocked_until - time.monotonic()) > 0:
@@ -4657,7 +4693,15 @@ class PredictFeed:
         for table in (self.markets, self.market_lists, self.strikes, self.types, self.info):
             for slug in [s for s in table if s not in keep]:
                 table.pop(slug, None)
-        await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in targets.items()))
+        now = time.monotonic()
+        cold = getattr(self.config, "predict_cold_poll", 0) or 0
+        due = {key: slug for key, slug in targets.items()
+               if hot is None or key in hot or key not in self.books and key not in self.ladders or now - self.key_refreshed.get(key, -1e9) >= cold}
+        await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in due.items()))
+        for key in due:
+            self.key_refreshed[key] = now
+        for key in [k for k in self.key_refreshed if k not in targets]:
+            self.key_refreshed.pop(key, None)
         # a market not listed yet is an answer, not a failure
         failed = [f"{key}：{error}" for key, error in self.errors.items() if key in targets and "还没有这个市场" not in error]
         return refreshed(failed, len(targets) - len(failed))
@@ -6978,6 +7022,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREDICT_TRADE_USD": {"kind": "number", "group": "高级", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
     "SIM_SECONDS": {"kind": "number", "group": "高级", "presets": ["3", "5", "10", "15"], "unit": "秒"},
     "PREDICT_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["3", "5", "10", "15", "30"], "unit": "秒"},
+    "PREDICT_COLD_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["15", "30", "60", "80"], "unit": "秒"},
     "LIVE_TAKER_WAIT_SECONDS": {"kind": "number", "group": "高级", "presets": ["15", "30", "60", "120"], "unit": "秒"},
     "LIVE_RETRY_SECONDS": {"kind": "number", "group": "高级", "presets": ["60", "300", "600", "1800"], "unit": "秒"},
     "LIVE_AUTO_REDEEM": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
@@ -8874,7 +8919,7 @@ function renderSettings(){if(!data)return;
   GROUPS.forEach(([g,title])=>{if(g==="高级"&&!adv)return;const items=data.settings.filter(s=>s.group===g);if(!items.length)return;
     box.append(el("div","grp",title));items.forEach(s=>{const k=card(s);if(k)box.append(k)})})}
 $("fold").addEventListener("click",()=>{folded=!folded;try{localStorage.setItem("ctlfold",folded?"1":"0")}catch(e){}renderSettings()});
-function renderCadence(c){if(!c)return;$("checksnote").textContent="每个市场现在会挂什么、为什么不挂；吃单的封顶价和封顶价之下能买到多少。每 "+c.sim+" 秒看一轮：盘口每 "+c.book+" 秒刷新，积分和费率每 10 分钟读一次（参数里的“检查订单的频率”“盘口刷新间隔”可改）。"}
+function renderCadence(c){if(!c)return;$("checksnote").textContent="每个市场现在会挂什么、为什么不挂；吃单的封顶价和封顶价之下能买到多少。盘口每 "+c.book+" 秒刷新（没人靠近的冷门市场每 "+(c.cold||c.book)+" 秒），刷新完立刻看一轮，最多每 "+c.sim+" 秒一轮；积分和费率每 10 分钟读一次（参数里的“检查订单的频率”“盘口刷新间隔”“冷门盘口刷新间隔”可改）。"}
 function renderChecksFold(){$("checksbody").style.display=checksFolded?"none":"";$("foldchecks").textContent=checksFolded?"展开":"收起"}
 $("foldchecks").addEventListener("click",()=>{checksFolded=!checksFolded;try{localStorage.setItem("ctlchecks",checksFolded?"1":"0")}catch(e){}renderChecksFold()});
 // the other sections fold the same way, each remembered on its own
@@ -9896,6 +9941,7 @@ class Bot:
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.sim_ran = -1e9  # monotonic time of the paper trader's last look
+        self.sim_wake = False  # a round of books just came in: the next look does not wait for SIM_SECONDS
         self.sim_checked: dict[str, float] = {}  # market id -> monotonic time Predict was last asked for its result
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
         self.reference_pool: ThreadPoolExecutor | None = None
@@ -11807,6 +11853,14 @@ class Bot:
                                      self.evidence(lambda cap=cap, row=row: self.market_evidence("ladder", now_ms, cap=cap, row=row))))
         return out
 
+    SIM_STEP_MIN_SECONDS = 1.0  # two looks never closer than this, however the books come in
+
+    def sim_step_due(self) -> bool:
+        """Whether the trader looks now: its timer (SIM_SECONDS) has run out, or a round of books just came in (sim_wake)
+        and the last look is at least SIM_STEP_MIN_SECONDS old."""
+        since = time.monotonic() - self.sim_ran
+        return since >= self.config.sim_seconds or (self.sim_wake and since >= self.SIM_STEP_MIN_SECONDS)
+
     def sim_note_closes(self) -> None:
         """Each contract's exchange close, kept per day (its feed holds only the latest), to settle the daily market."""
         for symbol, base in self.stocks.closes.items():
@@ -12646,9 +12700,9 @@ class Bot:
         SIM_MAKER_SPREAD, fills only as far as sellers show at or through its price, and is withdrawn once the trader no
         longer places such orders. Every position is pre-settled on the bot's own data, then confirmed (or corrected) by
         Predict's result. Nothing is ever sent to Predict."""
-        if time.monotonic() - self.sim_ran < self.config.sim_seconds:
+        if not self.sim_step_due():
             return False
-        self.sim_ran = time.monotonic()
+        self.sim_ran, self.sim_wake = time.monotonic(), False
         self.sim_note_closes()
         markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
         trades = self.sim_trades()
@@ -13997,7 +14051,7 @@ class Bot:
                   "SIM_MAKER_AFTER_HOURS_MARKETS": ",".join(sorted(c.sim_maker_after_hours_markets)), "SIM_MAKER_DEEP_MARKETS": ",".join(sorted(c.sim_maker_deep_markets)),
                   "SIM_MAKER_DEEP_ONLY_MARKETS": ",".join(sorted(c.sim_maker_deep_only_markets)),
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}", "SIM_SECONDS": str(c.sim_seconds), "PREDICT_POLL_SECONDS": str(c.predict_poll),
-                  "PREDICT_TRADE_USD": plain(c.predict_trade_usd), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
+                  "PREDICT_COLD_POLL_SECONDS": str(c.predict_cold_poll), "PREDICT_TRADE_USD": plain(c.predict_trade_usd), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait),
                   "LIVE_RETRY_SECONDS": str(c.live_retry), "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify)}
@@ -14042,7 +14096,7 @@ class Bot:
                               **CONTROL_FORMS.get(key, {"kind": "number", "group": "高级", "presets": [], "unit": ""})}
                              for key, label, hint in CONTROL_KEYS],
                 "scope": sim_scope(self.config), "checks": self.sim_checks(now_ms), "catalog": self.sim_catalog(now_ms),
-                "cadence": {"sim": self.config.sim_seconds, "book": self.config.predict_poll},
+                "cadence": {"sim": self.config.sim_seconds, "book": self.config.predict_poll, "cold": self.config.predict_cold_poll},
                 "presets": [{"name": n, "label": l, "hint": h, "values": dict(v)} for n, l, h, v in CONTROL_PRESETS],
                 "records": self.control_records(self.sim_trades()),
                 "sim": {"trades": stats["trades"], "settled": stats["settled"], "pnl": stats["pnl"], "open": stats["open"],
@@ -14545,6 +14599,24 @@ class Bot:
                 return "、".join(f"{c} {fmt(found[c].mark)}" for c in coins)
             probes.append(("Hyperliquid", f"dex {dex or '主市场'}", lambda payload=payload: http_json(Hyperliquid.URL, payload), check_hl))
 
+        if self.config.predict:  # Predict itself: one orderbook (the first market known) and the GraphQL endpoint, timed
+            known = next(iter(self.predict.books.values()), None)
+            if known is not None:
+                def check_book(data: Any, mid: str = str(known.market_id), key: str = known.key) -> str:
+                    book = data.get("data", data) if isinstance(data, dict) else {}
+                    if not isinstance(book, dict) or ("bids" not in book and "asks" not in book):
+                        raise ValueError("订单簿格式异常")
+                    bids, asks = book.get("bids") or [], book.get("asks") or []
+                    top = lambda rows: f"{float(rows[0][0]) * 100:.1f}¢×{float(rows[0][1]):g}" if rows and isinstance(rows[0], (list, tuple)) and len(rows[0]) >= 2 else "无"
+                    return f"{key} 市场 {mid}：买1 {top(bids)}｜卖1 {top(asks)}"
+                probes.append(("Predict", "REST 订单簿", lambda mid=str(known.market_id): self.predict.fetch(f"{PREDICT_REST}/markets/{urllib.parse.quote(mid)}/orderbook"), check_book))
+
+            def check_gql(data: Any) -> str:
+                if not isinstance(data, dict) or "data" not in data:
+                    raise ValueError("GraphQL 格式异常")
+                return "GraphQL 正常"
+            probes.append(("Predict", "GraphQL", lambda: self.predict.fetch(PREDICT_GRAPHQL, {"query": "{ __typename }", "variables": {}}), check_gql))
+
         for name, url in FxRates.SOURCES:
             def check_fx(data: Any) -> str:
                 rates = data.get("rates") if isinstance(data, dict) else None
@@ -14738,7 +14810,7 @@ class Bot:
         if self.config.probability:
             jobs.append(("概率输入", lambda: self.refresh_odds_inputs(now())))
         if self.config.predict:
-            jobs.append(("Predict 盘口", lambda: self.predict.refresh(self.predict_targets(now()))))
+            jobs.append(("Predict 盘口", lambda: self.refresh_books(now())))
         if self.config.touch:
             jobs.append(("先触市场", lambda: self.refresh_touch(now())))
             jobs.append(("涨跌市场", lambda: self.refresh_updown(now())))
@@ -14752,6 +14824,44 @@ class Bot:
         if self.config.edge_alert and self.config.predict:
             jobs.append(("优势提醒", lambda: self.edge_alerts(now())))
         return jobs
+
+    async def refresh_books(self, now_ms: int) -> Refreshed | bool:
+        """The orderbook round: the hot keys every round, the cold ones now and then (PredictFeed.refresh); a round
+        that brought books wakes the trader at once (sim_wake) instead of leaving it to its own timer."""
+        hot = None
+        if self.config.sim:
+            try:
+                hot = self.predict_hot_keys(now_ms)
+            except Exception as error:  # the round goes on with every key
+                self.log_limited("predict-hot", f"分级轮询计算失败：{clean_error(error) or type(error).__name__}")
+        result = await self.predict.refresh(self.predict_targets(now_ms), hot=hot)
+        if result is not False and self.config.sim:
+            self.sim_wake = True
+        return result
+
+    PREDICT_HOT_GAP = 0.05  # a market whose nearer side is within this of the taker's cap is refreshed every round
+
+    def predict_hot_keys(self, now_ms: int) -> set[str]:
+        """The item keys the orderbook feed refreshes every round: every market but the ladders (a handful), and a
+        ladder whose levels hold an order or a position, could be taken now or within PREDICT_HOT_GAP of the cap, or
+        clear the maker's bar — judged on the books of the last round."""
+        hot = {key for key in self.predict.slugs if key not in self.predict.ladder_keys}
+        trades = self.sim_trades()
+        busy = {t.get("market") for t in trades.values() if t.get("status") in {"resting", "filled"} or sim_in_flight(t)}
+        for mk in self.sim_markets(now_ms):
+            if mk.key in hot or mk.kind not in {"range", "ladder"}:
+                continue
+            if mk.market in busy:
+                hot.add(mk.key)
+                continue
+            if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk):
+                continue
+            gap = self.sim_taker_gap(mk, trades, now_ms)
+            if gap["state"] in {"ready", "blocked"} or (gap["state"] == "near" and gap["gap"] is not None and gap["gap"] <= self.PREDICT_HOT_GAP):
+                hot.add(mk.key)
+            elif mk.makers and self.config.sim_ways != "taker" and self.sim_maker_reason(mk, trades, now_ms)[0] is not None:
+                hot.add(mk.key)
+        return hot
 
     async def refresh_hsi(self, now_ms: int) -> Refreshed | bool:
         result = await self.hsi.refresh(now_ms)
@@ -14992,6 +15102,8 @@ class Bot:
             for task in [*tasks, *pending]:
                 task.cancel()
             await asyncio.gather(*tasks, *pending, stopper, return_exceptions=True)
+            if _PREDICT_POOL is not None:
+                _PREDICT_POOL.shutdown(wait=False)
             if self.reference_pool:
                 self.reference_pool.shutdown(wait=False, cancel_futures=True)
             if self.web:

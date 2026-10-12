@@ -1262,9 +1262,56 @@ async def taker_gap():
     print("TAKER_GAP_OK")
 
 
+async def faster():
+    """1.61.0: a round of books wakes the trader at once (sim_wake, never two looks within a second); the orderbook feed
+    refreshes the hot keys every round and the ladders only when something is near them (predict_hot_keys)."""
+    fbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                    "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}), m.Store(":memory:"), FM(NOW), None)
+    fbot.sim_markets = lambda now: world["markets"]
+    fbot.sim_ran = m.time.monotonic()
+    assert not fbot.sim_step_due()                      # the timer has not run out
+    fbot.sim_wake = True
+    assert not fbot.sim_step_due()                      # books just came, but the last look was under a second ago
+    fbot.sim_ran -= 1.5
+    assert fbot.sim_step_due()                          # ...now it looks
+    fbot.sim_wake = False
+    assert not fbot.sim_step_due() and fbot.sim_step_due() is False
+    fbot.sim_ran -= 10
+    assert fbot.sim_step_due()                          # the timer alone
+    world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.62, 100)], NOW)]
+    assert await fbot.sim_step(NOW) is not False and fbot.sim_wake is False and m.time.monotonic() - fbot.sim_ran < 1
+    # the feed's round: hot keys in, the trader woken
+    seen = {}
+    async def fake_refresh(targets, force=False, hot=None):
+        seen["targets"], seen["hot"] = targets, hot
+        return m.Refreshed("ok")
+    fbot.predict.refresh = fake_refresh
+    fbot.predict.slugs = {"HSI": HSI_SLUG, "PONS": "pons", "NIULAI": "niulai"}
+    fbot.predict.ladder_keys = {"PONS", "NIULAI"}
+    pons = lambda ask: m.SimMarket("pons#77", "$PONS FDV $10M", "ladder", "PONS", 0.30, book([(0.20, 100)], [(ask, 100)], NOW, slug="pons", key="PONS", mid="77"),
+                                   0.03, "", ("Yes", "No"), {"target": "10000000", "end": NOW + 86_400_000}, {})
+    niu = m.SimMarket("niulai#5", "$牛来 市值 $1B", "ladder", "NIULAI", 0.10, book([(0.02, 100)], [(0.60, 100)], NOW, slug="niulai", key="NIULAI", mid="5"),
+                      0.03, "", ("Yes", "No"), {"target": "1000000000", "end": NOW + 86_400_000}, {})
+    world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.62, 100)], NOW), pons(0.50), niu]  # PONS: cap 19¢, ask 50¢: far; 牛来: far
+    assert fbot.predict_hot_keys(NOW) == {"HSI"}
+    world["markets"][1] = pons(0.23)                    # within PREDICT_HOT_GAP of the cap: refreshed every round
+    assert fbot.predict_hot_keys(NOW) == {"HSI", "PONS"}
+    world["markets"][1] = pons(0.50)
+    fbot.store.put("sim:niulai#5|up|吃", {"v": 2, "market": "niulai#5", "slug": "niulai", "item": "$牛来 市值 $1B", "kind": "ladder", "key": "NIULAI",
+                                          "side": "up", "label": "吃Yes", "maker": False, "fair": 0.10, "opened": NOW, "settle": {"target": "1000000000", "end": NOW + 86_400_000},
+                                          "price": 0.05, "shares": 100.0, "order": 100.0, "status": "filled", "filled": NOW, "fill_fair": 0.10, "edge": 0.05,
+                                          "fills": [], "revisions": []})  # a position: its ladder stays hot
+    assert fbot.predict_hot_keys(NOW) == {"HSI", "NIULAI"}
+    fbot.sim_wake = False
+    assert await fbot.refresh_books(NOW) == m.Refreshed("ok") and seen["hot"] == {"HSI", "NIULAI"} and fbot.sim_wake is True
+    assert "HSI" in seen["targets"]
+    print("FASTER_OK")
+
+
 asyncio.run(run())
 asyncio.run(maker_rules())
 asyncio.run(follow_guard())
 asyncio.run(review_fixes())
 asyncio.run(taker_shares())
 asyncio.run(taker_gap())
+asyncio.run(faster())
