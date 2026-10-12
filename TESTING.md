@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.64.0
+版本：1.65.0
 
 ## 已完成
 
+- 1.65.0（关闭行情源）：`SOURCES_OFF`（`Config.sources_off`，逗号分隔的 eastmoney / sina / tencent / yahoo / naver / etnet，不认识的报错；控制台高级组“关闭的行情源”选择卡，当前只提供“关闭东方财富”）。`SourceHealth.off` 由 `Bot.__init__` / `apply_config` 维护：`order()` 先剔除关掉的源（所有走 `pick_quote` / `SOURCE_HEALTH.order` 的行情、日 K、波动率、现货源），`enabled()` 给恒指期货的 `read_families` 用，`disabled()` 让 A50 锚点查找改用新浪 5 分钟 K，`off_names()` 让 /diag 不再探测它们。测试 `tests/test_diag.py`、`tests/test_control.py`。
 - 1.64.0（链上操作移出交易一步）：/diag 里“模拟交易 上次用时 25.4s”——自动领取每 10 分钟一轮，十几个已结算持仓逐个 estimateGas 失败（BNB 不足）各花 1～2 秒，整步被拖住。（1）`live_sync` 把自动领取放进后台任务 `live_redeem_round`（`live_redeem_task`，不重叠），余额 / 授权刷新同样（`live_account_round` / `live_account_task`；从未读到过时仍当场读，余额门和授权检查要用）；（2）`live_redeem`：失败的持仓一小时内不再试（`live_redeem_failed`，`LIVE_REDEEM_RETRY_SECONDS`），BNB 低于 0.0005（`LIVE_REDEEM_MIN_BNB_WEI`）时一个都不试、每小时提醒一次“充值后自动恢复”；（3）`KEEPALIVE_PER_HOST` 8→24：并行 16 时原来每轮有 8 条连接池装不下、每轮重新握手（/diag 新建 1091 次）；（4）参考数据线程池 8→16：行情源节奏加快后 /diag 的 45 个探测曾把池子堵到 21 秒超时。测试 `tests/test_trading.py`（回退、燃气门、后台领取）。
 - 1.63.0（延迟链第三批）：（1）冷门盘口另开一轮：`PredictFeed.refresh` 只等热门键，到期的冷门键交给后台任务 `refresh_cold`（`cold_task`，先记时间再刷，不会重复开）；几十个阶梯档位不再拖慢日涨跌卡片的一轮。（2）`PREDICT_PARALLEL` 8→16、线程池 12→20：十几个热门市场一批发完，一轮约 1 秒。（3）公平价变动即看：`Bot.note_job` 在 `WAKE_JOBS` 里的参考任务（恒指期货、上证/A50、KOSPI、Hyperliquid、股票实时、交易所收盘、概率输入、各加密市场）每次刷新后算 `fair_signature`（每个市场公平价到 0.1¢），变了就置 `sim_wake`，`reference_loop` 调用；盘口用上一轮的（最多几秒前）。（4）盘后代理价的刷新：恒指期货页 20→10 秒、上证/A50 10→5 秒（连接复用后单次只要 0.2～0.4 秒）。（5）概率页 data.json 10→5 秒一次。测试 `tests/test_predict.py`（冷门后台轮）、`tests/test_sim.py` `faster`（公平价变动唤醒）。
 - 1.62.0（HTTP 连接复用）：`_http_get` 改为按主机保留已握手的 HTTPS 连接（标准库 `http.client`，`_pool_take` / `_pool_put`，每主机最多 `KEEPALIVE_PER_HOST`=8 条，闲置超过 `KEEPALIVE_IDLE_SECONDS`=25 秒丢弃）：欧洲机房到港韩沪的源每个请求省掉 0.4～0.8 秒的握手，Predict、Telegram、币安同样受益。对方已关闭的连接：请求还没写出去就换新连接重发；GET 没收到应答也重发一次；POST（下单）已发出就不再重发（调用方按“结果未知”处理），且带正文的请求只复用 `KEEPALIVE_POST_IDLE_SECONDS`=3 秒内用过的连接。错误映射抽成 `_remote_error`（状态码、对方原话、Retry-After、币安 418/429 下限、Predict 403 提示）与 `_net_error`，与原来一致；GET 的重定向最多跟 3 次；gzip 照样解压；`Connection: close` 的应答不入池。设了 https 代理或 http:// 的地址仍走 urllib（`_proxied`）。/diag 多一行“🔌 HTTP 连接：新建 / 复用 / 重发”。`tests/offline.py` 同时拦住 `HTTPSConnection.connect`。测试 `tests/test_http.py`（假连接：复用、两种重发、POST 不重发、空闲阈值、错误映射、重定向、gzip、池上限、代理走 urllib、离线护栏）。

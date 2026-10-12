@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.64.0"
+VERSION = "1.65.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -451,6 +451,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_SKIP", "不做的市场（详细选项）", "逗号分隔的市场代码；在“做哪些市场”卡片展开详细选项点选，空 = 所选类型里的市场都做"),
     ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "0 = 不限"),
     ("SIM_TAKER_SESSION", "只在标的开盘时段吃单", "开 = 指数/个股日涨跌的吃单只在标的开盘时段（卡片按现货定价时）进行，盘后只挂单；挂单不受影响"),
+    ("SOURCES_OFF", "关闭的行情源", "海外机房常被东方财富拒绝（502 / 直接断开）：关掉后每一轮、每个锚点查找和 /diag 都不再问它，由腾讯、新浪、Yahoo、Naver 顶上（A50 的 15:00 锚点只能用新浪 5 分钟 K 的近似值）"),
     ("SIM_TAKER_AFTER_HOURS_CENTS", "盘后吃单模式（¢/份）", "0～50：开盘前、收盘后也吃指数/个股日涨跌的单，但只吃净优势不低于这个数的（不低于触发门槛）；0 = 关（按上一项）"),
     ("SIM_AFTER_HOURS_MAX_PRICE_CENTS", "盘后只买这个价以下的（¢）", "1～99：指数/个股日涨跌开盘前、收盘后，吃单只买这个价以下的卖单、挂单只挂这个价以下的，挂着的高于它就撤；默认 60；0 = 不限"),
     ("SIM_QUIET_MINUTES", "结束前多少分钟不交易", "0～1440：从标的收盘 / 市场截止前这么多分钟起不开新单，未成交的挂单撤掉；0 = 不限"),
@@ -558,6 +559,7 @@ class Config:
     sim_ways: str = "taker"  # which suggestions it takes: taker (吃单), maker (挂单) or both
     sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
     sim_skip: frozenset = frozenset()              # SIM_SKIP: market keys (HSI, UNITREEUSDT, BNB…) left out within those kinds (the page's detail chips)
+    sources_off: frozenset = frozenset()           # SOURCES_OFF: quote sources never asked (eastmoney, sina, tencent, yahoo, naver, etnet)
     sim_group_usd: float = 300.0  # the most one driver's positions may lose on a single move (paper $); 0 = no limit
     sim_taker_after_hours: float = 0.0  # SIM_TAKER_AFTER_HOURS_CENTS / 100: after-hours taker mode — a daily card is also taken outside its
     # underlying's session, but only with this much net edge (never under sim_edge). 0 = off (SIM_TAKER_SESSION decides)
@@ -634,6 +636,9 @@ class Config:
                 raise ValueError(f"{name} 应是逗号分隔的市场代码（最多 200 个，每个不超过 40 字符）")
             return keys
         sim_skip = market_keys("SIM_SKIP")
+        sources_off = frozenset(t.strip().lower() for t in e.get("SOURCES_OFF", "").split(",") if t.strip())
+        if unknown := sorted(sources_off - set(SourceHealth.NAMES)):
+            raise ValueError(f"SOURCES_OFF 只认 {'、'.join(SourceHealth.NAMES)}（不认识：{'、'.join(unknown)}）")
         off = lambda value: str(value).strip().lower() in {"off", "0", "false", "no"}
         live_mode = {"on": "on", "1": "on", "true": "on", "yes": "on", "pause": "pause", "paused": "pause", "test": "pause"}.get(
             e.get("LIVE", "off").strip().lower(), "off")
@@ -708,7 +713,7 @@ class Config:
             sim_taker_shares=parse_bounded(e, "SIM_TAKER_SHARES", "0", 0, 1_000_000),
             sim_taker_after_hours_shares=parse_bounded(e, "SIM_TAKER_AFTER_HOURS_SHARES", "0", 0, 1_000_000),
             sim_taker_max_shares=parse_bounded(e, "SIM_TAKER_MAX_SHARES", "300", 0, 10_000_000),
-            sim_ways=sim_ways, sim_markets=sim_markets, sim_skip=sim_skip,
+            sim_ways=sim_ways, sim_markets=sim_markets, sim_skip=sim_skip, sources_off=sources_off,
             sim_maker_after_hours_markets=market_keys("SIM_MAKER_AFTER_HOURS_MARKETS"), sim_maker_deep_markets=market_keys("SIM_MAKER_DEEP_MARKETS"),
             sim_maker_deep_only_markets=market_keys("SIM_MAKER_DEEP_ONLY_MARKETS"),
             sim_group_usd=parse_bounded(e, "SIM_GROUP_USD", "300", 0, 10_000_000),
@@ -1116,8 +1121,24 @@ class SourceHealth:
     MAX = 3600          # a host failing for a quarter of an hour (Eastmoney 502-ing an overseas server all evening) stays
                         # behind for an hour; a recovered preferred feed is back as soon as any request to it succeeds
 
+    NAMES = {"eastmoney": "东方财富", "sina": "新浪", "tencent": "腾讯", "yahoo": "Yahoo", "naver": "Naver", "etnet": "etnet"}  # SOURCES_OFF token -> the name in /diag
+
     def __init__(self) -> None:
         self.hosts: dict[str, list] = {}  # host -> [consecutive failures, cool until (monotonic), last error]
+        self.off: frozenset = frozenset()  # SOURCES_OFF: tokens of the hosts never asked (Bot.apply_config keeps it current)
+
+    def disabled(self, url: str) -> bool:
+        """Whether SOURCES_OFF names this URL's host (a token is part of the host name: eastmoney, sina, tencent…)."""
+        host = self.host(url).lower()
+        return any(token in host for token in self.off)
+
+    def enabled(self, sources: Any) -> list:
+        """``sources`` ((name, url, ...) tuples) without the ones switched off, in the order given."""
+        return [source for source in sources if not self.disabled(source[1])]
+
+    def off_names(self) -> set[str]:
+        """The /diag names of the sources switched off (a token with no known name is shown as itself)."""
+        return {self.NAMES.get(token, token) for token in self.off}
 
     @staticmethod
     def host(url: str) -> str:
@@ -1144,7 +1165,7 @@ class SourceHealth:
         def rank(source: Any) -> int:
             state = self.hosts.get(self.host(source[1]))
             return state[0] if state and self.cooling(source[1]) > 0 else 0
-        return sorted(sources, key=rank)
+        return sorted(self.enabled(sources), key=rank)
 
     def lines(self) -> list[str]:
         now = time.monotonic()
@@ -2508,7 +2529,7 @@ class IndexFutures:
         """After the cash close, also read each source whose family the preferred one did not cover (hosts in cooldown
         aside): every family then has its own current quote, and its own print at 16:10 to anchor it."""
         current = {family for family, q in self.families.items() if q.fetched_ms == now_ms and not self.futures_problem(q, now_ms)}
-        for name, url, extra in self.FUTURES_SOURCES:
+        for name, url, extra in SOURCE_HEALTH.enabled(self.FUTURES_SOURCES):
             family = hsi_family(name)
             if family in current or name in attempted:
                 continue
@@ -7149,6 +7170,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_MARKETS": {"kind": "multi", "group": "策略", "options": [[k, n] for k, n in SIM_KINDS.items()]},
     "SIM_SKIP": {"kind": "detail", "group": "策略"},  # drawn inside the SIM_MARKETS card: one chip per market of the chosen kinds
     "SIM_TAKER_SESSION": {"kind": "choice", "group": "策略", "options": [["off", "全天都吃单"], ["on", "只在开盘时段吃单"]]},
+    "SOURCES_OFF": {"kind": "choice", "group": "高级", "options": [["", "全部启用"], ["eastmoney", "关闭东方财富"]]},
     "SIM_TAKER_AFTER_HOURS_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "10", "15", "20", "30"], "unit": "¢", "zero": "关"},
     "SIM_AFTER_HOURS_MAX_PRICE_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "40", "50", "60", "70", "80"], "unit": "¢", "zero": "不限"},
     "SIM_QUIET_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "5", "10", "15", "30", "60"], "unit": "分钟", "zero": "不限"},
@@ -10053,6 +10075,7 @@ class Bot:
     def __init__(self, config: Config, store: Store, market: Binance, telegram: Telegram):
         config = self.control_config(config, store)  # the control page's saved changes, on top of the environment
         self.config, self.store, self.market, self.telegram = config, store, market, telegram
+        SOURCE_HEALTH.off = config.sources_off
         self.snapshots: dict[str, dict] = {}
         self.stocks = StockMarket(config, store)
         self.fx = FxRates(config.fx_manual)
@@ -10714,6 +10737,8 @@ class Bot:
             anchor = self.anchors.get("A50")
             day = dt.datetime.fromtimestamp(close_ms / 1000, BEIJING).date()
             live = a50_family(a50.source) if a50 else "东方财富"
+            if SOURCE_HEALTH.disabled(IndexFutures.EM):
+                live = "新浪CFD"  # Eastmoney switched off: its K lines are not asked for the anchor either
             # The anchor must come from the same record as the live quote, or the two cannot be compared.
             chain = ([(self.cn.a50_sina_five_minute_at, "15:00 五分钟K近似")] if live == "新浪CFD" else
                      [(self.cn.a50_at, "15:00"), (self.cn.a50_five_minute_at, "15:00 五分钟K近似")])
@@ -14182,6 +14207,7 @@ class Bot:
         """A changed configuration takes effect: every loop reads self.config at use."""
         self.config = config
         self.predict.config = config  # the orderbook feed keeps its own reference (PREDICT_POLL_SECONDS)
+        SOURCE_HEALTH.off = config.sources_off  # the quote feeds read the switch from here
 
     def control_value(self, key: str) -> str:
         """A control setting's value in force, as the variable would be written."""
@@ -14201,7 +14227,8 @@ class Bot:
                   "SIM_MAKER_AFTER_HOURS_MARKETS": ",".join(sorted(c.sim_maker_after_hours_markets)), "SIM_MAKER_DEEP_MARKETS": ",".join(sorted(c.sim_maker_deep_markets)),
                   "SIM_MAKER_DEEP_ONLY_MARKETS": ",".join(sorted(c.sim_maker_deep_only_markets)),
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}", "SIM_SECONDS": str(c.sim_seconds), "PREDICT_POLL_SECONDS": str(c.predict_poll),
-                  "PREDICT_COLD_POLL_SECONDS": str(c.predict_cold_poll), "PREDICT_TRADE_USD": plain(c.predict_trade_usd), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
+                  "PREDICT_COLD_POLL_SECONDS": str(c.predict_cold_poll), "PREDICT_TRADE_USD": plain(c.predict_trade_usd),
+                  "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait),
                   "LIVE_RETRY_SECONDS": str(c.live_retry), "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify)}
@@ -14774,6 +14801,8 @@ class Bot:
                     raise ValueError("没有 rates 字段")
                 return "、".join(f"{c} {fmt(number(rates[c], c))}" for c in ("CNY", "HKD", "KRW") if c in rates) or "没有所需货币"
             probes.append(("汇率", name.split("（")[0], lambda url=url: http_json(url), check_fx))
+        if off := SOURCE_HEALTH.off_names():  # a source switched off is not probed either: nothing would use its answer
+            probes = [p for p in probes if not any(name in p[1] for name in off)]
         return probes
 
     async def diagnose(self) -> list[ProbeResult]:

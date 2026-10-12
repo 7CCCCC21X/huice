@@ -131,6 +131,7 @@ async def run():
     assert s["SIM_WAYS"]["kind"] == "choice" and s["SIM_WAYS"]["options"] == [["taker", "只吃单"], ["maker", "只挂单"], ["both", "挂单和吃单"]]
     assert s["SIM_MARKETS"]["kind"] == "multi" and [o[0] for o in s["SIM_MARKETS"]["options"]] == list(m.SIM_KINDS) and s["SIM_MARKETS"]["options"][0][1] == "指数/个股日涨跌"
     assert s["SIM_TAKER_SESSION"]["options"] == [["off", "全天都吃单"], ["on", "只在开盘时段吃单"]] and s["LIVE"]["options"][1][0] == "pause" and s["LIVE_NOTIFY"]["group"] == "高级"
+    assert s["SOURCES_OFF"]["kind"] == "choice" and s["SOURCES_OFF"]["value"] == "" and s["SOURCES_OFF"]["options"][1] == ["eastmoney", "关闭东方财富"]  # 1.65.0
     assert s["SIM_GROUP_USD"]["zero"] == "不限" and s["LIVE_MAX_DAILY_LOSS_USD"]["presets"][0] == "0"
     assert s["SIM_MAKER_AFTER_HOURS_CENTS"]["zero"] == "关" and s["SIM_MAKER_AFTER_HOURS_CENTS"]["value"] == "0" and "10" in s["SIM_MAKER_AFTER_HOURS_CENTS"]["presets"]
     assert s["SIM_MAKER_DEEP_CENTS"]["zero"] == "关" and s["SIM_MAKER_DEEP_CENTS"]["value"] == "0" and "25" in s["SIM_MAKER_DEEP_CENTS"]["presets"]

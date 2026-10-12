@@ -95,6 +95,24 @@ async def run():
                        "A50实时·东方财富、A50实时·新浪CFD、A50锚点·东方财富1分钟K 09-24 15:00、A50锚点·新浪5分钟K 09-24 15:00"), partial
     assert "【A50实时】\n❌ 东方财富（" in text and "🔄 后台刷新：未启动" in text and "📌 当前使用中的数据" in text
 
+    # SOURCES_OFF (1.65.0): a source switched off is neither probed nor asked; the A50 anchor goes straight to Sina
+    off_cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "SYMBOLS": "UNITREEUSDT", "EXCHANGE_TICKERS": "UNITREEUSDT=sh:688836",
+                                 "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "HL_TICKERS": "UNITREEUSDT=xyz:UNITREE", "HL_INDEX": "off", "SOURCES_OFF": "eastmoney"})
+    off_bot = m.Bot(off_cfg, m.Store(":memory:"), FM(off_cfg), TG())
+    assert off_cfg.sources_off == {"eastmoney"} and m.SOURCE_HEALTH.off == {"eastmoney"} and m.SOURCE_HEALTH.disabled("https://push2his.eastmoney.com/x")
+    assert not m.SOURCE_HEALTH.disabled("https://qt.gtimg.cn/q=sh000001")
+    names = [p[1] for p in off_bot.diag_probes(NOW)]
+    assert names and not any("东方财富" in n for n in names) and any("腾讯" in n for n in names), names
+    ordered = m.SOURCE_HEALTH.order(m.CnIndex.A50_SOURCES)
+    assert [n for n, *_ in ordered] == ["新浪CFD"] and [n for n, *_ in m.SOURCE_HEALTH.enabled(m.IndexFutures.FUTURES_SOURCES)] == ["etnet", "新浪CFD"]
+    try:
+        m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SOURCES_OFF": "eastmoney,foo"}); raise AssertionError("unknown token")
+    except ValueError as error:
+        assert "不认识：foo" in str(error)
+    off_bot.apply_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}))
+    assert m.SOURCE_HEALTH.off == frozenset() and [n for n, *_ in m.SOURCE_HEALTH.order(m.CnIndex.A50_SOURCES)][-1] == "新浪CFD"  # (Eastmoney back: last only while cooling)
+    m.SOURCE_HEALTH.hosts.clear()
+
     # every source down -> points at the deployment's network, not at the feeds
     down = [m.ProbeResult("币安", "x", False, 1, "请求失败：网络错误 (URLError: Tunnel connection failed: 403 Forbidden)"),
             m.ProbeResult("汇率", "y", False, 1, "请求失败：网络错误 (URLError: Tunnel connection failed: 403 Forbidden)")]

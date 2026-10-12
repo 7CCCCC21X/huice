@@ -482,6 +482,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-september-28-2026
 | `PREDICT` | `on` | `off` 关闭盘口获取和 `/book` |
 | `PREDICT_API_KEY` | 空 | 可选，作为 `x-api-key` 发给 api.predict.fun |
 | `PREDICT_POLL_SECONDS` | `10` | 盘口刷新间隔（3～3600 秒）。控制台可在线改（预设 3 / 5 / 10 / 15 / 30 秒）；设得比 `SIM_SECONDS` 还短没有意义，太短会被 Predict 限流（429，之后 20 秒内不再请求） |
+| `SOURCES_OFF` | 空 | 永不询问的行情源，逗号分隔：`eastmoney`、`sina`、`tencent`、`yahoo`、`naver`、`etnet`。东方财富常拒绝海外机房（502 / 直接断开），关掉后每一轮、锚点查找和 `/diag` 都不再问它，由腾讯、新浪、Yahoo、Naver 顶上（A50 的 15:00 锚点只能用新浪 5 分钟 K 的近似值）。控制台高级组“关闭的行情源”可在线切换 |
 | `PREDICT_COLD_POLL_SECONDS` | `60` | 冷门盘口刷新间隔（3～80 秒）。指数/个股日涨跌、先触、月度、反超等市场和有单的市场每轮都刷；几十个阶梯档位里只有距吃单 5¢ 以内、够挂单门槛或已有单的档位每轮刷，其余每隔这么多秒另开一轮刷（不占热门市场那一轮的时间）。盘口刷新完、或任一市场的公平价变动（行情源刷新后到 0.1¢ 有变化）时机器人立刻看一轮（不再等 `SIM_SECONDS` 的定时器，两轮最少隔 1 秒）；Predict 的请求走自己的线程池，不再排在失败的行情源后面 |
 | `PREDICT_REF_CODE` | `B00EA` | 市场链接后面加的邀请码（`?ref=`）；留空不加 |
 | `PREDICT_SLUGS` | 上表 | `键=前缀`，逗号分隔；键为 `HSI`/`KOSPI`/`SSE` 或合约代码。只写的键才获取，例如只看恒指：`PREDICT_SLUGS=HSI=hang-seng-index` |
