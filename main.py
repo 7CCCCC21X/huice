@@ -29,6 +29,7 @@ import secrets
 import signal
 import sqlite3
 import ssl
+import threading
 import sys
 import time
 import urllib.error
@@ -46,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.61.0"
+VERSION = "1.62.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -878,52 +879,184 @@ def http_error_text(body: Any) -> str:
     return ""
 
 
+# --- HTTP: a connection per host, kept alive -------------------------------------------------------------------------
+# Every request used to open its own TCP + TLS connection: to a far host (Hong Kong or Seoul from a European box) the
+# handshake alone cost 0.4-0.8 s, more than the answer. Connections are now pooled per host and reused; one that the
+# server closed meanwhile is retried once, on a fresh one, for a GET; a POST (an order) is never sent twice.
+KEEPALIVE_IDLE_SECONDS = 25.0       # a pooled connection unused this long is dropped (servers close idle ones around a minute)
+KEEPALIVE_POST_IDLE_SECONDS = 3.0   # a request with a body reuses only a connection used this recently (a stale one could
+                                    # swallow it, and it is never sent again)
+KEEPALIVE_PER_HOST = 8              # pooled connections per host (Telegram's long poll holds one for half a minute)
+HTTPS_CONNECTION = http.client.HTTPSConnection  # (the tests put a fake here)
+_POOL: dict[tuple[str, int], list[tuple[Any, float]]] = {}  # (host, port) -> [(connection, last used, monotonic)], oldest first
+_POOL_LOCK = threading.Lock()
+HTTP_STATS = {"new": 0, "reused": 0, "retried": 0}  # connections opened / reused / requests retried on a fresh one (/diag)
+
+
+def _pool_take(host: str, port: int, timeout: float, max_idle: float) -> tuple[Any, bool]:
+    """The most recently used pooled connection to host:port, when used within ``max_idle`` seconds (the older ones are
+    dropped with it: they are older still), else a new one. (connection, whether it came from the pool)."""
+    with _POOL_LOCK:
+        rows = _POOL.get((host, port)) or []
+        while rows:
+            conn, last = rows.pop()
+            if time.monotonic() - last <= max_idle:
+                HTTP_STATS["reused"] += 1
+                if getattr(conn, "sock", None) is not None:
+                    conn.sock.settimeout(timeout)
+                return conn, True
+            conn.close()
+            for old, _ in rows:
+                old.close()
+            rows.clear()
+        HTTP_STATS["new"] += 1
+    return HTTPS_CONNECTION(host, port, timeout=timeout, context=SSL_CONTEXT), False
+
+
+def _pool_put(host: str, port: int, conn: Any) -> None:
+    with _POOL_LOCK:
+        rows = _POOL.setdefault((host, port), [])
+        if len(rows) >= KEEPALIVE_PER_HOST:
+            conn.close()
+            return
+        rows.append((conn, time.monotonic()))
+
+
+def _proxied(host: str) -> bool:
+    """Whether an https proxy applies to this host: the request then goes the urllib way, which speaks proxies."""
+    proxies = urllib.request.getproxies()
+    return bool(proxies.get("https")) and not urllib.request.proxy_bypass(host)
+
+
+def _net_error(error: BaseException) -> RemoteError:
+    detail = clean_error(str(error))[:80]
+    return RemoteError(f"网络错误 ({type(error).__name__}{': ' + detail if detail else ''})")
+
+
+def _remote_error(host: str, code: int, retry_after: Any, raw: bytes, encoding: str) -> RemoteError:
+    """The RemoteError for an HTTP error answer: the status, the service's own words, Retry-After, the hints."""
+    retry = 0
+    try:
+        retry = max(0, int(retry_after or "0"))
+    except (ValueError, TypeError):
+        pass
+    description = ""
+    try:
+        body = json.loads(_inflate(raw, encoding or ""))
+        description = http_error_text(body)
+        retry = max(retry, int(body.get("parameters", {}).get("retry_after", 0)))
+    except (ValueError, TypeError, AttributeError, RemoteError):
+        pass
+    if host.endswith("telegram.org"):  # Telegram says exactly what is wrong (blocked, kicked, retry after N) and how long to wait
+        text = TELEGRAM_HINTS.get(code) or description or "接口请求失败"
+    elif host.endswith("predict.fun"):  # Predict says what is wrong (minimum order value, closed market…): its words first
+        text = description or HTTP_HINTS.get(code) or "接口请求失败"
+        if code == 403:
+            text += "（Predict 不向受限地区开放交易：部署在美国等受限地区时读取正常、下单 403，把服务换到允许的地区）"
+    else:
+        if "binance" in host and code in {418, 429}:
+            retry = max(retry, 120 if code == 418 else 30)
+        text = HTTP_HINTS.get(code) or description or "接口请求失败"
+    return RemoteError(clean_error(f"HTTP {code}: {text}"), retry)
+
+
 def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
               headers: dict[str, str] | None = None) -> bytes:
-    """GET (or POST ``payload`` as JSON) and return the body; HTTP/network failures become RemoteError."""
+    """GET (or POST ``payload`` as JSON) and return the body; HTTP/network failures become RemoteError. Over https
+    without a proxy the connection is kept alive and reused (_http_keepalive); otherwise urllib, as before."""
     data = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={
-        "User-Agent": f"CloseAlert/{VERSION}", "Accept": "application/json", "Accept-Encoding": "gzip",
-        **({"Content-Type": "application/json"} if data is not None else {}), **(headers or {}),
-    })
-    host = urllib.parse.urlsplit(url).hostname or ""
-    telegram = host.endswith("telegram.org")
+    hdrs = {"User-Agent": f"CloseAlert/{VERSION}", "Accept": "application/json", "Accept-Encoding": "gzip",
+            **({"Content-Type": "application/json"} if data is not None else {}), **(headers or {})}
+    split = urllib.parse.urlsplit(url)
+    host = split.hostname or ""
+    if split.scheme != "https" or not host or _proxied(host):
+        return _http_urllib(url, data, hdrs, timeout, host)
+    return _http_keepalive(url, split, data, hdrs, timeout)
+
+
+def _http_urllib(url: str, data: bytes | None, hdrs: dict[str, str], timeout: int, host: str) -> bytes:
+    req = urllib.request.Request(url, data=data, headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as response:
             raw = _read_body(response, timeout)
             return _inflate(raw, response.headers.get("Content-Encoding", ""))
     except urllib.error.HTTPError as error:
-        retry = 0
-        try:
-            retry = max(0, int(error.headers.get("Retry-After", "0")))
-        except (ValueError, TypeError):
-            pass
-        description = ""
-        try:
-            body = json.loads(_inflate(error.read(4096), error.headers.get("Content-Encoding", "")))
-            description = http_error_text(body)
-            retry = max(retry, int(body.get("parameters", {}).get("retry_after", 0)))
-        except (ValueError, TypeError, AttributeError, RemoteError):
-            pass
-        if telegram:  # Telegram says exactly what is wrong (blocked, kicked, retry after N) and how long to wait
-            text = TELEGRAM_HINTS.get(error.code) or description or "接口请求失败"
-        elif host.endswith("predict.fun"):  # Predict says what is wrong (minimum order value, closed market…): its words first
-            text = description or HTTP_HINTS.get(error.code) or "接口请求失败"
-            if error.code == 403:
-                text += "（Predict 不向受限地区开放交易：部署在美国等受限地区时读取正常、下单 403，把服务换到允许的地区）"
-        else:
-            if "binance" in host and error.code in {418, 429}:
-                retry = max(retry, 120 if error.code == 418 else 30)
-            text = HTTP_HINTS.get(error.code) or description or "接口请求失败"
-        raise RemoteError(clean_error(f"HTTP {error.code}: {text}"), retry) from None
+        raw = b""
+        with contextlib.suppress(Exception):
+            raw = error.read(4096)
+        raise _remote_error(host, error.code, error.headers.get("Retry-After"), raw, error.headers.get("Content-Encoding", "")) from None
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         # Keep the underlying reason (DNS failure, refused, proxy 403, certificate...): /diag relies on it.
         reason = getattr(error, "reason", None) if isinstance(error, urllib.error.URLError) else None
         detail = f": {clean_error(str(reason))[:80]}" if reason else ""
         raise RemoteError(f"网络错误 ({type(error).__name__}{detail})") from None
     except http.client.HTTPException as error:  # IncompleteRead, BadStatusLine, LineTooLong: a broken answer
-        detail = clean_error(str(error))[:80]
-        raise RemoteError(f"网络错误 ({type(error).__name__}{': ' + detail if detail else ''})") from None
+        raise _net_error(error) from None
+
+
+def _http_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str, str], timeout: int) -> bytes:
+    """The request on a pooled connection (see _http_get). A pooled connection the server had closed: the request is
+    sent again on a fresh one when nothing was sent yet, or, for a GET, when no answer came; a POST that may have been
+    taken is never repeated (the caller treats it as "result unknown"). Redirects of a GET are followed (3 at most)."""
+    host, port = split.hostname, split.port or 443
+    path = (split.path or "/") + (f"?{split.query}" if split.query else "")
+    method = "POST" if data is not None else "GET"
+    for _hop in range(4):
+        max_idle = KEEPALIVE_POST_IDLE_SECONDS if data is not None else KEEPALIVE_IDLE_SECONDS
+        while True:
+            conn, reused = _pool_take(host, port, timeout, max_idle)
+            try:
+                conn.request(method, path, body=data, headers=hdrs)
+            except (OSError, http.client.HTTPException) as error:
+                conn.close()
+                if reused:  # the server had closed it; nothing of this request was taken: once more, on a fresh one
+                    HTTP_STATS["retried"] += 1
+                    continue
+                raise _net_error(error) from None
+            try:
+                response = conn.getresponse()
+            except (OSError, http.client.HTTPException) as error:
+                conn.close()
+                if reused and data is None:  # a GET the closed connection swallowed: again; a POST may have been taken
+                    HTTP_STATS["retried"] += 1
+                    continue
+                raise _net_error(error) from None
+            break
+        status = response.status
+        try:
+            if status >= 400:
+                raw = b""
+                with contextlib.suppress(Exception):
+                    raw = response.read(4096)
+                raise _remote_error(host, status, response.getheader("Retry-After"), raw, response.getheader("Content-Encoding") or "")
+            location = response.getheader("Location")
+            if 300 <= status < 400 and location and data is None:
+                with contextlib.suppress(Exception):
+                    _read_body(response, timeout)  # drained: the connection stays usable
+                if response.will_close:
+                    conn.close()
+                else:
+                    _pool_put(host, port, conn)
+                url = urllib.parse.urljoin(url, location)
+                split = urllib.parse.urlsplit(url)
+                if split.scheme != "https" or not split.hostname:
+                    return _http_urllib(url, data, hdrs, timeout, split.hostname or "")
+                host, port = split.hostname, split.port or 443
+                path = (split.path or "/") + (f"?{split.query}" if split.query else "")
+                continue
+            raw = _read_body(response, timeout)
+        except RemoteError:
+            conn.close()
+            raise
+        except (OSError, http.client.HTTPException) as error:
+            conn.close()
+            raise _net_error(error) from None
+        if response.will_close:
+            conn.close()
+        else:
+            _pool_put(host, port, conn)
+        return _inflate(raw, response.getheader("Content-Encoding") or "")
+    raise RemoteError("网络错误 (重定向过多)")
 
 
 def _read_body(response: Any, timeout: float) -> bytes:
@@ -14643,6 +14776,10 @@ class Bot:
     def diag_state(self, now_ms: int) -> list[str]:
         """What the running bot currently holds: background refresh health and derived values."""
         lines = []
+        st = HTTP_STATS
+        if st["new"] or st["reused"]:
+            total = st["new"] + st["reused"]
+            lines.append(f"🔌 HTTP 连接：新建 {st['new']}｜复用 {st['reused']}（{st['reused'] * 100 // max(total, 1)}%）｜对方已关、换新连接重发 {st['retried']} 次")
         if self.reference_state:
             lines.append("🔄 后台刷新")
             for name, _ in self.reference_jobs():
