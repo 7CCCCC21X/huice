@@ -237,7 +237,8 @@ async def run():
         def fake_open(req, timeout=15, context=None):
             raise urllib.error.HTTPError(req.full_url, code, "x", {"Content-Type": "application/json"}, io.BytesIO(json.dumps(body).encode()))
         return fake_open
-    real_open = m.urllib.request.urlopen
+    real_open, proxied = m.urllib.request.urlopen, m._proxied
+    m._proxied = lambda host: True  # the urllib path (the fake is urlopen), whatever this machine's proxy settings; the mapping is shared with the kept-alive path (tests/test_http.py)
     try:
         for url, code, body, want in (("https://api.predict.fun/v1/orders", 400, {"message": "order must have a value of at least 0.9 USD"}, "HTTP 400: order must have a value of at least 0.9 USD"),
                                       ("https://api.predict.fun/v1/orders", 403, {"message": "Forbidden"}, "HTTP 403: Forbidden（Predict 不向受限地区开放交易"),
@@ -250,7 +251,7 @@ async def run():
             except m.RemoteError as error:
                 assert str(error).startswith(want), (url, str(error))
     finally:
-        m.urllib.request.urlopen = real_open
+        m.urllib.request.urlopen, m._proxied = real_open, proxied
 
     # --- Binance spot: a rate limit pauses every spot request; a plain failure still moves to the next host ---------------
     calls = []

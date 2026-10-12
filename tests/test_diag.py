@@ -118,12 +118,13 @@ async def run():
 
     # the raw network reason survives into RemoteError (was just "URLError" before)
     import urllib.error, urllib.request
-    saved = urllib.request.urlopen
+    saved, proxied = urllib.request.urlopen, m._proxied
     def refuse(*a, **k): raise urllib.error.URLError("Tunnel connection failed: 403 Forbidden")
     urllib.request.urlopen = refuse
+    m._proxied = lambda host: True  # a proxy's refusal: the urllib path, whatever this machine's proxy settings (1.62.0 keeps connections alive otherwise)
     try: m._http_get("https://example.invalid/"); assert False
     except m.RemoteError as e: assert str(e) == "网络错误 (URLError: Tunnel connection failed: 403 Forbidden)", e
-    urllib.request.urlopen = saved
+    urllib.request.urlopen, m._proxied = saved, proxied
     # GBK answers (Sina/Tencent) are shown readably, not as mojibake
     assert "富时中国A50期货" in m.raw_snippet('var hq_str_hf_CHA50CFD="1,,2026-09-26,富时中国A50期货";'.encode("gbk"))
     assert m.raw_snippet("上证指数".encode("utf-8")) == "上证指数"
