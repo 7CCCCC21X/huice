@@ -629,6 +629,24 @@ async def run():
                                 "amount": str(1 * WEI)})
     bot.store.delete_keys(["live:redeemed:101:2"])
     assert await bot.live_redeem(CLOSE + 72 * 60_000) == [] and "领取" in bot.live_errors[-1] and bot.store.get("live:redeemed:101:2") is None
+    # 1.64.0: a failed position waits an hour; no BNB for gas: one note, no attempt; the auto-redeem runs beside the step
+    n = len(bot.live_errors); bot.live.chain.fail = ""
+    assert await bot.live_redeem(CLOSE + 72 * 60_000 + 10_000) == [] and len(bot.live_errors) == n and len(bot.live.chain.redeemed) == 1, "backed off"
+    bot.live_redeem_failed.clear()
+    bot.live.chain.bnb = 10 ** 13
+    await bot.live.refresh_balance()
+    assert await bot.live_redeem(CLOSE + 72 * 60_000 + 20_000) == [] and len(bot.live.chain.redeemed) == 1 and "BNB 不足 0.0005" in bot.live_errors[-1]
+    n = len(bot.live_errors)
+    assert await bot.live_redeem(CLOSE + 72 * 60_000 + 30_000) == [] and len(bot.live_errors) == n, "said once an hour"
+    bot.live.chain.bnb = 10 ** 17
+    await bot.live.refresh_balance()
+    bot.config = dataclasses.replace(bot.config, live_auto_redeem=True)
+    bot.live_last_redeem = -1e9
+    await bot.live_sync(CLOSE + 72 * 60_000 + 40_000)  # (before the 73rd minute: the scenario below counts on the sync times)
+    assert bot.live_redeem_task is not None and len(bot.live.chain.redeemed) == 1, "the round runs beside the step"
+    await bot.live_redeem_task
+    assert len(bot.live.chain.redeemed) == 2 and bot.store.get("live:redeemed:101:2")["tx"] == "0xredeem"
+    bot.config = dataclasses.replace(bot.config, live_auto_redeem=False)
     # the sync step never stops the paper trader: an API failure is a line in /live
     fake.fail_open = "HTTP 500: down"
     fake.markets["111"] = market_json("111")

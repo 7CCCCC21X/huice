@@ -614,7 +614,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | `LIVE_MAX_ORDER_USD` | `100` | 单笔上限（价格 × 份数） |
 | `LIVE_MAX_OPEN_USD` | `500` | 持仓 + 挂单按成本的上限 |
 | `LIVE_MAX_DAILY_LOSS_USD` | `200` | 当日已结算亏损达到即停止开新仓并撤挂单；0 不限 |
-| `LIVE_AUTO_REDEEM` | `on` | 自动在链上领取已结算的赢方份额 |
+| `LIVE_AUTO_REDEEM` | `on` | 自动在链上领取已结算的赢方份额（每 10 分钟看一次，在交易一步之外进行；领取失败的持仓一小时后再试；签名钱包 BNB 不足 0.0005 时不尝试、每小时提醒一次，充值后自动恢复） |
 | `LIVE_NOTIFY` | `on` | 真实订单的 Telegram 通知 |
 | `WEB_CONTROL_KEY` | 空 | 网页控制台口令，见下一节 |
 

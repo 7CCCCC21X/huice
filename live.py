@@ -915,6 +915,8 @@ class LiveBot(core.Bot):
     LIVE_BALANCE_SECONDS = 60   # the USDT / BNB balances are re-read this often while trading
     LIVE_APPROVALS_SECONDS = 600
     LIVE_REDEEM_SECONDS = 600   # resolved positions are looked for this often
+    LIVE_REDEEM_RETRY_SECONDS = 3600  # a position whose redeem failed (gas, a revert) is tried again after this long, not every look
+    LIVE_REDEEM_MIN_BNB_WEI = 5 * 10 ** 14  # under 0.0005 BNB no redeem goes out (one costs about 0.0002): one note, not a failure per position
     LIVE_NOTE_SECONDS = 600     # the same failure is announced at most this often
     LIVE_PLACING_GRACE_MS = 120_000  # a record left in "placing" is reconciled by its hash after this long
     LIVE_IDLE_LIST_MS = 60_000      # the open-order list is re-read this often even with nothing in flight (orders this bot did not place)
@@ -936,6 +938,10 @@ class LiveBot(core.Bot):
         self.live_last_sync = 0.0
         self.live_last_redeem = -1e9
         self.live_last_balance = -1e9
+        self.live_redeem_task: asyncio.Task | None = None   # the auto-redeem round, beside the step (chain calls never hold a decision)
+        self.live_account_task: asyncio.Task | None = None  # the balances / approvals refresh, likewise
+        self.live_redeem_failed: dict[str, float] = {}      # position key -> monotonic time its redeem failed
+        self.live_gas_noted = -1e9
         self.live_last_signin = -1e9
         self.live_positions: tuple[list[dict], float] = ([], 0.0)
         self.live_errors: list[str] = []  # the latest failures, newest last, for /live
@@ -1198,11 +1204,10 @@ class LiveBot(core.Bot):
             return
         if time.monotonic() - self.live_last_balance >= self.LIVE_BALANCE_SECONDS:
             self.live_last_balance = time.monotonic()
-            with contextlib.suppress(Exception):
-                await self.live.refresh_balance()
-            if time.monotonic() - self.live.approvals_mono >= self.LIVE_APPROVALS_SECONDS or not self.live.approvals:
-                with contextlib.suppress(Exception):
-                    await self.live.refresh_approvals()
+            if self.live.balance is None or not self.live.approvals:  # never read: the step needs them now (the balance gate, the approvals)
+                await self.live_account_round()
+            elif self.live_account_task is None or self.live_account_task.done():
+                self.live_account_task = asyncio.create_task(self.live_account_round(), name="live-account")  # beside the step: chain reads never hold a decision
         c, trades = self.config, self.sim_trades()
         wanted, self.live_wanted = list(self.live_wanted), set()
         for mk in self.sim_markets(now_ms):
@@ -1232,6 +1237,14 @@ class LiveBot(core.Bot):
                 self.live_market_retry[mid] = time.monotonic() + self.LIVE_MARKET_RETRY_SECONDS  # again in a minute, not every step
                 self.live_note_error(f"市场 {mid} 详情读取失败：{core.clean_error(error) or type(error).__name__}")
         await asyncio.gather(*(read(mid) for mid in due[:5]))  # side by side (the API gate bounds them), not one after another
+
+    async def live_account_round(self) -> None:
+        """The balances, and now and then the approvals (chain reads of a second or two each)."""
+        with contextlib.suppress(Exception):
+            await self.live.refresh_balance()
+        if time.monotonic() - self.live.approvals_mono >= self.LIVE_APPROVALS_SECONDS or not self.live.approvals:
+            with contextlib.suppress(Exception):
+                await self.live.refresh_approvals()
 
     async def live_ensure_ready(self) -> None:
         """Sign in (and check the account) when not ready, at most once a minute."""
@@ -1410,12 +1423,17 @@ class LiveBot(core.Bot):
             return
         if active or now_ms - self.live_list_at_ms >= self.LIVE_IDLE_LIST_MS:
             await self.live_sync_orders(active, now_ms)  # with nothing in flight the list is still read now and then: orders this bot did not place
-        if self.config.live_auto_redeem and time.monotonic() - self.live_last_redeem >= self.LIVE_REDEEM_SECONDS:
+        if (self.config.live_auto_redeem and time.monotonic() - self.live_last_redeem >= self.LIVE_REDEEM_SECONDS
+                and (self.live_redeem_task is None or self.live_redeem_task.done())):
             self.live_last_redeem = time.monotonic()
-            try:
-                await self.live_redeem(now_ms)
-            except Exception as error:
-                self.live_note_error(f"领取结算失败：{core.clean_error(error) or type(error).__name__}")
+            # beside the step: a round of chain calls (a dozen positions failing on gas took 25 s) never holds the next decision
+            self.live_redeem_task = asyncio.create_task(self.live_redeem_round(now_ms), name="live-redeem")
+
+    async def live_redeem_round(self, now_ms: int) -> None:
+        try:
+            await self.live_redeem(now_ms)
+        except Exception as error:
+            self.live_note_error(f"领取结算失败：{core.clean_error(error) or type(error).__name__}")
 
     async def live_sync_orders(self, active: dict[str, dict], now_ms: int) -> None:
         try:
@@ -1732,10 +1750,13 @@ class LiveBot(core.Bot):
     # --- redeeming resolved positions -------------------------------------------------------------------------------------
     async def live_redeem(self, now_ms: int) -> list[str]:
         """Positions on markets Predict has resolved: the winning outcome's shares are redeemed for USDT on-chain
-        (once per market and outcome); the lines say what was done."""
+        (once per market and outcome); the lines say what was done. A position whose redeem failed waits
+        LIVE_REDEEM_RETRY_SECONDS; with no BNB for gas nothing is tried and the administrator hears once."""
         rows = await self.live.api.positions()
         self.live_positions = (rows, time.time())
         done = []
+        balance = self.live.balance
+        low_gas = balance is not None and int(balance[1]) < self.LIVE_REDEEM_MIN_BNB_WEI
         for row in rows:
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
             outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
@@ -1748,7 +1769,7 @@ class LiveBot(core.Bot):
                 continue
             index_set = int(outcome.get("indexSet") or 0)
             key = f"live:redeemed:{mid}:{index_set}"
-            if self.store.get(key):
+            if self.store.get(key) or time.monotonic() - self.live_redeem_failed.get(key, -1e9) < self.LIVE_REDEEM_RETRY_SECONDS:
                 continue
             try:
                 raw = await self.live.api.market(mid)
@@ -1761,10 +1782,16 @@ class LiveBot(core.Bot):
             won = resolved.get("split") or (resolved.get("index") is not None and index_set == int(resolved["index"]) + 1)
             if not won or not info.condition_id:
                 continue
+            if low_gas:
+                if time.monotonic() - self.live_gas_noted >= self.LIVE_REDEEM_RETRY_SECONDS:
+                    self.live_gas_noted = time.monotonic()
+                    self.live_note_error("⛽ 签名钱包的 BNB 不足 0.0005，有已结算的持仓等着领取：暂不自动领取，充值 BNB 后自动恢复")
+                return done
             try:
                 tx = await self.live.chain.redeem(info.condition_id, index_set, amount, info.neg_risk, info.yield_bearing)
             except Exception as error:
-                self.live_note_error(f"领取 {market.get('title') or mid} 失败：{core.clean_error(error) or type(error).__name__}")
+                self.live_redeem_failed[key] = time.monotonic()
+                self.live_note_error(f"领取 {market.get('title') or mid} 失败：{core.clean_error(error) or type(error).__name__}（一小时后再试）")
                 continue
             self.store.put(key, {"at": now_ms, "tx": tx, "amount": str(amount), "title": str(market.get("title") or "")})
             line = f"💵 已领取 {market.get('title') or mid} {outcome.get('name') or ''} {from_wei(amount):g} 份：{tx}"

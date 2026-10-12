@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.63.0"
+VERSION = "1.64.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -886,7 +886,8 @@ def http_error_text(body: Any) -> str:
 KEEPALIVE_IDLE_SECONDS = 25.0       # a pooled connection unused this long is dropped (servers close idle ones around a minute)
 KEEPALIVE_POST_IDLE_SECONDS = 3.0   # a request with a body reuses only a connection used this recently (a stale one could
                                     # swallow it, and it is never sent again)
-KEEPALIVE_PER_HOST = 8              # pooled connections per host (Telegram's long poll holds one for half a minute)
+KEEPALIVE_PER_HOST = 24             # pooled connections per host: at least PREDICT_PARALLEL, or every round opens the rest anew
+                                    # (Telegram's long poll holds one for half a minute)
 HTTPS_CONNECTION = http.client.HTTPSConnection  # (the tests put a fake here)
 _POOL: dict[tuple[str, int], list[tuple[Any, float]]] = {}  # (host, port) -> [(connection, last used, monotonic)], oldest first
 _POOL_LOCK = threading.Lock()
@@ -15123,7 +15124,7 @@ class Bot:
             state["error_at"] = now
 
     def start_reference_tasks(self) -> None:
-        self.reference_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="reference")
+        self.reference_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="reference")  # the feeds' faster cadences, and /diag's burst
         self.reference_tasks = [asyncio.create_task(self.reference_loop(name, job), name=f"reference:{name}")
                                 for name, job in self.reference_jobs()]
 
