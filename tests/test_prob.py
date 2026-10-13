@@ -50,8 +50,26 @@ assert m.intraday_share([None] + closes[1:], closes)[0] == m.INTRADAY_SHARE_BOUN
 book.record("X", closes, "指数日K", opens)
 full, _ = book.get("X", "sh"); part, note = book.get("X", "sh", intraday=True)
 assert abs(part - full * math.sqrt(share)) < 1e-12 and f"盘中取 {share * 100:.0f}% 方差（20 日开盘跳空已扣除）" in note, note
-book.record("X", closes, "指数日K"); assert book.get("X", "sh", intraday=True) == book.get("X", "sh")  # no opens: unchanged
+book.record("X", closes, "指数日K"); part, note = book.get("X", "sh", intraday=True)  # no opens: the prior share (1.70.0), named as such
+assert abs(part - book.get("X", "sh")[0] * math.sqrt(0.65)) < 1e-12 and "盘中按先验取 65% 方差（开盘跳空历史不足，先验扣除）" in note, note
 book.shares["HSI"] = (0.64, 30); assert abs(book.get("HSI", "HSI", intraday=True)[0] - 0.012 * 0.8) < 1e-12  # manual σ too
+assert abs(m.VolBook({}).get("HSI", "HSI", intraday=True)[0] - 0.013 * math.sqrt(0.55)) < 1e-12 and m.VolBook({}).get("HSI", "HSI")[0] == 0.013
+# 1.70.0: the bars are saved and come back after a restart (while young); a failed read is retried in 10 minutes, its reason shown
+st = m.Store(":memory:")
+saved = m.VolBook({}, st)
+saved.record("X", closes, "指数日K", opens)
+rec = st.get("vol:X"); assert rec["source"] == "指数日K" and len(rec["closes"]) == 21 and rec["opens"][0] is None and rec["opens"][1] == str(opens[1]), rec
+again = m.VolBook({}, st)
+assert again.load() == 1 and again.estimates["X"][1:] == (20, "指数日K") and abs(again.shares["X"][0] - 0.5) < 1e-9 and again.due("X"), "restored, and due for a fresh read"
+assert again.get("X", "sh", intraday=True) == saved.get("X", "sh", intraday=True)
+st.put("vol:X", {**rec, "at": rec["at"] - m.VOL_KEEP_SECONDS - 1})
+assert m.VolBook({}, st).load() == 0, "too old after a restart: the prior"
+again.failed("X", "网络错误 (TimeoutError)")
+assert not again.due("X") and m.time.monotonic() - again.refreshed["X"] > again.REFRESH_SECONDS - m.VOL_RETRY_SECONDS - 1
+assert "指数日K 20 日" in again.get("X", "sh")[1], "the bars in hand stand"
+empty = m.VolBook({}); empty.failed("Y", "HTTP 500")
+assert "暂无历史（日K未取得：HTTP 500）" in empty.get("Y", "hk")[1] and not empty.due("Y")
+empty.record("Y", closes, "指数日K"); assert "Y" not in empty.errors and empty.due("Y") is False
 # today's daily bar is not a finished day until 15 minutes after the close
 bars = [(dt.date(2026, 9, 23), D(1)), (dt.date(2026, 9, 28), D(2))]
 assert m.finished_bars(bars, "kr", kr(2026, 9, 28, 12, 30)) == bars[:1] and m.finished_bars(bars, "kr", kr(2026, 9, 28, 15, 44)) == bars[:1]
@@ -220,10 +238,50 @@ async def hsi():
     bot.hsi.quote = m.FuturesQuote("x", D("24600"), D("24691"), None, None, None, bj(2026, 9, 28, 10, 0), "etnet", D("24600"), "etnet", D("24510.09"))
     o = bot.hsi_odds(bj(2026, 9, 28, 10, 0))
     assert o.ref == D("24510.09") and o.effective == D("24600") and o.target == dt.date(2026, 9, 28) and abs(o.remaining - 300 / 330) < 1e-9 and o.fair_up > 0.5, o
-    assert o.ref_note == "09-25 收盘" and o.sigma_daily == 0.00979369, o  # dated reference; no open data: full σ
+    assert o.ref_note == "09-25 收盘" and abs(o.sigma_daily - 0.00979369 * math.sqrt(0.55)) < 1e-12 and "盘中按先验取 55% 方差" in o.sigma_note, o  # no open data: the prior share (1.70.0)
     bot.vols.shares["HSI"] = (0.64, 39)
     o = bot.hsi_odds(bj(2026, 9, 28, 10, 0)); assert abs(o.sigma_daily - 0.00979369 * 0.8) < 1e-12 and "盘中取 64% 方差" in o.sigma_note, o
     bot.hsi.quote = m.FuturesQuote("恒指期货(09/2026)夜市", D("24501"), D("24504"), None, None, None, bj(2026, 9, 25, 20, 59), "etnet", D("24510.09"), "etnet", D("24760"))
     assert bot.hsi_odds(now).sigma_daily == 0.00979369  # after hours the next opening gap is still ahead: full σ
+    # 1.70.0: the index history falls back to Yahoo when Tencent fails; a window whose sources all fail is retried in 10 minutes
+    days = []
+    d = dt.date(2026, 9, 24)
+    while len(days) < 45:
+        if d.weekday() < 5:
+            days.append(d)
+        d -= dt.timedelta(days=1)
+    days.reverse()
+    hk = dt.timezone(dt.timedelta(hours=8))
+    stamps = [int(dt.datetime(x.year, x.month, x.day, 9, 30, tzinfo=hk).timestamp()) for x in days]
+    yahoo = {"chart": {"result": [{"meta": {"gmtoffset": 28800}, "timestamp": stamps,
+                                   "indicators": {"quote": [{"open": [24000 + 10 * i for i in range(45)],
+                                                             "close": [24000 + 10 * i + (5 if i % 2 else -5) for i in range(45)]}]}}]}}
+    calls = []
+
+    async def fake_fetch(url, headers=None, *a, **k):
+        calls.append(url)
+        if "finance.yahoo.com" in url and "%5EHSI" in url:
+            return json.dumps(yahoo).encode()
+        raise m.RemoteError("网络错误 (TimeoutError)")
+    saved_fetch, m.fetch_source = m.fetch_source, fake_fetch
+    override = bot.vols.overrides.pop("HSI")  # PROB_VOL pins σ and skips the history: the read is for a bot without it
+    try:
+        for table in (bot.vols.estimates, bot.vols.shares, bot.vols.refreshed, bot.vols.errors):
+            table.pop("HSI", None)
+        await bot.refresh_odds_inputs(now)
+        assert bot.vols.estimates["HSI"][1:] == (40, "指数日K") and "HSI" in bot.vols.shares and "HSI" not in bot.vols.errors, (bot.vols.estimates, bot.vols.errors)
+        assert any("hkHSI" in u for u in calls) and any("%5EHSI" in u for u in calls), calls
+        assert bot.store.get("vol:HSI")["source"] == "指数日K" and len(bot.store.get("vol:HSI")["closes"]) == 41
+        bot.vols.refreshed.pop("HSI", None)
+
+        async def all_fail(url, *a, **k):
+            raise m.RemoteError("网络错误 (TimeoutError)")
+        m.fetch_source = all_fail
+        await bot.refresh_odds_inputs(now)
+        assert bot.vols.estimates["HSI"][1] == 40 and "tencent: 网络错误" in bot.vols.errors["HSI"] and "yahoo: 网络错误" in bot.vols.errors["HSI"], bot.vols.errors
+        assert not bot.vols.due("HSI") and m.time.monotonic() - bot.vols.refreshed["HSI"] > bot.vols.REFRESH_SECONDS - m.VOL_RETRY_SECONDS - 1, "again in 10 minutes"
+    finally:
+        m.fetch_source = saved_fetch
+        bot.vols.overrides["HSI"] = override
     print("HSI_PROB_OK")
 asyncio.run(run()); asyncio.run(hsi())

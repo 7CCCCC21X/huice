@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.69.0"
+VERSION = "1.70.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4070,6 +4070,11 @@ def realised_vol(closes: list[D]) -> tuple[float, int]:
 
 INTRADAY_SHARE_BOUNDS = (0.3, 1.0)  # in-session share of the daily variance is clamped to this range
 INTRADAY_SHARE_MIN_DAYS = 10
+# the in-session share assumed until the bars say (by the σ prior's key): an index gaps overnight on the US close, so a
+# session holds about half of its day's variance; a single stock's own news lands in its session more often
+INTRADAY_SHARE_PRIOR = {"sh": 0.65, "sz": 0.65, "hk": 0.6, "kr": 0.6, "HSI": 0.55, "KOSPI": 0.6, "SSE": 0.65}
+VOL_KEEP_SECONDS = 3 * 86400  # the bars saved in the store serve after a restart while younger than this
+VOL_RETRY_SECONDS = 600       # a read of the bars that failed is tried again after this long, not after the refresh interval
 
 
 def intraday_share(opens: list[D | None], closes: list[D]) -> tuple[float, int] | None:
@@ -4092,31 +4097,65 @@ def intraday_share(opens: list[D | None], closes: list[D]) -> tuple[float, int] 
 
 
 class VolBook:
-    """Daily volatility per asset: manual override, else recent realised volatility blended with a prior."""
+    """Daily volatility per asset: manual override, else recent realised volatility blended with a prior. The bars
+    behind an estimate are saved in the store (vol:<key>) and come back after a restart (load), so a deploy does not
+    put the trader on the prior for hours; a read that failed is tried again in VOL_RETRY_SECONDS."""
     REFRESH_SECONDS = 6 * 3600
 
-    def __init__(self, overrides: dict[str, float]):
+    def __init__(self, overrides: dict[str, float], store: "Store | None" = None):
         self.overrides = dict(overrides)
+        self.store = store
         self.estimates: dict[str, tuple[float, int, str]] = {}   # key -> (sigma, n, source)
         self.shares: dict[str, tuple[float, int]] = {}           # key -> (in-session share of daily variance, n)
         self.refreshed: dict[str, float] = {}
+        self.errors: dict[str, str] = {}                         # key -> why the last read of its bars failed (the figures in hand stand)
 
     def due(self, key: str) -> bool:
         return key not in self.overrides and time.monotonic() - self.refreshed.get(key, -1e9) >= self.REFRESH_SECONDS
 
-    def record(self, key: str, closes: list[D], source: str, opens: list[D | None] | None = None) -> None:
+    def record(self, key: str, closes: list[D], source: str, opens: list[D | None] | None = None, save: bool = True) -> None:
         """closes oldest first, finished sessions only; opens (same days) split the variance into gap and session."""
         sigma, n = realised_vol(closes)
         self.estimates[key] = (sigma, n, source)
         self.refreshed[key] = time.monotonic()
+        self.errors.pop(key, None)
         share = intraday_share(opens, closes) if opens else None
         if share is None:
             self.shares.pop(key, None)
         else:
             self.shares[key] = share
+        if save and self.store is not None:
+            self.store.put(f"vol:{key}", {"closes": [str(c) for c in closes], "source": source, "at": time.time(),
+                                          "opens": [str(o) if o is not None else None for o in opens] if opens else None})
+
+    def load(self) -> int:
+        """The bars record saved (from before a restart), while younger than VOL_KEEP_SECONDS: the estimates stand
+        from the start, and every key is due for a fresh read at once. How many keys came back."""
+        if self.store is None:
+            return 0
+        back = 0
+        for full_key, rec in self.store.items("vol:"):
+            key = full_key.removeprefix("vol:")
+            if not isinstance(rec, dict) or time.time() - float(rec.get("at") or 0) > VOL_KEEP_SECONDS:
+                continue
+            try:
+                closes = [D(str(c)) for c in rec["closes"]]
+                opens = [D(str(o)) if o is not None else None for o in rec["opens"]] if rec.get("opens") else None
+                self.record(key, closes, str(rec.get("source") or ""), opens, save=False)
+            except (KeyError, TypeError, ValueError, decimal.InvalidOperation):
+                continue
+            self.refreshed.pop(key, None)
+            back += 1
+        return back
+
+    def failed(self, key: str, why: str) -> None:
+        """A read of the bars failed: the reason kept for the σ note, the next try in VOL_RETRY_SECONDS."""
+        self.errors[key] = why
+        self.refreshed[key] = time.monotonic() - self.REFRESH_SECONDS + VOL_RETRY_SECONDS
 
     def get(self, key: str, prior_key: str, intraday: bool = False) -> tuple[float, str]:
-        """Daily close-to-close σ. intraday=True: only the in-session part (today's opening gap has happened)."""
+        """Daily close-to-close σ. intraday=True: only the in-session part (today's opening gap has happened) — the
+        share the bars show, or until they do the prior share (INTRADAY_SHARE_PRIOR), never the whole day's."""
         if key in self.overrides:
             sigma, note = self.overrides[key], "PROB_VOL 手动设定"
         else:
@@ -4124,12 +4163,17 @@ class VolBook:
             est, n, source = self.estimates.get(key, (0.0, 0, ""))
             if n < 2:
                 sigma, note = prior, f"先验 {prior * 100:.1f}%，暂无历史"
+                if self.errors.get(key):
+                    note += f"（日K未取得：{brief_error(self.errors[key], 50)}）"
             else:
                 sigma = math.sqrt((n * est ** 2 + PRIOR_WEIGHT * prior ** 2) / (n + PRIOR_WEIGHT))
                 note = f"{source} {n} 日 {est * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
         share = self.shares.get(key)
         if intraday and share is not None:
             return sigma * math.sqrt(share[0]), f"{note}；盘中取 {share[0] * 100:.0f}% 方差（{share[1]} 日开盘跳空已扣除）"
+        if intraday and INTRADAY_SHARE_PRIOR.get(prior_key):
+            assumed = INTRADAY_SHARE_PRIOR[prior_key]
+            return sigma * math.sqrt(assumed), f"{note}；盘中按先验取 {assumed * 100:.0f}% 方差（开盘跳空历史不足，先验扣除）"
         return sigma, note
 
 
@@ -10249,7 +10293,9 @@ class Bot:
             self.web_token = secrets.token_urlsafe(18)
             self.store.put("web_token", self.web_token)
         self.web: WebServer | None = None
-        self.vols = VolBook(config.prob_vol)
+        self.vols = VolBook(config.prob_vol, self.store)
+        if restored := self.vols.load():
+            LOG.info("波动率历史已从数据库恢复：%d 个标的", restored)
         self.predict = PredictFeed(config)
         self.predict.on_update = self.sim_express  # a market's book in: its taker decided at once (1.66.0)
         self.hsi_daily = DailyCloses("hk", (
@@ -10944,15 +10990,20 @@ class Bot:
             self.vols.refreshed["SSE"] = time.monotonic()
             done = finished_bars(self.cn.bars, "sh", now_ms)
             self.vols.record("SSE", [close for _, close in done], "上证日K", [self.cn.opens.get(day) for day, _ in done])
-        # Index volatility: KOSPI from Naver; HSI from Tencent, else Eastmoney. One attempt per window.
-        sources = {"KOSPI": (("https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=40&symbol=KOSPI", "naver"),),
+        # Index volatility: KOSPI from Naver, else Yahoo; HSI from Tencent, else Yahoo, else Eastmoney. One attempt per
+        # window; a window whose every source failed is tried again in VOL_RETRY_SECONDS (the bars in hand, or the
+        # prior, stand meanwhile)
+        sources = {"KOSPI": (("https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=40&symbol=KOSPI", "naver"),
+                             (yahoo_url("^KS11", "3mo"), "yahoo")),
                    "HSI": (("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=hkHSI,day,,,40,", "tencent"),
+                           (yahoo_url("^HSI", "3mo"), "yahoo"),
                            ("https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=40"
                             "&fields1=f1&fields2=f51,f52,f53&secid=100.HSI", "eastmoney"))}
         for key, urls in sources.items():
             if not self.vols.due(key):
                 continue
             self.vols.refreshed[key] = time.monotonic()
+            failures = []
             for url, kind in urls:
                 try:
                     raw = await fetch_source(url)
@@ -10961,14 +11012,19 @@ class Bot:
                         days = json.loads(raw)["data"]["hkHSI"]
                         bars = [(dt.date.fromisoformat(r[0]), _open_price(r[1]), number(r[2], "收盘"))
                                 for r in (days.get("day") or days.get("qfqday") or []) if len(r) > 2]
+                    elif kind == "yahoo":
+                        bars = parse_yahoo_daily(raw)
                     else:
                         bars = parse_daily_ohlc(market, raw)
-                    bars = finished_bars(sorted(bars, key=lambda bar: bar[0]), market, now_ms)  # today's bar is still moving
+                    bars = finished_bars(sorted(bars, key=lambda bar: bar[0]), market, now_ms)[-41:]  # today's bar is still moving; 40 returns
                     if len(bars) > 2:
                         self.vols.record(key, [c for _, _, c in bars], "指数日K", [o for _, o, _ in bars])
                         break
-                except Exception:
-                    continue
+                    failures.append(f"{kind}: 日 K 不足")
+                except Exception as error:
+                    failures.append(f"{kind}: {clean_error(error) or type(error).__name__}")
+            else:
+                self.vols.failed(key, "；".join(failures))
         self.record_predictions(now_ms)
         return refreshed([f"A50 锚点：{self.a50_anchor_error}" if self.config.sse_index and self.a50_anchor_error else "",
                           f"KR200 锚点：{self.kospi_anchor_error}" if self.config.kospi_index and self.kospi_anchor_error else ""], 1)
