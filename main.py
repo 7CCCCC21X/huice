@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.65.2"
+VERSION = "1.66.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4560,6 +4560,8 @@ class PredictFeed:
         self.refreshed = -1e9
         self.key_refreshed: dict[str, float] = {}                # item key -> monotonic time of its last refresh (the cold cadence)
         self.cold_task: asyncio.Task | None = None               # the cold keys' round, running beside the hot one
+        self.on_update: Any = None                               # async callback(key) once a key's books are stored: the trader's express lane
+        self.express_tasks: set = set()
         self.gate = asyncio.Semaphore(PREDICT_PARALLEL)          # requests in flight, on Predict's own pool
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
 
@@ -4785,12 +4787,21 @@ class PredictFeed:
         if key in self.ladder_pick:
             rows = self.ladder_pick[key](rows, self.market_meta)
         self.ladders[key] = sorted(rows, key=lambda row: row.target)
+        self.updated(key)
         failed = [row for row in rows if row.error and not self.book_absent(row)]  # no book at all is an answer, not a failure
         if failed:
             which = "、".join(brief_error(row.title or str(row.target), 14) for row in failed[:3]) + ("…" if len(failed) > 3 else "")
             self.errors[key] = f"{len(failed)}/{len(rows)} 档盘口刷新失败（{which}：{brief_error(failed[0].error, 60)}）；显示上次盘口"
         else:
             self.errors.pop(key, None)
+
+    def updated(self, key: str) -> None:
+        """A key's books just came in: the trader's express lane looks at that market now, beside the round."""
+        if self.on_update is None:
+            return
+        task = asyncio.create_task(self.on_update(key), name=f"express:{key}")
+        self.express_tasks.add(task)
+        task.add_done_callback(self.express_tasks.discard)
 
     async def refresh_cold(self, due: dict[str, str]) -> None:
         """The cold keys' round (refresh): marked as refreshed first, so a slow round is not started twice."""
@@ -4834,6 +4845,7 @@ class PredictFeed:
             bids, asks, _ = await self.orderbook(market)
             self.books[key] = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
             self.errors.pop(key, None)
+            self.updated(key)
         except (RemoteError, TimeoutError, OSError) as error:
             self.errors[key] = clean_error(error) or type(error).__name__
 
@@ -10090,6 +10102,7 @@ class Bot:
         self.web: WebServer | None = None
         self.vols = VolBook(config.prob_vol)
         self.predict = PredictFeed(config)
+        self.predict.on_update = self.sim_express  # a market's book in: its taker decided at once (1.66.0)
         self.hsi_daily = DailyCloses("hk", (
             ("tencent", "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=hkHSI,day,,,10,"),
             ("eastmoney", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=10"
@@ -10115,6 +10128,10 @@ class Bot:
         self.sim_ran = -1e9  # monotonic time of the paper trader's last look
         self.sim_wake = False  # a round of books just came in, or a fair price moved: the next look does not wait for SIM_SECONDS
         self.fair_sig: tuple | None = None  # the fair prices as of the last feed refresh (note_job): a change wakes the trader
+        self.fair_sig_at = -1e9
+        self.sim_lock = asyncio.Lock()      # the step's decisions and the express lane never run side by side
+        self.sim_express_count = 0          # taker decisions made by the express lane (for /diag)
+        self.sim_step_ms: dict[str, int] = {}  # the last decision phase, by part (for /diag)
         self.sim_checked: dict[str, float] = {}  # market id -> monotonic time Predict was last asked for its result
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
         self.reference_pool: ThreadPoolExecutor | None = None
@@ -12891,12 +12908,23 @@ class Bot:
             return False
         self.sim_ran, self.sim_wake = time.monotonic(), False
         self.sim_note_closes()
+        async with self.sim_lock:  # never beside the express lane (sim_express): one set of decisions at a time
+            confirm = await self.sim_decide(now_ms)
+        await confirm
+        return Refreshed("ok")
+
+    async def sim_decide(self, now_ms: int) -> "asyncio.Task":
+        """One look at every market: the orders to open, then the records' fills, withdrawals, markouts and
+        settlements, saved in one transaction. The task confirming results with Predict is started first and returned
+        (its answers are applied when the caller awaits it)."""
+        t0 = time.monotonic()
         markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
         trades = self.sim_trades()
         # Predict's final words on the decided markets: asked now, answered while the decisions below are made (the
         # requests run on threads; a second of them no longer adds to the step)
         confirm = asyncio.create_task(self.sim_confirm(trades, now_ms))
         await asyncio.sleep(0)
+        t1 = time.monotonic()
         costs, bar = self.edge_costs(), self.config.sim_edge
         ways, kinds = self.config.sim_ways, self.config.sim_markets
         changed: list[tuple[str, dict]] = []  # written once, in one transaction
@@ -12919,34 +12947,8 @@ class Bot:
                             changed = [(new_tid if k == tid else k, t) for k, t in changed]
                         trades[tid] = self.sim_open(mk, side, now_ms, maker=maker)
                         changed.append((tid, trades[tid]))
-            bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
-            quotes = []
-            # SIM_TAKER_SESSION: a daily card after hours is priced from a proxy; its taker waits for the session
-            takers = ways != "maker" and not (self.config.sim_taker_session and mk.in_session is False and not self.sim_taker_after_hours(mk))
-            for side in ("up", "down") if takers else ():
-                fair = mk.fair_up if side == "up" else 1 - mk.fair_up
-                # the dearest price that still leaves the edge the trade is about (the card's error and SIM_EDGE_CENTS, after
-                # hours the after-hours bar, never over the after-hours price limit): every ask at or under it is bought, up
-                # to SIM_SHARES; nothing above it, however much is wanted
-                cap = self.sim_taker_cap(mk, side, bps)
-                room, _ = self.sim_taker_room(trades, mk, side)  # what this side may still take (SIM_TAKER_MAX_SHARES), 0 with an order in flight
-                q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
-                if q and q["got"] >= SIM_MIN_SHARES - 1e-9:  # under a share is dust, not a trade: the slot stays free
-                    quotes.append((round(fair - q["cost"], 4), side, q))
-            if quotes:
-                _, side, q = max(quotes, key=lambda x: x[0])
-                tid = f"{mk.market}|{side}|吃"
-                held = trades.get(tid)  # a finished taker record (a position, a lapsed order): it moves to tid#n, the slot takes the next buy
-                why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, q["cost"], q["got"], taker=q)
-                if why:
-                    self.sim_note_block(tid, mk, "吃" + mk.sides[0 if side == "up" else 1], q["cost"], why, now_ms)
-                else:
-                    if held is not None:
-                        new_tid = self.sim_rekey(tid, held)
-                        trades[new_tid] = trades.pop(tid)
-                        changed = [(new_tid if k == tid else k, t) for k, t in changed]
-                    trades[tid] = self.sim_open(mk, side, now_ms, taker=q)
-                    changed.append((tid, trades[tid]))
+            self.sim_take(mk, trades, now_ms, changed)
+        t2 = time.monotonic()
         opened, rekeys = {tid for tid, _ in changed}, []
         for tid, trade in trades.items():
             if trade.get("final") or tid in opened:
@@ -12984,14 +12986,74 @@ class Bot:
                     trade["confirm"] = "local"
             if json.dumps(trade, sort_keys=True, default=str) != before:
                 changed.append((tid, trade))
+        t3 = time.monotonic()
         for tid in rekeys:
             new_tid = self.sim_rekey(tid, trades[tid])
             trades[new_tid] = trades.pop(tid)
             changed = [(new_tid if k == tid else k, t) for k, t in changed]
         if changed:
             self.sim_save(changed)
-        await confirm
-        return Refreshed("ok")
+        self.sim_step_ms = {"盘口": int((t1 - t0) * 1000), "判断": int((t2 - t1) * 1000), "结算": int((t3 - t2) * 1000),
+                            "保存": int((time.monotonic() - t3) * 1000)}
+        return confirm
+
+    def sim_take(self, mk: SimMarket, trades: dict[str, dict], now_ms: int, changed: list) -> None:
+        """The taker decision on one market (the step's and the express lane's): the side with the most edge whose asks
+        under its cap can be bought now, past the quiet window and the group cap, opened under its slot (a finished
+        record there moves to tid#n); ``trades`` and ``changed`` are updated in place."""
+        bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
+        quotes = []
+        # SIM_TAKER_SESSION: a daily card after hours is priced from a proxy; its taker waits for the session
+        takers = self.config.sim_ways != "maker" and not (self.config.sim_taker_session and mk.in_session is False and not self.sim_taker_after_hours(mk))
+        for side in ("up", "down") if takers else ():
+            fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+            # the dearest price that still leaves the edge the trade is about (the card's error and SIM_EDGE_CENTS, after
+            # hours the after-hours bar, never over the after-hours price limit): every ask at or under it is bought, up
+            # to SIM_SHARES; nothing above it, however much is wanted
+            cap = self.sim_taker_cap(mk, side, bps)
+            room, _ = self.sim_taker_room(trades, mk, side)  # what this side may still take (SIM_TAKER_MAX_SHARES), 0 with an order in flight
+            q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
+            if q and q["got"] >= SIM_MIN_SHARES - 1e-9:  # under a share is dust, not a trade: the slot stays free
+                quotes.append((round(fair - q["cost"], 4), side, q))
+        if not quotes:
+            return
+        _, side, q = max(quotes, key=lambda x: x[0])
+        tid = f"{mk.market}|{side}|吃"
+        held = trades.get(tid)  # a finished taker record (a position, a lapsed order): it moves to tid#n, the slot takes the next buy
+        why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, q["cost"], q["got"], taker=q)
+        if why:
+            self.sim_note_block(tid, mk, "吃" + mk.sides[0 if side == "up" else 1], q["cost"], why, now_ms)
+            return
+        if held is not None:
+            new_tid = self.sim_rekey(tid, held)
+            trades[new_tid] = trades.pop(tid)
+            changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]
+        trades[tid] = self.sim_open(mk, side, now_ms, taker=q)
+        changed.append((tid, trades[tid]))
+
+    async def sim_express(self, key: str) -> None:
+        """The express lane (PredictFeed.on_update): a market's book just came in — when an ask under the taker's cap
+        is there, the order is decided now, under the step's lock but without the step (its settlements, markouts and
+        maker logic over every market), and in real trading sent at once (sim_express_after). Makers wait for the step."""
+        if not (self.config.sim and self.config.predict) or self.config.sim_ways == "maker":
+            return
+        now_ms = self.market.now_ms()
+        changed: list[tuple[str, dict]] = []
+        async with self.sim_lock:
+            trades = self.sim_trades()
+            for mk in self.sim_markets(now_ms):
+                if mk.key != key or mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
+                    continue
+                self.sim_take(mk, trades, now_ms, changed)
+            if changed:
+                self.sim_save(changed)
+                self.sim_express_count += 1
+        if changed:
+            await self.sim_express_after(now_ms)
+
+    async def sim_express_after(self, now_ms: int) -> None:
+        """What follows an express decision: nothing on paper (the fill is immediate); the real trader sends the order."""
+        return None
 
     def sim_url(self, trade: dict) -> str:
         return predict_url(trade.get("slug") or trade["market"].partition("#")[0], self.config.predict_ref)
@@ -14867,6 +14929,10 @@ class Bot:
                 busy = f"｜本轮进行中 {running:.0f}s" if running >= 1 else ""
                 phases = getattr(self, "live_step_ms", None) if name == "模拟交易" else None  # the real-trading step, by phase
                 detail = ("｜" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in phases.items())) if phases else ""
+                if name == "模拟交易" and self.sim_step_ms:
+                    detail += "（决策内：" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in self.sim_step_ms.items()) + "）"
+                if name == "模拟交易" and self.sim_express_count:
+                    detail += f"｜快车道吃单决定 {self.sim_express_count} 次"
                 lines.append(f"  {mark} {name}：{what}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{busy}{detail}{err}")
         else:
             lines.append("🔄 后台刷新：未启动（命令行诊断或测试环境）")
@@ -15055,6 +15121,9 @@ class Bot:
         the last round are at most a few seconds old — instead of at its next timer or book round."""
         if name not in self.WAKE_JOBS or not (self.config.sim and self.config.predict) or self.sim_wake:
             return
+        if time.monotonic() - self.fair_sig_at < 1.0:  # a dozen feeds tick every second: one look a second is enough
+            return
+        self.fair_sig_at = time.monotonic()
         try:
             sig = self.fair_signature(now_ms)
         except Exception as error:

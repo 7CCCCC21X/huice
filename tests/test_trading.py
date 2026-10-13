@@ -1335,6 +1335,21 @@ async def audit_fixes():
     await step(rbot2, NOW + 25_000, deep(NOW + 25_000))
     t = rbot2.sim_trades()
     assert t[rtid]["order"] == 50 and t[rtid]["live"]["want"]["shares"] == 50 and len([k for k in t if k.startswith(rtid)]) == 3  # the remainder under 250
+    # --- the express lane in real trading (1.66.0): the book came in, the taker goes out at once; the step never sends it again ---
+    xbot = make_bot(); await xbot.live_prepare()
+    xmk = hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)
+    world["markets"] = [xmk]
+    await xbot.live_prefetch(NOW)
+    orders = lambda calls: [c for c in calls if isinstance(c[1], dict) and isinstance(c[1].get("data"), dict) and "order" in c[1]["data"]]
+    n = len(xbot.live.api.calls)
+    await xbot.sim_express("HSI")
+    xt = xbot.sim_trades()[f"{HSI_SLUG}|up|吃"]
+    assert xt["live"]["state"] == "open" and len(orders(xbot.live.api.calls[n:])) == 1 and xbot.sim_express_count == 1, xbot.live.api.calls[n:]
+    assert any(e["what"].startswith("已下单 #") and "Predict 应答用时" in e["what"] for e in xt["live"]["events"]), xt["live"]["events"]
+    n = len(xbot.live.api.calls)
+    await step(xbot, NOW + 1_000, xmk)
+    sent = orders(xbot.live.api.calls[n:])
+    assert len(sent) == 1 and xbot.sim_trades()[f"{HSI_SLUG}|up|挂"]["live"]["state"] == "open", "the step sends the maker only"
     print("AUDIT_FIXES_OK")
 
 

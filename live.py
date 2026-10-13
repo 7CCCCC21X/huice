@@ -943,6 +943,7 @@ class LiveBot(core.Bot):
         self.live_redeem_failed: dict[str, float] = {}      # position key -> monotonic time its redeem failed
         self.live_gas_noted = -1e9
         self.live_step_ms: dict[str, int] = {}  # the last step's phases (预取 / 决策 / 下单 / 同步), for /diag
+        self.live_placing: set[str] = set()     # records whose order is being sent right now: the step and the express lane never both
         self.live_last_signin = -1e9
         self.live_positions: tuple[list[dict], float] = ([], 0.0)
         self.live_errors: list[str] = []  # the latest failures, newest last, for /live
@@ -1273,7 +1274,7 @@ class LiveBot(core.Bot):
         sending = []
         for tid, trade in trades.items():
             st = trade.get("live")
-            if isinstance(st, dict) and st.get("state") == "pending" and trade["status"] == "resting":
+            if isinstance(st, dict) and st.get("state") == "pending" and trade["status"] == "resting" and tid not in self.live_placing:
                 if hold := self.live_send_hold(now_ms):
                     self.live_defer(tid, trade, hold, now_ms)  # waits (pending) rather than failing: the condition passes by itself
                     continue
@@ -1345,6 +1346,25 @@ class LiveBot(core.Bot):
         return ""
 
     async def live_place(self, tid: str, trade: dict, now_ms: int) -> None:
+        """Build, sign and send the order of a pending record — once: the express lane and the step may both find it
+        pending within the same second."""
+        if tid in self.live_placing:
+            return
+        self.live_placing.add(tid)
+        try:
+            await self.live_place_order(tid, trade, now_ms)
+        finally:
+            self.live_placing.discard(tid)
+
+    async def sim_express_after(self, now_ms: int) -> None:
+        """An express decision in real trading: its order goes out now (the step's own placements skip it)."""
+        if self.config.live_mode != "off":
+            try:
+                await self.live_place_pending(now_ms)
+            except Exception as error:
+                self.live_note_error(f"快车道下单失败：{core.clean_error(error) or type(error).__name__}")
+
+    async def live_place_order(self, tid: str, trade: dict, now_ms: int) -> None:
         """Build, sign and send the order of a pending record. The hash is saved (state "placing") before the request
         goes out: a crash in between is reconciled by the hash, never by sending again."""
         st, want = trade["live"], trade["live"]["want"]
@@ -1372,7 +1392,9 @@ class LiveBot(core.Bot):
                       price_per_share=from_wei(amounts["price_per_share"]), usd_cap=from_wei(amounts["maker"]),
                       shares_requested=from_wei(amounts["amount"]))
             self.sim_save([(tid, trade)])
+            sent = time.monotonic()
             result = await self.live.api.create_order(body)
+            took = time.monotonic() - sent
         except Exception as error:
             text = core.clean_error(error) or type(error).__name__
             definite = isinstance(error, OrderRejected) or 400 <= http_status(error) < 500
@@ -1391,7 +1413,7 @@ class LiveBot(core.Bot):
             self.live_fail(tid, trade, f"下单失败：{text}", now_ms)
             return
         st.update(state="open", order_id=result["order_id"], placed_at=now_ms, code=result.get("code"))
-        st["events"].append({"at": now_ms, "what": f"已下单 #{result['order_id']}"})
+        st["events"].append({"at": now_ms, "what": f"已下单 #{result['order_id']}（Predict 应答用时 {took:.1f} 秒）"})
         api_hash = str(result.get("hash") or "").lower()
         if api_hash and api_hash != st["hash"]:  # Predict's own hash is what its reads answer to: tracked by that one
             st["events"].append({"at": now_ms, "what": f"Predict 返回的订单哈希与本地算的不同（{api_hash[:12]}… / {st['hash'][:12]}…），按它的跟踪"})

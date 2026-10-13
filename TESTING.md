@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.65.2
+版本：1.66.0
 
 ## 已完成
 
+- 1.66.0（吃单快车道）：别人挂错的卖单几秒内就会被吃掉，原来要等下一步（盘口一轮 + 定时器 + 整步的结算 / 挂单逻辑）才下单。现在 `PredictFeed.refresh_one` / `refresh_ladder` 存好一个键的盘口后立刻回调 `on_update(key)`（`updated()`，另起任务），`Bot.sim_express(key)` 在 `sim_lock` 下只对这个键的市场做吃单判断（`sim_take`，从 `sim_decide` 里抽出来、两边共用），有单就存并记 `sim_express_count`，真实交易里 `LiveBot.sim_express_after` 立刻 `live_place_pending`；挂单仍由整步决定。`sim_step` 拆成 `sim_step`（锁 + 核对）与 `sim_decide`（决策、成交、结算、保存），`live_place` 外层加 `live_placing` 守卫（同一记录绝不发两次），`live_place_order` 是原来的发单；订单事件写“Predict 应答用时 N 秒”。`note_job` 每秒最多算一次公平价签名。/diag 的“模拟交易”行多“决策内：盘口 / 判断 / 结算 / 保存”和“快车道吃单决定 N 次”。测试 `tests/test_sim.py` `faster`、`tests/test_predict.py`、`tests/test_trading.py`。
 - 1.65.2（决策阶段不再等 Predict 核对；KOSPI 开盘前照常出概率）：（1）`sim_step` 先把 `sim_confirm` 起成任务（`asyncio.sleep(0)` 让它把请求发出去），决策算完再 `await`，核对的网络时间与计算重叠；`sim_confirm` 对这一步里被挪动（`sim_rekey`）的记录跳过、下一轮再核。（2）`kospi_odds`：开盘前 Naver 的报价带当天日期、数值仍是上一收盘，原来按“基准停在今天、应为昨收”拒绝输出，07:20～09:00 KST 没有 KOSPI 概率；现在当天还没收盘、时间在当天开盘前时把报价当作上一收盘处理，照常用 HL KR200 代理出盘后概率。测试 `tests/test_kospi.py`。
 - 1.65.1（一步里的串行请求并行）：/diag 分阶段计时显示收盘后一步“决策 7.2s、下单 4.4s”：`sim_confirm` 对每个待确认市场逐个读 Predict 详情（每个约 1 秒），改为一次 `gather`；`live_place_pending` 逐张下单改为并行（风控判断仍逐张、带着全部待发记录算）。`/diag` 的探测改用自己的线程池（`diag_pool`，8 线程），探测耗时不再混入行情源的排队时间。
 - 1.65.0（关闭行情源）：`SOURCES_OFF`（`Config.sources_off`，逗号分隔的 eastmoney / sina / tencent / yahoo / naver / etnet，不认识的报错；控制台高级组“关闭的行情源”选择卡，当前只提供“关闭东方财富”）。`SourceHealth.off` 由 `Bot.__init__` / `apply_config` 维护：`order()` 先剔除关掉的源（所有走 `pick_quote` / `SOURCE_HEALTH.order` 的行情、日 K、波动率、现货源），`enabled()` 给恒指期货的 `read_families` 用，`disabled()` 让 A50 锚点查找改用新浪 5 分钟 K，`off_names()` 让 /diag 不再探测它们。测试 `tests/test_diag.py`、`tests/test_control.py`。

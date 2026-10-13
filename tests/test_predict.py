@@ -125,6 +125,13 @@ async def run():
     await bot.predict.cold_task
     assert any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:]), "cold, and due again"
     assert m.time.monotonic() - bot.predict.key_refreshed["CXMTUSDT"] < 5
+    # the feed tells the trader when a key's books are in (1.66.0: the express lane); a key without a book is not announced
+    seen_keys = []
+    async def hook(key): seen_keys.append(key)
+    bot.predict.on_update = hook; bot.predict.refreshed = -1e9
+    await bot.predict.refresh(targets); await asyncio.sleep(0.05)
+    assert "SSE" in seen_keys and "CXMTUSDT" in seen_keys and "HSI" not in seen_keys, seen_keys
+    bot.predict.on_update = None
     assert cfg.predict_cold_poll == 60 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_COLD_POLL_SECONDS": "80"}).predict_cold_poll == 80
     try:
         m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_COLD_POLL_SECONDS": "500"}); raise AssertionError("over PREDICT_STALE_MS")

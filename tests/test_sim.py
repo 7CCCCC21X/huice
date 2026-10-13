@@ -1307,16 +1307,35 @@ async def faster():
     assert "HSI" in seen["targets"]
     # a feed refresh that moved a fair price wakes the trader too (1.63.0); an unchanged one, or a feed the odds do not hang on, does not
     fbot.sim_wake, fbot.fair_sig = False, None
-    fbot.note_job("恒指期货", NOW)
+    fresh = lambda: setattr(fbot, "fair_sig_at", -1e9)  # (one look a second: the throttle is reset between these calls)
+    fresh(); fbot.note_job("恒指期货", NOW)
     assert fbot.sim_wake and fbot.fair_sig and ("pons#77", 0.3) in fbot.fair_sig  # the first signature counts as a change
     fbot.sim_wake = False
-    fbot.note_job("恒指期货", NOW)
+    fresh(); fbot.note_job("恒指期货", NOW)
     assert not fbot.sim_wake, "nothing moved"
     world["markets"][0] = hsi(0.71, [(0.55, 100)], [(0.62, 100)], NOW)
-    fbot.note_job("汇率", NOW)
+    fresh(); fbot.note_job("汇率", NOW)
     assert not fbot.sim_wake, "not a feed the fair prices hang on"
-    fbot.note_job("上证/A50", NOW)
+    fresh(); fbot.note_job("上证/A50", NOW)
     assert fbot.sim_wake and ("hang-seng-index-up-or-down-on-october-5-2026", 0.71) in fbot.fair_sig
+    fbot.sim_wake = False; fbot.note_job("上证/A50", NOW)
+    assert not fbot.sim_wake, "within the second: not looked at"
+    # the express lane (1.66.0): a market's book just came in -> its taker is decided now, without the step; makers wait
+    xbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                    "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}), m.Store(":memory:"), FM(NOW), None)
+    xbot.sim_markets = lambda now: world["markets"]
+    world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW)]
+    assert xbot.predict.on_update == xbot.sim_express
+    await xbot.sim_express("KOSPI")
+    assert not xbot.sim_trades() and xbot.sim_express_count == 0, "another key: nothing here"
+    await xbot.sim_express("HSI")
+    assert sorted(xbot.sim_trades()) == [f"{HSI_SLUG}|up|吃"] and xbot.sim_express_count == 1, sorted(xbot.sim_trades())
+    await xbot.sim_express("HSI")
+    assert xbot.sim_express_count == 1 and len(xbot.sim_trades()) == 1, "the slot is taken: nothing twice"
+    xbot.predict.updated("HSI"); await asyncio.sleep(0.05)  # the feed's hook schedules the same
+    assert xbot.sim_express_count == 1 and not xbot.predict.express_tasks
+    await step(xbot, NOW + 5_000)  # the step adds the maker and leaves the taker alone
+    assert sorted(xbot.sim_trades()) == [f"{HSI_SLUG}|up|吃", f"{HSI_SLUG}|up|挂"] and set(xbot.sim_step_ms) == {"盘口", "判断", "结算", "保存"}
     print("FASTER_OK")
 
 
