@@ -1019,8 +1019,8 @@ class LiveBot(core.Bot):
         held = self.live_backoff.get((mk.market, side))
         if held and time.monotonic() < held[0]:
             return f"{held[1]}，{int(held[0] - time.monotonic()) + 1} 秒后再试"
-        if any(t.get("market") == mk.market and t.get("side") == side and bool(t.get("maker")) == (taker is None)
-               and isinstance(t.get("live"), dict) and t["live"].get("state") in {"pending", "placing", "cancelling", "unknown"} for t in trades.values()):
+        if any(t.get("side") == side and bool(t.get("maker")) == (taker is None) and isinstance(t.get("live"), dict)
+               and t["live"].get("state") in {"pending", "placing", "cancelling", "unknown"} for t in core.trades_of_market(trades, mk.market)):
             return "这个市场这一边还有同类订单在发送中、撤单中或对账中，等它结束"  # a re-placed resting order waits for the old one's cancel
         if hold := self.live_send_hold(self.market.now_ms()):
             return hold  # no new risk on an account whose orders were not read lately

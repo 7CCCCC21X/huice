@@ -1282,8 +1282,8 @@ async def faster():
     assert await fbot.sim_step(NOW) is not False and fbot.sim_wake is False and m.time.monotonic() - fbot.sim_ran < 1
     # the feed's round: hot keys in, the trader woken
     seen = {}
-    async def fake_refresh(targets, force=False, hot=None):
-        seen["targets"], seen["hot"] = targets, hot
+    async def fake_refresh(targets, force=False, hot=None, hot_rows=None):
+        seen["targets"], seen["hot"], seen["rows"] = targets, hot, hot_rows
         return m.Refreshed("ok")
     fbot.predict.refresh = fake_refresh
     fbot.predict.slugs = {"HSI": HSI_SLUG, "PONS": "pons", "NIULAI": "niulai"}
@@ -1300,11 +1300,41 @@ async def faster():
     fbot.store.put("sim:niulai#5|up|吃", {"v": 2, "market": "niulai#5", "slug": "niulai", "item": "$牛来 市值 $1B", "kind": "ladder", "key": "NIULAI",
                                           "side": "up", "label": "吃Yes", "maker": False, "fair": 0.10, "opened": NOW, "settle": {"target": "1000000000", "end": NOW + 86_400_000},
                                           "price": 0.05, "shares": 100.0, "order": 100.0, "status": "filled", "filled": NOW, "fill_fair": 0.10, "edge": 0.05,
-                                          "fills": [], "revisions": []})  # a position: its ladder stays hot
-    assert fbot.predict_hot_keys(NOW) == {"HSI", "NIULAI"}
+                                          "fills": [], "revisions": []})  # a fresh position: its level stays hot (the markouts)
+    assert fbot.predict_hot_keys(NOW) == {"HSI", "NIULAI"} and fbot.predict_hot(NOW) == ({"HSI", "NIULAI"}, {"5"})
     fbot.sim_wake = False
     assert await fbot.refresh_books(NOW) == m.Refreshed("ok") and seen["hot"] == {"HSI", "NIULAI"} and fbot.sim_wake is True
-    assert "HSI" in seen["targets"]
+    assert "HSI" in seen["targets"] and seen["rows"] == {"5"}, "1.67.0: the hot levels go with the hot keys"
+    # per level (1.67.0): a position past its markout window no longer keeps its level hot; a resting order does; the
+    # other levels of a hot ladder are not hot (they follow the cold cadence, a few per round)
+    old = fbot.store.get("sim:niulai#5|up|吃")
+    fbot.store.put("sim:niulai#5|up|吃", {**old, "filled": NOW - 2 * 3600_000})
+    assert fbot.predict_hot(NOW) == ({"HSI"}, set())
+    fbot.store.put("sim:niulai#5|up|挂", {**old, "maker": True, "status": "resting", "shares": 0.0, "filled": None, "label": "挂Yes"})
+    world["markets"].append(m.SimMarket("niulai#6", "$牛来 市值 $2B", "ladder", "NIULAI", 0.05, book([(0.01, 100)], [(0.60, 100)], NOW, slug="niulai", key="NIULAI", mid="6"),
+                                        0.03, "", ("Yes", "No"), {"target": "2000000000", "end": NOW + 86_400_000}, {}))
+    assert fbot.predict_hot(NOW) == ({"HSI", "NIULAI"}, {"5"})
+    world["markets"][1] = pons(0.23)
+    assert fbot.predict_hot(NOW) == ({"HSI", "NIULAI", "PONS"}, {"5", "77"})
+    world["markets"].pop(); world["markets"][1] = pons(0.50)
+    fbot.store.delete_keys(["sim:niulai#5|up|挂"]); fbot.sim_cache = None
+    # the records come as a TradeMap (1.67.0): one market's or driver's records from an index that any change to the
+    # map drops, the same answers as a scan of every record
+    trades = fbot.sim_trades()
+    assert isinstance(trades, m.TradeMap) and trades.of_market("niulai#5") == [trades["niulai#5|up|吃"]] and trades.of_market("x") == []
+    assert m.trades_of_market(dict(trades), "niulai#5") == trades.of_market("niulai#5") and trades.of_driver("NIULAI") == [trades["niulai#5|up|吃"]]
+    assert m.trades_of_driver(dict(trades), "NIULAI") == trades.of_driver("NIULAI") and trades.of_driver("PONS") == []
+    trades["pons#77|up|吃"] = {"market": "pons#77", "kind": "ladder", "key": "PONS", "side": "up", "status": "filled", "shares": 50.0, "price": 0.2, "settle": {}}
+    assert trades.of_driver("PONS") == [trades["pons#77|up|吃"]] and trades.of_market("pons#77") == [trades["pons#77|up|吃"]]
+    moved = trades.pop("pons#77|up|吃")
+    trades["pons#77|up|吃#1"] = moved
+    assert trades.of_market("pons#77") == [moved] and list(trades.copy().of_market("pons#77")) == [moved]
+    del trades["pons#77|up|吃#1"]
+    assert trades.of_market("pons#77") == [] and trades.of_driver("PONS") == []
+    for side in ("up", "down"):
+        assert fbot.sim_taker_room(trades, niu, side) == fbot.sim_taker_room(dict(trades), niu, side)
+        assert fbot.sim_group_room(trades, niu, side, 0.5, 100) == fbot.sim_group_room(dict(trades), niu, side, 0.5, 100)
+        assert m.Bot.sim_own_resting(trades, "niulai#5", side) == m.Bot.sim_own_resting(dict(trades), "niulai#5", side)
     # a feed refresh that moved a fair price wakes the trader too (1.63.0); an unchanged one, or a feed the odds do not hang on, does not
     fbot.sim_wake, fbot.fair_sig = False, None
     fresh = lambda: setattr(fbot, "fair_sig_at", -1e9)  # (one look a second: the throttle is reset between these calls)

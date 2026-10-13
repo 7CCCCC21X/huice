@@ -228,6 +228,44 @@ async def run():
     assert m.PredictFeed.market_closed({"status": "OPEN", "trading_status": "CLOSED"}) and m.PredictFeed.market_settled({"status": "RESOLVED"})
     assert not m.PredictFeed.market_settled({"status": "CLOSED"}) and m.PredictFeed.market_closed({"status": "Cancelled"})
     broken.clear(); statuses.clear()
+    # per-level polling (1.67.0): with the hot levels named only those are read every round; the others follow the cold
+    # cadence (a few per round, the oldest first) and keep their row meanwhile; every level of the category is kept apart
+    feed.market_meta.clear()
+    await feed.refresh({"NIULAI": NIU.slug}, force=True)
+    before = feed.ladders["NIULAI"]
+    assert all(r.book and not r.error for r in before) and set(feed.ladder_rows["NIULAI"]) == {"11", "12"}
+    asked.clear(); feed.refreshed = -1e9
+    await feed.refresh({"NIULAI": NIU.slug}, hot={"NIULAI"}, hot_rows={"11"})
+    assert [u for u in asked if "/11/" in u] and not [u for u in asked if "/12/" in u], asked
+    rows = feed.ladders["NIULAI"]
+    assert rows[1] is before[1] and rows[0] is not before[0], "the level not read keeps its row"
+    assert feed.round_info["keys"] == 1 and feed.round_info["rows"] == 1 and feed.round_info["slowest"][0] == "NIULAI", feed.round_info
+    feed.row_refreshed["NIULAI"]["12"] -= 61; asked.clear(); feed.refreshed = -1e9
+    await feed.refresh({"NIULAI": NIU.slug}, hot={"NIULAI"}, hot_rows={"11"})
+    assert not [u for u in asked if "/12/" in u] and feed.round_info["rows"] == 1, "cold and due again: read beside the round, not in it"
+    await feed.cold_task
+    assert [u for u in asked if "/12/" in u] and m.time.monotonic() - feed.row_refreshed["NIULAI"]["12"] < 5, asked
+    assert feed.ladders["NIULAI"][1] is not before[1] and set(feed.ladder_rows["NIULAI"]) == {"11", "12"}
+    asked.clear(); feed.refreshed = -1e9
+    await feed.refresh({"NIULAI": NIU.slug}, hot={"NIULAI"})  # no levels named: every level, as before
+    assert [u for u in asked if "/11/" in u] and [u for u in asked if "/12/" in u] and feed.round_info["rows"] == 2
+    # the ladders' own gate: at most PREDICT_LADDER_PARALLEL levels in flight at once
+    many = m.PredictFeed(cfg); many.ladder_keys.add("NIULAI")
+    flight = {"now": 0, "max": 0}
+    async def slow_fetch(url, payload=None):
+        if url == m.PREDICT_GRAPHQL:
+            if "id" in payload["variables"]:
+                return {"data": {"category": {"id": "90", "__typename": "MultiCategory"}}}
+            return {"data": {"markets": {"edges": [{"node": {"id": str(i), "conditionId": f"0x{i}", "title": f"${i}00M", "question": ""}} for i in range(1, 13)]}}}
+        if url.endswith("/orderbook"):
+            flight["now"] += 1; flight["max"] = max(flight["max"], flight["now"])
+            await asyncio.sleep(0.01)
+            flight["now"] -= 1
+            return {"data": {"bids": [["0.10", "100"]], "asks": [["0.14", "50"]]}}
+        return {"data": {"id": url.rsplit("/", 1)[-1], "status": "OPEN", "outcomes": [{"name": "Yes", "indexSet": 1}, {"name": "No", "indexSet": 2}]}}
+    many.fetch = slow_fetch
+    await many.refresh({"NIULAI": NIU.slug}, force=True)
+    assert len(many.ladders["NIULAI"]) == 12 and 1 < flight["max"] <= m.PREDICT_LADDER_PARALLEL, flight
     # what an API says in an error body reaches the message (Predict's REST is NestJS-style: message / error)
     assert m.http_error_text({"statusCode": 400, "message": "Market is closed", "error": "Bad Request"}) == "Market is closed"
     assert m.http_error_text({"message": ["a must be x", "b too"]}) == "a must be x；b too" and m.http_error_text({"error": {"message": "nope"}}) == "nope"

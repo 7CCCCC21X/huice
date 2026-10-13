@@ -125,6 +125,16 @@ async def run():
     st = "\n".join(bot.diag_state(NOW))
     assert "✅ 上证/A50：12 秒前成功｜上次用时 1.5s｜共 40 轮" in st and "❌ 交易所收盘：从未成功｜上次用时 300.0s｜共 2 轮｜最近错误：TimeoutError" in st, st
     assert "⏳ 汇率：尚未运行" in st and "上证收盘：09-24 3,888.37（腾讯日K）" in st, st
+    # the book round's size and slowest key, the decision's size (1.67.0)
+    bot.reference_state["Predict 盘口"] = {"ok_at": time.time() - 3, "error": "", "error_at": 0, "ms": 1800, "runs": 90}
+    bot.reference_state["模拟交易"] = {"ok_at": time.time() - 2, "error": "", "error_at": 0, "ms": 900, "runs": 50}
+    bot.predict.round_info = {"keys": 14, "rows": 5, "ms": 1800, "slowest": ("NIULAI", 1234)}
+    bot.sim_step_ms, bot.sim_step_info = {"盘口": 100, "判断": 40, "结算": 5, "保存": 1}, {"markets": 172, "records": 3000}
+    st = "\n".join(bot.diag_state(NOW))
+    assert "✅ Predict 盘口：3 秒前成功｜上次用时 1.8s｜共 90 轮｜上轮 14 个市场（阶梯 5 档），最慢 NIULAI 1.2s" in st, st
+    assert "✅ 模拟交易：2 秒前成功｜上次用时 0.9s｜共 50 轮（决策内：盘口 0.1s、判断 0.0s、结算 0.0s、保存 0.0s；172 个市场、3000 条记录）" in st, st
+    bot.predict.round_info = {"keys": 3, "rows": 0, "ms": 500, "slowest": None}
+    assert "｜上轮 3 个市场\n" in "\n".join(bot.diag_state(NOW)) + "\n"
 
     # /diag from Telegram (admin only): a "working on it" note, then the report
     await bot.process_message({"text": "/diag", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})

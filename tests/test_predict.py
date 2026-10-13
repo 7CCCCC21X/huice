@@ -119,6 +119,8 @@ async def run():
     await bot.predict.refresh(targets, hot={"SSE"})
     assert any(u.endswith("/markets/901/orderbook") for u, _ in calls[n:]) and not any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:]), calls[n:]
     assert any(want["HSI"] in str(v) for _, v in calls[n:]), "HSI (no book) is still asked every round"
+    info = bot.predict.round_info  # the round's size and its slowest key, for /diag (1.67.0)
+    assert info["keys"] >= 4 and info["rows"] == 0 and info["slowest"][0] in targets and info["ms"] >= 0, info
     bot.predict.key_refreshed["CXMTUSDT"] -= 61; n = len(calls); bot.predict.refreshed = -1e9
     await bot.predict.refresh(targets, hot={"SSE"})
     assert not any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:]), "the cold round runs beside the hot one, not in it (1.63.0)"

@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.66.0"
+VERSION = "1.67.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4143,6 +4143,8 @@ PREDICT_PARALLEL = 16           # Predict requests in flight at once, on Predict
                                 # hot round (a dozen markets, each answer about a second) goes out in one batch
 PREDICT_POOL_WORKERS = 20       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
                                 # feeds' pool, where a 502-ing scraper held threads for the 12-second timeout (a round took 60 s)
+PREDICT_LADDER_PARALLEL = 8     # of those, at most this many may be ladder levels at once: a hot ladder's levels never
+                                # queue the daily cards' books behind them
 _PREDICT_POOL: ThreadPoolExecutor | None = None
 
 
@@ -4563,6 +4565,11 @@ class PredictFeed:
         self.on_update: Any = None                               # async callback(key) once a key's books are stored: the trader's express lane
         self.express_tasks: set = set()
         self.gate = asyncio.Semaphore(PREDICT_PARALLEL)          # requests in flight, on Predict's own pool
+        self.ladder_gate = asyncio.Semaphore(PREDICT_LADDER_PARALLEL)  # ...of which ladder levels: the rest stays with the daily cards
+        self.ladder_rows: dict[str, dict[str, LadderRow]] = {}  # item key -> market id -> its latest row (every market of the category, picked or not)
+        self.row_refreshed: dict[str, dict[str, float]] = {}    # item key -> market id -> monotonic time of the level's last read
+        self.key_ms: dict[str, int] = {}                         # item key -> how long its last refresh took
+        self.round_info: dict[str, Any] = {}                     # the last hot round: keys, ladder levels read, the slowest key (for /diag)
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
 
     def headers(self) -> dict[str, str]:
@@ -4773,15 +4780,37 @@ class PredictFeed:
         book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
         return LadderRow(target, market["id"], market["title"], book, "", market.get("question", ""))
 
-    async def refresh_ladder(self, key: str, slug: str) -> None:
-        """A category of Yes/No markets, one per threshold: every market's book, sorted by threshold. A level whose book
-        could not be read keeps its previous one; the failures are recorded for the card and /status."""
+    async def refresh_ladder(self, key: str, slug: str, only: set[str] | None = None, aged: bool = False) -> int:
+        """A category of Yes/No markets, one per threshold: the markets' books, sorted by threshold. With ``only``
+        (market ids) just those levels are read now — the hot ones: with an order, or near a trade — plus any never
+        read, and with ``aged`` also every other level whose last read is PREDICT_COLD_POLL_SECONDS old (the cold
+        round: refresh_cold); None = every level. A level not read keeps its row (its book ages as it does). A level
+        whose book could not be read keeps its previous one; the failures are recorded for the card and /status.
+        Returns how many levels were read."""
         markets = await self.resolve_all(slug)
         if not markets:
             self.ladders.pop(key, None)
+            self.ladder_rows.pop(key, None)
             self.errors[key] = f"Predict 上还没有这个市场（{slug}）"
-            return
-        rows = [row for row in await asyncio.gather(*(self.ladder_row(key, slug, m) for m in markets)) if row]
+            return 0
+        have, read_at, now = self.ladder_rows.get(key) or {}, self.row_refreshed.setdefault(key, {}), time.monotonic()
+        if only is None:
+            due = list(markets)
+        else:
+            due = [m for m in markets if m["id"] in only or m["id"] not in have]
+            if aged:
+                cold = getattr(self.config, "predict_cold_poll", 0) or 0
+                due += [m for m in markets if m["id"] in have and m["id"] not in only and now - read_at.get(m["id"], -1e9) >= cold]
+        for m in due:
+            read_at[m["id"]] = now
+        fresh = dict(zip([m["id"] for m in due], await asyncio.gather(*(self.ladder_row_gated(key, slug, m) for m in due))))
+        # the rows as they stand now (a cold round may have stored some meanwhile), the ones read here replacing theirs
+        have = self.ladder_rows.get(key) or {}
+        current = {m["id"]: fresh[m["id"]] if m["id"] in fresh else have.get(m["id"]) for m in markets}
+        self.ladder_rows[key] = {mid: row for mid, row in current.items() if row is not None}
+        for mid in [mid for mid in read_at if mid not in current]:
+            read_at.pop(mid)
+        rows = list(self.ladder_rows[key].values())
         if not rows:
             raise RemoteError("Predict 市场标题里没有可识别的档位")
         if key in self.ladder_pick:
@@ -4794,6 +4823,12 @@ class PredictFeed:
             self.errors[key] = f"{len(failed)}/{len(rows)} 档盘口刷新失败（{which}：{brief_error(failed[0].error, 60)}）；显示上次盘口"
         else:
             self.errors.pop(key, None)
+        return len(due)
+
+    async def ladder_row_gated(self, key: str, slug: str, market: dict) -> "LadderRow | None":
+        """ladder_row under the ladders' own gate: at most PREDICT_LADDER_PARALLEL levels in flight at once."""
+        async with self.ladder_gate:
+            return await self.ladder_row(key, slug, market)
 
     def updated(self, key: str) -> None:
         """A key's books just came in: the trader's express lane looks at that market now, beside the round."""
@@ -4803,15 +4838,25 @@ class PredictFeed:
         self.express_tasks.add(task)
         task.add_done_callback(self.express_tasks.discard)
 
-    async def refresh_cold(self, due: dict[str, str]) -> None:
-        """The cold keys' round (refresh): marked as refreshed first, so a slow round is not started twice."""
+    async def refresh_cold(self, due: dict[str, str], aged: dict[str, str] | None = None) -> None:
+        """The cold keys' round (refresh), and the cold levels of the hot ladders (``aged``: key -> slug): marked as
+        refreshed first, so a slow round is not started twice."""
         now = time.monotonic()
         for key in due:
             self.key_refreshed[key] = now
         try:
-            await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in due.items()))
+            await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in due.items()),
+                                 *(self.refresh_aged(key, slug) for key, slug in (aged or {}).items()))
         except Exception as error:  # refresh_one answers its own failures; anything else is logged, never raised into the loop
             LOG.warning("Predict 冷门盘口刷新异常：%s", clean_error(error) or type(error).__name__)
+
+    async def refresh_aged(self, key: str, slug: str) -> int:
+        """A hot ladder's levels nobody is near, once PREDICT_COLD_POLL_SECONDS old (beside the hot round, never in it)."""
+        try:
+            return await self.refresh_ladder(key, slug, set(), aged=True)
+        except (RemoteError, TimeoutError, OSError) as error:
+            self.errors[key] = clean_error(error) or type(error).__name__
+        return 0
 
     def yes_book(self, row: "LadderRow") -> tuple["PredictBook | None", str]:
         """The row's book priced as "Yes", whatever the market's outcome order."""
@@ -4825,19 +4870,22 @@ class PredictFeed:
             return flip_book(row.book), ""
         return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}）"
 
-    async def refresh_one(self, key: str, slug: str) -> None:
+    async def refresh_one(self, key: str, slug: str, hot_rows: set[str] | None = None) -> int:
+        """One key's books now (a ladder: its levels, only the ``hot_rows`` ones and any never read when given; the
+        cold-due ones go with the cold round). Returns the markets read (a ladder's levels; 1 for a single market; 0
+        when nothing was)."""
         if key in self.ladder_keys:
             try:
-                await self.refresh_ladder(key, slug)
+                return await self.refresh_ladder(key, slug, hot_rows)
             except (RemoteError, TimeoutError, OSError) as error:
                 self.errors[key] = clean_error(error) or type(error).__name__
-            return
+            return 0
         try:
             market = await self.resolve(slug)
             if market is None:
                 self.books.pop(key, None)
                 self.errors[key] = f"Predict 上还没有这个市场（{slug}）"
-                return
+                return 0
             await self.strike(slug, market["id"])
             if slug in self.want_info and slug not in self.info:
                 await self.market_info(slug, market["id"])
@@ -4846,13 +4894,25 @@ class PredictFeed:
             self.books[key] = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
             self.errors.pop(key, None)
             self.updated(key)
+            return 1
         except (RemoteError, TimeoutError, OSError) as error:
             self.errors[key] = clean_error(error) or type(error).__name__
+            return 0
 
-    async def refresh(self, targets: dict[str, str], force: bool = False, hot: set[str] | None = None) -> Refreshed | bool:
+    async def refresh_timed(self, key: str, slug: str, hot_rows: set[str] | None = None) -> int:
+        """refresh_one, its time kept per key (the slowest of a round goes to /diag)."""
+        started = time.monotonic()
+        try:
+            return await self.refresh_one(key, slug, hot_rows)
+        finally:
+            self.key_ms[key] = int((time.monotonic() - started) * 1000)
+
+    async def refresh(self, targets: dict[str, str], force: bool = False, hot: set[str] | None = None,
+                      hot_rows: set[str] | None = None) -> Refreshed | bool:
         """targets: item key -> slug. False = not due yet. ``hot``: the keys refreshed every round (the daily cards, the
         markets with orders, those near a trade); the others only every PREDICT_COLD_POLL_SECONDS — a few dozen ladder
-        levels nobody is near cost a round most of its time. None = every key, every round."""
+        levels nobody is near cost a round most of its time. None = every key, every round. ``hot_rows``: of a hot
+        ladder, the market ids read every round (refresh_ladder); None = all of its levels."""
         if not force and time.monotonic() - self.refreshed < self.config.predict_poll:
             return False
         if (left := self.blocked_until - time.monotonic()) > 0:
@@ -4864,9 +4924,9 @@ class PredictFeed:
         for key in list(self.errors):
             if key not in targets:
                 self.errors.pop(key)
-        for key in list(self.ladders):
-            if key not in targets:
-                self.ladders.pop(key)
+        for table in (self.ladders, self.ladder_rows, self.row_refreshed, self.key_ms):
+            for key in [k for k in table if k not in targets]:
+                table.pop(key)
         self.slugs = dict(targets)
         keep = set(targets.values())  # yesterday's daily slugs are not kept around for ever
         for table in (self.markets, self.market_lists, self.strikes, self.types, self.info):
@@ -4876,12 +4936,18 @@ class PredictFeed:
         cold = getattr(self.config, "predict_cold_poll", 0) or 0
         due = {key: slug for key, slug in targets.items() if hot is None or key in hot or (key not in self.books and key not in self.ladders)}
         cold_due = {key: slug for key, slug in targets.items() if key not in due and now - self.key_refreshed.get(key, -1e9) >= cold}
-        await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in due.items()))
+        read = await asyncio.gather(*(self.refresh_timed(key, slug, hot_rows if hot is not None else None) for key, slug in due.items()))
         for key in due:
             self.key_refreshed[key] = now
-        if cold_due and (self.cold_task is None or self.cold_task.done()):
+        self.round_info = {"keys": len(due), "rows": sum(n for key, n in zip(due, read) if key in self.ladder_keys),
+                           "ms": int((time.monotonic() - now) * 1000),
+                           "slowest": max(((key, self.key_ms.get(key, 0)) for key in due), key=lambda kv: kv[1], default=None)}
+        # of a hot ladder, the levels nobody is near follow the cold cadence too (refresh_ladder read only the hot ones)
+        aged = {key: slug for key, slug in due.items() if key in self.ladder_keys and hot is not None and hot_rows is not None
+                and any(mid not in hot_rows and now - at >= cold for mid, at in self.row_refreshed.get(key, {}).items())}
+        if (cold_due or aged) and (self.cold_task is None or self.cold_task.done()):
             # beside the hot round, never in it: forty ladder levels must not hold the daily cards' books back
-            self.cold_task = asyncio.create_task(self.refresh_cold(cold_due), name="predict-cold")
+            self.cold_task = asyncio.create_task(self.refresh_cold(cold_due, aged), name="predict-cold")
         for key in [k for k in self.key_refreshed if k not in targets]:
             self.key_refreshed.pop(key, None)
         # a market not listed yet is an answer, not a failure
@@ -7318,6 +7384,85 @@ def trade_driver(trade: dict) -> tuple[str, str]:
     if trade.get("driver"):
         return str(trade["driver"]), str(trade.get("driver_name") or trade["driver"])
     return market_driver(str(trade.get("kind") or ""), str(trade.get("key") or ""), trade.get("settle"), str(trade.get("item") or ""))
+
+
+class TradeMap(dict):
+    """The paper trades by id (sim_trades), with an index by market and one by driver, built on first use and dropped
+    whenever the map itself changes (a record's status changes; its market, side and driver never do). The decision
+    loop asks for one market's records several times per market (sim_taker_room, sim_own_resting, sim_group_room):
+    scanning every record each time cost the step seconds once thousands of finished trades had piled up."""
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._by_market: dict[str, list[dict]] | None = None
+        self._by_driver: dict[str, list[dict]] | None = None
+
+    def of_market(self, market: str) -> list[dict]:
+        """The records of one market, in the map's order (not to be changed by the caller)."""
+        if self._by_market is None:
+            index: dict[str, list[dict]] = {}
+            for t in self.values():
+                index.setdefault(str(t.get("market") or ""), []).append(t)
+            self._by_market = index
+        return self._by_market.get(market, [])
+
+    def of_driver(self, driver: str) -> list[dict]:
+        """The records settling on one driver (trade_driver), in the map's order."""
+        if self._by_driver is None:
+            index: dict[str, list[dict]] = {}
+            for t in self.values():
+                index.setdefault(trade_driver(t)[0], []).append(t)
+            self._by_driver = index
+        return self._by_driver.get(driver, [])
+
+    def _changed(self) -> None:
+        self._by_market = self._by_driver = None
+
+    def __setitem__(self, key: str, value: dict) -> None:
+        super().__setitem__(key, value)
+        self._changed()
+
+    def __delitem__(self, key: str) -> None:
+        super().__delitem__(key)
+        self._changed()
+
+    def pop(self, *args: Any) -> Any:
+        value = super().pop(*args)
+        self._changed()
+        return value
+
+    def popitem(self) -> Any:
+        item = super().popitem()
+        self._changed()
+        return item
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        value = super().setdefault(key, default)
+        self._changed()
+        return value
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        super().update(*args, **kwargs)
+        self._changed()
+
+    def clear(self) -> None:
+        super().clear()
+        self._changed()
+
+    def copy(self) -> "TradeMap":
+        return TradeMap(self)
+
+
+def trades_of_market(trades: Mapping, market: str) -> list[dict]:
+    """The records of one market: from the map's index when it has one (TradeMap), else by scanning."""
+    of = getattr(trades, "of_market", None)
+    return of(market) if of is not None else [t for t in trades.values() if t.get("market") == market]
+
+
+def trades_of_driver(trades: Mapping, driver: str) -> list[dict]:
+    """The records settling on one driver: from the map's index when it has one (TradeMap), else by scanning."""
+    of = getattr(trades, "of_driver", None)
+    return of(driver) if of is not None else [t for t in trades.values() if trade_driver(t)[0] == driver]
 
 
 def scenario_result(kind: str, settle: dict, direction: str, level: float | None) -> float:
@@ -10132,6 +10277,7 @@ class Bot:
         self.sim_lock = asyncio.Lock()      # the step's decisions and the express lane never run side by side
         self.sim_express_count = 0          # taker decisions made by the express lane (for /diag)
         self.sim_step_ms: dict[str, int] = {}  # the last decision phase, by part (for /diag)
+        self.sim_step_info: dict[str, int] = {}  # ...and its size: markets judged, records held
         self.sim_checked: dict[str, float] = {}  # market id -> monotonic time Predict was last asked for its result
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
         self.reference_pool: ThreadPoolExecutor | None = None
@@ -11765,13 +11911,14 @@ class Bot:
 
     def sim_trades(self) -> dict[str, dict]:
         """Every paper trade, from an in-memory view of the store (the journal page and the sim step would otherwise parse
-        every record's JSON on every look); any write to a sim: record, by whoever, refreshes the view."""
+        every record's JSON on every look); any write to a sim: record, by whoever, refreshes the view. A TradeMap:
+        the records of one market or driver come from an index, not a scan (trades_of_market, trades_of_driver)."""
         generation = self.store.touched.get("sim", 0)
         if self.sim_cache is None or self.sim_gen != generation:
             self.sim_cache = {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:")
                               if isinstance(v, dict) and "status" in v}
             self.sim_gen = generation
-        return dict(self.sim_cache)
+        return TradeMap(self.sim_cache)
 
     def sim_save(self, pairs: Any) -> None:
         """Persist (trade id, trade) pairs in one transaction and keep the in-memory view current."""
@@ -12158,9 +12305,8 @@ class Bot:
     def sim_own_resting(trades: dict[str, dict], market: str, side: str) -> tuple[float, float | None]:
         """Our own resting real order on a market's side (a real book shows it among the bids): its unfilled shares and
         its price; (0, None) when there is none."""
-        for t in trades.values():
-            if (t.get("market") == market and t.get("side") == side and t.get("maker") and t.get("status") == "resting"
-                    and isinstance(t.get("live"), dict)):
+        for t in trades_of_market(trades, market):
+            if t.get("side") == side and t.get("maker") and t.get("status") == "resting" and isinstance(t.get("live"), dict):
                 return max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0), float(t.get("price") or 0)
         return 0.0, None
 
@@ -12446,8 +12592,8 @@ class Bot:
         per-buy count, capped by what is left under SIM_TAKER_MAX_SHARES (the last buy takes the remainder)."""
         c = self.config
         held = trades.get(f"{mk.market}|{side}|吃")
-        taken = sum(float(t.get("shares") or 0) for t in trades.values()
-                    if t.get("market") == mk.market and t.get("side") == side and not t.get("maker"))
+        taken = sum(float(t.get("shares") or 0) for t in trades_of_market(trades, mk.market)
+                    if t.get("side") == side and not t.get("maker"))
         want = self.sim_taker_shares(mk)
         if held is not None and (c.sim_taker_max_shares <= 0 or sim_in_flight(held)):
             return 0.0, taken
@@ -12995,6 +13141,7 @@ class Bot:
             self.sim_save(changed)
         self.sim_step_ms = {"盘口": int((t1 - t0) * 1000), "判断": int((t2 - t1) * 1000), "结算": int((t3 - t2) * 1000),
                             "保存": int((time.monotonic() - t3) * 1000)}
+        self.sim_step_info = {"markets": len(markets), "records": len(trades)}
         return confirm
 
     def sim_take(self, mk: SimMarket, trades: dict[str, dict], now_ms: int, changed: list) -> None:
@@ -13072,8 +13219,8 @@ class Bot:
             return ""
         driver, name = market_driver(mk.kind, mk.key, mk.settle, mk.item)
         mine = []
-        for t in trades.values():
-            if t.get("status") not in {"filled", "resting"} or trade_driver(t)[0] != driver:
+        for t in trades_of_driver(trades, driver):
+            if t.get("status") not in {"filled", "resting"}:
                 continue
             held = max(float(t.get("shares") or 0), float(t.get("order") or 0) if t.get("status") == "resting" else 0.0)
             if held > 0:
@@ -14930,9 +15077,15 @@ class Bot:
                 phases = getattr(self, "live_step_ms", None) if name == "模拟交易" else None  # the real-trading step, by phase
                 detail = ("｜" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in phases.items())) if phases else ""
                 if name == "模拟交易" and self.sim_step_ms:
-                    detail += "（决策内：" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in self.sim_step_ms.items()) + "）"
+                    size = self.sim_step_info
+                    detail += ("（决策内：" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in self.sim_step_ms.items())
+                               + (f"；{size['markets']} 个市场、{size['records']} 条记录" if size else "") + "）")
                 if name == "模拟交易" and self.sim_express_count:
                     detail += f"｜快车道吃单决定 {self.sim_express_count} 次"
+                if name == "Predict 盘口" and self.predict.round_info:
+                    r = self.predict.round_info
+                    detail += (f"｜上轮 {r['keys']} 个市场" + (f"（阶梯 {r['rows']} 档）" if r.get("rows") else "")
+                               + (f"，最慢 {r['slowest'][0]} {r['slowest'][1] / 1000:.1f}s" if r.get("slowest") else ""))
                 lines.append(f"  {mark} {name}：{what}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{busy}{detail}{err}")
         else:
             lines.append("🔄 后台刷新：未启动（命令行诊断或测试环境）")
@@ -15097,13 +15250,13 @@ class Bot:
     async def refresh_books(self, now_ms: int) -> Refreshed | bool:
         """The orderbook round: the hot keys every round, the cold ones now and then (PredictFeed.refresh); a round
         that brought books wakes the trader at once (sim_wake) instead of leaving it to its own timer."""
-        hot = None
+        hot = rows = None
         if self.config.sim:
             try:
-                hot = self.predict_hot_keys(now_ms)
+                hot, rows = self.predict_hot(now_ms)
             except Exception as error:  # the round goes on with every key
                 self.log_limited("predict-hot", f"分级轮询计算失败：{clean_error(error) or type(error).__name__}")
-        result = await self.predict.refresh(self.predict_targets(now_ms), hot=hot)
+        result = await self.predict.refresh(self.predict_targets(now_ms), hot=hot, hot_rows=rows)
         if result is not False and self.config.sim:
             self.sim_wake = True
         return result
@@ -15133,26 +15286,36 @@ class Bot:
             self.fair_sig, self.sim_wake = sig, True
 
     def predict_hot_keys(self, now_ms: int) -> set[str]:
-        """The item keys the orderbook feed refreshes every round: every market but the ladders (a handful), and a
-        ladder whose levels hold an order or a position, could be taken now or within PREDICT_HOT_GAP of the cap, or
-        clear the maker's bar — judged on the books of the last round."""
+        """The item keys the orderbook feed refreshes every round (predict_hot)."""
+        return self.predict_hot(now_ms)[0]
+
+    def predict_hot(self, now_ms: int) -> tuple[set[str], set[str]]:
+        """(item keys, ladder market ids) the orderbook feed refreshes every round: every market but the ladders (a
+        handful), and a ladder's level that holds an order (resting, or a real one in flight), was filled within the
+        markout window (its 1 / 5 / 30-minute markouts want fresh books), could be taken now or within PREDICT_HOT_GAP
+        of the cap, or clears the maker's bar — judged on the books of the last round. A ladder with such a level is
+        hot; its other levels follow the cold cadence, a few per round (PredictFeed.refresh_ladder)."""
         hot = {key for key in self.predict.slugs if key not in self.predict.ladder_keys}
+        rows: set[str] = set()
         trades = self.sim_trades()
-        busy = {t.get("market") for t in trades.values() if t.get("status") in {"resting", "filled"} or sim_in_flight(t)}
+        recent = max(s for s, _ in MARKOUT_HORIZONS) * 1000 + 60_000
+        busy = {t.get("market") for t in trades.values()
+                if sim_in_flight(t) or (t.get("status") == "filled" and t.get("filled") and now_ms - int(t["filled"]) <= recent)}
         for mk in self.sim_markets(now_ms):
-            if mk.key in hot or mk.kind not in {"range", "ladder"}:
+            if mk.kind not in {"range", "ladder"}:
                 continue
             if mk.market in busy:
                 hot.add(mk.key)
+                rows.add(str(mk.book.market_id))
                 continue
             if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk):
                 continue
             gap = self.sim_taker_gap(mk, trades, now_ms)
-            if gap["state"] in {"ready", "blocked"} or (gap["state"] == "near" and gap["gap"] is not None and gap["gap"] <= self.PREDICT_HOT_GAP):
+            if (gap["state"] in {"ready", "blocked"} or (gap["state"] == "near" and gap["gap"] is not None and gap["gap"] <= self.PREDICT_HOT_GAP)
+                    or (mk.makers and self.config.sim_ways != "taker" and self.sim_maker_reason(mk, trades, now_ms)[0] is not None)):
                 hot.add(mk.key)
-            elif mk.makers and self.config.sim_ways != "taker" and self.sim_maker_reason(mk, trades, now_ms)[0] is not None:
-                hot.add(mk.key)
-        return hot
+                rows.add(str(mk.book.market_id))
+        return hot, rows
 
     async def refresh_hsi(self, now_ms: int) -> Refreshed | bool:
         result = await self.hsi.refresh(now_ms)

@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.66.0
+版本：1.67.0
 
 ## 已完成
 
+- 1.67.0（判断阶段提速；阶梯按档位轮询）：/diag 显示“判断 2.3s”“Predict 盘口 12.5s”。（1）`sim_trades` 返回 `TradeMap`（dict 子类）：按市场、按事件（driver）的索引首次使用时建、映射本身一变就丢；`sim_taker_room`、`sim_own_resting`、`sim_group_room`、`live_room` 用 `trades_of_market` / `trades_of_driver` 取记录，不再每个市场扫一遍全部记录（基准：172 个市场、3000 条记录的判断 0.32s → 0.03s，1 万条 0.05s）。（2）`predict_hot` 返回热门键和热门档位（market id）：有挂单 / 在途订单、半小时内成交（markout 窗口）、距吃单 5¢ 内、够挂单门槛的档位；`PredictFeed.refresh_ladder(key, slug, only, aged)` 热门一轮只读这些档位（加从没读过的），同一阶梯到期的冷档由冷门那一轮（`refresh_cold` → `refresh_aged`，`cold_task`）在旁边一起读，没读的档位保留原行；`ladder_rows` 存整条阶梯每档最新行（挑选前），写回时以当前行为底、只替换本轮读到的；`ladder_gate`（`PREDICT_LADDER_PARALLEL` 8）限制同时在飞的档位请求，日涨跌市场不排在阶梯后面。（3）/diag：“Predict 盘口”行加“上轮 N 个市场（阶梯 K 档），最慢 X Ns”（`round_info`、`refresh_timed`），“模拟交易”行加“N 个市场、M 条记录”（`sim_step_info`）。测试 `tests/test_sim.py` `faster`、`tests/test_tuning.py`、`tests/test_predict.py`、`tests/test_diag.py`。
 - 1.66.0（吃单快车道）：别人挂错的卖单几秒内就会被吃掉，原来要等下一步（盘口一轮 + 定时器 + 整步的结算 / 挂单逻辑）才下单。现在 `PredictFeed.refresh_one` / `refresh_ladder` 存好一个键的盘口后立刻回调 `on_update(key)`（`updated()`，另起任务），`Bot.sim_express(key)` 在 `sim_lock` 下只对这个键的市场做吃单判断（`sim_take`，从 `sim_decide` 里抽出来、两边共用），有单就存并记 `sim_express_count`，真实交易里 `LiveBot.sim_express_after` 立刻 `live_place_pending`；挂单仍由整步决定。`sim_step` 拆成 `sim_step`（锁 + 核对）与 `sim_decide`（决策、成交、结算、保存），`live_place` 外层加 `live_placing` 守卫（同一记录绝不发两次），`live_place_order` 是原来的发单；订单事件写“Predict 应答用时 N 秒”。`note_job` 每秒最多算一次公平价签名。/diag 的“模拟交易”行多“决策内：盘口 / 判断 / 结算 / 保存”和“快车道吃单决定 N 次”。测试 `tests/test_sim.py` `faster`、`tests/test_predict.py`、`tests/test_trading.py`。
 - 1.65.2（决策阶段不再等 Predict 核对；KOSPI 开盘前照常出概率）：（1）`sim_step` 先把 `sim_confirm` 起成任务（`asyncio.sleep(0)` 让它把请求发出去），决策算完再 `await`，核对的网络时间与计算重叠；`sim_confirm` 对这一步里被挪动（`sim_rekey`）的记录跳过、下一轮再核。（2）`kospi_odds`：开盘前 Naver 的报价带当天日期、数值仍是上一收盘，原来按“基准停在今天、应为昨收”拒绝输出，07:20～09:00 KST 没有 KOSPI 概率；现在当天还没收盘、时间在当天开盘前时把报价当作上一收盘处理，照常用 HL KR200 代理出盘后概率。测试 `tests/test_kospi.py`。
 - 1.65.1（一步里的串行请求并行）：/diag 分阶段计时显示收盘后一步“决策 7.2s、下单 4.4s”：`sim_confirm` 对每个待确认市场逐个读 Predict 详情（每个约 1 秒），改为一次 `gather`；`live_place_pending` 逐张下单改为并行（风控判断仍逐张、带着全部待发记录算）。`/diag` 的探测改用自己的线程池（`diag_pool`，8 线程），探测耗时不再混入行情源的排队时间。
