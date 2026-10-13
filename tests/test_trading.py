@@ -359,7 +359,7 @@ async def step(bot, at, *markets):
 def make_bot(**env):
     cfg = m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
                              "SIM_WAYS": "both", "SIM_MARKETS": "all", "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT_API_KEY": "k",
-                             "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off", "SIM_MAKER_SPREAD_CENTS": "10", "SIM_TAKER_MAX_SHARES": "0",  # resting orders rest as placed, unless a test says otherwise
+                             "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off", "SIM_MAKER_SPREAD_CENTS": "10", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0",  # resting orders rest as placed and takers buy their per-buy count, unless a test says otherwise
                              "LIVE_MAX_ORDER_USD": "100", "LIVE_MAX_OPEN_USD": "250", "LIVE_MAX_DAILY_LOSS_USD": "50", **env})
     bot = L.LiveBot(cfg, m.Store(":memory:"), FM(NOW), None)
     bot.live.api, bot.live.chain = FakeApi(), FakeChain()
@@ -679,6 +679,21 @@ async def run():
     await step(lbot, NOW + 10_000)
     body = lbot.live.api.calls[-1][1]["data"]
     assert body["pricePerShare"] == str(69 * 10 ** 16) and body["order"]["takerAmount"] == str(100 * WEI) and lbot.sim_trades()["two|up|吃"]["cap"] == 0.69
+    # 1.68.0: SIM_TAKER_SWEEP_SHARES — the order asks for every share under the cap (58¢×40 + 62¢×100 = 140) at the cap; the
+    # real-trading limits judge that count (live_room), and a sweep they refuse falls back to the per-buy count
+    two = lambda at: m.SimMarket("two", "two", "close", "X", 0.80, book([], [("0.58", "40"), ("0.62", "100")], at, "two", mid="103"), 0.03, "", ("涨", "跌"), {})
+    for max_usd, shares in (("100", 140), ("80", 100)):
+        wbot = make_bot(SIM_WAYS="taker", SIM_TAKER_SWEEP_SHARES="300", LIVE_MAX_ORDER_USD=max_usd)
+        await wbot.live_prepare()
+        wbot.live.api.markets["103"] = market_json("103")
+        world["markets"] = [two(NOW)]
+        await wbot.live_prefetch(NOW)
+        await step(wbot, NOW)
+        body = wbot.live.api.calls[-1][1]["data"]
+        t = wbot.sim_trades()["two|up|吃"]
+        assert body["order"]["takerAmount"] == str(shares * WEI) and body["pricePerShare"] == str(69 * 10 ** 16), (max_usd, body)
+        assert body["order"]["makerAmount"] == str(69 * shares * WEI // 100) and t["order"] == shares and t["live"]["want"]["shares"] == shares, (max_usd, t["live"]["want"])
+        assert not wbot.sim_blocks(), "the fallback is a buy, not a refusal"
 
     # a Predict account signs and trades for the smart wallet
     kbot = make_bot(PREDICT_ACCOUNT=PA, SIM_WAYS="maker")

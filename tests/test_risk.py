@@ -105,7 +105,7 @@ def ladder(at, bids=(("0.14", "500"),), asks=(("0.16", "500"),), fair=0.02):
 
 
 async def run():
-    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_TAKER_MAX_SHARES": "0",
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0",
                              "WEB_PORT": "8080", "SIM_MARKETS": "all"})
     assert cfg.sim_group_usd == 300 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_GROUP_USD": "0"}).sim_group_usd == 0
     for bad in ({"SIM_GROUP_USD": "-1"}, {"SIM_GROUP_USD": "x"}):
@@ -183,7 +183,7 @@ async def run():
     assert card["groups"][0]["name"] == "$PONS FDV" and card["total"]["markout"]["1m"]["n"] == 3 and card["blocks"][0]["label"] == "吃No"
 
     # --- a resting order counts as if filled for the cap; a position on the other side of the event adds nothing ---------
-    cfg150 = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_TAKER_MAX_SHARES": "0",
+    cfg150 = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0",
                                 "SIM_MARKETS": "all", "SIM_WAYS": "both", "SIM_GROUP_USD": "150"})
     rbot = m.Bot(cfg150, m.Store(":memory:"), FM(NOW), None)
     resting = {"pons#9|down|挂": trade("pons#9|down|挂", "ladder", "PONS", "down", 0.90, 0, "resting", order=100, settle={"target": "300000000"})}
@@ -191,7 +191,7 @@ async def run():
     assert rbot.sim_group_room(resting, one_b, "down", 0.70, 100).startswith("$PONS FDV 涨到 $1B时这组仓位合计将亏 $160.00，超过组上限 $150")
     assert rbot.sim_group_room(resting, one_b, "up", 0.30, 100) == ""  # Yes at $1B: the pump pays it, the crash costs 30
     assert rbot.sim_group_room(resting, one_b, "down", 0.50, 100) == "" and rbot.sim_group_room({}, one_b, "down", 0.95, 100) == ""
-    bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_TAKER_MAX_SHARES": "0",
+    bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0",
                                     "SIM_MARKETS": "all", "SIM_GROUP_USD": "0"})
     await step(NOW + 1_900_000, ladder(NOW + 1_900_000))  # no cap: the fourth No is bought
     assert len(bot.sim_trades()) == 4 and bot.sim_report()["groups"][0]["positions"] == 4

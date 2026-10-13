@@ -19,7 +19,7 @@ HSI_SLUG = "hang-seng-index-up-or-down-on-october-5-2026"
 KOSPI_SLUG = "kospi-composite-index-up-or-down-on-october-5-2026"
 CLOSE = BJ(10, 5, 16, 10)
 LEGACY = {"SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off",
-          "SIM_MAKER_SPREAD_CENTS": "10", "SIM_TAKER_MAX_SHARES": "0"}  # the resting-order rules off and the old 10¢ spread rule on: orders rest as placed
+          "SIM_MAKER_SPREAD_CENTS": "10", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0"}  # the resting-order rules off and the old 10¢ spread rule on: orders rest as placed
 FEE = 0.02  # Predict: 2% × min(p, 1 − p) when the market states no rate
 
 # --- settings ----------------------------------------------------------------------------------------------------------
@@ -159,7 +159,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR, "sim_taker_max_shares": 0.0, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
+                                "beta_error": m.MODEL_BETA_ERROR, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert len(bot.sim_trades()) == 2
@@ -1157,7 +1157,7 @@ async def review_fixes():
 async def taker_shares():
     """Takers get their own share count: SIM_TAKER_SHARES in session, SIM_TAKER_AFTER_HOURS_SHARES after hours; makers keep SIM_SHARES."""
     env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
-           "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off", "SIM_MAKER_SESSION": "off",
+           "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off", "SIM_MAKER_SESSION": "off", "SIM_TAKER_SWEEP_SHARES": "0",
            "SIM_TAKER_SHARES": "20", "SIM_TAKER_AFTER_HOURS_SHARES": "10", "SIM_TAKER_AFTER_HOURS_CENTS": "10"}
     bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
     bot.sim_markets = lambda now: world["markets"]
@@ -1200,6 +1200,53 @@ async def taker_shares():
     assert [k for k in obot.sim_trades() if k.startswith(tid)] == [tid]  # 0 = once only
     row = next(r for r in obot.sim_checks(NOW + 5_000) if r["market"] == HSI_SLUG)
     assert "每边只吃一次" in row["taker"], row["taker"]
+    # 1.68.0: SIM_TAKER_SWEEP_SHARES — the asks under the cap are taken in one order, however many levels (a fair price
+    # of 50¢: the 20¢ and the 30¢ asks both clear the bar, both go), up to the ceiling and never under the per-buy count
+    two = lambda at, **kw: m.dataclasses.replace(hsi(0.50, [("0.10", "100")], [("0.20", "100"), ("0.30", "100"), ("0.45", "500")], at, **kw), in_session=True)
+    sweep_env = {**cap_env, "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "300"}
+    sbot = m.Bot(m.Config.from_env(sweep_env), m.Store(":memory:"), FM(NOW), None)
+    sbot.sim_markets = lambda now: world["markets"]
+    mk = two(NOW)
+    assert sbot.sim_taker_cap(mk, "up", 200) == 0.39 and sbot.sim_taker_want(mk, "up", 0.39) == 200 and sbot.sim_taker_want(mk, "down", 0.39) == 100
+    assert sbot.sim_taker_want(two(NOW, hold="x"), "up", 0) == 100 and sbot.sim_version()["sim_taker_sweep"] == 300
+    gap = sbot.sim_taker_gap(mk, sbot.sim_trades(), NOW)
+    assert gap["state"] == "ready" and "可买 200 份" in gap["text"], gap
+    await step(sbot, NOW, mk)
+    t = sbot.sim_trades()[tid]
+    assert t["order"] == 200 and t["shares"] == 200 and t["fills"][0]["levels"] == [[0.2, 100.0], [0.3, 100.0]] and not t["fills"][0]["short"], t
+    assert abs(t["avg"] - 0.25) < 1e-9 and t["cap"] == 0.39 and t["version"]["sim_taker_sweep"] == 300
+    wbot = m.Bot(m.Config.from_env({**sweep_env, "SIM_TAKER_SWEEP_SHARES": "150"}), m.Store(":memory:"), FM(NOW), None)  # the ceiling
+    wbot.sim_markets = lambda now: world["markets"]
+    await step(wbot, NOW, two(NOW))
+    assert wbot.sim_trades()[tid]["fills"][0]["levels"] == [[0.2, 100.0], [0.3, 50.0]]
+    mbot = m.Bot(m.Config.from_env({**sweep_env, "SIM_TAKER_MAX_SHARES": "120"}), m.Store(":memory:"), FM(NOW), None)  # under the per-side total
+    mbot.sim_markets = lambda now: world["markets"]
+    await step(mbot, NOW, two(NOW))
+    assert mbot.sim_trades()[tid]["fills"][0]["levels"] == [[0.2, 100.0], [0.3, 20.0]]
+    thin = lambda at: m.dataclasses.replace(hsi(0.50, [("0.10", "100")], [("0.20", "50"), ("0.45", "500")], at), in_session=True)
+    tbot = m.Bot(m.Config.from_env(sweep_env), m.Store(":memory:"), FM(NOW), None)  # a thin book: the per-buy count asked, as before
+    tbot.sim_markets = lambda now: world["markets"]
+    assert tbot.sim_taker_want(thin(NOW), "up", 0.39) == 100
+    await step(tbot, NOW, thin(NOW))
+    t = tbot.sim_trades()[tid]
+    assert t["order"] == 100 and t["shares"] == 50 and t["fills"][0]["short"]
+    # the group cap refuses the sweep ($50 at risk) but not the per-buy count ($20): the latter goes, as before
+    gbot = m.Bot(m.Config.from_env({**sweep_env, "SIM_GROUP_USD": "30"}), m.Store(":memory:"), FM(NOW), None)
+    gbot.sim_markets = lambda now: world["markets"]
+    gap = gbot.sim_taker_gap(two(NOW), gbot.sim_trades(), NOW)
+    assert gap["state"] == "ready" and "可买 100 份" in gap["text"], gap
+    await step(gbot, NOW, two(NOW))
+    t = gbot.sim_trades()[tid]
+    assert t["order"] == 100 and t["fills"][0]["levels"] == [[0.2, 100.0]], t
+    assert not gbot.sim_blocks(), "the fallback is a buy, not a refusal"
+    nbot = m.Bot(m.Config.from_env({**sweep_env, "SIM_GROUP_USD": "10"}), m.Store(":memory:"), FM(NOW), None)  # neither fits: refused, noted
+    nbot.sim_markets = lambda now: world["markets"]
+    await step(nbot, NOW, two(NOW))
+    assert tid not in nbot.sim_trades() and nbot.sim_blocks() and "超过组上限 $10" in nbot.sim_blocks()[0]["why"]
+    obot2 = m.Bot(m.Config.from_env({**sweep_env, "SIM_TAKER_SWEEP_SHARES": "0"}), m.Store(":memory:"), FM(NOW), None)  # off: the 20¢ ones only
+    obot2.sim_markets = lambda now: world["markets"]
+    await step(obot2, NOW, two(NOW))
+    assert obot2.sim_trades()[tid]["fills"][0]["levels"] == [[0.2, 100.0]]
     print("TAKER_SHARES_OK")
 
 

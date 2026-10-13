@@ -1025,7 +1025,7 @@ class LiveBot(core.Bot):
         if hold := self.live_send_hold(self.market.now_ms()):
             return hold  # no new risk on an account whose orders were not read lately
         if taker and taker.get("cap"):
-            price, shares = float(taker["cap"]), float(self.sim_taker_shares(mk))  # the LIMIT order asks for the taker count at the cap: the most it can cost
+            price, shares = float(taker["cap"]), float(taker.get("want") or self.sim_taker_shares(mk))  # the LIMIT order asks for the count at the cap: the most it can cost
         notional = float(price) * float(shares)
         if notional < MIN_ORDER_USD - 1e-9:
             return f"本单 ${notional:,.2f} 低于 Predict 最低订单金额 ${MIN_ORDER_USD:g}（提高 SIM_SHARES）"
