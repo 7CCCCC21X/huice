@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.68.0"
+VERSION = "1.69.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -450,7 +450,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_WAYS", "做哪种单", "吃单 = 算出仍留足净优势的最高价位（封顶价），盘口在它之下的立即买（真实交易用封顶限价单）；挂单 = 按建议价挂着等成交"),
     ("SIM_MARKETS", "做哪些市场", "可多选；全选 = all；展开详细选项可按市场逐个排除"),
     ("SIM_SKIP", "不做的市场（详细选项）", "逗号分隔的市场代码；在“做哪些市场”卡片展开详细选项点选，空 = 所选类型里的市场都做"),
-    ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "0 = 不限"),
+    ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "容不下想买的份数时只买到刚好不超过的份数，一份都容不下才不买；0 = 不限"),
     ("SIM_TAKER_SESSION", "只在标的开盘时段吃单", "开 = 指数/个股日涨跌的吃单只在标的开盘时段（卡片按现货定价时）进行，盘后只挂单；挂单不受影响"),
     ("SOURCES_OFF", "关闭的行情源", "海外机房常被东方财富拒绝（502 / 直接断开）：关掉后每一轮、每个锚点查找和 /diag 都不再问它，由腾讯、新浪、Yahoo、Naver 顶上（A50 的 15:00 锚点只能用新浪 5 分钟 K 的近似值）"),
     ("SIM_TAKER_AFTER_HOURS_CENTS", "盘后吃单模式（¢/份）", "0～50：开盘前、收盘后也吃指数/个股日涨跌的单，但只吃净优势不低于这个数的（不低于触发门槛）；0 = 关（按上一项）"),
@@ -472,8 +472,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_SECONDS", "检查订单的频率（秒）", "3～60：每隔这么多秒看一轮盘口——决定挂单 / 吃单 / 撤单，并读回真实订单的状态（成交、撤单）；越小反应越快、请求越多"),
     ("PREDICT_POLL_SECONDS", "盘口刷新间隔（秒）", "3～3600：每隔这么多秒读一遍 Predict 的订单簿；设得比检查频率还短没有意义，太短会被 Predict 限流（429，之后 20 秒内不再请求）"),
     ("PREDICT_COLD_POLL_SECONDS", "冷门盘口刷新间隔（秒）", "3～80：指数/个股日涨跌、有单的市场、距吃单 5¢ 以内或够挂单门槛的市场每轮都刷；其余（几十个阶梯档位）每隔这么多秒才刷一次，省下的请求让关键市场更快"),
-    ("LIVE_MAX_ORDER_USD", "真实交易单笔上限（$）", "1～1000000"),
-    ("LIVE_MAX_OPEN_USD", "持仓 + 挂单上限（$）", "1～100000000"),
+    ("LIVE_MAX_ORDER_USD", "真实交易单笔上限（$）", "1～1000000：吃单按封顶价 × 份数算；容不下想买的份数时只买上限之内的份数"),
+    ("LIVE_MAX_OPEN_USD", "持仓 + 挂单上限（$）", "1～100000000：容不下想买的份数时只买剩余额度之内的份数"),
     ("LIVE_MAX_DAILY_LOSS_USD", "当日已结算亏损停机线（$）", "0 = 不限"),
     ("LIVE_TAKER_WAIT_SECONDS", "吃单的限价单等多久（秒）", "5～3600：封顶限价单挂出后，这么多秒内没成交的部分撤掉"),
     ("LIVE_RETRY_SECONDS", "下单失败后回避（秒）", "10～86400"),
@@ -12226,7 +12226,7 @@ class Bot:
             self.note_outcome(symbol, day, base.value, base.source)
 
     def sim_open(self, mk: SimMarket, side: str, now_ms: int, maker: BookEdge | None = None,
-                 taker: dict | None = None) -> dict:
+                 taker: dict | None = None, shares: float | None = None) -> dict:
         """A paper buy of SIM_SHARES of one side, with everything it was decided on (entry snapshot: the model's inputs,
         the price sources and proxy, the book, the code and settings). A taker fills now across the book's depth (the
         quote it was judged on); a maker rests at its price behind the queue already there and fills only as sellers
@@ -12239,7 +12239,8 @@ class Bot:
                  "kind": mk.kind, "key": mk.key, "side": side, "label": ("挂" if maker else "吃") + mk.sides[0 if side == "up" else 1],
                  "maker": maker is not None, "fair": fair, "opened": now_ms, "settle": mk.settle,
                  "driver": driver, "driver_name": driver_name,  # the event it settles on: positions sharing it lose together
-                 "order": float(taker.get("want") or self.sim_taker_shares(mk)) if taker is not None else self.config.sim_shares, "fills": [], "revisions": [],
+                 "order": (float(taker.get("want") or self.sim_taker_shares(mk)) if taker is not None
+                           else self.config.sim_shares if shares is None else float(shares)), "fills": [], "revisions": [],
                  "entry": {"at": now_ms, "fair": fair, "fair_up": mk.fair_up, "need": mk.need, "book": book_snapshot(mk.book),
                            "card": [edge_json(e, shown, e.label.replace("涨", mk.sides[0]).replace("跌", mk.sides[1]))
                                     for e in edges], **self.evidence_of(mk)},
@@ -12441,10 +12442,10 @@ class Bot:
             if maker is not None:
                 side = "up" if maker.side == "涨" else "down"
                 ahead = sum(q for p, q in own_levels(mk.book, side) if p > maker.price + 1e-9) if maker.sweep else 0.0
-                maker_text = (f"挂{mk.sides[0 if side == 'up' else 1]} {cents(maker.price)}×{c.sim_shares:g} 份（净优势 {cents(maker.edge)}，"
+                count, maker_why = self.sim_maker_pick(mk, trades, side, maker, now_ms)  # SIM_SHARES, or the most the caps take
+                maker_text = (f"挂{mk.sides[0 if side == 'up' else 1]} {cents(maker.price)}×{count:g} 份（净优势 {cents(maker.edge)}，"
                               + (f"击穿单，前面 {ahead:g} 份）" if maker.sweep else ("买1 之上 1¢，" if maker.front else "")
                                  + (f"排在 {maker.size:g} 份之后）" if maker.size > 0 else "排在最前）")))
-                maker_why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, maker.price, c.sim_shares)
                 held = trades.get(f"{mk.market}|{side}|挂")
                 if held is not None and sim_position(held):
                     maker_text += f"；已有持仓 {float(held.get('shares') or 0):g} 份，再挂一笔"
@@ -12479,7 +12480,9 @@ class Bot:
                     elif q is None or q["got"] < SIM_MIN_SHARES - 1e-9:
                         parts.append(f"{name}：封顶 {cents(cap)}，之下没有卖单")
                     else:
-                        parts.append(f"{name}：封顶 {cents(cap)}，可买 {q['got']:g} 份" + (f"（已吃 {taken:g} 份，上限 {c.sim_taker_max_shares:g}）" if taken > 0 else ""))
+                        q, hold = self.sim_taker_pick(mk, trades, side, q, now_ms)  # the count the caps take, or why none
+                        parts.append(f"{name}：封顶 {cents(cap)}，可买 {q['got']:g} 份" + (f"（已吃 {taken:g} 份，上限 {c.sim_taker_max_shares:g}）" if taken > 0 else "")
+                                     + (f"，但{hold}" if hold else ""))
                 after = mk.in_session is False and (self.sim_taker_after_hours(mk) or self.sim_after_hours_price(mk) is not None)
                 taker_text = ("盘后：" if after else "") + "；".join(parts)
             rows.append({"item": mk.item, "kind": SIM_KINDS.get(mk.kind, mk.kind), "market": mk.market,
@@ -13103,7 +13106,7 @@ class Bot:
                 tid = f"{mk.market}|{side}|挂"
                 held = trades.get(tid)  # one order per market, side and way at a time; a position from a filled one lets the next in
                 if held is None or sim_position(held):
-                    why = self.sim_quiet(mk.settle, now_ms) or self.sim_group_room(trades, mk, side, maker.price, self.config.sim_shares)
+                    count, why = self.sim_maker_pick(mk, trades, side, maker, now_ms)  # SIM_SHARES, or the most the caps take
                     if why:
                         self.sim_note_block(tid, mk, "挂" + mk.sides[0 if side == "up" else 1], maker.price, why, now_ms)
                     else:
@@ -13111,7 +13114,7 @@ class Bot:
                             new_tid = self.sim_rekey(tid, held)
                             trades[new_tid] = trades.pop(tid)
                             changed = [(new_tid if k == tid else k, t) for k, t in changed]
-                        trades[tid] = self.sim_open(mk, side, now_ms, maker=maker)
+                        trades[tid] = self.sim_open(mk, side, now_ms, maker=maker, shares=count)
                         changed.append((tid, trades[tid]))
             self.sim_take(mk, trades, now_ms, changed)
         t2 = time.monotonic()
@@ -13202,19 +13205,78 @@ class Bot:
 
     def sim_taker_pick(self, mk: SimMarket, trades: dict[str, dict], side: str, q: dict, now_ms: int) -> tuple[dict, str]:
         """The taker order on this side as the trader places it now: the quote ``q`` (sim_taker_want's count) when the
-        quiet window and the group cap — in real trading the limits too (sim_group_room) — allow it; a sweep they do
-        not fit falls back to the per-buy count when that fits. (the quote, "" | why neither may be bought)."""
+        quiet window and the caps allow it; when the caps do not take that many — the group cap, in real trading the
+        order and exposure limits and the balance too — the most they do (whole shares, the cheapest asks first), so
+        a limit bounds the order instead of refusing it: 300 shares at a 77¢ cap are $231, over a $100 order limit;
+        129 are not. (the quote, "" | why nothing may be bought)."""
         quiet = self.sim_quiet(mk.settle, now_ms)
-        why = quiet or self.sim_group_room(trades, mk, side, q["cost"], q["got"], taker=q)
-        if why and not quiet and q["want"] > self.sim_taker_shares(mk) + 1e-9:
-            bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
-            room, _ = self.sim_taker_room(trades, mk, side)
-            plain = taker_quote(mk.book, side, room, bps, q["cap"]) if room >= SIM_MIN_SHARES - 1e-9 else None
-            if plain and plain["got"] >= SIM_MIN_SHARES - 1e-9:
-                why = self.sim_group_room(trades, mk, side, plain["cost"], plain["got"], taker=plain)
-                if not why:
-                    return plain, ""
+        if quiet:
+            return q, quiet
+        why = self.sim_group_room(trades, mk, side, q["cost"], q["got"], taker=q)
+        if not why:
+            return q, ""
+        bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
+        quotes: dict[int, dict | None] = {}
+
+        def quote(n: int) -> dict | None:
+            if n not in quotes:
+                quotes[n] = taker_quote(mk.book, side, float(n), bps, q["cap"])
+            return quotes[n]
+
+        def fits(n: int) -> bool:  # the paper cap alone while searching; the real-trading limits are counted once, below
+            qn = quote(n)
+            return bool(qn) and qn["got"] >= SIM_MIN_SHARES - 1e-9 and not Bot.sim_group_room(self, trades, mk, side, qn["cost"], qn["got"], taker=qn)
+        best = self.sim_size_down(self.sim_size_top(trades, q["want"], q["cap"]), fits)
+        if best is not None:
+            qb = quote(best)
+            if qb is not None and not self.sim_group_room(trades, mk, side, qb["cost"], qb["got"], taker=qb):
+                return qb, ""
         return q, why
+
+    def sim_maker_pick(self, mk: SimMarket, trades: dict[str, dict], side: str, maker: BookEdge, now_ms: int) -> tuple[float, str]:
+        """The resting order's count as the trader places it now: SIM_SHARES when the quiet window and the caps allow
+        it, else the most the caps take (as sim_taker_pick). (shares, "" | why none may be placed)."""
+        want = float(self.config.sim_shares)
+        quiet = self.sim_quiet(mk.settle, now_ms)
+        if quiet:
+            return want, quiet
+        why = self.sim_group_room(trades, mk, side, maker.price, want)
+        if not why:
+            return want, ""
+        best = self.sim_size_down(self.sim_size_top(trades, want, maker.price),
+                                  lambda n: not Bot.sim_group_room(self, trades, mk, side, maker.price, float(n)))
+        if best is not None and not self.sim_group_room(trades, mk, side, maker.price, float(best)):
+            return float(best), ""
+        return want, why
+
+    def sim_size_top(self, trades: dict[str, dict], want: float, price: float) -> int:
+        """The most whole shares a smaller order could have: under ``want`` (which the caps refused) and within what
+        the real-trading limits take at ``price`` per share (live_fit_shares: no limit on paper)."""
+        top = math.floor(min(self.live_fit_shares(trades, price), want) + 1e-9)
+        return top if top < want - 1e-9 else math.ceil(want) - 1
+
+    @staticmethod
+    def sim_size_down(top: int, fits: Any) -> int | None:
+        """The largest count in 1..``top`` that ``fits`` (count -> bool), by halving (what a bigger order breaks a
+        smaller one may not). None when not even one share fits — or none of the counts tried does, the refusal not
+        being about the size (an unread balance, an order in flight)."""
+        if top < 1:
+            return None
+        if fits(top):
+            return top
+        lo, hi, best = 1, top - 1, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if fits(mid):
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    def live_fit_shares(self, trades: dict[str, dict], price: float) -> float:
+        """The most shares the real-trading limits take at ``price`` per share; no limit on paper (the real trader
+        counts its order and exposure limits and the balance)."""
+        return math.inf
 
     async def sim_express(self, key: str) -> None:
         """The express lane (PredictFeed.on_update): a market's book just came in — when an ask under the taker's cap

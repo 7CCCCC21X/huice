@@ -680,9 +680,10 @@ async def run():
     body = lbot.live.api.calls[-1][1]["data"]
     assert body["pricePerShare"] == str(69 * 10 ** 16) and body["order"]["takerAmount"] == str(100 * WEI) and lbot.sim_trades()["two|up|吃"]["cap"] == 0.69
     # 1.68.0: SIM_TAKER_SWEEP_SHARES — the order asks for every share under the cap (58¢×40 + 62¢×100 = 140) at the cap; the
-    # real-trading limits judge that count (live_room), and a sweep they refuse falls back to the per-buy count
+    # real-trading limits judge that count (live_room); 1.69.0: a count they do not take is cut to the most they do
+    # ($80 at the 69¢ cap: 115 shares), never refused outright
     two = lambda at: m.SimMarket("two", "two", "close", "X", 0.80, book([], [("0.58", "40"), ("0.62", "100")], at, "two", mid="103"), 0.03, "", ("涨", "跌"), {})
-    for max_usd, shares in (("100", 140), ("80", 100)):
+    for max_usd, shares in (("100", 140), ("80", 115)):
         wbot = make_bot(SIM_WAYS="taker", SIM_TAKER_SWEEP_SHARES="300", LIVE_MAX_ORDER_USD=max_usd)
         await wbot.live_prepare()
         wbot.live.api.markets["103"] = market_json("103")
@@ -693,7 +694,20 @@ async def run():
         t = wbot.sim_trades()["two|up|吃"]
         assert body["order"]["takerAmount"] == str(shares * WEI) and body["pricePerShare"] == str(69 * 10 ** 16), (max_usd, body)
         assert body["order"]["makerAmount"] == str(69 * shares * WEI // 100) and t["order"] == shares and t["live"]["want"]["shares"] == shares, (max_usd, t["live"]["want"])
-        assert not wbot.sim_blocks(), "the fallback is a buy, not a refusal"
+        assert not wbot.sim_blocks(), "a smaller order, not a refusal"
+    assert abs(wbot.live_fit_shares({}, 0.69) - 80 / 0.69) < 1e-9 and wbot.live_fit_shares({}, 0) == float("inf")
+    wbot.config = dataclasses.replace(wbot.config, live_max_open_usd=100)  # the open order ($79.35 reserved) counts against the exposure limit
+    assert 0 < wbot.live_fit_shares(wbot.sim_trades(), 0.69) < 40, wbot.live_fit_shares(wbot.sim_trades(), 0.69)
+    # a resting order the order limit does not take at SIM_SHARES is placed for the most it does: 100 at 55¢ is $55, 90 are $49.5
+    mbot = make_bot(SIM_WAYS="maker", LIVE_MAX_ORDER_USD="50")
+    await mbot.live_prepare()
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    await mbot.live_prefetch(NOW)
+    await step(mbot, NOW)
+    body = mbot.live.api.calls[-1][1]["data"]
+    t = mbot.sim_trades()[f"{HSI_SLUG}|up|挂"]
+    assert body["order"]["takerAmount"] == str(90 * WEI) and body["order"]["makerAmount"] == str(495 * WEI // 10) and t["order"] == 90, (body, t["order"])
+    assert t["live"]["want"]["shares"] == 90 and not mbot.sim_blocks()
 
     # a Predict account signs and trades for the smart wallet
     kbot = make_bot(PREDICT_ACCOUNT=PA, SIM_WAYS="maker")

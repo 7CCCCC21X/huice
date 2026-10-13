@@ -1230,19 +1230,42 @@ async def taker_shares():
     await step(tbot, NOW, thin(NOW))
     t = tbot.sim_trades()[tid]
     assert t["order"] == 100 and t["shares"] == 50 and t["fills"][0]["short"]
-    # the group cap refuses the sweep ($50 at risk) but not the per-buy count ($20): the latter goes, as before
+    # the group cap does not take the sweep ($50 at risk): the most it does goes — 131 shares (100 at 20¢ and 31 at 30¢:
+    # $29.9 at risk under $30), neither nothing nor just the per-buy count (1.69.0: a cap bounds the order)
     gbot = m.Bot(m.Config.from_env({**sweep_env, "SIM_GROUP_USD": "30"}), m.Store(":memory:"), FM(NOW), None)
     gbot.sim_markets = lambda now: world["markets"]
     gap = gbot.sim_taker_gap(two(NOW), gbot.sim_trades(), NOW)
-    assert gap["state"] == "ready" and "可买 100 份" in gap["text"], gap
+    assert gap["state"] == "ready" and "可买 131 份" in gap["text"], gap
+    world["markets"] = [two(NOW)]
+    row = next(r for r in gbot.sim_checks(NOW) if r["market"] == HSI_SLUG)
+    assert "涨：封顶 39.0¢，可买 131 份" in row["taker"], row["taker"]
     await step(gbot, NOW, two(NOW))
     t = gbot.sim_trades()[tid]
-    assert t["order"] == 100 and t["fills"][0]["levels"] == [[0.2, 100.0]], t
-    assert not gbot.sim_blocks(), "the fallback is a buy, not a refusal"
-    nbot = m.Bot(m.Config.from_env({**sweep_env, "SIM_GROUP_USD": "10"}), m.Store(":memory:"), FM(NOW), None)  # neither fits: refused, noted
+    assert t["order"] == 131 and t["shares"] == 131 and t["fills"][0]["levels"] == [[0.2, 100.0], [0.3, 31.0]], t
+    assert not gbot.sim_blocks(), "a smaller buy, not a refusal"
+    assert gbot.sim_group_room(gbot.sim_trades(), two(NOW), "up", 0.204, 1).startswith("恒生指数"), "one more share would not fit"
+    sbot2 = m.Bot(m.Config.from_env({**sweep_env, "SIM_GROUP_USD": "10"}), m.Store(":memory:"), FM(NOW), None)  # $10: 49 shares at 20¢ (+ fee)
+    sbot2.sim_markets = lambda now: world["markets"]
+    await step(sbot2, NOW, two(NOW))
+    assert sbot2.sim_trades()[tid]["order"] == 49 and sbot2.sim_trades()[tid]["fills"][0]["levels"] == [[0.2, 49.0]]
+    nbot = m.Bot(m.Config.from_env({**sweep_env, "SIM_GROUP_USD": "0.1"}), m.Store(":memory:"), FM(NOW), None)  # not even a share fits: refused, noted
     nbot.sim_markets = lambda now: world["markets"]
+    gap = nbot.sim_taker_gap(two(NOW), nbot.sim_trades(), NOW)
+    assert gap["state"] == "blocked" and "超过组上限 $0.1" in gap["text"], gap
     await step(nbot, NOW, two(NOW))
-    assert tid not in nbot.sim_trades() and nbot.sim_blocks() and "超过组上限 $10" in nbot.sim_blocks()[0]["why"]
+    assert tid not in nbot.sim_trades() and nbot.sim_blocks() and "超过组上限 $0.1" in nbot.sim_blocks()[0]["why"]
+    assert m.Bot.sim_size_down(0, lambda n: True) is None and m.Bot.sim_size_down(7, lambda n: True) == 7 and m.Bot.sim_size_down(300, lambda n: n <= 129) == 129
+    assert m.Bot.sim_size_down(300, lambda n: n <= 1) == 1 and m.Bot.sim_size_down(300, lambda n: False) is None and m.Bot.sim_size_down(10, lambda n: n <= 8) == 8
+    # a resting order the group cap does not take at SIM_SHARES is placed for the most it does: 100 at 48¢ is $48, 62 are $29.8
+    kbot = m.Bot(m.Config.from_env({**sweep_env, "SIM_WAYS": "maker", "SIM_GROUP_USD": "30"}), m.Store(":memory:"), FM(NOW), None)
+    kbot.sim_markets = lambda now: world["markets"]
+    wide = lambda at: m.dataclasses.replace(hsi(0.70, [("0.48", "300")], [("0.90", "100")], at), in_session=True)
+    world["markets"] = [wide(NOW)]
+    row = next(r for r in kbot.sim_checks(NOW) if r["market"] == HSI_SLUG)
+    assert row["maker"].startswith("挂涨 48.0¢×62 份") and not row["maker_why"], row
+    await step(kbot, NOW, wide(NOW))
+    t = kbot.sim_trades()[f"{HSI_SLUG}|up|挂"]
+    assert t["status"] == "resting" and t["order"] == 62 and t["price"] == 0.48 and not kbot.sim_blocks(), t
     obot2 = m.Bot(m.Config.from_env({**sweep_env, "SIM_TAKER_SWEEP_SHARES": "0"}), m.Store(":memory:"), FM(NOW), None)  # off: the 20¢ ones only
     obot2.sim_markets = lambda now: world["markets"]
     await step(obot2, NOW, two(NOW))

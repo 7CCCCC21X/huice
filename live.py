@@ -1079,6 +1079,19 @@ class LiveBot(core.Bot):
         fill at its cap."""
         return sum(self.live_reserved(t) for t in trades.values())
 
+    def live_fit_shares(self, trades: dict[str, dict], price: float) -> float:
+        """The most shares the real-trading limits take at ``price`` per share (a maker's price, a taker's cap): the
+        order limit, what LIVE_MAX_OPEN_USD leaves beside the open records, the USDT balance; 0 when what fits is
+        under Predict's minimum order. No limit on paper (LIVE=off)."""
+        c = self.config
+        if c.live_mode == "off" or price <= 0:
+            return math.inf
+        room = min(c.live_max_order_usd, c.live_max_open_usd - self.live_exposure(trades))
+        usd = self.live.usd()
+        if usd is not None:
+            room = min(room, usd)
+        return room / price if room >= MIN_ORDER_USD - 1e-9 else 0.0
+
     def live_daily_pnl(self, trades: dict[str, dict], now_ms: int) -> float:
         today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
         since = int(today.timestamp() * 1000)
@@ -1100,8 +1113,9 @@ class LiveBot(core.Bot):
             self.live_notify(f"🛑 {why}；今天不再开新仓，已请求撤掉挂单（以 Predict 的确认为准）。/live resume 可手动恢复。", key="kill")
 
     # --- opening: the paper record becomes an order to place ----------------------------------------------------------
-    def sim_open(self, mk: core.SimMarket, side: str, now_ms: int, maker: Any = None, taker: dict | None = None) -> dict:
-        trade = super().sim_open(mk, side, now_ms, maker, taker)
+    def sim_open(self, mk: core.SimMarket, side: str, now_ms: int, maker: Any = None, taker: dict | None = None,
+                 shares: float | None = None) -> dict:
+        trade = super().sim_open(mk, side, now_ms, maker, taker, shares)
         if self.config.live_mode == "off":
             return trade  # a paper record, filled and settled as the base class does
         info = self.live.markets[str(mk.book.market_id)]

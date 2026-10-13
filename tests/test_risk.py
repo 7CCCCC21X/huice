@@ -105,9 +105,12 @@ def ladder(at, bids=(("0.14", "500"),), asks=(("0.16", "500"),), fair=0.02):
 
 
 async def run():
-    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0",
-                             "WEB_PORT": "8080", "SIM_MARKETS": "all"})
-    assert cfg.sim_group_usd == 300 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_GROUP_USD": "0"}).sim_group_usd == 0
+    base_env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0",
+                "WEB_PORT": "8080", "SIM_MARKETS": "all"}
+    # the cap at $259: the three No positions alone put the worst move at $258.84, so not a share of the fourth fits
+    # (1.69.0: a cap cuts an order to what fits; a refusal is for an order of which nothing fits)
+    cfg = m.Config.from_env({**base_env, "SIM_GROUP_USD": "259"})
+    assert m.Config.from_env(base_env).sim_group_usd == 300 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_GROUP_USD": "0"}).sim_group_usd == 0
     for bad in ({"SIM_GROUP_USD": "-1"}, {"SIM_GROUP_USD": "x"}):
         try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
         except ValueError: pass
@@ -135,15 +138,25 @@ async def run():
     assert [(s["source"], s["trades"]) for s in r["sources"]] == [("DexScreener", 3), ("DexScreener FDV ÷ 价格", 3)]
     (b,) = r["blocks"]
     assert b["item"] == "$PONS FDV $1B" and b["label"] == "吃No" and abs(b["price"] - t3["price"]) < 1e-12 and b["at"] == NOW and b["first"] == NOW
-    assert b["why"].startswith("$PONS FDV 涨到 $1B时这组仓位合计将亏 $345.12，超过组上限 $300（$PONS FDV 已有 3 笔") and r["group_cap"] == 300, b["why"]
+    assert b["why"].startswith("$PONS FDV 涨到 $1B时这组仓位合计将亏 $345.12，超过组上限 $259（$PONS FDV 已有 3 笔") and r["group_cap"] == 259, b["why"]
     assert (b["driver"], b["name"], b["id"]) == ("PONS", "$PONS FDV", "what-fdv-will-pons-hit-before-nov-2026#4|down|吃")
     text = bot.cmd_sim(None).text
     assert "🧩 最坏单一事件：$PONS FDV 涨到 $700M → −$258.84（$PONS FDV 3 笔，占持仓成本 100%）" in text, text
     assert "📡 持仓依赖的数据源：DexScreener 3 笔 $259｜DexScreener FDV ÷ 价格 3 笔 $259" in text, text
-    assert "⛔ 组上限 $300 一周内拦下 1 笔；最近 10-07 10:00 $PONS FDV $1B 吃No @ 86.3¢：" in text, text
+    assert "⛔ 组上限 $259 一周内拦下 1 笔；最近 10-07 10:00 $PONS FDV $1B 吃No @ 86.3¢：" in text, text
     # the review page carries the groups, the sources and the refused buys; the CSV the driver and the markouts
     j = bot.journal_payload()
-    assert j["groups"][0]["event"] == "$PONS FDV 涨到 $700M" and j["blocks"][0]["item"] == "$PONS FDV $1B" and j["group_cap"] == 300
+    assert j["groups"][0]["event"] == "$PONS FDV 涨到 $700M" and j["blocks"][0]["item"] == "$PONS FDV $1B" and j["group_cap"] == 259
+    # with room under the cap the fourth is cut to what fits (1.69.0): 47 shares take the pump past $1B to −$299.4 of $300
+    sbot = m.Bot(m.Config.from_env({**base_env, "SIM_GROUP_USD": "300"}), m.Store(":memory:"), FM(NOW), None)
+    sbot.sim_markets = lambda now: ladder(NOW)
+    sbot.sim_ran = -1e9
+    await sbot.sim_step(NOW)
+    st = sbot.sim_trades()
+    t4 = st["what-fdv-will-pons-hit-before-nov-2026#4|down|吃"]
+    assert len(st) == 4 and t4["order"] == 47 and t4["shares"] == 47 and not sbot.sim_blocks(), (t4["order"], sbot.sim_blocks())
+    worst = sbot.sim_report()["groups"][0]["worst"]
+    assert -300 <= worst < -299 and sbot.sim_group_room(st, ladder(NOW)[3], "down", t4["price"], 1).startswith("$PONS FDV 涨到 $1B"), worst
     assert all(t["driver_name"] == "$PONS FDV" for t in j["trades"])
     rows = list(csv.reader(io.StringIO(bot.journal_csv()[1:])))
     assert rows[0][-4:] == ["共同风险组", "成交后1分钟市价变动", "成交后5分钟市价变动", "成交后30分钟市价变动"]
