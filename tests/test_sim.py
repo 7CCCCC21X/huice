@@ -159,7 +159,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
+                                "beta_error": m.MODEL_BETA_ERROR, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert len(bot.sim_trades()) == 2
@@ -1536,3 +1536,37 @@ async def fair_limit():
 
 
 asyncio.run(fair_limit())
+
+
+async def after_hours_cap():
+    """1.73.0: SIM_AFTER_HOURS_MAX_SHARES — after hours a market's side holds at most this many shares, positions and
+    orders together: an order is cut to the room left, none when there is none; in session the cap does not apply."""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+           "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY, "SIM_TAKER_MAX_SHARES": "1000", "SIM_TAKER_SWEEP_SHARES": "300", "SIM_GROUP_USD": "0"}
+    assert m.Config.from_env(env).sim_after_hours_max_shares == 300 and m.Config.from_env({**env, "SIM_AFTER_HOURS_MAX_SHARES": "0"}).sim_after_hours_max_shares == 0
+    after = lambda at, session=False: m.dataclasses.replace(hsi(0.70, [("0.48", "1000")], [("0.50", "1000")], at), in_session=session)
+    abot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    abot.sim_markets = lambda now: world["markets"]
+    assert abot.sim_side_room({}, after(NOW), "up") == (300.0, "") and abot.sim_side_room({}, after(NOW, True), "up") == (m.math.inf, "")
+    await step(abot, NOW, after(NOW))  # the maker first (100 resting), then the taker: 300 wanted, 200 left under the cap
+    t = abot.sim_trades()
+    maker, taker = t[f"{HSI_SLUG}|up|挂"], t[f"{HSI_SLUG}|up|吃"]
+    assert maker["status"] == "resting" and maker["order"] == 100 and taker["status"] == "filled" and taker["shares"] == 200 and taker["order"] == 200, (maker["order"], taker["order"])
+    room, full = abot.sim_side_room(t, after(NOW), "up")
+    assert room == 0.0 and full == "盘后这一边已有 300 份（持仓加挂单），达到上限 300 份（SIM_AFTER_HOURS_MAX_SHARES）", (room, full)
+    gap = abot.sim_taker_gap(after(NOW + 5_000), t, NOW + 5_000)
+    assert gap["state"] == "blocked" and "达到上限 300 份" in gap["text"], gap
+    await step(abot, NOW + 5_000, after(NOW + 5_000))  # full: nothing more after hours, the refusal noted
+    assert len([k for k in abot.sim_trades() if k.startswith(f"{HSI_SLUG}|up|吃")]) == 1 and any("达到上限 300 份" in b["why"] for b in abot.sim_blocks())
+    assert abot.sim_version()["sim_after_hours_max_shares"] == 300 and abot.control_value("SIM_AFTER_HOURS_MAX_SHARES") == "300"
+    await step(abot, NOW + 10_000, after(NOW + 10_000, session=True))  # in session: no cap, the taker buys its 300
+    t = abot.sim_trades()
+    assert t[f"{HSI_SLUG}|up|吃"]["shares"] == 300 and t[f"{HSI_SLUG}|up|吃#1"]["shares"] == 200, sorted(t)
+    obot = m.Bot(m.Config.from_env({**env, "SIM_AFTER_HOURS_MAX_SHARES": "0"}), m.Store(":memory:"), FM(NOW), None)  # off: as before
+    obot.sim_markets = lambda now: world["markets"]
+    await step(obot, NOW, after(NOW))
+    assert obot.sim_trades()[f"{HSI_SLUG}|up|吃"]["shares"] == 300 and obot.sim_trades()[f"{HSI_SLUG}|up|挂"]["order"] == 100
+    print("AFTER_HOURS_CAP_OK")
+
+
+asyncio.run(after_hours_cap())

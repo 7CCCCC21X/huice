@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.72.1
+版本：1.73.0
 
 ## 已完成
 
+- 1.73.0（盘后每个市场每边持仓上限）：新设置 `SIM_AFTER_HOURS_MAX_SHARES`（默认 300，0 = 不限）：标的没开盘（`mk.in_session is False`，概率来自代理）时，同一市场同一方向的持仓加挂单（已成交份数 + 挂着 / 在途订单的未成交份数）合计不超过上限。`sim_side_room(trades, mk, side)` 给出剩余额度或“已达上限”的原因；`sim_taker_pick` 在安静期检查之后、组上限之前把报价裁到剩余额度（裁后不足一份则拒绝），`sim_maker_pick` 把挂单份数裁到剩余额度；开盘时段和加密市场不受影响。控制页“策略”组、版本信息、README、.env.example 同步。测试 `tests/test_sim.py` `after_hours_cap`（挂 100 + 吃 200 到顶；满了拒绝并记录；开盘后不限；0 关闭）、`tests/test_control.py`。
 - 1.72.1（挂单反复撤了再挂）：Predict 动态里同一张“BTC 10 月 涨 37¢ × 270”每两秒撤一次、挂一次。原因：1.69.0 起上限容不下整单时按容得下的份数挂（$100 ÷ 37¢ = 270），而 `sim_requote_reason` 里“每次份数已改为 N 份，按新份数重挂”拿订单份数和 `SIM_SHARES`（300）比，不等就撤、下一步再按 270 挂，循环。改为拿下单时记录的设置（`version.sim_shares`）和现在的设置比，只有设置本身变了才重挂。测试 `tests/test_trading.py`（裁到 90 份的挂单下一步还是同一张；改 SIM_SHARES 才重挂）。
 - 1.72.0（公平价超过 95¢ 不买）：KOSPI 涨 94.4¢ 这种接近必然的结果，模型按正态算的尾部偏薄，几分钱优势抵不过出事时归零。新设置 `SIM_MAX_FAIR_CENTS`（默认 95，50～100，100 = 不限）：`sim_fair_over(mk, side)` 给出这一边公平价超过上限的原因，`sim_take` 跳过这一边，`sim_taker_gap`（距吃单）把它记为 held 并写明，`sim_checks` 的吃单文字同样，`sim_maker_reason` 跳过这一边、另一边又没有够门槛的挂单时返回“涨的公平价超过上限 95.0¢，不挂”。版本信息、控制页“策略”组、README、.env.example 同步。注意价格阶梯远档 No 的公平价常在 95¢ 以上，想继续做要调到 99 或 100。测试 `tests/test_sim.py` `fair_limit`、`tests/test_control.py`。
 - 1.71.0（吃单按盘口价挂、尾单按公平价重算、记录洪水整理）：（1）`LIVE_TAKER_PRICE`（book 默认 / cap）：真实吃单的限价改为报价里实际走到的最后一档价格（`LiveBot.sim_taker_limit`，`want["limit"]`），封顶价只做决策门槛和显示；`live_room`、`live_unit_cap`、`live_place_order`、`live_apply` 的占位成本、`sim_size_top` 的额度折算都按限价；复盘页“成交方式”写“限价 X（封顶价 Y）”，`journal_row` 多 `limit`。（2）`live_taker_due`：吃单未成交的部分不再只等 `LIVE_TAKER_WAIT_SECONDS`，每一步 `live_taker_stale` 按当时公平价重算封顶价，限价高于封顶价或卡片暂不建议就撤（盘口过期时不判断，等定时器）。（3）/diag 里“决策 29.6s、保存 7.7s、43917 条记录”：`sim_rekey` 原来把整个内存视图清空，下一次 `sim_trades()` 重新解析四万条 JSON（每次挪动记录都来一遍）——改为视图跟着挪，编号改为“最大编号 + 1”；新增 `sim_prune`（每小时、启动后第一步）：每个市场 / 方向 / 方式的位置只留最近 `SIM_ATTEMPTS_KEEP`（20）条没成交的尝试（撤掉的挂单、作废的吃单、被拒的单），持仓、挂单中、真实订单未到终态的都不动；`sim_confirm` 对没有 market_id 的旧记录改为每步最多 8 个 slug 并发查、查到写回记录并记在 `sim_mids`（原来逐条串行查，而且盘口刷新会清掉 feed 的缓存，每步都重查一遍，20 多秒）；`sim_report` 按记录版本缓存，页面每 5 秒的轮询不再重算全部记录。测试 `tests/test_trading.py`（58¢ / 62¢ / 65¢ 限价、cap 模式、公平价变化撤单、卡片暂不建议撤单）、`tests/test_control.py`、`tests/test_sim.py` `prune`。
