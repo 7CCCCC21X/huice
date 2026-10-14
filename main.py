@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.70.0"
+VERSION = "1.71.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -475,7 +475,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_MAX_ORDER_USD", "真实交易单笔上限（$）", "1～1000000：吃单按封顶价 × 份数算；容不下想买的份数时只买上限之内的份数"),
     ("LIVE_MAX_OPEN_USD", "持仓 + 挂单上限（$）", "1～100000000：容不下想买的份数时只买剩余额度之内的份数"),
     ("LIVE_MAX_DAILY_LOSS_USD", "当日已结算亏损停机线（$）", "0 = 不限"),
-    ("LIVE_TAKER_WAIT_SECONDS", "吃单的限价单等多久（秒）", "5～3600：封顶限价单挂出后，这么多秒内没成交的部分撤掉"),
+    ("LIVE_TAKER_WAIT_SECONDS", "吃单的限价单等多久（秒）", "5～3600：吃单的限价单挂出后，这么多秒内没成交的部分撤掉；公平价变到限价高于封顶价时提前撤"),
+    ("LIVE_TAKER_PRICE", "吃单的限价挂在哪", "book = 盘口里实际要吃的最后一档的价格（成交价不会高于看到的，1～2 秒内新出现的更贵卖单留给下一轮）；cap = 封顶价（留足门槛的最高价，新出现的更贵卖单也一并吃）"),
     ("LIVE_RETRY_SECONDS", "下单失败后回避（秒）", "10～86400"),
     ("LIVE_AUTO_REDEEM", "自动领取已结算持仓", "开 = 市场结算后自动在链上领取赢的一边（签名钱包需有 BNB 付 gas）"),
     ("LIVE_NOTIFY", "真实订单的 Telegram 通知", "开 = 真实下单、成交、撤单、失败都发 Telegram 通知"),
@@ -600,6 +601,7 @@ class Config:
     live_chain: int = 56               # PREDICT_CHAIN_ID: 56 = BNB mainnet, 97 = BNB testnet
     live_rpc: str = ""                 # BSC_RPC_URL: JSON-RPC node for balances, allowances, approvals, redeeming; "" = the chain's public node
     live_taker_wait: int = 60          # LIVE_TAKER_WAIT_SECONDS: a taker's LIMIT order (capped at the dearest acceptable price) is cancelled after this
+    live_taker_price: str = "book"     # LIVE_TAKER_PRICE: a taker's LIMIT price — book = the dearest level its quote walks, cap = the dearest acceptable price
     live_retry: int = 300              # LIVE_RETRY_SECONDS: a market and side whose order failed or filled nothing waits this long
     live_max_order_usd: float = 100.0  # LIVE_MAX_ORDER_USD: the most one order may cost
     live_max_open_usd: float = 500.0   # LIVE_MAX_OPEN_USD: filled positions plus resting orders, at cost
@@ -649,6 +651,9 @@ class Config:
         if live_mode == "on" and not live_allowed:
             live_mode = "pause"  # the hard switch: nothing the database saved can turn real orders on past it
         live_key, live_account = e.get("PREDICT_PRIVATE_KEY", "").strip(), e.get("PREDICT_ACCOUNT", "").strip()
+        live_taker_price = e.get("LIVE_TAKER_PRICE", "book").strip().lower() or "book"
+        if live_taker_price not in {"book", "cap"}:
+            raise ValueError("LIVE_TAKER_PRICE 只能是 book（盘口价）或 cap（封顶价）")
         live_chain = bounded_int(e, "PREDICT_CHAIN_ID", 56, 1, 10**9)
         live_rpc = e.get("BSC_RPC_URL", "").strip().rstrip("/")
         if live_key and not re.fullmatch(r"(0x)?[0-9a-fA-F]{64}", live_key):
@@ -753,7 +758,7 @@ class Config:
             else bounded_int(e, "WEB_PORT", int(e.get("PORT") or 0), 0, 65535),
             web_token=e.get("WEB_TOKEN", "").strip(),
             live=live, live_mode=live_mode, live_allowed=live_allowed, live_key=live_key, live_account=live_account, live_chain=live_chain, live_rpc=live_rpc,
-            live_taker_wait=bounded_int(e, "LIVE_TAKER_WAIT_SECONDS", 60, 5, 3600),
+            live_taker_wait=bounded_int(e, "LIVE_TAKER_WAIT_SECONDS", 60, 5, 3600), live_taker_price=live_taker_price,
             live_retry=bounded_int(e, "LIVE_RETRY_SECONDS", 300, 10, 86400),
             live_max_order_usd=parse_bounded(e, "LIVE_MAX_ORDER_USD", "100", 1, 1_000_000),
             live_max_open_usd=parse_bounded(e, "LIVE_MAX_OPEN_USD", "500", 1, 100_000_000),
@@ -7321,6 +7326,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREDICT_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["3", "5", "10", "15", "30"], "unit": "秒"},
     "PREDICT_COLD_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["15", "30", "60", "80"], "unit": "秒"},
     "LIVE_TAKER_WAIT_SECONDS": {"kind": "number", "group": "高级", "presets": ["15", "30", "60", "120"], "unit": "秒"},
+    "LIVE_TAKER_PRICE": {"kind": "choice", "group": "高级", "options": [["book", "盘口价"], ["cap", "封顶价"]]},
     "LIVE_RETRY_SECONDS": {"kind": "number", "group": "高级", "presets": ["60", "300", "600", "1800"], "unit": "秒"},
     "LIVE_AUTO_REDEEM": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
     "LIVE_NOTIFY": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
@@ -8917,7 +8923,7 @@ function detail(t){
   if(t.withdrawn)add("撤单",when(t.withdrawn.at)+"："+(t.withdrawn.why||"")+"，没成交的 "+num(t.withdrawn.unfilled)+" 份作废");
   if(t.maker){add("成交方式",t.real?"真实挂单：成交份数来自 Predict 的订单记录，不按盘口推定":"推定成交：盘口出现卖到挂价或更低的卖单才算，按看到的数量、取最多看到的一次");
     if(!t.real&&t.queue_ahead!=null)add("排队假设","排在挂单时该价位已有的 "+num(t.queue_ahead)+" 份之后；之后最少剩 "+num(t.queue_min)+" 份")}
-  else{add("成交方式",t.real?"真实吃单：封顶限价单"+(t.cap!=null?"，封顶价 "+cent(t.cap):""):"吃单立即成交");add("成交均价",cent(t.avg));add("最优价",cent(t.best));add("深度滑点",sg(t.slip));add("手续费",cent(t.fee)+" /份")}
+  else{add("成交方式",t.real?"真实吃单：限价单"+(t.limit!=null?"，限价 "+cent(t.limit):"")+(t.cap!=null?"（封顶价 "+cent(t.cap)+"）":""):"吃单立即成交");add("成交均价",cent(t.avg));add("最优价",cent(t.best));add("深度滑点",sg(t.slip));add("手续费",cent(t.fee)+" /份")}
   fx.append(fl);
   if((t.fills||[]).length)fx.append($("div","sub","成交记录"),table(["时间","份数","当时公平价","依据"],t.fills.map(f=>[when(f.at),num(f.shares),cent(f.fair),
     f.levels?"吃过："+f.levels.map(l=>cent(l[0])+"×"+num(l[1])).join("、")+(f.short?"（盘口不够）":""):
@@ -8934,7 +8940,7 @@ function detail(t){
     const ST={pending:"准备发送",placing:"发送中（待确认）",open:"已挂出",cancelling:"撤单中",unknown:"状态未知（对账中）",done:"已结束"},FN={filled:"已成交",cancelled:"已撤单",failed:"失败",expired:"未成交"};
     p("订单号",lv.order_id?"#"+lv.order_id:"—");p("状态",(ST[lv.state]||lv.state||"—")+(lv.final?" · "+(FN[lv.final]||lv.final):""));
     if(lv.placed_at)p("下单时间",when(lv.placed_at));if(lv.attempt>1)p("尝试次数",num(lv.attempt));
-    if(t.cost_confirmed===false&&t.shares>0)p("成本","待对账：按封顶价计，读到 Predict 的成交均价后改为实际值");if(lv.error)p("错误",String(lv.error));
+    if(t.cost_confirmed===false&&t.shares>0)p("成本","待对账：按限价计，读到 Predict 的成交均价后改为实际值");if(lv.error)p("错误",String(lv.error));
     const ev=$("div");ev.append(ld);if((lv.events||[]).length)ev.append($("div","sub","订单事件"),table(["时间","事件"],lv.events.map(x=>[when(x.at),x.what||""])));
     d.append(sec("真实订单",ev))}
   // 6. how it was settled
@@ -9319,7 +9325,7 @@ function renderRecords(){if(!data)return;const rows=data.records||[];const tabs=
   shown.forEach(r=>{const tr=el("tr");tr.append(el("td","",r.opened));
     const tdm=el("td");const a=el("a","",r.item);a.href=r.url;a.target="_blank";a.rel="noopener";tdm.append(a);tr.append(tdm);
     tr.append(el("td","",r.label));tr.append(el("td","",(r.price*100).toFixed(1)+"¢×"+r.order+(r.shares&&r.group!=="resting"&&r.shares!==r.order?"（成交 "+r.shares+"）":"")));
-    const tds=el("td");tds.append(el("span",stClass(r),r.status+(r.state?"·"+r.state:"")));if(r.cost_pending)tds.append(el("div","why","成本待对账：按封顶价计，等 Predict 回报成交均价"));if(r.why)tds.append(el("div","why",r.why));tr.append(tds);
+    const tds=el("td");tds.append(el("span",stClass(r),r.status+(r.state?"·"+r.state:"")));if(r.cost_pending)tds.append(el("div","why","成本待对账：按限价计，等 Predict 回报成交均价"));if(r.why)tds.append(el("div","why",r.why));tr.append(tds);
     tr.append(el("td","",r.order_id?"#"+r.order_id:r.live_state||(data.live&&data.live.mode!=="off"?"":"纸面")));
     const td=el("td");if(r.cancellable&&data.live){const b=el("button","bad","撤单");b.disabled=!data.enabled;b.addEventListener("click",()=>{if(confirm("撤掉这张真实挂单（#"+r.order_id+"）？"))act({action:"cancel",id:r.order_id})});td.append(b)}tr.append(td);
     [...tr.children].forEach((c,i)=>{c.dataset.l=REC_LABELS[i]||""});t.append(tr)});
@@ -10329,6 +10335,10 @@ class Bot:
         self.sim_step_ms: dict[str, int] = {}  # the last decision phase, by part (for /diag)
         self.sim_step_info: dict[str, int] = {}  # ...and its size: markets judged, records held
         self.sim_checked: dict[str, float] = {}  # market id -> monotonic time Predict was last asked for its result
+        self.sim_mids: dict[str, str] = {}       # slug -> market id, for old records that carry none (sim_confirm)
+        self.sim_mid_asked: dict[str, float] = {}  # slug -> monotonic time of the last lookup
+        self.sim_pruned_at = -1e9                # monotonic time of the last sim_prune
+        self.sim_report_cache: dict[tuple, dict] = {}  # the last sim_report per arguments, while the records stand
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
         self.reference_pool: ThreadPoolExecutor | None = None
         self.diag_pool: ThreadPoolExecutor | None = None  # /diag's probes run here, not on the feeds' pool
@@ -12873,14 +12883,43 @@ class Bot:
         the attempt stays in the journal. A record already numbered keeps its key."""
         if "#" in tid.rsplit("|", 1)[-1]:
             return tid
-        existing = [k for k in self.sim_trades() if k.startswith(tid + "#")]
-        new_tid = f"{tid}#{len(existing) + 1}"
+        numbers = [int(k.rpartition("#")[2]) for k in self.sim_trades() if k.startswith(tid + "#") and k.rpartition("#")[2].isdigit()]
+        new_tid = f"{tid}#{max(numbers, default=0) + 1}"  # past the highest ever used: a number sim_prune removed is never reused
         if isinstance(trade.get("live"), dict):
             trade["live"]["rekeyed"] = new_tid
         self.store.delete_keys([f"sim:{tid}"])
-        self.sim_cache = None
+        if self.sim_cache is not None:  # the view follows the move (a rebuild parses every record's JSON: seconds with tens of thousands)
+            self.sim_cache.pop(tid, None)
+            self.sim_gen = self.store.touched.get("sim", 0)
         self.sim_save([(new_tid, trade)])
         return new_tid
+
+    SIM_ATTEMPTS_KEEP = 20     # per market, side and way: the attempts that filled nothing kept in the records (the newest)
+    SIM_PRUNE_SECONDS = 3600   # how often the step looks for attempts beyond that
+
+    def sim_prune(self) -> int:
+        """Of the attempts that filled nothing — a resting order withdrawn, a taker that lapsed, an order refused:
+        cancelled or expired records with no shares, moved to tid#n — only the newest SIM_ATTEMPTS_KEEP per slot are
+        kept. A maker re-quoted every few seconds for days left tens of thousands of them, and every look at the
+        records (the step, the journal, the page) paid for all of them. How many were removed."""
+        by_slot: dict[str, list[tuple[int, str]]] = {}
+        for tid, t in self.sim_trades().items():
+            head, _, way = tid.rpartition("|")
+            label, _, n = way.partition("#")
+            if not n.isdigit() or t.get("status") not in {"cancelled", "expired"} or float(t.get("shares") or 0) > 1e-9:
+                continue
+            st = t.get("live")
+            if isinstance(st, dict) and st.get("state") not in (None, "done"):
+                continue  # a real order not at its final word yet
+            by_slot.setdefault(f"{head}|{label}", []).append((int(t.get("opened") or 0), tid))
+        doomed = [tid for rows in by_slot.values() for _, tid in sorted(rows, reverse=True)[self.SIM_ATTEMPTS_KEEP:]]
+        if doomed:
+            self.store.delete_keys([f"sim:{tid}" for tid in doomed])
+            if self.sim_cache is not None:
+                for tid in doomed:
+                    self.sim_cache.pop(tid, None)
+                self.sim_gen = self.store.touched.get("sim", 0)
+        return len(doomed)
 
     def sim_withdraw(self, trade: dict, why: str, now_ms: int) -> None:
         """Withdraw a resting order: the shares it had filled stay a position, the rest lapses now, not at the result."""
@@ -13040,6 +13079,7 @@ class Bot:
         trade.update(status="settled", payout=payout, note=note, settled=trade.get("settled") or now_ms)
 
     SIM_CONFIRM_SECONDS = 600  # each market's final result is asked of Predict at most this often
+    SIM_LOOKUPS_PER_STEP = 8   # old records without a market id: this many slugs looked up per step (side by side)
     SIM_GIVE_UP_MS = 7 * DAY_MS  # ...and no longer than this after the local settlement
 
     def sim_due(self, trade: dict, now_ms: int) -> bool:
@@ -13077,15 +13117,34 @@ class Bot:
         trade is re-settled on Predict's result, the change kept as a revision), or settles what the local data could
         not. Asked at most every SIM_CONFIRM_SECONDS per market; a failed or unreadable answer leaves it pending."""
         wanted: dict[str, list[str]] = {}
+        lookups: dict[str, list[str]] = {}  # slug -> old records without the market's id
         for tid, trade in trades.items():
             if self.sim_due(trade, now_ms):
                 mid = trade.get("market_id") or trade["market"].partition("#")[2]
-                if not mid:  # an old record without the market's id: look it up by its slug
-                    with contextlib.suppress(Exception):
-                        market = await self.predict.resolve(trade.get("slug") or trade["market"])
-                        mid = str(market["id"]) if market else ""
-                if mid:
+                if not mid:
+                    slug = str(trade.get("slug") or trade["market"])
+                    mid = self.sim_mids.get(slug, "")
+                    if not mid:
+                        lookups.setdefault(slug, []).append(tid)
+                        continue
+                wanted.setdefault(mid, []).append(tid)
+        if lookups:
+            # the ids of old records: a few slugs per step, side by side, remembered on the record once found and asked
+            # again only after SIM_CONFIRM_SECONDS when not. (The feed's own cache forgets the slugs no card prices, so
+            # a step once looked every one of them up again, one after another: twenty seconds a step.)
+            slugs = [s for s in lookups if time.monotonic() - self.sim_mid_asked.get(s, -1e9) >= self.SIM_CONFIRM_SECONDS][:self.SIM_LOOKUPS_PER_STEP]
+            for slug in slugs:
+                self.sim_mid_asked[slug] = time.monotonic()
+            found = await asyncio.gather(*(self.predict.resolve(slug) for slug in slugs), return_exceptions=True)
+            for slug, market in zip(slugs, found):
+                if not isinstance(market, dict) or not market.get("id"):
+                    continue
+                mid = self.sim_mids[slug] = str(market["id"])
+                tids = [tid for tid in lookups[slug] if tid in trades]  # a record the step moved meanwhile: next round
+                for tid in tids:
+                    trades[tid]["market_id"] = mid
                     wanted.setdefault(mid, []).append(tid)
+                self.sim_save((tid, trades[tid]) for tid in tids)
         due = [mid for mid in wanted if time.monotonic() - self.sim_checked.get(mid, -1e9) >= self.SIM_CONFIRM_SECONDS]
         for mid in due:
             self.sim_checked[mid] = time.monotonic()
@@ -13132,6 +13191,10 @@ class Bot:
         if not self.sim_step_due():
             return False
         self.sim_ran, self.sim_wake = time.monotonic(), False
+        if time.monotonic() - self.sim_pruned_at >= self.SIM_PRUNE_SECONDS:
+            self.sim_pruned_at = time.monotonic()
+            if pruned := self.sim_prune():
+                LOG.info("模拟交易记录整理：清掉 %d 条没成交的旧尝试（每个位置只留最近 %d 条）", pruned, self.SIM_ATTEMPTS_KEEP)
         self.sim_note_closes()
         async with self.sim_lock:  # never beside the express lane (sim_express): one set of decisions at a time
             confirm = await self.sim_decide(now_ms)
@@ -13282,7 +13345,7 @@ class Bot:
         def fits(n: int) -> bool:  # the paper cap alone while searching; the real-trading limits are counted once, below
             qn = quote(n)
             return bool(qn) and qn["got"] >= SIM_MIN_SHARES - 1e-9 and not Bot.sim_group_room(self, trades, mk, side, qn["cost"], qn["got"], taker=qn)
-        best = self.sim_size_down(self.sim_size_top(trades, q["want"], q["cap"]), fits)
+        best = self.sim_size_down(self.sim_size_top(trades, q["want"], self.sim_taker_limit(q)), fits)
         if best is not None:
             qb = quote(best)
             if qb is not None and not self.sim_group_room(trades, mk, side, qb["cost"], qb["got"], taker=qb):
@@ -13304,6 +13367,11 @@ class Bot:
         if best is not None and not self.sim_group_room(trades, mk, side, maker.price, float(best)):
             return float(best), ""
         return want, why
+
+    def sim_taker_limit(self, q: dict) -> float:
+        """The most a share of this taker quote may cost, for the caps that count a whole order: the cap (the real
+        trader puts its order's limit price here: LIVE_TAKER_PRICE)."""
+        return float(q["cap"])
 
     def sim_size_top(self, trades: dict[str, dict], want: float, price: float) -> int:
         """The most whole shares a smaller order could have: under ``want`` (which the caps refused) and within what
@@ -13444,6 +13512,10 @@ class Bot:
         """The paper trader's record for the page: totals, by market kind and by maker / taker, the latest trades —
         on the public odds page (``public``) without the trade list once a real-trading key is configured: that is an
         account's activity, shown on the review page behind the control key."""
+        key = (recent, public, self.store.touched.get("sim", 0), self.store.touched.get("simblock", 0), bool(getattr(self.config, "live_key", "")),
+               self.config.sim_edge, self.config.sim_shares, self.config.sim_group_usd, sim_scope(self.config))
+        if key in self.sim_report_cache:  # the page asks every few seconds; the records change only when the step changes them
+            return self.sim_report_cache[key]
         trades = sorted(self.sim_trades().items(), key=lambda kv: kv[1].get("opened", 0))
         private = public and bool(getattr(self.config, "live_key", ""))
         rows = [{"id": tid, "opened": stamp(t["opened"], seconds=False), "item": t["item"], "label": t["label"],
@@ -13454,13 +13526,15 @@ class Bot:
                 for tid, t in reversed(trades[-recent:])]
         values = [t for _, t in trades]
         ways, kinds = sim_scope(self.config)
-        return {"edge": self.config.sim_edge, "shares": self.config.sim_shares, "ways": ways, "scope": kinds, "total": sim_stats(values),
-                "kinds": [{"name": name, **sim_stats([t for t in values if t["kind"] == kind])}
-                          for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
-                "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
-                          for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
-                "groups": sim_groups(values), "sources": sim_sources(values), "blocks": self.sim_blocks(),
-                "group_cap": self.config.sim_group_usd, "rows": [] if private else rows, "private": private}
+        report = {"edge": self.config.sim_edge, "shares": self.config.sim_shares, "ways": ways, "scope": kinds, "total": sim_stats(values),
+                  "kinds": [{"name": name, **sim_stats([t for t in values if t["kind"] == kind])}
+                            for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
+                  "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
+                            for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
+                  "groups": sim_groups(values), "sources": sim_sources(values), "blocks": self.sim_blocks(),
+                  "group_cap": self.config.sim_group_usd, "rows": [] if private else rows, "private": private}
+        self.sim_report_cache = {key: report}
+        return report
 
     def sim_text(self) -> str:
         r = self.sim_report(recent=10)
@@ -13581,7 +13655,7 @@ class Bot:
     JOURNAL_HISTORY = 300  # finished trades the review page lists at first; the older ones come on request (journal.json?all=1)
     JOURNAL_LIGHT = ("id", "market", "slug", "item", "kind", "key", "side", "label", "maker", "deep", "sweep", "price", "shares", "order",
                      "unfilled", "opened", "filled", "settled", "status", "confirm", "payout", "edge", "fair", "note", "driver_name",
-                     "text", "state", "pnl", "expected_fill", "url", "wait", "legacy", "cost_confirmed", "withdrawn", "real")
+                     "text", "state", "pnl", "expected_fill", "url", "wait", "legacy", "cost_confirmed", "withdrawn", "real", "limit")
 
     def journal_row(self, tid: str, t: dict, mk: "SimMarket | None", now_ms: int, full: bool) -> dict:
         """One trade for the review page: a list row (JOURNAL_LIGHT — what a line and the filters need, a few hundred
@@ -13591,7 +13665,8 @@ class Bot:
         row = {**t, "id": tid, "driver_name": trade_driver(t)[1], "text": sim_status(t), "state": sim_state(t),
                "pnl": (t["payout"] - t["price"]) * t["shares"] if t["status"] == "settled" else None,
                "expected_fill": sim_fill_expectation(t) if float(t.get("shares") or 0) else 0.0, "url": self.sim_url(t),
-               "wait": self.sim_wait(t, mk, now_ms), "real": bool(st)}
+               "wait": self.sim_wait(t, mk, now_ms), "real": bool(st),
+               "limit": float((st.get("want") or {}).get("limit") or 0) or None}  # a real taker's LIMIT price (LIVE_TAKER_PRICE)
         if full:
             return row
         light = {k: row[k] for k in self.JOURNAL_LIGHT if k in row}
@@ -14611,7 +14686,7 @@ class Bot:
                   "PREDICT_COLD_POLL_SECONDS": str(c.predict_cold_poll), "PREDICT_TRADE_USD": plain(c.predict_trade_usd),
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
-                  "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait),
+                  "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,
                   "LIVE_RETRY_SECONDS": str(c.live_retry), "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify)}
         return values.get(key, "")
 

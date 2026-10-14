@@ -1446,3 +1446,59 @@ asyncio.run(review_fixes())
 asyncio.run(taker_shares())
 asyncio.run(taker_gap())
 asyncio.run(faster())
+
+
+async def prune():
+    """1.71.0: the attempts that filled nothing are kept only SIM_ATTEMPTS_KEEP per slot (a maker re-quoted every few
+    seconds for days left tens of thousands); a moved record is numbered past the highest ever used; the view follows
+    a move without a rebuild; an old record's market id is looked up once, side by side with the others, and kept."""
+    pbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                    "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}), m.Store(":memory:"), FM(NOW), None)
+    base = {"v": 2, "market": HSI_SLUG, "slug": HSI_SLUG, "market_id": "101", "item": "恒生指数", "kind": "close", "key": "HSI", "side": "up",
+            "label": "挂涨", "maker": True, "fair": 0.7, "settle": SETTLE_HSI, "order": 100.0, "fills": [], "revisions": [], "price": 0.55, "edge": 0.15}
+    rows = [(f"{HSI_SLUG}|up|挂#{n}", {**base, "opened": NOW - n * 1000, "status": "cancelled", "shares": 0.0}) for n in range(1, 31)]
+    rows += [(f"{HSI_SLUG}|up|挂#31", {**base, "opened": NOW - 31_000, "status": "filled", "shares": 40.0, "filled": NOW - 31_000}),  # a position: kept
+             (f"{HSI_SLUG}|up|挂#32", {**base, "opened": NOW - 32_000, "status": "cancelled", "shares": 0.0, "live": {"state": "cancelling", "want": {}}}),  # a real order not final: kept
+             (f"{HSI_SLUG}|up|挂", {**base, "opened": NOW, "status": "resting", "shares": 0.0}),
+             (f"{HSI_SLUG}|down|吃#1", {**base, "side": "down", "label": "吃跌", "maker": False, "opened": NOW - 5000, "status": "cancelled", "shares": 0.0})]
+    pbot.sim_save(rows)
+    assert len(pbot.sim_trades()) == 34
+    assert pbot.sim_prune() == 10 and pbot.sim_prune() == 0
+    kept = pbot.sim_trades()
+    assert len(kept) == 24 and all(f"{HSI_SLUG}|up|挂#{n}" in kept for n in range(1, 21)) and not any(f"{HSI_SLUG}|up|挂#{n}" in kept for n in range(21, 31)), sorted(kept)
+    assert f"{HSI_SLUG}|up|挂#31" in kept and f"{HSI_SLUG}|up|挂#32" in kept and f"{HSI_SLUG}|up|挂" in kept and f"{HSI_SLUG}|down|吃#1" in kept
+    assert pbot.store.count("sim:") == 24, "gone from the store too"
+    gen = pbot.store.touched.get("sim", 0)
+    new_tid = pbot.sim_rekey(f"{HSI_SLUG}|up|挂", kept[f"{HSI_SLUG}|up|挂"])
+    assert new_tid == f"{HSI_SLUG}|up|挂#33", new_tid  # past the highest ever used, never a pruned number
+    assert pbot.sim_cache is not None and new_tid in pbot.sim_cache and f"{HSI_SLUG}|up|挂" not in pbot.sim_cache and pbot.sim_gen == pbot.store.touched.get("sim", 0) > gen
+    assert pbot.sim_trades()[new_tid]["status"] == "resting" and pbot.store.get(f"sim:{new_tid}") is not None and pbot.store.get(f"sim:{HSI_SLUG}|up|挂") is None
+    # the step prunes once an hour (and at its first look)
+    pbot.sim_save([(f"{HSI_SLUG}|up|挂#{n}", {**base, "opened": NOW - n * 1000, "status": "cancelled", "shares": 0.0}) for n in range(40, 70)])
+    pbot.sim_markets = lambda now: []
+    pbot.sim_ran = -1e9
+    await pbot.sim_step(NOW)
+    assert pbot.store.count("sim:") == 24 and pbot.sim_pruned_at > 0, pbot.store.count("sim:")  # the 30 new attempts: the newest 20 of the slot stay (#1–#20), the rest go
+    # old records without a market id: looked up by slug a few at a time, remembered on the record and in the bot
+    looked = []
+    async def resolve(slug):
+        looked.append(slug)
+        return {"id": "909"} if slug == "old-slug" else None
+    asked = []
+    async def details(mid):
+        asked.append(mid)
+        return {"outcomes": ["Up", "Down"], "status": "REGISTERED", "resolved": None}
+    pbot.predict.resolve, pbot.predict.market_details = resolve, details
+    legacy = {**base, "market": "old-slug", "slug": "old-slug", "opened": NOW - 86_400_000, "status": "filled", "shares": 100.0,
+              "local": {"up": 1.0, "note": "x", "at": NOW - 1000, "evidence": {}}, "confirm": "local"}
+    legacy.pop("market_id")
+    pbot.sim_save([("old-slug|up|挂", legacy), ("gone-slug|up|挂", {**legacy, "market": "gone-slug", "slug": "gone-slug"})])
+    await pbot.sim_confirm(pbot.sim_trades(), NOW)
+    assert looked == ["old-slug", "gone-slug"] and asked == ["909"] and pbot.sim_mids == {"old-slug": "909"}, (looked, asked)
+    assert pbot.sim_trades()["old-slug|up|挂"]["market_id"] == "909" and "market_id" not in pbot.sim_trades()["gone-slug|up|挂"]
+    await pbot.sim_confirm(pbot.sim_trades(), NOW)
+    assert looked == ["old-slug", "gone-slug"], "found: on the record; not found: not asked again within SIM_CONFIRM_SECONDS"
+    print("PRUNE_OK")
+
+
+asyncio.run(prune())

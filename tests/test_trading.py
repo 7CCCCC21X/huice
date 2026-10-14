@@ -404,12 +404,13 @@ async def run():
     assert o["hash"] == bot.live.wallet.order_hash(o, False, False) and o["signature"].startswith("0x") and len(o["signature"]) == 132
     assert Account.recover_message(encode_typed_data(full_message=bot.live.wallet.typed_data(o, False, False)), signature=o["signature"]) == ADDR
     assert mkt["strategy"] == "LIMIT" and "slippageBps" not in mkt and "isMinAmountOut" not in mkt and "amount" not in mkt
-    assert mkt["pricePerShare"] == str(59 * 10 ** 16) and mkt["order"]["makerAmount"] == str(59 * WEI) and mkt["order"]["takerAmount"] == str(100 * WEI)
-    assert taker["cap"] == 0.59 and taker["live"]["want"]["cap"] == 0.59 and taker["live"]["usd_cap"] == 59.0 and taker["live"]["shares_requested"] == 100
+    # 1.71.0: the LIMIT price is the dearest level the quote walks (58¢: the one level under the 59¢ cap), not the cap
+    assert mkt["pricePerShare"] == str(58 * 10 ** 16) and mkt["order"]["makerAmount"] == str(58 * WEI) and mkt["order"]["takerAmount"] == str(100 * WEI)
+    assert taker["cap"] == 0.59 and taker["live"]["want"]["cap"] == 0.59 and taker["live"]["want"]["limit"] == 0.58 and taker["live"]["usd_cap"] == 58.0 and taker["live"]["shares_requested"] == 100
     assert mkt["order"]["expiration"] == str(NOW // 1000 + 300) and mkt["order"]["tokenId"] == "1011"
     assert maker["live"]["hash"] == o["hash"].lower() and maker["live"]["want"]["outcome"] == "Up" and maker["live"]["usd_cap"] == 55.0
     assert maker["version"]["live"] and maker["version"]["live_account"] == "0x8fd3…7A03"
-    assert abs(bot.live_exposure(trades) - (55 + 100 * 0.59)) < 1e-9  # resting orders are reserved at their cap: the maker's price, the taker's limit
+    assert abs(bot.live_exposure(trades) - (55 + 100 * 0.58)) < 1e-9  # resting orders are reserved at the most they can cost: the maker's price, the taker's limit
     assert L.sim_status(taker) == "吃单等待成交（真实订单 #102 已成交 0/100 份）" and L.sim_status(maker) == "挂单中（真实订单 #101 已成交 0/100 份）"
     assert "限价吃单等待 Predict 成交（封顶 59.0¢" in bot.sim_wait(taker, world["markets"][0], NOW) and "挂 55.0¢" in bot.sim_wait(maker, world["markets"][0], NOW)
     # the edge lasting buys nothing more; the open orders are read back each step
@@ -562,8 +563,8 @@ async def run():
     t = bot.sim_trades()["down|down|吃"]
     body = [b for kind, b in fake.calls if kind == "create"][-1]["data"]
     assert t["label"] == "吃No" and body["order"]["tokenId"] == "1092" and body["order"]["side"] == 0 and t["live"]["want"]["neg_risk"]
-    assert body["pricePerShare"] == str(69 * 10 ** 16) and t["cap"] == 0.69 and t["order"] == 100  # 跌 fair 80¢: the cap keeps 10¢ after the fee
-    assert body["order"]["takerAmount"] == str(100 * WEI) and body["order"]["makerAmount"] == str(69 * WEI)  # only the 65¢ level is under it now; the rest waits
+    assert body["pricePerShare"] == str(65 * 10 ** 16) and t["cap"] == 0.69 and t["order"] == 100  # 跌 fair 80¢: the cap keeps 10¢ after the fee; the limit is the 65¢ level seen
+    assert body["order"]["takerAmount"] == str(100 * WEI) and body["order"]["makerAmount"] == str(65 * WEI)  # only the 65¢ level is under the cap; the rest waits at 65¢
     assert body["order"]["hash"] == bot.live.wallet.order_hash(body["order"], True, False)  # signed for the multi-outcome exchange
 
     # --- settlement: the paper trader's, on the shares really filled; a loss trips the daily limit ------------------------------
@@ -672,18 +673,18 @@ async def run():
     await lbot.live_prefetch(NOW)
     await step(lbot, NOW, deep(NOW))
     body = lbot.live.api.calls[-1][1]["data"]
-    assert body["strategy"] == "LIMIT" and body["pricePerShare"] == str(59 * 10 ** 16) and body["order"]["makerAmount"] == str(59 * WEI)
+    assert body["strategy"] == "LIMIT" and body["pricePerShare"] == str(58 * 10 ** 16) and body["order"]["makerAmount"] == str(58 * WEI)
     assert body["order"]["expiration"] == str(NOW // 1000 + 300) and "slippageBps" not in body
-    # fair 80¢: the cap is 69¢, both levels (58¢×40, 62¢×100) are under it, the order still asks for the full 100 at the cap
+    # fair 80¢: the cap is 69¢, both levels (58¢×40, 62¢×100) are under it, the order asks for the full 100 at the dearest level walked (62¢)
     world["markets"] = [m.SimMarket("two", "two", "close", "X", 0.80, book([], [("0.58", "40"), ("0.62", "100")], NOW + 10_000, "two", mid="103"), 0.03, "", ("涨", "跌"), {})]
     await step(lbot, NOW + 10_000)
     body = lbot.live.api.calls[-1][1]["data"]
-    assert body["pricePerShare"] == str(69 * 10 ** 16) and body["order"]["takerAmount"] == str(100 * WEI) and lbot.sim_trades()["two|up|吃"]["cap"] == 0.69
-    # 1.68.0: SIM_TAKER_SWEEP_SHARES — the order asks for every share under the cap (58¢×40 + 62¢×100 = 140) at the cap; the
-    # real-trading limits judge that count (live_room); 1.69.0: a count they do not take is cut to the most they do
-    # ($80 at the 69¢ cap: 115 shares), never refused outright
+    assert body["pricePerShare"] == str(62 * 10 ** 16) and body["order"]["takerAmount"] == str(100 * WEI) and lbot.sim_trades()["two|up|吃"]["cap"] == 0.69
+    # 1.68.0: SIM_TAKER_SWEEP_SHARES — the order asks for every share under the cap (58¢×40 + 62¢×100 = 140) at the dearest
+    # level walked (62¢); the real-trading limits judge that count (live_room); 1.69.0: a count they do not take is cut to
+    # the most they do ($80 at the 62¢ limit: 129 shares), never refused outright
     two = lambda at: m.SimMarket("two", "two", "close", "X", 0.80, book([], [("0.58", "40"), ("0.62", "100")], at, "two", mid="103"), 0.03, "", ("涨", "跌"), {})
-    for max_usd, shares in (("100", 140), ("80", 115)):
+    for max_usd, shares in (("100", 140), ("80", 129)):
         wbot = make_bot(SIM_WAYS="taker", SIM_TAKER_SWEEP_SHARES="300", LIVE_MAX_ORDER_USD=max_usd)
         await wbot.live_prepare()
         wbot.live.api.markets["103"] = market_json("103")
@@ -692,9 +693,38 @@ async def run():
         await step(wbot, NOW)
         body = wbot.live.api.calls[-1][1]["data"]
         t = wbot.sim_trades()["two|up|吃"]
-        assert body["order"]["takerAmount"] == str(shares * WEI) and body["pricePerShare"] == str(69 * 10 ** 16), (max_usd, body)
-        assert body["order"]["makerAmount"] == str(69 * shares * WEI // 100) and t["order"] == shares and t["live"]["want"]["shares"] == shares, (max_usd, t["live"]["want"])
+        assert body["order"]["takerAmount"] == str(shares * WEI) and body["pricePerShare"] == str(62 * 10 ** 16), (max_usd, body)
+        assert body["order"]["makerAmount"] == str(62 * shares * WEI // 100) and t["order"] == shares and t["live"]["want"]["shares"] == shares, (max_usd, t["live"]["want"])
         assert not wbot.sim_blocks(), "a smaller order, not a refusal"
+    # LIVE_TAKER_PRICE=cap: the limit at the cap, as before 1.71.0 (asks that show up under it in the next second are taken too)
+    cbot = make_bot(SIM_WAYS="taker", LIVE_TAKER_PRICE="cap")
+    await cbot.live_prepare()
+    cbot.live.api.markets["103"] = market_json("103")
+    world["markets"] = [two(NOW)]
+    await cbot.live_prefetch(NOW)
+    await step(cbot, NOW)
+    body = cbot.live.api.calls[-1][1]["data"]
+    t = cbot.sim_trades()["two|up|吃"]
+    assert body["pricePerShare"] == str(69 * 10 ** 16) and t["live"]["want"]["limit"] == 0.69 and t["cap"] == 0.69 and cbot.live_unit_cap(t) == 0.69
+    assert cbot.journal_row("two|up|吃", t, None, NOW, False)["limit"] == 0.69 and wbot.journal_row("two|up|吃", wbot.sim_trades()["two|up|吃"], None, NOW, False)["limit"] == 0.62
+    # 1.71.0: a taker's unfilled rest is not left to the timer alone: once the fair price has moved so that the limit no
+    # longer leaves the bar (the cap recomputed each step), or the card holds, the rest is cancelled
+    deep_at = lambda at, fair=0.70, hold="": m.SimMarket("deep", "deep", "close", "X", fair, book([], [("0.58", "100"), ("0.70", "1000")], at, "deep", mid="103"), 0.03, hold, ("涨", "跌"),
+                                                         {"key": "X", "target": "2026-10-05", "line": 1.0, "close_ms": CLOSE})
+    for move, why in ((dict(fair=0.60), "公平价变了：限价 58.0¢ 已高于现在的封顶价 49.0¢，剩余吃单撤掉"), (dict(hold="数据有疑问"), "卡片暂不建议（数据有疑问），剩余吃单撤掉")):
+        sbot = make_bot(SIM_WAYS="taker")
+        await sbot.live_prepare(); sfake = sbot.live.api
+        sfake.markets["103"] = market_json("103")
+        world["markets"] = [deep_at(NOW)]
+        await sbot.live_prefetch(NOW)
+        await step(sbot, NOW)
+        st = sbot.sim_trades()["deep|up|吃"]["live"]
+        assert st["state"] == "open" and st["want"]["limit"] == 0.58, st
+        await step(sbot, NOW + 10_000, deep_at(NOW + 10_000))  # 10 s, nothing moved: it waits
+        assert sbot.sim_trades()["deep|up|吃"]["live"]["state"] == "open" and ("remove", [st["order_id"]]) not in sfake.calls
+        await step(sbot, NOW + 20_000, deep_at(NOW + 20_000, **move))
+        tt = sbot.sim_trades()["deep|up|吃#1"]
+        assert tt["live"]["cancel_why"] == why and ("remove", [st["order_id"]]) in sfake.calls and tt["status"] == "cancelled", (tt["live"], sfake.calls[-2:])
     assert abs(wbot.live_fit_shares({}, 0.69) - 80 / 0.69) < 1e-9 and wbot.live_fit_shares({}, 0) == float("inf")
     wbot.config = dataclasses.replace(wbot.config, live_max_open_usd=100)  # the open order ($79.35 reserved) counts against the exposure limit
     assert 0 < wbot.live_fit_shares(wbot.sim_trades(), 0.69) < 40, wbot.live_fit_shares(wbot.sim_trades(), 0.69)
@@ -853,7 +883,7 @@ async def run():
     await step(sbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
     s_trades = sbot.sim_trades()
     smaker, staker = s_trades[f"{HSI_SLUG}|up|挂"], s_trades[f"{HSI_SLUG}|up|吃"]
-    assert abs(sbot.live_reserved(smaker) - 55.0) < 1e-9 and abs(sbot.live_reserved(staker) - 59.0) < 1e-9  # every unfilled share at the order's cap
+    assert abs(sbot.live_reserved(smaker) - 55.0) < 1e-9 and abs(sbot.live_reserved(staker) - 58.0) < 1e-9  # every unfilled share at the most it can cost: the maker's price, the taker's limit (the 58¢ level seen)
     status0 = sbot.live_status(NOW)
     assert status0["unconfirmed"] == 0 and status0["synced_at"] and status0["unknown_open"] == [] and status0["allowed"] is True
     # a withdrawal releases nothing while the cancel is unconfirmed (the open list cannot be read): the reservation stays
@@ -863,7 +893,7 @@ async def run():
     assert result["ok"] is False and text.startswith("❌") and "发送撤单请求失败" in text and "尚未发出" in text, text  # the page is told it did not succeed
     s_trades = sbot.sim_trades()
     assert s_trades[f"{HSI_SLUG}|up|挂"]["status"] == "cancelled" and s_trades[f"{HSI_SLUG}|up|挂"]["live"]["state"] == "cancelling"
-    assert abs(sbot.live_exposure(s_trades) - 114.0) < 1e-9 and sbot.live_status(NOW)["unconfirmed"] == 2
+    assert abs(sbot.live_exposure(s_trades) - 113.0) < 1e-9 and sbot.live_status(NOW)["unconfirmed"] == 2  # 55 + 100 × 58¢
     assert sbot.live_status(NOW)["orders"][0]["live_state"] == "cancelling" and "why" in sbot.live_status(NOW)["orders"][0]  # the active orders come first
     sfake.fail_open = None
     await step(sbot, NOW + 10_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
@@ -926,7 +956,7 @@ async def run():
     await step(sbot, NOW + 330_000, gone(NOW + 330_000))
     g2 = sbot.sim_trades()["gone|up|吃"]
     assert g2["live"]["state"] == "open" and g2["status"] == "resting" and any("继续跟踪" in e["what"] for e in g2["live"]["events"])
-    assert abs(sbot.live_reserved(g2) - 59.0) < 1e-9
+    assert abs(sbot.live_reserved(g2) - 58.0) < 1e-9
     g_row["status"], g_row["amountFilled"] = "FILLED", g_row["amount"]
     await step(sbot, NOW + 340_000, gone(NOW + 340_000))
     g3 = sbot.sim_trades()["gone|up|吃"]
@@ -939,7 +969,7 @@ async def run():
     await sbot.live_prefetch(NOW + 400_000)
     await step(sbot, NOW + 400_000, fast(NOW + 400_000))
     f_rec = sbot.sim_trades()["fast|up|吃"]
-    assert f_rec["live"]["state"] == "placing" and any("结果未知" in e["what"] for e in f_rec["live"]["events"]) and abs(sbot.live_reserved(f_rec) - 59.0) < 1e-9
+    assert f_rec["live"]["state"] == "placing" and any("结果未知" in e["what"] for e in f_rec["live"]["events"]) and abs(sbot.live_reserved(f_rec) - 58.0) < 1e-9
     sfake.fail_create = None
     sfake.closed["900"] = {"id": "900", "status": "FILLED", "amount": str(100 * WEI), "amountFilled": str(100 * WEI), "order": {"hash": f_rec["live"]["hash"]}}
     await step(sbot, NOW + 410_000, fast(NOW + 410_000))
@@ -1294,7 +1324,7 @@ async def audit_fixes():
     pbot.live_daily_pnl = lambda trades, now_ms: -60.0
     pending = {"live": {"want": {"shares": 100.0, "price": 0.5}, "events": [{"at": NOW}], "state": "pending"}, "order": 100.0, "price": 0.5, "opened": NOW, "maker": False}
     assert "已达 LIVE_MAX_DAILY_LOSS_USD" in pbot.live_send_block(pending, {}, NOW)
-    # a taker's fill without an average price from Predict is costed at the cap (the most it could have paid), flagged until a price is read
+    # a taker's fill without an average price from Predict is costed at its limit (the most it could have paid), flagged until a price is read
     fbot = make_bot(SIM_WAYS="taker")
     await fbot.live_prepare(); ffake = fbot.live.api
     await fbot.live_prefetch(NOW)
@@ -1305,7 +1335,7 @@ async def audit_fixes():
     ffake.fill(ft["live"]["order_id"], 100, done=True)  # Predict's record: amount, amountFilled, status — no price
     await step(fbot, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000))
     ft = fbot.sim_trades()[ftid]
-    assert ft["status"] == "filled" and ft["cost_confirmed"] is False and abs(ft["avg"] - 0.59) < 1e-9 and abs(ft["price"] - (0.59 + m.taker_fee(0.59, 200))) < 1e-9, ft
+    assert ft["status"] == "filled" and ft["cost_confirmed"] is False and abs(ft["avg"] - 0.58) < 1e-9 and abs(ft["price"] - (0.58 + m.taker_fee(0.58, 200))) < 1e-9, ft
     assert any(r["id"] == ftid and r["cost_pending"] for r in fbot.control_records(fbot.sim_trades()))
     gbot = make_bot(SIM_WAYS="taker")
     await gbot.live_prepare(); gfake = gbot.live.api

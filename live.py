@@ -1025,7 +1025,7 @@ class LiveBot(core.Bot):
         if hold := self.live_send_hold(self.market.now_ms()):
             return hold  # no new risk on an account whose orders were not read lately
         if taker and taker.get("cap"):
-            price, shares = float(taker["cap"]), float(taker.get("want") or self.sim_taker_shares(mk))  # the LIMIT order asks for the count at the cap: the most it can cost
+            price, shares = self.sim_taker_limit(taker), float(taker.get("want") or self.sim_taker_shares(mk))  # the LIMIT order asks for the count at its limit: the most it can cost
         notional = float(price) * float(shares)
         if notional < MIN_ORDER_USD - 1e-9:
             return f"本单 ${notional:,.2f} 低于 Predict 最低订单金额 ${MIN_ORDER_USD:g}（提高 SIM_SHARES）"
@@ -1053,13 +1053,22 @@ class LiveBot(core.Bot):
             return f"未授权{'多结果' if info.neg_risk else ''}交易所使用 USDT（python main.py --approve）"
         return ""
 
+    def sim_taker_limit(self, q: dict) -> float:
+        """A taker's LIMIT price: the dearest level its quote walks (LIVE_TAKER_PRICE=book: what was seen is the most
+        paid; an ask that shows up dearer in the next second is left to the next look), or the cap (cap: the dearest
+        acceptable price, so such asks are taken too)."""
+        if self.config.live_taker_price == "book" and q.get("levels"):
+            return float(q["levels"][-1][0])
+        return float(q["cap"])
+
     @staticmethod
     def live_unit_cap(trade: dict) -> float:
-        """The most a share of this order can cost: a maker's price, a taker's cap (the limit the order was signed at)."""
+        """The most a share of this order can cost: a maker's price, a taker's limit (the price the order was signed at)."""
         st = trade.get("live") if isinstance(trade.get("live"), dict) else {}
         if trade.get("maker"):
             return float(trade.get("price") or 0)
-        return float((st.get("want") or {}).get("cap") or trade.get("cap") or st.get("price_per_share") or trade.get("price") or 0)
+        want = st.get("want") or {}
+        return float(want.get("limit") or want.get("cap") or trade.get("cap") or st.get("price_per_share") or trade.get("price") or 0)
 
     def live_reserved(self, trade: dict) -> float:
         """USDT this record ties up: the shares filled, at their price, plus — while the real order may still fill
@@ -1126,6 +1135,7 @@ class LiveBot(core.Bot):
         want = {"maker": maker is not None, "side": side, "shares": float(trade["order"]),
                 "price": float(maker.price) if maker is not None else float(taker["avg"]),
                 "cap": float(taker["cap"]) if taker and taker.get("cap") else None,
+                "limit": self.sim_taker_limit(taker) if taker and taker.get("cap") else None,  # the LIMIT price (LIVE_TAKER_PRICE)
                 "cost": float(trade["price"]), "token": outcome["token"], "outcome": outcome["name"],
                 "index_set": outcome["index_set"], "assumed": assumed, "fee_bps": info.fee_bps,
                 "neg_risk": info.neg_risk, "yield_bearing": info.yield_bearing, "condition_id": info.condition_id,
@@ -1395,8 +1405,9 @@ class LiveBot(core.Bot):
                 amounts = limit_amounts(True, to_wei(want["price"]), shares_wei)
                 strategy, expiration = "LIMIT", int(want.get("expires") or FAR_FUTURE)
             else:
-                # the dearest acceptable price: the book at or under it fills now, the rest waits LIVE_TAKER_WAIT_SECONDS
-                amounts = limit_amounts(True, to_wei(want.get("cap") or want["price"]), shares_wei)
+                # the limit (the dearest level seen, or the cap: LIVE_TAKER_PRICE): the book at or under it fills now, the
+                # rest waits LIVE_TAKER_WAIT_SECONDS, or less once the fair price moves away (live_taker_due)
+                amounts = limit_amounts(True, to_wei(want.get("limit") or want.get("cap") or want["price"]), shares_wei)
                 strategy, expiration = "LIMIT", int(now_ms // 1000) + TAKER_ORDER_SECONDS
             order = build_order(wallet, want["token"], amounts["maker"], amounts["taker"], want["fee_bps"], expiration)
             digest, signature = wallet.sign_order(order, want["neg_risk"], want["yield_bearing"])
@@ -1591,12 +1602,35 @@ class LiveBot(core.Bot):
         self.live_unknown(tid, trade, f"连续 {self.LIVE_MISSES} 次查不到这张单，补发的撤单请求也未确认", now_ms)
 
     async def live_taker_due(self, tid: str, trade: dict, by_id: dict, mk: Any, now_ms: int) -> None:
-        """A taker's LIMIT order still open after LIVE_TAKER_WAIT_SECONDS: the rest is cancelled."""
+        """A taker's LIMIT order still open: the rest is cancelled after LIVE_TAKER_WAIT_SECONDS, and sooner when the
+        fair price has moved so that its limit no longer leaves the bar (the cap recomputed every step: a bid left at
+        the old price is a free option for whoever knows why the price moved) or the card suggests nothing now."""
         st = trade["live"]
-        if not trade.get("maker") and now_ms - int(st.get("placed_at") or now_ms) >= self.config.live_taker_wait * 1000:
-            st.update(state="cancelling", cancel_why=f"吃单 {self.config.live_taker_wait} 秒未全部成交")
-            st["events"].append({"at": now_ms, "what": st["cancel_why"]})
+        if trade.get("maker"):
+            return
+        why = ""
+        if now_ms - int(st.get("placed_at") or now_ms) >= self.config.live_taker_wait * 1000:
+            why = f"吃单 {self.config.live_taker_wait} 秒未全部成交"
+        elif mk is not None and float(trade.get("shares") or 0) < float(trade.get("order") or 0) - 1e-9:
+            why = self.live_taker_stale(trade, mk, now_ms)
+        if why:
+            st.update(state="cancelling", cancel_why=why)
+            st["events"].append({"at": now_ms, "what": why})
             await self.live_cancel(tid, trade, by_id, mk, now_ms)
+
+    def live_taker_stale(self, trade: dict, mk: Any, now_ms: int) -> str:
+        """Why a taker's unfilled rest should not go on waiting: its limit is over the cap the fair price allows now,
+        or the card holds its suggestion. "" while it may rest (a stale book decides nothing: the timer does)."""
+        if mk.book.stale(now_ms):
+            return ""
+        if mk.hold:
+            return f"卡片暂不建议（{mk.hold}），剩余吃单撤掉"
+        bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
+        cap = self.sim_taker_cap(mk, str(trade.get("side") or "up"), bps)
+        limit = self.live_unit_cap(trade)
+        if cap <= 0 or limit > cap + 1e-9:
+            return f"公平价变了：限价 {core.cents(limit)} 已高于现在的封顶价 {core.cents(cap)}，剩余吃单撤掉"
+        return ""
 
     async def live_cancel(self, tid: str, trade: dict, by_id: dict, mk: Any, now_ms: int) -> None:
         """A withdrawn record's real order is removed from Predict and the record ends only on Predict's final word
@@ -1754,9 +1788,9 @@ class LiveBot(core.Bot):
             fee = core.taker_fee(price, int(st["want"].get("fee_bps") or 0))
             trade.update(avg=price, fee=fee, price=price + fee, slip=price - float(trade.get("best", price)), cost_confirmed=True)
         elif not trade.get("maker") and filled > 1e-9 and not trade.get("cost_confirmed") and st["want"].get("cap"):
-            # Predict's record states no average price: the fill is costed at the cap — the most the LIMIT could have
-            # paid — until a price is read back, never at the estimate made before the order (which may be lower)
-            cap = float(st["want"]["cap"])
+            # Predict's record states no average price: the fill is costed at the order's limit — the most it could
+            # have paid — until a price is read back, never at the estimate made before the order (which may be lower)
+            cap = float(st["want"].get("limit") or st["want"]["cap"])
             fee = core.taker_fee(cap, int(st["want"].get("fee_bps") or 0))
             trade.update(avg=cap, fee=fee, price=cap + fee, slip=cap - float(trade.get("best", cap)), cost_confirmed=False)
         prev = float(trade.get("shares") or 0)

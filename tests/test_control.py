@@ -340,6 +340,10 @@ async def run():
     st, j = await post(port3, {"key": KEY, "action": "resume"}); assert st == 200 and lbot.live_paused() == ""
     st, j = await post(port3, {"key": KEY, "action": "set", "values": {"LIVE_MAX_OPEN_USD": "123", "LIVE_TAKER_WAIT_SECONDS": "30"}})
     assert st == 200 and lbot.config.live_max_open_usd == 123 and lbot.live.config.live_max_open_usd == 123 and lbot.live.config.live_taker_wait == 30
+    assert lbot.control_value("LIVE_TAKER_PRICE") == "book" and lbot.config.live_taker_price == "book"  # 1.71.0: the taker's limit at the level seen
+    st, j = await post(port3, {"key": KEY, "action": "set", "values": {"LIVE_TAKER_PRICE": "cap"}}); assert st == 200 and lbot.config.live_taker_price == "cap"
+    st, j = await post(port3, {"key": KEY, "action": "set", "values": {"LIVE_TAKER_PRICE": "mid"}}); assert st != 200 and lbot.config.live_taker_price == "cap", (st, j)
+    st, j = await post(port3, {"key": KEY, "action": "set", "values": {"LIVE_TAKER_PRICE": ""}}); assert st == 200 and lbot.config.live_taker_price == "book"
     assert (await get_json(port3, "control.json"))["live"]["caps"]["open"] == 123 and "30 秒未成交撤单" in (await get_json(port3, "control.json"))["live"]["lines"][-1]
     # a resting real order appears with its cancel switch; cancelling through the page reaches Predict
     trade = {"v": 2, "market": "x", "slug": "x", "market_id": "9", "item": "恒生指数", "kind": "close", "key": "HSI", "side": "up", "label": "挂涨",
