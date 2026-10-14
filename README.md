@@ -559,6 +559,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | `SIM_TAKER_SHARES` | `0` | 开盘时段吃单每次最多买多少份；`0` = 同 `SIM_SHARES`。挂单不受影响 |
 | `SIM_TAKER_AFTER_HOURS_SHARES` | `0` | 开盘前、收盘后吃单每次最多买多少份；`0` = 同 `SIM_TAKER_SHARES` |
 | `SIM_TAKER_MAX_SHARES` | `300` | 同一市场同一方向的吃单累计成交到这么多份就不再吃；优势够就一笔接一笔买，最后一笔只吃剩下的份数，一次只发一张吃单；`0` = 每边只吃一次 |
+| `SIM_MAX_FAIR_CENTS` | `95` | 这一边的公平价高于这个数时不吃也不挂：接近必然的结果，剩下几分钱优势抵不过正态模型算不到的尾部风险；`100` = 不限。价格阶梯上远离现价的档位 No 的公平价常在 95¢ 以上，想继续做那些就调到 99 或 100 |
 | `SIM_TAKER_SWEEP_SHARES` | `300` | 封顶价之下的卖单不止一档时一张单全吃掉（公平价 50¢，20¢ 和 30¢ 的卖单都够优势就一起吃，不是先吃 20¢ 的、下一步再看 30¢ 的还在不在），最多这么多份、不少于每次的份数；组上限或真实交易风控容不下这么多时退回按每次份数买；`0` = 只按每次份数买 |
 | `SIM_WAYS` | `taker` | 模拟交易做哪种单：`taker` 只吃单、`maker` 只挂单、`both` 都做 |
 | `SIM_MARKETS` | `close` | 模拟交易做哪些市场：`all`，或 `close`（指数/个股日涨跌）、`touch`、`updown`、`flip`、`range`、`ladder` 的组合 |
