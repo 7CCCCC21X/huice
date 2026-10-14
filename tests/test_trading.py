@@ -738,6 +738,14 @@ async def run():
     t = mbot.sim_trades()[f"{HSI_SLUG}|up|挂"]
     assert body["order"]["takerAmount"] == str(90 * WEI) and body["order"]["makerAmount"] == str(495 * WEI // 10) and t["order"] == 90, (body, t["order"])
     assert t["live"]["want"]["shares"] == 90 and not mbot.sim_blocks()
+    # 1.72.1: the order the limit cut to 90 is not re-quoted for "SIM_SHARES is 100" every step (10-14: placed and
+    # withdrawn every two seconds); only a change of the setting itself re-quotes it
+    oid = t["live"]["order_id"]
+    await step(mbot, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000))
+    assert mbot.sim_trades()[f"{HSI_SLUG}|up|挂"]["live"]["order_id"] == oid and ("remove", [oid]) not in mbot.live.api.calls, "still the same order"
+    assert mbot.sim_requote_reason(mbot.sim_trades()[f"{HSI_SLUG}|up|挂"], world["markets"][0], NOW + 5_000) == ""
+    mbot.config = dataclasses.replace(mbot.config, sim_shares=120.0)
+    assert mbot.sim_requote_reason(mbot.sim_trades()[f"{HSI_SLUG}|up|挂"], world["markets"][0], NOW + 5_000) == "每次份数已改为 120 份，按新份数重挂"
 
     # a Predict account signs and trades for the smart wallet
     kbot = make_bot(PREDICT_ACCOUNT=PA, SIM_WAYS="maker")

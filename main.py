@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.72.0"
+VERSION = "1.72.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -12838,7 +12838,11 @@ class Bot:
             return "标的未开盘，不挂单"
         if (limit := self.sim_after_hours_price(mk)) is not None and float(trade.get("price") or 0) > limit + 1e-9:
             return f"盘后只挂 {cents(limit)} 以下的，{cents(float(trade.get('price') or 0))} 的单撤掉"
-        if abs(float(trade.get("order") or 0) - c.sim_shares) > 1e-9:
+        placed_shares = float((trade.get("version") or {}).get("sim_shares") or trade.get("order") or 0)
+        if abs(placed_shares - c.sim_shares) > 1e-9:
+            # the setting changed since the order was placed. Never the order's own count against the setting: an order the
+            # caps cut short (1.69.0) would be withdrawn and placed again, cut again, every step (10-14: a 270-share order
+            # under a $100 limit, placed and withdrawn every two seconds)
             return f"每次份数已改为 {c.sim_shares:g} 份，按新份数重挂"
         if c.sim_maker_points and mk.book.market_id and self.points_status(mk.book.market_id, mk.book, now_ms, PREDICT_POINTS_STALE_SECONDS)["points_active"] is False:
             return "积分已停止发放，不挂"
