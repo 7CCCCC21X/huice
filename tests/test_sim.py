@@ -1582,8 +1582,13 @@ async def open_quiet():
     assert qbot.config.sim_open_quiet_minutes == 3 and dt.date(2026, 10, 5) not in qbot.config.holidays["hk"]
     live = lambda at: m.dataclasses.replace(hsi(0.70, [("0.55", "300")], [("0.58", "400")], at), in_session=True)  # HSI: HK opens 09:30
     at = BJ(10, 5, 9, 31)
-    assert qbot.sim_open_quiet(live(at), at) == "开盘后 3 分钟内不开新单（SIM_OPEN_QUIET_MINUTES）"
-    assert qbot.sim_open_quiet(live(at), BJ(10, 5, 9, 29)) == "" and qbot.sim_open_quiet(live(at), BJ(10, 5, 9, 33)) == ""
+    assert qbot.sim_open_quiet(live(at), at) == "开盘后 3 分钟内不开新单，挂单撤掉（SIM_OPEN_QUIET_MINUTES）"
+    assert qbot.sim_open_quiet(live(at), BJ(10, 5, 9, 26)) == "" and qbot.sim_open_quiet(live(at), BJ(10, 5, 9, 33)) == ""
+    # 1.75.0: the minutes before an open too, and the afternoon open (HK 13:00) as much as the day's first
+    assert qbot.sim_open_quiet(live(at), BJ(10, 5, 9, 27)) == "开盘前 3 分钟内不开新单，挂单撤掉（SIM_OPEN_QUIET_MINUTES）"
+    assert qbot.sim_open_quiet(live(at), BJ(10, 5, 12, 58)) == "午后开盘前 3 分钟内不开新单，挂单撤掉（SIM_OPEN_QUIET_MINUTES）"
+    assert qbot.sim_open_quiet(live(at), BJ(10, 5, 13, 2)) == "午后开盘后 3 分钟内不开新单，挂单撤掉（SIM_OPEN_QUIET_MINUTES）"
+    assert qbot.sim_open_quiet(live(at), BJ(10, 5, 12, 56)) == "" and qbot.sim_open_quiet(live(at), BJ(10, 5, 13, 3)) == ""
     assert qbot.sim_open_quiet(m.dataclasses.replace(live(at), kind="updown"), at) == "", "crypto markets have no open"
     assert qbot.sim_open_quiet(live(at), BJ(10, 3, 9, 31)) == "", "a Saturday"
     gap = qbot.sim_taker_gap(live(at), qbot.sim_trades(), at)
@@ -1599,6 +1604,37 @@ async def open_quiet():
     obot.sim_markets = lambda now: world["markets"]
     await step(obot, at, live(at))
     assert len(obot.sim_trades()) == 2
+    # 1.75.0: a resting order is withdrawn for the window around an open and placed afresh after it — the one placed
+    # overnight on the proxy's fair price above all (LEGACY: SIM_MAKER_SESSION off, so it rests before the open)
+    wbot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    wbot.sim_markets = lambda now: world["markets"]
+    night = lambda at: m.dataclasses.replace(hsi(0.70, [("0.55", "300")], [("0.58", "400")], at), in_session=False)
+    await step(wbot, BJ(10, 5, 9, 20), night(BJ(10, 5, 9, 20)))
+    assert wbot.sim_trades()[f"{HSI_SLUG}|up|挂"]["status"] == "resting"
+    await step(wbot, BJ(10, 5, 9, 27), night(BJ(10, 5, 9, 27)))
+    t = wbot.sim_trades()
+    assert f"{HSI_SLUG}|up|挂" not in t and t[f"{HSI_SLUG}|up|挂#1"]["status"] == "cancelled", sorted(t)
+    assert t[f"{HSI_SLUG}|up|挂#1"]["withdrawn"]["why"] == "开盘前 3 分钟内不开新单，挂单撤掉（SIM_OPEN_QUIET_MINUTES）", t[f"{HSI_SLUG}|up|挂#1"]["withdrawn"]
+    await step(wbot, BJ(10, 5, 9, 31), live(BJ(10, 5, 9, 31)))
+    assert not any(k.startswith(f"{HSI_SLUG}|up|挂") and v["status"] == "resting" for k, v in wbot.sim_trades().items()), "nothing placed in the window"
+    await step(wbot, BJ(10, 5, 9, 34), live(BJ(10, 5, 9, 34)))
+    assert wbot.sim_trades()[f"{HSI_SLUG}|up|挂"]["status"] == "resting", sorted(wbot.sim_trades())
+    # 1.75.0: the lunch break puts a daily card under the after-hours rules though it is still priced from the spot
+    assert qbot.sim_exchange("HSI") == "hk" and qbot.sim_exchange("UNITREEUSDT") == "sh" and qbot.sim_exchange("BNB") == ""
+    assert qbot.sim_lunch("hk", BJ(10, 5, 12, 30)) and not qbot.sim_lunch("hk", BJ(10, 5, 11, 0)) and not qbot.sim_lunch("", BJ(10, 5, 12, 30)) and not qbot.sim_lunch("kr", BJ(10, 5, 12, 30))
+    lbot = m.Bot(m.Config.from_env({**env, "SIM_MAKER_SESSION": "on", "SIM_TAKER_SESSION": "on"}), m.Store(":memory:"), FM(NOW), None)
+    odds = m.close_odds("恒生指数", D("24600"), D("24650"), 0.013, 0.5, dt.date(2026, 10, 5), D("0.01"), "10-02 收盘", "恒指现货 24,650（盘中直接用现货）", "σ")
+    lbot.odds_items = lambda ms: [("恒生指数", odds)]
+    lbot.predict.books["HSI"] = book([("0.55", "300")], [("0.58", "400")], BJ(10, 5, 11, 0))
+    mk = lbot.sim_markets(BJ(10, 5, 11, 0))[0]
+    assert odds.direct and mk.in_session is True and not mk.lunch, (mk.in_session, mk.lunch)
+    lbot.predict.books["HSI"] = book([("0.55", "300")], [("0.58", "400")], BJ(10, 5, 12, 30))
+    mk = lbot.sim_markets(BJ(10, 5, 12, 30))[0]
+    assert mk.lunch and mk.in_session is False, (mk.in_session, mk.lunch)
+    assert lbot.sim_maker_reason(mk, {}, BJ(10, 5, 12, 30))[1] == "标的午休，不挂单", lbot.sim_maker_reason(mk, {}, BJ(10, 5, 12, 30))
+    assert "标的午休，不吃单" in lbot.sim_taker_gap(mk, {}, BJ(10, 5, 12, 30))["text"], lbot.sim_taker_gap(mk, {}, BJ(10, 5, 12, 30))
+    resting = {"status": "resting", "price": 0.55, "order": 100.0, "shares": 0.0, "maker": True, "side": "up", "kind": "close", "market": HSI_SLUG, "version": {"sim_shares": 100}}
+    assert lbot.sim_requote_reason(resting, mk, BJ(10, 5, 12, 30)) == "标的午休，不挂单"
     print("OPEN_QUIET_OK")
 
 

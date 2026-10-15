@@ -118,6 +118,20 @@ async def run():
     bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "74.50", "75.00", "20260928093030"), 0)
     o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 9, 31))  # a print: used at once
     assert "盘中直接用现货" in o.proxy_note and o.effective == D("74.50"), o
+    # 1.75.0: a price still at the previous close a quarter hour into the session (the feed stamping the current time) is
+    # the placeholder of a market that has not opened (a closure the calendar does not know, a halt): the proxy prices it
+    bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "75.00", "75.00", "20260928094500"), 0)
+    assert bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 9, 45)).effective == D("75.00")  # first seen flat at 09:45
+    bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "75.00", "75.00", "20260928100000"), 0)
+    assert bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 10, 0)).effective == D("75.00")  # a quarter hour exactly: not yet
+    bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "75.00", "75.00", "20260928100100"), 0)
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 10, 1))
+    assert o.proxy_note.endswith("｜现货仍等于昨收，09-28 09:45 起已 15 分钟没有变动，视为尚未开出（临时休市或停牌），暂用币安"), o.proxy_note
+    # a stock may trade at one price for an hour (a limit-locked one does): a price not at the previous close is a price
+    bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "74.90", "75.00", "20260928100100"), 0)
+    assert bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 10, 1)).effective == D("74.90")
+    bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "74.90", "75.00", "20260928110000"), 0)
+    assert bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 11, 0)).effective == D("74.90")
     assert m.opening_print_pending(D("1"), D("1"), 100, 0) and not m.opening_print_pending(D("1"), D("1"), m.OPENING_PRINT_GRACE_MS, 0)
     assert not m.opening_print_pending(D("1"), D("2"), 100, 0) and not m.opening_print_pending(D("1"), None, 100, 0) and not m.opening_print_pending(D("1"), D("1"), -1, 0)
     # Every source failing is reported next to the Binance fallback

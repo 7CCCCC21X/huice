@@ -219,11 +219,23 @@ async def run():
     bot.cn.quote = m.IndexQuote("上证指数", D("3860"), D("3850.12"), None, None, None, bj(2026, 10, 8, 10, 0), "腾讯")
     o = bot.sse_odds(bj(2026, 10, 8, 10, 0)); assert o.ref == D("3850.12") and o.effective == D("3860") and o.target == dt.date(2026, 10, 8) and o.remaining < 1, o
     assert o.ref_note == "09-30 收盘", o.ref_note
-    # a live quote that stopped updating gives no new probability; the lunch break does not count
-    assert "上证实时报价已超 10 分钟未更新（最后 10-08 10:00）" in bot.sse_odds(bj(2026, 10, 8, 10, 11))
-    bot.cn.quote = m.IndexQuote("上证指数", D("3860"), D("3850.12"), None, None, None, bj(2026, 10, 8, 11, 30), "腾讯")
+    # a live quote that stopped updating gives no new probability (1.75.0: after three minutes — an index prints every few
+    # seconds — not ten); the lunch break does not count
+    assert isinstance(bot.sse_odds(bj(2026, 10, 8, 10, 3)), m.CloseOdds)
+    assert "上证实时报价已超 3 分钟未更新（最后 10-08 10:00）" in bot.sse_odds(bj(2026, 10, 8, 10, 4))
+    bot.cn.quote = m.IndexQuote("上证指数", D("3861"), D("3850.12"), None, None, None, bj(2026, 10, 8, 11, 30), "腾讯")
     assert isinstance(bot.sse_odds(bj(2026, 10, 8, 12, 45)), m.CloseOdds)
-    assert isinstance(bot.sse_odds(bj(2026, 10, 8, 13, 5)), m.CloseOdds) and "未更新" in bot.sse_odds(bj(2026, 10, 8, 13, 11))
+    assert isinstance(bot.sse_odds(bj(2026, 10, 8, 13, 3)), m.CloseOdds) and "未更新" in bot.sse_odds(bj(2026, 10, 8, 13, 4))
+    # 1.75.0: an index unchanged for a quarter hour of trading time is a market that is not trading, whatever the feed's clock says
+    bot.cn.quote = m.IndexQuote("上证指数", D("3870"), D("3850.12"), None, None, None, bj(2026, 10, 8, 13, 20), "腾讯")
+    assert isinstance(bot.sse_odds(bj(2026, 10, 8, 13, 20)), m.CloseOdds)
+    bot.cn.quote = m.IndexQuote("上证指数", D("3870"), D("3850.12"), None, None, None, bj(2026, 10, 8, 13, 36), "腾讯")
+    assert bot.sse_odds(bj(2026, 10, 8, 13, 36)) == "上证现货 10-08 13:20 起已 15 分钟没有变动，视为临时休市或行情中断，暂不输出新概率", bot.sse_odds(bj(2026, 10, 8, 13, 36))
+    bot.cn.quote = m.IndexQuote("上证指数", D("3870.5"), D("3850.12"), None, None, None, bj(2026, 10, 8, 13, 36), "腾讯")
+    assert isinstance(bot.sse_odds(bj(2026, 10, 8, 13, 36)), m.CloseOdds)
+    # the closing call auction (14:57–15:00) keeps the 10 minutes: the index stands still until the match
+    bot.cn.quote = m.IndexQuote("上证指数", D("3871"), D("3850.12"), None, None, None, bj(2026, 10, 8, 14, 55), "腾讯")
+    assert isinstance(bot.sse_odds(bj(2026, 10, 8, 14, 59)), m.CloseOdds)
     # holiday: status says 休市
     assert bot.cn.status(bj(2026, 10, 2, 10, 0), cfg.holidays["sh"]) == "休市"
 

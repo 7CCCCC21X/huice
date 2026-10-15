@@ -43,6 +43,16 @@ assert m.local_ms("20260930100503") == bj(9, 30, 10, 5, 3) and m.local_ms("0") =
 # the shared rule
 assert m.quote_problem(0, NOW, True, 0) == "报价时间未知"
 assert m.quote_problem(NOW - 9 * 60_000, NOW, True, 0) == "" and "已超 10 分钟未更新" in m.quote_problem(NOW - 11 * 60_000, NOW, True, 0)
+# 1.75.0: an index feed is stale after INDEX_STALE_MS (3 minutes) in continuous trading, LIVE_STALE_MS (10) from the closing auction on
+assert "已超 3 分钟未更新" in m.quote_problem(NOW - 4 * 60_000, NOW, True, 0, stale_ms=m.INDEX_STALE_MS) and m.quote_problem(NOW - 4 * 60_000, NOW, True, 0) == ""
+assert m.index_stale_ms("hk", bj(9, 30, 15, 59)) == m.INDEX_STALE_MS == 3 * 60_000 and m.index_stale_ms("hk", bj(9, 30, 16, 0)) == m.LIVE_STALE_MS == 10 * 60_000
+assert m.index_stale_ms("sh", bj(9, 30, 14, 56)) == m.INDEX_STALE_MS and m.index_stale_ms("sh", bj(9, 30, 14, 57)) == m.LIVE_STALE_MS
+assert m.index_stale_ms("kr", kr(9, 29, 15, 19)) == m.INDEX_STALE_MS and m.index_stale_ms("kr", kr(9, 29, 15, 20)) == m.LIVE_STALE_MS
+assert m.closing_auction_start("hk", dt.date(2026, 12, 24)) == dt.time(12, 0) and m.closing_auction_start("hk", dt.date(2026, 9, 30)) == dt.time(16, 0)  # a half day
+still = m.Stillness()
+assert still.since("k", 1, 100) == 100 and still.since("k", 1, 200) == 100 and still.since("k", 2, 300) == 300 and still.since("k", 2, 250) == 250  # a replay starts afresh
+assert m.still_problem(100, 100 + m.CLOSURE_STILL_MS, 0) == "" and m.still_problem(100, 101 + m.CLOSURE_STILL_MS, 0).endswith("起已 15 分钟没有变动，视为临时休市或行情中断")
+assert m.still_problem(100, 101 + m.CLOSURE_STILL_MS, 100 + m.CLOSURE_STILL_MS) == "", "unchanged since before the open: counted from the open"
 assert "早于最近一个交易时段" in m.quote_problem(NOW - 3 * 3600_000, NOW, False, NOW - 60_000)
 assert m.quote_problem(NOW - 50 * 60_000, NOW, False, NOW - 60_000) == ""  # a thin final hour of the last session is fine
 lunch = (dt.time(11, 30), dt.time(13, 0))
@@ -64,7 +74,8 @@ async def run():
     bot = make_bot(NOW)
     bot.kospi.quote = m.IndexQuote("KOSPI", D("7150"), D("7080"), None, None, None, kr(9, 29, 9, 30), "Naver")
     o = bot.kospi_odds(NOW)
-    assert o == "KOSPI 实时报价停在 09-29 08:30，已超 10 分钟未更新，暂不输出新概率", o
+    assert o == "KOSPI 实时报价停在 09-29 08:30，已超 10 分钟未更新，暂不输出新概率", o  # 15:20: the closing auction keeps the 10 minutes
+    assert bot.kospi_odds(kr(9, 29, 14, 0)) == "KOSPI 实时报价停在 09-29 08:30，已超 3 分钟未更新，暂不输出新概率"  # 1.75.0: three in continuous trading
     bot.kospi.quote = m.dataclasses.replace(bot.kospi.quote, quoted_ms=kr(9, 29, 15, 19))
     assert bot.kospi_odds(NOW).fair_up > 0.99  # the same reading, fresh, is a near-certain close up
     bot.kospi.quote = m.dataclasses.replace(bot.kospi.quote, quoted_ms=kr(9, 28, 15, 30))  # yesterday's page, mid-session
@@ -169,9 +180,27 @@ async def run():
     assert o == "恒指现货的前收 24,761.13 不是 09-29 收盘 24,510.09，不是 09-30 的行情，暂不输出新概率", o
     hbot.hsi.quote = m.dataclasses.replace(page, spot=D("24600"), spot_prev=D("24510.09"), spot_ms=bj(9, 30, 10, 0))
     assert isinstance(hbot.hsi_odds(bj(9, 30, 10, 0)), m.CloseOdds)
-    assert "已超 10 分钟未更新" in hbot.hsi_odds(bj(9, 30, 10, 11)) and isinstance(hbot.hsi_odds(bj(9, 30, 13, 5)), m.CloseOdds) is False
-    hbot.hsi.quote = m.dataclasses.replace(page, spot=D("24600"), spot_prev=D("24510.09"), spot_ms=bj(9, 30, 11, 58))
-    assert isinstance(hbot.hsi_odds(bj(9, 30, 13, 5)), m.CloseOdds)  # the lunch break does not age it
+    # 1.75.0: an index prints every few seconds — three minutes without one is a stuck feed (it used to pass for ten)
+    assert isinstance(hbot.hsi_odds(bj(9, 30, 10, 3)), m.CloseOdds) and "已超 3 分钟未更新" in hbot.hsi_odds(bj(9, 30, 10, 4))
+    assert "已超 3 分钟未更新" in hbot.hsi_odds(bj(9, 30, 10, 11)) and isinstance(hbot.hsi_odds(bj(9, 30, 13, 5)), m.CloseOdds) is False
+    hbot.hsi.quote = m.dataclasses.replace(page, spot=D("24605"), spot_prev=D("24510.09"), spot_ms=bj(9, 30, 11, 59))
+    assert isinstance(hbot.hsi_odds(bj(9, 30, 13, 2)), m.CloseOdds)  # the lunch break does not age it
+    assert "已超 3 分钟未更新" in hbot.hsi_odds(bj(9, 30, 13, 3))
+    # 1.75.0: an index unchanged for a quarter hour of trading time while the calendar has the market open is a market
+    # that is not trading (an outage, a closure the calendar does not know), whatever the feed's clock says
+    hbot.hsi.quote = m.dataclasses.replace(page, spot=D("24620"), spot_prev=D("24510.09"), spot_ms=bj(9, 30, 14, 0))
+    assert isinstance(hbot.hsi_odds(bj(9, 30, 14, 0)), m.CloseOdds)
+    hbot.hsi.quote = m.dataclasses.replace(page, spot=D("24620"), spot_prev=D("24510.09"), spot_ms=bj(9, 30, 14, 15))
+    assert isinstance(hbot.hsi_odds(bj(9, 30, 14, 15)), m.CloseOdds)  # a quarter hour exactly: not yet
+    hbot.hsi.quote = m.dataclasses.replace(page, spot=D("24620"), spot_prev=D("24510.09"), spot_ms=bj(9, 30, 14, 16))
+    assert hbot.hsi_odds(bj(9, 30, 14, 16)) == "恒指现货 09-30 14:00 起已 15 分钟没有变动，视为临时休市或行情中断，暂不输出新概率", hbot.hsi_odds(bj(9, 30, 14, 16))
+    hbot.hsi.quote = m.dataclasses.replace(page, spot=D("24621"), spot_prev=D("24510.09"), spot_ms=bj(9, 30, 14, 16))
+    assert isinstance(hbot.hsi_odds(bj(9, 30, 14, 16)), m.CloseOdds)  # it moved: a level again
+    # the closing auction (16:00–16:10) keeps the 10 minutes: the index may stand still until the match
+    hbot.hsi.quote = m.dataclasses.replace(page, spot=D("24630"), spot_prev=D("24510.09"), spot_ms=bj(9, 30, 15, 50))
+    assert "已超 3 分钟未更新" in hbot.hsi_odds(bj(9, 30, 15, 54))
+    hbot.hsi.quote = m.dataclasses.replace(page, spot=D("24630"), spot_prev=D("24510.09"), spot_ms=bj(9, 30, 15, 59))
+    assert isinstance(hbot.hsi_odds(bj(9, 30, 16, 5)), m.CloseOdds) and "已超 10 分钟未更新" in hbot.hsi_odds(bj(9, 30, 16, 9, 30))
 
     # a frozen etnet page ages (its values stop changing) and the next sources are asked; a timed one takes over
     LIVE = """<div><h3>恒生指數期貨(10/2026)</h3><span>日市</span><div>&#9650;24,600 +80 (+0.33%) 高水5</div>

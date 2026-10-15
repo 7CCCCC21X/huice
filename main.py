@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.74.0"
+VERSION = "1.75.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -1700,6 +1700,7 @@ class StockMarket:
         self.refreshed = -1e9
         self.live: dict[str, IndexQuote] = {}   # realtime stock quote while its session runs
         self.live_errors: dict[str, str] = {}
+        self.still = Stillness()                # when each stock's price last changed (closure_problem)
         self.live_refreshed = -1e9
         for symbol in config.tickers:
             saved = store.get(f"stock_close:{symbol}") if store else None
@@ -1872,6 +1873,12 @@ class StockMarket:
         clock = min(now_ms, int(dt.datetime.combine(day, end, tz).timestamp() * 1000) + 60_000)
         if quote_stale(q, clock, self.LIVE_STALE_MS, lunch):
             return None, f"现货行情已超 10 分钟未更新（最后 {stamp(q.quoted_ms, seconds=False)}）"
+        since = self.still.since(symbol, q.last, clock)  # tracked on every look: a return to the previous close starts the clock afresh
+        if q.prev_close is not None and q.last == q.prev_close and (why := still_problem(since, clock, window[0], lunch, "尚未开出（临时休市或停牌）")):
+            # a stock may trade at one price for hours (a limit-locked one does), so only a price still at the previous close
+            # a quarter hour into the session is read as the feed's placeholder for a market that has not opened (a closure
+            # the calendar does not know, a halt) — the proxy prices the card meanwhile, as before the open
+            return None, f"现货仍等于昨收，{why}"
         return q, ""
 
     async def fetch(self, symbol: str, ticker: StockTicker, now_ms: int) -> Baseline:
@@ -2399,6 +2406,7 @@ class IndexFutures:
         self.spot_at = -1e9      # monotonic time of the last good cash-index read
         self.spot_error = ""
         self.seen: dict[tuple, tuple[tuple, int]] = {}  # untimed source -> (values, when first seen unchanged)
+        self.still = Stillness()                          # when the cash index last changed, by source (closure_problem)
         self.dated_close: Any = lambda day: None         # dated daily closes, plugged in by the Bot
 
     SPOT_KEEP_SECONDS = 5 * 60
@@ -2462,8 +2470,9 @@ class IndexFutures:
 
     def spot_problem(self, q: FuturesQuote, now_ms: int) -> str:
         """Why q's cash index cannot be used now ("" when it can). During the cash session it must be today's and
-        have moved within 10 minutes (lunch aside). Its previous close must be the dated close of the session
-        before (when that is known): otherwise the figure belongs to another day, e.g. yesterday's page."""
+        have printed within index_stale_ms (3 minutes in continuous trading, 10 in the closing auction; lunch aside).
+        Its previous close must be the dated close of the session before (when that is known): otherwise the figure
+        belongs to another day, e.g. yesterday's page."""
         if q.spot is None:
             return "缺少恒指现货"
         if self.cash_open(now_ms):
@@ -2475,8 +2484,9 @@ class IndexFutures:
                 return f"恒指现货停在 {stamp(when, seconds=False)}，早于今日开盘"
             if opening_print_pending(q.spot, q.spot_prev, now_ms, opened):
                 return "恒指现货开盘头两分钟仍等于昨收，视为尚未开出"
-            if quiet_ms(when, now_ms, self.LUNCH) > LIVE_STALE_MS:
-                return f"恒指现货停在 {stamp(when, seconds=False)}，已超 10 分钟未更新"
+            limit = index_stale_ms("hk", now_ms)
+            if quiet_ms(when, now_ms, self.LUNCH) > limit:
+                return f"恒指现货停在 {stamp(when, seconds=False)}，已超 {limit // 60_000} 分钟未更新"
         else:
             day = hk_cash_close_date(now_ms, self.holidays)
         before = hk_previous_day(day, self.holidays)
@@ -2485,6 +2495,16 @@ class IndexFutures:
             return (f"恒指现货的前收 {fmt(q.spot_prev)} 不是 {before:%m-%d} 收盘 {fmt(expected)}，"
                     f"不是 {day:%m-%d} 的行情")
         return ""
+
+    def spot_still(self, q: FuturesQuote, now_ms: int) -> str:
+        """Why the cash index, current by its clock, cannot price the session now ("" when it can): unchanged for
+        CLOSURE_STILL_MS of trading time since the open (closure_problem) — the market is not trading."""
+        if q.spot is None or not self.cash_open(now_ms):
+            return ""
+        day = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+        opened = int(dt.datetime.combine(day, dt.time(9, 30), BEIJING).timestamp() * 1000)
+        why = closure_problem(self.still, ("spot", q.spot_source), q.spot, now_ms, opened, self.LUNCH)
+        return f"恒指现货 {why}" if why else ""
 
     def observed(self, key: tuple, values: tuple, fetched_ms: int) -> int:
         """For a source that prints no time: when these exact values were first seen in a row. A trading market keeps
@@ -3114,8 +3134,67 @@ class DailyClose:
         return int(dt.datetime.combine(self.day, dt.time(15, 0), BEIJING).timestamp() * 1000)
 
 
-LIVE_STALE_MS = 10 * 60_000  # a live feed silent this long while its market trades is stale
+LIVE_STALE_MS = 10 * 60_000  # a live feed silent this long while its market trades is stale (a single stock may not trade for minutes)
+INDEX_STALE_MS = 3 * 60_000  # an index cash feed: the index prints every few seconds while its constituents trade; three minutes without one is a stuck feed, not a quiet market
 OPENING_PRINT_GRACE_MS = 2 * 60_000  # after the open, a live price still equal to the previous close is no print yet for this long
+CLOSURE_STILL_MS = 15 * 60_000  # a live price unchanged this long of trading time while the calendar has its market open: the market is not trading
+CLOSING_AUCTIONS = {"sh": dt.time(14, 57), "sz": dt.time(14, 57), "hk": dt.time(16, 0), "kr": dt.time(15, 20)}  # local time; until the match the index may stand still
+
+
+def closing_auction_start(market: str, day: dt.date) -> dt.time:
+    """When ``market``'s closing auction opens on ``day`` (local time; a half day or a late day moves it)."""
+    if market == "hk":
+        return CALENDAR.sessions("hk", day)[-1][1]
+    if market == "kr":
+        return CALENDAR.kr_time(CLOSING_AUCTIONS["kr"], day)
+    return CLOSING_AUCTIONS[market]
+
+
+def index_stale_ms(market: str, now_ms: int) -> int:
+    """How long an index feed may go without a print while its market is open before it is stale: INDEX_STALE_MS in
+    continuous trading (the index moves every few seconds; a feed stuck for nine minutes used to pass as live while the
+    index may have walked 1%), LIVE_STALE_MS from the closing auction on (no trades until the match: it may stand still)."""
+    info = STOCK_MARKETS[market]
+    local = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset)))
+    return LIVE_STALE_MS if local.time() >= closing_auction_start(market, local.date()) else INDEX_STALE_MS
+
+
+class Stillness:
+    """When each live value was last seen to change, by key: the clock behind closure_problem. A value first seen at an
+    earlier time than the last one (a replay) starts afresh."""
+
+    def __init__(self):
+        self.seen: dict[Any, tuple[Any, int]] = {}
+
+    def since(self, key: Any, value: Any, now_ms: int) -> int:
+        """When ``value`` was first seen in a row under ``key`` (now, when it differs from the last one seen)."""
+        old = self.seen.get(key)
+        if old is not None and old[0] == value and old[1] <= now_ms:
+            return old[1]
+        self.seen[key] = (value, now_ms)
+        return now_ms
+
+
+def still_problem(since_ms: int, now_ms: int, opened_ms: int, lunch: tuple[dt.time, dt.time] | None = None,
+                  cause: str = "临时休市或行情中断") -> str:
+    """Why a live price unchanged since ``since_ms`` cannot price its market though the calendar has it trading ("" while
+    it can): CLOSURE_STILL_MS of trading time since the open (a lunch break not counted) without a change. An exchange
+    outage, a halt, a closure the calendar does not know: a feed that stamps the standing figure with the current time
+    passes every time check, and past the opening grace an unchanged figure is taken for a print (a 50¢ fair price all
+    day on yesterday's close)."""
+    since = max(since_ms, opened_ms)
+    if quiet_ms(since, now_ms, lunch) > CLOSURE_STILL_MS:
+        return f"{stamp(since, seconds=False)} 起已 {CLOSURE_STILL_MS // 60_000} 分钟没有变动，视为{cause}"
+    return ""
+
+
+def closure_problem(still: Stillness, key: Any, value: Any, now_ms: int, opened_ms: int,
+                    lunch: tuple[dt.time, dt.time] | None = None) -> str:
+    """still_problem for an index level tracked under ``key``: an index moves with every constituent trade, so a quarter
+    hour without a change while the calendar has its market open is a market that is not trading (an exchange outage, a
+    circuit breaker, a closure the calendar does not know), whatever the feed's clock says. (A single stock is not
+    judged so: a limit-locked one trades at one price for hours.)"""
+    return still_problem(still.since(key, value, now_ms), now_ms, opened_ms, lunch)
 
 
 def opening_print_pending(price: D | None, prev: D | None, now_ms: int, opened_ms: int) -> bool:
@@ -3141,14 +3220,14 @@ def quote_stale(q: IndexQuote, now_ms: int, limit_ms: int, lunch: tuple[dt.time,
 
 
 def quote_problem(quoted_ms: int, now_ms: int, live: bool, last_end_ms: int,
-                  lunch: tuple[dt.time, dt.time] | None = None) -> str:
+                  lunch: tuple[dt.time, dt.time] | None = None, stale_ms: int = LIVE_STALE_MS) -> str:
     """Why a quote cannot stand for its market now ("" when it can). Its market time must be known; while the
-    market trades it must have updated within 10 minutes (a lunch break does not count); while the market is shut
-    it must come from the session that ended last (whose final hour may be thin)."""
+    market trades it must have updated within ``stale_ms`` (10 minutes; a lunch break does not count); while the
+    market is shut it must come from the session that ended last (whose final hour may be thin)."""
     if quoted_ms <= 0:
         return "报价时间未知"
-    if live and quiet_ms(quoted_ms, now_ms, lunch) > LIVE_STALE_MS:
-        return f"报价停在 {stamp(quoted_ms, seconds=False)}，已超 10 分钟未更新"
+    if live and quiet_ms(quoted_ms, now_ms, lunch) > stale_ms:
+        return f"报价停在 {stamp(quoted_ms, seconds=False)}，已超 {stale_ms // 60_000} 分钟未更新"
     if not live and quoted_ms < last_end_ms - 60 * 60_000:
         return f"报价停在 {stamp(quoted_ms, seconds=False)}，早于最近一个交易时段"
     return ""
@@ -3171,7 +3250,7 @@ class CnIndex:
     SESSION_SECONDS = 5       # while Shanghai trades (its own index) or an A50 session runs (the after-hours proxy)
     DAILY_SECONDS = 600       # re-read the daily bars this often once the expected close is confirmed
     PENDING_SECONDS = 60      # ...and this often while the close the calendar expects is not confirmed yet
-    STALE_MS = 10 * 60_000    # a live quote older than this is not used for new probabilities
+    STALE_MS = 10 * 60_000    # an A50 quote older than this is not used for new probabilities (the Composite: index_stale_ms)
     DAILY_SOURCES = (("腾讯日K", "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh000001,day,,,40,",
                       {"Referer": "https://gu.qq.com/"}),
                      ("东方财富日K", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101"
@@ -3214,6 +3293,7 @@ class CnIndex:
         self.refreshed = -1e9
         self.refreshed_ms = 0  # market clock of the last refresh (the 15:00 close is caught at once)
         self.daily_refreshed = -1e9
+        self.still = Stillness()  # when the Composite last changed, by source (closure_problem)
 
     @staticmethod
     def parse_a50(source: str, raw: bytes, now_ms: int) -> IndexQuote:
@@ -3257,9 +3337,10 @@ class CnIndex:
         return live, int(dt.datetime.combine(last, dt.time(15, 0), BEIJING).timestamp() * 1000)
 
     def sse_problem(self, q: IndexQuote, now_ms: int) -> str:
-        """Why q cannot stand for the Composite now ("" when it can): see quote_problem."""
+        """Why q cannot stand for the Composite now ("" when it can): see quote_problem (in session a print within
+        index_stale_ms: the index moves every few seconds, the closing auction aside)."""
         live, last_end = self.sse_session(now_ms)
-        return quote_problem(q.quoted_ms, now_ms, live, last_end, self.LUNCH)
+        return quote_problem(q.quoted_ms, now_ms, live, last_end, self.LUNCH, index_stale_ms("sh", now_ms))
 
     def a50_problem(self, q: IndexQuote, now_ms: int) -> str:
         """Why q cannot stand for A50 now ("" when it can): a print from the session running, or from the last one."""
@@ -3342,7 +3423,8 @@ class CnIndex:
         return self.daily_error
 
     def live_stale(self, now_ms: int) -> bool:
-        return self.quote is not None and quote_stale(self.quote, now_ms, self.STALE_MS, self.LUNCH)
+        """The Composite's live quote has not printed within index_stale_ms (the lunch break does not count)."""
+        return self.quote is not None and quote_stale(self.quote, now_ms, index_stale_ms("sh", now_ms), self.LUNCH)
 
     def a50_stale(self, now_ms: int) -> bool:
         """Reject an old live quote, including one that predates the last completed A50 session. A thin final
@@ -3542,6 +3624,7 @@ class KospiIndex:
         self.daily_rank: dict[dt.date, int] = {}  # which source each close came from (0 = Yahoo, the settlement one)
         self.daily_refreshed = -1e9
         self.daily_error = ""
+        self.still = Stillness()  # when the index last changed, by source (closure_problem)
 
     DAILY_URL = "https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=10&symbol=KOSPI"
     YAHOO_URL = yahoo_url("^KS11")  # Predict's KOSPI markets resolve on Yahoo ^KS11
@@ -3566,9 +3649,10 @@ class KospiIndex:
         return live, int(dt.datetime.combine(last, CALENDAR.close_time("kr", last), kst).timestamp() * 1000)
 
     def problem(self, q: IndexQuote, now_ms: int) -> str:
-        """Why q cannot stand for the index now ("" when it can): see quote_problem."""
+        """Why q cannot stand for the index now ("" when it can): see quote_problem (in session a print within
+        index_stale_ms: the index moves every few seconds, the closing auction aside)."""
         live, last_end = self.session(now_ms)
-        return quote_problem(q.quoted_ms, now_ms, live, last_end)
+        return quote_problem(q.quoted_ms, now_ms, live, last_end, stale_ms=index_stale_ms("kr", now_ms))
 
     async def refresh_daily(self, now_ms: int) -> str | None:
         """Every 10 minutes, and every minute from the close until the day's bar is in. Answers are merged by date:
@@ -7273,6 +7357,7 @@ class SimMarket:
     maker_alerts: bool = False  # price ladders: separately gated maker opportunities, independent of taker alerts
     maker_note: str = ""     # why a price-ladder maker suggestion is unavailable
     in_session: bool | None = None  # a daily card: its underlying trades now (the odds come from the spot); None = not a session market
+    lunch: bool = False      # a daily card: its underlying is in its lunch break (in_session is False then: the after-hours rules apply)
 
 
 class LazyEvidence(Mapping):
@@ -11315,10 +11400,13 @@ class Bot:
             if q is None:
                 return "缺少上证实时报价，暂不输出概率"
             if self.cn.live_stale(now_ms):
-                return f"上证实时报价已超 10 分钟未更新（最后 {quote_time(q.quoted_ms)}），暂不输出新概率"
+                return f"上证实时报价已超 {index_stale_ms('sh', now_ms) // 60_000} 分钟未更新（最后 {quote_time(q.quoted_ms)}），暂不输出新概率"
             today_bj = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
-            if opening_print_pending(q.last, q.prev_close, now_ms, int(dt.datetime.combine(today_bj, dt.time(9, 30), BEIJING).timestamp() * 1000)):
+            opened = int(dt.datetime.combine(today_bj, dt.time(9, 30), BEIJING).timestamp() * 1000)
+            if opening_print_pending(q.last, q.prev_close, now_ms, opened):
                 return "上证开盘头两分钟仍等于昨收，视为尚未开出，暂不输出新概率"
+            if why := closure_problem(self.cn.still, ("sse", q.source), q.last, now_ms, opened, self.cn.LUNCH):
+                return f"上证现货 {why}，暂不输出新概率"
             if close and close.day == self.cn.expected_close(now_ms):
                 ref, ref_note = close.value, f"{close.day.strftime('%m-%d')} 收盘"
             elif q.prev_close:
@@ -11604,7 +11692,7 @@ class Bot:
         sigma, sigma_note = self.vols.get("HSI", "HSI")
         if self.hsi.cash_open(now_ms):
             # the cash session runs: only today's own, fresh index prices it (never yesterday's page or a frozen feed)
-            why = self.hsi.spot_problem(q, now_ms)
+            why = self.hsi.spot_problem(q, now_ms) or self.hsi.spot_still(q, now_ms)
             if why:
                 return f"{why}，暂不输出新概率"
             if not q.spot_prev:
@@ -11663,6 +11751,8 @@ class Bot:
             opened = int(dt.datetime.combine(local.date(), CALENDAR.sessions("kr", local.date())[0][0], kst).timestamp() * 1000)
             if opening_print_pending(k.last, k.prev_close, now_ms, opened):
                 return "KOSPI 开盘头两分钟仍等于昨收，视为尚未开出，暂不输出新概率"
+            if why := closure_problem(self.kospi.still, ("kospi", k.source), k.last, now_ms, opened):
+                return f"KOSPI 现货 {why}，暂不输出新概率"
             if not k.prev_close:
                 return "缺少 KOSPI 昨收"
             remaining, target = session_remaining("kr", now_ms, local.date() - dt.timedelta(days=1), holidays)
@@ -12240,11 +12330,14 @@ class Bot:
                     continue
                 name, _, symbol = title.partition("｜")
                 close_ms, _ = self.target_close(title, odds.target)
+                # the lunch break: the card is still priced from the spot (the last morning print), but the trader is under
+                # the after-hours rules — by the afternoon open that print is an hour old and the book has long moved on
+                lunch = self.sim_lunch(self.sim_exchange(key, symbol or key), now_ms)
                 out.append(SimMarket(slug, name, "close", key, odds.fair_up, book, self.edge_need(model_swing(odds)), odds.warn,
                                      ("涨", "跌"), {"key": symbol or key, "target": odds.target.isoformat(),
                                                    "line": float(odds.ref), "close_ms": close_ms},
                                      self.evidence(lambda title=title, odds=odds: self.close_evidence(title, odds, now_ms)),
-                                     in_session=odds.direct))
+                                     in_session=odds.direct and not lunch, lunch=lunch))
         if not self.config.touch:
             return out
         for touch in self.touches.values():
@@ -12456,7 +12549,7 @@ class Bot:
         if mk.book.stale(now_ms):
             return None, "盘口过期"
         if c.sim_maker_session and mk.in_session is False and not self.sim_after_hours(mk):
-            return None, "标的未开盘，不挂单" + ("（盘后挂单模式未选这个市场）" if c.sim_maker_after_hours > 0 else "")
+            return None, f"{self.sim_closed(mk)}，不挂单" + ("（盘后挂单模式未选这个市场）" if c.sim_maker_after_hours > 0 else "")
         if c.sim_maker_points:
             status = self.points_status(mk.book.market_id, mk.book, now_ms, PREDICT_POINTS_STALE_SECONDS) if mk.book.market_id \
                 else {"points_active": None, "points_note": "积分状态暂缺"}
@@ -12564,7 +12657,7 @@ class Bot:
             elif mk.book.stale(now_ms):
                 taker_why = "盘口过期"
             elif c.sim_taker_session and mk.in_session is False and not self.sim_taker_after_hours(mk):
-                taker_why = "标的未开盘，不吃单"
+                taker_why = f"{self.sim_closed(mk)}，不吃单"
             else:
                 parts = []
                 for side in ("up", "down"):
@@ -12617,7 +12710,7 @@ class Bot:
         if c.sim_ways == "maker":
             return {**out, "state": "off", "text": "SIM_WAYS=maker：只挂单，不吃单", "short": "只挂单"}
         why = (f"卡片暂不建议（{mk.hold}）" if mk.hold else "盘口过期" if mk.book.stale(now_ms)
-               else "标的未开盘，不吃单" if c.sim_taker_session and mk.in_session is False and not self.sim_taker_after_hours(mk) else "")
+               else f"{self.sim_closed(mk)}，不吃单" if c.sim_taker_session and mk.in_session is False and not self.sim_taker_after_hours(mk) else "")
         sides = []
         for side in ("up", "down"):
             label = "吃" + mk.sides[0 if side == "up" else 1]
@@ -12705,24 +12798,46 @@ class Bot:
 
     INDEX_MARKETS = {"HSI": "hk", "KOSPI": "kr", "SSE": "sh"}  # a daily index card's exchange, for its session times
 
+    def sim_exchange(self, key: str, symbol: str = "") -> str:
+        """The exchange a daily card's underlying trades on ("hk" / "sh" / "sz" / "kr"; "" when it has none, as a crypto
+        market): a stock's from its ticker, an index's from INDEX_MARKETS."""
+        ticker = self.config.tickers.get(str(key)) or self.config.tickers.get(str(symbol))
+        market = ticker.market if ticker else self.INDEX_MARKETS.get(str(key), "")
+        return market if market in STOCK_MARKETS else ""
+
+    def sim_lunch(self, market: str, now_ms: int) -> bool:
+        """Whether ``market`` is in its lunch break now (none on a half day, none in Korea)."""
+        return bool(market) and session_state(market, now_ms, self.config.holidays.get(market, frozenset())) == "午休"
+
+    @staticmethod
+    def sim_closed(mk: SimMarket) -> str:
+        """'标的午休' in the lunch break, else '标的未开盘': how the lines that keep a daily card to its session begin."""
+        return "标的午休" if mk.lunch else "标的未开盘"
+
     def sim_open_quiet(self, mk: SimMarket, now_ms: int) -> str:
-        """Why no new order goes on a daily card now: its underlying opened less than SIM_OPEN_QUIET_MINUTES ago — the
-        minutes after the opening auction, when the live feeds lag the most and the fair price is least worth
-        trading on (10-15: a buy at 50¢ fair in the opening second, the print at −7.3% a minute later). "" otherwise."""
+        """Why no new order goes on a daily card now, and a resting one is withdrawn: its underlying opens — the day's
+        first session or the afternoon one — within SIM_OPEN_QUIET_MINUTES, or opened that long ago. The minutes around
+        an open are when the live feeds lag the most and the fair price is least worth trading on (10-15: a buy at 50¢
+        fair in the opening second, the print at −7.3% a minute later), and an order left resting through them — one
+        placed overnight on the proxy's fair price above all — is a free option for whoever sees the opening print
+        first. "" otherwise (weekends, holidays, crypto markets)."""
         minutes = self.config.sim_open_quiet_minutes
         if not minutes or mk.kind != "close":
             return ""
-        ticker = self.config.tickers.get(str(mk.key)) or self.config.tickers.get(str((mk.settle or {}).get("key") or ""))
-        market = ticker.market if ticker else self.INDEX_MARKETS.get(str(mk.key), "")
-        if market not in STOCK_MARKETS:
+        market = self.sim_exchange(mk.key, (mk.settle or {}).get("key") or "")
+        if not market:
             return ""
         tz = dt.timezone(dt.timedelta(hours=STOCK_MARKETS[market].utc_offset))
         local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
         if local.weekday() >= 5 or local.date() in self.config.holidays.get(market, frozenset()):
             return ""
-        opened = int(dt.datetime.combine(local.date(), CALENDAR.sessions(market, local.date())[0][0], tz).timestamp() * 1000)
-        if opened <= now_ms < opened + minutes * 60_000:
-            return f"开盘后 {minutes} 分钟内不开新单（SIM_OPEN_QUIET_MINUTES）"
+        for n, (start, _) in enumerate(CALENDAR.sessions(market, local.date())):
+            opened = int(dt.datetime.combine(local.date(), start, tz).timestamp() * 1000)
+            when = "午后开盘" if n else "开盘"
+            if opened - minutes * 60_000 <= now_ms < opened:
+                return f"{when}前 {minutes} 分钟内不开新单，挂单撤掉（SIM_OPEN_QUIET_MINUTES）"
+            if opened <= now_ms < opened + minutes * 60_000:
+                return f"{when}后 {minutes} 分钟内不开新单，挂单撤掉（SIM_OPEN_QUIET_MINUTES）"
         return ""
 
     def sim_side_room(self, trades: dict[str, dict], mk: SimMarket, side: str) -> tuple[float, str]:
@@ -12898,13 +13013,19 @@ class Bot:
 
     def sim_requote_reason(self, trade: dict, mk: SimMarket | None, now_ms: int) -> str:
         """Why a resting order is withdrawn to be placed afresh when the chance returns (its slot is freed when nothing
-        filled): the underlying is not in session (SIM_MAKER_SESSION), its edge fell under the exit line
-        (SIM_MAKER_EXIT_CENTS), the valid 买1 is gone or has moved (SIM_MAKER_MIN_BID). "" while it may stand."""
+        filled): the underlying is about to open or has just opened (SIM_OPEN_QUIET_MINUTES), is not in session
+        (SIM_MAKER_SESSION), its edge fell under the exit line (SIM_MAKER_EXIT_CENTS), the valid 买1 is gone or has moved
+        (SIM_MAKER_MIN_BID). "" while it may stand."""
         c = self.config
         if not trade.get("maker") or mk is None:
             return ""
+        if quiet := self.sim_open_quiet(mk, now_ms):
+            # an order resting through the open — one placed overnight on the proxy's fair price above all — is a free
+            # option for whoever sees the opening print first (10-15: SK Hynix −7.3% at the open, the overnight 涨 bid
+            # would have been hit in the opening second); placed afresh on the new fair price once the window is over
+            return quiet
         if c.sim_maker_session and mk.in_session is False and not self.sim_after_hours(mk):
-            return "标的未开盘，不挂单"
+            return f"{self.sim_closed(mk)}，不挂单"
         if (limit := self.sim_after_hours_price(mk)) is not None and float(trade.get("price") or 0) > limit + 1e-9:
             return f"盘后只挂 {cents(limit)} 以下的，{cents(float(trade.get('price') or 0))} 的单撤掉"
         placed_shares = float((trade.get("version") or {}).get("sim_shares") or trade.get("order") or 0)
