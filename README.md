@@ -569,6 +569,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | `SIM_GROUP_USD` | `300` | 每组（同一结算事件）持仓在最坏单一事件下最多亏多少模拟美元；想买的份数会超过时只买到刚好不超过的份数，一份都容不下才不买；0 = 不限 |
 | `SIM_TAKER_SESSION` | `off` | `on`：指数/个股日涨跌只在标的开盘时段（卡片按现货定价、不是盘后代理估算时；午休按盘后算）吃单，盘后只挂单；加密市场不受影响。真实交易同样遵守，控制台可在线改 |
 | `SIM_TAKER_AFTER_HOURS_CENTS` | `0` | 盘后吃单模式：开盘前、收盘后也吃指数/个股日涨跌的单，但只吃净优势不低于这个数（¢/份，不低于 `SIM_EDGE_CENTS`）的；`0` = 关，按 `SIM_TAKER_SESSION` |
+| `SIM_TAKER_AFTER_HOURS_MARKETS` | 空 | 盘后吃单只做这些市场（逗号分隔的市场代码，不分大小写）；空 = 所有指数/个股日涨跌市场。没选的市场开盘前、收盘后（含午休）一律不吃单，`SIM_TAKER_SESSION` 开不开都一样，开盘时段照常；选中的市场按盘后吃单模式的门槛吃。在控制台“盘后吃单模式”卡片展开详细选项点选 |
 | `SIM_AFTER_HOURS_MAX_PRICE_CENTS` | `60` | 指数/个股日涨跌开盘前、收盘后只买这个价（¢）以下的：吃单只买这个价以下的卖单，挂单只挂这个价以下的，挂着的高于它就撤；`0` = 不限 |
 | `SIM_MAKER_MIN_BID` | `100` | 挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 只有几份不跟；买1 移动 1¢ 以上就撤了改跟新买1。`0` = 跟最高买价、挂上后不改跟（旧行为） |
 | `SIM_MAKER_EXIT_CENTS` | `5` | 挂单撤单线：挂着的单净优势降到这个数（¢/份）以下就撤（自动不高于 `SIM_EDGE_CENTS` 减半分）；`0` 不撤 |
@@ -656,7 +657,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | 触发门槛 `SIM_EDGE_CENTS` | 10¢ | 10¢ | 8¢ |
 | 只在开盘时段挂单 / 吃单 | 开 / 开 | 开 / 开 | 开 / 开 |
 | 盘后挂单 `SIM_MAKER_AFTER_HOURS_CENTS` | 关 | 15¢，只做 HSI、KOSPI、SSE | 10¢，所有日涨跌市场 |
-| 盘后吃单 `SIM_TAKER_AFTER_HOURS_CENTS` | 关 | 20¢ | 15¢ |
+| 盘后吃单 `SIM_TAKER_AFTER_HOURS_CENTS` | 关 | 20¢，只做 HSI、KOSPI、SSE | 15¢，所有日涨跌市场 |
 | 盘后最高买价 `SIM_AFTER_HOURS_MAX_PRICE_CENTS` | 60¢ | 60¢ | 60¢ |
 | 低价挂单 `SIM_MAKER_DEEP_CENTS` / 只挂低价挂单 | 25¢ / 关 | 25¢ / 关 | 20¢ / 关 |
 | 买1 至少 `SIM_MAKER_MIN_BID` | 100 份 | 50 份 | 20 份 |

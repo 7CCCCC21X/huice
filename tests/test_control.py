@@ -148,6 +148,8 @@ async def run():
     assert s["PREDICT_POLL_SECONDS"]["kind"] == "number" and s["PREDICT_POLL_SECONDS"]["value"] == "10" and "5" in s["PREDICT_POLL_SECONDS"]["presets"] and data["cadence"] == {"sim": 5, "book": 10, "cold": 60}
     assert 'id="checksnote"' in body.decode() and "renderCadence" in body.decode()
     assert s["SIM_MAKER_DEEP_MARKETS"]["kind"] == "detail" and s["SIM_MAKER_DEEP_MARKETS"]["value"] == "" and s["SIM_MAKER_AFTER_HOURS_MARKETS"]["kind"] == "detail"
+    assert s["SIM_TAKER_AFTER_HOURS_MARKETS"]["kind"] == "detail" and s["SIM_TAKER_AFTER_HOURS_MARKETS"]["value"] == "" and s["SIM_TAKER_AFTER_HOURS_MARKETS"]["group"] == "策略"  # 1.76.0
+    assert 'SIM_TAKER_AFTER_HOURS_CENTS:{key:"SIM_TAKER_AFTER_HOURS_MARKETS",mode:"include",kinds:["close"]}' in body.decode(), "the chips under the 盘后吃单模式 card"
     assert s["SIM_MAKER_DEEP_ONLY_MARKETS"]["kind"] == "detail" and s["SIM_MAKER_DEEP_ONLY_MARKETS"]["value"] == "" and s["SIM_MAKER_DEEP_ONLY_MARKETS"]["group"] == "策略"
     assert all(x in body.decode() for x in ('id="exbox"', "renderExceptions", 'data-act="stop"', 'class="cols"', "const drafts", "lockView", "REC_LABELS")), "the page's new parts"
     assert "全部市场" in body.decode() and ".sw.on" in body.decode() and "绿色 = 开" in body.decode() and "挂单没开，不生效" in body.decode()
@@ -158,7 +160,7 @@ async def run():
     withkey = {**base, "PREDICT_PRIVATE_KEY": "a" * 64}
     for key, form in m.CONTROL_FORMS.items():
         if form["kind"] == "detail":  # SIM_SKIP: drawn inside the SIM_MARKETS card from the catalog, no presets or options of its own
-            assert "presets" not in form and "options" not in form and key in {"SIM_SKIP", "SIM_MAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_DEEP_MARKETS", "SIM_MAKER_DEEP_ONLY_MARKETS"}, key
+            assert "presets" not in form and "options" not in form and key in {"SIM_SKIP", "SIM_MAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_DEEP_MARKETS", "SIM_MAKER_DEEP_ONLY_MARKETS", "SIM_TAKER_AFTER_HOURS_MARKETS"}, key
             continue
         assert form["kind"] in {"choice", "multi", "number"} and (form["kind"] == "number") == ("presets" in form) and (form["kind"] != "number") == ("options" in form), key
         for value in (form.get("presets") or [o[0] for o in form.get("options", [])]):
@@ -215,6 +217,9 @@ async def run():
     assert st == 200 and bot.config.sim_maker_deep_markets == {"HSI", "KOSPI"} and bot.control_value("SIM_MAKER_DEEP_MARKETS") == "HSI,KOSPI" and bot.config.sim_maker_after_hours_markets == {"SSE"}
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_MARKETS": "", "SIM_MAKER_AFTER_HOURS_MARKETS": ""}})
     assert st == 200 and bot.config.sim_maker_deep_markets == frozenset() and bot.config.sim_maker_after_hours_markets == frozenset()
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_TAKER_AFTER_HOURS_MARKETS": "hk0625usdt, hsi"}})  # 1.76.0
+    assert st == 200 and bot.config.sim_taker_after_hours_markets == {"HK0625USDT", "HSI"} and bot.control_value("SIM_TAKER_AFTER_HOURS_MARKETS") == "HK0625USDT,HSI", (st, j)
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_TAKER_AFTER_HOURS_MARKETS": ""}}); assert st == 200 and bot.config.sim_taker_after_hours_markets == frozenset()
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_ONLY_MARKETS": "kospi, hsi"}})
     assert st == 200 and bot.config.sim_maker_deep_only_markets == {"HSI", "KOSPI"} and bot.control_value("SIM_MAKER_DEEP_ONLY_MARKETS") == "HSI,KOSPI", (st, j)
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MAKER_DEEP_ONLY_MARKETS": ""}}); assert st == 200 and bot.config.sim_maker_deep_only_markets == frozenset()
@@ -232,12 +237,13 @@ async def run():
     st, j = await post(port, {"key": KEY, "action": "preset", "name": "balanced"})
     assert st == 200 and j["message"].startswith("已套用「均衡」。已保存并生效：") and bot.config.sim_ways == "both" and bot.config.sim_maker_after_hours == 0.15, (st, j)
     assert bot.config.sim_maker_after_hours_markets == {"HSI", "KOSPI", "SSE"} and bot.config.sim_taker_after_hours == 0.20 and bot.config.sim_maker_min_bid == 50
+    assert bot.config.sim_taker_after_hours_markets == {"HSI", "KOSPI", "SSE"}, "1.76.0: 均衡 takes after hours on the three indexes only, as its hint says"
     assert bot.config.sim_quiet_minutes == 10 and bot.config.sim_maker_deep == 0.25 and not bot.config.sim_maker_deep_only and bot.config.sim_edge == 0.10
-    assert store.get("control:env")["SIM_MAKER_AFTER_HOURS_MARKETS"] == "HSI,KOSPI,SSE" and "SIM_MAKER_DEEP_MARKETS" not in store.get("control:env")  # "" clears
+    assert store.get("control:env")["SIM_MAKER_AFTER_HOURS_MARKETS"] == "HSI,KOSPI,SSE" == store.get("control:env")["SIM_TAKER_AFTER_HOURS_MARKETS"] and "SIM_MAKER_DEEP_MARKETS" not in store.get("control:env")  # "" clears
     st, j = await post(port, {"key": KEY, "action": "preset", "name": "balanced"}); assert st == 200 and j["message"] == "已套用「均衡」。已保存，设置没有变化。"
     st, j = await post(port, {"key": KEY, "action": "preset", "name": "steady"})
     assert st == 200 and bot.config.sim_ways == "maker" and bot.config.sim_maker_after_hours == 0 and bot.config.sim_taker_after_hours == 0
-    assert bot.config.sim_quiet_minutes == 15 and bot.config.sim_maker_min_bid == 100 and bot.config.sim_maker_after_hours_markets == frozenset()
+    assert bot.config.sim_quiet_minutes == 15 and bot.config.sim_maker_min_bid == 100 and bot.config.sim_maker_after_hours_markets == frozenset() == bot.config.sim_taker_after_hours_markets
     st, j = await post(port, {"key": KEY, "action": "preset", "name": "bold"})
     assert st == 200 and bot.config.sim_edge == 0.08 and bot.config.sim_maker_exit == 0.04 and bot.config.sim_seconds == 3 and bot.predict.config.predict_poll == 5
     st, j = await post(port, {"key": KEY, "action": "preset", "name": "nope"}); assert st == 400 and j == {"ok": False, "message": "没有这个搭配"}

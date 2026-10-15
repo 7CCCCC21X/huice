@@ -40,8 +40,9 @@ for bad in ({"SIM_TAKER_AFTER_HOURS_CENTS": "51"}, {"SIM_AFTER_HOURS_MAX_PRICE_C
     except ValueError: pass
 assert c.sim_skip == frozenset()  # the detail chips: SIM_SKIP names markets left out of the chosen kinds, upper-cased, blanks dropped
 assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_SKIP": " hsi, bnb ,HSI,"}).sim_skip == frozenset({"HSI", "BNB"})
-c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEP_MARKETS": " hsi, kospi ", "SIM_MAKER_AFTER_HOURS_MARKETS": "sse"})
+c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEP_MARKETS": " hsi, kospi ", "SIM_MAKER_AFTER_HOURS_MARKETS": "sse", "SIM_TAKER_AFTER_HOURS_MARKETS": " hk0625usdt ,HSI"})
 assert c.sim_maker_deep_markets == {"HSI", "KOSPI"} and c.sim_maker_after_hours_markets == {"SSE"} and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).sim_maker_deep_markets == frozenset()
+assert c.sim_taker_after_hours_markets == {"HK0625USDT", "HSI"} and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).sim_taker_after_hours_markets == frozenset()  # 1.76.0
 for bad in ({"SIM_EDGE_CENTS": "0"}, {"SIM_EDGE_CENTS": "60"}, {"SIM_SHARES": "0"}, {"SIM_WAYS": "none"}, {"SIM_MARKETS": "index"},
             {"SIM_SKIP": "x" * 41}, {"SIM_SKIP": ",".join(f"k{i}" for i in range(201))}, {"SIM_MAKER_DEEP_MARKETS": "x" * 41}):
     try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
@@ -1639,3 +1640,46 @@ async def open_quiet():
 
 
 asyncio.run(open_quiet())
+
+
+async def after_hours_markets():
+    """1.76.0: SIM_TAKER_AFTER_HOURS_MARKETS — after hours only the chosen daily cards are taken, whatever SIM_TAKER_SESSION
+    says (10-16: 希音 out of the after-hours trading); the after-hours taker mode and its bar apply on them; in session every
+    market as before; empty = all, as before."""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+           "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY, "SIM_TAKER_AFTER_HOURS_MARKETS": "hsi, kospi"}
+    shein_slug = "shein-up-or-down-on-october-5-2026"
+    shein = lambda at, session=False: m.dataclasses.replace(hsi(0.80, [("0.50", "300")], [("0.55", "100")], at), market=shein_slug, item="希音", key="HK0625USDT",
+                                                              book=book([("0.50", "300")], [("0.55", "100")], at, slug=shein_slug, key="HK0625USDT", mid="202"), in_session=session)
+    index = lambda at, session=False: m.dataclasses.replace(hsi(0.80, [("0.50", "300")], [("0.55", "100")], at), in_session=session)
+    tbot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)  # SIM_TAKER_SESSION off: takers all day, after hours on the chosen markets only
+    tbot.sim_markets = lambda now: world["markets"]
+    assert tbot.config.sim_taker_after_hours_markets == {"HSI", "KOSPI"} and tbot.control_value("SIM_TAKER_AFTER_HOURS_MARKETS") == "HSI,KOSPI"
+    assert tbot.sim_version()["sim_taker_after_hours_markets"] == ["HSI", "KOSPI"]
+    closed_text = "标的未开盘，盘后吃单未选这个市场，不吃单"
+    assert tbot.sim_taker_closed(shein(NOW)) == closed_text and tbot.sim_taker_closed(shein(NOW, True)) == "" and tbot.sim_taker_closed(index(NOW)) == ""
+    gap = tbot.sim_taker_gap(shein(NOW), {}, NOW)
+    assert gap["state"] == "wait" and gap["short"] == closed_text and gap["text"] == f"不吃单：{closed_text}", gap
+    await step(tbot, NOW, shein(NOW), index(NOW))
+    t = tbot.sim_trades()
+    assert f"{HSI_SLUG}|up|吃" in t and f"{shein_slug}|up|吃" not in t and f"{shein_slug}|up|挂" in t, sorted(t)  # the index is taken, 希音 only quoted on
+    await step(tbot, NOW + 5_000, shein(NOW + 5_000, True))
+    assert f"{shein_slug}|up|吃" in tbot.sim_trades(), sorted(tbot.sim_trades())  # in session as before
+    assert "开盘前、收盘后只吃 HSI、KOSPI 的单，其余指数/个股日涨跌盘后不吃（SIM_TAKER_AFTER_HOURS_MARKETS）" in tbot.sim_text(), tbot.sim_text()
+    # with SIM_TAKER_SESSION on and the after-hours taker mode, the mode (and its bar) applies on the chosen markets only
+    mbot = m.Bot(m.Config.from_env({**env, "SIM_TAKER_SESSION": "on", "SIM_TAKER_AFTER_HOURS_CENTS": "15"}), m.Store(":memory:"), FM(NOW), None)
+    assert mbot.sim_taker_after_hours(index(NOW)) and not mbot.sim_taker_after_hours(shein(NOW))
+    assert mbot.sim_taker_bar(index(NOW)) == 0.15 and mbot.sim_taker_bar(shein(NOW)) == 0.10 and mbot.sim_taker_bar(shein(NOW, True)) == 0.10
+    assert mbot.sim_taker_closed(shein(NOW)) == closed_text and mbot.sim_taker_closed(index(NOW)) == ""
+    assert "只吃净优势 ≥ 15.0¢ 的（SIM_TAKER_AFTER_HOURS_CENTS），只做 HSI、KOSPI" in mbot.sim_text(), mbot.sim_text()
+    # SIM_TAKER_SESSION on without the mode: nothing is taken after hours, chosen or not
+    sbot = m.Bot(m.Config.from_env({**env, "SIM_TAKER_SESSION": "on"}), m.Store(":memory:"), FM(NOW), None)
+    assert sbot.sim_taker_closed(index(NOW)) == "标的未开盘，不吃单" and sbot.sim_taker_closed(shein(NOW)) == closed_text
+    assert sbot.sim_taker_closed(m.dataclasses.replace(shein(NOW), lunch=True)) == "标的午休，盘后吃单未选这个市场，不吃单"
+    # empty = every market, as before
+    abot = m.Bot(m.Config.from_env({**env, "SIM_TAKER_AFTER_HOURS_MARKETS": ""}), m.Store(":memory:"), FM(NOW), None)
+    assert abot.sim_taker_closed(shein(NOW)) == "" and abot.control_value("SIM_TAKER_AFTER_HOURS_MARKETS") == "" and "sim_taker_after_hours_markets" not in abot.sim_version()
+    print("AFTER_HOURS_MARKETS_OK")
+
+
+asyncio.run(after_hours_markets())
