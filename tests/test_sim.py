@@ -159,7 +159,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
+                                "beta_error": m.MODEL_BETA_ERROR, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert len(bot.sim_trades()) == 2
@@ -1570,3 +1570,36 @@ async def after_hours_cap():
 
 
 asyncio.run(after_hours_cap())
+
+
+async def open_quiet():
+    """1.74.0: SIM_OPEN_QUIET_MINUTES — no new order on a daily card in the first minutes after its underlying opens
+    (the opening auction just done, the feeds lagging the most): takers and makers alike; crypto markets never."""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+           "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}
+    qbot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    qbot.sim_markets = lambda now: world["markets"]
+    assert qbot.config.sim_open_quiet_minutes == 3 and dt.date(2026, 10, 5) not in qbot.config.holidays["hk"]
+    live = lambda at: m.dataclasses.replace(hsi(0.70, [("0.55", "300")], [("0.58", "400")], at), in_session=True)  # HSI: HK opens 09:30
+    at = BJ(10, 5, 9, 31)
+    assert qbot.sim_open_quiet(live(at), at) == "开盘后 3 分钟内不开新单（SIM_OPEN_QUIET_MINUTES）"
+    assert qbot.sim_open_quiet(live(at), BJ(10, 5, 9, 29)) == "" and qbot.sim_open_quiet(live(at), BJ(10, 5, 9, 33)) == ""
+    assert qbot.sim_open_quiet(m.dataclasses.replace(live(at), kind="updown"), at) == "", "crypto markets have no open"
+    assert qbot.sim_open_quiet(live(at), BJ(10, 3, 9, 31)) == "", "a Saturday"
+    gap = qbot.sim_taker_gap(live(at), qbot.sim_trades(), at)
+    assert gap["state"] == "blocked" and "开盘后 3 分钟内不开新单" in gap["text"], gap
+    maker = qbot.sim_maker_reason(live(at), {}, at)[0]
+    assert maker is not None and qbot.sim_maker_pick(live(at), qbot.sim_trades(), "up", maker, at)[1].startswith("开盘后 3 分钟内不开新单")
+    await step(qbot, at, live(at))
+    assert not qbot.sim_trades(), "nothing in the quiet minutes"
+    await step(qbot, BJ(10, 5, 9, 34), live(BJ(10, 5, 9, 34)))
+    assert sorted(qbot.sim_trades()) == [f"{HSI_SLUG}|up|吃", f"{HSI_SLUG}|up|挂"], sorted(qbot.sim_trades())
+    assert qbot.sim_version()["sim_open_quiet_minutes"] == 3 and qbot.control_value("SIM_OPEN_QUIET_MINUTES") == "3"
+    obot = m.Bot(m.Config.from_env({**env, "SIM_OPEN_QUIET_MINUTES": "0"}), m.Store(":memory:"), FM(NOW), None)
+    obot.sim_markets = lambda now: world["markets"]
+    await step(obot, at, live(at))
+    assert len(obot.sim_trades()) == 2
+    print("OPEN_QUIET_OK")
+
+
+asyncio.run(open_quiet())

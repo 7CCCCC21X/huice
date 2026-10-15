@@ -211,6 +211,10 @@ async def run():
     # /prob and the Shanghai contract's alert
     tg.sent.clear(); await bot.process_message({"text": "/prob", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})
     pr = tg.sent[-1]; assert "<b>📍 上证指数</b>" in pr and "→ 目标 10-08 收盘" in pr and "× √3.500" in pr and "上证日K 39 日" in pr, pr
+    # 1.74.0: in the first two minutes after the open an index still equal to the previous close is no print yet
+    bot.cn.quote = m.IndexQuote("上证指数", D("3850.12"), D("3850.12"), None, None, None, bj(2026, 10, 8, 9, 30), "腾讯")
+    assert bot.sse_odds(bj(2026, 10, 8, 9, 31)) == "上证开盘头两分钟仍等于昨收，视为尚未开出，暂不输出新概率"
+    assert isinstance(bot.sse_odds(bj(2026, 10, 8, 9, 33)), m.CloseOdds), bot.sse_odds(bj(2026, 10, 8, 9, 33))
     # during the session: live index vs the dated close (09-30 is the session before 10-08)
     bot.cn.quote = m.IndexQuote("上证指数", D("3860"), D("3850.12"), None, None, None, bj(2026, 10, 8, 10, 0), "腾讯")
     o = bot.sse_odds(bj(2026, 10, 8, 10, 0)); assert o.ref == D("3850.12") and o.effective == D("3860") and o.target == dt.date(2026, 10, 8) and o.remaining < 1, o

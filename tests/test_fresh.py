@@ -158,6 +158,11 @@ async def run():
                           D("24510.09"), "etnet", D("24761.13"), session="日市", spot_ms=bj(9, 30, 9, 29))
     hbot.hsi.quote = page
     assert hbot.hsi_odds(bj(9, 30, 9, 31)) == "恒指现货停在 09-30 09:29，早于今日开盘，暂不输出新概率"
+    # 1.74.0: in the first two minutes after the open a cash index still equal to the previous close is no print yet
+    hbot.hsi.quote = m.dataclasses.replace(page, spot=D("24510.09"), spot_prev=D("24510.09"), spot_ms=bj(9, 30, 9, 30, 20))
+    assert hbot.hsi_odds(bj(9, 30, 9, 31)) == "恒指现货开盘头两分钟仍等于昨收，视为尚未开出，暂不输出新概率"
+    assert isinstance(hbot.hsi_odds(bj(9, 30, 9, 33)), m.CloseOdds), hbot.hsi_odds(bj(9, 30, 9, 33))  # past the grace: an unchanged level is a level
+    hbot.hsi.quote = page
     # a restart that first sees the page after the open cannot tell its age, but its 前收 gives the day away
     hbot.hsi.quote = m.dataclasses.replace(page, spot_ms=bj(9, 30, 10, 0))
     o = hbot.hsi_odds(bj(9, 30, 10, 0))

@@ -109,6 +109,17 @@ async def run():
     bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "76.50", "75.00", "20260924150002"), 0)
     o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 9, 31))
     assert o.proxy_note.endswith("｜现货今日尚未开盘成交，暂用币安"), o.proxy_note
+    # 1.74.0: in the first two minutes after the open a price still equal to the previous close is the feed's placeholder, not a print
+    bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "75.00", "75.00", "20260928093030"), 0)
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 9, 31))
+    assert o.proxy_note.endswith("｜开盘头两分钟现价仍等于昨收，视为尚未成交，暂用币安"), o.proxy_note
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 9, 33))  # past the grace: an unchanged price is a price
+    assert "盘中直接用现货" in o.proxy_note and o.effective == D("75.00"), o
+    bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "74.50", "75.00", "20260928093030"), 0)
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 9, 31))  # a print: used at once
+    assert "盘中直接用现货" in o.proxy_note and o.effective == D("74.50"), o
+    assert m.opening_print_pending(D("1"), D("1"), 100, 0) and not m.opening_print_pending(D("1"), D("1"), m.OPENING_PRINT_GRACE_MS, 0)
+    assert not m.opening_print_pending(D("1"), D("2"), 100, 0) and not m.opening_print_pending(D("1"), None, 100, 0) and not m.opening_print_pending(D("1"), D("1"), -1, 0)
     # Every source failing is reported next to the Binance fallback
     bot.stocks.live.clear()
     async def down(url, timeout=15, headers=None): raise m.RemoteError("HTTP 502")

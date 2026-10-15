@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.73.0"
+VERSION = "1.74.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -447,6 +447,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_AFTER_HOURS_SHARES", "盘后吃单每次最多买多少份", "0～1000000：开盘前、收盘后的吃单单独按这个份数；0 = 同盘中吃单的份数"),
     ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；0 = 不限"),
+    ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
     ("SIM_MAX_FAIR_CENTS", "公平价超过多少就不买（¢）", "50～100：这一边的公平价高于这个数时不吃也不挂——接近必然的结果，剩下几分钱的优势抵不过正态模型算不到的尾部风险（出事时 95¢ 也能归零）；100 = 不限"),
     ("SIM_TAKER_SWEEP_SHARES", "吃单一次最多吃光多少份", "0～10000000：封顶价之下的卖单不止一档时一张单全吃掉（公平价 50¢，20¢ 和 30¢ 的卖单都够优势就一起吃），最多这么多份、不少于每次的份数；组上限或真实交易风控容不下这么多时退回按每次份数买；0 = 只按每次份数买"),
     ("SIM_WAYS", "做哪种单", "吃单 = 算出仍留足净优势的最高价位（封顶价），盘口在它之下的立即买（真实交易用封顶限价单）；挂单 = 按建议价挂着等成交"),
@@ -562,6 +563,7 @@ class Config:
     sim_taker_sweep: float = 300.0             # SIM_TAKER_SWEEP_SHARES: a taker takes every ask under its cap in one order, up to this many shares; 0 = the per-buy count only
     sim_max_fair: float = 0.95                 # SIM_MAX_FAIR_CENTS: no new order on a side whose fair price is over this (the tail a normal model cannot see); 1 = no limit
     sim_after_hours_max_shares: float = 300.0  # SIM_AFTER_HOURS_MAX_SHARES: after hours a market's side holds at most this many shares (positions and orders); 0 = no limit
+    sim_open_quiet_minutes: int = 3            # SIM_OPEN_QUIET_MINUTES: no new order on a daily card this long after its underlying opens; 0 = none
     sim_seconds: int = 5     # seconds between the trader's looks: the books judged, orders placed / withdrawn, real orders read back (SIM_SECONDS)
     sim_ways: str = "taker"  # which suggestions it takes: taker (吃单), maker (挂单) or both
     sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
@@ -727,6 +729,7 @@ class Config:
             sim_taker_sweep=parse_bounded(e, "SIM_TAKER_SWEEP_SHARES", "300", 0, 10_000_000),
             sim_max_fair=parse_bounded(e, "SIM_MAX_FAIR_CENTS", "95", 50, 100) / 100,
             sim_after_hours_max_shares=parse_bounded(e, "SIM_AFTER_HOURS_MAX_SHARES", "300", 0, 10_000_000),
+            sim_open_quiet_minutes=bounded_int(e, "SIM_OPEN_QUIET_MINUTES", 3, 0, 60),
             sim_ways=sim_ways, sim_markets=sim_markets, sim_skip=sim_skip, sources_off=sources_off,
             sim_maker_after_hours_markets=market_keys("SIM_MAKER_AFTER_HOURS_MARKETS"), sim_maker_deep_markets=market_keys("SIM_MAKER_DEEP_MARKETS"),
             sim_maker_deep_only_markets=market_keys("SIM_MAKER_DEEP_ONLY_MARKETS"),
@@ -1858,6 +1861,8 @@ class StockMarket:
             return None, "现货行情缺少报价时间"
         if q.quoted_ms < window[0] - 30 * 60_000:  # still yesterday's print (pre-open auction may stamp minutes early)
             return None, "现货今日尚未开盘成交"
+        if opening_print_pending(q.last, q.prev_close, now_ms, window[0]):
+            return None, "开盘头两分钟现价仍等于昨收，视为尚未成交"
         info = STOCK_MARKETS[ticker.market]
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         day = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
@@ -2468,6 +2473,8 @@ class IndexFutures:
                 return "恒指现货报价时间未知"
             if when < opened:
                 return f"恒指现货停在 {stamp(when, seconds=False)}，早于今日开盘"
+            if opening_print_pending(q.spot, q.spot_prev, now_ms, opened):
+                return "恒指现货开盘头两分钟仍等于昨收，视为尚未开出"
             if quiet_ms(when, now_ms, self.LUNCH) > LIVE_STALE_MS:
                 return f"恒指现货停在 {stamp(when, seconds=False)}，已超 10 分钟未更新"
         else:
@@ -3108,6 +3115,14 @@ class DailyClose:
 
 
 LIVE_STALE_MS = 10 * 60_000  # a live feed silent this long while its market trades is stale
+OPENING_PRINT_GRACE_MS = 2 * 60_000  # after the open, a live price still equal to the previous close is no print yet for this long
+
+
+def opening_print_pending(price: D | None, prev: D | None, now_ms: int, opened_ms: int) -> bool:
+    """A live price equal to the previous close within OPENING_PRINT_GRACE_MS of the open is the feed's placeholder,
+    not today's first trade: the feed stamps it with the current time, so the time checks let it through (10-15:
+    SK Hynix "at" 1,419,000 at 09:00:00, the opening print at −7.3% a minute later; 337 涨 shares bought at 50¢ fair)."""
+    return price is not None and prev is not None and prev > 0 and opened_ms <= now_ms < opened_ms + OPENING_PRINT_GRACE_MS and price == prev
 
 
 def quiet_ms(quoted_ms: int, now_ms: int, lunch: tuple[dt.time, dt.time] | None = None) -> int:
@@ -7305,6 +7320,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_TAKER_SWEEP_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "200", "300", "500", "1000", "2000"], "unit": "份", "zero": "只按每次份数"},
     "SIM_MAX_FAIR_CENTS": {"kind": "number", "group": "策略", "presets": ["90", "95", "97", "99", "100"], "unit": "¢"},
     "SIM_AFTER_HOURS_MAX_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "100", "200", "300", "500", "1000"], "unit": "份", "zero": "不限"},
+    "SIM_OPEN_QUIET_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "1", "3", "5", "10"], "unit": "分钟", "zero": "不限"},
     "SIM_WAYS": {"kind": "choice", "group": "策略", "options": [["taker", "只吃单"], ["maker", "只挂单"], ["both", "挂单和吃单"]]},
     "SIM_MARKETS": {"kind": "multi", "group": "策略", "options": [[k, n] for k, n in SIM_KINDS.items()]},
     "SIM_SKIP": {"kind": "detail", "group": "策略"},  # drawn inside the SIM_MARKETS card: one chip per market of the chosen kinds
@@ -8876,7 +8892,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
   session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_skip:"详细选项排除的市场",
-  sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_max_fair:"公平价上限（超过不买）",sim_after_hours_max_shares:"盘后每边持仓上限",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
+  sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_max_fair:"公平价上限（超过不买）",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
   min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
@@ -11300,6 +11316,9 @@ class Bot:
                 return "缺少上证实时报价，暂不输出概率"
             if self.cn.live_stale(now_ms):
                 return f"上证实时报价已超 10 分钟未更新（最后 {quote_time(q.quoted_ms)}），暂不输出新概率"
+            today_bj = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+            if opening_print_pending(q.last, q.prev_close, now_ms, int(dt.datetime.combine(today_bj, dt.time(9, 30), BEIJING).timestamp() * 1000)):
+                return "上证开盘头两分钟仍等于昨收，视为尚未开出，暂不输出新概率"
             if close and close.day == self.cn.expected_close(now_ms):
                 ref, ref_note = close.value, f"{close.day.strftime('%m-%d')} 收盘"
             elif q.prev_close:
@@ -11641,6 +11660,9 @@ class Bot:
             why = self.kospi.problem(k, now_ms)
             if why:
                 return f"KOSPI 实时{why}，暂不输出新概率"
+            opened = int(dt.datetime.combine(local.date(), CALENDAR.sessions("kr", local.date())[0][0], kst).timestamp() * 1000)
+            if opening_print_pending(k.last, k.prev_close, now_ms, opened):
+                return "KOSPI 开盘头两分钟仍等于昨收，视为尚未开出，暂不输出新概率"
             if not k.prev_close:
                 return "缺少 KOSPI 昨收"
             remaining, target = session_remaining("kr", now_ms, local.date() - dt.timedelta(days=1), holidays)
@@ -12167,6 +12189,7 @@ class Bot:
         ways, kinds = sim_scope(c)
         return {"code": VERSION, "sim_edge": c.sim_edge, "sim_shares": c.sim_shares, "sim_taker_max_shares": c.sim_taker_max_shares,
                 "sim_taker_sweep": c.sim_taker_sweep, "sim_max_fair": c.sim_max_fair, "sim_after_hours_max_shares": c.sim_after_hours_max_shares,
+                "sim_open_quiet_minutes": c.sim_open_quiet_minutes,
                 "sim_ways": ways, "sim_markets": kinds,
                 **({"sim_taker_shares": c.sim_taker_shares} if c.sim_taker_shares else {}),
                 **({"sim_taker_after_hours_shares": c.sim_taker_after_hours_shares} if c.sim_taker_after_hours_shares else {}),
@@ -12679,6 +12702,28 @@ class Bot:
         if mk.in_session is False and c.sim_taker_after_hours_shares > 0:
             return c.sim_taker_after_hours_shares
         return c.sim_taker_shares or c.sim_shares
+
+    INDEX_MARKETS = {"HSI": "hk", "KOSPI": "kr", "SSE": "sh"}  # a daily index card's exchange, for its session times
+
+    def sim_open_quiet(self, mk: SimMarket, now_ms: int) -> str:
+        """Why no new order goes on a daily card now: its underlying opened less than SIM_OPEN_QUIET_MINUTES ago — the
+        minutes after the opening auction, when the live feeds lag the most and the fair price is least worth
+        trading on (10-15: a buy at 50¢ fair in the opening second, the print at −7.3% a minute later). "" otherwise."""
+        minutes = self.config.sim_open_quiet_minutes
+        if not minutes or mk.kind != "close":
+            return ""
+        ticker = self.config.tickers.get(str(mk.key)) or self.config.tickers.get(str((mk.settle or {}).get("key") or ""))
+        market = ticker.market if ticker else self.INDEX_MARKETS.get(str(mk.key), "")
+        if market not in STOCK_MARKETS:
+            return ""
+        tz = dt.timezone(dt.timedelta(hours=STOCK_MARKETS[market].utc_offset))
+        local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
+        if local.weekday() >= 5 or local.date() in self.config.holidays.get(market, frozenset()):
+            return ""
+        opened = int(dt.datetime.combine(local.date(), CALENDAR.sessions(market, local.date())[0][0], tz).timestamp() * 1000)
+        if opened <= now_ms < opened + minutes * 60_000:
+            return f"开盘后 {minutes} 分钟内不开新单（SIM_OPEN_QUIET_MINUTES）"
+        return ""
 
     def sim_side_room(self, trades: dict[str, dict], mk: SimMarket, side: str) -> tuple[float, str]:
         """After hours (the card priced from a proxy: mk.in_session is False) how many more shares this market's side
@@ -13382,7 +13427,7 @@ class Bot:
         order and exposure limits and the balance too — the most they do (whole shares, the cheapest asks first), so
         a limit bounds the order instead of refusing it: 300 shares at a 77¢ cap are $231, over a $100 order limit;
         129 are not. (the quote, "" | why nothing may be bought)."""
-        quiet = self.sim_quiet(mk.settle, now_ms)
+        quiet = self.sim_quiet(mk.settle, now_ms) or self.sim_open_quiet(mk, now_ms)
         if quiet:
             return q, quiet
         bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
@@ -13418,7 +13463,7 @@ class Bot:
         """The resting order's count as the trader places it now: SIM_SHARES when the quiet window and the caps allow
         it, else the most the caps take (as sim_taker_pick). (shares, "" | why none may be placed)."""
         want = float(self.config.sim_shares)
-        quiet = self.sim_quiet(mk.settle, now_ms)
+        quiet = self.sim_quiet(mk.settle, now_ms) or self.sim_open_quiet(mk, now_ms)
         if quiet:
             return want, quiet
         room, full = self.sim_side_room(trades, mk, side)  # SIM_AFTER_HOURS_MAX_SHARES: what the side may still hold after hours
@@ -14741,6 +14786,7 @@ class Bot:
                   "SIM_TAKER_SHARES": plain(c.sim_taker_shares), "SIM_TAKER_AFTER_HOURS_SHARES": plain(c.sim_taker_after_hours_shares),
                   "SIM_TAKER_MAX_SHARES": plain(c.sim_taker_max_shares), "SIM_TAKER_SWEEP_SHARES": plain(c.sim_taker_sweep),
                   "SIM_MAX_FAIR_CENTS": f"{c.sim_max_fair * 100:g}", "SIM_AFTER_HOURS_MAX_SHARES": plain(c.sim_after_hours_max_shares),
+                  "SIM_OPEN_QUIET_MINUTES": str(c.sim_open_quiet_minutes),
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
                   "SIM_GROUP_USD": plain(c.sim_group_usd), "SIM_TAKER_SESSION": flag(c.sim_taker_session),
                   "SIM_TAKER_AFTER_HOURS_CENTS": f"{c.sim_taker_after_hours * 100:g}", "SIM_AFTER_HOURS_MAX_PRICE_CENTS": f"{c.sim_after_hours_max_price * 100:g}", "SIM_SKIP": ",".join(sorted(c.sim_skip)),

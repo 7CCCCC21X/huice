@@ -180,6 +180,13 @@ async def run():
     await bot4.kospi_anchor(k, hl)
     msg = bot4.kospi_odds(now)
     assert isinstance(msg, str) and "缺少 HL KR200 在 09-23 15:30 的同源锚点" in msg and "HTTP 500" in msg, msg
+    # 1.74.0: in the first two minutes after the open a KOSPI level still equal to the previous close is no print yet
+    kbot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(cfg), FakeTelegram())
+    kbot.kospi.quote = m.IndexQuote("KOSPI", D("3400"), D("3400"), None, None, None, kr(2026, 9, 28, 9, 0), "Naver")
+    assert kbot.kospi_odds(kr(2026, 9, 28, 9, 1)) == "KOSPI 开盘头两分钟仍等于昨收，视为尚未开出，暂不输出新概率"
+    assert isinstance(kbot.kospi_odds(kr(2026, 9, 28, 9, 3)), m.CloseOdds), kbot.kospi_odds(kr(2026, 9, 28, 9, 3))
+    kbot.kospi.quote = m.IndexQuote("KOSPI", D("3390"), D("3400"), None, None, None, kr(2026, 9, 28, 9, 0), "Naver")
+    assert isinstance(kbot.kospi_odds(kr(2026, 9, 28, 9, 1)), m.CloseOdds), kbot.kospi_odds(kr(2026, 9, 28, 9, 1))
     bot5 = m.Bot(cfg, m.Store(":memory:"), FakeMarket(cfg), FakeTelegram()); bot5.kospi.quote = k
     at_close = dataclasses.replace(hl, mark=D("1126.9"), fetched_ms=close_ms + 20_000)
     await bot5.kospi_anchor(k, at_close)  # the live mark seen right after the close is recorded ...
