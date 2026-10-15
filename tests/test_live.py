@@ -104,6 +104,27 @@ async def run():
     assert o.target == dt.date(2026, 9, 29) and o.ref == D("79.00") and o.effective == D("79.00") and "日K待确认" in o.ref_note, o
     o = bot.contract_odds("UNITREEUSDT", D("10.90"), bj(9, 28, 15, 40))  # live window over, bar still pending
     assert o.target == dt.date(2026, 9, 29) and o.ref == D("79.00") and o.effective > D("79.00"), o
+    # 1.76.1: a reference older than the last finished session prices the wrong market — the next close is measured
+    # from a close the bot does not have yet (no daily bar, no closing print noted): no odds until it does
+    pbot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(cfg), None)
+    pbot.stocks.closes["UNITREEUSDT"] = m.StockMarket.baseline(m.StockTicker("sh", "688836"), sh, "腾讯", dt.date(2026, 9, 24), D("76.50"))
+    pbot.anchors["UNITREEUSDT"] = (bj(9, 24, 15, 0), D("10.60"))
+    o = pbot.contract_odds("UNITREEUSDT", D("10.20"), bj(9, 28, 15, 10))  # 15:10: today's close not final yet — today's market, from the 09-24 close
+    assert isinstance(o, m.CloseOdds) and o.target == dt.date(2026, 9, 28) and o.ref == D("76.50"), o
+    assert pbot.contract_odds("UNITREEUSDT", D("10.20"), bj(9, 28, 18, 43)) == "09-28 收盘价待确认（09-28 日 K 未出），暂不输出概率"
+    pbot.note_live_close("UNITREEUSDT", cfg.tickers["UNITREEUSDT"], bj(9, 28, 15, 10))  # no live quote at all in the window: the reason is kept
+    assert pbot.close_print_why["UNITREEUSDT"] == "等待现货行情"
+    pbot.stocks.errors["UNITREEUSDT"] = "收盘只取到 09-24，应有 09-28（各源未更新或失败）"
+    assert pbot.contract_odds("UNITREEUSDT", D("10.20"), bj(9, 29, 8, 0)) == "09-28 收盘价待确认（收盘只取到 09-24，应有 09-28（各源未更新或失败）；收盘现价未记到：等待现货行情），暂不输出概率"
+    pbot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "72.50", "76.50", "20260928145200"), 0)
+    pbot.note_live_close("UNITREEUSDT", cfg.tickers["UNITREEUSDT"], bj(9, 28, 15, 10))  # a (fresh) print from before the closing auction is not the close
+    assert pbot.close_print_why["UNITREEUSDT"] == "最后一笔 09-28 14:52 早于收盘竞价"
+    pbot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "72.50", "76.50", "20260928150002"), 0)
+    pbot.note_live_close("UNITREEUSDT", cfg.tickers["UNITREEUSDT"], bj(9, 28, 15, 10))  # the closing print: noted, the card moves on from it
+    assert "UNITREEUSDT" not in pbot.close_print_why and pbot.odds_base("UNITREEUSDT", bj(9, 28, 18, 43))[:2] == (bj(9, 28, 15, 0), D("72.50"))
+    pbot.anchors["UNITREEUSDT"] = (bj(9, 28, 15, 0), D("10.20"))
+    o = pbot.contract_odds("UNITREEUSDT", D("10.20"), bj(9, 28, 18, 43))
+    assert isinstance(o, m.CloseOdds) and o.target == dt.date(2026, 9, 29) and o.ref == D("72.50") and abs(o.fair_up - 0.5) < 0.05, o
     bot.anchors["UNITREEUSDT"] = (bj(9, 24, 15, 0), D("10.60"))
     # Yesterday's quote at the open is not today's price
     bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "76.50", "75.00", "20260924150002"), 0)

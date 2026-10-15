@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.76.0"
+VERSION = "1.76.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -10459,6 +10459,7 @@ class Bot:
         self.diag_pool: ThreadPoolExecutor | None = None  # /diag's probes run here, not on the feeds' pool
         self.reference_state: dict[str, dict] = {}  # per background feed: last success, last error, duration
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
+        self.close_print_why: dict[str, str] = {}  # symbol -> why today's closing print could not be noted (note_live_close)
         self.kospi_anchor_note, self.kospi_anchor_error = "", ""
         self.pred_last: dict[str, int] = {}  # index -> ms of the last saved prediction snapshot
         self.a50_anchor_note = "15:00"
@@ -11506,9 +11507,15 @@ class Bot:
         close_ms = int(dt.datetime.combine(today, CALENDAR.close_time(ticker.market, today), tz).timestamp() * 1000)
         if now_ms < close_ms + CLOSE_SETTLE_MS.get(ticker.market, 60_000):
             return
-        live, _ = self.stocks.live_quote(symbol, now_ms)  # None once the close is final (+15 min): keep the last one
-        if live is None or live.quoted_ms < close_ms - 5 * 60_000:
+        live, why = self.stocks.live_quote(symbol, now_ms)  # None once the close is final (+15 min): keep the last one
+        if live is None:
+            if why:  # (outside the window there is no reason: the last one seen stands, for the card to show)
+                self.close_print_why[symbol] = why
+            return
+        if live.quoted_ms < close_ms - 5 * 60_000:
+            self.close_print_why[symbol] = f"最后一笔 {stamp(live.quoted_ms, seconds=False)} 早于收盘竞价"
             return  # no print from the closing auction yet
+        self.close_print_why.pop(symbol, None)
         if ticker.market == "kr" and live.quoted_ms >= close_ms + 10 * 60_000:
             return  # 15:40 KST on: Nextrade after-hours prints, not the KRX close
         if ticker.market == "kr" and live.quoted_ms >= close_ms and not self.store.get(f"krx_close:{ticker.code}:{today.isoformat()}"):
@@ -11570,6 +11577,16 @@ class Bot:
             return close_odds(NAMES.get(symbol, symbol), base, live.last, sigma, remaining, target,
                               price_tick(ticker.market, base), base_note,
                               f"{info.name}现货 {fmt_price(live.last)}（{live.source}·盘中直接用现货）", sigma_note, unit)
+        expected = expected_close_date(ticker.market, now_ms, holidays)
+        if close_date < expected:
+            # a session has closed since the reference: the market now asks about the close after that one, which the bot
+            # does not have yet (the daily bar not out, the closing print not noted). Mapping the proxy's move since the
+            # older close would price the wrong question — the finished session's move reads as the next one's (10-15
+            # 18:43: CXMT 跌 bought at 47.9¢ for a 94.5¢ fair price against the 10-14 close, the 10-15 close −5.2% already
+            # in the proxy; against the 10-15 close the card was 50/50)
+            why = self.stocks.errors.get(symbol) or f"{expected:%m-%d} 日 K 未出"
+            miss = self.close_print_why.get(symbol)
+            return f"{expected:%m-%d} 收盘价待确认（{why}" + (f"；收盘现价未记到：{miss}" if miss else "") + "），暂不输出概率"
         if anchor is None or anchor[0] != base_ms:
             return "等待币安在收盘时刻的价格"
         if quote_ms and now_ms - quote_ms > self.config.max_age * 1000:
