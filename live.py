@@ -291,6 +291,7 @@ class PredictApi:
         self.jwt, self.jwt_exp, self.jwt_at = "", 0, 0.0
         self.auth_error = ""
         self.gate = asyncio.Semaphore(self.PARALLEL)
+        self.read_gate = asyncio.Semaphore(max(1, self.PARALLEL - 1))  # the reads leave a slot: an order or a cancel never queues behind them
         self.blocked_until = 0.0
         self.calls = 0
         self.orders_complete = self.positions_complete = True  # the last list read came whole (every page)
@@ -303,37 +304,46 @@ class PredictApi:
             out["Authorization"] = f"Bearer {self.jwt}"
         return out
 
-    async def call(self, method: str, path: str, payload: dict | None = None, timeout: int = API_TIMEOUT) -> Any:
+    async def call(self, method: str, path: str, payload: dict | None = None, timeout: int = API_TIMEOUT, priority: bool = False) -> Any:
+        """One request under the gate (PARALLEL in flight at most). A read takes a slot of the reads' own gate first, so
+        one slot is always free for a ``priority`` request — an order, a cancel — which never waits behind the reads."""
         left = self.blocked_until - time.monotonic()
         if left > 0:
             raise core.RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
         if method == "POST" and payload is None:
             payload = {}
         self.calls += 1
-        async with self.gate:
-            try:
-                raw = await core.predict_blocking(core._http_get, self.base + path, payload, timeout, self.headers())
-            except core.RemoteError as error:
-                if error.retry_after or http_status(error) == 429:
-                    self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, self.BACKOFF_SECONDS))
-                raise
+        if priority:
+            async with self.gate:
+                raw = await self.send(method, path, payload, timeout)
+        else:
+            async with self.read_gate, self.gate:
+                raw = await self.send(method, path, payload, timeout)
         try:
             return json.loads(raw) if raw else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise core.RemoteError("Predict 接口未返回有效 JSON") from None
 
-    async def authed(self, method: str, path: str, payload: dict | None = None, timeout: int = API_TIMEOUT) -> Any:
+    async def send(self, method: str, path: str, payload: dict | None, timeout: int) -> Any:
+        try:
+            return await core.predict_blocking(core._http_get, self.base + path, payload, timeout, self.headers())
+        except core.RemoteError as error:
+            if error.retry_after or http_status(error) == 429:
+                self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, self.BACKOFF_SECONDS))
+            raise
+
+    async def authed(self, method: str, path: str, payload: dict | None = None, timeout: int = API_TIMEOUT, priority: bool = False) -> Any:
         """A request that needs the sign-in: signs in first when the token is missing or about to expire, once more
         after a 401."""
         await self.ensure_auth()
         try:
-            return await self.call(method, path, payload, timeout)
+            return await self.call(method, path, payload, timeout, priority)
         except core.RemoteError as error:
             if http_status(error) != 401 or not self.wallet:
                 raise
             self.jwt = ""
             await self.ensure_auth()
-            return await self.call(method, path, payload, timeout)
+            return await self.call(method, path, payload, timeout, priority)
 
     async def ensure_auth(self) -> None:
         if self.jwt and (not self.jwt_exp or time.time() < self.jwt_exp - 300):
@@ -381,7 +391,7 @@ class PredictApi:
 
     async def create_order(self, body: dict) -> dict:
         """POST /v1/orders -> {"order_id", "hash", "code"}; success=false is an error with the API's own reason."""
-        answer = await self.authed("POST", "/orders", body, timeout=20)
+        answer = await self.authed("POST", "/orders", body, timeout=20, priority=True)
         data = answer.get("data") if isinstance(answer, dict) else None
         if not isinstance(answer, dict) or answer.get("success") is False or not isinstance(data, dict):
             raise OrderRejected("下单被拒绝：" + (core.http_error_text(answer) if isinstance(answer, dict) else "")
@@ -393,7 +403,7 @@ class PredictApi:
 
     async def remove_orders(self, ids: list[str]) -> dict:
         """POST /v1/orders/remove -> {"removed": [...], "noop": [...]}."""
-        answer = await self.authed("POST", "/orders/remove", {"data": {"ids": [str(i) for i in ids]}})
+        answer = await self.authed("POST", "/orders/remove", {"data": {"ids": [str(i) for i in ids]}}, priority=True)
         data = answer.get("data") if isinstance(answer, dict) and isinstance(answer.get("data"), dict) else answer
         if not isinstance(answer, dict) or answer.get("success") is False:
             raise core.RemoteError("撤单被拒绝：" + (core.http_error_text(answer) if isinstance(answer, dict) else "")
@@ -953,6 +963,8 @@ class LiveBot(core.Bot):
         self.live_synced_at = 0  # when the open-order list was last read in full
         self.live_sync_failed_ms = 0  # when a read of it last failed (a failure after the last success holds new orders)
         self.live_list_at_ms = -10 ** 15  # ...on the bot's clock, for the idle re-read
+        self.live_auth_tried = -1e9  # monotonic time of the last sign-in renewal tried ahead of the token's expiry
+        self.live_place_ms = 0       # the last step's placement time (sim_after_decide), for the phases
 
     # --- readiness -------------------------------------------------------------------------------------------------------
     async def live_prepare(self) -> list[str]:
@@ -1136,7 +1148,7 @@ class LiveBot(core.Bot):
                 "price": float(maker.price) if maker is not None else float(taker["avg"]),
                 "cap": float(taker["cap"]) if taker and taker.get("cap") else None,
                 "limit": self.sim_taker_limit(taker) if taker and taker.get("cap") else None,  # the LIMIT price (LIVE_TAKER_PRICE)
-                "cost": float(trade["price"]), "token": outcome["token"], "outcome": outcome["name"],
+                "cost": float(trade["price"]), "token": outcome["token"], "outcome": outcome["name"], "book_ms": mk.book.fetched_ms,
                 "index_set": outcome["index_set"], "assumed": assumed, "fee_bps": info.fee_bps,
                 "neg_risk": info.neg_risk, "yield_bearing": info.yield_bearing, "condition_id": info.condition_id,
                 "asks": [[p, q] for p, q in core.side_levels(mk.book, side)][:core.PREDICT_DEPTH],
@@ -1220,18 +1232,30 @@ class LiveBot(core.Bot):
         except Exception as error:
             self.live_note_error(f"读取市场信息失败：{core.clean_error(error) or type(error).__name__}")
         mark("预取")
-        result = await super().sim_step(now_ms)
+        self.live_place_ms = 0
+        result = await super().sim_step(now_ms)  # ...which sends the pending orders (sim_after_decide) before its settlement lookups
         mark("决策")
+        marks["决策"] -= self.live_place_ms
+        marks["下单"] = self.live_place_ms
         try:
-            self.live_check_kill(self.sim_trades(), now_ms)  # the settlements of this step count before anything goes out
-            await self.live_place_pending(now_ms)
-            mark("下单")
             await self.live_sync(now_ms)
             mark("同步")
         except Exception as error:
             self.live_note_error(f"同步真实订单失败：{core.clean_error(error) or type(error).__name__}")
         self.live_step_ms = marks
         return result
+
+    async def sim_after_decide(self, now_ms: int) -> None:
+        """The step's decisions made: the loss switch is checked on this step's settlements and the pending orders go
+        out now — before the settlement lookups of old positions (sim_confirm) are waited for, which used to hold a new
+        order behind a slow Predict read."""
+        started = time.monotonic()
+        try:
+            self.live_check_kill(self.sim_trades(), now_ms)
+            await self.live_place_pending(now_ms)
+        except Exception as error:
+            self.live_note_error(f"下单步骤失败：{core.clean_error(error) or type(error).__name__}")
+        self.live_place_ms = int((time.monotonic() - started) * 1000)
 
     async def live_prefetch(self, now_ms: int) -> None:
         """Sign in again when needed; market details for the markets whose suggestion is near the bar (a decision
@@ -1416,10 +1440,12 @@ class LiveBot(core.Bot):
             st.update(state="placing", hash=digest.lower(), strategy=strategy, order=order, placing_at=now_ms,
                       price_per_share=from_wei(amounts["price_per_share"]), usd_cap=from_wei(amounts["maker"]),
                       shares_requested=from_wei(amounts["amount"]))
+            st["sent_at"] = now_ms  # the order path's timing points (live_latency, /diag): the book's read (want.book_ms), the decision (opened), sent, answered
             self.sim_save([(tid, trade)])
             sent = time.monotonic()
             result = await self.live.api.create_order(body)
             took = time.monotonic() - sent
+            st["answered_at"] = now_ms + int(took * 1000)
         except Exception as error:
             text = core.clean_error(error) or type(error).__name__
             definite = isinstance(error, OrderRejected) or 400 <= http_status(error) < 500
@@ -1492,6 +1518,7 @@ class LiveBot(core.Bot):
             await self.live_ensure_ready()  # real orders are followed to their end whatever the mode (LIVE=off included)
         if not self.live.ready:
             return
+        await self.live_renew_auth()
         if active or now_ms - self.live_list_at_ms >= self.LIVE_IDLE_LIST_MS:
             await self.live_sync_orders(active, now_ms)  # with nothing in flight the list is still read now and then: orders this bot did not place
         if (self.config.live_auto_redeem and time.monotonic() - self.live_last_redeem >= self.LIVE_REDEEM_SECONDS
@@ -1499,6 +1526,42 @@ class LiveBot(core.Bot):
             self.live_last_redeem = time.monotonic()
             # beside the step: a round of chain calls (a dozen positions failing on gas took 25 s) never holds the next decision
             self.live_redeem_task = asyncio.create_task(self.live_redeem_round(now_ms), name="live-redeem")
+
+    LIVE_AUTH_RENEW_S = 900  # the sign-in token is renewed this long before it expires, in the background
+
+    async def live_renew_auth(self) -> None:
+        """A token about to expire is renewed here, between the steps, rather than by the order that finds it expired
+        (that order then waited for two sign-in requests first). Tried once a minute at most; a failure is the next
+        request's to report."""
+        api = self.live.api
+        exp = float(getattr(api, "jwt_exp", 0) or 0)
+        if not getattr(api, "jwt", "") or not exp or not 0 < exp - time.time() < self.LIVE_AUTH_RENEW_S:
+            return
+        if time.monotonic() - self.live_auth_tried < 60:
+            return
+        self.live_auth_tried = time.monotonic()
+        with contextlib.suppress(Exception):
+            await api.authenticate()
+
+    def live_latency(self, last: int = 30) -> dict | None:
+        """The order path of the last ``last`` real orders sent, in seconds (median and longest): 盘口→决策 (the book's
+        read to the decision), 决策→发出 (to the request), 发出→订单号 (Predict's answer). None before any was sent."""
+        rows = []
+        for t in self.sim_trades().values():
+            st = t.get("live")
+            if not isinstance(st, dict) or not st.get("sent_at") or not st.get("answered_at"):
+                continue
+            want = st.get("want") or {}
+            rows.append((int(t.get("opened") or 0), int(want.get("book_ms") or 0), int(st["sent_at"]), int(st["answered_at"])))
+        rows = sorted(rows, key=lambda r: r[2])[-last:]
+        if not rows:
+            return None
+
+        def span(values: list) -> dict | None:
+            values = sorted(v for v in values if v is not None and v >= 0)
+            return {"median": values[len(values) // 2] / 1000, "max": values[-1] / 1000} if values else None
+        return {"n": len(rows), "book": span([o - b for o, b, s, a in rows if b and o]), "send": span([s - o for o, b, s, a in rows if o]),
+                "answer": span([a - s for o, b, s, a in rows])}
 
     async def live_redeem_round(self, now_ms: int) -> None:
         try:

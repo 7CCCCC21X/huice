@@ -1530,3 +1530,26 @@ async def expiry_positions():
 
 
 asyncio.run(expiry_positions())
+
+
+async def latency():
+    """1.79.0: the order path's timing points — the book's read, the decision, the request sent, Predict's answer — kept
+    on each real order and summarised for /diag; orders go out before the step waits for its settlement lookups; the
+    API's reads leave a slot for an order or a cancel."""
+    bot = make_bot()
+    await bot.live_prepare(); await bot.live_prefetch(NOW)
+    await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    t = bot.sim_trades()[f"{HSI_SLUG}|up|吃"]
+    assert t["live"]["want"]["book_ms"] == NOW and t["live"]["sent_at"] == NOW and t["live"]["answered_at"] >= NOW, t["live"]
+    lat = bot.live_latency()
+    assert lat and lat["n"] == 2 and lat["book"]["median"] == 0.0 and lat["send"]["median"] == 0.0 and lat["answer"]["max"] < 1, lat
+    assert set(bot.live_step_ms) == {"预取", "决策", "下单", "同步"} and bot.live_step_ms["下单"] >= 0, bot.live_step_ms
+    bot.reference_state["模拟交易"] = {"ok_at": time.time() - 2, "error": "", "error_at": 0, "ms": 900, "runs": 50}
+    diag = "\n".join(bot.diag_state(NOW))
+    assert "下单链路（最近 2 笔真实订单）：盘口→决策 中位 0.0s / 最长 0.0s、决策→发出 中位 0.0s / 最长 0.0s、发出→订单号 中位 0.0s" in diag, diag
+    api = L.PredictApi("https://x.test/v1", "k", None)
+    assert api.gate._value == 3 and api.read_gate._value == 2  # the reads' own gate: a slot stays free for an order or a cancel
+    print("LATENCY_OK")
+
+
+asyncio.run(latency())

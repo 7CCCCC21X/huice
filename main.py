@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.78.0"
+VERSION = "1.79.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -546,6 +546,7 @@ class Config:
     ladder_deadlines: dict[str, int] = field(default_factory=dict)  # STOCK_HIT_MARKETS key -> deadline (23:59 ET, ms) pinned by hand
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
+    hl_refresh: int = 10  # HL_REFRESH_SECONDS: how often the Hyperliquid quotes (the KR200 after-hours proxy among them) are read
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
@@ -713,6 +714,7 @@ class Config:
             hl_tickers=parse_hl_tickers(e.get("HL_TICKERS", DEFAULT_HL_TICKERS), symbols),
             kospi_index=e.get("KOSPI_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
             hl_index=parse_hl_tickers(e.get("HL_INDEX", DEFAULT_HL_INDEX), ("KR200",)),
+            hl_refresh=bounded_int(e, "HL_REFRESH_SECONDS", 10, 3, 120),
             predict=e.get("PREDICT", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
@@ -2736,10 +2738,11 @@ class Hyperliquid:
     name markets "dex:COIN". Read-only, best effort; a missing market is a note, not an error.
     """
     URL = "https://api.hyperliquid.xyz/info"
-    REFRESH_SECONDS = 30
+    REFRESH_SECONDS = 10  # HL_REFRESH_SECONDS: the KR200 perp is the KOSPI card's after-hours price — every 30 s it lagged the book
 
-    def __init__(self, tickers: dict[str, tuple[str, str]]):
+    def __init__(self, tickers: dict[str, tuple[str, str]], refresh_seconds: int = REFRESH_SECONDS):
         self.tickers = dict(tickers)
+        self.refresh_seconds = refresh_seconds
         self.quotes: dict[str, HlQuote] = {}
         self.notes: dict[str, str] = {}   # symbol -> why there is no quote (not listed / fetch failed)
         self.at_cache: dict[tuple[str, int, str], D] = {}
@@ -2800,7 +2803,7 @@ class Hyperliquid:
         return quotes
 
     async def refresh(self, force: bool = False) -> Refreshed | bool:
-        if not self.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
+        if not self.tickers or (not force and time.monotonic() - self.refreshed < self.refresh_seconds):
             return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         by_dex: dict[str, dict[str, HlQuote] | str] = {}
@@ -4977,7 +4980,28 @@ class PredictFeed:
                 due += [m for m in markets if m["id"] in have and m["id"] not in only and now - read_at.get(m["id"], -1e9) >= cold]
         for m in due:
             read_at[m["id"]] = now
-        fresh = dict(zip([m["id"] for m in due], await asyncio.gather(*(self.ladder_row_gated(key, slug, m) for m in due))))
+        # each level's book is published as it arrives — the express lane looks at it at once — not after the slowest of
+        # the round (one level answering in 8 s used to hold the others' decisions for 8 s)
+        tasks = {asyncio.create_task(self.ladder_row_gated(key, slug, m)): m["id"] for m in due}
+        fresh: dict[str, Any] = {}
+        pending = set(tasks)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                published = False
+                for task in done:
+                    mid = tasks[task]
+                    fresh[mid] = task.result()
+                    if fresh[mid] is not None and pending:
+                        self.ladder_rows.setdefault(key, {})[mid] = fresh[mid]
+                        published = True
+                if published:
+                    self.ladder_publish(key)
+                    self.updated(key)
+        except BaseException:
+            for task in pending:
+                task.cancel()
+            raise
         # the rows as they stand now (a cold round may have stored some meanwhile), the ones read here replacing theirs
         have = self.ladder_rows.get(key) or {}
         current = {m["id"]: fresh[m["id"]] if m["id"] in fresh else have.get(m["id"]) for m in markets}
@@ -4987,9 +5011,7 @@ class PredictFeed:
         rows = list(self.ladder_rows[key].values())
         if not rows:
             raise RemoteError("Predict 市场标题里没有可识别的档位")
-        if key in self.ladder_pick:
-            rows = self.ladder_pick[key](rows, self.market_meta)
-        self.ladders[key] = sorted(rows, key=lambda row: row.target)
+        self.ladder_publish(key)
         self.updated(key)
         failed = [row for row in rows if row.error and not self.book_absent(row)]  # no book at all is an answer, not a failure
         if failed:
@@ -4998,6 +5020,15 @@ class PredictFeed:
         else:
             self.errors.pop(key, None)
         return len(due)
+
+    def ladder_publish(self, key: str) -> None:
+        """self.ladders[key] from the rows held now: picked (ladder_pick) and sorted by threshold."""
+        rows = list((self.ladder_rows.get(key) or {}).values())
+        if not rows:
+            return
+        if key in self.ladder_pick:
+            rows = self.ladder_pick[key](rows, self.market_meta)
+        self.ladders[key] = sorted(rows, key=lambda row: row.target)
 
     async def ladder_row_gated(self, key: str, slug: str, market: dict) -> "LadderRow | None":
         """ladder_row under the ladders' own gate: at most PREDICT_LADDER_PARALLEL levels in flight at once."""
@@ -8884,18 +8915,19 @@ function drawMeta(d){const ago=$("span","","");ago.id="ago";
     ...(live?[$("span","","实时推送")]:[]),$("span","","基准 "+d.mode),$("span","","v"+d.version))}
 // The event stream (/events): the index and contract cards' numbers arrive within a second of a change and are patched into the
 // last full answer; data.json still brings the books, the crypto cards and the texts every 10 seconds, and is the fallback.
-let es=null,live=false;
+let es=null,live=false,pushReload=0;  // pushReload: a fair price moved by the stream — the books' suggestions are re-read soon after
 const LIVE_KEYS=["quote_ms","effective","move","ref","up","flat","down","z","fair_up","fair_down","sigma","remaining","warn","proxy_note","source","eff_label","missing"];
 function patchLive(d){
   if(!last||!Array.isArray(d.items))return;if(d.server_ms)skew=d.server_ms-Date.now();
-  let changed=false;
+  let changed=false,fairMoved=false;
   for(const li of d.items){const it=last.items.find(x=>x.name===li.name&&(x.symbol||"")===(li.symbol||""));if(!it)continue;
     if(!!li.missing!==!!it.missing)continue;  // a card that just appeared or paused: the next full answer draws it whole
     for(const k of LIVE_KEYS){if(!(k in li)||JSON.stringify(li[k])===JSON.stringify(it[k]))continue;
-      if(k==="fair_up"&&it.fair_up!=null&&li.fair_up!=null&&Math.abs(li.fair_up-it.fair_up)>=5e-4)changedAt[favKey(it)]={at:Date.now(),up:li.fair_up>it.fair_up};
+      if(k==="fair_up"&&it.fair_up!=null&&li.fair_up!=null&&Math.abs(li.fair_up-it.fair_up)>=5e-4){changedAt[favKey(it)]={at:Date.now(),up:li.fair_up>it.fair_up};fairMoved=true}
       it[k]=li[k];changed=true}}
-  if(!changed)return;if(d.generated_at)last.generated_at=d.generated_at;fetchedAt=okAt=Date.now();failMsg="";
-  if(document.visibilityState!=="hidden")render(last);drawMeta(last);tick()}
+  if(!changed)return;if(d.generated_at)last.generated_at=d.generated_at;fetchedAt=Date.now();  // okAt / failMsg are the full refresh's: a stream patch is not one (the books it leaves are as old as before)
+  if(document.visibilityState!=="hidden")render(last);drawMeta(last);tick();
+  if(fairMoved){clearTimeout(pushReload);pushReload=setTimeout(load,1000)}}  // the book suggestions are computed on the server from the fair price it had: re-read them for the moved one
 function connectLive(){
   if(!("EventSource" in window)||dead||es)return;
   try{es=new EventSource(location.pathname.replace(/\\/$/,"")+"/events")}catch(e){es=null;return}
@@ -10450,7 +10482,7 @@ class Bot:
         self.stocks = StockMarket(config, store)
         self.fx = FxRates(config.fx_manual)
         self.hsi = IndexFutures(config.hsi_futures, config.holidays.get("hk", frozenset()))
-        self.hl = Hyperliquid({**config.hl_tickers, **config.hl_index})
+        self.hl = Hyperliquid({**config.hl_tickers, **config.hl_index}, config.hl_refresh)
         self.kospi = KospiIndex(config.kospi_index, config.holidays.get("kr", frozenset()))
         self.cn = CnIndex(config.sse_index, config.holidays.get("sh", frozenset()))
         self.web_token = config.web_token or self.store.get("web_token") or ""
@@ -11876,13 +11908,17 @@ class Bot:
             return f"{prefix}概率暂缺：{odds}"
         return odds.row().replace("🎲 ", prefix, 1)
 
-    def odds_items(self, now_ms: int) -> list[tuple[str, CloseOdds | str]]:
-        items = [("恒生指数", self.hsi_odds(now_ms)), ("KOSPI", self.kospi_odds(now_ms)), ("上证指数", self.sse_odds(now_ms))]
+    def odds_items(self, now_ms: int, only: str | None = None) -> list[tuple[str, CloseOdds | str]]:
+        """Every daily card's odds, by title — with ``only`` (a book key) that card's alone, the others not computed:
+        the express lane prices one market, not every card."""
+        thunks: list[tuple[str, Any]] = [("恒生指数", lambda: self.hsi_odds(now_ms)), ("KOSPI", lambda: self.kospi_odds(now_ms)),
+                                        ("上证指数", lambda: self.sse_odds(now_ms))]
         for symbol in self.config.symbols:
             snapshot = self.snapshots.get(symbol) or {}
             quote = snapshot.get("quote")
-            items.append((f"{NAMES.get(symbol, symbol)}｜{symbol}",
-                          self.contract_odds(symbol, quote.price, now_ms, quote.timestamp_ms) if quote else "等待行情"))
+            thunks.append((f"{NAMES.get(symbol, symbol)}｜{symbol}",
+                           lambda symbol=symbol, quote=quote: self.contract_odds(symbol, quote.price, now_ms, quote.timestamp_ms) if quote else "等待行情"))
+        items = [(title, thunk()) for title, thunk in thunks if only is None or self.predict_key(title) == only]
         return [(title, self.settle_on_strike(title, odds)) for title, odds in items if odds is not None]
 
     def settle_on_strike(self, title: str, odds: CloseOdds | str) -> CloseOdds | str:
@@ -12389,12 +12425,23 @@ class Bot:
     def evidence_of(mk: SimMarket) -> dict:
         return dict(mk.evidence)
 
-    def sim_markets(self, now_ms: int) -> list[SimMarket]:
-        """Every Predict market a card prices right now, with the bar its suggestion must clear and why it holds back."""
+    def sim_markets_for(self, key: str, now_ms: int) -> list[SimMarket]:
+        """The express lane's view: one key's markets, built alone (sim_markets with ``only``: the other cards' odds, the
+        other ladders' levels are not computed) — a stubbed sim_markets (the tests') is filtered instead."""
+        if "sim_markets" in self.__dict__:
+            return [mk for mk in self.sim_markets(now_ms) if mk.key == key]
+        return self.sim_markets(now_ms, key)
+
+    def sim_markets(self, now_ms: int, only: str | None = None) -> list[SimMarket]:
+        """Every Predict market a card prices right now, with the bar its suggestion must clear and why it holds back;
+        with ``only`` (a book key) just that key's, nothing else priced."""
         out: list[SimMarket] = []
         if self.config.probability:
-            for title, odds in self.odds_items(now_ms):
+            items = self.odds_items(now_ms) if only is None or "odds_items" in self.__dict__ else self.odds_items(now_ms, only)
+            for title, odds in items:
                 key = self.predict_key(title)
+                if only is not None and key != only:
+                    continue
                 if not isinstance(odds, CloseOdds):
                     continue
                 # the book must be the market of the close the card prices now. At the close the card moves on to the next
@@ -12418,6 +12465,8 @@ class Bot:
         if not self.config.touch:
             return out
         for touch in self.touches.values():
+            if only is not None and touch.spec.key != only:
+                continue
             spec, odds = touch.spec, touch.odds(now_ms)
             book, _ = self.touch_book(spec)
             if isinstance(odds, TouchOdds) and book is not None:
@@ -12427,6 +12476,8 @@ class Bot:
                                      touch.advice_problem(now_ms), (high, low), {"deadline": spec.deadline_ms},
                                      self.evidence(lambda touch=touch: self.market_evidence("touch", now_ms, touch=touch))))
         for mkt in self.updowns.values():
+            if only is not None and mkt.spec.key != only:
+                continue
             odds = mkt.odds(now_ms)
             book, _ = self.updown_book(mkt.spec)
             if isinstance(odds, UpDownOdds) and book is not None:
@@ -12435,6 +12486,8 @@ class Bot:
                                      {"end": mkt.spec.end_ms},
                                      self.evidence(lambda mkt=mkt, odds=odds: self.market_evidence("updown", now_ms, mkt=mkt, odds=odds))))
         for fm in self.flips.values():
+            if only is not None and fm.spec.key != only:
+                continue
             odds = fm.odds(now_ms)
             book, _ = self.flip_yes_book(fm.spec)
             if isinstance(odds, float) and book is not None:
@@ -12442,6 +12495,8 @@ class Bot:
                                      self.flip_hold(fm, odds, book, now_ms), ("Yes", "No"), {"end": fm.spec.end_ms},
                                      self.evidence(lambda fm=fm: self.market_evidence("flip", now_ms, fm=fm))))
         for rm in self.ranges.values():
+            if only is not None and rm.spec.key != only:
+                continue
             problem = rm.advice_problem(now_ms)
             for row in self.predict.ladders.get(rm.spec.key) or []:
                 direction, source = self.range_level(rm, row)
@@ -12461,6 +12516,8 @@ class Bot:
                                                                         source=source)), makers=RANGE_SIM_MAKERS,
                                      maker_alerts=maker_status["makers"], maker_note=maker_status["maker_note"]))
         for cap in self.caps.values():
+            if only is not None and cap.spec.key != only:
+                continue
             for row in self.predict.ladders.get(cap.spec.key) or []:
                 fair = self.ladder_fair(cap, row, now_ms)
                 book, _ = self.predict.yes_book(row) if row.market_id else (None, "")
@@ -13508,8 +13565,15 @@ class Bot:
         self.sim_note_closes()
         async with self.sim_lock:  # never beside the express lane (sim_express): one set of decisions at a time
             confirm = await self.sim_decide(now_ms)
+        await self.sim_after_decide(now_ms)  # the real orders go out now, not behind the settlement lookups
         await confirm
         return Refreshed("ok")
+
+    async def sim_after_decide(self, now_ms: int) -> None:
+        """What follows the step's decisions before the settlement lookups (sim_confirm) are waited for: nothing on
+        paper; the real trader checks its loss switch and sends the pending orders (a slow lookup on an old position
+        used to hold a new order)."""
+        return None
 
     async def sim_decide(self, now_ms: int) -> "asyncio.Task":
         """One look at every market: the orders to open, then the records' fills, withdrawals, markouts and
@@ -13738,8 +13802,8 @@ class Bot:
         changed: list[tuple[str, dict]] = []
         async with self.sim_lock:
             trades = self.sim_trades()
-            for mk in self.sim_markets(now_ms):
-                if mk.key != key or mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
+            for mk in self.sim_markets_for(key, now_ms):  # this key's markets alone: the other cards and ladders are not priced for it
+                if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
                     continue
                 self.sim_take(mk, trades, now_ms, changed)
             if changed:
@@ -15659,6 +15723,11 @@ class Bot:
                                + (f"；{size['markets']} 个市场、{size['records']} 条记录" if size else "") + "）")
                 if name == "模拟交易" and self.sim_express_count:
                     detail += f"｜快车道吃单决定 {self.sim_express_count} 次"
+                latency = getattr(self, "live_latency", None)
+                if name == "模拟交易" and latency and (lat := latency()):
+                    span = lambda s: f"中位 {s['median']:.1f}s / 最长 {s['max']:.1f}s" if s else "—"
+                    detail += (f"｜下单链路（最近 {lat['n']} 笔真实订单）：盘口→决策 {span(lat['book'])}、决策→发出 {span(lat['send'])}、"
+                               f"发出→订单号 {span(lat['answer'])}")
                 if name == "Predict 盘口" and self.predict.round_info:
                     r = self.predict.round_info
                     detail += (f"｜上轮 {r['keys']} 个市场" + (f"（阶梯 {r['rows']} 档）" if r.get("rows") else "")

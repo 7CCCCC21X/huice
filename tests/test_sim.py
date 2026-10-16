@@ -1636,6 +1636,13 @@ async def open_quiet():
     assert "标的午休，不吃单" in lbot.sim_taker_gap(mk, {}, BJ(10, 5, 12, 30))["text"], lbot.sim_taker_gap(mk, {}, BJ(10, 5, 12, 30))
     resting = {"status": "resting", "price": 0.55, "order": 100.0, "shares": 0.0, "maker": True, "side": "up", "kind": "close", "market": HSI_SLUG, "version": {"sim_shares": 100}}
     assert lbot.sim_requote_reason(resting, mk, BJ(10, 5, 12, 30)) == "标的午休，不挂单"
+    # 1.79.0: the express lane builds one key's markets alone (sim_markets(only=key)); a stubbed odds_items is filtered
+    assert [x.key for x in lbot.sim_markets(BJ(10, 5, 11, 0), "HSI")] == ["HSI"] and lbot.sim_markets(BJ(10, 5, 11, 0), "KOSPI") == []
+    assert [x.key for x in lbot.sim_markets_for("HSI", BJ(10, 5, 11, 0))] == ["HSI"] and qbot.sim_markets_for("HSI", at) == [mk for mk in world["markets"] if mk.key == "HSI"]
+    assert m.Config.from_env(env).hl_refresh == 10 and m.Config.from_env({**env, "HL_REFRESH_SECONDS": "5"}).hl_refresh == 5 and m.Hyperliquid({}).refresh_seconds == 10
+    try: m.Config.from_env({**env, "HL_REFRESH_SECONDS": "1"}); assert False
+    except ValueError: pass
+    assert m.WEB_PAGE.count('fetchedAt=okAt=Date.now();failMsg=""') == 1 and "pushReload=setTimeout(load,1000)" in m.WEB_PAGE, "a stream patch is not a full refresh"
     print("OPEN_QUIET_OK")
 
 
