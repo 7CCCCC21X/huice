@@ -89,6 +89,17 @@ async def run():
     assert bot.control_value("SIM_EDGE_CENTS") == "10" and bot.control_value("SIM_MARKETS") == "close"
     assert bot.control_value("LIVE_AUTO_REDEEM") == "on" and bot.control_value("nope") == "" and bot.control_value("LIVE") == "off"
     web = m.WebServer(bot, 0, TOKEN); web.CACHE_SECONDS = {}; port = await web.start()
+    # 1.78.0: the review data is locked by the records too — real orders in the database keep it private after the key is gone
+    assert not web.journal_locked() and not bot.sim_has_real()
+    store.put("sim:x|up|吃", {"v": 2, "market": "x", "slug": "x", "item": "x", "kind": "close", "key": "X", "side": "up", "label": "吃涨", "maker": False,
+                              "fair": 0.7, "opened": NOW, "settle": {}, "order": 10.0, "fills": [], "revisions": [], "price": 0.5, "shares": 10.0,
+                              "status": "filled", "edge": 0.2, "live": {"state": "done", "events": []}})
+    assert bot.sim_has_real() and web.journal_locked()
+    rep = bot.sim_report(public=True)
+    assert rep["private"] and rep["rows"] == [] and rep["groups"] == [] and rep["sources"] == [] and rep["blocks"] == [] and rep["total"]["trades"] == 1, rep
+    assert bot.sim_report(public=False)["rows"] and bot.sim_report(public=False)["groups"], "the review page behind the key sees everything"
+    store.delete_keys(["sim:x|up|吃"])
+    assert not web.journal_locked()
     st, head, body = await request(port, f"GET /p/{TOKEN}/control HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     assert st == 200 and "<title>交易控制台</title>" in body.decode() and "text/html" in head and "Content-Security-Policy" in head
     assert 'data-act="test"' in body.decode() and 'id="testlines"' in body.decode() and 'data-mode="pause"' in body.decode()

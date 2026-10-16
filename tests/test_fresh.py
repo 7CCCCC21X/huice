@@ -76,6 +76,11 @@ async def run():
     o = bot.kospi_odds(NOW)
     assert o == "KOSPI 实时报价停在 09-29 08:30，已超 10 分钟未更新，暂不输出新概率", o  # 15:20: the closing auction keeps the 10 minutes
     assert bot.kospi_odds(kr(9, 29, 14, 0)) == "KOSPI 实时报价停在 09-29 08:30，已超 3 分钟未更新，暂不输出新概率"  # 1.75.0: three in continuous trading
+    # 1.78.0: after the close the same stale quote is not the close either (it used to be, from 15:33 on): no odds until the dated bar
+    assert bot.kospi_odds(kr(9, 29, 15, 34)) == "KOSPI 收盘价待确认（实时报价停在 09-29 08:30，09-29 日 K 未出）；暂不输出概率", bot.kospi_odds(kr(9, 29, 15, 34))
+    bot.kospi.daily[dt.date(2026, 9, 29)] = D("7150")
+    assert "收盘价待确认" not in str(bot.kospi_odds(kr(9, 29, 15, 34)))  # the dated close known: priced from it (or waiting on its anchor)
+    del bot.kospi.daily[dt.date(2026, 9, 29)]
     bot.kospi.quote = m.dataclasses.replace(bot.kospi.quote, quoted_ms=kr(9, 29, 15, 19))
     assert bot.kospi_odds(NOW).fair_up > 0.99  # the same reading, fresh, is a near-certain close up
     bot.kospi.quote = m.dataclasses.replace(bot.kospi.quote, quoted_ms=kr(9, 28, 15, 30))  # yesterday's page, mid-session

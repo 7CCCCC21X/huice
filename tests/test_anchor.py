@@ -74,7 +74,7 @@ async def run():
     bot = m.Bot(cfg, store, FM(bj(9, 30, 16, 10, 3)), None)
     bot.hsi.quote = hsi.quote
     bot.note_hsi_close_print(hsi.quote)
-    assert store.get("anchor:HSI") == [bj(9, 30, 16, 10), "24600", "16:10 现货收市时", "10/2026", bj(9, 30, 16, 10, 3)]
+    assert store.get("anchor:HSI") == [bj(9, 30, 16, 10), "24600", "16:10 现货收市时", "10/2026", bj(9, 30, 16, 10, 3), bj(9, 30, 16, 10, 3)]
     late = m.dataclasses.replace(hsi.quote, last=D("24700"), fetched_ms=bj(9, 30, 16, 12), quoted_ms=bj(9, 30, 16, 12))
     bot.note_hsi_close_print(late)
     assert store.get("anchor:HSI")[1] == "24600"
@@ -83,6 +83,14 @@ async def run():
     assert fresh.get("anchor:HSI")[2] == "16:10 后 2 分钟首笔近似", fresh.get("anchor:HSI")
     fresh_bot.note_hsi_close_print(m.dataclasses.replace(late, fetched_ms=bj(9, 30, 16, 16), quoted_ms=bj(9, 30, 16, 16)))
     assert fresh.get("anchor:HSI")[1] == "24700"
+    # 1.78.0: a print read at 16:10:03 whose own time is 16:01 (a lagging feed) is approximate, and gives way to the print at the close
+    lag = m.Store(":memory:"); lag_bot = m.Bot(cfg, lag, FM(0), None)
+    lag_bot.note_hsi_close_print(m.dataclasses.replace(hsi.quote, last=D("24550"), quoted_ms=bj(9, 30, 16, 1)))
+    assert lag.get("anchor:HSI")[1:3] == ["24550", "16:10 前 9 分钟的报价近似"], lag.get("anchor:HSI")
+    lag_bot.note_hsi_close_print(m.dataclasses.replace(hsi.quote, last=D("24580"), fetched_ms=bj(9, 30, 16, 10, 33), quoted_ms=bj(9, 30, 16, 10, 30)))
+    assert lag.get("anchor:HSI")[1:3] == ["24580", "16:10 现货收市时"], lag.get("anchor:HSI")
+    lag_bot.note_hsi_close_print(m.dataclasses.replace(hsi.quote, last=D("24590"), fetched_ms=bj(9, 30, 16, 10, 40), quoted_ms=bj(9, 30, 16, 10, 38)))
+    assert lag.get("anchor:HSI")[1] == "24580"  # the print at the close stands
     nothing = m.Store(":memory:"); m.Bot(cfg, nothing, FM(0), None).note_hsi_close_print(
         m.dataclasses.replace(late, fetched_ms=bj(9, 30, 16, 16), quoted_ms=bj(9, 30, 16, 16)))
     assert nothing.get("anchor:HSI") is None  # too long after the close to stand for it

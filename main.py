@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.77.0"
+VERSION = "1.78.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -2033,13 +2033,14 @@ class StockMarket:
         if not force and time.monotonic() - self.refreshed < cadence:
             return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
-        started, got = time.monotonic(), 0
+        started, got, start_ms = time.monotonic(), 0, now_ms
         for index, (symbol, ticker) in enumerate(self.config.tickers.items()):
             if index:
                 await asyncio.sleep(0.5)  # Spread requests out; feeds drop bursts from one IP.
             # each stock is judged at its own moment: a round that straddles the "bar is final" minute must not
-            # reject a close for the later stocks with the earlier clock
-            now_ms = now_ms + int((time.monotonic() - started) * 1000) if index else now_ms
+            # reject a close for the later stocks with the earlier clock (from the round's start: the elapsed time
+            # used to be added to a clock already advanced, running minutes ahead on a slow round)
+            now_ms = start_ms + int((time.monotonic() - started) * 1000) if index else now_ms
             try:
                 close = await self.fetch(symbol, ticker, now_ms)
             except Exception as error:  # Keep the last good close; report the failure alongside it.
@@ -7678,27 +7679,57 @@ def scenario_text(name: str, kinds: set[str], direction: str, level: float | Non
     return f"{name}{word}到 {label(level)}" if level is not None else f"{name}{word}过所有档位"
 
 
+def path_result(kind: str, settle: dict, legs: tuple) -> float:
+    """What the 涨 / Yes side pays under a path of one or two moves (``legs``: (direction, level) each): a level market is
+    touched by either leg; a first-touch market goes to the first move; a close, a month or a flip to where the path
+    ends."""
+    if kind in {"range", "ladder"}:
+        return max(scenario_result(kind, settle, d, lvl) for d, lvl in legs)
+    if kind == "touch":
+        return scenario_result(kind, settle, *legs[0])
+    return scenario_result(kind, settle, *legs[-1])
+
+
+def path_text(name: str, kinds: set[str], legs: tuple) -> str:
+    """scenario_text for a path: one move as before; two moves as 'BTC 涨到 $120k 又跌到 $100k'."""
+    if len(legs) == 1:
+        return scenario_text(name, kinds, *legs[0])
+    label = usd_short if "ladder" in kinds else level_label
+    name = name + (" " if name and name[-1].isascii() else "")
+    def leg(direction: str, level: float | None) -> str:
+        word = "涨" if direction == "up" else "跌"
+        return f"{word}到 {label(level)}" if level is not None else f"{word}过所有档位"
+    return f"{name}{leg(*legs[0])} 又{leg(*legs[1])}"
+
+
 def group_worst_case(positions: list[dict], name: str = "") -> tuple[float, str]:
-    """(P&L, the move) of one driver's positions under the single move that hurts them most. Candidates: the driver
-    moves up to each upward level (or past all), down to each downward level (or past all), or does neither. Three
-    No positions at $300M / $500M / $1B lose together on the move past $1B: that is the number to limit, not the
-    count of markets. ``positions``: dicts with kind, side, settle, price and shares (the filled ones)."""
+    """(P&L, the move) of one driver's positions under the path that hurts them most. Candidates: the driver moves up
+    to each upward level (or past all), down to each downward level (or past all), does neither — and, where it has
+    levels on both sides, up to one then down to another (and the reverse): both touched, No positions on both lose
+    together (the single moves alone priced that pair at the loss of one). Three No positions at $300M / $500M / $1B
+    lose together on the move past $1B: that is the number to limit, not the count of markets. ``positions``: dicts
+    with kind, side, settle, price and shares; one flagged ``resting`` (an order not filled) counts only where it loses:
+    an unfilled order is no hedge."""
     kinds = {str(p.get("kind") or "") for p in positions}
     up_levels = sorted({float(p["settle"].get("target") or 0) for p in positions
                         if p.get("kind") == "ladder" or (p.get("kind") == "range" and (p.get("settle") or {}).get("dir", "up") == "up")})
     down_levels = sorted({float(p["settle"].get("target") or 0) for p in positions
                           if p.get("kind") == "range" and (p.get("settle") or {}).get("dir", "up") == "down"}, reverse=True)
-    scenarios = [("flat", None), *(("up", t) for t in up_levels), ("up", None), *(("down", t) for t in down_levels), ("down", None)]
+    ups, downs = [*(("up", t) for t in up_levels), ("up", None)], [*(("down", t) for t in down_levels), ("down", None)]
+    scenarios: list[tuple] = [(("flat", None),), *((u,) for u in ups), *((d,) for d in downs)]
+    if up_levels and down_levels:
+        scenarios += [(u, d) for u in ups for d in downs] + [(d, u) for u in ups for d in downs]
 
-    def pnl(direction: str, level: float | None) -> float:
+    def pnl(legs: tuple) -> float:
         total = 0.0
         for p in positions:
-            up = scenario_result(str(p.get("kind") or ""), p.get("settle") or {}, direction, level)
+            up = path_result(str(p.get("kind") or ""), p.get("settle") or {}, legs)
             payout = up if p.get("side") == "up" else 1 - up
-            total += (payout - float(p["price"])) * float(p["shares"])
+            gain = (payout - float(p["price"])) * float(p["shares"])
+            total += min(0.0, gain) if p.get("resting") else gain
         return total
-    worst = min(scenarios, key=lambda s: (round(pnl(*s), 6), s[1] is None))  # past every level only when that is worse
-    return pnl(*worst), scenario_text(name, kinds, *worst)
+    worst = min(scenarios, key=lambda s: (round(pnl(s), 6), len(s), s[-1][1] is None))  # a single move, a level reached, when as bad
+    return pnl(worst), path_text(name, kinds, worst)
 
 
 def sim_positions(trades: list[dict]) -> list[dict]:
@@ -9705,8 +9736,9 @@ class WebServer:
 
     def journal_locked(self) -> bool:
         """The review data (every trade with its fills, costs and real order records) needs the control key once a
-        real-trading key is configured: the page token alone shows the odds, never an account's activity."""
-        return bool(self.bot.config.web_control_key) and bool(getattr(self.bot.config, "live_key", ""))
+        real-trading key is configured, or the records hold real orders (a database kept after the key was removed):
+        the page token alone shows the odds, never an account's activity."""
+        return bool(self.bot.config.web_control_key) and (bool(getattr(self.bot.config, "live_key", "")) or self.bot.sim_has_real())
 
     def key_check(self, head: str, client: str) -> tuple[int, str] | None:
         """None when X-Control-Key carries the configured key; else (status, message), the failure counted."""
@@ -11627,11 +11659,16 @@ class Bot:
             return
         key = f"anchor:{hsi_anchor_key(q)}"
         saved = self.store.get(key)
-        if isinstance(saved, list) and saved and saved[0] == close_ms:
-            return  # only the first print counts
+        behind = (close_ms - q.quoted_ms) // 60_000  # the print's own age at the close: a lagging feed read at 16:10:03 may still show 16:01
         late = (read_ms - close_ms) // 60_000
-        note = "16:10 现货收市时" if late < 1 else f"16:10 后 {late} 分钟首笔近似"
-        self.store.put(key, [close_ms, str(q.last), note, q.contract, read_ms])
+        note = (f"16:10 前 {behind} 分钟的报价近似" if behind >= 1 else "16:10 现货收市时" if late < 1 else f"16:10 后 {late} 分钟首笔近似")
+        if isinstance(saved, list) and saved and saved[0] == close_ms:
+            if "近似" not in str(saved[2]):
+                return  # the print at the close stands
+            old_gap = abs(int(saved[5] if len(saved) > 5 else saved[4]) - close_ms)  # an approximate one gives way to a print nearer the close
+            if abs(q.quoted_ms - close_ms) >= old_gap:
+                return
+        self.store.put(key, [close_ms, str(q.last), note, q.contract, read_ms, q.quoted_ms])
 
     async def recover_hsi_cfd_anchor(self, now_ms: int) -> None:
         """When the CFD has no anchor for the latest cash close (the bot was not running at 16:10) and it is needed (the
@@ -11809,6 +11846,10 @@ class Bot:
         remaining, target = session_remaining("kr", now_ms, quoted_day, holidays)
         if quoted_day < expected or (quoted_day == local.date() and local.time() < CALENDAR.kr_time(KRX_SETTLED, local.date())):
             return f"KOSPI 基准停在 {stamp(k.quoted_ms, seconds=False)}，应为 {expected.strftime('%m-%d')} 收盘；暂不输出概率"
+        if self.kospi.daily.get(quoted_day) is None and k.quoted_ms < self.kospi_day_close_ms(quoted_day):
+            # the feed stopped during the session (a quote stamped 10:00 was stale at 15:32 and passed for the close at 15:34):
+            # without the dated close the figure is not the close
+            return f"KOSPI 收盘价待确认（实时报价停在 {stamp(k.quoted_ms, seconds=False)}，{quoted_day.strftime('%m-%d')} 日 K 未出）；暂不输出概率"
         if hl is None:
             return "缺少 HL KR200 代理"
         if now_ms - hl.fetched_ms > self.HL_STALE_MS:
@@ -13731,9 +13772,11 @@ class Bot:
         for t in trades_of_driver(trades, driver):
             if t.get("status") not in {"filled", "resting"}:
                 continue
-            held = max(float(t.get("shares") or 0), float(t.get("order") or 0) if t.get("status") == "resting" else 0.0)
-            if held > 0:
-                mine.append({**t, "shares": held})
+            filled, order = float(t.get("shares") or 0), float(t.get("order") or 0)
+            if filled > 0:
+                mine.append({**t, "shares": filled})
+            if t.get("status") == "resting" and order - filled > 0:
+                mine.append({**t, "shares": order - filled, "resting": True})  # the unfilled part: counted where it loses, never as a hedge
         candidate = {"kind": mk.kind, "side": side, "settle": mk.settle, "price": price, "shares": shares}
         worst, event = group_worst_case([*mine, candidate], name)
         if -worst > cap + 1e-9:
@@ -13793,6 +13836,16 @@ class Bot:
             marks[label] = {"at": now_ms, "after_s": (now_ms - int(filled)) // 1000, "mid": mid, "move": mid - paid,
                             "fair": fair, "fair_move": fair - float(trade.get("fill_fair", trade["fair"]))}
 
+    def sim_has_real(self) -> bool:
+        """Whether the records hold a real order (a ``live`` state): an account's activity, whichever key is configured
+        now — a database kept after the key was removed is as private as before."""
+        gen = self.store.touched.get("sim", 0)
+        cached = getattr(self, "_sim_real_cache", None)
+        if cached is None or cached[0] != gen:
+            cached = (gen, any(isinstance(t.get("live"), dict) for t in self.sim_trades().values()))
+            self._sim_real_cache = cached
+        return cached[1]
+
     def sim_report(self, recent: int = 30, public: bool = False) -> dict:
         """The paper trader's record for the page: totals, by market kind and by maker / taker, the latest trades —
         on the public odds page (``public``) without the trade list once a real-trading key is configured: that is an
@@ -13802,7 +13855,7 @@ class Bot:
         if key in self.sim_report_cache:  # the page asks every few seconds; the records change only when the step changes them
             return self.sim_report_cache[key]
         trades = sorted(self.sim_trades().items(), key=lambda kv: kv[1].get("opened", 0))
-        private = public and bool(getattr(self.config, "live_key", ""))
+        private = public and (bool(getattr(self.config, "live_key", "")) or self.sim_has_real())  # real trades in the records: an account's activity, key or no key
         rows = [{"id": tid, "opened": stamp(t["opened"], seconds=False), "item": t["item"], "label": t["label"],
                  "maker": t["maker"], "price": t["price"], "shares": t["shares"], "order": t.get("order", t["shares"]),
                  "edge": t["edge"], "status": t["status"], "text": sim_status(t), "state": sim_state(t),
@@ -13816,7 +13869,8 @@ class Bot:
                             for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
                   "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
                             for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
-                  "groups": sim_groups(values), "sources": sim_sources(values), "blocks": self.sim_blocks(),
+                  "groups": [] if private else sim_groups(values), "sources": [] if private else sim_sources(values),
+                  "blocks": [] if private else self.sim_blocks(),  # the public page: the totals only, never a position's name or cost
                   "group_cap": self.config.sim_group_usd, "rows": [] if private else rows, "private": private}
         self.sim_report_cache = {key: report}
         return report

@@ -50,6 +50,17 @@ assert m.group_worst_case([pos("updown", "down", 0.4)], "BTC") == (-40.0, "BTC �
 assert m.group_worst_case([pos("touch", "down", 0.45)], "BNB") == (-45.0, "BNB 先触高线")
 assert m.group_worst_case([pos("flip", "up", 0.3)], "HYPE/SOL") == (-30.0, "HYPE/SOL 没反超")
 assert m.scenario_result("close", {}, "flat", None) == 0.5 and m.scenario_result("flip", {}, "flat", None) == 0.0
+# 1.78.0: a path that touches a level on each side (up to one, then down to another) hurts the No positions on both: the
+# single moves priced that pair at the loss of one
+both = [pos("range", "down", 0.6, target="120000", dir="up"), pos("range", "down", 0.6, target="100000", dir="down")]
+worst, event = m.group_worst_case(both, "BTC")
+assert abs(worst + 120) < 1e-9 and event in {"BTC 涨到 $120k 又跌到 $100k", "BTC 跌到 $100k 又涨到 $120k"}, (worst, event)
+assert m.path_result("touch", {}, (("up", 120000.0), ("down", 100000.0))) == 1.0 and m.path_result("close", {}, (("up", 120000.0), ("down", 100000.0))) == 0.0
+assert m.path_result("range", {"target": "100000", "dir": "down"}, (("up", 120000.0), ("down", 100000.0))) == 1.0
+# a resting order counts only where it loses: an unfilled Yes on the other side is no hedge for the cap
+hedge = [pos("range", "down", 0.6, target="120000", dir="up"), {**pos("range", "up", 0.4, target="120000", dir="up"), "resting": True}]
+assert m.group_worst_case(hedge, "BTC") == (-60.0, "BTC 涨到 $120k"), m.group_worst_case(hedge, "BTC")
+assert m.group_worst_case([pos("range", "down", 0.6, target="120000", dir="up"), pos("range", "up", 0.4, target="120000", dir="up")], "BTC")[0] == 0.0  # filled: a hedge
 assert m.scenario_result("range", {"target": "60000", "dir": "down"}, "down", 65000.0) == 0.0  # the crash stopped above it
 assert m.scenario_result("range", {"target": "60000", "dir": "down"}, "down", None) == 1.0
 

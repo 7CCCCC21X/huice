@@ -130,7 +130,7 @@ assert isinstance(o, str) and "缺少恒指期货在 09-30 16:10 现货收市时
 at_close = m.dataclasses.replace(pre, quoted_ms=ms(30, 16, 10), fetched_ms=ms(30, 16, 10) + 5_000, last=D("24158.4"))
 bot.note_hsi_close_print(at_close)                  # recorded as it happened (persisted) ...
 bot.note_hsi_close_print(m.dataclasses.replace(at_close, last=D("1"), fetched_ms=ms(30, 16, 11)))  # ... only the first
-assert bot.store.get("anchor:HSI") == [ms(30, 16, 10), "24158.4", "16:10 现货收市时", "10/2026", ms(30, 16, 10) + 5_000]
+assert bot.store.get("anchor:HSI")[:5] == [ms(30, 16, 10), "24158.4", "16:10 现货收市时", "10/2026", ms(30, 16, 10) + 5_000]  # (1.78.0: the print's own time follows)
 o = bot.hsi_odds(ms(30, 16, 20))
 assert isinstance(o, m.CloseOdds) and abs(float(o.effective / o.ref) - 24400 / 24158.4) < 1e-12 and not o.warn, o
 assert abs(float(o.effective / o.ref) - 1.01) < 1e-4 and "/ 16:10 现货收市时 24,158.4 → +1.000%" in o.proxy_note, o.proxy_note

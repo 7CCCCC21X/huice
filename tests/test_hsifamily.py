@@ -70,8 +70,8 @@ async def run():
     assert isinstance(await bot.hsi.refresh(now), m.Refreshed) and bot.hsi.quote.source == "etnet"
     assert set(bot.hsi.families) == {"HSI", "HSI:cfd"} and [u.split("/")[2] for u in calls] == ["www.etnet.com.hk", "hq.sinajs.cn"], calls
     await bot.refresh_odds_inputs(now)
-    assert store.get("anchor:HSI") == [bj(9, 30, 16, 10), "24600", "16:10 现货收市时", "10/2026", now], store.get("anchor:HSI")
-    assert store.get("anchor:HSI:cfd") == [bj(9, 30, 16, 10), "24603.5", "16:10 现货收市时", "", now], store.get("anchor:HSI:cfd")
+    assert store.get("anchor:HSI")[:5] == [bj(9, 30, 16, 10), "24600", "16:10 现货收市时", "10/2026", now], store.get("anchor:HSI")  # (1.78.0: the print's own time follows)
+    assert store.get("anchor:HSI:cfd")[:5] == [bj(9, 30, 16, 10), "24603.5", "16:10 现货收市时", "", now], store.get("anchor:HSI:cfd")
     assert not [u for u in calls if "getMink" in u]  # an exact print is there: no history needed
 
     # --- 21:00, the night session: etnet answers -> the HKEX contract maps onto its own 16:10 print ------------------------
