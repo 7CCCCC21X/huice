@@ -1683,3 +1683,29 @@ async def after_hours_markets():
 
 
 asyncio.run(after_hours_markets())
+
+
+# 1.77.0: a record moved to another key (sim_rekey) is deleted and written in one transaction: a failure in between leaves
+# the old record in place, never nothing
+class Flaky:
+    def __init__(self, conn): self.conn = conn
+    def __enter__(self): return self.conn.__enter__()
+    def __exit__(self, *a): return self.conn.__exit__(*a)
+    def executemany(self, sql, rows):
+        if "INSERT" in sql: raise RuntimeError("disk full")
+        return self.conn.executemany(sql, rows)
+    def __getattr__(self, name): return getattr(self.conn, name)
+
+
+fstore = m.Store(":memory:")
+fstore.put("sim:a", {"x": 1})
+fstore.conn = Flaky(fstore.conn)
+try:
+    fstore.replace(["sim:a"], [("sim:a#1", {"x": 1})]); assert False, "the write failed"
+except RuntimeError:
+    pass
+assert fstore.get("sim:a") == {"x": 1} and fstore.get("sim:a#1") is None, "rolled back as one"
+fstore.conn = fstore.conn.conn
+fstore.replace(["sim:a"], [("sim:a#1", {"x": 2})])
+assert fstore.get("sim:a") is None and fstore.get("sim:a#1") == {"x": 2} and fstore.touched["sim"] >= 3
+print("REPLACE_OK")

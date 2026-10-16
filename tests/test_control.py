@@ -153,6 +153,7 @@ async def run():
     assert s["SIM_MAKER_DEEP_ONLY_MARKETS"]["kind"] == "detail" and s["SIM_MAKER_DEEP_ONLY_MARKETS"]["value"] == "" and s["SIM_MAKER_DEEP_ONLY_MARKETS"]["group"] == "策略"
     assert all(x in body.decode() for x in ('id="exbox"', "renderExceptions", 'data-act="stop"', 'class="cols"', "const drafts", "lockView", "REC_LABELS")), "the page's new parts"
     assert "全部市场" in body.decode() and ".sw.on" in body.decode() and "绿色 = 开" in body.decode() and "挂单没开，不生效" in body.decode()
+    assert 'act({action:"stop"},true)' in body.decode() and "async function act(body,urgent){if(busy&&!urgent)return false" in body.decode(), "1.77.0: the stop is never held back by another request"
     assert s["SIM_SKIP"]["kind"] == "detail" and s["SIM_SKIP"]["value"] == "" and s["SIM_SKIP"]["group"] == "策略"
     assert isinstance(data["catalog"], list) and all({"kind", "key", "name", "skipped"} <= set(r) for r in data["catalog"]) and "展开详细选项" in body.decode()
     # every setting has a widget, every group is one the page knows, and every preset / option is a value the Config accepts

@@ -869,17 +869,15 @@ async def run():
     await step(mbot, NOW + 30_000, hsi(0.70, [("0.53", "200")], [("0.58", "400")], NOW + 30_000))  # our cancelled 100 are gone from the book
     new = mbot.sim_trades()[mtid]
     assert new["price"] == 0.53 and new["live"]["order_id"] == "102" and new["live"]["want"]["price"] == 0.53
-    # while a cancel is unconfirmed (the order list cannot be read), no fresh order goes out for that slot
+    # the order list cannot be read: the cancel still goes out, by order id (1.77.0: live_cancel_blind — a list that cannot be
+    # read must not keep an order resting), and Predict's confirmation ends the record; the failure itself is noted
     mfake.fail_open = "HTTP 500: boom"
     await step(mbot, NOW + 40_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 40_000))
     trades = mbot.sim_trades()
-    assert mtid not in trades and trades[f"{mtid}#2"]["live"]["state"] == "cancelling"
-    await step(mbot, NOW + 50_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 50_000))
-    assert mtid not in mbot.sim_trades() and any(b["id"] == mtid and "撤单中" in b["why"] for b in mbot.sim_blocks()), mbot.sim_blocks()
+    assert mtid not in trades and trades[f"{mtid}#2"]["live"]["state"] == "done" and ("remove", ["102"]) in mfake.calls, trades[f"{mtid}#2"]["live"]
+    assert trades[f"{mtid}#2"]["live"]["cancel_confirmed"] and mbot.live_reserved(trades[f"{mtid}#2"]) == 0 and any("同步真实订单失败" in e for e in mbot.live_errors), mbot.live_errors[-2:]
     mfake.fail_open = None
-    await step(mbot, NOW + 60_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 60_000))
-    assert mbot.sim_trades()[f"{mtid}#2"]["live"]["state"] == "done" and ("remove", ["102"]) in mfake.calls
-    await step(mbot, NOW + 70_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 70_000))
+    await step(mbot, NOW + 50_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 50_000))
     assert mbot.sim_trades()[mtid]["price"] == 0.57 and mbot.sim_trades()[mtid]["live"]["order_id"] == "103"
 
     # --- execution safety: reserved until Predict's final word, cancels confirmed, unknown results reconciled, the pre-send check
@@ -894,16 +892,20 @@ async def run():
     assert abs(sbot.live_reserved(smaker) - 55.0) < 1e-9 and abs(sbot.live_reserved(staker) - 58.0) < 1e-9  # every unfilled share at the most it can cost: the maker's price, the taker's limit (the 58¢ level seen)
     status0 = sbot.live_status(NOW)
     assert status0["unconfirmed"] == 0 and status0["synced_at"] and status0["unknown_open"] == [] and status0["allowed"] is True
-    # a withdrawal releases nothing while the cancel is unconfirmed (the open list cannot be read): the reservation stays
+    # a withdrawal releases nothing while the cancel is unconfirmed (the open list cannot be read, and the removal — tried by
+    # order id regardless of the list since 1.77.0 — fails too): the reservation stays
     sfake.fail_open = "HTTP 500: boom"
+    real_remove = sfake.remove_orders
+    async def no_remove(ids): raise m.RemoteError("HTTP 500: boom")
+    sfake.remove_orders = no_remove
     result = await sbot.live_control("cancel", {"id": "all"})
     text = result["message"]
-    assert result["ok"] is False and text.startswith("❌") and "发送撤单请求失败" in text and "尚未发出" in text, text  # the page is told it did not succeed
+    assert result["ok"] is False and text.startswith("❌") and "账户挂单列表读取失败" in text and "尚未发出" in text, text  # the page is told it did not succeed
     s_trades = sbot.sim_trades()
     assert s_trades[f"{HSI_SLUG}|up|挂"]["status"] == "cancelled" and s_trades[f"{HSI_SLUG}|up|挂"]["live"]["state"] == "cancelling"
     assert abs(sbot.live_exposure(s_trades) - 113.0) < 1e-9 and sbot.live_status(NOW)["unconfirmed"] == 2  # 55 + 100 × 58¢
     assert sbot.live_status(NOW)["orders"][0]["live_state"] == "cancelling" and "why" in sbot.live_status(NOW)["orders"][0]  # the active orders come first
-    sfake.fail_open = None
+    sfake.fail_open, sfake.remove_orders = None, real_remove
     await step(sbot, NOW + 10_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
     s_trades = sbot.sim_trades()
     assert all(t["live"]["state"] == "done" for t in s_trades.values()) and sbot.live_exposure(s_trades) == 0.0  # confirmed: released
@@ -1431,3 +1433,100 @@ def _noop_remove(api):
 asyncio.run(run())
 asyncio.run(review_fixes())
 asyncio.run(audit_fixes())
+
+
+async def stop_chain():
+    """1.77.0: the emergency stop chain. A record withdrawn while its order request is in flight stays withdrawn when the
+    answer arrives: the order is cancelled by the id just returned, never tracked as open — and when the answer is lost
+    the record is reconciled by its hash, never failed as "never sent". With the open list unreadable the cancels of
+    records with an order id still go out, by id."""
+    tid = f"{HSI_SLUG}|up|挂"
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare(); fake = bot.live.api
+    await bot.live_prefetch(NOW)
+    real_create = fake.create_order
+    async def withdrawn_meanwhile(body):  # the stop lands while Predict is still answering the placement
+        t = bot.sim_trades()[tid]
+        bot.sim_withdraw(t, "管理员撤单", NOW)
+        bot.sim_save([(tid, t)])
+        return await real_create(body)
+    fake.create_order = withdrawn_meanwhile
+    await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    t = bot.sim_trades()[tid]
+    oid = t["live"]["order_id"]
+    assert oid and t["status"] == "cancelled" and ("remove", [oid]) in fake.calls and oid in fake.closed, (fake.calls, t["live"])
+    assert t["live"]["state"] == "done" and t["live"]["final"] == "cancelled" and bot.live_reserved(t) == 0, t["live"]
+    assert any("应答到达前已被撤单" in e["what"] for e in t["live"]["events"]), t["live"]["events"]
+    # the answer lost on top of it: the request may have reached Predict — reconciled by hash (cancelling, reserved), not "never sent"
+    bot2 = make_bot(SIM_WAYS="maker")
+    await bot2.live_prepare(); fake2 = bot2.live.api
+    await bot2.live_prefetch(NOW)
+    async def lost(body):
+        t = bot2.sim_trades()[tid]
+        bot2.sim_withdraw(t, "管理员撤单", NOW)
+        bot2.sim_save([(tid, t)])
+        raise m.RemoteError("请求超时")
+    fake2.create_order = lost
+    await step(bot2, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    t2 = bot2.sim_trades()[tid]
+    assert t2["live"]["state"] == "cancelling" and t2["live"]["hash"] and any("下单请求结果未知" in e["what"] for e in t2["live"]["events"]), t2["live"]
+    assert not any(k.startswith(f"{tid}#") for k in bot2.sim_trades()) and bot2.live_reserved(t2) > 0, sorted(bot2.sim_trades())
+    # the open list unreadable: the stop still sends the cancels by order id, and says so
+    bot3 = make_bot(SIM_WAYS="maker")
+    await bot3.live_prepare(); fake3 = bot3.live.api
+    await bot3.live_prefetch(NOW)
+    await step(bot3, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    oid3 = bot3.sim_trades()[tid]["live"]["order_id"]
+    fake3.fail_open = "HTTP 503"
+    result = await bot3.live_control("stop", {})
+    t3 = bot3.sim_trades()[tid]
+    assert ("remove", [oid3]) in fake3.calls and oid3 in fake3.closed and t3["live"]["state"] == "done" and bot3.live_reserved(t3) == 0, (result, t3["live"])
+    assert result["ok"] and "账户挂单列表读取失败" in result["message"] and "Predict 确认撤掉 1 笔" in result["message"], result
+    print("STOP_CHAIN_OK")
+
+
+asyncio.run(stop_chain())
+
+
+async def expiry_positions():
+    """1.77.0: an order of unknown state past its expiry is not simply "unfilled": the account's position on its outcome
+    beyond what the other records explain is what it filled (costed at the limit, pending reconciliation); with the
+    positions unreadable it stays unknown, reserved, until they can be read; with none it ends unfilled as before."""
+    async def _none(*a, **k): return None
+    async def _empty(*a, **k): return []
+    async def _noop(ids): return {"removed": [], "noop": list(ids)}
+    tid = f"{HSI_SLUG}|up|吃"
+    for case in ("filled", "unreadable", "none"):
+        bot = make_bot(SIM_WAYS="taker")
+        await bot.live_prepare(); fake = bot.live.api
+        await bot.live_prefetch(NOW)
+        await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+        fake.orders, fake.order, fake.remove_orders = _empty, _none, _noop
+        for at in (NOW + 10_000, NOW + 20_000, NOW + 30_000, NOW + 65_000):
+            await step(bot, at, hsi(0.70, [("0.55", "300")], [("0.58", "400")], at))
+        t = bot.sim_trades()[tid]
+        assert t["live"]["state"] == "unknown", (case, t["live"])
+        want = t["live"]["want"]
+        if case == "filled":
+            fake.positions_rows = [{"id": "p9", "market": {"id": 101, "title": "恒生指数"}, "outcome": {"name": want["outcome"], "indexSet": want["index_set"]},
+                                    "amount": str(100 * WEI)}]
+        elif case == "unreadable":
+            async def broken(): raise m.RemoteError("HTTP 503")
+            fake.positions = broken
+        at = NOW + 300_000 + 600_000 + 5_000
+        await step(bot, at, hsi(0.70, [("0.55", "300")], [("0.58", "400")], at))
+        trades = bot.sim_trades()
+        if case == "filled":
+            t = trades[tid]
+            assert t["live"]["state"] == "done" and t["status"] == "filled" and abs(t["shares"] - 100) < 1e-9 and t["cost_confirmed"] is False, t
+            assert any("持仓比记录多" in e["what"] for e in t["live"]["events"]) and abs(bot.live_reserved(t) - 100 * t["price"]) < 1e-9, (t["live"]["events"], bot.live_reserved(t))  # a position: its cost is exposure
+        elif case == "unreadable":
+            t = trades[tid]
+            assert t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0 and "持仓读取失败" in t["live"].get("last_error", ""), t["live"]
+        else:
+            t = trades[f"{tid}#1"]
+            assert t["live"]["state"] == "done" and any("有效期已过" in e["what"] for e in t["live"]["events"]) and bot.live_reserved(t) == 0, t["live"]
+    print("EXPIRY_POSITIONS_OK")
+
+
+asyncio.run(expiry_positions())

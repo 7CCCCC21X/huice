@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.76.1"
+VERSION = "1.77.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -846,6 +846,18 @@ class Store:
                 self.conn.executemany("DELETE FROM records WHERE k=?", [(k,) for k in keys])
             for key in keys:
                 self._bump(key)
+
+    def replace(self, keys: list[str], pairs: Any) -> None:
+        """Delete ``keys`` and write ``pairs`` in one transaction: a record moved to another key is at no moment gone
+        from the database (two transactions left a crash in between with the record — a real position's — lost)."""
+        rows = [(key, json.dumps(value, ensure_ascii=False)) for key, value in pairs]
+        with self.conn:
+            if keys:
+                self.conn.executemany("DELETE FROM records WHERE k=?", [(k,) for k in keys])
+            if rows:
+                self.conn.executemany(self.UPSERT, rows)
+        for key in [*keys, *(key for key, _ in rows)]:
+            self._bump(key)
 
     def close(self) -> None:
         self.conn.close()
@@ -9317,7 +9329,7 @@ async function load(){const key=$("key").value.trim();const my=++seq;const ctl=n
     if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();if(my!==seq)return;data=j;keyBad=false;okAt=new Date().toTimeString().slice(0,8);lockView(false);render()}
   catch(e){if(my!==seq)return;$("meta").textContent="加载失败："+(e.name==="AbortError"?"请求超时":e.message)+(okAt?"｜下面显示的是 "+okAt+" 的数据":"")}
   finally{clearTimeout(timer)}}
-async function act(body){if(busy)return false;const key=$("key").value.trim();if(!key){toast("请先输入控制口令",false);return false}
+async function act(body,urgent){if(busy&&!urgent)return false;const key=$("key").value.trim();if(!key){toast("请先输入控制口令",false);return false}  // urgent (the emergency stop): never held back by another request in flight
   busy=true;let ok=false;try{const r=await fetch(base+"/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key,...body})});
   let j={};try{j=await r.json()}catch(e){}ok=!!j.ok;toast(j.message||("HTTP "+r.status),ok);await load()}catch(e){toast("请求失败："+e.message,false)}finally{busy=false}return ok}
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
@@ -9520,7 +9532,7 @@ function renderPresets(){const box=$("presetbtns");box.replaceChildren();if(!dat
 $("adv").addEventListener("click",()=>{adv=!adv;try{localStorage.setItem("ctladv",adv?"1":"0")}catch(e){}renderSettings()});
 $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.act;
   if(a==="pause"){const why=prompt("暂停原因（可留空）","");if(why===null)return;act({action:"pause",why})}
-  else if(a==="stop"){if(confirm("紧急停止：暂停开新仓，并撤掉本策略在 Predict 上的全部挂单（以 Predict 的确认为准，确认前额度仍占用；已成交的持仓继续持有，领取不受影响）。继续？"))act({action:"stop"})}
+  else if(a==="stop"){if(confirm("紧急停止：暂停开新仓，并撤掉本策略在 Predict 上的全部挂单（以 Predict 的确认为准，确认前额度仍占用；已成交的持仓继续持有，领取不受影响）。继续？"))act({action:"stop"},true)}
   else if(a==="test"){if(confirm("在 Predict 上挂一张远离盘口的限价单（不高于 2¢，份数按 Predict 最低订单金额 $1 取，2¢ 时 50 份），确认它出现在盘口后立即撤掉，用来验证真实下单链路。最多锁定约 1 美元，极少数情况下可能成交。继续？"))act({action:"test"})}
   else if(a==="cancelall"){if(confirm("撤掉本策略在 Predict 上的全部真实挂单？已成交的份数继续持有；以 Predict 的确认为准，确认前额度仍占用。"))act({action:"cancel",id:"all"})}
   else if(a==="cancelaccount"){if(confirm("撤掉这个 Predict 账户上的全部挂单，包括手动单和本机器人没有记录的单？"))act({action:"cancel",id:"account"})}
@@ -13144,11 +13156,11 @@ class Bot:
         new_tid = f"{tid}#{max(numbers, default=0) + 1}"  # past the highest ever used: a number sim_prune removed is never reused
         if isinstance(trade.get("live"), dict):
             trade["live"]["rekeyed"] = new_tid
-        self.store.delete_keys([f"sim:{tid}"])
+        self.store.replace([f"sim:{tid}"], [(f"sim:{new_tid}", trade)])  # one transaction: never gone from the database in between
         if self.sim_cache is not None:  # the view follows the move (a rebuild parses every record's JSON: seconds with tens of thousands)
             self.sim_cache.pop(tid, None)
-            self.sim_gen = self.store.touched.get("sim", 0)
-        self.sim_save([(new_tid, trade)])
+            self.sim_cache[new_tid] = trade
+        self.sim_gen = self.store.touched.get("sim", 0)
         return new_tid
 
     SIM_ATTEMPTS_KEEP = 20     # per market, side and way: the attempts that filled nothing kept in the records (the newest)
