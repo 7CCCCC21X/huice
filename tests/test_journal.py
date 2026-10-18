@@ -110,6 +110,94 @@ async def run():
     assert s[1]["records"] == 1 and s[1]["losses"] == 1 and abs(s[1]["pnl"] + 50) < 1e-9 and s[1]["parts"][0]["name"] == "指数/个股日涨跌"
     assert s[-1]["day"] == "" and s[-1]["records"] == 6 and abs(s[-1]["pnl"] - data["total"]["pnl"]) < 1e-9 and s[-1]["settled"] == data["total"]["settled"]
     assert m.sim_summary([]) == [] and 'id="summary"' in web.route("GET", f"/p/{TOKEN}/journal")[2].decode() and "jrnsum" in m.JOURNAL_PAGE
+    # 1.81.0: the analysis tables (per underlying, per edge / fair bucket, per session part, the makers, the refused buys), the
+    # marks, the summary CSV and the daily report
+    hsi_mk = m.SimMarket(HSI_SLUG, "恒生指数", "close", "HSI", 0.70, book([("0.55", "300")], [("0.58", "400")], NOW, HSI_SLUG, "HSI", "101"),
+                         0.03, "", ("涨", "跌"), {"key": "HSI", "target": "2026-10-05", "line": 24600.0, "close_ms": CLOSE}, EVIDENCE)
+    bot.sim_note_block(f"{HSI_SLUG}|down|吃", hsi_mk, "吃跌", 0.40, "收涨时这组仓位合计将亏 $350.00，超过组上限 $300", NOW + 30_000)
+    data = json.loads(web.route("GET", f"/p/{TOKEN}/journal.json")[2])
+    a = data["analysis"]
+    names = [r["name"] for r in a["items"]]
+    assert names == ["恒生指数", "KOSPI", "上证指数", "HYPE"] and sum(r["records"] for r in a["items"]) == 6, a["items"]  # the most traded first
+    hsi_row = next(r for r in a["items"] if r["name"] == "恒生指数")
+    assert hsi_row["settled"] == hsi_row["wins"] == 2 and hsi_row["hit"] == 1.0 and abs(hsi_row["avg_fair"] - 0.7) < 1e-9 and abs(hsi_row["expected"] - 48.48) < 1e-6, hsi_row
+    assert [(r["name"], r["records"]) for r in a["edges"]] == [("10–15¢", 4), ("15–20¢", 2)], a["edges"]  # an edge of 0.0999…98 is 10¢; 15¢ starts the next bucket
+    assert [(r["name"], r["records"]) for r in a["fairs"]] == [("30–50¢", 1), ("50–70¢", 1), ("70–90¢", 4)], a["fairs"]
+    assert [(r["name"], r["records"]) for r in a["sessions"]] == [("盘中", 2), ("休市日", 3), ("无交易时段", 1)], a["sessions"]  # 10-05 is a KRX holiday; the old record a Sunday
+    assert "markout" in a["sessions"][0] and a["sessions"][1]["settled"] == 2 and a["sessions"][1]["wins"] == a["sessions"][1]["losses"] == 1
+    mk = a["makers"]
+    assert mk["placed"] == 4 and mk["filled"] == 2 and mk["partial"] == 0 and mk["unfilled"] == 1 and mk["resting"] == 1 and mk["cancelled"] == 1 and mk["expired"] == 0, mk
+    assert abs(mk["fill_rate"] - 2 / 3) < 1e-9 and mk["wait_n"] == 2 and mk["wait_median"] == 6_400_000 and mk["rest_n"] == 1, mk
+    assert mk["reasons"] == [{"why": "已到结束时间，等结果出来：不开新单，挂单撤掉", "n": 1}], mk["reasons"]
+    bl = a["blocked"]
+    assert bl["n"] == 1 and bl["settled"] == 1 and bl["losses"] == 1 and bl["shares"] == 100 and abs(bl["pnl"] + 40) < 1e-9 and bl["rows"][0]["payout"] == 0, bl
+    assert data["marked"] == 0 and data["unrealized"] == 0 and data["summary"][0]["marked"] == 0 and all("mark" in t for t in data["trades"])  # nothing held: nothing to mark
+    flip_mk = next(iter(bot.sim_markets(NOW)))  # the HYPE flip market: 买1 20¢, 卖1 30¢
+    marks = bot.sim_marks({flip_mk.market: flip_mk}, CLOSE + 73 * 60_000)
+    assert marks == {("hype-flip#1", "up"): 0.25, ("hype-flip#1", "down"): 0.75}, marks
+    assert bot.sim_marks({flip_mk.market: flip_mk}, CLOSE + 73 * 60_000 + m.LIVE_STALE_MS + 1) == {}  # a stale book marks nothing
+    assert m.book_mark(book([("0.20", "1")], [], NOW, "x", "X", "1"), "up") is None  # nor a one-sided one
+    held = {"market": "hype-flip#1", "side": "up", "status": "filled", "shares": 50, "price": 0.28, "payout": None}
+    s1 = m.summary_of([held], marks)
+    assert s1["open"] == 1 and s1["marked"] == 1 and abs(s1["unrealized"] + 1.5) < 1e-9 and m.summary_of([held])["marked"] == 0, s1
+    assert m.bucket_of(0.10, m.EDGE_BUCKETS) == "10–15¢" and m.bucket_of(0.0999, m.EDGE_BUCKETS) == "<10¢" and m.bucket_of(0.95, m.FAIR_BUCKETS) == "≥90¢"
+    # the summary CSV: one file, the table's name first
+    status, ctype, body = web.route("GET", f"/p/{TOKEN}/summary.csv")
+    text = body.decode("utf-8")
+    assert status == 200 and ctype == "text/csv; charset=utf-8" and text.startswith("\ufeff表,行,记录,市场"), text[:40]
+    srows = list(csv.reader(io.StringIO(text[1:])))
+    tables = [r[0] for r in srows[1:]]
+    assert tables[0] == "每日汇总" and {"按标的", "按下单时净优势", "按下单时公平价", "按时段", "挂单效率", "挂单撤单原因", "被拦下的机会"} <= set(tables), sorted(set(tables))
+    assert next(r for r in srows if r[1] == "累计")[2] == "6" and next(r for r in srows if r[0] == "挂单效率" and r[1] == "挂出")[2] == "4"
+    assert next(r for r in srows if r[0] == "按标的" and r[1] == "恒生指数")[18] == "1.0" and next(r for r in srows if r[0] == "被拦下的机会")[10] == "-40.0"
+    assert 'id="scsv"' in web.route("GET", f"/p/{TOKEN}/journal")[2].decode() and "jrnana" in m.JOURNAL_PAGE
+    # the daily report: once per day and subscription, from SIM_DAILY_REPORT (16:30) on, within six hours of it
+    sent = []
+
+    async def fake_tell(chat, thread, text, reply_markup=None, html_mode=False, fresh=None, render=None):
+        sent.append((chat, thread, text))
+        return True
+    bot.tell = fake_tell
+    bot.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}, "2:0": {"chat": 2, "thread": 0, "active": False}})
+    at = CLOSE + 73 * 60_000  # 17:23 Beijing
+    await bot.daily_report(BJ(10, 5, 16, 0)); await bot.drain_deliveries()
+    assert sent == []  # not due yet
+    await bot.daily_report(at); await bot.drain_deliveries()
+    assert len(sent) == 1 and sent[0][:2] == (1, 0), sent
+    report = sent[0][2]
+    for want in ("模拟交易日报", "10-05 周一", "今天下单 5 笔（挂单 3 笔、吃单 2 笔）｜3 个市场｜成交 430 份 $251.23", "今天最多：恒生指数 2 笔、KOSPI 2 笔、HYPE 1 笔",
+                 "今天结算 4 笔：赢 3 输 1｜盈亏 +$128.77", "持仓 0 笔 成本 $0.00｜挂单中 1", "累计 结算 4 笔 赢 3 输 1｜盈亏 +$128.77｜收益率 +42.7%", "挂单成交率 67%（4 笔挂单"):
+        assert want in report, (want, report)
+    assert "复盘页" not in report  # no web port in this test
+    assert bot.store.get("simreport:2026-10-05:1:0") and not bot.store.get("simreport:2026-10-05:2:0")
+    await bot.daily_report(at + 60_000); await bot.drain_deliveries()
+    assert len(sent) == 1  # once a day
+    keep = bot.config
+    bot.store.put("subscriptions", {"3:0": {"chat": 3, "thread": 0, "active": True}})
+    bot.config = m.dataclasses.replace(keep, sim_daily_report="")
+    await bot.daily_report(at); await bot.drain_deliveries()
+    assert len(sent) == 1  # off
+    bot.config = m.dataclasses.replace(keep, sim_daily_report="09:00")
+    await bot.daily_report(at); await bot.drain_deliveries()
+    assert len(sent) == 1  # 09:00 was more than six hours ago: the day's report is skipped, not sent late
+    bot.config = m.dataclasses.replace(keep, sim_daily_report="12:00")
+    await bot.daily_report(at); await bot.drain_deliveries()
+    assert len(sent) == 2 and sent[1][0] == 3  # within the window: the bot was down at noon, the report goes now
+    bot.config = keep
+    bot.store.put("subscriptions", {})
+    empty = m.Bot(keep, m.Store(":memory:"), FM(at), None); empty.tell = fake_tell  # a bot with no record at all: nothing to say
+    empty.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    await empty.daily_report(at); await empty.drain_deliveries()
+    assert len(sent) == 2 and empty.store.get("simreport:2026-10-05:1:0") == {"skipped": at} and empty.daily_report_text(at) == ""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT"}
+    assert m.Config.from_env(env).sim_daily_report == "16:30" and m.Config.from_env({**env, "SIM_DAILY_REPORT": "off"}).sim_daily_report == ""
+    assert m.Config.from_env({**env, "SIM_DAILY_REPORT": "7:05"}).sim_daily_report == "07:05"
+    for bad in ("25:00", "16:60", "noon"):
+        try:
+            m.Config.from_env({**env, "SIM_DAILY_REPORT": bad})
+            raise AssertionError(f"{bad} accepted")
+        except ValueError:
+            pass
     status, _, body = web.route("GET", f"/p/{TOKEN}/journal.json", "full=1")
     full = json.loads(body)
     assert status == 200 and len(full["trades"]) == 6 and sum("entry" in t for t in full["trades"]) == 5 and full["more"] == 0

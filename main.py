@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.80.0"
+VERSION = "1.81.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -166,6 +166,17 @@ def clean_error(error: BaseException | str) -> str:
     text = re.sub(r"\b\d{5,}:[A-Za-z0-9_-]{15,}\b", "[TOKEN REDACTED]", text)
     text = re.sub(r"https?://\S+", "[URL]", text)
     return text[:280]
+
+
+def parse_clock(env: dict[str, str], key: str, default: str) -> str:
+    """A Beijing time of day as HH:MM (7:05 -> 07:05); "" for off / empty / 0 / none; anything else raises."""
+    raw = env.get(key, default).strip().lower()
+    if raw in {"", "off", "0", "false", "no", "none"}:
+        return ""
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", raw)
+    if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+        raise ValueError(f"{key} 应为 HH:MM（北京时间）或 off")
+    return f"{int(match.group(1)):02d}:{match.group(2)}"
 
 
 def parse_bounded(env: dict[str, str], key: str, default: str, low: float, high: float) -> float:
@@ -602,6 +613,7 @@ class Config:
     edge_alert_confirm: int = 60   # seconds a change has to hold before it is announced (a one-refresh blip is not)
     edge_alert_cooldown: int = 900  # seconds before the same market and side is announced as new again
     edge_alert_digest: int = 0  # minutes: 新机会 gathered into one message per period, grouped by driver; 0 = one by one
+    sim_daily_report: str = "16:30"  # SIM_DAILY_REPORT: the Beijing time (HH:MM) the day's trading report goes to every subscription; "" = none
     # Real trading (live.py): LIVE=on sends every paper-trading decision to Predict as a real order.
     live: bool = False                 # LIVE=on or LIVE=pause: the real-trading module runs (live_mode says whether it opens positions)
     live_mode: str = "off"             # off | pause (wallet, sign-in, checks, the order test and cancels work; no new positions) | on
@@ -760,6 +772,7 @@ class Config:
             edge_alert_confirm=bounded_int(e, "EDGE_ALERT_CONFIRM_SECONDS", 60, 0, 3600),
             edge_alert_cooldown=bounded_int(e, "EDGE_ALERT_COOLDOWN_SECONDS", 900, 0, 86400),
             edge_alert_digest=bounded_int(e, "EDGE_ALERT_DIGEST_MINUTES", 0, 0, 1440),
+            sim_daily_report=parse_clock(e, "SIM_DAILY_REPORT", "16:30"),
             probability=e.get("PROBABILITY", "on").strip().lower() not in {"off", "0", "false", "no"},
             prob_vol=parse_prob_vol(e.get("PROB_VOL", "")),
             sse_index=e.get("SSE_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -7808,42 +7821,196 @@ def sim_sources(trades: list[dict]) -> list[dict]:
     return sorted(out.values(), key=lambda r: (-r["cost"], -r["trades"], r["source"]))
 
 
-def summary_of(rows: list[dict]) -> dict:
+def summary_of(rows: list[dict], marks: Mapping | None = None) -> dict:
     """One summary line over ``rows``: the records, the distinct markets, the shares and money filled, the settled ones
-    (with their result split and P&L), the positions still open and what they cost."""
+    (with their result split and P&L), the positions still open and what they cost — and, given ``marks`` ((market,
+    side) -> the book's middle for that side, Bot.sim_marks), how many of the open positions have a mark and their
+    unrealized P&L at it."""
     done = [t for t in rows if t.get("status") == "settled"]
     filled = [t for t in rows if float(t.get("shares") or 0) > 0]
     held = [t for t in filled if t.get("status") in {"filled", "resting"}]
+    marked = [(t, mark) for t in held for mark in [(marks or {}).get((str(t.get("market") or ""), str(t.get("side") or "")))] if mark is not None]
     return {"records": len(rows), "markets": len({str(t.get("market") or "") for t in rows}),
             "filled": sum(float(t["shares"]) for t in filled), "volume": sum(float(t["price"]) * float(t["shares"]) for t in filled),
             "settled": len(done), "wins": sum(t["payout"] == 1 for t in done), "losses": sum(t["payout"] == 0 for t in done),
             "ties": sum(0 < t["payout"] < 1 for t in done), "pnl": sum((float(t["payout"]) - float(t["price"])) * float(t["shares"]) for t in done),
             "open": len(held), "open_cost": sum(float(t["price"]) * float(t["shares"]) for t in held),
-            "resting": sum(t.get("status") == "resting" for t in rows)}
+            "resting": sum(t.get("status") == "resting" for t in rows),
+            "marked": len(marked), "unrealized": sum((float(mark) - float(t["price"])) * float(t["shares"]) for t, mark in marked)}
 
 
-def sim_summary(trades: list[dict], days: int = 14) -> list[dict]:
+def sim_summary(trades: list[dict], days: int = 14, marks: Mapping | None = None) -> list[dict]:
     """The review page's daily summary: one line per Beijing day the records were opened on (the latest ``days`` days
-    that have any, newest first) and one over every day (累计) — summary_of each, with the same figures per market kind
-    and per way (挂单 / 吃单) as ``parts`` under it."""
+    that have any, newest first) and one over every day (累计) — summary_of each (with ``marks`` for the open positions'
+    unrealized P&L), with the same figures per market kind and per way (挂单 / 吃单) as ``parts`` under it."""
     def day_of(t: dict) -> dt.date:
         return dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date()
 
     def parts(rows: list[dict]) -> list[dict]:
-        out = [{"name": name, **summary_of([t for t in rows if t.get("kind") == kind])}
+        out = [{"name": name, **summary_of([t for t in rows if t.get("kind") == kind], marks)}
                for kind, name in SIM_KINDS.items() if any(t.get("kind") == kind for t in rows)]
-        out += [{"name": name, **summary_of([t for t in rows if bool(t.get("maker")) == maker])}
+        out += [{"name": name, **summary_of([t for t in rows if bool(t.get("maker")) == maker], marks)}
                 for name, maker in (("挂单", True), ("吃单", False)) if any(bool(t.get("maker")) == maker for t in rows)]
         return out
 
     by_day: dict[dt.date, list[dict]] = {}
     for t in trades:
         by_day.setdefault(day_of(t), []).append(t)
-    out = [{"day": day.isoformat(), "label": f"{day:%m-%d} {WEEKDAYS[day.weekday()]}", **summary_of(rows), "parts": parts(rows)}
+    out = [{"day": day.isoformat(), "label": f"{day:%m-%d} {WEEKDAYS[day.weekday()]}", **summary_of(rows, marks), "parts": parts(rows)}
            for day, rows in sorted(by_day.items(), reverse=True)[:days]]
     if trades:
-        out.append({"day": "", "label": "累计", **summary_of(trades), "parts": parts(trades)})
+        out.append({"day": "", "label": "累计", **summary_of(trades, marks), "parts": parts(trades)})
     return out
+
+
+# --- the review page's analysis: by underlying, by edge and fair price at the order, by session part, the makers, the refused buys
+def book_mark(book: "PredictBook | None", side: str) -> float | None:
+    """The book's middle as the mark of an open position on ``side`` (the Yes bid and ask for 涨 / Yes, their complement
+    for 跌 / No); None on a one-sided or empty book, which marks nothing (a lone quote is no price)."""
+    if book is None or not book.bid or not book.ask:
+        return None
+    mid = (float(book.bid[0]) + float(book.ask[0])) / 2
+    return mid if side == "up" else 1 - mid
+
+
+EDGE_BUCKETS = ((0.10, "<10¢"), (0.15, "10–15¢"), (0.20, "15–20¢"), (0.30, "20–30¢"), (None, "≥30¢"))  # the net edge at the order
+FAIR_BUCKETS = ((0.30, "<30¢"), (0.50, "30–50¢"), (0.70, "50–70¢"), (0.90, "70–90¢"), (None, "≥90¢"))  # the bought side's fair price at the order
+SESSION_BUCKETS = ("开盘后 30 分钟", "盘中", "午休", "开盘前", "收盘后", "休市日", "无交易时段")
+
+
+def bucket_of(value: float, buckets: tuple) -> str:
+    """The first bucket whose top (exclusive) is above ``value``; the last one (top None) takes the rest."""
+    for top, name in buckets:
+        if top is None or value < top - 1e-12:
+            return name
+    return buckets[-1][1]
+
+
+def settled_extras(rows: list[dict]) -> dict:
+    """Over the settled records of ``rows``: what the model expected of them at the order (net edge × shares), their
+    mean fair price at the order and the share of them that paid (a tie counts half) — the two to compare: a group
+    whose hit rate falls short of its mean fair price was priced too keenly."""
+    done = [t for t in rows if t.get("status") == "settled"]
+    return {"expected": sum(float(t.get("edge") or 0) * float(t.get("shares") or 0) for t in done),
+            "avg_fair": sum(float(t.get("fair") or 0) for t in done) / len(done) if done else None,
+            "hit": sum(float(t.get("payout") or 0) for t in done) / len(done) if done else None}
+
+
+def sim_item_name(trade: dict) -> str:
+    """The underlying a record is on, for the per-underlying table: a daily card's index or stock (every day's 恒生指数
+    card is the same underlying), else the event it settles on (trade_driver: HYPE/SOL, BTC, a token's ladder)."""
+    if trade.get("kind") == "close":
+        return str(trade.get("item") or "").partition("｜")[0] or str(trade.get("key") or "")
+    return trade_driver(trade)[1]
+
+
+def sim_by_item(trades: list[dict], marks: Mapping | None = None) -> list[dict]:
+    """summary_of per underlying (sim_item_name), the most traded first, each with what the model expected of its
+    settled records and their hit rate (settled_extras)."""
+    by: dict[str, list[dict]] = {}
+    for t in trades:
+        by.setdefault(sim_item_name(t), []).append(t)
+    out = [{"name": name, **summary_of(rows, marks), **settled_extras(rows)} for name, rows in by.items()]
+    return sorted(out, key=lambda r: (-r["records"], -r["volume"], r["name"]))
+
+
+def sim_by_bucket(trades: list[dict], value_of: Any, buckets: tuple, marks: Mapping | None = None) -> list[dict]:
+    """summary_of per bucket of ``value_of(trade)`` (the net edge or the fair price at the order), in the buckets' order,
+    the empty ones left out, each with settled_extras: the calibration table — in which buckets the edge the model saw
+    was real (the settled P&L against the expectation, the hit rate against the mean fair price) and in which it was
+    not. A record without the value is left out."""
+    by: dict[str, list[dict]] = {}
+    for t in trades:
+        value = value_of(t)
+        if value is not None:
+            by.setdefault(bucket_of(float(value), buckets), []).append(t)
+    return [{"name": name, **summary_of(by[name], marks), **settled_extras(by[name])} for _, name in buckets if name in by]
+
+
+def sim_session_bucket(trade: dict, exchange: str, holidays: frozenset = frozenset()) -> str:
+    """The part of its underlying's day a daily card's record was opened in, on the venue's own clock: the first 30
+    minutes after the open, the rest of the session, the lunch break, before the open, after the close, a weekend or
+    holiday; 无交易时段 when the underlying has no session (a crypto card)."""
+    if exchange not in SESSIONS or exchange not in STOCK_MARKETS:
+        return "无交易时段"
+    opened = int(trade.get("opened") or 0)
+    state = session_state(exchange, opened, holidays)
+    if state == "开盘中":
+        local = dt.datetime.fromtimestamp(opened / 1000, dt.timezone(dt.timedelta(hours=STOCK_MARKETS[exchange].utc_offset)))
+        start = dt.datetime.combine(local.date(), CALENDAR.sessions(exchange, local.date())[0][0], local.tzinfo)
+        return "开盘后 30 分钟" if local - start < dt.timedelta(minutes=30) else "盘中"
+    return {"午休": "午休", "未开盘": "开盘前", "已收盘": "收盘后", "休市": "休市日"}.get(state, "无交易时段")
+
+
+def sim_by_session(trades: list[dict], exchange_of: Any, holidays_of: Any, marks: Mapping | None = None) -> list[dict]:
+    """summary_of per part of the underlying's day the records were opened in (sim_session_bucket; ``exchange_of(trade)``
+    names the venue, ``holidays_of(exchange)`` its holidays), in SESSION_BUCKETS' order, the empty ones left out, each
+    with settled_extras and its markouts (markout_stats): which hours' edges were real, and in which the fills were
+    someone else's exit."""
+    by: dict[str, list[dict]] = {}
+    for t in trades:
+        exchange = exchange_of(t)
+        by.setdefault(sim_session_bucket(t, exchange, holidays_of(exchange)), []).append(t)
+    return [{"name": name, **summary_of(by[name], marks), **settled_extras(by[name]), "markout": markout_stats(by[name])}
+            for name in SESSION_BUCKETS if name in by]
+
+
+def sim_maker_efficiency(trades: list[dict]) -> dict:
+    """The resting orders' record: how many were placed, filled whole, filled in part, never filled (expired at the end
+    or withdrawn empty) or still rest; the fill rate of the finished ones by count (any fill) and by shares; how long
+    the filled ones waited for their first fill (mean, median); how long the unfilled ones rested; the most frequent
+    withdrawal reasons, their numbers replaced by N so one rule's lines count as one."""
+    makers = [t for t in trades if bool(t.get("maker"))]
+    resting = [t for t in makers if t.get("status") == "resting"]
+    ended = [t for t in makers if t.get("status") != "resting"]
+    shares_of = lambda t: float(t.get("shares") or 0)
+    order_of = lambda t: float(t.get("order") or t.get("shares") or 0)
+    whole = [t for t in ended if shares_of(t) > 0 and shares_of(t) >= order_of(t) - 1e-9]
+    partial = [t for t in ended if 0 < shares_of(t) < order_of(t) - 1e-9]
+    unfilled = [t for t in ended if shares_of(t) <= 0]
+    waits = sorted(int(t["filled"]) - int(t.get("opened") or 0) for t in makers if t.get("filled") and shares_of(t) > 0)
+    rests = []
+    for t in unfilled:
+        end = int((t.get("withdrawn") or {}).get("at") or t.get("settled") or 0)
+        if end and t.get("opened"):
+            rests.append(end - int(t["opened"]))
+    reasons: dict[str, int] = {}
+    for t in makers:
+        why = str((t.get("withdrawn") or {}).get("why") or "")
+        if why:
+            key = re.sub(r"\d+(?:\.\d+)?", "N", why)
+            reasons[key] = reasons.get(key, 0) + 1
+    ordered = sum(order_of(t) for t in ended)
+    return {"placed": len(makers), "filled": len(whole), "partial": len(partial), "unfilled": len(unfilled), "resting": len(resting),
+            "expired": sum(t.get("status") == "expired" for t in unfilled), "cancelled": sum(t.get("status") == "cancelled" for t in unfilled),
+            "fill_rate": (len(whole) + len(partial)) / len(ended) if ended else None,
+            "share_rate": sum(shares_of(t) for t in ended) / ordered if ordered else None,
+            "wait_n": len(waits), "wait_avg": sum(waits) / len(waits) if waits else None, "wait_median": waits[len(waits) // 2] if waits else None,
+            "rest_n": len(rests), "rest_avg": sum(rests) / len(rests) if rests else None,
+            "reasons": [{"why": why, "n": n} for why, n in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:8]]}
+
+
+def sim_blocked_outcomes(blocks: list[dict], trades: list[dict], shares: float) -> dict:
+    """What the buys the group cap refused (sim_blocks) would have done: each against a settled record on the same market
+    (the market's result is one; the block's side is read off its label against the record's), bought at the block's
+    price for ``shares`` (SIM_SHARES). How many are settled, how many of those would have won, their P&L, the rows."""
+    settled: dict[str, dict] = {}
+    for t in trades:
+        if t.get("status") == "settled" and t.get("payout") is not None:
+            settled.setdefault(str(t.get("market") or ""), t)
+    rows = []
+    for b in blocks:
+        ref = settled.get(str(b.get("market") or ""))
+        if ref is None:
+            continue
+        same = str(b.get("label") or "")[1:] == str(ref.get("label") or "")[1:]
+        payout = float(ref["payout"]) if same else 1 - float(ref["payout"])
+        price = float(b.get("price") or 0)
+        rows.append({"at": b.get("at"), "item": b.get("item", ""), "label": b.get("label", ""), "price": price, "why": b.get("why", ""),
+                     "payout": payout, "pnl": (payout - price) * shares})
+    return {"n": len(blocks), "settled": len(rows), "shares": shares, "wins": sum(r["payout"] == 1 for r in rows),
+            "losses": sum(r["payout"] == 0 for r in rows), "ties": sum(0 < r["payout"] < 1 for r in rows),
+            "pnl": sum(r["pnl"] for r in rows), "rows": rows[:30]}
 
 
 # --- markouts: where the market goes after a fill (a fill that is followed by a fall was someone else's exit) ---------
@@ -9064,10 +9231,21 @@ dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
-<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
+<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
 <div class="tiles" id="tiles"></div>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
-<div class="body" id="sumbody"><div class="tbl" id="summary"></div><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；每天下面按市场类型和挂/吃拆开。</p></div></section>
+<div class="body" id="sumbody"><div class="tbl" id="summary"></div><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
+<section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="foldana">展开</button></div>
+<div class="body" id="anabody" hidden>
+<h3>按标的</h3><div id="a-items"></div>
+<h3>按下单时净优势</h3><div id="a-edges"></div>
+<p class="small mut">每桶的已结算盈亏对比“下单时预期”（净优势 × 份数），胜率（平局算半）对比平均公平价：胜率低于公平价的桶，模型把优势看高了。</p>
+<h3>按下单时公平价</h3><div id="a-fairs"></div>
+<h3>按时段</h3><div id="a-sessions"></div>
+<p class="small mut">按下单时标的所在的时段（交易所当地时间）；成交后市场走向 = 盘口中间价 − 成交价，每份，持续为负 = 这个时段的成交常是别人在出货；没有开盘时段的市场（加密）记在“无交易时段”。</p>
+<h3>挂单效率</h3><div id="a-makers"></div>
+<h3>被拦下的机会</h3><div id="a-blocked"></div>
+<p class="small mut">组上限（SIM_GROUP_USD）最近一周拦下的买入：市场已出结果的，按每笔份数（SIM_SHARES）算若当时买入的盈亏——长期为正说明上限偏紧。</p></div></section>
 <section class="box" id="statsbox"><div class="hd" id="statshd"><h2>统计与风险</h2><span class="sum" id="statsum"></span><button type="button" class="lnk" id="foldstats">展开</button></div>
 <div class="body" id="statsbody" hidden><div id="stats"></div>
 <h3 id="h-groups" hidden>分组</h3><div class="tbl" id="groups" hidden></div>
@@ -9110,9 +9288,10 @@ let data=null,stateF="all",wayF="all",kindF="all",openId=decodeURIComponent(loca
 const details={};  // trade id -> its whole record, fetched when the trade is opened
 try{statsOpen=localStorage.getItem("jrnstats")==="1"}catch(e){}
 let sumOpen=true;try{sumOpen=localStorage.getItem("jrnsum")!=="0"}catch(e){}  // the daily summary: open unless folded by hand
+let anaOpen=false;try{anaOpen=localStorage.getItem("jrnana")==="1"}catch(e){}  // the analysis tables: folded unless opened by hand
 const base=location.pathname.replace(/\/journal\/?$/,"");
 document.getElementById("back").href=base;document.getElementById("ctl").href=base+"/control";
-document.getElementById("csv").href=base+"/journal.csv";document.getElementById("json").href=base+"/journal.json?full=1";  // also right under /journal/
+document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";  // also right under /journal/
 function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
   if(MS_KEYS.has(k))return v?when(v):"—";if(k==="high_at")return v?when(v*1000):"—";if(CENT_KEYS.has(k))return cent(v);
   if(k==="sigma_daily"||k==="sigma")return (v*100).toFixed(2)+"%";if(k==="history")return JSON.stringify(v);
@@ -9217,16 +9396,44 @@ async function loadDetail(id){  // one trade's whole record (its snapshots, sour
 function summary(){  // per day the records were opened on: records, markets, what filled, what settled and its P&L, what is open — by kind and way under each
   const rows=data.summary||[],el=document.getElementById("summary"),head=document.getElementById("sumsum");el.replaceChildren();
   if(!rows.length){el.append($("p","small mut","还没有交易"));head.textContent="";document.getElementById("sumbody").hidden=!sumOpen;return}
-  const t=$("table"),h=$("tr");["日期 / 类别","记录","市场","成交份数","成交额","已结算","盈亏","持仓中"].forEach(x=>h.append($("th","",x)));t.append(h);
+  const t=$("table"),h=$("tr");["日期 / 类别","记录","市场","成交份数","成交额","已结算","盈亏","持仓中","浮动盈亏"].forEach(x=>h.append($("th","",x)));t.append(h);
   const cell=(v,cls)=>{const c=$("td","",v);if(cls)c.className=cls;return c};
   const wl=r=>r.settled+"（赢 "+r.wins+" 输 "+r.losses+(r.ties?" 平 "+r.ties:"")+"）";
   const line=(r,name,cls)=>{const tr=$("tr",cls);tr.append(cell(name),cell(r.records),cell(r.markets),cell(num(r.filled)),cell(usd(r.volume)),cell(r.settled?wl(r):"—"),
-    cell(r.settled?money(r.pnl):"—",r.settled?(r.pnl>=0?"ok":"bad"):""),cell((r.open?r.open+"（"+usd(r.open_cost)+"）":"")+(r.resting?(r.open?" · ":"")+"挂单 "+r.resting:"")||"—"));return tr};
+    cell(r.settled?money(r.pnl):"—",r.settled?(r.pnl>=0?"ok":"bad"):""),cell((r.open?r.open+"（"+usd(r.open_cost)+"）":"")+(r.resting?(r.open?" · ":"")+"挂单 "+r.resting:"")||"—"),
+    cell(r.marked?money(r.unrealized)+(r.marked<r.open?"（"+r.marked+"/"+r.open+" 笔有报价）":""):"—",r.marked?(r.unrealized>=0?"ok":"bad"):""));return tr};
   rows.forEach(r=>{t.append(line(r,r.label,r.day?"":"all"));if(r.day)(r.parts||[]).forEach(p=>t.append(line(p,p.name,"sub")))});
   el.append(t);
   const d=rows[0];head.replaceChildren(d.label+"：记录 "+d.records+" · 成交 "+usd(d.volume)+(d.settled?" · 盈亏 ":""));
   if(d.settled){const b=$("b","",money(d.pnl));b.className=d.pnl>=0?"ok":"bad";head.append(b)}
   document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"}
+function pn(x){const b=$("b","",money(x));b.className=x>=0?"ok":"bad";return b}
+function anaTable(rows,extra){  // one summary table: records, fills, the settled P&L against the model's expectation, the hit rate against the mean fair price, open, unrealized — plus a table's own columns
+  const head=["分组","记录","市场","成交份数","成交额","已结算","盈亏","下单时预期","胜率 / 平均公平价","持仓中","浮动盈亏"].concat(extra?extra.head:[]);
+  const wl=r=>r.settled+"（赢 "+r.wins+" 输 "+r.losses+(r.ties?" 平 "+r.ties:"")+"）";
+  return table(head,rows.map(r=>[r.name,r.records,r.markets,num(r.filled),usd(r.volume),r.settled?wl(r):"—",r.settled?pn(r.pnl):"—",r.settled?money(r.expected):"—",
+    r.settled?(r.hit*100).toFixed(0)+"% / "+cent(r.avg_fair):"—",(r.open?r.open+"（"+usd(r.open_cost)+"）":"")+(r.resting?(r.open?" · ":"")+"挂单 "+r.resting:"")||"—",r.marked?pn(r.unrealized):"—"].concat(extra?extra.cells(r):[])))}
+function analysis(){  // per underlying, per net edge and fair price at the order, per part of the underlying's day, the resting orders' record, the refused buys' outcomes: folded away
+  const a=data.analysis||{},put=(id,rows,extra)=>{const el=document.getElementById(id);el.replaceChildren(rows&&rows.length?anaTable(rows,extra):$("p","small mut","还没有记录"))};
+  put("a-items",a.items);put("a-edges",a.edges);put("a-fairs",a.fairs);
+  const mo=(r,k)=>r.markout&&r.markout[k]?sg(r.markout[k].avg)+"（"+r.markout[k].n+" 笔）":"—";
+  put("a-sessions",a.sessions,{head:["成交后 5 分钟","成交后 30 分钟"],cells:r=>[mo(r,"5m"),mo(r,"30m")]});
+  const mk=a.makers||{},mb=document.getElementById("a-makers");mb.replaceChildren();
+  if(!mk.placed)mb.append($("p","small mut","还没有挂单"));
+  else{const d=$("dl"),p=(k,v)=>d.append($("dt","",k),$("dd","",v));
+    p("挂出",mk.placed+" 笔");p("全部成交",mk.filled+" 笔");p("部分成交",mk.partial+" 笔");p("没成交",mk.unfilled+" 笔（到期 "+mk.expired+" · 撤单 "+mk.cancelled+"）");p("还在挂",mk.resting+" 笔");
+    p("成交率",mk.fill_rate==null?"还没有结束的挂单":(mk.fill_rate*100).toFixed(0)+"%（按笔，有成交的）· "+(mk.share_rate*100).toFixed(0)+"%（按份数）");
+    p("等到第一笔成交",mk.wait_n?"平均 "+span(mk.wait_avg)+" · 中位 "+span(mk.wait_median)+"（"+mk.wait_n+" 笔）":"—");
+    p("没成交的挂了多久",mk.rest_n?"平均 "+span(mk.rest_avg)+"（"+mk.rest_n+" 笔）":"—");
+    mb.append(d);if((mk.reasons||[]).length)mb.append($("div","sub","撤单原因（数字换成 N 后归并）"),table(["笔数","原因"],mk.reasons.map(x=>[x.n,x.why])))}
+  const bl=a.blocked||{},bb=document.getElementById("a-blocked");bb.replaceChildren();
+  if(!bl.n)bb.append($("p","small mut","最近一周没有被组上限拦下的买入"));
+  else{const s=$("p","small","最近一周被拦下 "+bl.n+" 次，其中市场已出结果的 "+bl.settled+" 次"+(bl.settled?"；若按 "+num(bl.shares)+" 份买入：赢 "+bl.wins+" 输 "+bl.losses+(bl.ties?" 平 "+bl.ties:"")+"，盈亏 ":""));
+    if(bl.settled)s.append(pn(bl.pnl));bb.append(s);
+    if((bl.rows||[]).length)bb.append(table(["时间","市场","方向","价格","结果","若买入的盈亏","原因"],bl.rows.map(r=>[when(r.at),r.item,r.label,cent(r.price),r.payout===1?"赢":r.payout===0?"输":"平",money(r.pnl),r.why])))}
+  const hd=document.getElementById("anasum");hd.replaceChildren("标的 "+(a.items||[]).length+" 个"+(mk.fill_rate!=null?" · 挂单成交率 "+(mk.fill_rate*100).toFixed(0)+"%":"")+(bl.settled?" · 被拦下的若买入 ":""));
+  if(bl.settled)hd.append(pn(bl.pnl));
+  document.getElementById("anabody").hidden=!anaOpen;document.getElementById("foldana").textContent=anaOpen?"收起":"展开"}
 function tiles(){  // today, the last 7 days, the lifetime, what is open: the four numbers a glance needs
   const s=data.total,el=document.getElementById("tiles"),rc={};(data.recent||[]).forEach(r=>{rc[r.name]=r});
   const tile=(k,v,sub,cls)=>{const x=$("div","tile");x.append($("div","k",k));const vv=$("div","v",v);if(cls)vv.className+=" "+cls;x.append(vv);if(sub)x.append(typeof sub==="string"?$("div","s",sub):sub);return x};
@@ -9235,7 +9442,7 @@ function tiles(){  // today, the last 7 days, the lifetime, what is open: the fo
   const sub=$("div","s");sub.append("已结算 "+s.settled+" 笔 · "+wl(s)+" · 成本 "+usd(s.cost)+(s.cost?" · "+(s.roi>=0?"+":"")+(s.roi*100).toFixed(1)+"%":""));
   if(s.mismatch)sub.append(" · ",$("span","bad","结果不一致 "+s.mismatch));if(s.local)sub.append(" · ",$("span","warn","待确认 "+s.local));
   el.replaceChildren(recent("今天"),recent("近 7 天"),tile("累计",money(s.pnl),sub,s.pnl>=0?"ok":"bad"),
-    tile("进行中","持仓 "+s.open,"成本 "+usd(s.open_cost)+" · 挂单中 "+s.resting+(s.partial?" · 部分成交 "+s.partial:"")+(s.expired?" · 未成交 "+s.expired:"")+(s.cancelled?" · 撤单 "+s.cancelled:"")))}
+    tile("进行中","持仓 "+s.open,"成本 "+usd(s.open_cost)+(data.marked?" · 浮动 "+money(data.unrealized)+"（"+data.marked+" 笔有报价）":"")+" · 挂单中 "+s.resting+(s.partial?" · 部分成交 "+s.partial:"")+(s.expired?" · 未成交 "+s.expired:"")+(s.cancelled?" · 撤单 "+s.cancelled:"")))}
 function stats(){  // the model's expectation, how results were confirmed, the markouts, the groups, the common risks, the rules: folded away
   const s=data.total,d=$("dl"),put=(k,v)=>d.append($("dt","",k),$("dd","",v));
   put("模型预期（下单时）",money(s.expected)+"　按下单时的净优势 × 份数");
@@ -9291,7 +9498,7 @@ function foot(){document.getElementById("foot").textContent=data.live?"真实订
 function render(){
   if(!data)return;
   const name=data.live?"交易复盘":"模拟交易复盘";document.getElementById("title").textContent=name;document.title=name;
-  tiles();summary();stats();filters();foot();
+  tiles();summary();analysis();stats();filters();foot();
   const st=(STATES.find(s=>s[0]===stateF)||STATES[0])[2];
   const all=data.trades.filter(t=>st(t)&&(wayF==="all"||(wayF==="maker")===!!t.maker)&&(kindF==="all"||t.kind===kindF)),page=all.slice(0,shown);
   const byDay=new Map();all.forEach(t=>{const k=dayKey(t.opened);if(!byDay.has(k))byDay.set(k,[]);byDay.get(k).push(t)});
@@ -9320,7 +9527,7 @@ async function load(){  // the list: light rows, the open trades and the last fe
       (okAt?"；下面显示的是 "+hms+" 的旧数据":"")))}
   finally{clearTimeout(timer);load.busy=false}
   if(again||load.again){load.again=false;load()}}
-["csv","json"].forEach(id=>{const a=document.getElementById(id);a.addEventListener("click",async e=>{const key=ctlKey();if(!key)return;e.preventDefault();  // with a key: fetched with it, saved as a file
+["csv","scsv","json"].forEach(id=>{const a=document.getElementById(id);a.addEventListener("click",async e=>{const key=ctlKey();if(!key)return;e.preventDefault();  // with a key: fetched with it, saved as a file
   try{const r=await fetch(a.href,{cache:"no-store",headers:{"X-Control-Key":key}});if(!r.ok)throw new Error("HTTP "+r.status);const u=URL.createObjectURL(await r.blob());
     const t=document.createElement("a");t.href=u;t.download=a.getAttribute("download");document.body.append(t);t.click();t.remove();setTimeout(()=>URL.revokeObjectURL(u),5000)}
   catch(err){alert("导出失败："+err.message)}})});
@@ -9328,6 +9535,8 @@ document.getElementById("statshd").addEventListener("click",()=>{statsOpen=!stat
   document.getElementById("statsbody").hidden=!statsOpen;document.getElementById("foldstats").textContent=statsOpen?"收起":"展开"});
 document.getElementById("sumhd").addEventListener("click",()=>{sumOpen=!sumOpen;try{localStorage.setItem("jrnsum",sumOpen?"1":"0")}catch(e){}
   document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"});
+document.getElementById("anahd").addEventListener("click",()=>{anaOpen=!anaOpen;try{localStorage.setItem("jrnana",anaOpen?"1":"0")}catch(e){}
+  document.getElementById("anabody").hidden=!anaOpen;document.getElementById("foldana").textContent=anaOpen?"收起":"展开"});
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
 const THEMES={auto:["◐","自动"],light:["☀","浅色"],dark:["☾","深色"]};let theme="auto";try{const t=JSON.parse(localStorage.getItem("theme"));if(typeof t==="string"&&Object.prototype.hasOwnProperty.call(THEMES,t))theme=t}catch(e){}
 function applyTheme(){const r=document.documentElement;if(theme==="auto")delete r.dataset.theme;else r.dataset.theme=theme;const b=document.getElementById("theme");b.textContent=THEMES[theme][0]+" "+THEMES[theme][1];b.title="主题："+THEMES[theme][1]+"（点击切换）"}
@@ -9778,6 +9987,8 @@ class WebServer:
                 return self.journal_json(query)
             if parts[2] == "journal.csv":
                 return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
+            if parts[2] == "summary.csv":
+                return 200, "text/csv; charset=utf-8", self.bot.journal_summary_csv().encode("utf-8")
             if parts[2] == "control":
                 return 200, "text/html; charset=utf-8", self.pages["control"]
         return 404, "text/plain; charset=utf-8", b"not found"
@@ -9933,7 +10144,8 @@ class WebServer:
                 status, ctype, body = await self.control(reader, rest, self.client_of(rest, writer))
             elif method.upper() in {"GET", "HEAD"} and self.is_control(path, "control.json"):
                 status, ctype, body = self.control_json(rest, self.client_of(rest, writer))
-            elif method.upper() in {"GET", "HEAD"} and self.journal_locked() and (self.is_control(path, "journal.json") or self.is_control(path, "journal.csv")):
+            elif method.upper() in {"GET", "HEAD"} and self.journal_locked() and (self.is_control(path, "journal.json") or self.is_control(path, "journal.csv")
+                                                                                 or self.is_control(path, "summary.csv")):
                 status, ctype, body = self.journal_keyed(path, query, rest, self.client_of(rest, writer))
             else:
                 status, ctype, body = self.route(method.upper(), path, query)
@@ -14119,7 +14331,7 @@ class Bot:
     JOURNAL_HISTORY = 300  # finished trades the review page lists at first; the older ones come on request (journal.json?all=1)
     JOURNAL_LIGHT = ("id", "market", "slug", "item", "kind", "key", "side", "label", "maker", "deep", "sweep", "price", "shares", "order",
                      "unfilled", "opened", "filled", "settled", "status", "confirm", "payout", "edge", "fair", "note", "driver_name",
-                     "text", "state", "pnl", "expected_fill", "url", "wait", "legacy", "cost_confirmed", "withdrawn", "real", "limit")
+                     "text", "state", "pnl", "expected_fill", "url", "wait", "legacy", "cost_confirmed", "withdrawn", "real", "limit", "mark", "unrealized")
 
     def journal_row(self, tid: str, t: dict, mk: "SimMarket | None", now_ms: int, full: bool) -> dict:
         """One trade for the review page: a list row (JOURNAL_LIGHT — what a line and the filters need, a few hundred
@@ -14131,6 +14343,9 @@ class Bot:
                "expected_fill": sim_fill_expectation(t) if float(t.get("shares") or 0) else 0.0, "url": self.sim_url(t),
                "wait": self.sim_wait(t, mk, now_ms), "real": bool(st),
                "limit": float((st.get("want") or {}).get("limit") or 0) or None}  # a real taker's LIMIT price (LIVE_TAKER_PRICE)
+        mark = (book_mark(mk.book, str(t.get("side") or "")) if mk is not None and t["status"] in {"filled", "resting"}
+                and float(t.get("shares") or 0) > 0 and not mk.book.stale(now_ms) else None)  # the position at the book's middle
+        row["mark"], row["unrealized"] = mark, (mark - float(t["price"])) * float(t["shares"]) if mark is not None else None
         if full:
             return row
         light = {k: row[k] for k in self.JOURNAL_LIGHT if k in row}
@@ -14151,6 +14366,8 @@ class Bot:
             except Exception as error:  # the journal is still served; open trades just cannot say where the book stands
                 LOG.warning("journal: markets unavailable: %s", clean_error(error) or type(error).__name__)
         rows = [self.journal_row(tid, t, markets.get(t["market"]), now_ms, full) for tid, t in trades]
+        marks = self.sim_marks(markets, now_ms)
+        totals = summary_of(values, marks)
         limit = self.JOURNAL_HISTORY if history is None else int(history)
         shown = rows
         if limit > 0:
@@ -14167,8 +14384,38 @@ class Bot:
                 "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
                           for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
                 "groups": sim_groups(values), "sources": sim_sources(values), "blocks": self.sim_blocks(),
-                "summary": sim_summary(values),  # per day the records were opened on, per kind and way under each, and 累计
+                "summary": sim_summary(values, marks=marks),  # per day the records were opened on, per kind and way under each, and 累计
+                "analysis": self.sim_analysis(values, marks),  # per underlying, per edge / fair bucket, per session part, the makers, the refused buys
+                "unrealized": totals["unrealized"], "marked": totals["marked"],  # the open positions at the fresh books' middles
                 "group_cap": self.config.sim_group_usd, "history": limit, "more": len(rows) - len(shown), "trades": shown}
+
+    @staticmethod
+    def sim_marks(markets: Mapping, now_ms: int) -> dict:
+        """(market, side) -> the book's middle for that side (book_mark), over the markets whose book is fresh: the marks
+        the open positions' unrealized P&L is taken at."""
+        marks: dict[tuple[str, str], float] = {}
+        for mk in markets.values():
+            if mk.book is None or mk.book.stale(now_ms):
+                continue
+            for side in ("up", "down"):
+                mark = book_mark(mk.book, side)
+                if mark is not None:
+                    marks[(mk.market, side)] = mark
+        return marks
+
+    def sim_analysis(self, trades: list[dict], marks: Mapping) -> dict:
+        """The review page's analysis tables (journal.json "analysis"): per underlying, per net edge and per fair price
+        at the order, per part of the underlying's day, the resting orders' record, and what the buys the group cap
+        refused would have done."""
+        exchange_of = lambda t: (self.sim_exchange(str(t.get("key") or ""), str((t.get("settle") or {}).get("key") or ""))
+                                 if t.get("kind") == "close" else "")
+        holidays_of = lambda market: self.config.holidays.get(market, frozenset()) if market else frozenset()
+        return {"items": sim_by_item(trades, marks),
+                "edges": sim_by_bucket(trades, lambda t: t.get("edge"), EDGE_BUCKETS, marks),
+                "fairs": sim_by_bucket(trades, lambda t: t.get("fair"), FAIR_BUCKETS, marks),
+                "sessions": sim_by_session(trades, exchange_of, holidays_of, marks),
+                "makers": sim_maker_efficiency(trades),
+                "blocked": sim_blocked_outcomes(self.sim_blocks(), trades, self.config.sim_shares)}
 
     def journal_trade(self, tid: str) -> dict | None:
         """One trade's whole record (None when there is no such trade): what the review page fetches when a trade is opened."""
@@ -14227,6 +14474,63 @@ class Bot:
                 trade_driver(t)[1], *(round(float(marks[label]["move"]), 6) if isinstance(marks.get(label), dict) else ""
                                      for marks in [t.get("markout") if isinstance(t.get("markout"), dict) else {}]
                                      for _, label in MARKOUT_HORIZONS)])
+        return "\ufeff" + out.getvalue()
+
+    SUMMARY_COLUMNS = ("表", "行", "记录", "市场", "成交份数", "成交额", "已结算", "赢", "输", "平", "盈亏", "持仓中", "持仓成本", "挂单中",
+                       "浮动盈亏", "有报价的持仓", "下单时预期", "平均公平价", "胜率", "成交后5分钟市价变动", "成交后30分钟市价变动")
+
+    def journal_summary_csv(self) -> str:
+        """The review page's summary and analysis tables as one CSV (UTF-8 with BOM), the table's name in the first
+        column: the daily summary with its parts, per underlying, per net edge and per fair price at the order, per part
+        of the day, the resting orders' record and withdrawal reasons, the refused buys and what they would have done."""
+        import csv
+        import io
+        payload = self.journal_payload(history=0)
+        when = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING).strftime("%Y-%m-%d %H:%M:%S") if ms else ""
+        r4 = lambda x: round(float(x), 4) if isinstance(x, (int, float)) and not isinstance(x, bool) else ""
+        col = {name: i for i, name in enumerate(self.SUMMARY_COLUMNS)}
+        out = io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow(self.SUMMARY_COLUMNS)
+
+        def put(table: str, name: str, cells: dict) -> None:
+            row: list = [""] * len(self.SUMMARY_COLUMNS)
+            row[0], row[1] = table, name
+            for key, value in cells.items():
+                row[col[key]] = value
+            writer.writerow(row)
+
+        def line(table: str, name: str, r: dict) -> None:
+            mo = r.get("markout") or {}
+            put(table, name, {"记录": r.get("records", ""), "市场": r.get("markets", ""), "成交份数": r4(r.get("filled")), "成交额": r4(r.get("volume")),
+                              "已结算": r.get("settled", ""), "赢": r.get("wins", ""), "输": r.get("losses", ""), "平": r.get("ties", ""),
+                              "盈亏": r4(r.get("pnl")), "持仓中": r.get("open", ""), "持仓成本": r4(r.get("open_cost")), "挂单中": r.get("resting", ""),
+                              "浮动盈亏": r4(r.get("unrealized")), "有报价的持仓": r.get("marked", ""), "下单时预期": r4(r.get("expected")),
+                              "平均公平价": r4(r.get("avg_fair")), "胜率": r4(r.get("hit")),
+                              "成交后5分钟市价变动": r4((mo.get("5m") or {}).get("avg")), "成交后30分钟市价变动": r4((mo.get("30m") or {}).get("avg"))})
+        for r in payload["summary"]:
+            line("每日汇总", r["label"], r)
+            for p in r.get("parts") or []:
+                line("每日汇总", f"{r['label']}｜{p['name']}", p)
+        analysis = payload["analysis"]
+        for table, key in (("按标的", "items"), ("按下单时净优势", "edges"), ("按下单时公平价", "fairs"), ("按时段", "sessions")):
+            for r in analysis[key]:
+                line(table, r["name"], r)
+        mk = analysis["makers"]
+        seconds = lambda ms: r4(ms / 1000) if ms is not None else ""
+        for name, value in (("挂出", mk["placed"]), ("全部成交", mk["filled"]), ("部分成交", mk["partial"]), ("没成交", mk["unfilled"]),
+                            ("到期", mk["expired"]), ("撤单", mk["cancelled"]), ("还在挂", mk["resting"]), ("成交率（按笔）", r4(mk["fill_rate"])),
+                            ("成交率（按份数）", r4(mk["share_rate"])), ("等到第一笔成交（平均，秒）", seconds(mk["wait_avg"])),
+                            ("等到第一笔成交（中位，秒）", seconds(mk["wait_median"])), ("没成交的挂了多久（平均，秒）", seconds(mk["rest_avg"]))):
+            put("挂单效率", name, {"记录": value})
+        for x in mk["reasons"]:
+            put("挂单撤单原因", x["why"], {"记录": x["n"]})
+        bl = analysis["blocked"]
+        put("被拦下的机会", f"最近一周 {bl['n']} 次，市场已出结果 {bl['settled']} 次，按 {bl['shares']:g} 份算",
+            {"记录": bl["n"], "已结算": bl["settled"], "赢": bl["wins"], "输": bl["losses"], "平": bl["ties"], "盈亏": r4(bl["pnl"])})
+        for r in bl["rows"]:
+            put("被拦下的机会", f"{when(r['at'])} {r['item']} {r['label']} @{r['price'] * 100:.1f}¢",
+                {"记录": 1, "已结算": 1, "赢": int(r["payout"] == 1), "输": int(r["payout"] == 0), "平": int(0 < r["payout"] < 1), "盈亏": r4(r["pnl"])})
         return "\ufeff" + out.getvalue()
 
     def cmd_sim(self, req: Request) -> "Reply":
@@ -14778,6 +15082,86 @@ class Bot:
                     if await self.tell(sub["chat"], sub["thread"], text, html_mode=True, fresh=fresh):
                         self.store.put(key, self.market.now_ms())
                 self.deliver(key, send)
+
+    REPORT_WINDOW_MS = 6 * 3_600_000  # a day's report the bot was down for at its hour still goes within this; later it is skipped
+
+    async def daily_report(self, now_ms: int) -> None:
+        """Once per Beijing day and subscription, from SIM_DAILY_REPORT on: the day's trading (daily_report_text). A copy
+        is recorded only after Telegram accepted it, so a failed send is retried on the next cycle; a bot that was down
+        at the hour sends it when back, up to REPORT_WINDOW_MS later (after that the day's report is skipped). A day
+        with nothing to say (daily_report_text "") sends nothing and is recorded as done."""
+        clock = self.config.sim_daily_report
+        if not clock or not self.config.sim or not self.config.predict:
+            return
+        local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+        hour, minute = (int(x) for x in clock.split(":"))
+        due_at = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if local < due_at or local - due_at > dt.timedelta(milliseconds=self.REPORT_WINDOW_MS):
+            return
+        day_key = f"simreport:{local.date().isoformat()}"
+        due = [(sub_id, sub) for sub_id, sub in self.subscriptions().items() if sub.get("active")
+               and not self.store.get(f"{day_key}:{sub_id}") and not self.delivering(f"{day_key}:{sub_id}")]
+        if not due:
+            return
+        text = self.daily_report_text(now_ms)
+        for sub_id, sub in due:
+            key = f"{day_key}:{sub_id}"
+            if not text:
+                self.store.put(key, {"skipped": now_ms})  # nothing to say today: the day is done for this subscription
+                continue
+
+            async def send(sub: dict = sub, key: str = key) -> None:
+                if await self.tell(sub["chat"], sub["thread"], text, html_mode=True):
+                    self.store.put(key, self.market.now_ms())
+            self.deliver(key, send)
+
+    def daily_report_text(self, now_ms: int) -> str:
+        """The day's trading for Telegram (bold sentinels; send as HTML): what was ordered today and how it filled, the
+        underlyings with the most records, what settled today and its P&L, the open positions with their unrealized P&L
+        at the books' middles, the lifetime, the resting orders' fill rate, and the review page's link. "" when there
+        is nothing to say: no record opened or settled today, no position held, no order resting."""
+        trades = list(self.sim_trades().values())
+        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+        day_of = lambda ms: dt.datetime.fromtimestamp(int(ms or 0) / 1000, BEIJING).date()
+        today_rows = [t for t in trades if day_of(t.get("opened")) == today]
+        settled_rows = [t for t in trades if t["status"] == "settled" and day_of(t.get("settled")) == today]
+        held = [t for t in trades if t["status"] in {"resting", "filled"}]
+        if not today_rows and not settled_rows and not held:
+            return ""
+        markets: dict[str, SimMarket] = {}
+        if held:
+            try:
+                markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
+            except Exception as error:  # the report still goes; the open positions just carry no mark
+                LOG.warning("report: markets unavailable: %s", clean_error(error) or type(error).__name__)
+        marks = self.sim_marks(markets, now_ms)
+        money = lambda x: ("+$" if x >= 0 else "−$") + f"{abs(x):,.2f}"
+        wl = lambda r: f"赢 {r['wins']} 输 {r['losses']}" + (f" 平 {r['ties']}" if r["ties"] else "")
+        day, total, done = summary_of(today_rows, marks), summary_of(trades, marks), summary_of(settled_rows)
+        lifetime, makers = sim_stats(trades), sim_maker_efficiency(trades)
+        body = []
+        if today_rows:
+            ways = "、".join(f"{name} {n} 笔" for name, n in (("挂单", sum(bool(t.get("maker")) for t in today_rows)),
+                                                             ("吃单", sum(not t.get("maker") for t in today_rows))) if n)
+            body.append(f"今天下单 {day['records']} 笔（{ways}）｜{day['markets']} 个市场｜成交 {day['filled']:g} 份 ${day['volume']:,.2f}")
+            body.append("今天最多：" + "、".join(f"{r['name']} {r['records']} 笔" for r in sim_by_item(today_rows)[:3]))
+        else:
+            body.append("今天没有下单")
+        body.append(f"今天结算 {done['settled']} 笔：{wl(done)}｜盈亏 {money(done['pnl'])}" if done["settled"] else "今天没有结算")
+        held = f"持仓 {total['open']} 笔 成本 ${total['open_cost']:,.2f}"
+        if total["marked"]:
+            held += f"｜浮动 {money(total['unrealized'])}（按盘口中间价，{total['marked']} 笔有报价）"
+        if total["resting"]:
+            held += f"｜挂单中 {total['resting']}"
+        body.append(held)
+        body.append(f"累计 结算 {lifetime['settled']} 笔 {wl(lifetime)}｜盈亏 {money(lifetime['pnl'])}"
+                    + (f"｜收益率 {lifetime['roi'] * 100:+.1f}%" if lifetime["cost"] else ""))
+        if makers["fill_rate"] is not None:
+            body.append(f"挂单成交率 {makers['fill_rate'] * 100:.0f}%（{makers['placed']} 笔挂单；已结束的里有成交的占比）")
+        if self.config.web_port and self.web_token:
+            body.append(f"复盘页：{self.web_url()}/journal")
+        title = "交易日报" if self.sim_has_real() else "模拟交易日报"
+        return "\n".join([f"📒 {bold(title)} {today:%m-%d} {WEEKDAYS[today.weekday()]}", *tree(body)])
 
     def auction_text(self, label: str, items: list[tuple[str, CloseOdds | str]], now_ms: int) -> str:
         lines = [f"🔔 {bold(label + ' 开始')}", "竞价最后几分钟的价格基本就是收盘价，涨跌大体已定："]
@@ -15453,6 +15837,10 @@ class Bot:
             await self.auction_reminders(now_ms)
         except Exception as error:  # a reminder must never block price alerts
             self.log_limited("auction", f"集合竞价提醒失败：{clean_error(error)}")
+        try:
+            await self.daily_report(now_ms)
+        except Exception as error:  # the day's report must never block price alerts
+            self.log_limited("report", f"交易日报失败：{clean_error(error)}")
         try:
             await self.plan_alerts(collected, settings, threshold)
         finally:
