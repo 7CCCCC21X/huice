@@ -101,6 +101,15 @@ async def run():
     # the list rows are light (1.59.1): the whole record comes when a trade is opened (?id=) and for the exports (?full=1)
     assert all("entry" not in t and "fills" not in t for t in data["trades"]) and data["more"] == 0 and data["mode"] == "paper" and data["history"] == 300
     assert [r["name"] for r in data["recent"]] == ["今天", "近 7 天"] and data["recent"][0]["settled"] == data["total"]["settled"] > 0
+    # 1.80.0: the daily summary — per day the records were opened on, by kind and way under each, and 累计
+    s = data["summary"]
+    assert [r["label"] for r in s] == ["10-05 周一", "10-04 周日", "累计"], [r["label"] for r in s]
+    assert s[0]["records"] == 5 and s[0]["markets"] == 3 and s[0]["settled"] == 3 and s[0]["open"] == 0 and s[0]["resting"] == 1 and s[0]["filled"] == 430 and abs(s[0]["volume"] - 251.23) < 1e-6, s[0]
+    assert [p["name"] for p in s[0]["parts"]] == ["指数/个股日涨跌", "反超", "挂单", "吃单"], [p["name"] for p in s[0]["parts"]]
+    assert sum(p["records"] for p in s[0]["parts"][:2]) == 5 and sum(p["records"] for p in s[0]["parts"][2:]) == 5
+    assert s[1]["records"] == 1 and s[1]["losses"] == 1 and abs(s[1]["pnl"] + 50) < 1e-9 and s[1]["parts"][0]["name"] == "指数/个股日涨跌"
+    assert s[-1]["day"] == "" and s[-1]["records"] == 6 and abs(s[-1]["pnl"] - data["total"]["pnl"]) < 1e-9 and s[-1]["settled"] == data["total"]["settled"]
+    assert m.sim_summary([]) == [] and 'id="summary"' in web.route("GET", f"/p/{TOKEN}/journal")[2].decode() and "jrnsum" in m.JOURNAL_PAGE
     status, _, body = web.route("GET", f"/p/{TOKEN}/journal.json", "full=1")
     full = json.loads(body)
     assert status == 200 and len(full["trades"]) == 6 and sum("entry" in t for t in full["trades"]) == 5 and full["more"] == 0

@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.79.0"
+VERSION = "1.80.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7808,6 +7808,44 @@ def sim_sources(trades: list[dict]) -> list[dict]:
     return sorted(out.values(), key=lambda r: (-r["cost"], -r["trades"], r["source"]))
 
 
+def summary_of(rows: list[dict]) -> dict:
+    """One summary line over ``rows``: the records, the distinct markets, the shares and money filled, the settled ones
+    (with their result split and P&L), the positions still open and what they cost."""
+    done = [t for t in rows if t.get("status") == "settled"]
+    filled = [t for t in rows if float(t.get("shares") or 0) > 0]
+    held = [t for t in filled if t.get("status") in {"filled", "resting"}]
+    return {"records": len(rows), "markets": len({str(t.get("market") or "") for t in rows}),
+            "filled": sum(float(t["shares"]) for t in filled), "volume": sum(float(t["price"]) * float(t["shares"]) for t in filled),
+            "settled": len(done), "wins": sum(t["payout"] == 1 for t in done), "losses": sum(t["payout"] == 0 for t in done),
+            "ties": sum(0 < t["payout"] < 1 for t in done), "pnl": sum((float(t["payout"]) - float(t["price"])) * float(t["shares"]) for t in done),
+            "open": len(held), "open_cost": sum(float(t["price"]) * float(t["shares"]) for t in held),
+            "resting": sum(t.get("status") == "resting" for t in rows)}
+
+
+def sim_summary(trades: list[dict], days: int = 14) -> list[dict]:
+    """The review page's daily summary: one line per Beijing day the records were opened on (the latest ``days`` days
+    that have any, newest first) and one over every day (累计) — summary_of each, with the same figures per market kind
+    and per way (挂单 / 吃单) as ``parts`` under it."""
+    def day_of(t: dict) -> dt.date:
+        return dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date()
+
+    def parts(rows: list[dict]) -> list[dict]:
+        out = [{"name": name, **summary_of([t for t in rows if t.get("kind") == kind])}
+               for kind, name in SIM_KINDS.items() if any(t.get("kind") == kind for t in rows)]
+        out += [{"name": name, **summary_of([t for t in rows if bool(t.get("maker")) == maker])}
+                for name, maker in (("挂单", True), ("吃单", False)) if any(bool(t.get("maker")) == maker for t in rows)]
+        return out
+
+    by_day: dict[dt.date, list[dict]] = {}
+    for t in trades:
+        by_day.setdefault(day_of(t), []).append(t)
+    out = [{"day": day.isoformat(), "label": f"{day:%m-%d} {WEEKDAYS[day.weekday()]}", **summary_of(rows), "parts": parts(rows)}
+           for day, rows in sorted(by_day.items(), reverse=True)[:days]]
+    if trades:
+        out.append({"day": "", "label": "累计", **summary_of(trades), "parts": parts(trades)})
+    return out
+
+
 # --- markouts: where the market goes after a fill (a fill that is followed by a fall was someone else's exit) ---------
 MARKOUT_HORIZONS = ((60, "1m"), (300, "5m"), (1800, "30m"))
 
@@ -8996,6 +9034,7 @@ a{color:var(--best)}.mut{color:var(--muted)}.small{font-size:12.5px}.warn{color:
 .box p{margin:4px 0}
 .tbl{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
 table{border-collapse:collapse;font-size:12.5px;width:100%;font-variant-numeric:tabular-nums}
+.tbl tr.sub td{color:var(--muted)}.tbl tr.sub td:first-child{padding-left:22px}.tbl tr.all td{font-weight:700;border-top:2px solid var(--line)}
 td,th{border-bottom:1px solid var(--line2);padding:6px 10px;text-align:left;vertical-align:top;white-space:nowrap}
 th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;background:var(--chip)}tr:last-child td{border-bottom:0}tr:hover td{background:var(--chip)}td.wrap{white-space:normal;min-width:160px}
 .filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:12px 0 8px}
@@ -9027,6 +9066,8 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
 <div class="tiles" id="tiles"></div>
+<section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
+<div class="body" id="sumbody"><div class="tbl" id="summary"></div><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；每天下面按市场类型和挂/吃拆开。</p></div></section>
 <section class="box" id="statsbox"><div class="hd" id="statshd"><h2>统计与风险</h2><span class="sum" id="statsum"></span><button type="button" class="lnk" id="foldstats">展开</button></div>
 <div class="body" id="statsbody" hidden><div id="stats"></div>
 <h3 id="h-groups" hidden>分组</h3><div class="tbl" id="groups" hidden></div>
@@ -9068,6 +9109,7 @@ const PAGE=50;  // rows shown at a time; the rest on request
 let data=null,stateF="all",wayF="all",kindF="all",openId=decodeURIComponent(location.hash.slice(1)||""),shown=PAGE,allLoaded=false,statsOpen=false;
 const details={};  // trade id -> its whole record, fetched when the trade is opened
 try{statsOpen=localStorage.getItem("jrnstats")==="1"}catch(e){}
+let sumOpen=true;try{sumOpen=localStorage.getItem("jrnsum")!=="0"}catch(e){}  // the daily summary: open unless folded by hand
 const base=location.pathname.replace(/\/journal\/?$/,"");
 document.getElementById("back").href=base;document.getElementById("ctl").href=base+"/control";
 document.getElementById("csv").href=base+"/journal.csv";document.getElementById("json").href=base+"/journal.json?full=1";  // also right under /journal/
@@ -9172,6 +9214,19 @@ async function loadDetail(id){  // one trade's whole record (its snapshots, sour
   catch(e){details[id]={id:id,error:e.message}}
   finally{loadDetail.busy=null}
   if(openId===id)render()}
+function summary(){  // per day the records were opened on: records, markets, what filled, what settled and its P&L, what is open — by kind and way under each
+  const rows=data.summary||[],el=document.getElementById("summary"),head=document.getElementById("sumsum");el.replaceChildren();
+  if(!rows.length){el.append($("p","small mut","还没有交易"));head.textContent="";document.getElementById("sumbody").hidden=!sumOpen;return}
+  const t=$("table"),h=$("tr");["日期 / 类别","记录","市场","成交份数","成交额","已结算","盈亏","持仓中"].forEach(x=>h.append($("th","",x)));t.append(h);
+  const cell=(v,cls)=>{const c=$("td","",v);if(cls)c.className=cls;return c};
+  const wl=r=>r.settled+"（赢 "+r.wins+" 输 "+r.losses+(r.ties?" 平 "+r.ties:"")+"）";
+  const line=(r,name,cls)=>{const tr=$("tr",cls);tr.append(cell(name),cell(r.records),cell(r.markets),cell(num(r.filled)),cell(usd(r.volume)),cell(r.settled?wl(r):"—"),
+    cell(r.settled?money(r.pnl):"—",r.settled?(r.pnl>=0?"ok":"bad"):""),cell((r.open?r.open+"（"+usd(r.open_cost)+"）":"")+(r.resting?(r.open?" · ":"")+"挂单 "+r.resting:"")||"—"));return tr};
+  rows.forEach(r=>{t.append(line(r,r.label,r.day?"":"all"));if(r.day)(r.parts||[]).forEach(p=>t.append(line(p,p.name,"sub")))});
+  el.append(t);
+  const d=rows[0];head.replaceChildren(d.label+"：记录 "+d.records+" · 成交 "+usd(d.volume)+(d.settled?" · 盈亏 ":""));
+  if(d.settled){const b=$("b","",money(d.pnl));b.className=d.pnl>=0?"ok":"bad";head.append(b)}
+  document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"}
 function tiles(){  // today, the last 7 days, the lifetime, what is open: the four numbers a glance needs
   const s=data.total,el=document.getElementById("tiles"),rc={};(data.recent||[]).forEach(r=>{rc[r.name]=r});
   const tile=(k,v,sub,cls)=>{const x=$("div","tile");x.append($("div","k",k));const vv=$("div","v",v);if(cls)vv.className+=" "+cls;x.append(vv);if(sub)x.append(typeof sub==="string"?$("div","s",sub):sub);return x};
@@ -9236,7 +9291,7 @@ function foot(){document.getElementById("foot").textContent=data.live?"真实订
 function render(){
   if(!data)return;
   const name=data.live?"交易复盘":"模拟交易复盘";document.getElementById("title").textContent=name;document.title=name;
-  tiles();stats();filters();foot();
+  tiles();summary();stats();filters();foot();
   const st=(STATES.find(s=>s[0]===stateF)||STATES[0])[2];
   const all=data.trades.filter(t=>st(t)&&(wayF==="all"||(wayF==="maker")===!!t.maker)&&(kindF==="all"||t.kind===kindF)),page=all.slice(0,shown);
   const byDay=new Map();all.forEach(t=>{const k=dayKey(t.opened);if(!byDay.has(k))byDay.set(k,[]);byDay.get(k).push(t)});
@@ -9271,6 +9326,8 @@ async function load(){  // the list: light rows, the open trades and the last fe
   catch(err){alert("导出失败："+err.message)}})});
 document.getElementById("statshd").addEventListener("click",()=>{statsOpen=!statsOpen;try{localStorage.setItem("jrnstats",statsOpen?"1":"0")}catch(e){}
   document.getElementById("statsbody").hidden=!statsOpen;document.getElementById("foldstats").textContent=statsOpen?"收起":"展开"});
+document.getElementById("sumhd").addEventListener("click",()=>{sumOpen=!sumOpen;try{localStorage.setItem("jrnsum",sumOpen?"1":"0")}catch(e){}
+  document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"});
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
 const THEMES={auto:["◐","自动"],light:["☀","浅色"],dark:["☾","深色"]};let theme="auto";try{const t=JSON.parse(localStorage.getItem("theme"));if(typeof t==="string"&&Object.prototype.hasOwnProperty.call(THEMES,t))theme=t}catch(e){}
 function applyTheme(){const r=document.documentElement;if(theme==="auto")delete r.dataset.theme;else r.dataset.theme=theme;const b=document.getElementById("theme");b.textContent=THEMES[theme][0]+" "+THEMES[theme][1];b.title="主题："+THEMES[theme][1]+"（点击切换）"}
@@ -14110,6 +14167,7 @@ class Bot:
                 "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
                           for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
                 "groups": sim_groups(values), "sources": sim_sources(values), "blocks": self.sim_blocks(),
+                "summary": sim_summary(values),  # per day the records were opened on, per kind and way under each, and 累计
                 "group_cap": self.config.sim_group_usd, "history": limit, "more": len(rows) - len(shown), "trades": shown}
 
     def journal_trade(self, tid: str) -> dict | None:
