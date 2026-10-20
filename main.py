@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.83.0"
+VERSION = "1.83.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7215,8 +7215,9 @@ class StockRangeMarket(RangeMarket):
 
     def choose(self, rows: list, meta: dict) -> list:
         """Predict lists this question once per deadline ("June 30", "September 30", "December 31": a market each). The card
-        prices one of them: the pinned deadline's (LADDER_DEADLINES) — none when Predict does not list that one, the
-        reason kept in ``pin_missing`` —, else the latest deadline still ahead, else the latest."""
+        prices one of them: the pinned deadline's (LADDER_DEADLINES) — the one market whose title names no date when
+        none names the pinned one, none when Predict does not list it (the reason kept in ``pin_missing``) —, else the
+        latest deadline still ahead, else the latest."""
         if len(rows) <= 1 and not self.deadline_override:
             return list(rows)
         now = int(time.time() * 1000)
@@ -7229,10 +7230,20 @@ class StockRangeMarket(RangeMarket):
             # another deadline's market priced to the pinned date is a wrong price (1.83.0: pinned to 11-30 with only the
             # December market listed, that market was priced to November — 54.26% against 64.65%): none is priced
             pinned = [row for deadline, row in dated if deadline == self.deadline_override]
+            unread = [row for deadline, row in dated if not deadline]
+            if not pinned and len(unread) == 1:
+                # the one market whose title names no date: the pin is its deadline — what LADDER_DEADLINES is for (1.83.1:
+                # 1.83.0 priced nothing then, the pin matching no date it could read)
+                pinned = unread
             day = lambda ms: f"{et_date(ms):%Y-%m-%d}" if ms else "日期未识别"
-            self.pin_missing = "" if pinned else (
-                f"LADDER_DEADLINES 钉的截止日 {day(self.deadline_override)} 在 Predict 上没有对应的市场（列出的截止日："
-                + ("、".join(day(d) for d in sorted({d for d, _ in dated})) or "无") + "），暂不定价")
+            if pinned:
+                self.pin_missing = ""
+            elif unread:
+                self.pin_missing = (f"LADDER_DEADLINES 钉的截止日 {day(self.deadline_override)}：Predict 上有 {len(unread)} 个市场的标题读不出"
+                                    "截止日，分不清钉的是哪一个，暂不定价")
+            else:
+                self.pin_missing = (f"LADDER_DEADLINES 钉的截止日 {day(self.deadline_override)} 在 Predict 上没有对应的市场（列出的截止日："
+                                    + ("、".join(day(d) for d in sorted({d for d, _ in dated})) or "无") + "），暂不定价")
             return pinned[:1]
         ahead = [pair for pair in dated if pair[0] >= now]
         return [max(ahead or dated, key=lambda pair: pair[0])[1]]

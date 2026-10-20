@@ -1696,10 +1696,50 @@ async def send_rechecks():
         if case == "same":  # the fair price where it was: the limit still leaves the edge, the order goes out at it
             assert len(created(bot)) == 1 and created(bot)[0]["pricePerShare"] == str(58 * 10 ** 16) and bot.sim_trades()[tid]["live"]["state"] == "open"
             continue
+        if case == "stale":  # 1.83.1: nothing to judge it on is no ground to fail it — it waits, its side not backed off
+            t = bot.sim_trades()[tid]
+            assert not created(bot) and t["live"]["state"] == "pending" and "没有新鲜盘口可复核" in t["live"]["last_error"], t["live"]
+            assert (HSI_SLUG, "up") not in bot.live_backoff
+            continue
         t = bot.sim_trades()[f"{tid}#1"]
         assert not created(bot) and t["live"]["final"] == "failed", (case, t["live"])
-        assert {"moved": "公平价变了：限价 58.0¢ 已高于现在的封顶价", "stale": "现在没有新鲜盘口可复核",
+        assert {"moved": "公平价变了：限价 58.0¢ 已高于现在的封顶价",
                 "held": "卡片暂不建议（测试暂不建议），5 秒前的吃单决定作废"}[case] in t["note"], (case, t["note"])
+    # 1.83.1: a decision on a book 89 s old, its sign-in taking 1.5 s — the book is past PREDICT_STALE_MS at the re-check:
+    # the order waits (it used to fail, its side backed off for 300 s), goes out once a fresh book still allows its limit,
+    # and is given up only when the decision itself is too old to send
+    for later, sent in ((mkt(0.70, NOW + 5_000), True), (None, False)):
+        bot = make_bot(SIM_WAYS="taker")
+        await bot.live_prepare(); await bot.live_prefetch(NOW)
+        async def slow(bot=bot): bot.market.now += 1_500
+        bot.live.api.ensure_auth = slow
+        await step(bot, NOW, mkt(0.70, NOW, NOW - 89_000))
+        t = bot.sim_trades()[tid]
+        assert not created(bot) and t["live"]["state"] == "pending" and (HSI_SLUG, "up") not in bot.live_backoff, t["live"]
+        bot.live.api.ensure_auth = up
+        notes = sum("没有新鲜盘口可复核" in e["what"] for e in t["live"]["events"])
+        if later is not None:
+            await step(bot, NOW + 5_000, later)
+            assert len(created(bot)) == 1 and bot.sim_trades()[tid]["live"]["state"] == "open"
+            continue
+        for at in (NOW + 5_000, NOW + 40_000, NOW + 80_000):  # no fresh book comes: it waits, noted once...
+            await step(bot, at, mkt(0.70, at, NOW - 89_000))
+        t = bot.sim_trades()[tid]
+        assert t["live"]["state"] == "pending" and sum("没有新鲜盘口可复核" in e["what"] for e in t["live"]["events"]) == notes == 1, t["live"]["events"]
+        await step(bot, NOW + 95_000, mkt(0.70, NOW + 95_000, NOW - 89_000))  # ...until the decision is too old to send
+        t = next(v for k, v in bot.sim_trades().items() if k.startswith(tid))
+        assert not created(bot) and t["live"]["final"] == "failed" and "决定已过时" in t["note"], t.get("note")
+    # 1.83.1: pricing the market again fails — the order waits, neither sent nor failed
+    bot = make_bot(SIM_WAYS="taker")
+    await bot.live_prepare(); await bot.live_prefetch(NOW)
+    bot.live.api.ensure_auth = down
+    await step(bot, NOW, mkt(0.70, NOW))
+    bot.live.api.ensure_auth = up
+    def broken(now): raise ValueError("card exploded")
+    bot.sim_markets = broken
+    await bot.live_place_pending(NOW + 5_000)
+    t = bot.sim_trades()[tid]
+    assert not created(bot) and t["live"]["state"] == "pending" and "复核吃单决定时定价出错（card exploded）" in t["live"]["last_error"], t["live"]
     print("SEND_RECHECKS_OK")
 
 

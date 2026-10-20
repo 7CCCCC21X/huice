@@ -231,6 +231,18 @@ async def run():
     assert [r.market_id for r in nov.choose(nov_listed, {**metas, "65": metas["61"]})] == ["65"] and nov.pin_missing == ""  # listed again: priced
     dec = m.StockRangeMarket(m.Store(":memory:"), STRC, m.et_wall_ms(dt.date(2026, 12, 31), 23, 59))
     assert [r.market_id for r in dec.choose(dated, metas)] == ["63"] and [r.market_id for r in dec.choose(dated[2:3], metas)] == ["63"] and dec.pin_missing == ""
+    # 1.83.1: a title naming no date is what the pin is for — the one such market is priced to the pinned date (1.83.0 priced
+    # nothing), beside markets of other dates too; two such cannot be told apart (nothing priced, said why); a title naming
+    # the pinned date wins over one naming none
+    unread = lambda mid: m.LadderRow(D("100"), mid, "STRC hits $100 by the listed date?", None, "", "Will STRC reach $100?")
+    blank = {mid: ({"created_ms": m.et_ms(2026, 6, 18, 0, 16, -4), "question": "", "rules": ""}, 0) for mid in ("71", "72")}
+    assert [r.market_id for r in dec.choose([unread("71")], blank)] == ["71"] and dec.pin_missing == ""
+    assert [r.market_id for r in dec.choose([*dated[:2], unread("71")], {**metas, **blank})] == ["71"] and dec.pin_missing == ""
+    assert dec.choose([unread("71"), unread("72")], blank) == [] and dec.pin_missing == (
+        "LADDER_DEADLINES 钉的截止日 2026-12-31：Predict 上有 2 个市场的标题读不出截止日，分不清钉的是哪一个，暂不定价"), dec.pin_missing
+    assert [r.market_id for r in dec.choose([*dated, unread("71")], {**metas, **blank})] == ["63"] and dec.pin_missing == ""
+    dec.choose([unread("71")], blank); dec.learn([unread("71")], blank)  # the card prices it to the pin: known, nothing held for the pin
+    assert dec.pin_missing == "" and dec.known() and dec.end_ms == m.et_wall_ms(dt.date(2026, 12, 31), 23, 59) and "LADDER_DEADLINES" not in dec.advice_problem(NOW)
     pinned = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "LADDER_DEADLINES": "STRC-100=2026-11-30"}), m.Store(":memory:"), FakeMarket(), None)
     assert pinned.ranges["STRC-100"].end_ms == m.et_wall_ms(dt.date(2026, 11, 30), 23, 59)
 

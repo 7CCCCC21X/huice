@@ -1346,11 +1346,8 @@ class LiveBot(core.Bot):
                 if hold := self.live_send_hold(now_ms):
                     self.live_defer(tid, trade, hold, now_ms)  # waits (pending) rather than failing: the condition passes by itself
                     continue
-                why = self.live_send_block(trade, trades, now_ms)  # judged with every pending record counted (live_reserved)
-                if why:
-                    self.live_fail(tid, trade, f"未下单：{why}", now_ms)
-                    continue
-                sending.append((tid, trade))
+                if self.live_send_gate(tid, trade, trades, now_ms, now_ms):  # judged with every pending record counted (live_reserved)
+                    sending.append((tid, trade))
         # side by side (the API gate bounds them): two orders after a close took 4 s one after the other
         await asyncio.gather(*(self.live_place(tid, trade, now_ms) for tid, trade in sending))
 
@@ -1399,7 +1396,7 @@ class LiveBot(core.Bot):
             return f"今日已结算亏损 {money(pnl)} 已达 LIVE_MAX_DAILY_LOSS_USD ${cap:g}"  # recomputed now, not a flag saved a step ago
         if not self.live.ready:
             return f"真实交易未就绪：{self.live.not_ready_why}"
-        decided = int((st.get("events") or [{}])[0].get("at") or trade.get("opened") or now_ms)
+        decided = self.live_decided(trade, now_ms)
         if now_ms - decided > self.LIVE_DECISION_MAX_MS:
             return f"决定已过时（{(now_ms - decided) // 1000} 秒前的盘口），不下单"
         notional = float((st.get("want") or {}).get("shares") or trade.get("order") or 0) * self.live_unit_cap(trade)
@@ -1411,30 +1408,52 @@ class LiveBot(core.Bot):
         usd = self.live.usd()
         if usd is not None and usd < notional:
             return f"USDT 余额 ${usd:,.2f} 不足本单 ${notional:,.2f}"
-        if not trade.get("maker"):
-            return self.live_taker_recheck(trade, now_ms, decided)
         return ""
+
+    @staticmethod
+    def live_decided(trade: dict, default: int) -> int:
+        """When the record's order was decided (its first event), on the bot's clock."""
+        return int(((trade.get("live") or {}).get("events") or [{}])[0].get("at") or trade.get("opened") or default)
+
+    def live_send_gate(self, tid: str, trade: dict, trades: dict[str, dict], now_ms: int, at_ms: int) -> bool:
+        """Whether a pending order goes out now, judged right before it is signed (at ``at_ms``): blocked (live_send_block)
+        it fails; a taker the book now voids fails too; one that cannot be judged now waits, pending, until it can or
+        its decision is too old to send (live_taker_recheck). True to send."""
+        if why := self.live_send_block(trade, trades, at_ms):
+            self.live_fail(tid, trade, f"未下单：{why}", now_ms)
+            return False
+        why, wait = self.live_taker_recheck(trade, at_ms)
+        if why and wait:
+            self.live_defer(tid, trade, why, now_ms)
+        elif why:
+            self.live_fail(tid, trade, f"未下单：{why}", now_ms)
+        return not why
 
     LIVE_TAKER_RECHECK_MS = 1_000  # a taker decided longer ago than this (held by a cooldown, a sign-in) is priced again before it goes out
 
-    def live_taker_recheck(self, trade: dict, now_ms: int, decided: int) -> str:
-        """Why a taker decided a while ago — held by a cooldown or a sign-in, up to LIVE_DECISION_MAX_MS — is not sent:
-        its limit over the cap the fair price allows now, the card holding its suggestion, or no fresh book to judge
-        it on (1.83.0: such an order went out at a limit set on a book up to 90 s old; nothing re-priced a taker before
-        it was sent). "" to send; a decision of this very second (the step's own, the express lane's) is sent as made."""
-        age = now_ms - decided
-        if age <= self.LIVE_TAKER_RECHECK_MS:
-            return ""
-        mk = next((x for x in self.sim_markets_for(str(trade.get("key") or ""), now_ms) if x.market == trade.get("market")), None)
+    def live_taker_recheck(self, trade: dict, now_ms: int) -> tuple[str, bool]:
+        """(why, wait) for a taker decided a while ago — held by a cooldown or a sign-in, up to LIVE_DECISION_MAX_MS —
+        priced again before it is sent (1.83.0: such an order went out at a limit set on a book up to 90 s old). Its
+        decision is void when its limit is over the cap the fair price allows now or the card holds its suggestion;
+        it waits (``wait``) when it cannot be judged now — no fresh book, the market not priced, its pricing failing:
+        1.83.0 failed it then, and its side sat out LIVE_RETRY_SECONDS for a book a second past PREDICT_STALE_MS.
+        ("", False) to send; a decision of this very second (the step's own, the express lane's) is sent as made."""
+        age = now_ms - self.live_decided(trade, now_ms)
+        if trade.get("maker") or age <= self.LIVE_TAKER_RECHECK_MS:
+            return "", False
+        try:
+            mk = next((x for x in self.sim_markets_for(str(trade.get("key") or ""), now_ms) if x.market == trade.get("market")), None)
+        except Exception as error:  # the order waits; a pricing failure is no ground to send it, nor to fail it
+            return f"复核吃单决定时定价出错（{core.clean_error(error) or type(error).__name__}），等下一轮", True  # one note per cause (live_defer)
         if mk is None or mk.book.stale(now_ms) or core.book_crossed(mk.book):
-            return f"吃单决定已是 {age // 1000} 秒前，现在没有新鲜盘口可复核"
+            return "吃单决定之后还没有新鲜盘口可复核，等新盘口", True
         if mk.hold:
-            return f"卡片暂不建议（{mk.hold}），{age // 1000} 秒前的吃单决定作废"
+            return f"卡片暂不建议（{mk.hold}），{age // 1000} 秒前的吃单决定作废", False
         bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
         cap, limit = self.sim_taker_cap(mk, str(trade.get("side") or "up"), bps), self.live_unit_cap(trade)
         if cap <= 0 or limit > cap + 1e-9:
-            return f"公平价变了：限价 {core.cents(limit)} 已高于现在的封顶价 {core.cents(cap)}，{age // 1000} 秒前的吃单决定作废"
-        return ""
+            return f"公平价变了：限价 {core.cents(limit)} 已高于现在的封顶价 {core.cents(cap)}，{age // 1000} 秒前的吃单决定作废", False
+        return "", False
 
     async def live_place(self, tid: str, trade: dict, now_ms: int) -> None:
         """Build, sign and send the order of a pending record — once: the express lane and the step may both find it
@@ -1466,11 +1485,11 @@ class LiveBot(core.Bot):
             await self.live.api.ensure_auth()  # a sign-in failure is "not sent", never "result unknown"
         except Exception as error:
             return self.live_defer(tid, trade, f"登录失败：{core.clean_error(error) or type(error).__name__}", now_ms)
-        # the sign-in may have taken seconds: what was checked before it (the mode, the pauses, the stops, the caps) is
-        # checked again on what holds now — a LIVE=off / pause or an emergency stop set meanwhile sends nothing (1.83.0:
-        # the order went out, and with LIVE=off it then rested untouched)
-        if why := self.live_send_block(trade, self.sim_trades(), self.market.now_ms()):
-            return self.live_fail(tid, trade, f"未下单：{why}", now_ms)
+        # the sign-in may have taken seconds: what was checked before it (the mode, the pauses, the stops, the caps, a
+        # taker's price) is checked again on what holds now — a LIVE=off / pause or an emergency stop set meanwhile sends
+        # nothing (1.83.0: the order went out, and with LIVE=off it then rested untouched)
+        if not self.live_send_gate(tid, trade, self.sim_trades(), now_ms, self.market.now_ms()):
+            return
         try:
             shares_wei = to_wei(want["shares"])
             if want["maker"]:
