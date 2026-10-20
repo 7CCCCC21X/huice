@@ -297,4 +297,122 @@ async def run():
     await web.stop()
 
 asyncio.run(run())
+
+
+async def market_lists():
+    """1.83.0: a category of more than a page of markets is read whole (a full GraphQL page brings the REST category's
+    markets beside it), and a category's list is read again every PREDICT_LIST_SECONDS — a level or a deadline added later
+    shows up, the known markets kept beside the new ones; a failed re-read keeps the list."""
+    feed = m.PredictFeed(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}))
+    node = lambda i: {"node": {"id": str(i), "conditionId": f"0x{i}", "title": f"${i}k", "question": f"q{i}"}}
+    world = {"graph": [node(i) for i in range(1, 21)], "rest": [{"id": i, "conditionId": f"0x{i}", "title": f"${i}k"} for i in range(1, 26)], "down": False}
+    calls = []
+    async def fetch(url, payload=None):
+        calls.append(url)
+        if world["down"]:
+            raise m.RemoteError("网络错误 (TimeoutError)")
+        if url == m.PREDICT_GRAPHQL:
+            if "id" in payload["variables"]:
+                return {"data": {"category": {"id": "7", "__typename": "MultiCategory"}}}
+            assert f"first: {m.PREDICT_MARKETS_PAGE}" in payload["query"]
+            return {"data": {"markets": {"edges": world["graph"]}}}
+        if url.endswith("/categories/ladder"):
+            return {"success": True, "data": {"id": 7, "markets": world["rest"]}}
+        raise AssertionError(url)
+    feed.fetch = fetch
+    found = await feed.resolve_all("ladder")
+    assert [x["id"] for x in found] == [str(i) for i in range(1, 26)] and found[0]["question"] == "q1", found[:2]  # the page's own records first
+    assert sum(u.endswith("/categories/ladder") for u in calls) == 1
+    calls.clear()
+    world["graph"] = [node(i) for i in range(1, 6)]  # under a page: GraphQL alone, no REST read
+    feed.market_lists.clear()
+    assert len(await feed.resolve_all("ladder")) == 5 and not any(u.endswith("/categories/ladder") for u in calls)
+    world["graph"] = [node(i) for i in range(1, 7)]  # a level added: seen at the next read, not before
+    assert len(await feed.resolve_all("ladder")) == 5  # within PREDICT_LIST_SECONDS: the list read last
+    feed.market_lists["ladder"] = (feed.market_lists["ladder"][0], m.time.monotonic() - m.PREDICT_LIST_SECONDS - 1)
+    assert [x["id"] for x in await feed.resolve_all("ladder")] == [str(i) for i in range(1, 7)]
+    world["graph"] = [node(i) for i in range(2, 7)]  # one dropped from the answer: kept (its book says what became of it)
+    feed.market_lists["ladder"] = (feed.market_lists["ladder"][0], m.time.monotonic() - m.PREDICT_LIST_SECONDS - 1)
+    assert sorted(int(x["id"]) for x in await feed.resolve_all("ladder")) == [1, 2, 3, 4, 5, 6]
+    world["down"] = True  # a failed re-read: the list stands, asked again in a minute
+    feed.market_lists["ladder"] = (feed.market_lists["ladder"][0], m.time.monotonic() - m.PREDICT_LIST_SECONDS - 1)
+    assert len(await feed.resolve_all("ladder")) == 6
+    assert m.PREDICT_LIST_SECONDS - (m.time.monotonic() - feed.market_lists["ladder"][1]) <= m.PREDICT_MISS_SECONDS + 1
+    try:
+        await feed.resolve_all("other"); assert False  # nothing known yet: the failure is the answer
+    except m.RemoteError:
+        pass
+    print("MARKET_LISTS_OK")
+
+
+asyncio.run(market_lists())
+
+
+async def book_order():
+    """1.83.2: a book answer never replaces one asked for later. A key read by the cold round (a slow answer) that turns
+    hot in the next round: the hot round's fresh book stands when the cold answer lands after it (it used to put the
+    book back in time, under a newer read time) — a single market's book and a ladder's level alike; and a failure of
+    the older read does not mark the fresh book as failing."""
+    feed = m.PredictFeed(m.dataclasses.replace(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}), predict_cold_poll=0))
+    plan = {"slow": set(), "fail": set(), "ask": {}}  # market id -> the ask its next book answers with
+    seen = []
+    async def fetch(url, payload=None):
+        if url == m.PREDICT_GRAPHQL:
+            v = payload["variables"]
+            if "id" in v:
+                return {"data": {"category": {"id": v["id"]}}}
+            cid = v["f"]["categoryId"]
+            ids = ["L1", "L2"] if cid == "ladder" else ["m-" + cid]
+            return {"data": {"markets": {"edges": [{"node": {"id": i, "conditionId": "0x" + i, "title": {"L1": "$200M", "L2": "$300M"}.get(i, cid),
+                                                              "question": ""}} for i in ids]}}}
+        if url.endswith("/orderbook"):
+            mid = url.rsplit("/", 2)[-2]
+            ask, slow, fail = plan["ask"].get(mid, "0.58"), mid in plan["slow"], mid in plan["fail"]
+            plan["slow"].discard(mid); plan["fail"].discard(mid)
+            seen.append((mid, ask, slow))
+            await asyncio.sleep(0.2 if slow else 0)
+            if fail:
+                raise m.RemoteError("网络错误 (TimeoutError)")
+            return {"data": {"bids": [["0.50", "100"]], "asks": [[ask, "400"]]}}
+        if "/markets/" in url:
+            return {"data": {"id": url.rsplit("/", 1)[-1], "status": "OPEN", "feeRateBps": 200, "outcomes": [{"name": "Yes", "indexSet": 1}, {"name": "No", "indexSet": 2}]}}
+        raise AssertionError(url)
+    feed.fetch = fetch
+    targets = {"A": "slug-a", "B": "slug-b"}
+    await feed.refresh(targets, force=True, hot={"A"})       # both new: read
+    plan["slow"].add("m-slug-b")
+    await feed.refresh(targets, force=True, hot={"A"})       # B cold-due: the cold round reads it, slowly (asks 0.58)
+    await asyncio.sleep(0.01)
+    plan["ask"]["m-slug-b"] = "0.70"
+    await feed.refresh(targets, force=True, hot={"A", "B"})  # B hot now: read at once, asks 0.70
+    assert feed.books["B"].asks[0][0] == D("0.70")
+    await feed.cold_task
+    assert feed.books["B"].asks[0][0] == D("0.70"), feed.books["B"]  # the older answer landed last: dropped
+    assert [x for x in seen if x[0] == "m-slug-b"] == [("m-slug-b", "0.58", False), ("m-slug-b", "0.58", True), ("m-slug-b", "0.70", False)], seen
+    # the older read failing after the fresh one: no error for a book that is fresh
+    plan["slow"].add("m-slug-b"); plan["fail"].add("m-slug-b")
+    older = asyncio.create_task(feed.refresh_one("B", "slug-b"))
+    await asyncio.sleep(0.01)
+    plan["ask"]["m-slug-b"] = "0.72"
+    assert await feed.refresh_one("B", "slug-b") == 1 and await older == 0
+    assert feed.books["B"].asks[0][0] == D("0.72") and "B" not in feed.errors, feed.errors
+    # a ladder's level: the cold round's slow read of L2 lands after the hot round's read of it
+    feed.ladder_keys.add("LAD")
+    assert await feed.refresh_ladder("LAD", "ladder") == 2
+    plan["slow"].add("L2")
+    aged = asyncio.create_task(feed.refresh_ladder("LAD", "ladder", set(), aged=True))  # every level old: L1 and L2, L2 slowly
+    await asyncio.sleep(0.01)
+    plan["ask"]["L2"] = "0.66"
+    assert await feed.refresh_ladder("LAD", "ladder", {"L2"}) == 1  # L2 hot: read at once
+    assert await aged == 2
+    level = lambda mid: next(r for r in feed.ladders["LAD"] if r.market_id == mid)
+    assert feed.ladder_rows["LAD"]["L2"].book.asks[0][0] == D("0.66") and level("L2").book.asks[0][0] == D("0.66"), feed.ladder_rows["LAD"]["L2"]
+    assert level("L1").book is not None and set(feed.row_asked["LAD"]) == {"L1", "L2"}
+    del targets["B"]
+    await feed.refresh(targets, force=True, hot={"A"})
+    assert "B" not in feed.book_asked and "LAD" not in feed.row_asked  # gone with their keys
+    print("BOOK_ORDER_OK")
+
+
+asyncio.run(book_order())
 print("PREDICT_OK")
