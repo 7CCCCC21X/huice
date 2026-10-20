@@ -423,6 +423,29 @@ async def run():
     lbot2 = L.LiveBot(m.Config.from_env({**base, "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64}), lstore, FM(NOW), None)
     assert lbot2.config.live_max_order_usd == 33 and lbot2.live.config.live_max_order_usd == 33
     await web3.stop()
+
+    # 1.83.0: an empty choice over a restricting environment stands — 全部市场 / 不排除 / 全部启用 used to clear the saved value,
+    # and the environment's list came back; the restore link sends null and brings the environment's back on purpose
+    env = {**base, "WEB_CONTROL_KEY": KEY, "SIM_MAKER_DEEP_MARKETS": "HSI", "SIM_SKIP": "BNB", "SOURCES_OFF": "eastmoney", "SIM_WAYS": "taker"}
+    estore = m.Store(":memory:")
+    ebot = m.Bot(m.Config.from_env(env), estore, FM(NOW), None)
+    assert ebot.config.sim_maker_deep_markets == {"HSI"} and ebot.config.sim_skip == {"BNB"} and ebot.config.sources_off == {"eastmoney"}
+    assert m.CONTROL_CLEARABLE == {"SIM_SKIP", "SOURCES_OFF", "SIM_TAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_DEEP_MARKETS", "SIM_MAKER_DEEP_ONLY_MARKETS"}
+    assert ebot.control_set({"SIM_MAKER_DEEP_MARKETS": "sse"})["ok"] and ebot.config.sim_maker_deep_markets == {"SSE"}
+    r = ebot.control_set({"SIM_MAKER_DEEP_MARKETS": "", "SIM_SKIP": "", "SOURCES_OFF": ""})
+    assert r["ok"] and ebot.config.sim_maker_deep_markets == frozenset() and ebot.config.sim_skip == frozenset() and ebot.config.sources_off == frozenset(), r
+    assert "SIM_MAKER_DEEP_MARKETS=（原 SSE）" in r["message"] and "SIM_SKIP=（原 BNB）" in r["message"] and "SOURCES_OFF=（原 eastmoney）" in r["message"], r
+    assert estore.get("control:env") == {"SIM_MAKER_DEEP_MARKETS": "", "SIM_SKIP": "", "SOURCES_OFF": ""}
+    settings = {x["key"]: x for x in ebot.control_payload()["settings"]}
+    assert settings["SIM_SKIP"]["overridden"] and settings["SIM_SKIP"]["saved"] == "" and settings["SIM_SKIP"]["env"] == "BNB" and not settings["SIM_SHARES"]["overridden"]
+    again = m.Bot(m.Config.from_env(env), estore, FM(NOW), None)  # a restart keeps the choice
+    assert again.config.sim_maker_deep_markets == frozenset() and again.config.sim_skip == frozenset() and again.config.sources_off == frozenset()
+    r = ebot.control_set({"SIM_MAKER_DEEP_MARKETS": None, "SOURCES_OFF": None})  # 恢复环境变量
+    assert r["ok"] and ebot.config.sim_maker_deep_markets == {"HSI"} and ebot.config.sources_off == {"eastmoney"} and estore.get("control:env") == {"SIM_SKIP": ""}, r
+    assert ebot.control_set({"SIM_WAYS": ""})["ok"] and ebot.config.sim_ways == "taker" and "SIM_WAYS" not in estore.get("control:env")  # elsewhere "" is the environment's
+    plain = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY}), m.Store(":memory:"), FM(NOW), None)  # no environment list: nothing to stand over
+    assert plain.control_set({"SIM_SKIP": "hsi"})["ok"] and plain.control_set({"SIM_SKIP": ""})["ok"] and plain.store.get("control:env") == {}
+    assert "values:{[s.key]:null}" in m.CONTROL_PAGE and "ds.overridden&&ds.env" in m.CONTROL_PAGE and "s.saved||s.overridden" in m.CONTROL_PAGE
     print("CONTROL_OK")
 
 

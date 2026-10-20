@@ -1496,7 +1496,7 @@ async def expiry_positions():
     async def _empty(*a, **k): return []
     async def _noop(ids): return {"removed": [], "noop": list(ids)}
     tid = f"{HSI_SLUG}|up|吃"
-    for case in ("filled", "unreadable", "none"):
+    for case in ("filled", "unreadable", "cut", "none"):
         bot = make_bot(SIM_WAYS="taker")
         await bot.live_prepare(); fake = bot.live.api
         await bot.live_prefetch(NOW)
@@ -1513,6 +1513,11 @@ async def expiry_positions():
         elif case == "unreadable":
             async def broken(): raise m.RemoteError("HTTP 503")
             fake.positions = broken
+        elif case == "cut":  # 1.83.0: more positions than the pages read — the one it filled may be among the rest
+            async def cut():
+                fake.positions_complete = False
+                return [{"id": "p1", "market": {"id": 999}, "outcome": {"indexSet": 1}, "amount": str(5 * WEI)}]
+            fake.positions = cut
         at = NOW + 300_000 + 600_000 + 5_000
         await step(bot, at, hsi(0.70, [("0.55", "300")], [("0.58", "400")], at))
         trades = bot.sim_trades()
@@ -1523,6 +1528,9 @@ async def expiry_positions():
         elif case == "unreadable":
             t = trades[tid]
             assert t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0 and "持仓读取失败" in t["live"].get("last_error", ""), t["live"]
+        elif case == "cut":
+            t = trades[tid]
+            assert t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0 and "持仓列表没读全" in t["live"].get("last_error", ""), t["live"]
         else:
             t = trades[f"{tid}#1"]
             assert t["live"]["state"] == "done" and any("有效期已过" in e["what"] for e in t["live"]["events"]) and bot.live_reserved(t) == 0, t["live"]
@@ -1553,3 +1561,191 @@ async def latency():
 
 
 asyncio.run(latency())
+
+
+async def risk_caps():
+    """1.83.0: the caps count what a real order may still fill. A taker's LIMIT order is counted whole under SIM_GROUP_USD
+    — every share asked for at its limit plus the fee — not just what the book showed under the cap; an order being
+    cancelled stays counted under the group cap and the after-hours share cap until Predict confirms the cancel."""
+    created = lambda bot: [body["data"] for kind, body in bot.live.api.calls if kind == "create"]
+    shares_of = lambda data: int(data["order"]["takerAmount"]) / WEI
+    # one 50¢ share under the 59¢ cap: the order asks for 100 at 50¢ — $51 with the fee if the rest fills — so a $30 group
+    # cap takes 58 of them (58 × 51¢ = $29.58), not 100 (it used to see the one share: 51¢)
+    thin = lambda at: hsi(0.70, [("0.40", "300")], [("0.50", "1")], at)
+    gbot = make_bot(SIM_WAYS="taker", SIM_GROUP_USD="30")
+    await gbot.live_prepare(); await gbot.live_prefetch(NOW)
+    await step(gbot, NOW, thin(NOW))
+    sent = created(gbot)
+    assert len(sent) == 1 and shares_of(sent[0]) == 58 and sent[0]["pricePerShare"] == str(50 * 10 ** 16), [shares_of(d) for d in sent]
+    gt = gbot.sim_trades()[f"{HSI_SLUG}|up|吃"]
+    assert gt["order"] == 58 and gt["live"]["want"]["shares"] == 58 and abs(gbot.sim_resting_cost(gt) - 0.51) < 1e-9, gt["live"]["want"]
+    # LIVE_TAKER_PRICE=cap: the limit is the 59¢ cap, 59.82¢ a share with the fee — 50 shares; and the next decision on the same
+    # event counts those 50 unfilled shares at 59.82¢ ($29.91), not at the quote's 51¢ ($25.50): no room for a 40¢ share
+    kbot = make_bot(SIM_WAYS="taker", SIM_GROUP_USD="30", LIVE_TAKER_PRICE="cap")
+    await kbot.live_prepare(); await kbot.live_prefetch(NOW)
+    await step(kbot, NOW, thin(NOW))
+    kt = kbot.sim_trades()[f"{HSI_SLUG}|up|吃"]
+    assert kt["order"] == 50 and created(kbot)[0]["pricePerShare"] == str(59 * 10 ** 16) and abs(kt["price"] - 0.51) < 1e-9, kt["order"]
+    assert abs(kbot.sim_resting_cost(kt) - (0.59 + FEE * 0.41)) < 1e-9
+    assert "超过组上限 $30" in m.Bot.sim_group_room(kbot, kbot.sim_trades(), thin(NOW + 5_000), "up", 0.40, 1.0)
+    # on paper nothing changes: the one share fills now, the group cap counts it alone
+    pbot = make_bot(SIM_WAYS="taker", SIM_GROUP_USD="30", LIVE="off")
+    await step(pbot, NOW, thin(NOW))
+    pt = pbot.sim_trades()[f"{HSI_SLUG}|up|吃"]
+    assert pt["status"] == "filled" and pt["shares"] == 1 and pt["order"] == 100 and not created(pbot), pt
+    assert pbot.sim_group_order(thin(NOW), 0.51, 1.0, {"cap": 0.59, "want": 100, "levels": [[0.5, 1]]}) == (0.51, 1.0)
+
+    # --- a resting order withdrawn, its cancel not confirmed: still counted -------------------------------------------------
+    ah = lambda at: dataclasses.replace(hsi(0.70, [("0.55", "300")], [("0.58", "400")], at), in_session=False)
+    abot = make_bot(SIM_WAYS="both", SIM_AFTER_HOURS_MAX_SHARES="100", SIM_GROUP_USD="0")
+    await abot.live_prepare(); afake = abot.live.api
+    await abot.live_prefetch(NOW)
+    await step(abot, NOW, ah(NOW))  # the maker's 100 shares fill the after-hours cap: no taker
+    atid = f"{HSI_SLUG}|up|挂"
+    assert sorted(abot.sim_trades()) == [atid] and abot.sim_trades()[atid]["live"]["state"] == "open", sorted(abot.sim_trades())
+    aoid = abot.sim_trades()[atid]["live"]["order_id"]
+    real_remove, afake.remove_orders = afake.remove_orders, _noop_remove(afake)  # Predict answers "noop": the order still rests
+    abot.control_set({"SIM_WAYS": "taker"})  # the maker is withdrawn (its cancel asked for); takers only from now on
+    await step(abot, NOW + 5_000, ah(NOW + 5_000))
+    await step(abot, NOW + 10_000, ah(NOW + 10_000))
+    trades = abot.sim_trades()
+    w = trades[f"{atid}#1"]
+    assert w["status"] == "cancelled" and w["live"]["state"] == "cancelling" and f"{HSI_SLUG}|up|吃" not in trades, sorted(trades)
+    held = m.side_held(trades, HSI_SLUG, "up")
+    assert held["resting"] == 100 and held["orders"] == 1 and held["cancelling"] == 1 and held["total"] == 100, held
+    assert m.side_held_text(held) == "挂单 1 笔未成交 100 份（其中 1 笔撤单待确认）"
+    assert any(b["id"] == f"{HSI_SLUG}|up|吃" and "其中 1 笔撤单待确认" in b["why"] and "达到上限 100 份" in b["why"] for b in abot.sim_blocks()), abot.sim_blocks()
+    assert not [d for d in created(abot) if d["strategy"] == "LIMIT" and d["order"]["expiration"] == str((NOW + 10_000) // 1000 + 300)]
+    # confirmed at last: the shares are released and the taker goes out
+    afake.remove_orders = real_remove
+    await step(abot, NOW + 40_000, ah(NOW + 40_000))  # 35 s after the first ask: asked again next look...
+    await step(abot, NOW + 45_000, ah(NOW + 45_000))  # ...and confirmed: the record ends, its shares released
+    assert abot.sim_trades()[f"{atid}#1"]["live"]["state"] == "done" and aoid not in afake.open
+    await step(abot, NOW + 50_000, ah(NOW + 50_000))
+    assert abot.sim_trades()[f"{HSI_SLUG}|up|吃"]["live"]["state"] == "open" and m.side_held(abot.sim_trades(), HSI_SLUG, "up")["cancelling"] == 0
+    # the group cap likewise: $60 with a $55 maker being cancelled leaves $5 — eight shares at 58.84¢, not 100
+    cbot = make_bot(SIM_WAYS="both", SIM_GROUP_USD="60")
+    await cbot.live_prepare(); cfake = cbot.live.api
+    await cbot.live_prefetch(NOW)
+    dear = lambda at: hsi(0.70, [("0.55", "300")], [("0.62", "400")], at)  # no taker yet: 62¢ is over the 59¢ cap
+    await step(cbot, NOW, dear(NOW))
+    ctid = f"{HSI_SLUG}|up|挂"
+    assert sorted(cbot.sim_trades()) == [ctid], sorted(cbot.sim_trades())
+    cfake.remove_orders = _noop_remove(cfake)
+    cbot.control_set({"SIM_WAYS": "taker"})
+    await step(cbot, NOW + 5_000, dear(NOW + 5_000))
+    assert cbot.sim_trades()[f"{ctid}#1"]["live"]["state"] == "cancelling"
+    await step(cbot, NOW + 10_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
+    ct = cbot.sim_trades()[f"{HSI_SLUG}|up|吃"]
+    assert ct["order"] == 8 and shares_of(created(cbot)[-1]) == 8, (ct["order"], ct["live"]["want"])
+    print("RISK_CAPS_OK")
+
+
+asyncio.run(risk_caps())
+
+
+async def send_rechecks():
+    """1.83.0: what was checked before the sign-in is checked again after it — a pause, LIVE=off or a stop set while the
+    sign-in ran sends nothing — and a taker held back (a sign-in failure, a cooldown) is priced again before it goes out."""
+    created = lambda bot: [body["data"] for kind, body in bot.live.api.calls if kind == "create"]
+    tid = f"{HSI_SLUG}|up|吃"
+    mkt = lambda fair, at, fetched=None: hsi(fair, [("0.55", "300")], [("0.58", "400")], at if fetched is None else fetched)
+    # /live pause, then LIVE=off, while the order's sign-in is in progress
+    for name, switch in (("pause", lambda bot: bot.live_action("pause", ["测试暂停"], NOW)),
+                         ("off", lambda bot: asyncio.sleep(0, bot.control_set({"LIVE": "off"})))):
+        bot = make_bot(SIM_WAYS="taker")
+        await bot.live_prepare(); await bot.live_prefetch(NOW)
+        async def signing_in(bot=bot, switch=switch):
+            await switch(bot)
+        bot.live.api.ensure_auth = signing_in
+        await step(bot, NOW, mkt(0.70, NOW))
+        t = bot.sim_trades()[f"{tid}#1"]
+        assert not created(bot) and t["live"]["final"] == "failed", (name, created(bot), t["live"])
+        assert ("真实交易已暂停（测试暂停）" if name == "pause" else "LIVE=off，不下单") in t["note"], (name, t["note"])
+        await step(bot, NOW + 5_000, mkt(0.70, NOW + 5_000))
+        assert not created(bot), name  # and nothing after it either
+    # a sign-in that just takes its time sends the order as decided
+    sbot = make_bot(SIM_WAYS="taker")
+    await sbot.live_prepare(); await sbot.live_prefetch(NOW)
+    async def slow(): sbot.market.now += 600  # 0.6 s: under LIVE_TAKER_RECHECK_MS, sent as made
+    sbot.live.api.ensure_auth = slow
+    await step(sbot, NOW, mkt(0.70, NOW))
+    assert len(created(sbot)) == 1 and sbot.sim_trades()[tid]["live"]["state"] == "open"
+    # ...and its timing points are read off the clock as they happen: the 0.6 s the sign-in took is in 决策→发出
+    sst = sbot.sim_trades()[tid]["live"]
+    assert sst["sent_at"] == NOW + 600 and sst["answered_at"] >= NOW + 600 and sbot.live_latency()["send"]["max"] == 0.6, sst
+    lbot = make_bot()  # the median of an even count is the mean of the middle two: 10 s and 90 s give 50 s, not 90 s
+    lbot.sim_save([(f"lat{i}", {"v": 2, "status": "filled", "opened": NOW, "market": "x", "side": "up",
+                               "live": {"sent_at": NOW + d, "answered_at": NOW + d + 100, "want": {"book_ms": NOW}}}) for i, d in enumerate((10_000, 90_000))])
+    lat = lbot.live_latency()
+    assert lat["n"] == 2 and lat["send"] == {"median": 50.0, "max": 90.0} and lat["answer"] == {"median": 0.1, "max": 0.1}, lat
+
+    # --- a taker held back by a failed sign-in, priced again before it goes out --------------------------------------------
+    async def down(): raise m.RemoteError("HTTP 503: sign-in down")
+    async def up(): pass
+    for case, later in (("moved", mkt(0.62, NOW + 5_000)), ("stale", mkt(0.70, NOW + 5_000, NOW - 86_000)),
+                        ("held", dataclasses.replace(mkt(0.70, NOW + 5_000), hold="测试暂不建议")), ("same", mkt(0.70, NOW + 5_000))):
+        bot = make_bot(SIM_WAYS="taker")
+        await bot.live_prepare(); await bot.live_prefetch(NOW)
+        bot.live.api.ensure_auth = down
+        await step(bot, NOW, mkt(0.70, NOW))
+        t = bot.sim_trades()[tid]
+        assert t["live"]["state"] == "pending" and "登录失败" in t["live"]["last_error"] and not created(bot), t["live"]
+        bot.live.api.ensure_auth = up
+        await step(bot, NOW + 5_000, later)
+        if case == "same":  # the fair price where it was: the limit still leaves the edge, the order goes out at it
+            assert len(created(bot)) == 1 and created(bot)[0]["pricePerShare"] == str(58 * 10 ** 16) and bot.sim_trades()[tid]["live"]["state"] == "open"
+            continue
+        t = bot.sim_trades()[f"{tid}#1"]
+        assert not created(bot) and t["live"]["final"] == "failed", (case, t["live"])
+        assert {"moved": "公平价变了：限价 58.0¢ 已高于现在的封顶价", "stale": "现在没有新鲜盘口可复核",
+                "held": "卡片暂不建议（测试暂不建议），5 秒前的吃单决定作废"}[case] in t["note"], (case, t["note"])
+    print("SEND_RECHECKS_OK")
+
+
+asyncio.run(send_rechecks())
+
+
+async def cancel_reads():
+    """1.83.0: a cancel's reads. The open list's fills count even when the removal is confirmed at once (the single-order
+    read may lag the list, or not know a removed order); a removal answered "noop" for an order the list misses but whose
+    own record still says OPEN is asked again, as for one still listed."""
+    tid = f"{HSI_SLUG}|up|挂"
+    mkt = lambda at: hsi(0.70, [("0.55", "300")], [("0.58", "400")], at)
+    for case in ("lagging", "unknown"):
+        bot = make_bot(SIM_WAYS="maker")
+        await bot.live_prepare(); fake = bot.live.api
+        await bot.live_prefetch(NOW)
+        await step(bot, NOW, mkt(NOW))
+        oid = bot.sim_trades()[tid]["live"]["order_id"]
+        stale = json.loads(json.dumps(fake.open[oid]))  # the single-order read as it stood before the fill
+        fake.fill(oid, 20)  # 20 of the 100 filled: the open list shows it
+        async def lagging(oid_, hash_=""): return stale if case == "lagging" else None
+        fake.order = lagging
+        bot.control_set({"SIM_MARKETS": "touch"})  # withdrawn: the removal goes out in this step's sync and is confirmed at once
+        await step(bot, NOW + 5_000, mkt(NOW + 5_000))
+        t = next(t for k, t in bot.sim_trades().items() if k.startswith(tid))
+        assert ("remove", [oid]) in fake.calls and t["live"]["state"] == "done" and t["shares"] == 20, (case, t["shares"], t["live"]["events"])
+        assert t["status"] == "filled" and t["unfilled"] == 80 and abs(bot.live_reserved(t) - 20 * 0.55) < 1e-9, (case, t["status"], bot.live_reserved(t))
+    # "noop", gone from the open list, OPEN by its hash: asked again 30 s on, and once more each 30 s while that holds
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare(); fake = bot.live.api
+    await bot.live_prefetch(NOW)
+    await step(bot, NOW, mkt(NOW))
+    oid = bot.sim_trades()[tid]["live"]["order_id"]
+    fake.remove_orders, fake.orders = _noop_remove(fake), _none_list
+    bot.control_set({"SIM_MARKETS": "touch"})
+    removes = lambda: [c for c in fake.calls if c[0] == "remove"]
+    for at in (NOW + 5_000, NOW + 10_000, NOW + 30_000):
+        await step(bot, at, mkt(at))
+    t = bot.sim_trades()[f"{tid}#1"]
+    assert t["live"]["state"] == "cancelling" and len(removes()) == 1, (t["live"]["state"], removes())
+    await step(bot, NOW + 35_000, mkt(NOW + 35_000))  # 30 s after the first ask
+    await step(bot, NOW + 40_000, mkt(NOW + 40_000))
+    t = bot.sim_trades()[f"{tid}#1"]
+    assert len(removes()) == 2 and any("撤单未获确认，按哈希查到订单仍为 OPEN，再发一次" in e["what"] for e in t["live"]["events"]), (removes(), t["live"]["events"])
+    assert abs(bot.live_reserved(t) - 55.0) < 1e-9  # still reserved in full while it may rest
+    print("CANCEL_READS_OK")
+
+
+asyncio.run(cancel_reads())

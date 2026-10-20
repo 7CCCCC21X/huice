@@ -297,4 +297,53 @@ async def run():
     await web.stop()
 
 asyncio.run(run())
+
+
+async def market_lists():
+    """1.83.0: a category of more than a page of markets is read whole (a full GraphQL page brings the REST category's
+    markets beside it), and a category's list is read again every PREDICT_LIST_SECONDS — a level or a deadline added later
+    shows up, the known markets kept beside the new ones; a failed re-read keeps the list."""
+    feed = m.PredictFeed(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}))
+    node = lambda i: {"node": {"id": str(i), "conditionId": f"0x{i}", "title": f"${i}k", "question": f"q{i}"}}
+    world = {"graph": [node(i) for i in range(1, 21)], "rest": [{"id": i, "conditionId": f"0x{i}", "title": f"${i}k"} for i in range(1, 26)], "down": False}
+    calls = []
+    async def fetch(url, payload=None):
+        calls.append(url)
+        if world["down"]:
+            raise m.RemoteError("网络错误 (TimeoutError)")
+        if url == m.PREDICT_GRAPHQL:
+            if "id" in payload["variables"]:
+                return {"data": {"category": {"id": "7", "__typename": "MultiCategory"}}}
+            assert f"first: {m.PREDICT_MARKETS_PAGE}" in payload["query"]
+            return {"data": {"markets": {"edges": world["graph"]}}}
+        if url.endswith("/categories/ladder"):
+            return {"success": True, "data": {"id": 7, "markets": world["rest"]}}
+        raise AssertionError(url)
+    feed.fetch = fetch
+    found = await feed.resolve_all("ladder")
+    assert [x["id"] for x in found] == [str(i) for i in range(1, 26)] and found[0]["question"] == "q1", found[:2]  # the page's own records first
+    assert sum(u.endswith("/categories/ladder") for u in calls) == 1
+    calls.clear()
+    world["graph"] = [node(i) for i in range(1, 6)]  # under a page: GraphQL alone, no REST read
+    feed.market_lists.clear()
+    assert len(await feed.resolve_all("ladder")) == 5 and not any(u.endswith("/categories/ladder") for u in calls)
+    world["graph"] = [node(i) for i in range(1, 7)]  # a level added: seen at the next read, not before
+    assert len(await feed.resolve_all("ladder")) == 5  # within PREDICT_LIST_SECONDS: the list read last
+    feed.market_lists["ladder"] = (feed.market_lists["ladder"][0], m.time.monotonic() - m.PREDICT_LIST_SECONDS - 1)
+    assert [x["id"] for x in await feed.resolve_all("ladder")] == [str(i) for i in range(1, 7)]
+    world["graph"] = [node(i) for i in range(2, 7)]  # one dropped from the answer: kept (its book says what became of it)
+    feed.market_lists["ladder"] = (feed.market_lists["ladder"][0], m.time.monotonic() - m.PREDICT_LIST_SECONDS - 1)
+    assert sorted(int(x["id"]) for x in await feed.resolve_all("ladder")) == [1, 2, 3, 4, 5, 6]
+    world["down"] = True  # a failed re-read: the list stands, asked again in a minute
+    feed.market_lists["ladder"] = (feed.market_lists["ladder"][0], m.time.monotonic() - m.PREDICT_LIST_SECONDS - 1)
+    assert len(await feed.resolve_all("ladder")) == 6
+    assert m.PREDICT_LIST_SECONDS - (m.time.monotonic() - feed.market_lists["ladder"][1]) <= m.PREDICT_MISS_SECONDS + 1
+    try:
+        await feed.resolve_all("other"); assert False  # nothing known yet: the failure is the answer
+    except m.RemoteError:
+        pass
+    print("MARKET_LISTS_OK")
+
+
+asyncio.run(market_lists())
 print("PREDICT_OK")

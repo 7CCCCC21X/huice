@@ -36,7 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 from dataclasses import dataclass, field
@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.82.0"
+VERSION = "1.83.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4355,6 +4355,8 @@ PREDICT_REWARD_STALE_SECONDS = 120  # allows the normal refresh to finish across
 PREDICT_POINTS_STALE_SECONDS = 3 * PREDICT_META_SECONDS  # other markets' points (read with the fee) are shown this long
 PREDICT_STRIKE_SECONDS = 300   # a known target price is re-read this often (the site may correct it)
 PREDICT_MISS_SECONDS = 60      # an unknown slug is looked up again after this long (new markets show up within a minute)
+PREDICT_LIST_SECONDS = 600     # a category's market list is read again this often: levels and deadlines Predict adds later
+PREDICT_MARKETS_PAGE = 20      # markets per GraphQL page: a category answering this many may hold more (the REST category is read too)
 PREDICT_DEPTH = 20            # levels kept per side: a fill for the trade size is judged on these (a book "too thin" at
 #                               5 levels was often only cut off there), the page and the evidence show the top of them
 PREDICT_SHOW_DEPTH = 10       # levels sent to the page per side (it recomputes the edges for the viewer's trade size)
@@ -4799,11 +4801,24 @@ class PredictFeed:
         return market
 
     async def resolve_all(self, slug: str) -> list[dict] | None:
-        """slug -> every market of the category (a ladder such as $200M / $300M / ...); None = not listed."""
+        """slug -> every market of the category (a ladder such as $200M / $300M / ...); None = not listed. A list is read
+        again every PREDICT_LIST_SECONDS, the markets known before kept beside the new ones — a level or a deadline Predict
+        adds later shows up (1.83.0: a list once read was kept until a restart); a failed re-read keeps the list."""
         cached = self.market_lists.get(slug)
-        if cached and (cached[0] is not None or time.monotonic() - cached[1] < PREDICT_MISS_SECONDS):
+        if cached and time.monotonic() - cached[1] < (PREDICT_LIST_SECONDS if cached[0] is not None else PREDICT_MISS_SECONDS):
             return cached[0]
-        found = await self.find(slug) or None
+        try:
+            found = await self.find(slug) or None
+        except (RemoteError, TimeoutError, OSError):
+            if not cached or cached[0] is None:
+                raise
+            self.market_lists[slug] = (cached[0], time.monotonic() - PREDICT_LIST_SECONDS + PREDICT_MISS_SECONDS)  # again in a minute
+            return cached[0]
+        if cached and cached[0] is not None:
+            merged = {m["id"]: m for m in found or []}
+            for market in cached[0]:
+                merged.setdefault(market["id"], market)
+            found = list(merged.values())
         self.market_lists[slug] = (found, time.monotonic())
         return found
 
@@ -4819,16 +4834,24 @@ class PredictFeed:
                 self.types[slug] = category["__typename"]
             if category.get("id") is not None:
                 data = await self.graphql(
-                    "query($f: MarketFilterInput!) { markets(filter: $f, pagination: { first: 20 }) "
+                    f"query($f: MarketFilterInput!) {{ markets(filter: $f, pagination: {{ first: {PREDICT_MARKETS_PAGE} }}) "
                     "{ edges { node { id conditionId title question } } } }", {"f": {"categoryId": str(category["id"])}})
                 found = predict_markets(data)
         except (RemoteError, TimeoutError, OSError) as error:
             errors.append(clean_error(error))
-        if not found:
+        if not found or len(found) >= PREDICT_MARKETS_PAGE:
+            # nothing from GraphQL — or a full page, which may be the first of several (1.83.0: a category's markets past
+            # the twentieth were never seen): the REST category, its markets added to the page's
             try:
-                found = predict_markets(await self.fetch(f"{PREDICT_REST}/categories/{urllib.parse.quote(slug)}"))
+                rest = predict_markets(await self.fetch(f"{PREDICT_REST}/categories/{urllib.parse.quote(slug)}"))
+                merged = {m["id"]: m for m in found}
+                for market in rest:
+                    merged.setdefault(market["id"], market)
+                found = list(merged.values())
             except (RemoteError, TimeoutError, OSError) as error:
-                if "HTTP 404" not in str(error) and errors:
+                if found:
+                    pass  # the GraphQL page stands
+                elif "HTTP 404" not in str(error) and errors:
                     errors.append(clean_error(error))
                 else:
                     errors.clear()  # GraphQL answered "no such category", or REST did (404)
@@ -7177,6 +7200,7 @@ class StockRangeMarket(RangeMarket):
         self._start, self._end, self.title = int(saved.get("start") or 0), int(saved.get("end") or 0), str(saved.get("title") or "")
         self.failures = {"price": "", "scan": ""}
         self.times = {"price": -1e9, "scan": -1e9}
+        self.pin_missing = ""  # why nothing is priced: the pinned deadline (LADDER_DEADLINES) is not among the markets Predict lists
 
     @property
     def start_ms(self) -> int:
@@ -7191,8 +7215,9 @@ class StockRangeMarket(RangeMarket):
 
     def choose(self, rows: list, meta: dict) -> list:
         """Predict lists this question once per deadline ("June 30", "September 30", "December 31": a market each). The card
-        prices one of them: the pinned deadline's (LADDER_DEADLINES), else the latest deadline still ahead, else the latest."""
-        if len(rows) <= 1:
+        prices one of them: the pinned deadline's (LADDER_DEADLINES) — none when Predict does not list that one, the
+        reason kept in ``pin_missing`` —, else the latest deadline still ahead, else the latest."""
+        if len(rows) <= 1 and not self.deadline_override:
             return list(rows)
         now = int(time.time() * 1000)
         dated = []
@@ -7201,9 +7226,14 @@ class StockRangeMarket(RangeMarket):
             texts = [row.title, row.question, details.get("question", ""), details.get("rules", "")]
             dated.append((deadline_from_text(texts, int(details.get("created_ms") or 0) or now), row))
         if self.deadline_override:
+            # another deadline's market priced to the pinned date is a wrong price (1.83.0: pinned to 11-30 with only the
+            # December market listed, that market was priced to November — 54.26% against 64.65%): none is priced
             pinned = [row for deadline, row in dated if deadline == self.deadline_override]
-            if pinned:
-                return pinned[:1]
+            day = lambda ms: f"{et_date(ms):%Y-%m-%d}" if ms else "日期未识别"
+            self.pin_missing = "" if pinned else (
+                f"LADDER_DEADLINES 钉的截止日 {day(self.deadline_override)} 在 Predict 上没有对应的市场（列出的截止日："
+                + ("、".join(day(d) for d in sorted({d for d, _ in dated})) or "无") + "），暂不定价")
+            return pinned[:1]
         ahead = [pair for pair in dated if pair[0] >= now]
         return [max(ahead or dated, key=lambda pair: pair[0])[1]]
 
@@ -7319,8 +7349,19 @@ class StockRangeMarket(RangeMarket):
         self.scanned_ms = now_ms
         self.store.put(f"range:{self.spec.slug}", hist)
 
+    SESSION_QUOTE_STALE_MS = 30 * 60_000  # in the session, a last trade this old (counted from the open at most) is a stuck feed
+
     def price_stale(self, now_ms: int) -> bool:
-        return now_ms - self.fetched_ms > self.PRICE_STALE_MS
+        """Yahoo stopped answering (PRICE_STALE_MS since the last read), or — while the regular session runs — the trade it
+        answers with is SESSION_QUOTE_STALE_MS old, counted from today's open at most: a feed stuck on an old print, not
+        a quiet market (1.83.0: a 22-hour-old quote read in the session passed as fresh, the read itself being new).
+        Between sessions, and in the session's first half hour, the last trade is the price, however old."""
+        if now_ms - self.fetched_ms > self.PRICE_STALE_MS:
+            return True
+        if not self.priced_ms or us_session_state(now_ms)[0] != "交易中":
+            return False
+        session = us_session(et_date(now_ms))
+        return now_ms - max(self.priced_ms, session[0] if session else 0) > self.SESSION_QUOTE_STALE_MS
 
     def remaining_years(self, now_ms: int) -> float:
         """Trading time left, the running session's remainder scaled by the in-session share of the daily variance (its
@@ -7331,9 +7372,11 @@ class StockRangeMarket(RangeMarket):
         return us_trading_years(max(now_ms, self.start_ms), self.window_end, self.share[0] if self.share else 1.0)
 
     def probability(self, level: D, direction: str, now_ms: int) -> float | None:
-        return super().probability(level, direction, now_ms) if self.known() else None
+        return super().probability(level, direction, now_ms) if self.known() and not self.pin_missing else None
 
     def advice_problem(self, now_ms: int) -> str:
+        if self.pin_missing:
+            return self.pin_missing
         if not self.known():
             return "等待 Predict 的创建时间和截止日期；暂不给建议"
         return super().advice_problem(now_ms)
@@ -7381,12 +7424,16 @@ class StockRangeMarket(RangeMarket):
                              "数据源不同，差几分钱的触及请到 Predict 核实"}
 
     def missing_note(self, now_ms: int) -> str:
+        if self.pin_missing:
+            return self.pin_missing
         if not self.known():
             return "等待 Predict 的创建时间和截止日期" + (f"（标题：{brief_error(self.title, 60)}）" if self.title else "")
         if self.price is None or self.sigma is None:
             return f"等待 Yahoo 行情（{brief_error(self.error, 80)}）" if self.error else "等待 Yahoo 行情"
         if self.price_stale(now_ms) and now_ms < self.window_end:
-            return f"Yahoo 行情停在 {stamp(self.fetched_ms, seconds=False)}，暂停概率（已触及的档位仍算已触及）"
+            if now_ms - self.fetched_ms > self.PRICE_STALE_MS:
+                return f"Yahoo 行情停在 {stamp(self.fetched_ms, seconds=False)}，暂停概率（已触及的档位仍算已触及）"
+            return f"美股交易中，Yahoo 的最新成交还停在 {stamp(self.priced_ms, seconds=False)}，暂停概率（已触及的档位仍算已触及）"
         return ""
 
 
@@ -7502,6 +7549,10 @@ CONTROL_FORMS: dict[str, dict] = {
     "LIVE_AUTO_REDEEM": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
     "LIVE_NOTIFY": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
 }
+# The settings whose empty value is a choice of its own — every market (the detail lists), nothing left out (SIM_SKIP), every
+# quote source on (SOURCES_OFF) — not "the environment's": the page saves it as "" over a non-empty environment value, and
+# its restore link sends null instead (1.83.0: 全部市场 over SIM_MAKER_DEEP_MARKETS=HSI put HSI back)
+CONTROL_CLEARABLE = frozenset(k for k, form in CONTROL_FORMS.items() if form.get("kind") == "detail") | {"SOURCES_OFF"}
 # A resting paper order is placed only on a book it could fill in: both sides quoted, no further apart than this. A lone
 # 0.2¢ bid under an 80¢ ask is not a quote anyone sells into: an order joining it would rest until the result and tell
 # nothing (10-03: 54 such price-ladder orders sat as 挂单中 0/100 for weeks).
@@ -7518,6 +7569,15 @@ def sim_in_flight(trade: Mapping) -> bool:
     """A record whose order may still fill: resting on paper, or a real order not yet at its final word."""
     st = trade.get("live")
     return trade.get("status") == "resting" or (isinstance(st, dict) and st.get("state") in {"pending", "placing", "open", "cancelling", "unknown"})
+
+
+def sim_open_order(trade: Mapping) -> bool:
+    """Whether a record's unfilled shares may still fill, for the caps that count them (SIM_GROUP_USD, the after-hours
+    share cap): resting — on paper or for real — or a real order withdrawn whose cancel Predict has not confirmed yet.
+    A withdrawal changes the record's status at once, but the order on Predict can fill until the cancel is confirmed:
+    its shares stay counted until then, as live_reserved keeps its money (1.83.0: a 100-share order being cancelled
+    let another 100 in under a 100-share cap). A settled or expired market's records hold nothing."""
+    return trade.get("status") == "resting" or (trade.get("status") in {"filled", "cancelled"} and sim_in_flight(trade))
 
 
 def sim_position(trade: Mapping) -> bool:
@@ -7696,14 +7756,17 @@ def side_held(trades: Mapping, market: str, side: str) -> dict:
     flight, at their whole count, and ``orders``, how many such orders; ``total``, the two together — what the cap
     counts. ``deep``, apart: the unfilled shares of the deep-bid orders resting there (SIM_MAKER_DEEP_CENTS, the sweep
     orders too), which are outside the cap — placed whatever the side holds and not counted against it (what they
-    fill is a position, counted). Withdrawn, expired and settled records hold nothing."""
+    fill is a position, counted). Expired and settled records hold nothing; a withdrawn one holds its fills, and while
+    its real order's cancel is not confirmed (sim_open_order) its unfilled shares too — ``cancelling`` counts those
+    orders among ``orders``."""
     positions = resting = deep = 0.0
-    orders = 0
+    orders = cancelling = 0
     for t in trades_of_market(trades, market):
-        if t.get("side") != side or t.get("status") not in {"filled", "resting"}:
+        unfilled = sim_open_order(t)
+        if t.get("side") != side or (t.get("status") not in {"filled", "resting"} and not unfilled):
             continue
         positions += float(t.get("shares") or 0)
-        if t.get("status") == "resting":
+        if unfilled:
             left = max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0)
             if left <= 1e-9:
                 continue
@@ -7712,7 +7775,8 @@ def side_held(trades: Mapping, market: str, side: str) -> dict:
             else:
                 resting += left
                 orders += 1
-    return {"positions": positions, "resting": resting, "orders": orders, "deep": deep, "total": positions + resting}
+                cancelling += t.get("status") != "resting"
+    return {"positions": positions, "resting": resting, "orders": orders, "cancelling": cancelling, "deep": deep, "total": positions + resting}
 
 
 def side_held_text(held: dict) -> str:
@@ -7723,7 +7787,8 @@ def side_held_text(held: dict) -> str:
     if held["positions"] > 1e-9:
         parts.append(f"持仓 {held['positions']:g} 份")
     if held["orders"]:
-        parts.append(f"挂单 {held['orders']} 笔未成交 {held['resting']:g} 份")
+        parts.append(f"挂单 {held['orders']} 笔未成交 {held['resting']:g} 份"
+                     + (f"（其中 {held['cancelling']} 笔撤单待确认）" if held.get("cancelling") else ""))
     text = " + ".join(parts) + (f" = {held['total']:g} 份" if len(parts) > 1 else "") if parts else "没有持仓和挂单"
     if held.get("deep", 0.0) > 1e-9:
         text += f"，另有低价挂单 {held['deep']:g} 份不占额度"  # outside the cap (side_held)
@@ -7995,6 +8060,16 @@ def sim_by_session(trades: list[dict], exchange_of: Any, holidays_of: Any, marks
             for name in SESSION_BUCKETS if name in by]
 
 
+def median(values: Iterable[float]) -> float | None:
+    """The middle of ``values``: the middle one, or the mean of the two middle ones for an even count (1.83.0: waits of
+    10 s and 90 s gave 90 s, the upper one); None for none."""
+    ordered = sorted(values)
+    n = len(ordered)
+    if not n:
+        return None
+    return ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+
+
 def sim_maker_efficiency(trades: list[dict]) -> dict:
     """The resting orders' record: how many were placed, filled whole, filled in part, never filled (expired at the end
     or withdrawn empty) or still rest; the fill rate of the finished ones by count (any fill) and by shares; how long
@@ -8025,7 +8100,7 @@ def sim_maker_efficiency(trades: list[dict]) -> dict:
             "expired": sum(t.get("status") == "expired" for t in unfilled), "cancelled": sum(t.get("status") == "cancelled" for t in unfilled),
             "fill_rate": (len(whole) + len(partial)) / len(ended) if ended else None,
             "share_rate": sum(shares_of(t) for t in ended) / ordered if ordered else None,
-            "wait_n": len(waits), "wait_avg": sum(waits) / len(waits) if waits else None, "wait_median": waits[len(waits) // 2] if waits else None,
+            "wait_n": len(waits), "wait_avg": sum(waits) / len(waits) if waits else None, "wait_median": median(waits),
             "rest_n": len(rests), "rest_avg": sum(rests) / len(rests) if rests else None,
             "reasons": [{"why": why, "n": n} for why, n in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:8]]}
 
@@ -9746,7 +9821,7 @@ function card(s){
   const c=el("div","set");c.dataset.key=s.key;
   const t=el("div","ttl");t.append(el("b","",s.label));
   const now=el("span","now","当前 "+(s.kind==="number"?fmt(s,s.value):s.value)+" ");
-  now.append(s.saved?el("span","badge saved","已保存"):el("span","badge",s.env?"环境变量 "+s.env:"默认值"));
+  now.append(s.saved||s.overridden?el("span","badge saved","已保存"):el("span","badge",s.env?"环境变量 "+s.env:"默认值"));
   if(MAKER_MODES.has(s.key)&&s.value!=="0"&&(data.settings.find(x=>x.key==="SIM_WAYS")||{}).value==="taker")now.append(" ",el("span","badge warn","挂单没开，不生效"));
   t.append(now);c.append(t);
   c.append(el("div","hint",s.hint));
@@ -9766,6 +9841,8 @@ function card(s){
       const items=k=>(data.catalog||[]).filter(x=>x.kind===k&&(spec.mode==="exclude"||!skip.has(String(x.key).toUpperCase())));
       const all=new Set(groups.flatMap(([k])=>items(k).map(x=>String(x.key).toUpperCase())));let any=false;
       if(spec.mode==="include"){const row=el("div","opts");const b=el("button","opt"+(list.size?"":" sel"),"全部市场");b.disabled=!data.enabled;b.title="all";b.addEventListener("click",()=>{if(list.size)save(new Set())});row.append(b);d.append(row)}
+      const ds=data.settings.find(x=>x.key===spec.key)||{};
+      if(ds.overridden&&ds.env){const back=el("button","lnk","恢复环境变量（"+ds.env+"）");back.disabled=!data.enabled;back.addEventListener("click",()=>act({action:"set",values:{[spec.key]:null}}));d.append(back)}
       groups.forEach(([k,name])=>{const its=items(k);if(!its.length)return;any=true;d.append(el("div","grp",name));const row=el("div","opts");
         its.forEach(it=>{const K=String(it.key).toUpperCase();const on=spec.mode==="exclude"?!list.has(K):(!list.size||list.has(K));
           const b=el("button","opt"+(on?" sel":spec.mode==="exclude"?" off":""),it.name+(spec.mode==="exclude"&&!on?"（不做）":""));b.disabled=!data.enabled;b.title=it.key;
@@ -9785,7 +9862,7 @@ function card(s){
     inp.addEventListener("input",()=>{if(inp.value.trim())drafts[s.key]=inp.value;else delete drafts[s.key];mark.style.display=drafts[s.key]?"":"none"});
     const go=el("button","opt","保存");go.disabled=!data.enabled;go.addEventListener("click",async()=>{const v=inp.value.trim();if(v&&await act({action:"set",values:{[s.key]:v}}))delete drafts[s.key]});
     inp.addEventListener("keydown",e=>{if(e.key==="Enter"){go.click();inp.blur()}});cu.append(inp,go,mark)}
-  if(s.saved){const back=el("button","lnk","恢复环境变量");back.disabled=!data.enabled;back.addEventListener("click",()=>act({action:"set",values:{[s.key]:""}}));cu.append(back)}
+  if(s.saved||s.overridden){const back=el("button","lnk","恢复环境变量");back.disabled=!data.enabled;back.addEventListener("click",()=>act({action:"set",values:{[s.key]:null}}));cu.append(back)}
   if(cu.childNodes.length)c.append(cu);
   return c}
 function renderSettings(){if(!data)return;
@@ -14148,19 +14225,31 @@ class Bot:
         driver, name = market_driver(mk.kind, mk.key, mk.settle, mk.item)
         mine = []
         for t in trades_of_driver(trades, driver):
-            if t.get("status") not in {"filled", "resting"}:
+            unfilled = sim_open_order(t)  # resting, or a real order whose cancel is not confirmed yet: it may still fill
+            if t.get("status") not in {"filled", "resting"} and not unfilled:
                 continue
             filled, order = float(t.get("shares") or 0), float(t.get("order") or 0)
             if filled > 0:
                 mine.append({**t, "shares": filled})
-            if t.get("status") == "resting" and order - filled > 0:
-                mine.append({**t, "shares": order - filled, "resting": True})  # the unfilled part: counted where it loses, never as a hedge
+            if unfilled and order - filled > 0:  # the unfilled part: counted where it loses, never as a hedge
+                mine.append({**t, "shares": order - filled, "price": self.sim_resting_cost(t), "resting": True})
+        price, shares = self.sim_group_order(mk, price, shares, taker)
         candidate = {"kind": mk.kind, "side": side, "settle": mk.settle, "price": price, "shares": shares}
         worst, event = group_worst_case([*mine, candidate], name)
         if -worst > cap + 1e-9:
             return (f"{event}时这组仓位合计将亏 ${-worst:,.2f}，超过组上限 ${cap:g}"
                     f"（{name} 已有 {len(mine)} 笔，SIM_GROUP_USD 调整）")
         return ""
+
+    def sim_group_order(self, mk: SimMarket, price: float, shares: float, taker: dict | None = None) -> tuple[float, float]:
+        """(price, shares) of the order the group cap counts: on paper the order as given (a taker fills what its quote
+        shows, now); the real trader counts a taker's whole LIMIT order."""
+        return price, shares
+
+    def sim_resting_cost(self, trade: dict) -> float:
+        """What a share of a record's unfilled part may cost, for the group cap: its price on paper; the real trader
+        counts a taker's limit."""
+        return float(trade.get("price") or 0)
 
     def sim_note_block(self, tid: str, mk: SimMarket, label: str, price: float, why: str, now_ms: int) -> None:
         """Remember a paper buy the group cap refused (per driver, the latest per market and side, a week), so the
@@ -15623,6 +15712,7 @@ class Bot:
                 "enabled": bool(self.config.web_control_key), "mode": "paper", "live": None,
                 "settings": [{"key": key, "label": label, "hint": hint, "value": self.control_value(key),
                               "saved": str(saved.get(key, "")) if isinstance(saved, dict) else "", "env": self.config.env.get(key, ""),
+                              "overridden": isinstance(saved, dict) and key in saved,  # saved, if only as "" (CONTROL_CLEARABLE)
                               **CONTROL_FORMS.get(key, {"kind": "number", "group": "高级", "presets": [], "unit": ""})}
                              for key, label, hint in CONTROL_KEYS],
                 "scope": sim_scope(self.config), "checks": self.sim_checks(now_ms), "catalog": self.sim_catalog(now_ms),
@@ -15652,7 +15742,9 @@ class Bot:
         return await self.live_control(action, data)
 
     def control_set(self, values: dict) -> dict:
-        """Save the settings given (an empty value clears that one), validated together like the environment."""
+        """Save the settings given, validated together like the environment. None clears a saved value (the environment's
+        applies again); so does "" — except for a CONTROL_CLEARABLE setting the environment gives a value: there "" is
+        saved, the empty choice (every market, nothing left out, every source on) standing over the environment's."""
         saved = {k: str(v) for k, v in (self.store.get("control:env") or {}).items() if k in CONTROL_KEY_SET}
         if str(values.get("LIVE") or "").strip().lower() == "on" and not self.config.live_allowed:
             return {"ok": False, "message": "部署变量 LIVE_TRADING_ALLOWED=off 禁止真实下单（硬开关）：不能保存 LIVE=on"}
@@ -15660,14 +15752,19 @@ class Bot:
         for key, _, _ in CONTROL_KEYS:
             if key not in values:
                 continue
+            if values[key] is None:  # 恢复环境变量
+                changed.append(key)
+                saved.pop(key, None)
+                continue
             value = str(values[key]).strip()
             limit = 2000 if CONTROL_FORMS.get(key, {}).get("kind") == "detail" else 200  # a detail list names up to 200 markets
             if value and len(value) > limit:
                 return {"ok": False, "message": f"{key} 太长"}
-            if value != saved.get(key, ""):
-                changed.append(key)
+            changed.append(key)  # the message names those whose value in force changed
             if value:
                 saved[key] = value
+            elif key in CONTROL_CLEARABLE and str(self.config.env.get(key) or "").strip():
+                saved[key] = ""  # chosen over the environment's list: kept, or popping it would bring that list back
             else:
                 saved.pop(key, None)
         unknown = [k for k in values if k not in CONTROL_KEY_SET]
