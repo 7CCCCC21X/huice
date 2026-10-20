@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.81.0"
+VERSION = "1.82.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -457,7 +457,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_SHARES", "盘中吃单每次最多买多少份", "0～1000000：开盘时段的吃单单独按这个份数；0 = 同上一项"),
     ("SIM_TAKER_AFTER_HOURS_SHARES", "盘后吃单每次最多买多少份", "0～1000000：开盘前、收盘后的吃单单独按这个份数；0 = 同盘中吃单的份数"),
     ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
-    ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；0 = 不限"),
+    ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
     ("SIM_MAX_FAIR_CENTS", "公平价超过多少就不买（¢）", "50～100：这一边的公平价高于这个数时不吃也不挂——接近必然的结果，剩下几分钱的优势抵不过正态模型算不到的尾部风险（出事时 95¢ 也能归零）；100 = 不限"),
     ("SIM_TAKER_SWEEP_SHARES", "吃单一次最多吃光多少份", "0～10000000：封顶价之下的卖单不止一档时一张单全吃掉（公平价 50¢，20¢ 和 30¢ 的卖单都够优势就一起吃），最多这么多份、不少于每次的份数；组上限或真实交易风控容不下这么多时退回按每次份数买；0 = 只按每次份数买"),
@@ -7690,6 +7690,46 @@ def trades_of_driver(trades: Mapping, driver: str) -> list[dict]:
     return of(driver) if of is not None else [t for t in trades.values() if trade_driver(t)[0] == driver]
 
 
+def side_held(trades: Mapping, market: str, side: str) -> dict:
+    """What one market's side holds now, for the after-hours cap (SIM_AFTER_HOURS_MAX_SHARES): ``positions``, the
+    shares filled (a partial fill's included); ``resting``, the unfilled shares of the ordinary orders resting or in
+    flight, at their whole count, and ``orders``, how many such orders; ``total``, the two together — what the cap
+    counts. ``deep``, apart: the unfilled shares of the deep-bid orders resting there (SIM_MAKER_DEEP_CENTS, the sweep
+    orders too), which are outside the cap — placed whatever the side holds and not counted against it (what they
+    fill is a position, counted). Withdrawn, expired and settled records hold nothing."""
+    positions = resting = deep = 0.0
+    orders = 0
+    for t in trades_of_market(trades, market):
+        if t.get("side") != side or t.get("status") not in {"filled", "resting"}:
+            continue
+        positions += float(t.get("shares") or 0)
+        if t.get("status") == "resting":
+            left = max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0)
+            if left <= 1e-9:
+                continue
+            if t.get("deep"):
+                deep += left
+            else:
+                resting += left
+                orders += 1
+    return {"positions": positions, "resting": resting, "orders": orders, "deep": deep, "total": positions + resting}
+
+
+def side_held_text(held: dict) -> str:
+    """side_held in words: "持仓 195.6 份 + 挂单 2 笔未成交 303.595 份 = 499.195 份" — the parts that are there, the sum
+    only when both are (10-20: a line saying "已有 499.195 份（持仓加挂单）" against a 195.6-share position on Predict
+    read as a miscount; the rest sat in two resting orders, which Predict's positions tab does not show)."""
+    parts = []
+    if held["positions"] > 1e-9:
+        parts.append(f"持仓 {held['positions']:g} 份")
+    if held["orders"]:
+        parts.append(f"挂单 {held['orders']} 笔未成交 {held['resting']:g} 份")
+    text = " + ".join(parts) + (f" = {held['total']:g} 份" if len(parts) > 1 else "") if parts else "没有持仓和挂单"
+    if held.get("deep", 0.0) > 1e-9:
+        text += f"，另有低价挂单 {held['deep']:g} 份不占额度"  # outside the cap (side_held)
+    return text
+
+
 def scenario_result(kind: str, settle: dict, direction: str, level: float | None) -> float:
     """What the 涨 / Yes side pays (1, 0 or ½) when the driver makes one move: "up" to ``level`` (every upward level at
     or under it is touched; None = past them all), "down" likewise, or "flat" (nothing touched, a tie where one is
@@ -13246,20 +13286,20 @@ class Bot:
     def sim_side_room(self, trades: dict[str, dict], mk: SimMarket, side: str) -> tuple[float, str]:
         """After hours (the card priced from a proxy: mk.in_session is False) how many more shares this market's side
         may take under SIM_AFTER_HOURS_MAX_SHARES: the cap less what is held there — positions, and orders resting or
-        in flight at their whole count — and why none when there is no room. (inf, "") in session or with the cap off."""
+        in flight at their whole count (side_held) — and why none when there is no room, itemised: the positions and
+        the resting orders each with their count, so the figure can be checked against Predict's positions and orders
+        tabs; under a share short of the cap it says so rather than "达到上限". The deep-bid orders resting there are
+        outside the cap (side_held; sim_maker_pick places them whatever the side holds). (inf, "") in session or with
+        the cap off."""
         cap = self.config.sim_after_hours_max_shares
         if cap <= 0 or mk.in_session is not False:
             return math.inf, ""
-        held = 0.0
-        for t in trades_of_market(trades, mk.market):
-            if t.get("side") != side or t.get("status") not in {"filled", "resting"}:
-                continue
-            held += float(t.get("shares") or 0)
-            if t.get("status") == "resting":
-                held += max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0)
-        room = cap - held
+        held = side_held(trades, mk.market, side)
+        room = cap - held["total"]
         if room < SIM_MIN_SHARES - 1e-9:
-            return 0.0, f"盘后这一边已有 {held:g} 份（持仓加挂单），达到上限 {cap:g} 份（SIM_AFTER_HOURS_MAX_SHARES）"
+            at_cap = held["total"] >= cap - 1e-9
+            return 0.0, (f"盘后这一边{side_held_text(held)}，" + (f"达到上限 {cap:g} 份" if at_cap else f"离上限 {cap:g} 份只差 {room:g} 份、不足 1 份")
+                         + "（SIM_AFTER_HOURS_MAX_SHARES）")
         return room, ""
 
     def sim_fair_over(self, mk: SimMarket, side: str) -> str:
@@ -14008,16 +14048,21 @@ class Bot:
 
     def sim_maker_pick(self, mk: SimMarket, trades: dict[str, dict], side: str, maker: BookEdge, now_ms: int) -> tuple[float, str]:
         """The resting order's count as the trader places it now: SIM_SHARES when the quiet window and the caps allow
-        it, else the most the caps take (as sim_taker_pick). (shares, "" | why none may be placed)."""
+        it, else the most the caps take (as sim_taker_pick). A deep-bid order (maker.front: SIM_MAKER_DEEP_CENTS, the
+        sweep orders too) is outside SIM_AFTER_HOURS_MAX_SHARES — placed whatever the side holds, at its whole count:
+        a bid far under the fair price, filled only when someone dumps into the book, is wanted however large the
+        position (10-20); the cap counts the positions and the ordinary orders (side_held). The group cap and the
+        real-trading limits hold for every order. (shares, "" | why none may be placed)."""
         want = float(self.config.sim_shares)
         quiet = self.sim_quiet(mk.settle, now_ms) or self.sim_open_quiet(mk, now_ms)
         if quiet:
             return want, quiet
-        room, full = self.sim_side_room(trades, mk, side)  # SIM_AFTER_HOURS_MAX_SHARES: what the side may still hold after hours
-        if full:
-            return want, full
-        if room < want - 1e-9:  # (never floor an unbounded room)
-            want = float(math.floor(room + 1e-9))
+        if not maker.front:  # SIM_AFTER_HOURS_MAX_SHARES: what the side may still hold after hours (a deep-bid order: outside it)
+            room, full = self.sim_side_room(trades, mk, side)
+            if full:
+                return want, full
+            if room < want - 1e-9:  # (never floor an unbounded room)
+                want = float(math.floor(room + 1e-9))
         why = self.sim_group_room(trades, mk, side, maker.price, want)
         if not why:
             return want, ""
