@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.83.1"
+VERSION = "1.83.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4762,6 +4762,8 @@ class PredictFeed:
         self.row_refreshed: dict[str, dict[str, float]] = {}    # item key -> market id -> monotonic time of the level's last read
         self.key_ms: dict[str, int] = {}                         # item key -> how long its last refresh took
         self.round_info: dict[str, Any] = {}                     # the last hot round: keys, ladder levels read, the slowest key (for /diag)
+        self.book_asked: dict[str, float] = {}                   # item key -> monotonic time the stored book was asked for
+        self.row_asked: dict[str, dict[str, float]] = {}         # item key -> market id -> the same, for a ladder's levels
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
 
     def headers(self) -> dict[str, str]:
@@ -4966,10 +4968,15 @@ class PredictFeed:
         return self.market_closed(meta) and bool(re.search(r"HTTP 4(00|10)\b", row.error))
 
     async def ladder_row(self, key: str, slug: str, market: dict) -> "LadderRow | None":
+        return (await self.ladder_row_read(key, slug, market))[0]
+
+    async def ladder_row_read(self, key: str, slug: str, market: dict) -> tuple["LadderRow | None", float]:
+        """(the level's row, the monotonic time its book was asked for): a slower read asked for earlier must not
+        replace a row a later read stored (refresh_ladder)."""
         parse = self.ladder_parse.get(key, cap_target)
         target = parse(market.get("title", "")) or parse(market.get("question", ""))
         if target is None:
-            return None
+            return None, time.monotonic()
         meta = self.market_meta.get(market["id"])
         refresh_seconds = PREDICT_REWARD_SECONDS if key in self.reward_keys else PREDICT_META_SECONDS
         if meta is None or time.monotonic() - meta[1] >= refresh_seconds:
@@ -4978,9 +4985,10 @@ class PredictFeed:
                 self.meta_errors.pop(market["id"], None)
             except (RemoteError, TimeoutError, OSError) as error:
                 self.meta_errors[market["id"]] = clean_error(error) or type(error).__name__
+        asked = time.monotonic()
         if self.market_settled((self.market_meta.get(market["id"]) or ({}, 0))[0]):
             # Predict has settled this level: it has no live book any more (asking gets HTTP 400) and the card needs none
-            return LadderRow(target, market["id"], market["title"], None, "", market.get("question", ""))
+            return LadderRow(target, market["id"], market["title"], None, "", market.get("question", "")), asked
         try:
             bids, asks, _ = await self.orderbook(market)
         except (RemoteError, TimeoutError, OSError) as error:
@@ -4988,10 +4996,10 @@ class PredictFeed:
             # the book it had last time stays, aging as it does (stale after PREDICT_STALE_MS), with the failure noted
             kept = next((row.book for row in self.ladders.get(key) or () if row.market_id == market["id"] and row.book), None)
             return LadderRow(target, market["id"], market["title"], kept, clean_error(error) or type(error).__name__,
-                             market.get("question", ""))
+                             market.get("question", "")), asked
         fee = (self.market_meta.get(market["id"]) or ({}, 0))[0].get("fee_bps")
         book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
-        return LadderRow(target, market["id"], market["title"], book, "", market.get("question", ""))
+        return LadderRow(target, market["id"], market["title"], book, "", market.get("question", "")), asked
 
     async def refresh_ladder(self, key: str, slug: str, only: set[str] | None = None, aged: bool = False) -> int:
         """A category of Yes/No markets, one per threshold: the markets' books, sorted by threshold. With ``only``
@@ -5004,6 +5012,7 @@ class PredictFeed:
         if not markets:
             self.ladders.pop(key, None)
             self.ladder_rows.pop(key, None)
+            self.row_asked.pop(key, None)
             self.errors[key] = f"Predict 上还没有这个市场（{slug}）"
             return 0
         have, read_at, now = self.ladder_rows.get(key) or {}, self.row_refreshed.setdefault(key, {}), time.monotonic()
@@ -5020,6 +5029,11 @@ class PredictFeed:
         # the round (one level answering in 8 s used to hold the others' decisions for 8 s)
         tasks = {asyncio.create_task(self.ladder_row_gated(key, slug, m)): m["id"] for m in due}
         fresh: dict[str, Any] = {}
+        asked = self.row_asked.setdefault(key, {})
+        # a level read here and by another round at once (the cold round's slow read, the hot round's fresh one): the
+        # answer to the later request stands, whichever lands last (1.83.2: the older one, landing last, put the book back
+        # in time under a newer read time). A read asked for before the stored row's is dropped.
+        newer = lambda mid, at: at >= asked.get(mid, -1e18)
         pending = set(tasks)
         try:
             while pending:
@@ -5028,8 +5042,10 @@ class PredictFeed:
                 for task in done:
                     mid = tasks[task]
                     fresh[mid] = task.result()
-                    if fresh[mid] is not None and pending:
-                        self.ladder_rows.setdefault(key, {})[mid] = fresh[mid]
+                    row, at = fresh[mid]
+                    if row is not None and pending and newer(mid, at):
+                        self.ladder_rows.setdefault(key, {})[mid] = row
+                        asked[mid] = at
                         published = True
                 if published:
                     self.ladder_publish(key)
@@ -5038,12 +5054,20 @@ class PredictFeed:
             for task in pending:
                 task.cancel()
             raise
-        # the rows as they stand now (a cold round may have stored some meanwhile), the ones read here replacing theirs
+        # the rows as they stand now (a cold round may have stored some meanwhile), the ones read here replacing theirs —
+        # unless another round's read of the level was asked for later
         have = self.ladder_rows.get(key) or {}
-        current = {m["id"]: fresh[m["id"]] if m["id"] in fresh else have.get(m["id"]) for m in markets}
+        current = {}
+        for m in markets:
+            mid = m["id"]
+            if mid in fresh and newer(mid, fresh[mid][1]):
+                current[mid], asked[mid] = fresh[mid]
+            else:
+                current[mid] = have.get(mid)
         self.ladder_rows[key] = {mid: row for mid, row in current.items() if row is not None}
-        for mid in [mid for mid in read_at if mid not in current]:
-            read_at.pop(mid)
+        for table in (read_at, asked):
+            for mid in [mid for mid in table if mid not in current]:
+                table.pop(mid)
         rows = list(self.ladder_rows[key].values())
         if not rows:
             raise RemoteError("Predict 市场标题里没有可识别的档位")
@@ -5066,10 +5090,10 @@ class PredictFeed:
             rows = self.ladder_pick[key](rows, self.market_meta)
         self.ladders[key] = sorted(rows, key=lambda row: row.target)
 
-    async def ladder_row_gated(self, key: str, slug: str, market: dict) -> "LadderRow | None":
-        """ladder_row under the ladders' own gate: at most PREDICT_LADDER_PARALLEL levels in flight at once."""
+    async def ladder_row_gated(self, key: str, slug: str, market: dict) -> tuple["LadderRow | None", float]:
+        """ladder_row_read under the ladders' own gate: at most PREDICT_LADDER_PARALLEL levels in flight at once."""
         async with self.ladder_gate:
-            return await self.ladder_row(key, slug, market)
+            return await self.ladder_row_read(key, slug, market)
 
     def updated(self, key: str) -> None:
         """A key's books just came in: the trader's express lane looks at that market now, beside the round."""
@@ -5121,6 +5145,7 @@ class PredictFeed:
             except (RemoteError, TimeoutError, OSError) as error:
                 self.errors[key] = clean_error(error) or type(error).__name__
             return 0
+        started = time.monotonic()
         try:
             market = await self.resolve(slug)
             if market is None:
@@ -5131,13 +5156,20 @@ class PredictFeed:
             if slug in self.want_info and slug not in self.info:
                 await self.market_info(slug, market["id"])
             fee = await self.market_fee(market["id"])
+            asked = time.monotonic()
             bids, asks, _ = await self.orderbook(market)
+            if asked < self.book_asked.get(key, -1e18):
+                # a later request's book is stored already (the cold round's slow read landing after the hot round's): this
+                # answer would put the book back in time under a newer read time (1.83.2) — dropped, the express lane not woken
+                return 0
             self.books[key] = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
+            self.book_asked[key] = asked
             self.errors.pop(key, None)
             self.updated(key)
             return 1
         except (RemoteError, TimeoutError, OSError) as error:
-            self.errors[key] = clean_error(error) or type(error).__name__
+            if started >= self.book_asked.get(key, -1e18):  # a failure of a read older than the stored book says nothing of it
+                self.errors[key] = clean_error(error) or type(error).__name__
             return 0
 
     async def refresh_timed(self, key: str, slug: str, hot_rows: set[str] | None = None) -> int:
@@ -5162,10 +5194,11 @@ class PredictFeed:
         for key in list(self.books):
             if targets.get(key) != self.books[key].slug:
                 self.books.pop(key)  # the target day moved on: never show yesterday's book for today's market
+                self.book_asked.pop(key, None)
         for key in list(self.errors):
             if key not in targets:
                 self.errors.pop(key)
-        for table in (self.ladders, self.ladder_rows, self.row_refreshed, self.key_ms):
+        for table in (self.ladders, self.ladder_rows, self.row_refreshed, self.key_ms, self.row_asked, self.book_asked):
             for key in [k for k in table if k not in targets]:
                 table.pop(key)
         self.slugs = dict(targets)
