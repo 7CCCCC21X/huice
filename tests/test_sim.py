@@ -1554,7 +1554,57 @@ async def after_hours_cap():
     maker, taker = t[f"{HSI_SLUG}|up|挂"], t[f"{HSI_SLUG}|up|吃"]
     assert maker["status"] == "resting" and maker["order"] == 100 and taker["status"] == "filled" and taker["shares"] == 200 and taker["order"] == 200, (maker["order"], taker["order"])
     room, full = abot.sim_side_room(t, after(NOW), "up")
-    assert room == 0.0 and full == "盘后这一边已有 300 份（持仓加挂单），达到上限 300 份（SIM_AFTER_HOURS_MAX_SHARES）", (room, full)
+    assert room == 0.0 and full == "盘后这一边持仓 200 份 + 挂单 1 笔未成交 100 份 = 300 份，达到上限 300 份（SIM_AFTER_HOURS_MAX_SHARES）", (room, full)
+    # 1.81.1: the refusal itemises what fills the cap (10-20: "已有 499.195 份（持仓加挂单）" on the SSE card against a 195.6-share
+    # position on Predict — the rest sat unfilled in two resting orders, which its positions tab does not show); a partial
+    # fill counts as position, the rest of its order as resting; the other side, withdrawn, expired and settled records
+    # hold nothing; under a share short of the cap the line says so rather than "达到上限"
+    mkt = after(NOW).market
+    rec = lambda status, shares, order, side="down", maker=True: {"market": mkt, "side": side, "status": status, "shares": shares, "order": order, "maker": maker}
+    t5 = {"a": rec("filled", 195.195, 200, maker=False), "b": rec("resting", 0.0, 150), "c": rec("resting", 0.405, 154),
+          "d": rec("resting", 0.0, 100, side="up"), "e": rec("cancelled", 0.0, 100), "f": rec("settled", 100.0, 100), "g": rec("expired", 0.0, 100)}
+    held = m.side_held(t5, mkt, "down")
+    assert abs(held["positions"] - 195.6) < 1e-9 and abs(held["resting"] - 303.595) < 1e-9 and held["orders"] == 2 and abs(held["total"] - 499.195) < 1e-9, held
+    assert m.side_held_text(held) == "持仓 195.6 份 + 挂单 2 笔未成交 303.595 份 = 499.195 份"
+    cbot = m.Bot(m.Config.from_env({**env, "SIM_AFTER_HOURS_MAX_SHARES": "500"}), m.Store(":memory:"), FM(NOW), None)
+    assert cbot.sim_side_room(t5, after(NOW), "down") == (0.0, "盘后这一边持仓 195.6 份 + 挂单 2 笔未成交 303.595 份 = 499.195 份，离上限 500 份只差 0.805 份、不足 1 份（SIM_AFTER_HOURS_MAX_SHARES）"), cbot.sim_side_room(t5, after(NOW), "down")
+    assert cbot.sim_side_room(t5, after(NOW), "up") == (400.0, ""), "the other side counts its own records only"
+    assert abot.sim_side_room({"a": rec("filled", 300, 300, maker=False)}, after(NOW), "down") == (0.0, "盘后这一边持仓 300 份，达到上限 300 份（SIM_AFTER_HOURS_MAX_SHARES）")
+    assert abot.sim_side_room({"b": rec("resting", 0.0, 300)}, after(NOW), "down") == (0.0, "盘后这一边挂单 1 笔未成交 300 份，达到上限 300 份（SIM_AFTER_HOURS_MAX_SHARES）")
+    assert abot.sim_side_room({"b": rec("resting", 0.0, 299.5)}, after(NOW), "down") == (0.0, "盘后这一边挂单 1 笔未成交 299.5 份，离上限 300 份只差 0.5 份、不足 1 份（SIM_AFTER_HOURS_MAX_SHARES）")
+    assert abot.sim_side_room({"a": rec("filled", 100, 100, maker=False), "c": rec("resting", 20.0, 120)}, after(NOW), "down") == (80.0, ""), "the room left: 300 − (100 + 20 filled) − 100 unfilled"
+    # 1.82.0: a deep-bid order (SIM_MAKER_DEEP_CENTS; a sweep order too) is outside the cap — placed whatever the side holds,
+    # at its whole count — and its unfilled shares are not counted against it; what it fills is a position, counted
+    at_cap = {"a": rec("filled", 300, 300, side="up", maker=False)}
+    deep_cand = m.BookEdge("涨", True, 0.06, 0.32, 0.0, 0.32, front=True)
+    sweep_cand = m.BookEdge("涨", True, 0.02, 0.36, 0.0, 0.36, front=True, sweep=True)
+    join_cand = m.BookEdge("涨", True, 0.05, 0.33, 300.0, 0.33)
+    assert abot.sim_maker_pick(after(NOW), at_cap, "up", deep_cand, NOW) == (100.0, "") and abot.sim_maker_pick(after(NOW), at_cap, "up", sweep_cand, NOW) == (100.0, "")
+    assert abot.sim_maker_pick(after(NOW), at_cap, "up", join_cand, NOW) == (100.0, "盘后这一边持仓 300 份，达到上限 300 份（SIM_AFTER_HOURS_MAX_SHARES）")
+    part = {"a": rec("filled", 250, 250, side="up", maker=False)}
+    assert abot.sim_maker_pick(after(NOW), part, "up", join_cand, NOW) == (50.0, "") and abot.sim_maker_pick(after(NOW), part, "up", deep_cand, NOW) == (100.0, "")
+    t6 = {**at_cap, "b": {**rec("resting", 0.405, 304, side="up"), "deep": True}}
+    held = m.side_held(t6, mkt, "up")
+    assert abs(held["positions"] - 300.405) < 1e-9 and abs(held["deep"] - 303.595) < 1e-9 and held["orders"] == 0 and held["resting"] == 0 and abs(held["total"] - 300.405) < 1e-9, held
+    assert abot.sim_side_room(t6, after(NOW), "up") == (0.0, "盘后这一边持仓 300.405 份，另有低价挂单 303.595 份不占额度，达到上限 300 份（SIM_AFTER_HOURS_MAX_SHARES）")
+    room6, full6 = abot.sim_side_room({"b": t6["b"]}, after(NOW), "up")
+    assert abs(room6 - 299.595) < 1e-9 and full6 == "", "a resting deep-bid order alone: only the 0.405 it filled counts"
+    # in a step: the deep-bid mode on a wide book after hours places its whole SIM_SHARES over a 50-share cap; an ordinary
+    # order on the same cap is cut to 50
+    wbot = m.Bot(m.Config.from_env({**env, "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_AFTER_HOURS_MAX_SHARES": "50"}), m.Store(":memory:"), FM(NOW), None)
+    wbot.sim_markets = lambda now: world["markets"]
+    wide_after = m.dataclasses.replace(hsi(0.38, [("0.05", "300"), ("0.01", "1000")], [("0.38", "1"), ("0.40", "100")], NOW), in_session=False)
+    assert wbot.sim_maker_reason(wide_after, {}, NOW)[0].front and wbot.sim_maker_pick(wide_after, {}, "up", wbot.sim_maker_reason(wide_after, {}, NOW)[0], NOW) == (100.0, "")
+    await step(wbot, NOW, wide_after)
+    tw = wbot.sim_trades()[f"{HSI_SLUG}|up|挂"]
+    assert tw["status"] == "resting" and tw["deep"] is True and tw["order"] == 100 and tw["price"] == 0.06, tw
+    assert wbot.sim_side_room(wbot.sim_trades(), wide_after, "up") == (50.0, "")
+    obot5 = m.Bot(m.Config.from_env({**env, "SIM_WAYS": "maker", "SIM_AFTER_HOURS_MAX_SHARES": "50"}), m.Store(":memory:"), FM(NOW), None)
+    obot5.sim_markets = lambda now: world["markets"]
+    await step(obot5, NOW, after(NOW))
+    to5 = obot5.sim_trades()[f"{HSI_SLUG}|up|挂"]
+    assert to5["status"] == "resting" and "deep" not in to5 and to5["order"] == 50, to5
+    assert obot5.sim_side_room(obot5.sim_trades(), after(NOW), "up") == (0.0, "盘后这一边挂单 1 笔未成交 50 份，达到上限 50 份（SIM_AFTER_HOURS_MAX_SHARES）")
     gap = abot.sim_taker_gap(after(NOW + 5_000), t, NOW + 5_000)
     assert gap["state"] == "blocked" and "达到上限 300 份" in gap["text"], gap
     await step(abot, NOW + 5_000, after(NOW + 5_000))  # full: nothing more after hours, the refusal noted
