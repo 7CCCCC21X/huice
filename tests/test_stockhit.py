@@ -146,6 +146,19 @@ async def run():
         assert rm.model_swing(D("100"), "up", NOW, fair) > 0
         # the live price is the last trade: valid while the market is closed, stale only when Yahoo stops answering
         assert not rm.price_stale(NOW + 4 * 60_000) and rm.price_stale(NOW + 5 * 60_000 + 1)
+        # 1.83.0: in the session the trade read must itself be recent and today's — a fresh read of a 22-hour-old quote is a
+        # stuck feed, not the price (it used to pass on the read's own time)
+        for age, stale in ((22 * 3600_000, True), (31 * 60_000, True), (29 * 60_000, False), (30_000, False)):
+            rm.priced_ms = NOW - age
+            assert rm.price_stale(NOW) is stale and (rm.probability(D("100"), "up", NOW) is None) is stale, age
+        rm.priced_ms = NOW - 22 * 3600_000
+        assert rm.missing_note(NOW) == f"美股交易中，Yahoo 的最新成交还停在 {m.stamp(NOW - 22 * 3600_000, seconds=False)}，暂停概率（已触及的档位仍算已触及）"
+        opening = m.us_session(TODAY)[0]  # yesterday's last trade stands overnight and for the session's first half hour, not after
+        rm.priced_ms = opening - 17 * 3600_000
+        for at, stale in ((opening - 60_000, False), (opening + 60_000, False), (opening + 29 * 60_000, False), (opening + 31 * 60_000, True)):
+            rm.fetched_ms = at
+            assert rm.price_stale(at) is stale, (at - opening) // 60_000
+        rm.priced_ms, rm.fetched_ms = NOW - 30_000, NOW
         sat = et(2026, 10, 10, 12, 0)
         rm.fetched_ms = sat
         assert rm.probability(D("100"), "up", sat) == m.hit_probability(99.6, 100.0, rm.sigma, m.us_trading_years(sat, dec31 + 60_000))
@@ -207,9 +220,29 @@ async def run():
     assert [r.market_id for r in srm.choose(dated, metas)] == ["64"]  # 2027-03-31: the latest ahead
     assert [r.market_id for r in srm.choose(dated[:3], metas)] == ["63"] and [r.market_id for r in srm.choose(dated[:1], metas)] == ["61"]
     nov = m.StockRangeMarket(m.Store(":memory:"), STRC, m.et_wall_ms(dt.date(2026, 11, 30), 23, 59))
-    assert [r.market_id for r in nov.choose(dated, metas)] == ["64"]  # 11-30 is not listed: the latest ahead
+    # 1.83.0: 11-30 is not listed — nothing is priced (it used to take the latest ahead and price that market to 11-30), the
+    # card says why; the same with the December market alone listed
+    assert nov.choose(dated, metas) == [] and nov.pin_missing == (
+        "LADDER_DEADLINES 钉的截止日 2026-11-30 在 Predict 上没有对应的市场（列出的截止日：2026-06-30、2026-09-30、2026-12-31、2027-03-31），暂不定价"), nov.pin_missing
+    assert nov.choose(dated[2:3], metas) == [] and "列出的截止日：2026-12-31）" in nov.pin_missing
+    nov.learn([row], {"41": (meta41, time.monotonic())})
+    assert nov.known() and nov.advice_problem(NOW) == nov.pin_missing == nov.missing_note(NOW) and nov.probability(D("100"), "up", NOW) is None
+    nov_listed = [*dated, m.LadderRow(D("100"), "65", "November 30", None, "", "Will STRC hit $100 by November 30?")]
+    assert [r.market_id for r in nov.choose(nov_listed, {**metas, "65": metas["61"]})] == ["65"] and nov.pin_missing == ""  # listed again: priced
     dec = m.StockRangeMarket(m.Store(":memory:"), STRC, m.et_wall_ms(dt.date(2026, 12, 31), 23, 59))
-    assert [r.market_id for r in dec.choose(dated, metas)] == ["63"]
+    assert [r.market_id for r in dec.choose(dated, metas)] == ["63"] and [r.market_id for r in dec.choose(dated[2:3], metas)] == ["63"] and dec.pin_missing == ""
+    # 1.83.1: a title naming no date is what the pin is for — the one such market is priced to the pinned date (1.83.0 priced
+    # nothing), beside markets of other dates too; two such cannot be told apart (nothing priced, said why); a title naming
+    # the pinned date wins over one naming none
+    unread = lambda mid: m.LadderRow(D("100"), mid, "STRC hits $100 by the listed date?", None, "", "Will STRC reach $100?")
+    blank = {mid: ({"created_ms": m.et_ms(2026, 6, 18, 0, 16, -4), "question": "", "rules": ""}, 0) for mid in ("71", "72")}
+    assert [r.market_id for r in dec.choose([unread("71")], blank)] == ["71"] and dec.pin_missing == ""
+    assert [r.market_id for r in dec.choose([*dated[:2], unread("71")], {**metas, **blank})] == ["71"] and dec.pin_missing == ""
+    assert dec.choose([unread("71"), unread("72")], blank) == [] and dec.pin_missing == (
+        "LADDER_DEADLINES 钉的截止日 2026-12-31：Predict 上有 2 个市场的标题读不出截止日，分不清钉的是哪一个，暂不定价"), dec.pin_missing
+    assert [r.market_id for r in dec.choose([*dated, unread("71")], {**metas, **blank})] == ["63"] and dec.pin_missing == ""
+    dec.choose([unread("71")], blank); dec.learn([unread("71")], blank)  # the card prices it to the pin: known, nothing held for the pin
+    assert dec.pin_missing == "" and dec.known() and dec.end_ms == m.et_wall_ms(dt.date(2026, 12, 31), 23, 59) and "LADDER_DEADLINES" not in dec.advice_problem(NOW)
     pinned = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "LADDER_DEADLINES": "STRC-100=2026-11-30"}), m.Store(":memory:"), FakeMarket(), None)
     assert pinned.ranges["STRC-100"].end_ms == m.et_wall_ms(dt.date(2026, 11, 30), 23, 59)
 

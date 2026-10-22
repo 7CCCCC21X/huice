@@ -15,7 +15,7 @@ assert [(s.symbol, s.venue) for s in m.RANGE_MARKETS] == [("BTCUSDT", "spot"), (
 # the rules each category came with: BTC's "final Low ≤", the others' "final High ≥" (each market's own rules decide)
 assert [s.default_dir for s in m.RANGE_MARKETS] == ["down", "up", "up", "up", "up", "up"]
 assert [s.name for s in m.RANGE_MARKETS] == ["BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "BTC 2027前价格", "ZEC 2027前价格"]
-# 1.83.0: the "before 2027" cards — BTC from 11-24-2025 14:00 EST to 12-31-2026 23:59 EST (a High at or over the level); ZEC
+# 1.84.0: the "before 2027" cards — BTC from 11-24-2025 14:00 EST to 12-31-2026 23:59 EST (a High at or over the level); ZEC
 # to the same end from the market's creation, read from Predict (start_ms 0)
 assert (BTC27.slug, ZEC27.slug) == ("what-price-will-bitcoin-hit-before-2027", "what-price-will-zcash-hit-before-2027")
 assert BTC27.start_ms == m.et_ms(2025, 11, 24, 14, 0, -5) and BTC27.start_ms % H == 0 and BTC27.end_ms == ZEC27.end_ms == m.TOUCH_DEADLINE_MS and ZEC27.start_ms == 0
@@ -265,7 +265,7 @@ async def run():
     targets = bot.predict_targets(NOW)
     assert all(targets[s.key] == s.slug and s.key in bot.predict.ladder_keys for s in m.RANGE_MARKETS)
     assert all(bot.predict.ladder_parse[s.key] is m.price_level for s in m.RANGE_MARKETS)
-    zec = bot.range_payload(bot.ranges["ZEC-HIT-2027"], NOW)  # 1.83.0: a window from the market's creation, not learnt yet
+    zec = bot.range_payload(bot.ranges["ZEC-HIT-2027"], NOW)  # 1.84.0: a window from the market's creation, not learnt yet
     assert zec["ladder"]["window"] == "等待 Predict 的创建时间" and zec["ladder"]["window_word"] == "窗口内" and zec["missing"] == "等待币安行情", zec
     assert zec["ladder"]["hold"] == "等待 Predict 的创建时间；暂不给建议" and zec["close_ms"] == ZEC27.end_ms and zec["ladder"]["waiting"] == "等待 Predict 档位"
     btc27 = bot.range_payload(bot.ranges["BTC-HIT-2027"], NOW)
@@ -768,7 +768,7 @@ def rm_sigma(bot):
 
 
 async def creation_window():
-    """1.83.0: a ladder "from the creation of this market" (ZEC-HIT-2027, start_ms 0): the start is learnt from Predict's
+    """1.84.0: a ladder "from the creation of this market" (ZEC-HIT-2027, start_ms 0): the start is learnt from Predict's
     createdAt (the earliest of the category's markets, never moved later, kept in SQLite), the opening hour's minutes come
     from 1-minute candles — the creation minute included, nothing before it — up to the first hour boundary, where the
     hourly candles take over; "窗口内" is a window longer than a month."""

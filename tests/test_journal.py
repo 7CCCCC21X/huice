@@ -127,7 +127,8 @@ async def run():
     assert "markout" in a["sessions"][0] and a["sessions"][1]["settled"] == 2 and a["sessions"][1]["wins"] == a["sessions"][1]["losses"] == 1
     mk = a["makers"]
     assert mk["placed"] == 4 and mk["filled"] == 2 and mk["partial"] == 0 and mk["unfilled"] == 1 and mk["resting"] == 1 and mk["cancelled"] == 1 and mk["expired"] == 0, mk
-    assert abs(mk["fill_rate"] - 2 / 3) < 1e-9 and mk["wait_n"] == 2 and mk["wait_median"] == 6_400_000 and mk["rest_n"] == 1, mk
+    assert abs(mk["fill_rate"] - 2 / 3) < 1e-9 and mk["wait_n"] == 2 and mk["wait_median"] == 3_230_000 and mk["rest_n"] == 1, mk  # 1.83.0: two waits' median is their mean (60 s and 6 400 s: 3 230 s, not the upper one)
+    assert m.median([10, 90]) == 50 and m.median([3, 1, 2]) == 2 and m.median([]) is None and m.median(iter([4])) == 4
     assert mk["reasons"] == [{"why": "已到结束时间，等结果出来：不开新单，挂单撤掉", "n": 1}], mk["reasons"]
     bl = a["blocked"]
     assert bl["n"] == 1 and bl["settled"] == 1 and bl["losses"] == 1 and bl["shares"] == 100 and abs(bl["pnl"] + 40) < 1e-9 and bl["rows"][0]["payout"] == 0, bl
