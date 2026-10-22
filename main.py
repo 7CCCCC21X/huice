@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.82.0"
+VERSION = "1.83.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -6617,15 +6617,16 @@ class CapMarket:
 # --- price ladders ("what price will Bitcoin hit in October?": one Yes/No market per level) ---------------------------
 @dataclass(frozen=True)
 class RangeSpec:
-    """A "what price will X hit in <month>" category: one Yes/No market per price level, Yes as soon as any Binance
-    1-minute candle of the window has a High at or above an upward level (a Low at or below a downward one). Each market's
-    own rules (or its title) say which; the rules for this category's levels name the default."""
+    """A "what price will X hit in <month>" (or "before <year>") category: one Yes/No market per price level, Yes as
+    soon as any Binance 1-minute candle of the window has a High at or above an upward level (a Low at or below a
+    downward one). Each market's own rules (or its title) say which; the rules for this category's levels name the
+    default."""
     key: str          # item / book key and the card's favourite key
     slug: str
     symbol: str       # the Binance pair the rules name
     venue: str        # "spot" (BTC/USDT, ETH/USDT, SOL/USDT) or "futures" (HYPEUSDT, a USDⓈ-M perpetual)
     name: str         # card title
-    start_ms: int     # open of the first candle: 00:00 ET on the 1st
+    start_ms: int     # open of the first candle: 00:00 ET on the 1st; 0 = "from the creation of this market", read from Predict (createdAt)
     end_ms: int       # open of the last candle: 23:59 ET on the last day
     default_dir: str = "up"  # the direction of the rules the category was added with ("up": High ≥, "down": Low ≤)
 
@@ -6645,6 +6646,15 @@ RANGE_MARKETS = (
     # HYPEUSDT on Binance futures (the rules link binance.com/en/futures/HYPEUSDT)
     RangeSpec("HYPE-HIT-10", "what-price-will-hyperliquid-hit-in-october-2026", "HYPEUSDT", "futures", "HYPE 10月价格",
               et_ms(2026, 10, 1, 0, 0, -4), et_ms(2026, 10, 31, 23, 59, -4)),
+    # "between November 24, 2025, 14:00 and December 31, 2026, 23:59 in the ET timezone" (EST at both ends), a High at or
+    # over the level: the whole of 2026 on one card
+    RangeSpec("BTC-HIT-2027", "what-price-will-bitcoin-hit-before-2027", "BTCUSDT", "spot", "BTC 2027前价格",
+              et_ms(2025, 11, 24, 14, 0, -5), et_ms(2026, 12, 31, 23, 59, -5)),
+    # "from the creation of this market through 11:59 PM ET on the last day of the year": the start is read from Predict
+    # (createdAt, the earliest of the category's markets; start_ms 0); ↑ levels by the High, ↓ levels by the Low, each
+    # market's title saying which
+    RangeSpec("ZEC-HIT-2027", "what-price-will-zcash-hit-before-2027", "ZECUSDT", "spot", "ZEC 2027前价格",
+              0, et_ms(2026, 12, 31, 23, 59, -5)),
 )
 
 
@@ -6923,9 +6933,10 @@ async def binance_futures(path: str, **params: Any) -> Any:
 
 
 class RangeMarket:
-    """A Binance pair over one month: live price, 30-day σ, and the window's highest High and lowest Low so far. Hourly
-    candles carry exactly the extremes of their minutes, and the window runs from one hour boundary to another, so they
-    decide every level; the running hour's own candle counts at once (a level reached resolves the market at once)."""
+    """A Binance pair over one window (a month; the rest of a year): live price, 30-day σ, and the window's highest High
+    and lowest Low so far. Hourly candles carry exactly the extremes of their minutes, and a window opening on an hour
+    boundary is decided by them alone; one opening inside an hour (at the market's creation) starts with that hour's
+    1-minute candles. The running candle counts at once (a level reached resolves the market at once)."""
     PRICE_SECONDS = 30
     VOL_SECONDS = 3600
     SCAN_SECONDS = 60
@@ -6936,6 +6947,8 @@ class RangeMarket:
     def __init__(self, store: "Store", spec: RangeSpec, futures: Any = None):
         self.store, self.spec = store, spec
         self.futures = futures or binance_futures  # the bot passes its own futures feed (base URL, rate-limit cooldown)
+        saved = store.get(f"range:{spec.slug}:window", {}) if not spec.start_ms else {}  # a window from the market's creation (learn)
+        self._start = int(saved.get("start") or 0) if isinstance(saved, dict) else 0
         self.price: D | None = None
         self.priced_ms = 0
         self.sigma: float | None = None
@@ -6962,11 +6975,17 @@ class RangeMarket:
         return saved if isinstance(saved, dict) and saved.get("start") == self.start_ms else {}
 
     # the window and the card's wording: a stock market (StockRangeMarket) answers these differently
-    range_word = "本月"
+    @property
+    def range_word(self) -> str:
+        """"本月" for a window inside one calendar month (ET); "窗口内" for a longer one (a "before 2027" category)."""
+        start, end = self.start_ms, self.end_ms
+        if start and end and et_date(start).replace(day=1) == et_date(end).replace(day=1):
+            return "本月"
+        return "窗口内"
 
     @property
     def start_ms(self) -> int:
-        return self.spec.start_ms
+        return self.spec.start_ms or self._start
 
     @property
     def end_ms(self) -> int:
@@ -6998,11 +7017,11 @@ class RangeMarket:
         return f"{self.spec.label(self.end_ms)}这根 1 分钟 K 为止"
 
     def window_label(self) -> str:
-        return f"{self.spec.label(self.start_ms)}起"
+        return f"{self.spec.label(self.start_ms)}起" if self.start_ms else "等待 Predict 的创建时间"
 
     def card_extras(self, now_ms: int) -> dict:
-        """Extra ladder fields for the card (none for a Binance pair)."""
-        return {}
+        """Extra ladder fields for the card: the window's word for a Binance pair ("本月" / "窗口内")."""
+        return {"window_word": self.range_word}
 
     def missing_note(self, now_ms: int) -> str:
         """Why the card prices nothing now ("" when it does)."""
@@ -7013,7 +7032,17 @@ class RangeMarket:
         return ""
 
     def learn(self, rows: list, meta: dict) -> None:
-        """What Predict's own listing says about the window (nothing for a Binance pair: the rules fix it)."""
+        """What Predict's own listing says about the window: nothing when the rules fix it (start_ms set); a window "from
+        the creation of this market" (start_ms 0) opens at the earliest createdAt among the category's markets, kept in
+        SQLite so a restart prices at once (a level listed later is judged from the same opening: Predict adds levels
+        outside the range already seen, and its own book decides the rest)."""
+        if self.spec.start_ms:
+            return
+        created = [int(((meta.get(row.market_id) or ({}, 0))[0] or {}).get("created_ms") or 0) for row in rows if getattr(row, "market_id", None)]
+        created = [ms for ms in created if ms > 0] + ([self._start] if self._start else [])
+        if created and min(created) != self._start:
+            self._start = min(created)
+            self.store.put(f"range:{self.spec.slug}:window", {"start": self._start})
 
     async def refresh(self, now_ms: int) -> None:
         mono, why = time.monotonic(), lambda error: clean_error(error) or type(error).__name__
@@ -7045,33 +7074,53 @@ class RangeMarket:
 
     async def scan(self, now_ms: int) -> None:
         """Extend the window's extremes (persisted) with the hours finished since the last scan; keep the running hour's
-        candle apart. Once the window is over and read to its end, "through" reaches window_end: the record is complete."""
+        candle apart. A window opening inside an hour (a start read from Predict's createdAt) begins with that hour's
+        minutes from 1-minute candles — the creation minute included — up to the first hour boundary, where the hourly
+        candles take over. Once the window is over and read to its end, "through" reaches window_end: the record is
+        complete."""
         start, end = self.start_ms, self.window_end
-        if now_ms <= start:
+        if not start or now_ms <= start:
             return
-        hist = dict(self.history) or {"start": start, "through": start, "high": None, "high_at": 0, "low": None, "low_at": 0}
+        first_hour = min(-(-start // 3_600_000) * 3_600_000, end)  # the first hour boundary at or after the start
+        hist = dict(self.history) or {"start": start, "through": start - start % 60_000, "high": None, "high_at": 0, "low": None, "low_at": 0}
         running: dict = {}
+
+        def take(row: list) -> None:
+            opened, closed, high, low = int(row[0]), int(row[6]), float(row[2]), float(row[3])
+            if opened <= start < closed and hist.get("open") is None:
+                hist["open"] = float(row[1])  # the window's first price: which side of it a level sits on
+            if closed >= now_ms:  # still running: counts now, persisted once it is over
+                running.update(open=opened, high=high, low=low)
+                return
+            if hist["high"] is None or high > hist["high"]:
+                hist["high"], hist["high_at"] = high, opened
+            if hist["low"] is None or low < hist["low"]:
+                hist["low"], hist["low_at"] = low, opened
+            hist["through"] = closed + 1
+
+        def candles(rows: Any, cursor: int, until: int, word: str) -> list:
+            if not isinstance(rows, list):  # an error object is not "no candles" (that would close the window unread)
+                raise RemoteError(f"币安{word} K 格式异常：{str(rows)[:80]}")
+            return [r for r in rows if isinstance(r, list) and len(r) > 6 and cursor <= int(r[0]) < until]
+
+        cursor = int(hist["through"])
+        if cursor < first_hour:  # the opening hour's minutes
+            rows = candles(await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=cursor,
+                                          endTime=min(now_ms, first_hour) - 1, limit=60), cursor, first_hour, "1 分钟")
+            for row in rows:
+                take(row)
+                if running:
+                    break
+            if not running and now_ms >= first_hour:
+                hist["through"] = max(int(hist["through"]), first_hour)  # minutes without a candle had no trades
         for _ in range(50):
             cursor = int(hist["through"])
-            if cursor >= end:
+            if running or cursor >= end:
                 break
-            rows = await self.get("klines", symbol=self.spec.symbol, interval="1h", startTime=cursor,
-                                  endTime=min(now_ms, end) - 1, limit=1000)
-            if not isinstance(rows, list):  # an error object is not "no candles" (that would close the window unread)
-                raise RemoteError(f"币安小时 K 格式异常：{str(rows)[:80]}")
-            rows = [r for r in rows if isinstance(r, list) and len(r) > 6 and cursor <= int(r[0]) < end]
+            rows = candles(await self.get("klines", symbol=self.spec.symbol, interval="1h", startTime=cursor,
+                                          endTime=min(now_ms, end) - 1, limit=1000), cursor, end, "小时")
             for row in rows:
-                opened, closed, high, low = int(row[0]), int(row[6]), float(row[2]), float(row[3])
-                if opened == start and hist.get("open") is None:
-                    hist["open"] = float(row[1])  # the window's first price: which side of it a level sits on
-                if closed >= now_ms:  # still running: counts now, persisted once it is over
-                    running = {"open": opened, "high": high, "low": low}
-                    continue
-                if hist["high"] is None or high > hist["high"]:
-                    hist["high"], hist["high_at"] = high, opened
-                if hist["low"] is None or low < hist["low"]:
-                    hist["low"], hist["low_at"] = low, opened
-                hist["through"] = closed + 1
+                take(row)
             if len(rows) < 1000 or running:
                 break
         if now_ms >= end and not running:
@@ -7132,6 +7181,8 @@ class RangeMarket:
     def advice_problem(self, now_ms: int) -> str:
         """Why no level may be suggested now ("" when they may): the window's extremes must be read up to now (a level
         already reached would otherwise look open), σ current, the window still running."""
+        if not self.start_ms:
+            return "等待 Predict 的创建时间；暂不给建议"
         if now_ms >= self.window_end:
             return "窗口已结束，等待结算"
         if now_ms > self.start_ms and now_ms - self.scanned_ms > self.SCAN_STALE_MS:
@@ -8835,14 +8886,14 @@ function priceLadder(c,it,L,det,sm){
   // a price ladder: one Yes/No market per level, ↑ reached by a 1-minute High, ↓ by a 1-minute Low, inside the month
   c.classList.add("price-lad");det.classList.add("price-model");
   const top=$("div","price-top");top.append($("span","plabel","现价"),$("b","",L.price));c.append(top);
-  const rw=L.range_word||"本月",range=$("div","price-range"),high=$("span","",rw+"最高 "),low=$("span","","最低 ");high.append($("b","",L.high));low.append($("b","",L.low));range.append(high,low);c.append(range);
+  const rw=L.range_word||L.window_word||"本月",range=$("div","price-range"),high=$("span","",rw+"最高 "),low=$("span","","最低 ");high.append($("b","",L.high));low.append($("b","",L.low));range.append(high,low);c.append(range);
   sm.textContent="规则与计算明细";
   det.append(sm);const dl=$("dl"),row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("窗口",L.window+" → "+it.close_label);row("价格",L.price+"（"+L.venue+" "+L.symbol+"）");
   row(rw+"最高 / 最低",L.high+(L.high_at?"（"+L.high_at+(L.range_word?"）":" 那一小时）"):"")+" / "+L.low+(L.low_at?"（"+L.low_at+(L.range_word?"）":" 那一小时）"):"")+
     "："+(L.extremes_note||"币安小时 K 的最高/最低（与 1 分钟 K 一致）")+(L.through?"，已核至 "+L.through:"")+(L.range_word?"，加上今天的 1 分钟 K 和现价":"，加上正在走的这一小时和现价"));
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
-  row("规则",L.rule_note||"↑ 档：本月任一 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes。方向按每个市场自己的规则或标题判断");
+  row("规则",L.rule_note||"↑ 档："+rw+"任一 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes。方向按每个市场自己的规则或标题判断");
   row("模型","零漂移、固定波动率的单边触及概率：↑ Φ((−h−s²/2)/s) + (S/K)·Φ((−h+s²/2)/s)，h = ln(K/S)；↓ Φ((−a+s²/2)/s) + (S/K)·Φ((−a−s²/2)/s)，a = ln(S/K)；s = σ√T");
   det.append(dl);c.append(det);
   const st=$("div","lstat");
@@ -8854,7 +8905,7 @@ function priceLadder(c,it,L,det,sm){
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
   if(done.length){const t=$("details","touched"),dk=it.name+"#touched";t.open=open.has(dk);t.addEventListener("toggle",()=>{t.open?open.add(dk):open.delete(dk)});
     t.append($("summary","","✓ 已触及 "+done.length+" 档"));const ts=$("div","tchips");
-    done.forEach(r=>{const x=$("span","tchip",r.label+(r.settled?" · 已结算":""));x.title=(r.settled?"Predict 已把这一档结算为已触及；":"")+(L.range_word||"本月")+(r.dir==="up"?"最高价":"最低价")+"已到 "+r.label.slice(2);ts.append(x)});t.append(ts);st.append(t)}
+    done.forEach(r=>{const x=$("span","tchip",r.label+(r.settled?" · 已结算":""));x.title=(r.settled?"Predict 已把这一档结算为已触及；":"")+(L.range_word||L.window_word||"本月")+(r.dir==="up"?"最高价":"最低价")+"已到 "+r.label.slice(2);ts.append(x)});t.append(ts);st.append(t)}
   c.append(st);return priceLadderBook(c,it,L,live)}
 function priceLadderBook(c,it,L,live){
   const w=$("div","pb"),h=$("div","quote"),key=favKey(it);h.append(it.predict?openLink(it.predict.url):$("span","pt","Predict"));
