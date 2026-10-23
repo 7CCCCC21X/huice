@@ -160,7 +160,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
+                                "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert len(bot.sim_trades()) == 2
@@ -1506,33 +1506,64 @@ asyncio.run(prune())
 
 
 async def fair_limit():
-    """1.72.0: SIM_MAX_FAIR_CENTS — a side the model calls near certain (its fair price over the limit) is neither taken
-    nor quoted on: the few cents of edge left there do not pay for the tail a normal model cannot see."""
+    """1.72.0 / 1.85.0: SIM_MAX_FAIR_CENTS — a side the model calls near certain is judged at the limit, no higher: the
+    cents of edge the model claims past it do not pay for the tail a normal model cannot see, so such a side is bought or
+    quoted only when the price leaves the bar under the limit (before 1.85.0 it was refused outright, whatever the price)."""
     env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
            "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}
     assert m.Config.from_env(env).sim_max_fair == 0.95 and m.Config.from_env({**env, "SIM_MAX_FAIR_CENTS": "100"}).sim_max_fair == 1.0
     for bad in ("49", "101", "x"):
         try: m.Config.from_env({**env, "SIM_MAX_FAIR_CENTS": bad}); assert False, bad
         except ValueError: pass
-    sure = lambda at, fair=0.97: m.dataclasses.replace(hsi(fair, [("0.80", "100")], [("0.85", "100")], at), in_session=True)  # 涨 97¢: a taker at 85¢ (+11¢) and a maker at 80¢ (+17¢) would both go
+    near = lambda pair, want: all(abs(a - b) < 1e-9 for a, b in zip(pair, want))
+    sure = lambda at, fair=0.97, bids=(("0.80", "100"),), asks=(("0.85", "100"),): m.dataclasses.replace(
+        hsi(fair, list(bids), list(asks), at), in_session=True)  # 涨 97¢: by the card a taker at 85¢ has +11.7¢ and a maker at 80¢ +17¢
     fbot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
     fbot.sim_markets = lambda now: world["markets"]
     world["markets"] = [sure(NOW)]
-    assert fbot.sim_fair_over(sure(NOW), "up") == "公平价 97.0¢ 超过上限 95.0¢，不买" and fbot.sim_fair_over(sure(NOW), "down") == ""
-    assert fbot.sim_fair_over(sure(NOW, 0.95), "up") == "" and fbot.sim_fair_over(sure(NOW, 0.03), "down").startswith("公平价 97.0¢")
+    assert near(fbot.sim_fair(sure(NOW), "up"), (0.95, 0.02)) and near(fbot.sim_fair(sure(NOW), "down"), (0.03, 0.0))
+    assert near(fbot.sim_fair(sure(NOW, 0.95), "up"), (0.95, 0.0)) and near(fbot.sim_fair(sure(NOW, 0.03), "down"), (0.95, 0.02))
+    # judged at 95¢: the taker's cap is 95 − 10 after the fee = 84¢ (m.taker_cap), the 85¢ ask a cent over it; the maker at the
+    # 80¢ 买1 has 15¢ (not the card's 17) and goes
+    cap = m.taker_cap(0.95, 0.10, 200)
+    assert cap == 0.84 and fbot.sim_taker_cap(sure(NOW), "up", 200) == cap
     gap = fbot.sim_taker_gap(sure(NOW), fbot.sim_trades(), NOW)
-    assert gap["state"] == "held" and "吃涨：公平价 97.0¢ 超过上限 95.0¢，不买" in gap["detail"] and gap["short"].startswith("公平价 97.0¢"), gap
-    assert fbot.sim_maker_reason(sure(NOW), {}, NOW) == (None, "涨的公平价超过上限 95.0¢，不挂")
+    assert gap["state"] == "near" and gap["label"] == "吃涨" and abs(gap["gap"] - 0.01) < 1e-9, gap
+    assert gap["text"] == "距吃单 1.0¢：吃涨 卖1 85.0¢，封顶 84.0¢（公平价 97.0¢ 按上限 95.0¢ 计）" and gap["sides"][0]["fair"] == 0.95 \
+        and gap["sides"][0]["model"] == 0.97 and gap["sides"][1]["capped"] == "" and "吃跌：公平价 3.0¢ 留不出 10.0¢" in gap["detail"], gap
+    cand, why = fbot.sim_maker_reason(sure(NOW), {}, NOW)
+    assert why == "" and abs(cand.price - 0.80) < 1e-9 and abs(cand.edge - 0.15) < 1e-9, (cand, why)
     row = next(r for r in fbot.sim_checks(NOW) if r["market"] == HSI_SLUG)
-    assert "涨：公平价 97.0¢ 超过上限 95.0¢，不买" in row["taker"] and row["maker_why"] == "涨的公平价超过上限 95.0¢，不挂", row
+    assert "涨：封顶 84.0¢（公平价 97.0¢ 按上限 95.0¢ 计），之下没有卖单" in row["taker"] and row["maker_why"] == "", row
     await step(fbot, NOW, sure(NOW))
-    assert not fbot.sim_trades() and not fbot.sim_blocks(), "neither way, and not a refusal to record"
+    assert sorted(fbot.sim_trades()) == [f"{HSI_SLUG}|up|挂"] and not fbot.sim_blocks(), "the maker only, and not a refusal to record"
+    t = fbot.sim_trades()[f"{HSI_SLUG}|up|挂"]
+    assert t["fair"] == 0.97 and abs(t["edge"] - 0.15) < 1e-9 and abs(t["signal"] - 0.15) < 1e-9 and t["entry"]["fair_cap"] == 0.95 \
+        and t["entry"]["fair"] == 0.97, t
     assert fbot.sim_version()["sim_max_fair"] == 0.95 and fbot.control_value("SIM_MAX_FAIR_CENTS") == "95"
-    for limit in ("100", "98"):  # no limit, or one the 97¢ side is under: both orders go
+    # an ask under the cap is taken: 84¢ + the 0.32¢ fee leaves 10.68¢ under the 95¢ it is judged by (the card says 12.68)
+    tbot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    tbot.sim_markets = lambda now: world["markets"]
+    await step(tbot, NOW, sure(NOW, asks=(("0.84", "100"),)))
+    t = tbot.sim_trades()[f"{HSI_SLUG}|up|吃"]
+    assert t["shares"] == 100 and abs(t["price"] - 0.8432) < 1e-9 and abs(t["edge"] - 0.1068) < 1e-9 and t["fair"] == 0.97 \
+        and t["fill_fair"] == 0.97 and t["fills"][0]["fair"] == 0.97 and t["entry"]["fair_cap"] == 0.95, t
+    # a 买1 too near the limit is not joined, and the reason says what the fair price was judged at
+    assert fbot.sim_maker_reason(sure(NOW, bids=(("0.90", "100"),), asks=(("0.95", "100"),)), {}, NOW) == \
+        (None, "净优势 5.0¢ 低于触发门槛 10.0¢；涨的公平价 97.0¢ 按上限 95.0¢ 计")
+    # a resting order's withdrawal line is judged the same way: at 92¢ under a 97¢ card the model sees 5¢, the trader 3¢
+    resting = {"maker": True, "side": "up", "price": 0.92, "status": "resting", "order": 100.0, "shares": 0.0, "market": HSI_SLUG, "kind": "close", "key": "HSI"}
+    tight = lambda at, fair=0.97: sure(at, fair, bids=(("0.92", "100"),), asks=(("0.96", "100"),))
+    xbot = m.Bot(m.Config.from_env({**env, "SIM_MAKER_EXIT_CENTS": "5"}), m.Store(":memory:"), FM(NOW), None)
+    assert xbot.sim_requote_reason(resting, tight(NOW), NOW) == "净优势降到 3.0¢，低于撤单线 5.0¢"
+    ybot = m.Bot(m.Config.from_env({**env, "SIM_MAKER_EXIT_CENTS": "5", "SIM_MAX_FAIR_CENTS": "100"}), m.Store(":memory:"), FM(NOW), None)
+    assert ybot.sim_requote_reason(resting, tight(NOW), NOW) == "", ybot.sim_requote_reason(resting, tight(NOW), NOW)
+    for limit in ("100", "98"):  # no limit, or one the 97¢ side is under: judged as the card says, both orders go
         obot = m.Bot(m.Config.from_env({**env, "SIM_MAX_FAIR_CENTS": limit}), m.Store(":memory:"), FM(NOW), None)
         obot.sim_markets = lambda now: world["markets"]
         await step(obot, NOW, sure(NOW))
         assert sorted(obot.sim_trades()) == [f"{HSI_SLUG}|up|吃", f"{HSI_SLUG}|up|挂"], (limit, sorted(obot.sim_trades()))
+        assert "fair_cap" not in obot.sim_trades()[f"{HSI_SLUG}|up|吃"]["entry"] and abs(obot.sim_trades()[f"{HSI_SLUG}|up|挂"]["edge"] - 0.17) < 1e-9
     print("FAIR_LIMIT_OK")
 
 

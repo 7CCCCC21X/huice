@@ -27,6 +27,25 @@ for sig, up in ((0.016642, 14.77), (0.043580, 34.47)):
 # --- ticks, sessions, volatility ----------------------------------------------------------------
 assert m.price_tick("kr", D("1857000")) == 1000 and m.price_tick("kr", D("45000")) == 50 and m.price_tick("hk", D("35.95")) == D("0.05")
 assert m.price_tick("hk", D("15")) == D("0.02") and m.price_tick("sh", D("488")) == D("0.01") and m.price_tick("hk", D("1"), index=True) == D("0.01")
+# 1.85.0: a day that has already moved far widens the σ ahead (big_move_widen), in the odds and their note — the SSE on
+# 10-23 09:57: −1.68% against a 0.8%/day σ (2.1 of them) 27 minutes in, 89% of the session left, 65% of the day's variance in session
+assert m.big_move_widen(0.01, 0.008, 1.5) == 1.0 and m.big_move_widen(0.05, 0.008, 0) == 1.0 and m.big_move_widen(0.05, 0, 1.5) == 1.0
+assert abs(m.big_move_widen(-0.016930, 0.008, 1.5) - 1.41083) < 1e-4 and m.big_move_widen(0.05, 0.008, 1.5) == 2.0 and m.BIG_MOVE_WIDEN_MAX == 2.0
+sse_args = ("上证指数", D("3658.03"), D("3596.62"), 0.008 * math.sqrt(0.65), 0.886, dt.date(2026, 10, 23), D("0.01"), "", "上证现货 3,596.62（盘中直接用现货）", "x")
+sse = m.close_odds(*sse_args, sigma_day=0.008, big_move=1.5)
+assert abs(sse.widen - 1.41083) < 1e-4 and abs(sse.sigma - sse.sigma_daily * math.sqrt(0.886) * sse.widen) < 1e-12
+assert sse.sigma_note == "x；今日已动 2.1 个日 σ（-1.68% / 0.80%），剩余 σ ×1.41" and 0.02 < sse.fair_up < 0.03, (sse.sigma_note, sse.fair_up)
+assert " × 1.41 = " in sse.detail()[3] and sse.detail()[3].startswith("σ 日 0.64%（x；今日已动"), sse.detail()[3]
+plain = m.close_odds(*sse_args)
+assert plain.widen == 1.0 and plain.fair_up < 0.005 and plain.sigma_note == "x" and " × 1" not in plain.detail()[3], (plain.fair_up, plain.detail()[3])
+assert m.close_odds(*sse_args, sigma_day=0.008, big_move=0).widen == 1.0, "PROB_BIG_MOVE_SIGMAS=0: never"
+assert m.close_odds(*sse_args, sigma_day=0.008, big_move=3).widen == 1.0, "2.1 daily σ is under three of them"
+given = m.close_odds(*sse_args, sigma_day=0.008, big_move=1.5, widen=1.41083)
+assert given.widen == 1.41083 and given.sigma_note == "x", "a multiplier given is kept as it is, nothing added to the note"
+assert m.close_odds(*sse_args[:9], "", widen=1.5).sigma_note == "" and m.close_odds(*sse_args[:9], "", sigma_day=0.008, big_move=1.5).sigma_note.startswith("今日已动")
+# the model's error variants keep the day's multiplier (model_swing), so the error band is of the widened odds
+wide = m.close_odds(*sse_args[:3], sse.sigma_daily * m.MODEL_SIGMA_ERROR, *sse_args[4:], widen=sse.widen)
+assert abs(m.model_swing(sse) - abs(wide.fair_up - sse.fair_up)) < 1e-12 and m.model_swing(sse) > m.model_swing(plain)
 frac, target = m.session_remaining("kr", kr(2026, 9, 25, 10, 0), dt.date(2026, 9, 24))
 assert target == dt.date(2026, 9, 25) and abs(frac - 330 / 390) < 1e-9, frac               # 09:00–15:30 = 390 min, 330 left
 frac, target = m.session_remaining("hk", bj(2026, 9, 25, 12, 30), dt.date(2026, 9, 24))

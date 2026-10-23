@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.84.0"
+VERSION = "1.85.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -459,7 +459,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
-    ("SIM_MAX_FAIR_CENTS", "公平价超过多少就不买（¢）", "50～100：这一边的公平价高于这个数时不吃也不挂——接近必然的结果，剩下几分钱的优势抵不过正态模型算不到的尾部风险（出事时 95¢ 也能归零）；100 = 不限"),
+    ("SIM_MAX_FAIR_CENTS", "公平价最多按多少计（¢）", "50～100：这一边的公平价高于这个数时按这个数算净优势——模型再自信也只信到这里（出事时 95¢ 也能归零），接近必然的一边只在价格低到上限之下仍留足门槛时才吃、才挂：公平价 99.6¢、卖1 85¢，按 95 − 85.3 = 9.7¢ 判；100 = 按模型的公平价"),
+    ("PROB_BIG_MOVE_SIGMAS", "大波动日放宽 σ（倍日 σ）", "0～10：指数 / 个股日涨跌卡片，今日相对参考收盘的涨跌幅超过这么多倍日 σ 时，剩余时段的 σ 按超出的比例放大（最多 2 倍，连续变化）：日 σ 来自 40 根日收盘，对当天的波动没有反应，大跌日里“跌 99.6¢”这种过度自信的公平价会被压回 90–97¢；0 = 关"),
     ("SIM_TAKER_SWEEP_SHARES", "吃单一次最多吃光多少份", "0～10000000：封顶价之下的卖单不止一档时一张单全吃掉（公平价 50¢，20¢ 和 30¢ 的卖单都够优势就一起吃），最多这么多份、不少于每次的份数；组上限或真实交易风控容不下这么多时退回按每次份数买；0 = 只按每次份数买"),
     ("SIM_WAYS", "做哪种单", "吃单 = 算出仍留足净优势的最高价位（封顶价），盘口在它之下的立即买（真实交易用封顶限价单）；挂单 = 按建议价挂着等成交"),
     ("SIM_MARKETS", "做哪些市场", "可多选；全选 = all；展开详细选项可按市场逐个排除"),
@@ -574,7 +575,8 @@ class Config:
     sim_taker_after_hours_shares: float = 0.0  # SIM_TAKER_AFTER_HOURS_SHARES: shares per taker buy after hours; 0 = the taker count above
     sim_taker_max_shares: float = 300.0        # SIM_TAKER_MAX_SHARES: takers buy again on a market's side until this many shares are held there; 0 = once only
     sim_taker_sweep: float = 300.0             # SIM_TAKER_SWEEP_SHARES: a taker takes every ask under its cap in one order, up to this many shares; 0 = the per-buy count only
-    sim_max_fair: float = 0.95                 # SIM_MAX_FAIR_CENTS: no new order on a side whose fair price is over this (the tail a normal model cannot see); 1 = no limit
+    sim_max_fair: float = 0.95                 # SIM_MAX_FAIR_CENTS: the trader judges a side by its fair price at most this high (the tail a normal model cannot see); 1 = as the card says
+    big_move_sigmas: float = 1.5               # PROB_BIG_MOVE_SIGMAS: a daily card's σ ahead is widened once the day's move passes this many daily σ (big_move_widen); 0 = never
     sim_after_hours_max_shares: float = 300.0  # SIM_AFTER_HOURS_MAX_SHARES: after hours a market's side holds at most this many shares (positions and orders); 0 = no limit
     sim_open_quiet_minutes: int = 3            # SIM_OPEN_QUIET_MINUTES: no new order on a daily card this long after its underlying opens; 0 = none
     sim_seconds: int = 5     # seconds between the trader's looks: the books judged, orders placed / withdrawn, real orders read back (SIM_SECONDS)
@@ -745,6 +747,7 @@ class Config:
             sim_taker_max_shares=parse_bounded(e, "SIM_TAKER_MAX_SHARES", "300", 0, 10_000_000),
             sim_taker_sweep=parse_bounded(e, "SIM_TAKER_SWEEP_SHARES", "300", 0, 10_000_000),
             sim_max_fair=parse_bounded(e, "SIM_MAX_FAIR_CENTS", "95", 50, 100) / 100,
+            big_move_sigmas=parse_bounded(e, "PROB_BIG_MOVE_SIGMAS", "1.5", 0, 10),
             sim_after_hours_max_shares=parse_bounded(e, "SIM_AFTER_HOURS_MAX_SHARES", "300", 0, 10_000_000),
             sim_open_quiet_minutes=bounded_int(e, "SIM_OPEN_QUIET_MINUTES", 3, 0, 60),
             sim_ways=sim_ways, sim_markets=sim_markets, sim_skip=sim_skip, sources_off=sources_off,
@@ -3946,6 +3949,7 @@ class CloseOdds:
     mode: str = "盘中"     # "盘中" = live index vs previous close; "盘后" = mapped from an after-hours proxy
     warn: str = ""         # the inputs are aging: shown, but no trade suggestion is made from these odds
     tick: D = D("0.01")    # the price step a flat close is measured with
+    widen: float = 1.0     # the σ ahead is this many times the plain estimate: the day's own move widened it (big_move_widen); 1 = not
 
     @property
     def direct(self) -> bool:
@@ -3959,7 +3963,7 @@ class CloseOdds:
 
     @property
     def sigma(self) -> float:
-        return self.sigma_daily * math.sqrt(self.remaining)
+        return self.sigma_daily * math.sqrt(self.remaining) * self.widen
 
     @property
     def z(self) -> float:
@@ -3984,21 +3988,46 @@ class CloseOdds:
             f"参考收盘 {bold(fmt(self.ref) + unit)}（{self.ref_note}）→ 目标 {self.target.strftime('%m-%d')} 收盘",
             f"代理 {self.proxy_note}",
             f"有效价 {bold(fmt(self.effective.quantize(D('0.0001'))) + unit)}（{percent(self.effective, self.ref):+.3f}%）",
-            f"σ 日 {self.sigma_daily * 100:.2f}%（{self.sigma_note}）× √{self.remaining:.3f} = {self.sigma * 100:.2f}%｜z {self.z:+.3f}",
+            f"σ 日 {self.sigma_daily * 100:.2f}%（{self.sigma_note}）× √{self.remaining:.3f}"
+            + (f" × {self.widen:.2f}" if self.widen > 1 + 1e-9 else "") + f" = {self.sigma * 100:.2f}%｜z {self.z:+.3f}",
             f"涨 {self.up * 100:.2f}%·平 {self.flat * 100:.2f}%·跌 {self.down * 100:.2f}% → 公平价 涨 {bold(f'{self.fair_up * 100:.1f}¢')} / 跌 {bold(f'{self.fair_down * 100:.1f}¢')}",
         ] + ([f"⚠️ {self.warn}"] if self.warn else [])
 
 
+BIG_MOVE_WIDEN_MAX = 2.0  # the most the day's own move widens the σ ahead (big_move_widen)
+
+
+def big_move_widen(move: float, sigma_day: float, sigmas: float) -> float:
+    """How much a daily card's σ ahead is widened by the move the day has already made (``move`` = ln(effective /
+    reference), the overnight gap included): 1 while |move| is under ``sigmas`` daily σ, then |move| / (sigmas × σ_day),
+    at most BIG_MOVE_WIDEN_MAX — continuous, so the odds never jump as the move crosses the line. A day 2 σ down 27
+    minutes after the open is no ordinary day for the hours left either (volatility clusters within the day), yet the 40
+    closes behind σ know nothing of it: 10-23 09:57 the SSE −1.68% on a 0.8%/day σ priced 跌 at 99.6¢, where a σ of
+    the day's own size says 90–97. ``sigmas`` 0 (PROB_BIG_MOVE_SIGMAS=0) or no σ: never."""
+    if sigmas <= 0 or sigma_day <= 0:
+        return 1.0
+    return min(BIG_MOVE_WIDEN_MAX, max(1.0, abs(move) / (sigmas * sigma_day)))
+
+
 def close_odds(name: str, ref: D, effective: D, sigma_daily: float, remaining: float, target: dt.date, tick: D,
                ref_note: str, proxy_note: str, sigma_note: str, unit: str = "", beta: float = 1.0,
-               mode: str = "盘中") -> CloseOdds:
-    sigma = max(sigma_daily * math.sqrt(max(remaining, 1e-6)), 1e-9)
+               mode: str = "盘中", sigma_day: float = 0.0, big_move: float = 0.0, widen: float | None = None) -> CloseOdds:
+    """sigma_daily: the σ of what is ahead (in session the open-to-close part of the day's); sigma_day / big_move: the
+    whole day's σ and PROB_BIG_MOVE_SIGMAS, from which the move already made widens it (big_move_widen, said in the σ
+    note); widen given: that multiplier as it is (a variant of odds already priced keeps theirs)."""
+    if widen is None:
+        move = math.log(float(effective / ref))
+        widen = big_move_widen(move, sigma_day, big_move)
+        if widen > 1 + 1e-9:
+            sigma_note = (f"{sigma_note}；" if sigma_note else "") + (
+                f"今日已动 {abs(move) / sigma_day:.1f} 个日 σ（{percent(effective, ref):+.2f}% / {sigma_day * 100:.2f}%），剩余 σ ×{widen:.2f}")
+    sigma = max(sigma_daily * math.sqrt(max(remaining, 1e-6)) * widen, 1e-9)
     half = tick / 2
     hi = math.log(float((ref + half) / effective)) / sigma
     lo = math.log(float((ref - half) / effective)) / sigma if ref > half else -math.inf
     up, down = 1 - norm_cdf(hi), norm_cdf(lo)
     return CloseOdds(name, target, ref, ref_note, proxy_note, effective, sigma_daily, sigma_note, remaining,
-                     up, max(0.0, 1 - up - down), down, unit, beta, mode, tick=tick)
+                     up, max(0.0, 1 - up - down), down, unit, beta, mode, tick=tick, widen=widen)
 
 
 MODEL_SIGMA_ERROR = 1.25  # σ is an estimate: a suggested edge must survive σ × or ÷ this
@@ -4011,7 +4040,7 @@ def model_swing(odds: CloseOdds) -> float:
     """How far the fair 涨 price moves under plausible model error: σ ×/÷ 1.25 and, for an estimate mapped from a proxy,
     β ± 0.25 (each varied alone). An edge smaller than this lies within the model's own error."""
     def fair(effective: D, sigma: float) -> float:
-        return close_odds(odds.name, odds.ref, effective, sigma, odds.remaining, odds.target, odds.tick, "", "", "").fair_up
+        return close_odds(odds.name, odds.ref, effective, sigma, odds.remaining, odds.target, odds.tick, "", "", "", widen=odds.widen).fair_up
     variants = [fair(odds.effective, odds.sigma_daily * MODEL_SIGMA_ERROR), fair(odds.effective, odds.sigma_daily / MODEL_SIGMA_ERROR)]
     if not odds.direct:
         for beta in (odds.beta + MODEL_BETA_ERROR, max(0.05, odds.beta - MODEL_BETA_ERROR)):
@@ -7607,6 +7636,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_TAKER_MAX_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "100", "200", "300", "500", "1000"], "unit": "份", "zero": "只吃一次"},
     "SIM_TAKER_SWEEP_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "200", "300", "500", "1000", "2000"], "unit": "份", "zero": "只按每次份数"},
     "SIM_MAX_FAIR_CENTS": {"kind": "number", "group": "策略", "presets": ["90", "95", "97", "99", "100"], "unit": "¢"},
+    "PROB_BIG_MOVE_SIGMAS": {"kind": "number", "group": "高级", "presets": ["0", "1", "1.5", "2", "3"], "unit": "σ", "zero": "关"},
     "SIM_AFTER_HOURS_MAX_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "100", "200", "300", "500", "1000"], "unit": "份", "zero": "不限"},
     "SIM_OPEN_QUIET_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "1", "3", "5", "10"], "unit": "分钟", "zero": "不限"},
     "SIM_WAYS": {"kind": "choice", "group": "策略", "options": [["taker", "只吃单"], ["maker", "只挂单"], ["both", "挂单和吃单"]]},
@@ -9181,7 +9211,7 @@ function card(it,g){
   const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";sm.append(chip);det.append(sm);
   const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("目标",it.close_label);row("参考",it.ref+unit+"（"+it.ref_note+"）");row("有效",it.effective+unit);row("代理",it.proxy_note);
-  row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+" = "+(it.sigma*100).toFixed(2)+"%");
+  row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+(it.widen>1.000001?" × "+it.widen.toFixed(2):"")+" = "+(it.sigma*100).toFixed(2)+"%");
   row("σ 来源",it.sigma_note);row("涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%");row("z",it.z.toFixed(3));
   det.append(dl);c.append(det);if(it.warn){const w=$("div","warn small","⚠️ "+it.warn);c.append(w)}
   tail(c,it);return c}
@@ -9486,8 +9516,8 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
   session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_skip:"详细选项排除的市场",
-  sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_max_fair:"公平价上限（超过不买）",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
-  min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",rule:"规则",close:"收盘",
+  sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
+  min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",big_move:"大波动日放宽 σ（倍日 σ）",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
 const CENT_KEYS=new Set(["fair_up"]);
@@ -11804,7 +11834,7 @@ class Bot:
                 "ref": float(shown.ref), "up": shown.fair_up, "eff": float(shown.effective), "warn": shown.warn,
                 "mkt": self.predict_mid(key, slug, now_ms),  # the market's own 涨 price then: /calib scores both
                 "ref_raw": float(raw.ref), "up_raw": raw.fair_up, "strike": float(shown.ref) if shown.ref != raw.ref else None,
-                "move": raw.move, "beta": raw.beta, "sigma": raw.sigma_daily, "R": raw.remaining, "proxy": raw.proxy_note,
+                "move": raw.move, "beta": raw.beta, "sigma": raw.sigma_daily * raw.widen, "widen": raw.widen, "R": raw.remaining, "proxy": raw.proxy_note,
                 "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else ""})
         if time.time() - self.pred_pruned > 86400:  # the snapshots are kept PRED_KEEP_DAYS, not forever
             self.pred_pruned = time.time()
@@ -11957,6 +11987,7 @@ class Bot:
             return None
         holidays = self.config.holidays.get("sh", frozenset())
         sigma, sigma_note = self.vols.get("SSE", "SSE")
+        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
         close = self.cn.close
         if self.cn.sse_session(now_ms)[0]:
             # the session runs: only today's own, fresh print prices it (never a frozen or yesterday's quote, and
@@ -11981,7 +12012,7 @@ class Bot:
             remaining, target = session_remaining("sh", now_ms, today - dt.timedelta(days=1), holidays)
             sigma, sigma_note = self.vols.get("SSE", "SSE", intraday=True)
             return close_odds("上证指数", ref, q.last, sigma, remaining, target, D("0.01"), ref_note,
-                              f"上证现货 {fmt(q.last)}（盘中直接用现货）", sigma_note)
+                              f"上证现货 {fmt(q.last)}（盘中直接用现货）", sigma_note, sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
         # After hours the reference is the close of a dated daily bar; only today's own closing print
         # stands in for it while that bar is pending, never an older realtime "last price".
         close = self.sse_close(now_ms)
@@ -12038,7 +12069,7 @@ class Bot:
         odds = close_odds("上证指数", close.value, effective, sigma, remaining, target, D("0.01"),
                           f"{ref_note}·{close.source}",
                           f"A50 {fmt(a50.last)} / {base_note} {fmt(base)} → {percent(a50.last, base):+.3f}% × {beta_note}",
-                          sigma_note, beta=beta, mode="盘后")
+                          sigma_note, beta=beta, mode="盘后", sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
         return dataclasses.replace(odds, warn=warn) if warn else odds
 
     @staticmethod
@@ -12117,6 +12148,7 @@ class Bot:
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         close_date = dt.datetime.fromtimestamp(base_ms / 1000, tz).date()
         sigma, sigma_note = self.stock_sigma(symbol, ticker.market)
+        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
         unit = "" if ticker.same_unit else ((ref.currency if ref else "") or info.currency)
         live, live_why = self.stocks.live_quote(symbol, now_ms)
         closed_today = close_date == dt.datetime.fromtimestamp(now_ms / 1000, tz).date() and base_ms <= now_ms
@@ -12133,7 +12165,7 @@ class Bot:
             sigma, sigma_note = self.stock_sigma(symbol, ticker.market, intraday=True)  # today's opening gap has happened
             return close_odds(NAMES.get(symbol, symbol), base, live.last, sigma, remaining, target,
                               price_tick(ticker.market, base), base_note,
-                              f"{info.name}现货 {fmt_price(live.last)}（{live.source}·盘中直接用现货）", sigma_note, unit)
+                              f"{info.name}现货 {fmt_price(live.last)}（{live.source}·盘中直接用现货）", sigma_note, unit, sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
         expected = expected_close_date(ticker.market, now_ms, holidays)
         if close_date < expected:
             # a session has closed since the reference: the market now asks about the close after that one, which the bot
@@ -12153,7 +12185,7 @@ class Bot:
         return close_odds(NAMES.get(symbol, symbol), base_value, base_value * price / anchor[1], sigma, remaining, target,
                           price_tick(ticker.market, base_value), base_label,
                           f"币安 {fmt_price(price)} / 收盘时刻 {fmt_price(anchor[1])} → {move:+.3f}%"
-                          + (f"｜{live_why}，暂用币安" if live_why else ""), sigma_note, unit)
+                          + (f"｜{live_why}，暂用币安" if live_why else ""), sigma_note, unit, sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
 
     HSI_PRINT_MS = 5 * 60_000  # the first futures print this soon after the 16:10 cash close is its anchor
 
@@ -12275,6 +12307,7 @@ class Bot:
         holidays = self.hsi.holidays
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
         sigma, sigma_note = self.vols.get("HSI", "HSI")
+        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
         if self.hsi.cash_open(now_ms):
             # the cash session runs: only today's own, fresh index prices it (never yesterday's page or a frozen feed)
             why = self.hsi.spot_problem(q, now_ms) or self.hsi.spot_still(q, now_ms)
@@ -12287,7 +12320,7 @@ class Bot:
             prev_day = expected_close_date("hk", now_ms, holidays)
             ref, ref_note = dated_ref(self.hsi_daily.daily, prev_day, q.spot_prev)
             return close_odds("恒生指数", ref, q.spot, sigma, remaining, target, D("0.01"), ref_note,
-                              f"恒指现货 {fmt(q.spot)}（盘中直接用现货）", sigma_note)
+                              f"恒指现货 {fmt(q.spot)}（盘中直接用现货）", sigma_note, sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
         close_date = hk_cash_close_date(now_ms, holidays)
         self.hsi_used = None
         choices = [c for c in self.hsi_choices(now_ms) if not self.hsi.futures_problem(c, now_ms)]
@@ -12306,7 +12339,7 @@ class Bot:
         label = "恒指期货" if used.exchange_contract else "恒指期货·新浪CFD"
         odds = close_odds("恒生指数", ref, ref * used.last / anchor, sigma, remaining, target, D("0.01"), ref_note,
                           f"{label} {fmt(used.last)} / {anchor_note} {fmt(anchor)} → {percent(used.last, anchor):+.3f}%",
-                          sigma_note, mode="盘后")
+                          sigma_note, mode="盘后", sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
         return dataclasses.replace(odds, warn="期货锚点是近似值，暂不给建议") if approximate else odds
 
     A50_SOFT_STALE_MS = 60 * 60_000  # A50 silent longer than this: no odds at all (shorter: odds with a warning)
@@ -12324,6 +12357,7 @@ class Bot:
         if k is None:
             return "缺少 KOSPI"
         sigma, sigma_note = self.vols.get("KOSPI", "KOSPI")
+        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
         kst = dt.timezone(dt.timedelta(hours=9))
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
         holidays = self.config.holidays.get("kr", frozenset())
@@ -12345,7 +12379,7 @@ class Bot:
             prev_day = expected_close_date("kr", now_ms, holidays)
             ref, ref_note = self.kospi_ref(prev_day, k.prev_close)
             return close_odds("KOSPI", ref, k.last, sigma, remaining, target, D("0.01"), ref_note,
-                              f"KOSPI 现货 {fmt(k.last)}（盘中直接用现货）", sigma_note)
+                              f"KOSPI 现货 {fmt(k.last)}（盘中直接用现货）", sigma_note, sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
         if not k.quoted_ms:
             return "KOSPI 报价时间未知，无法确认是哪一天的收盘；暂不输出概率"
         quoted_day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
@@ -12378,7 +12412,7 @@ class Bot:
         effective = ref * D(str(math.exp(beta * math.log(float(price / base)))))
         return close_odds("KOSPI", ref, effective, sigma, remaining, target, D("0.01"), ref_note,
                           f"HL KR200 {kind} {fmt(price)} / {base_note} {fmt(base)} → {percent(price, base):+.3f}%"
-                          + (f" × β {beta:g}" if beta != 1 else "") + "（KOSPI200 代理）", sigma_note, beta=beta, mode="盘后")
+                          + (f" × β {beta:g}" if beta != 1 else "") + "（KOSPI200 代理）", sigma_note, beta=beta, mode="盘后", sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
 
     @staticmethod
     def odds_row(odds: CloseOdds | str | None, label: str = "") -> str:
@@ -12422,7 +12456,7 @@ class Bot:
         return dataclasses.replace(
             close_odds(odds.name, strike, effective, odds.sigma_daily, odds.remaining, odds.target, tick,
                        f"Predict 目标价（本地参考 {fmt(odds.ref)}·{odds.ref_note}）", odds.proxy_note, odds.sigma_note,
-                       odds.unit, odds.beta, odds.mode), warn=odds.warn)
+                       odds.unit, odds.beta, odds.mode, widen=odds.widen), warn=odds.warn)
 
     def odds_payload(self) -> dict:
         """JSON for the web page: one entry per item, numbers raw, text already plain."""
@@ -12494,7 +12528,7 @@ class Bot:
             "source": "现货" if odds.direct else "代理估算·近似锚点" if "近似" in odds.warn else "代理估算",
             "ref": fmt(odds.ref), "effective": fmt(odds.effective.quantize(D("0.0001"))),
             "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note, "warn": odds.warn,
-            "sigma": odds.sigma, "remaining": odds.remaining, "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
+            "sigma": odds.sigma, "remaining": odds.remaining, "widen": odds.widen, "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
             "fair_up": odds.fair_up, "fair_down": odds.fair_down,
         }
 
@@ -12724,7 +12758,7 @@ class Bot:
         """What a daily card's odds rest on, for the trade's record: the model's inputs, every price behind them (its real
         source, code, quote and read times, kind of price) and, for an estimate, the proxy and its anchor."""
         basis = {"fair_up": odds.fair_up, "ref": float(odds.ref), "ref_note": odds.ref_note, "effective": float(odds.effective),
-                 "sigma_daily": odds.sigma_daily, "sigma_note": odds.sigma_note, "remaining": odds.remaining,
+                 "sigma_daily": odds.sigma_daily, "sigma_note": odds.sigma_note, "remaining": odds.remaining, "widen": odds.widen,
                  "sigma": odds.sigma, "z": odds.z, "beta": odds.beta, "mode": odds.mode, "direct": odds.direct,
                  "proxy_note": odds.proxy_note, "target": odds.target.isoformat(), "warn": odds.warn,
                  "close_ms": self.target_close(title, odds.target)[0]}
@@ -12878,7 +12912,7 @@ class Bot:
                 **({"sim_taker_after_hours_shares": c.sim_taker_after_hours_shares} if c.sim_taker_after_hours_shares else {}),
                 "sim_group_usd": c.sim_group_usd, "min_edge": c.predict_min_edge,
                 "fee_bps": c.predict_fee_bps, "trade_usd": c.predict_trade_usd, "a50_beta": c.a50_beta,
-                "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR,
+                "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR, "big_move": c.big_move_sigmas,
                 **({"sim_taker_session": True} if c.sim_taker_session else {}),
                 **({"sim_quiet_minutes": c.sim_quiet_minutes} if c.sim_quiet_minutes else {}),
                 **({"sim_maker_min_bid": c.sim_maker_min_bid} if c.sim_maker_min_bid > 0 else {}),
@@ -13037,17 +13071,19 @@ class Bot:
         the price sources and proxy, the book, the code and settings). A taker fills now across the book's depth (the
         quote it was judged on); a maker rests at its price behind the queue already there and fills only as sellers
         show up at or through it (see maker_fill)."""
-        fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+        model = mk.fair_up if side == "up" else 1 - mk.fair_up  # the card's fair price for this side
+        fair, cut = self.sim_fair(mk, side)  # what the trader judged it by: at most SIM_MAX_FAIR_CENTS (entry.fair_cap when cut)
         edges = book_edges(mk.fair_up, mk.book, self.edge_costs())
         shown = None if mk.hold or mk.book.stale(now_ms) else best_edge(edges, mk.need)  # the card's framed direction
         driver, driver_name = market_driver(mk.kind, mk.key, mk.settle, mk.item)
         trade = {"v": 2, "market": mk.market, "slug": mk.book.slug, "market_id": mk.book.market_id, "item": mk.item,
                  "kind": mk.kind, "key": mk.key, "side": side, "label": ("挂" if maker else "吃") + mk.sides[0 if side == "up" else 1],
-                 "maker": maker is not None, "fair": fair, "opened": now_ms, "settle": mk.settle,
+                 "maker": maker is not None, "fair": model, "opened": now_ms, "settle": mk.settle,
                  "driver": driver, "driver_name": driver_name,  # the event it settles on: positions sharing it lose together
                  "order": (float(taker.get("want") or self.sim_taker_shares(mk)) if taker is not None
                            else self.config.sim_shares if shares is None else float(shares)), "fills": [], "revisions": [],
-                 "entry": {"at": now_ms, "fair": fair, "fair_up": mk.fair_up, "need": mk.need, "book": book_snapshot(mk.book),
+                 "entry": {"at": now_ms, "fair": model, "fair_up": mk.fair_up, "need": mk.need, **({"fair_cap": fair} if cut > 0 else {}),
+                           "book": book_snapshot(mk.book),
                            "card": [edge_json(e, shown, e.label.replace("涨", mk.sides[0]).replace("跌", mk.sides[1]))
                                     for e in edges], **self.evidence_of(mk)},
                  "version": self.sim_version()}
@@ -13058,10 +13094,10 @@ class Bot:
         else:
             trade.update(price=taker["cost"], avg=taker["avg"], fee=taker["fee"], best=taker["best"],
                          slip=taker["avg"] - taker["best"], signal=fair - taker["cost"], shares=taker["got"], status="filled", cap=taker.get("cap"),
-                         filled=now_ms, fill_fair=fair,
-                         fills=[{"at": now_ms, "shares": taker["got"], "fair": fair, "how": "吃单立即成交",
+                         filled=now_ms, fill_fair=model,
+                         fills=[{"at": now_ms, "shares": taker["got"], "fair": model, "how": "吃单立即成交",
                                  "levels": taker["levels"], "short": taker["short"]}])
-        trade["edge"] = fair - trade["price"]  # the expectation per share when the decision was made
+        trade["edge"] = fair - trade["price"]  # the expectation per share when the decision was made (by the judged fair price)
         return trade
 
     def sim_fill(self, trade: dict, mk: SimMarket, now_ms: int) -> None:
@@ -13178,16 +13214,15 @@ class Bot:
         only = front_ok and c.sim_maker_deep_only and self.sim_mode_market(mk, c.sim_maker_deep_only_markets)  # SIM_MAKER_DEEP_ONLY (on its markets): the joining orders are not placed at all
         deep_bar = self.sim_maker_mode(mk, True)[0] if front_ok or wide else c.sim_maker_deep  # the deep-bid orders' bar here: SIM_MAKER_DEEP_CENTS, or the after-hours bar when higher
         limit = self.sim_after_hours_price(mk)  # after hours only at or under SIM_AFTER_HOURS_MAX_PRICE_CENTS
-        cands, joined, dear, over = [], None, None, []  # joined / dear / over: what was passed over, for the reason when nothing is left
+        cands, joined, dear, capped = [], None, None, []  # joined / dear / capped: what was passed over or cut, for the reason when nothing is left
         for side, name in (("up", "涨"), ("down", "跌")):
-            if self.sim_fair_over(mk, side):
-                over.append(name)  # SIM_MAX_FAIR_CENTS: a near-certain side is not quoted on either
-                continue
+            fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: a near-certain side is judged at the limit, no higher
+            if cut > 0:
+                capped.append(f"{name}的公平价 {cents(fair + cut)} 按上限 {cents(fair)} 计")
             own, own_price = self.sim_own_resting(trades, mk.market, side)
             level = maker_level(mk.book, side, c.sim_maker_min_bid, own, own_price)
             if level is None:
                 continue
-            fair = mk.fair_up if side == "up" else 1 - mk.fair_up
             front = self.sim_maker_price(mk.book, side, level, True, own, own_price)
             in_front = front[0] > level[0] + 1e-9  # a cent over the 买1 is possible (the best ask is not right there)
             front_edge = fair - front[0] >= deep_bar - 1e-9
@@ -13208,8 +13243,7 @@ class Bot:
             edge = fair - price
             cands.append(BookEdge(name, True, price, edge, queued, edge, front=use_front or sweep is not None, sweep=sweep is not None))
         cands.sort(key=lambda b: b.edge, reverse=True)
-        if over and not any(cand.edge > mk.need and cand.edge >= self.sim_maker_mode(mk)[0] - 1e-9 for cand in cands):
-            return None, f"{'、'.join(over)}的公平价超过上限 {cents(c.sim_max_fair)}，不挂"  # the other side has no order of its own to make
+        cut_note = f"；{'；'.join(capped)}" if capped else ""
         best = cands[0] if cands else None
         if best is None:
             if dear is not None and joined is None:
@@ -13218,12 +13252,12 @@ class Bot:
                 return None, f"只挂低价挂单：买1 之上 1¢ 的净优势不到 {cents(deep_bar)}（跟买1 也只有 {cents(joined)}）"
             return None, f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟" if c.sim_maker_min_bid > 0 else "没有可跟的买价"
         if best.edge <= mk.need:
-            return None, f"净优势 {cents(best.edge)} 不超过模型误差 {cents(mk.need)}"
+            return None, f"净优势 {cents(best.edge)} 不超过模型误差 {cents(mk.need)}" + cut_note
         bar, mode, _ = self.sim_maker_mode(mk)
         if best.edge < bar - 1e-9:
             return None, (f"{mode}只挂净优势 ≥ {cents(bar)} 的，现 {cents(best.edge)}" if mode
                           else f"净优势 {cents(best.edge)} 低于触发门槛 {cents(bar)}") \
-                + (f"；{cents(dear)} 的价位高于盘后上限 {cents(limit)}" if dear is not None else "")
+                + (f"；{cents(dear)} 的价位高于盘后上限 {cents(limit)}" if dear is not None else "") + cut_note
         # the side with the most edge first; when its order is already resting, the other side, if it clears the bar on its
         # own (both sides cheap enough is a pair: whichever fills has the edge it was judged on)
         for cand in cands:
@@ -13277,25 +13311,23 @@ class Bot:
                 parts = []
                 for side in ("up", "down"):
                     name = mk.sides[0 if side == "up" else 1]
-                    if over := self.sim_fair_over(mk, side):
-                        parts.append(f"{name}：{over}")
-                        continue
-                    fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+                    fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: judged at the limit when the card says more
+                    capped = f"（公平价 {cents(fair + cut)} 按上限 {cents(fair)} 计）" if cut > 0 else ""
                     cap = self.sim_taker_cap(mk, side, bps)
                     room, taken = self.sim_taker_room(trades, mk, side, self.sim_taker_want(mk, side, cap))
                     q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
                     held = trades.get(f"{mk.market}|{side}|吃")
                     if cap <= 0:
-                        parts.append(f"{name}：无封顶价（公平价 {cents(fair)} 留不出 {cents(max(mk.need, self.sim_taker_bar(mk)))}）")
+                        parts.append(f"{name}：无封顶价（公平价 {cents(fair)} 留不出 {cents(max(mk.need, self.sim_taker_bar(mk)))}）{capped}")
                     elif room < SIM_MIN_SHARES - 1e-9 and held is not None:
                         parts.append(f"{name}：" + (f"已有{sim_status(held)}，等它结束" if sim_in_flight(held) else
                                                     f"这一边吃单已累计 {taken:g} 份，达到上限 {c.sim_taker_max_shares:g} 份" if c.sim_taker_max_shares > 0 else
                                                     f"已有{sim_status(held)}（每边只吃一次）"))
                     elif q is None or q["got"] < SIM_MIN_SHARES - 1e-9:
-                        parts.append(f"{name}：封顶 {cents(cap)}，之下没有卖单")
+                        parts.append(f"{name}：封顶 {cents(cap)}{capped}，之下没有卖单")
                     else:
                         q, hold = self.sim_taker_pick(mk, trades, side, q, now_ms)  # the count the caps take, or why none
-                        parts.append(f"{name}：封顶 {cents(cap)}，可买 {q['got']:g} 份" + (f"（已吃 {taken:g} 份，上限 {c.sim_taker_max_shares:g}）" if taken > 0 else "")
+                        parts.append(f"{name}：封顶 {cents(cap)}{capped}，可买 {q['got']:g} 份" + (f"（已吃 {taken:g} 份，上限 {c.sim_taker_max_shares:g}）" if taken > 0 else "")
                                      + (f"，但{hold}" if hold else ""))
                 after = mk.in_session is False and (self.sim_taker_after_hours(mk) or self.sim_after_hours_price(mk) is not None)
                 taker_text = ("盘后：" if after else "") + "；".join(parts)
@@ -13329,7 +13361,9 @@ class Bot:
         sides = []
         for side in ("up", "down"):
             label = "吃" + mk.sides[0 if side == "up" else 1]
-            fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+            model = mk.fair_up if side == "up" else 1 - mk.fair_up
+            fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: judged at the limit when the card says more
+            capped = f"（公平价 {cents(model)} 按上限 {cents(fair)} 计）" if cut > 0 else ""
             cap = self.sim_taker_cap(mk, side, bps)
             levels = side_levels(mk.book, side)
             ask = levels[0][0] if levels else None
@@ -13337,11 +13371,9 @@ class Bot:
             held = trades.get(f"{mk.market}|{side}|吃")
             q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
             got = float(q["got"]) if q and q["got"] >= SIM_MIN_SHARES - 1e-9 else 0.0
-            block = self.sim_fair_over(mk, side)
-            if block:
-                got = 0.0  # SIM_MAX_FAIR_CENTS: not bought, whatever the asks
-            elif cap <= 0:
-                block = f"公平价 {cents(fair)} 留不出 {cents(need)}"
+            block = ""
+            if cap <= 0:
+                block = f"公平价 {cents(model)}{'（按上限 ' + cents(fair) + ' 计）' if cut > 0 else ''} 留不出 {cents(need)}"
             elif room < SIM_MIN_SHARES - 1e-9 and held is not None:
                 block = (f"已有{sim_status(held)}，等它结束" if sim_in_flight(held)
                          else f"已吃 {taken:g} 份，达到上限 {c.sim_taker_max_shares:g} 份" if c.sim_taker_max_shares > 0
@@ -13351,10 +13383,10 @@ class Bot:
             elif not got and ask <= cap + 1e-9:
                 block = f"封顶 {cents(cap)} 之下只有零星卖单（不足 1 份）"
             gap = round(ask - cap, 6) if ask is not None and cap > 0 else None
-            sides.append({"side": side, "label": label, "fair": fair, "cap": cap, "ask": ask, "gap": gap, "got": got, "taken": taken,
-                          "block": block, "edge": round(fair - q["cost"], 6) if got else None, "quote": q})
+            sides.append({"side": side, "label": label, "fair": fair, "model": model, "cut": cut, "capped": capped, "cap": cap, "ask": ask,
+                          "gap": gap, "got": got, "taken": taken, "block": block, "edge": round(fair - q["cost"], 6) if got else None, "quote": q})
         out["sides"] = [{k: v for k, v in s.items() if k != "quote"} for s in sides]
-        out["detail"] = "；".join(f"{s['label']}：" + (s["block"] or f"卖1 {cents(s['ask'])}，封顶 {cents(s['cap'])}"
+        out["detail"] = "；".join(f"{s['label']}：" + (s["block"] or f"卖1 {cents(s['ask'])}，封顶 {cents(s['cap'])}{s['capped']}"
                                                    + (f"，可买 {s['got']:g} 份" if s["got"] else f"，差 {cents(s['gap'])}")) for s in sides)
         if why:
             return {**out, "state": "wait", "text": f"不吃单：{why}", "short": why}
@@ -13368,12 +13400,12 @@ class Bot:
                 return {**out, "state": "blocked", "label": s["label"], "gap": s["gap"],
                         "text": f"{s['label']}可买 {got:g} 份，但{hold}", "short": f"{s['label']} 可买，但{hold}"}
             return {**out, "state": "ready", "label": s["label"], "gap": s["gap"],
-                    "text": f"可吃单：{s['label']} 封顶 {cents(s['cap'])}，可买 {got:g} 份{more}", "short": f"{s['label']} 可买 {got:g} 份"}
+                    "text": f"可吃单：{s['label']} 封顶 {cents(s['cap'])}{s['capped']}，可买 {got:g} 份{more}", "short": f"{s['label']} 可买 {got:g} 份"}
         near = [s for s in sides if s["gap"] is not None and not s["block"]]
         if near:
             s = min(near, key=lambda x: x["gap"])
             return {**out, "state": "near", "label": s["label"], "gap": s["gap"],
-                    "text": f"距吃单 {cents(s['gap'])}：{s['label']} 卖1 {cents(s['ask'])}，封顶 {cents(s['cap'])}", "short": f"{s['label']} 差 {cents(s['gap'])}"}
+                    "text": f"距吃单 {cents(s['gap'])}：{s['label']} 卖1 {cents(s['ask'])}，封顶 {cents(s['cap'])}{s['capped']}", "short": f"{s['label']} 差 {cents(s['gap'])}"}
         return {**out, "state": "held", "text": out["detail"], "short": sides[0]["block"] or sides[1]["block"] or "没有卖单"}
 
     def sim_taker_gaps(self, now_ms: int) -> dict[str, dict]:
@@ -13474,15 +13506,15 @@ class Bot:
                          + "（SIM_AFTER_HOURS_MAX_SHARES）")
         return room, ""
 
-    def sim_fair_over(self, mk: SimMarket, side: str) -> str:
-        """Why no new order goes on this side now: its fair price is over SIM_MAX_FAIR_CENTS — an outcome the model
-        calls near certain, where the few cents of edge left do not pay for the tail a normal model cannot see (a
-        95¢ side goes to zero when something happens). "" when the side may be bought."""
-        limit = self.config.sim_max_fair
+    def sim_fair(self, mk: SimMarket, side: str) -> tuple[float, float]:
+        """The fair price the trader judges ``side`` by, and what was cut off it: the card's, at most SIM_MAX_FAIR_CENTS.
+        The model is trusted that far and no further — an outcome it calls near certain has a tail a normal model
+        cannot see (a 99¢ side goes to zero when something happens) — so such a side is bought or quoted only when the
+        price leaves the bar under the limit (跌 99.6¢ fair, 85¢ ask: judged as 95 − 85.3 = 9.7¢, not 14.3¢), rather
+        than refused whatever the price (1.72.0–1.84.0: the 14¢ at 85¢ went untouched along with the 2¢ at 97¢)."""
         fair = mk.fair_up if side == "up" else 1 - mk.fair_up
-        if limit < 1 - 1e-9 and fair > limit + 1e-9:
-            return f"公平价 {cents(fair)} 超过上限 {cents(limit)}，不买"
-        return ""
+        limit = self.config.sim_max_fair
+        return (limit, fair - limit) if limit < 1 - 1e-9 and fair > limit + 1e-9 else (fair, 0.0)
 
     def sim_taker_want(self, mk: SimMarket, side: str, cap: float) -> float:
         """Shares a taker asks for on this market's side now: the per-buy count (sim_taker_shares), or — with
@@ -13546,7 +13578,7 @@ class Bot:
     def sim_taker_cap(self, mk: SimMarket, side: str, bps: float, slack: float = 0.0) -> float:
         """The dearest price a taker of ``side`` pays on this market now: the cap that keeps max(the card's error, the
         taker's bar − ``slack``) after the fee, and after hours never over the after-hours price limit."""
-        fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+        fair, _ = self.sim_fair(mk, side)  # at most SIM_MAX_FAIR_CENTS
         cap = taker_cap(fair, max(mk.need, self.sim_taker_bar(mk) - slack), bps)
         limit = self.sim_after_hours_price(mk)
         return min(cap, limit) if limit is not None and cap > 0 else cap
@@ -13671,7 +13703,7 @@ class Bot:
         if mk.hold or mk.book.stale(now_ms) or book_crossed(mk.book):
             return ""  # no fresh view of the market: the order stands
         side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)
-        fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+        fair, _ = self.sim_fair(mk, side)  # the edge as the order was judged: at most SIM_MAX_FAIR_CENTS
         edge = fair - price
         exit_edge = self.sim_maker_exit()
         if exit_edge > 0 and edge < exit_edge - 1e-9:
@@ -14151,9 +14183,7 @@ class Bot:
         # for the session, or is never placed after hours on a market not chosen for it
         takers = self.config.sim_ways != "maker" and not self.sim_taker_closed(mk)
         for side in ("up", "down") if takers else ():
-            if self.sim_fair_over(mk, side):
-                continue  # SIM_MAX_FAIR_CENTS: a near-certain side is not bought, whatever the asks
-            fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+            fair, _ = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: a near-certain side is judged at the limit, no higher
             # the dearest price that still leaves the edge the trade is about (the card's error and SIM_EDGE_CENTS, after
             # hours the after-hours bar, never over the after-hours price limit): every ask at or under it is bought, up
             # to SIM_SHARES; nothing above it, however much is wanted
@@ -15752,6 +15782,7 @@ class Bot:
                   "SIM_TAKER_SHARES": plain(c.sim_taker_shares), "SIM_TAKER_AFTER_HOURS_SHARES": plain(c.sim_taker_after_hours_shares),
                   "SIM_TAKER_MAX_SHARES": plain(c.sim_taker_max_shares), "SIM_TAKER_SWEEP_SHARES": plain(c.sim_taker_sweep),
                   "SIM_MAX_FAIR_CENTS": f"{c.sim_max_fair * 100:g}", "SIM_AFTER_HOURS_MAX_SHARES": plain(c.sim_after_hours_max_shares),
+                  "PROB_BIG_MOVE_SIGMAS": f"{c.big_move_sigmas:g}",
                   "SIM_OPEN_QUIET_MINUTES": str(c.sim_open_quiet_minutes),
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
                   "SIM_GROUP_USD": plain(c.sim_group_usd), "SIM_TAKER_SESSION": flag(c.sim_taker_session),
