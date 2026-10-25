@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.89.1"
+VERSION = "1.89.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5767,6 +5767,51 @@ HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 PRICE_WS_BACKOFF = (2.0, 300.0)  # the wait before a new connection: doubled per failure within these bounds
 PRICE_WS_STEADY_SECONDS = 60.0   # a connection that lasted this long and delivered prices puts the backoff back to the shortest
 WS_CLOSE_SECONDS = 1.0           # a connection's closing handshake is given this long at a stop or a reconnect (the socket is dropped after)
+PROBE_STREAM_SECONDS = 8.0       # how long a /diag stream probe waits for the first payload (under DIAG_TIMEOUT)
+
+
+async def probe_stream(url: str, name: str, seconds: float = PROBE_STREAM_SECONDS, connect: Any = None) -> dict:
+    """A /diag probe (1.89.2): connect to a Binance stream endpoint (the raw one), subscribe one stream and wait for its
+    first payload. Returns what happened — the answer to the subscription (已登记 / 被拒绝 / none), the frames seen, the
+    seconds to the first payload and its symbol and price; raises RemoteError when no payload came within ``seconds``,
+    saying what did come: a server that registers the stream and sends nothing is told apart from one that is unreachable."""
+    out: dict[str, Any] = {"url": url, "name": name, "answer": "", "frames": 0, "first": None, "symbol": "", "price": ""}
+    ws = await (connect or ws_connect)(url, {"User-Agent": f"CloseAlert/{VERSION}"})
+    started = time.monotonic()
+    try:
+        await ws.send(json.dumps({"method": "SUBSCRIBE", "params": [name], "id": 1}))
+        while True:
+            left = seconds - (time.monotonic() - started)
+            if left <= 0:
+                break
+            try:
+                raw = await asyncio.wait_for(ws.recv(), left)
+            except asyncio.TimeoutError:
+                break
+            out["frames"] += 1
+            try:
+                msg = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(msg, dict):
+                continue
+            data = msg if "e" in msg else msg.get("data")
+            if isinstance(data, dict) and "e" in data:
+                out["first"] = time.monotonic() - started
+                out["symbol"], out["price"] = str(data.get("s") or ""), str(data.get("p") or data.get("c") or "")
+                return out
+            if "id" in msg:
+                error = msg.get("error") if isinstance(msg.get("error"), dict) else (msg if "result" not in msg else None)
+                out["answer"] = f"被拒绝：{error.get('code', '')} {error.get('msg', '')}".strip() if error is not None else "已登记"
+    finally:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(ws.close(), WS_CLOSE_SECONDS)
+    raise RemoteError(f"连上 {url}，订阅 {name} {out['answer'] or '无答复'}，{seconds:.0f} 秒内收到 {out['frames']} 帧、没有任何行情")
+
+
+def stream_probe_detail(out: dict) -> str:
+    """The /diag line of a stream probe that got its payload."""
+    return f"{out['first']:.1f} 秒收到首帧（{out['symbol']} {out['price']}），订阅{out['answer'] or '无答复'}"
 
 
 class PushStream:
@@ -17271,6 +17316,12 @@ class Bot:
 
         probes += [("币安", "服务器时间", lambda: self.market.get("/fapi/v1/time"), check_time),
                    ("币安", "合约最新价", self.market.prices, check_prices)]
+        if self.config.binance_ws:  # the streams (1.89.2): does this deployment get market data over WebSocket at all? BTC's
+            # trades asked of the futures server(s) in use, of spot's main host and of spot's data host (the control)
+            for base in self.binance_streams["futures"].bases():
+                probes.append(("币安推送", f"合约 {base.partition('://')[2]}", lambda base=base: probe_stream(base + "/ws", "btcusdt@aggTrade"), stream_probe_detail))
+            probes += [("币安推送", "现货主站 stream.binance.com", lambda: probe_stream(BINANCE_WS_SPOT[1] + "/ws", "btcusdt@aggTrade"), stream_probe_detail),
+                       ("币安推送", "现货数据站 data-stream.binance.vision", lambda: probe_stream(BINANCE_WS_SPOT[0] + "/ws", "btcusdt@aggTrade"), stream_probe_detail)]
 
         # Underlying stock closes: every source for every ticker
         for symbol, ticker in self.config.tickers.items():

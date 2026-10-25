@@ -289,6 +289,41 @@ async def run():
         except ValueError as error:
             assert "BINANCE_WS_URL" in str(error), error
     assert m.age_text(5) == "5 秒前" and m.age_text(599) == "599 秒前" and m.age_text(600) == "10 分前" and m.age_text(36000) == "10 小时前" and m.age_text(-3) == "0 秒前"
+    # the /diag stream probe (1.89.2): connect, subscribe one stream, wait for its first payload
+    pconns = []
+    async def pconnect(url, headers):
+        assert headers == {"User-Agent": f"CloseAlert/{m.VERSION}"}
+        ws = FakeWs(url); pconns.append(ws); return ws
+    task = asyncio.create_task(m.probe_stream("wss://fstream.binance.com/ws", "btcusdt@aggTrade", 1.0, connect=pconnect))
+    await asyncio.sleep(0.02)
+    assert pconns[0].sent == [{"method": "SUBSCRIBE", "params": ["btcusdt@aggTrade"], "id": 1}]
+    pconns[0].push({"result": None, "id": 1}); pconns[0].push({"e": "aggTrade", "s": "BTCUSDT", "p": "110234.5", "T": NOW})
+    out = await asyncio.wait_for(task, 1)
+    assert out["answer"] == "已登记" and out["frames"] == 2 and out["symbol"] == "BTCUSDT" and out["price"] == "110234.5" and 0 <= out["first"] < 1 and pconns[0].closed, out
+    assert m.stream_probe_detail(out) == "0.0 秒收到首帧（BTCUSDT 110234.5），订阅已登记"
+    # the wrapped payload of a combined endpoint counts too; a refusal is kept
+    task = asyncio.create_task(m.probe_stream("wss://x/ws", "btcusdt@aggTrade", 1.0, connect=pconnect))
+    await asyncio.sleep(0.02)
+    pconns[1].push({"error": {"code": 2, "msg": "Invalid request"}, "id": 1}); pconns[1].push({"stream": "btcusdt@aggTrade", "data": {"e": "aggTrade", "s": "BTCUSDT", "p": "110235"}})
+    out = await asyncio.wait_for(task, 1)
+    assert out["answer"] == "被拒绝：2 Invalid request" and out["price"] == "110235"
+    # silence: the error says the stream was registered and nothing came
+    task = asyncio.create_task(m.probe_stream("wss://fstream.binance.com/ws", "btcusdt@aggTrade", 0.3, connect=pconnect))
+    await asyncio.sleep(0.02); pconns[2].push({"result": None, "id": 1})
+    try:
+        await asyncio.wait_for(task, 1); raise AssertionError("mute")
+    except m.RemoteError as error:
+        assert str(error) == "连上 wss://fstream.binance.com/ws，订阅 btcusdt@aggTrade 已登记，0 秒内收到 1 帧、没有任何行情", error
+    assert pconns[2].closed
+    task = asyncio.create_task(m.probe_stream("wss://fstream.binance.com/ws", "btcusdt@aggTrade", 0.2, connect=pconnect))
+    try:
+        await asyncio.wait_for(task, 1); raise AssertionError("mute")
+    except m.RemoteError as error:
+        assert str(error).endswith("无答复，0 秒内收到 0 帧、没有任何行情"), error
+    probes = [p for p in bot.diag_probes(NOW) if p[0] == "币安推送"]
+    assert [p[1] for p in probes] == ["合约 fstream.binance.com", "现货主站 stream.binance.com", "现货数据站 data-stream.binance.vision"] and all(p[3] is m.stream_probe_detail for p in probes)
+    assert [p[1] for p in rbot.diag_probes(NOW) if p[0] == "币安推送"][:3] == ["合约 relay.example", "合约 fstream.binance.com", "合约 10.0.0.5:8080/relay"]
+    assert not [p for p in obot.diag_probes(NOW) if p[0] == "币安推送"], "BINANCE_WS=off: no stream probe"
     # a bot without the streams' attributes (the tests' stubs) still samples: prices() reads REST
     bare = FakeMarket(on)
     assert bare.stream is None and (await bare.prices())["UNITREEUSDT"]["price"] == "70.5"
