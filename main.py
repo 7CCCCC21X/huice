@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.86.0"
+VERSION = "1.87.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -559,6 +559,8 @@ class Config:
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
     hl_refresh: int = 10  # HL_REFRESH_SECONDS: how often the Hyperliquid quotes (the KR200 after-hours proxy among them) are read
+    binance_ws: bool = True  # BINANCE_WS: Binance's trade streams beside the REST reads (BinanceStream: the contracts, the crypto cards' pairs); off = REST only
+    hl_ws: bool = True       # HL_WS: Hyperliquid's context stream beside the REST reads (HyperliquidStream); off = REST only
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
@@ -730,6 +732,8 @@ class Config:
             kospi_index=e.get("KOSPI_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
             hl_index=parse_hl_tickers(e.get("HL_INDEX", DEFAULT_HL_INDEX), ("KR200",)),
             hl_refresh=bounded_int(e, "HL_REFRESH_SECONDS", 10, 3, 120),
+            binance_ws=e.get("BINANCE_WS", "on").strip().lower() not in {"off", "0", "false", "no"},
+            hl_ws=e.get("HL_WS", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict=e.get("PREDICT", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
@@ -1445,6 +1449,7 @@ class Binance:
         self.offset_ms = 0
         self.clock_checked = 0.0
         self.blocked_until = 0.0
+        self.stream: Any = None  # BinanceStream (1.87.0): its pushed rows stand in for the REST read of prices() while fresh
 
     def now_ms(self) -> int:
         return int(time.time() * 1000) + self.offset_ms
@@ -1477,7 +1482,10 @@ class Binance:
         self.clock_checked = time.monotonic()
 
     async def prices(self) -> dict[str, dict]:
-        """Last trade per symbol, plus the mark price (markPrice/markTime) when the index feed answers."""
+        """Last trade per symbol, plus the mark price (markPrice/markTime) when the index feed answers. The pushed rows
+        (BinanceStream) when the stream lives and every symbol's is fresh; else the REST read, which seeds the stream."""
+        if self.stream is not None and (rows := self.stream.rows(self.config.symbols)) is not None:
+            return rows
         data, marks = await asyncio.gather(self.get("/fapi/v2/ticker/price"),
                                            self.get("/fapi/v1/premiumIndex"), return_exceptions=True)
         if isinstance(data, BaseException):
@@ -1492,6 +1500,8 @@ class Binance:
                                                 indexPrice=mark.get("indexPrice"))
         elif isinstance(marks, BaseException):
             LOG.debug("premiumIndex unavailable: %s", clean_error(marks))
+        if self.stream is not None:
+            self.stream.seed(rows)
         return rows
 
     async def price_at(self, symbol: str, at_ms: int) -> tuple[D, str]:
@@ -5616,6 +5626,321 @@ class PredictStream:
         return text
 
 
+# --- Binance's and Hyperliquid's streams: the prices pushed as they trade (1.87.0) ----------------------------------------
+BINANCE_WS_FUTURES = ("wss://fstream.binance.com/stream",)
+BINANCE_WS_SPOT = ("wss://data-stream.binance.vision/stream", "wss://stream.binance.com:9443/stream")  # market data only; the next host after a failure
+HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
+PRICE_WS_BACKOFF = (2.0, 300.0)  # the wait before a new connection: doubled per failure within these bounds
+
+
+class PushStream:
+    """A WebSocket kept for as long as the bot runs (the connection loop PredictStream has, for the price feeds): made,
+    used until it fails or falls silent (SILENT_SECONDS), made again after a growing pause (PRICE_WS_BACKOFF, back to
+    the shortest once a connection lasted a minute), the next host of urls() after a failure. A subclass says what to
+    connect to (urls, headers), what to send once connected (opened), what to do with a frame (frame) and every
+    TICK_SECONDS (tick: a ping). ``connect`` (the tests): a coroutine function (url, headers) -> a connection."""
+    NAME = "推送"
+    SILENT_SECONDS = 60.0
+    TICK_SECONDS = 30.0
+
+    def __init__(self, connect: Any = None):
+        self.connect = connect or ws_connect
+        self.ws: Any = None
+        self.connected_at = 0.0   # monotonic; 0 = not connected
+        self.last_frame = 0.0
+        self.connects = 0
+        self.frames = 0
+        self.pushed = 0           # prices applied
+        self.dropped = 0          # frames not understood
+        self.error = ""
+        self.error_at = 0.0
+        self.closed_why = ""
+        self.backoff = PRICE_WS_BACKOFF[0]
+        self.host_index = 0
+
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    def urls(self) -> list[str]:
+        return []
+
+    def headers(self) -> dict[str, str]:
+        return {}
+
+    async def opened(self, ws: Any) -> None:
+        return None
+
+    async def frame(self, ws: Any, raw: Any) -> None:
+        return None
+
+    async def tick(self, ws: Any) -> None:
+        return None
+
+    @property
+    def connected(self) -> bool:
+        return self.ws is not None and self.connected_at > 0
+
+    async def run(self, stopping: asyncio.Event) -> None:
+        while not stopping.is_set():
+            urls = self.urls() if self.enabled else []
+            if not urls:
+                await PredictStream.pause(stopping, 5.0)
+                continue
+            url = urls[self.host_index % len(urls)]
+            try:
+                ws = await self.connect(url, self.headers())
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.error, self.error_at = clean_error(error) or type(error).__name__, time.time()
+                self.host_index += 1
+                LOG.warning("%s连接失败：%s（%.0f 秒后重试）", self.NAME, self.error, self.backoff)
+                await PredictStream.pause(stopping, self.backoff)
+                self.backoff = min(self.backoff * 2, PRICE_WS_BACKOFF[1])
+                continue
+            since = time.monotonic()
+            self.ws, self.connected_at, self.last_frame, self.connects = ws, since, since, self.connects + 1
+            LOG.info("%s已连接（第 %d 次）：%s", self.NAME, self.connects, url.partition("?")[0])
+            why = ""
+            try:
+                await self.opened(ws)
+                why = await self.session(ws, stopping)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                why = clean_error(error) or type(error).__name__
+            finally:
+                self.ws, self.connected_at = None, 0.0
+                with contextlib.suppress(Exception):
+                    await ws.close()
+            if stopping.is_set():
+                return
+            self.closed_why = why or "连接结束"
+            self.error, self.error_at = self.closed_why, time.time()
+            lasted = time.monotonic() - since
+            self.backoff = PRICE_WS_BACKOFF[0] if lasted >= 60 else min(self.backoff * 2, PRICE_WS_BACKOFF[1])
+            LOG.warning("%s断开：%s（%.0f 秒后重连）", self.NAME, self.closed_why, self.backoff)
+            await PredictStream.pause(stopping, self.backoff)
+
+    async def session(self, ws: Any, stopping: asyncio.Event) -> str:
+        reader = asyncio.create_task(self.read(ws), name=f"{self.NAME}-read")
+        ticker = asyncio.create_task(self.tick_loop(ws), name=f"{self.NAME}-tick")
+        stopper = asyncio.create_task(stopping.wait(), name=f"{self.NAME}-stop")
+        try:
+            done, _ = await asyncio.wait({reader, ticker, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            if stopper in done:
+                return ""
+            task = reader if reader in done else ticker
+            error = task.exception()
+            return (clean_error(error) or type(error).__name__) if error else (task.result() or "连接结束")
+        finally:
+            for task in (reader, ticker, stopper):
+                task.cancel()
+            await asyncio.gather(reader, ticker, stopper, return_exceptions=True)
+
+    async def read(self, ws: Any) -> str:
+        while True:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=self.SILENT_SECONDS)
+            except asyncio.TimeoutError:
+                return f"{self.SILENT_SECONDS:.0f} 秒没有收到任何帧"
+            self.frames += 1
+            self.last_frame = time.monotonic()
+            await self.frame(ws, raw)
+
+    async def tick_loop(self, ws: Any) -> str:
+        while True:
+            await asyncio.sleep(self.TICK_SECONDS)
+            await self.tick(ws)
+
+    def line(self) -> str:
+        """The stream's state in a line (/diag)."""
+        if not self.enabled:
+            return "关"
+        if not self.urls():
+            return "没有要订阅的市场"
+        if self.connected:
+            text = (f"已连接 {int(time.monotonic() - self.connected_at)} 秒（第 {self.connects} 次），收到 {self.pushed} 次行情、"
+                    f"{self.frames} 帧，最近一帧 {time.monotonic() - self.last_frame:.0f} 秒前")
+        elif self.connects:
+            text = f"未连接（上次断开：{brief_error(self.closed_why, 60)}；{self.backoff:.0f} 秒后重连）"
+        else:
+            text = "尚未连接" + (f"（{brief_error(self.error, 60)}）" if self.error else "")
+        return text + (f"；丢弃 {self.dropped} 帧" if self.dropped else "")
+
+
+class BinanceStream(PushStream):
+    """Binance's market streams, one connection per venue: every trade (aggTrade) of the pairs the bot prices — on
+    futures the contracts (SYMBOLS, with the mark price every second: a thin contract's quote falls back to it) and
+    HYPEUSDT's ladder, on spot the crypto cards' pairs — pushed where the REST reads put them (Bot.price_pushed): the
+    contract's quote between sampling cycles, the cards' prices. The rows stand in for the sampling cycle's REST read
+    while fresh (rows), the REST read seeds them (seed: a contract may not trade for minutes after the connection is
+    made, and the quote wants its last trade)."""
+    NAME = "币安推送"
+    FRESH_SECONDS = 10.0  # a symbol's row pushed within this stands in for the REST read (the mark price comes every second)
+
+    def __init__(self, bot: "Bot", venue: str, connect: Any = None):
+        super().__init__(connect)
+        self.bot, self.venue = bot, venue
+        self.latest: dict[str, dict] = {}   # symbol -> the row in the REST read's shape: symbol, price, time, markPrice, markTime, indexPrice
+        self.row_at: dict[str, float] = {}  # symbol -> monotonic time of its last push
+
+    @property
+    def enabled(self) -> bool:
+        return bool(getattr(self.bot.config, "binance_ws", True))
+
+    def symbols(self) -> list[str]:
+        """The pairs streamed on this venue: the contracts (futures) and, with the crypto cards on, their pairs."""
+        c = self.bot.config
+        out = list(c.symbols) if self.venue == "futures" else []
+        if c.touch:
+            if self.venue == "spot":
+                out += [spec.symbol for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS)]
+            out += [spec.symbol for spec in RANGE_MARKETS if spec.venue == self.venue]
+        return list(dict.fromkeys(out))
+
+    def urls(self) -> list[str]:
+        symbols = self.symbols()
+        if not symbols:
+            return []
+        names = [f"{s.lower()}@aggTrade" for s in symbols]
+        if self.venue == "futures":
+            names += [f"{s.lower()}@markPrice@1s" for s in symbols]
+        query = "?streams=" + "/".join(names)
+        return [base + query for base in (BINANCE_WS_FUTURES if self.venue == "futures" else BINANCE_WS_SPOT)]
+
+    async def frame(self, ws: Any, raw: Any) -> None:
+        """A combined-stream frame: {"stream": "<pair>@aggTrade", "data": {...}} — a trade (p, T) or a mark price (p, i, E)."""
+        try:
+            msg = json.loads(raw)
+        except (TypeError, ValueError):
+            self.dropped += 1
+            return
+        data = msg.get("data") if isinstance(msg, dict) else None
+        if not isinstance(data, dict):
+            self.dropped += 1
+            return
+        kind, symbol = data.get("e"), str(data.get("s") or "").upper()
+        if not symbol or kind not in ("aggTrade", "markPriceUpdate"):
+            self.dropped += 1
+            return
+        row = self.latest.setdefault(symbol, {"symbol": symbol})
+        try:
+            if kind == "aggTrade":
+                row["price"], row["time"] = str(data["p"]), int(data["T"])
+            else:
+                row["markPrice"], row["markTime"] = str(data["p"]), int(data["E"])
+                if data.get("i") is not None:
+                    row["indexPrice"] = str(data["i"])
+        except (KeyError, TypeError, ValueError):
+            self.dropped += 1
+            return
+        self.row_at[symbol] = time.monotonic()
+        self.pushed += 1
+        if kind == "aggTrade" or symbol in self.bot.config.symbols:  # a mark price matters to a contract's quote alone
+            self.bot.price_pushed(self.venue, symbol, row)
+
+    def rows(self, symbols: Any) -> dict[str, dict] | None:
+        """The pushed rows for ``symbols`` in the REST read's shape, when the connection lives and every one is fresh
+        (FRESH_SECONDS) and has a last trade (pushed, or seeded from the last REST read); else None."""
+        if not self.connected:
+            return None
+        now, out = time.monotonic(), {}
+        for symbol in symbols:
+            row = self.latest.get(symbol)
+            if row is None or "price" not in row or "time" not in row or now - self.row_at.get(symbol, -1e9) > self.FRESH_SECONDS:
+                return None
+            out[symbol] = dict(row)
+        return out
+
+    def seed(self, rows: dict[str, dict]) -> None:
+        """The REST read's rows: a symbol's last trade and mark price when newer than what the stream holds (never
+        newer data overwritten with older). Freshness (row_at) comes from pushes alone."""
+        for symbol, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            mine = self.latest.setdefault(symbol, {"symbol": symbol})
+            with contextlib.suppress(KeyError, TypeError, ValueError):
+                if row.get("price") is not None and ("time" not in mine or int(row.get("time") or 0) > int(mine["time"])):
+                    mine["price"], mine["time"] = str(row["price"]), int(row["time"])
+                if row.get("markPrice") is not None and ("markTime" not in mine or int(row.get("markTime") or 0) > int(mine["markTime"])):
+                    mine["markPrice"], mine["markTime"] = str(row["markPrice"]), int(row["markTime"])
+                    if row.get("indexPrice") is not None:
+                        mine["indexPrice"] = str(row["indexPrice"])
+
+
+class HyperliquidStream(PushStream):
+    """Hyperliquid's stream: the context of every perp the bot quotes (HL_TICKERS, HL_INDEX — KR200 is the KOSPI card's
+    after-hours price) and of the flip cards' coins, pushed as it changes (activeAssetCtx: markPx, midPx, oraclePx,
+    prevDayPx, funding) where the REST read puts it (Bot.hl_pushed). A ping every TICK_SECONDS keeps the server from
+    closing a quiet connection."""
+    NAME = "Hyperliquid 推送"
+    TICK_SECONDS = 45.0
+
+    def __init__(self, bot: "Bot", connect: Any = None):
+        super().__init__(connect)
+        self.bot = bot
+
+    @property
+    def enabled(self) -> bool:
+        return bool(getattr(self.bot.config, "hl_ws", True))
+
+    def coins(self) -> dict[str, list[tuple[str, str]]]:
+        """Full coin name ("xyz:KR200", "HYPE") -> what hangs on it: ("quote", symbol) for a reference quote, ("flip",
+        key) for a flip card's coin."""
+        out: dict[str, list[tuple[str, str]]] = {}
+        for symbol, (dex, coin) in self.bot.hl.tickers.items():
+            out.setdefault(f"{dex}:{coin}" if dex else coin, []).append(("quote", symbol))
+        if self.bot.config.touch:
+            for key, fm in self.bot.flips.items():
+                for coin in (fm.spec.coin, fm.spec.other):
+                    out.setdefault(coin, []).append(("flip", key))
+        return out
+
+    def urls(self) -> list[str]:
+        return [HL_WS_URL] if self.coins() else []
+
+    async def opened(self, ws: Any) -> None:
+        for coin in self.coins():
+            await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "activeAssetCtx", "coin": coin}}))
+
+    async def tick(self, ws: Any) -> None:
+        await ws.send(json.dumps({"method": "ping"}))
+
+    async def frame(self, ws: Any, raw: Any) -> None:
+        try:
+            msg = json.loads(raw)
+        except (TypeError, ValueError):
+            self.dropped += 1
+            return
+        if not isinstance(msg, dict):
+            self.dropped += 1
+            return
+        channel = msg.get("channel")
+        if channel in ("pong", "subscriptionResponse"):
+            return
+        if channel == "error":
+            self.error, self.error_at = brief_error(str(msg.get("data") or "error"), 120), time.time()
+            return
+        if channel != "activeAssetCtx":
+            return
+        data = msg.get("data") if isinstance(msg.get("data"), dict) else {}
+        coin, ctx = str(data.get("coin") or ""), data.get("ctx")
+        if not coin or not isinstance(ctx, dict):
+            self.dropped += 1
+            return
+        try:
+            mark = number(ctx.get("markPx"), "标记价")
+        except ValueError:
+            self.dropped += 1
+            return
+        quote = HlQuote(coin, mark, _opt(ctx.get("oraclePx")), _opt(ctx.get("midPx")), _opt(ctx.get("prevDayPx")),
+                        _opt(ctx.get("funding")), int(time.time() * 1000))
+        self.pushed += 1
+        self.bot.hl_pushed(coin, quote)
+
+
 # --- first-touch market (which barrier does BNB hit first?) ------------------------------------------
 def et_ms(year: int, month: int, day: int, hour: int, minute: int, utc_offset: int) -> int:
     """US Eastern wall time -> epoch ms; utc_offset is -4 (EDT, Mar-Nov) or -5 (EST)."""
@@ -5835,6 +6160,13 @@ class TouchMarket:
 
     async def get(self, path: str, **params: Any) -> Any:
         return await binance_spot(path, **params)
+
+    def push_price(self, price: D, now_ms: int) -> None:
+        """A trade pushed in (BinanceStream): the price as the 30-second read would set it, that read deferred by as
+        long; at a line the path is checked at once."""
+        self.price, self.priced_ms, self.times["price"] = price, now_ms, time.monotonic()
+        if (price <= self.spec.low or price >= self.spec.high) and self.history.get("kind") in {None, "clear"}:
+            self.times["scan"] = -1e9
 
     @property
     def history(self) -> dict:
@@ -6118,6 +6450,10 @@ class UpDownMarket:
     async def get(self, path: str, **params: Any) -> Any:
         return await binance_spot(path, **params)
 
+    def push_price(self, price: D, now_ms: int) -> None:
+        """A trade pushed in (BinanceStream): the price as the 30-second read would set it, that read deferred by as long."""
+        self.price, self.priced_ms, self.times["price"] = price, now_ms, time.monotonic()
+
     def close_of(self, which: str) -> D | None:
         """The kept close of the "start" or "end" candle, None until it has been read."""
         open_ms = self.spec.start_ms if which == "start" else self.spec.end_ms
@@ -6280,6 +6616,13 @@ class FlipMarket:
 
     async def info(self, payload: dict) -> Any:
         return await http_json(Hyperliquid.URL, payload)
+
+    def push_mid(self, coin: str, mid: D, now_ms: int) -> None:
+        """One coin's mid pushed in (HyperliquidStream): the pair is priced once both coins have one, the 30-second read
+        deferred by as long."""
+        self.prices = {**self.prices, coin: mid}
+        if all(c in self.prices for c in (self.spec.coin, self.spec.other)):
+            self.priced_ms, self.times["price"] = now_ms, time.monotonic()
 
     async def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict]:
         rows = await self.info({"type": "candleSnapshot", "req": {"coin": coin, "interval": interval,
@@ -7404,6 +7747,11 @@ class RangeMarket:
 
     async def get(self, path: str, **params: Any) -> Any:
         return await (self.futures if self.spec.venue == "futures" else binance_spot)(path, **params)
+
+    def push_price(self, price: D, now_ms: int) -> None:
+        """A trade pushed in (BinanceStream): the price as the 30-second read would set it, that read deferred by as long."""
+        self.price, self.priced_ms, self.times["price"] = price, now_ms, time.monotonic()
+        self.failures["price"] = ""
 
     @property
     def window_end(self) -> int:
@@ -11380,6 +11728,18 @@ class Bot:
             if isinstance(rm, StockRangeMarket):  # "hits $100 by <date>": the date-titled markets, one per deadline
                 self.predict.ladder_parse[key], self.predict.ladder_pick[key] = hit_level_parser(rm.spec.slug), rm.choose
         self.predict.reward_keys.update(self.ranges)
+        # the price streams (1.87.0): the crypto cards by the pair that prices them, the Binance venues, Hyperliquid
+        self.pair_markets: dict[tuple[str, str], list] = {}  # (venue, pair) -> the cards priced from it (BinanceStream)
+        for card in (*self.touches.values(), *self.updowns.values()):
+            self.pair_markets.setdefault(("spot", card.spec.symbol), []).append(card)
+        for rm in self.ranges.values():
+            if rm.spec.venue in ("spot", "futures"):
+                self.pair_markets.setdefault((rm.spec.venue, rm.spec.symbol), []).append(rm)
+        self.binance_streams = {venue: BinanceStream(self, venue) for venue in ("futures", "spot")}
+        self.market.stream = self.binance_streams["futures"]  # the sampling cycle's prices() takes the pushed rows while fresh
+        self.hl_stream = HyperliquidStream(self)
+        self.price_dirty: set[str] = set()                   # book keys a pushed price moved, looked at after PRICE_LOOK_DELAY
+        self.price_look: asyncio.Task | None = None
         if config.touch:
             self.predict.want_info.update(spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *FLIP_MARKETS))
             self.predict.ladder_keys.update(self.caps)
@@ -16766,6 +17126,8 @@ class Bot:
         if st["new"] or st["reused"]:
             total = st["new"] + st["reused"]
             lines.append(f"🔌 HTTP 连接：新建 {st['new']}｜复用 {st['reused']}（{st['reused'] * 100 // max(total, 1)}%）｜对方已关、换新连接重发 {st['retried']} 次")
+        lines.append("📡 行情推送：" + "｜".join(f"{name} {stream.line()}" for name, stream in (
+            ("币安合约", self.binance_streams["futures"]), ("币安现货", self.binance_streams["spot"]), ("Hyperliquid", self.hl_stream))))
         if self.reference_state:
             lines.append("🔄 后台刷新")
             for name, _ in self.reference_jobs():
@@ -16985,7 +17347,7 @@ class Bot:
 
     PREDICT_HOT_GAP = 0.05  # a market whose nearer side is within this of the taker's cap is refreshed every round
     WAKE_JOBS = frozenset({"恒指期货", "上证/A50", "KOSPI", "Hyperliquid", "股票实时", "交易所收盘", "概率输入",
-                           "先触市场", "涨跌市场", "反超市场", "市值阶梯", "价格阶梯"})  # the feeds the fair prices hang on
+                           "先触市场", "涨跌市场", "反超市场", "市值阶梯", "价格阶梯", "行情推送"})  # the feeds the fair prices hang on
 
     def fair_signature(self, now_ms: int) -> tuple:
         """Every priced market's fair price, to the tenth of a cent: the trader looks again when it changes."""
@@ -17006,6 +17368,70 @@ class Bot:
             return
         if sig != self.fair_sig:
             self.fair_sig, self.sim_wake = sig, True
+
+    PRICE_LOOK_DELAY = 0.2  # pushes gathered this long before the keys they move are looked at (a busy pair ticks many times a second)
+
+    def price_pushed(self, venue: str, symbol: str, row: dict) -> None:
+        """A Binance price pushed in (BinanceStream): a contract's quote between sampling cycles (the baseline kept; a
+        push that moves nothing — the mark price while the last trade is fresh — wakes nothing), the crypto cards priced
+        from the pair; the keys that hang on it are looked at after PRICE_LOOK_DELAY (priced)."""
+        now_ms, keys = self.market.now_ms(), []
+        if venue == "futures" and symbol in self.config.symbols:
+            snapshot = self.snapshots.get(symbol)
+            if isinstance(snapshot, dict) and isinstance(snapshot.get("quote"), Quote):
+                try:
+                    quote = Quote.parse(row, symbol, now_ms, self.config.max_age)
+                except ValueError:
+                    quote = None
+                if quote is not None:
+                    old = snapshot["quote"]
+                    snapshot["quote"] = quote
+                    if quote.price != old.price or quote.source != old.source:
+                        keys.append(symbol)
+        cards = self.pair_markets.get((venue, symbol), ())
+        if cards and row.get("price") is not None:
+            try:
+                price = number(row.get("price"), symbol)
+            except ValueError:
+                price = None
+            if price is not None:
+                for card in cards:
+                    card.push_price(price, now_ms)
+                    keys.append(card.spec.key)
+        if keys:
+            self.priced(keys)
+
+    def hl_pushed(self, coin: str, quote: HlQuote) -> None:
+        """A Hyperliquid context pushed in (HyperliquidStream): the reference quote (HL_TICKERS / HL_INDEX; KR200's is the
+        KOSPI card's after-hours price), a flip card's mid; the keys that hang on it are looked at (priced)."""
+        keys = []
+        for what, key in self.hl_stream.coins().get(coin, ()):
+            if what == "quote":
+                self.hl.quotes[key] = quote
+                self.hl.notes.pop(key, None)
+                if key == "KR200":
+                    keys.append("KOSPI")
+            elif quote.mid is not None and (fm := self.flips.get(key)) is not None:
+                fm.push_mid(coin, quote.mid, self.market.now_ms())
+                if fm.priced_ms:
+                    keys.append(key)
+        if keys:
+            self.priced(keys)
+
+    def priced(self, keys: Any) -> None:
+        """Book keys a pushed price moved: looked at together after PRICE_LOOK_DELAY (price_looks) — the express lane for
+        their takers, the trader woken for the rest (note_job) — not once per tick of a busy pair."""
+        self.price_dirty.update(keys)
+        if self.price_look is None or self.price_look.done():
+            self.price_look = asyncio.create_task(self.price_looks(), name="price-look")
+
+    async def price_looks(self) -> None:
+        await asyncio.sleep(self.PRICE_LOOK_DELAY)
+        keys, self.price_dirty = self.price_dirty, set()
+        for key in sorted(keys):
+            if key in self.predict.books or key in self.predict.ladders:
+                self.predict.updated(key)
+        self.note_job("行情推送", self.market.now_ms())
 
     def predict_hot_keys(self, now_ms: int) -> set[str]:
         """The item keys the orderbook feed refreshes every round (predict_hot)."""
@@ -17249,6 +17675,9 @@ class Bot:
         tasks = [*core, *self.reference_tasks]
         if self.config.predict:  # Predict's WebSocket beside the REST rounds (PREDICT_WS=off: it idles)
             tasks.append(asyncio.create_task(self.predict.stream.run(self.stopping), name="predict-ws"))
+        for name, stream in (("binance-ws-futures", self.binance_streams["futures"]), ("binance-ws-spot", self.binance_streams["spot"]),
+                             ("hl-ws", self.hl_stream)):  # the price streams beside the REST reads (BINANCE_WS / HL_WS=off: they idle)
+            tasks.append(asyncio.create_task(stream.run(self.stopping), name=name))
         if self.config.web_port:
             try:
                 self.web = WebServer(self, self.config.web_port, self.web_token)

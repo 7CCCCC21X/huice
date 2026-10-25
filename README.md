@@ -483,6 +483,8 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-september-28-2026
 | --- | --- | --- |
 | `PREDICT` | `on` | `off` 关闭盘口获取和 `/book` |
 | `PREDICT_API_KEY` | 空 | 可选，作为 `x-api-key` 发给 api.predict.fun |
+| `BINANCE_WS` | `on` | 币安行情推送（1.87.0）：合约和加密卡片的成交价一笔一笔推过来，和 REST 轮询并行；`off` = 只轮询。见“行情时效”一节 |
+| `HL_WS` | `on` | Hyperliquid 行情推送（1.87.0）：KR200 等永续的标记价、中间价一变就推过来；`off` = 只轮询 |
 | `PREDICT_WS` | `on` | Predict 的 WebSocket 推送（`wss://ws.predict.fun/ws`，1.86.0）：热门市场的盘口一变就推过来，和 REST 轮询并行（轮询照旧）；`off` = 只轮询。见下面“盘口推送” |
 | `PREDICT_POLL_SECONDS` | `10` | 盘口刷新间隔（3～3600 秒）。控制台可在线改（预设 3 / 5 / 10 / 15 / 30 秒）；设得比 `SIM_SECONDS` 还短没有意义，太短会被 Predict 限流（429，之后 20 秒内不再请求） |
 | `SOURCES_OFF` | 空 | 永不询问的行情源，逗号分隔：`eastmoney`、`sina`、`tencent`、`yahoo`、`naver`、`etnet`。东方财富常拒绝海外机房（502 / 直接断开），关掉后每一轮、锚点查找和 `/diag` 都不再问它，由腾讯、新浪、Yahoo、Naver 顶上（A50 的 15:00 锚点只能用新浪 5 分钟 K 的近似值）。控制台高级组“关闭的行情源”可在线切换 |
@@ -741,6 +743,9 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 限制：假期表只覆盖预设和手动配置的日期；代理（币安合约、HL KR200、恒指期货）与结算标的之间有基差，KR200 追踪的是 KOSPI 200 而不是 KOSPI 综合指数；σ 是历史估计，不同估法会让概率差十几个百分点；预测市场若对平盘另有规则，需要自行调整。`PROBABILITY=off` 关闭。
 
 ### 行情时效
+
+**行情推送**（`BINANCE_WS=on`、`HL_WS=on`，默认都开，1.87.0）：除了按秒轮询，机器人另开三条 WebSocket。币安合约（`wss://fstream.binance.com`）订阅每个合约的逐笔成交 `aggTrade` 和每秒一次的标记价 `markPrice@1s`，以及 HYPE 价格阶梯用的 HYPEUSDT；币安现货（`wss://data-stream.binance.vision`，失败换 `stream.binance.com:9443`）订阅先触、月度涨跌和价格阶梯各卡片的现货对；Hyperliquid（`wss://api.hyperliquid.xyz/ws`）按币订阅 `activeAssetCtx`，覆盖 `HL_TICKERS` / `HL_INDEX` 里的永续和反超卡的两个币。推来的价格放到轮询原来放的位置：合约的最新成交和标记价进入 5 秒采样周期用的那份行情（连接活着、每个合约 10 秒内有推送时，采样周期直接用推送来的行情，不再请求 REST；REST 读到的则反过来补进推送的记录，合约几分钟没成交时最新成交仍是上次 REST 读到的那一笔），同时直接换掉两次采样之间卡片用的报价（昨收基准不变）；先触、月度、阶梯卡片的现价每笔成交更新一次，30 秒一次的 REST 取价顺延（推送停了 30 秒后自动恢复轮询）；KR200 的上下文换掉 KOSPI 盘后代理用的报价，HYPE 和 SOL 的中间价换掉反超卡的两个价。价格推进来后，受它影响的市场合并 0.2 秒看一轮：吃单走快车道（和盘口推送一样按市场合并），其余的唤醒交易判断（最快 1 秒一次）。标记价推送在最新成交仍新鲜时不改变报价，也不触发判断。60 秒没有任何帧断开重连，连接失败按 2 秒起、最长 5 分钟的间隔重试，币安的连接每 24 小时会被服务端关闭一次，重连即可；Hyperliquid 每 45 秒发一次 ping。/diag 的“📡 行情推送”一行写出三条连接的状态、收到的行情次数和丢弃的帧数。指数和个股行情没有推送源，仍按原来的间隔轮询。
+
 
 旧行情不再产生新概率。每条行情分开记录“抓取时间”和“市场报价时间”：数据源没给报价时间（东方财富缺 `f86`、Naver 缺 `localTradedAt`）就记为未知，不再填成当前时间。etnet 页面正文不印时间：已收市的那一段按该段收市时间计；正在交易的那一段按“这组数字最早一次出现”的时间计，页面停住不变就会变旧，而不是每次都算“刚刚”。
 
