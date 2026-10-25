@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.85.0"
+VERSION = "1.86.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -563,6 +563,7 @@ class Config:
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
     predict_poll: int = 10   # seconds between orderbook refreshes (PREDICT_POLL_SECONDS)
+    predict_ws: bool = True  # PREDICT_WS: Predict's WebSocket beside the REST rounds, the hot markets' books pushed as they change (PredictStream); off = REST only
     predict_cold_poll: int = 60  # ...for the markets nothing is near on (PREDICT_COLD_POLL_SECONDS; under PREDICT_STALE_MS)
     predict_ref: str = "B00EA"  # referral code appended to Predict market links (?ref=); empty = none
     predict_fee_bps: int = 200   # taker fee rate when a market states none (Predict: 2% × min(p, 1 − p); makers 0)
@@ -733,6 +734,7 @@ class Config:
             predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
             predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 10, 3, 3600),
+            predict_ws=e.get("PREDICT_WS", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict_cold_poll=bounded_int(e, "PREDICT_COLD_POLL_SECONDS", 60, 3, 80),
             predict_ref=parse_ref_code(e.get("PREDICT_REF_CODE", "B00EA")),
             predict_fee_bps=bounded_int(e, "PREDICT_FEE_BPS", 200, 0, 1000),
@@ -4794,6 +4796,9 @@ class PredictFeed:
         self.book_asked: dict[str, float] = {}                   # item key -> monotonic time the stored book was asked for
         self.row_asked: dict[str, dict[str, float]] = {}         # item key -> market id -> the same, for a ladder's levels
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
+        self.stream = PredictStream(self)                        # Predict's WebSocket: the hot markets' books pushed as they change (1.86.0)
+        self.express_by_key: dict[str, asyncio.Task] = {}        # item key -> its express look under way (updated: pushes are coalesced)
+        self.express_dirty: set[str] = set()                     # item keys whose books came in during their look: looked at once more after it
 
     def headers(self) -> dict[str, str]:
         return {"x-api-key": self.config.predict_api_key} if self.config.predict_api_key else {}
@@ -5125,12 +5130,43 @@ class PredictFeed:
             return await self.ladder_row_read(key, slug, market)
 
     def updated(self, key: str) -> None:
-        """A key's books just came in: the trader's express lane looks at that market now, beside the round."""
+        """A key's books just came in: the trader's express lane looks at that market now, beside the round. A look
+        already under way for the key is not doubled: the key is looked at once more when it ends — pushes arriving
+        faster than a look takes are coalesced, never queued up (a stream can bring a book several times a second)."""
         if self.on_update is None:
             return
+        task = self.express_by_key.get(key)
+        if task is not None and not task.done():
+            self.express_dirty.add(key)
+            return
+        self.express(key)
+
+    def express(self, key: str) -> None:
         task = asyncio.create_task(self.on_update(key), name=f"express:{key}")
         self.express_tasks.add(task)
-        task.add_done_callback(self.express_tasks.discard)
+        self.express_by_key[key] = task
+
+        def done(finished: asyncio.Task) -> None:
+            self.express_tasks.discard(finished)
+            if self.express_by_key.get(key) is finished:
+                self.express_by_key.pop(key, None)
+            if key in self.express_dirty and self.on_update is not None:
+                self.express_dirty.discard(key)
+                self.express(key)
+        task.add_done_callback(done)
+
+    def stream_targets(self, hot: set[str] | None, rows: set[str] | None) -> dict[str, tuple[str, bool]]:
+        """Market id -> (item key, a ladder level?) for the stream (PredictStream.want): the hot single markets whose
+        book is in hand (a push needs one to put its levels into: the slug, the title, the fee come from the REST read)
+        and, of the hot ladders, the hot levels; ``hot`` None (no trader): every single market, no ladder level."""
+        ids = {book.market_id: (key, False) for key, book in self.books.items()
+               if book.market_id and (hot is None or key in hot) and key not in self.ladder_keys}
+        if hot is not None:
+            for key in hot:
+                for mid, row in (self.ladder_rows.get(key) or {}).items():
+                    if row.book is not None and (rows is None or mid in rows):
+                        ids[mid] = (key, True)
+        return ids
 
     async def refresh_cold(self, due: dict[str, str], aged: dict[str, str] | None = None) -> None:
         """The cold keys' round (refresh), and the cold levels of the hot ladders (``aged``: key -> slug): marked as
@@ -5191,7 +5227,9 @@ class PredictFeed:
                 # a later request's book is stored already (the cold round's slow read landing after the hot round's): this
                 # answer would put the book back in time under a newer read time (1.83.2) — dropped, the express lane not woken
                 return 0
-            self.books[key] = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
+            book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
+            self.stream.note_rest(key, self.books.get(key), book)  # a pushed book replaced by a later REST read: compared (/diag)
+            self.books[key] = book
             self.book_asked[key] = asked
             self.errors.pop(key, None)
             self.updated(key)
@@ -5256,6 +5294,326 @@ class PredictFeed:
         # a market not listed yet is an answer, not a failure
         failed = [f"{key}：{error}" for key, error in self.errors.items() if key in targets and "还没有这个市场" not in error]
         return refreshed(failed, len(targets) - len(failed))
+
+
+# --- Predict's WebSocket: the hot markets' books pushed as they change (1.86.0) -----------------------------------------
+PREDICT_WS_URL = "wss://ws.predict.fun/ws"
+PREDICT_WS_TOPIC = "predictOrderbook/"      # + market id: the market's aggregated book, a snapshot at once and then every change
+PREDICT_WS_HEARTBEAT = "heartbeat"          # the server's topic every 15 s; echoed back, or the server closes the connection
+PREDICT_WS_SILENT_SECONDS = 45.0            # no frame for this long (three heartbeats): the connection is given up and made anew
+PREDICT_WS_BACKOFF = (2.0, 300.0)           # the wait before a new connection: doubled per failure within these bounds
+PREDICT_WS_MAX_TOPICS = 80                  # subscriptions at once: the single markets first, then the hot ladder levels
+PREDICT_WS_RETRY_TOPIC_SECONDS = 300.0      # a topic the server refused (invalid_topic) is asked for again after this long
+PREDICT_WS_SYNC_SECONDS = 30.0              # the subscriptions are brought in step with the wants at least this often
+
+
+async def ws_connect(url: str, headers: dict[str, str]) -> Any:
+    """A WebSocket connection to ``url`` (the websockets package; without it the stream reports so and the REST rounds
+    go on). The library pings every 20 s on its own; the application heartbeat is answered by PredictStream."""
+    try:
+        from websockets.asyncio.client import connect
+    except ImportError as error:
+        raise RemoteError("websockets 包未安装（requirements.txt 已列出）") from error
+    return await connect(url, additional_headers=headers, open_timeout=15, ping_interval=20, ping_timeout=20, max_size=4 * 1024 * 1024)
+
+
+class PredictStream:
+    """Predict's WebSocket (wss://ws.predict.fun/ws): the hot markets' books pushed as they change, subscribed by market id
+    (predictOrderbook/<id>: a snapshot at once, then every change), stored into PredictFeed as the REST rounds store
+    theirs — the express lane sees a book within a fraction of a second of its change instead of at the next 10-second
+    round. The REST rounds go on unchanged: the stream is an accelerator, never the only source. Between the two the
+    later read wins, as between two REST reads (book_asked): a REST answer asked for before the last push is dropped,
+    one asked for after it replaces the pushed book and is compared with it (note_rest: a steady difference would be a
+    stream missing changes, shown in /diag). While the connection lives (its heartbeat echoed) every pushed book is as
+    current as it was, so its age restarts at each heartbeat and a quiet market's book is not stale for being quiet.
+    Protocol (dev.predict.fun): JSON text frames; the client sends {"method": "subscribe" | "unsubscribe", "requestId":
+    n, "params": [topic]}, answered by {"type": "R", "requestId": n, "success": bool, "error": {"code", "message"}};
+    the server pushes {"type": "M", "topic", "data"}, a book as {"version", "marketId", "updateTimestampMs", "bids",
+    "asks": [[price, size], ...]} (an older version than the one in hand is dropped); its heartbeat (topic "heartbeat")
+    every 15 s is echoed as {"method": "heartbeat", "data": <its data>}. ``connect`` (the tests): a coroutine function
+    (url, headers) -> a connection with send / recv / close."""
+
+    def __init__(self, feed: "PredictFeed", connect: Any = None):
+        self.feed = feed
+        self.connect = connect or ws_connect
+        self.wanted: dict[str, tuple[str, bool]] = {}     # market id -> (item key, a ladder level?) the trader wants pushed
+        self.subscribed: dict[str, tuple[str, bool]] = {}  # the same, for the markets subscribed (asked for and not refused)
+        self.pending: dict[int, tuple[str, str]] = {}     # requestId -> (method, market id) awaiting the server's answer
+        self.versions: dict[str, int] = {}                # market id -> the last version applied (an older push is dropped)
+        self.refused: dict[str, tuple[str, float]] = {}   # market id -> (the server's error, when): asked for again later
+        self.live: set[str] = set()                       # market ids pushed at least once on this connection (their books are current)
+        self.pushed: set[str] = set()                     # item keys whose stored (single) book is a push: a REST read replacing it is compared
+        self.wake = asyncio.Event()                       # the wants changed: the subscriptions are brought in step
+        self.request_id = 0
+        self.ws: Any = None
+        self.connected_at = 0.0       # monotonic; 0 = not connected
+        self.last_frame = 0.0         # monotonic time of the last frame received
+        self.connects = 0
+        self.frames = 0
+        self.heartbeats = 0
+        self.books = 0                # pushed books applied
+        self.dropped = 0              # pushes dropped: unreadable, an older version, a market with no book of its own to put them in
+        self.replaced = 0             # pushed books a later REST read replaced...
+        self.mismatch = 0             # ...of which with another top of book
+        self.last_mismatch = ""
+        self.error = ""               # the last failure: a connection, a refused request
+        self.error_at = 0.0
+        self.closed_why = ""          # why the last connection ended
+        self.backoff = PREDICT_WS_BACKOFF[0]
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.feed.config.predict and getattr(self.feed.config, "predict_ws", True))
+
+    @property
+    def connected(self) -> bool:
+        return self.ws is not None and self.connected_at > 0
+
+    def want(self, ids: dict[str, tuple[str, bool]]) -> None:
+        """The markets to have pushed (market id -> (item key, a ladder level?)): the single markets first, then the
+        ladder levels, at most PREDICT_WS_MAX_TOPICS; the difference to what is subscribed is sent at the next chance."""
+        chosen = {mid: v for mid, v in ids.items() if not v[1]}
+        chosen = dict(list(chosen.items())[:PREDICT_WS_MAX_TOPICS])
+        for mid, v in ids.items():
+            if v[1] and len(chosen) < PREDICT_WS_MAX_TOPICS:
+                chosen[mid] = v
+        if chosen != self.wanted:
+            self.wanted = chosen
+            self.wake.set()
+
+    async def run(self, stopping: asyncio.Event) -> None:
+        """The connection, kept for as long as the bot runs: made, used until it fails or falls silent, made again after
+        a growing pause (PREDICT_WS_BACKOFF; back to the shortest once a connection lasted a minute). Off (PREDICT_WS=off,
+        PREDICT=off): nothing, looked at again every few seconds."""
+        while not stopping.is_set():
+            if not self.enabled:
+                await self.pause(stopping, 5.0)
+                continue
+            try:
+                ws = await self.connect(PREDICT_WS_URL, self.feed.headers())
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.error, self.error_at = clean_error(error) or type(error).__name__, time.time()
+                LOG.warning("Predict 推送连接失败：%s（%.0f 秒后重试）", self.error, self.backoff)
+                await self.pause(stopping, self.backoff)
+                self.backoff = min(self.backoff * 2, PREDICT_WS_BACKOFF[1])
+                continue
+            since = time.monotonic()
+            self.ws, self.connected_at, self.last_frame, self.connects = ws, since, since, self.connects + 1
+            self.subscribed.clear(); self.pending.clear(); self.versions.clear(); self.live.clear(); self.pushed.clear()
+            self.wake.set()
+            LOG.info("Predict 推送已连接（第 %d 次），订阅 %d 个市场", self.connects, len(self.wanted))
+            why = ""
+            try:
+                why = await self.session(ws, stopping)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                why = clean_error(error) or type(error).__name__
+            finally:
+                self.ws, self.connected_at = None, 0.0
+                with contextlib.suppress(Exception):
+                    await ws.close()
+            if stopping.is_set():
+                return
+            self.closed_why = why or "连接结束"
+            self.error, self.error_at = self.closed_why, time.time()
+            lasted = time.monotonic() - since
+            self.backoff = PREDICT_WS_BACKOFF[0] if lasted >= 60 else min(self.backoff * 2, PREDICT_WS_BACKOFF[1])
+            LOG.warning("Predict 推送断开：%s（%.0f 秒后重连）", self.closed_why, self.backoff)
+            await self.pause(stopping, self.backoff)
+
+    @staticmethod
+    async def pause(stopping: asyncio.Event, seconds: float) -> None:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stopping.wait(), seconds)
+
+    async def session(self, ws: Any, stopping: asyncio.Event) -> str:
+        """One connection's life: the wanted topics subscribed and kept in step as the wants change, every frame
+        handled, the heartbeat echoed. Returns why it ended ("" = the bot is stopping)."""
+        reader = asyncio.create_task(self.read(ws), name="predict-ws-read")
+        syncer = asyncio.create_task(self.sync_loop(ws), name="predict-ws-sync")
+        stopper = asyncio.create_task(stopping.wait(), name="predict-ws-stop")
+        try:
+            done, _ = await asyncio.wait({reader, syncer, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            if stopper in done:
+                return ""
+            task = reader if reader in done else syncer
+            error = task.exception()
+            return (clean_error(error) or type(error).__name__) if error else (task.result() or "连接结束")
+        finally:
+            for task in (reader, syncer, stopper):
+                task.cancel()
+            await asyncio.gather(reader, syncer, stopper, return_exceptions=True)
+
+    async def read(self, ws: Any) -> str:
+        while True:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=PREDICT_WS_SILENT_SECONDS)
+            except asyncio.TimeoutError:
+                return f"{PREDICT_WS_SILENT_SECONDS:.0f} 秒没有收到任何帧"
+            self.frames += 1
+            self.last_frame = time.monotonic()
+            await self.handle(ws, raw)
+
+    async def sync_loop(self, ws: Any) -> str:
+        while True:
+            self.wake.clear()
+            await self.sync(ws)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.wake.wait(), timeout=PREDICT_WS_SYNC_SECONDS)
+
+    async def sync(self, ws: Any) -> None:
+        """The subscriptions brought in step with the wants: the wanted markets not subscribed are asked for (a refused
+        one again after PREDICT_WS_RETRY_TOPIC_SECONDS), the subscribed ones no longer wanted are let go."""
+        now = time.monotonic()
+        for mid, target in list(self.wanted.items()):
+            if mid in self.subscribed:
+                continue
+            refused = self.refused.get(mid)
+            if refused and now - refused[1] < PREDICT_WS_RETRY_TOPIC_SECONDS:
+                continue
+            await self.request(ws, "subscribe", mid)
+            self.subscribed[mid] = target
+        for mid in [mid for mid in self.subscribed if mid not in self.wanted]:
+            await self.request(ws, "unsubscribe", mid)
+            self.subscribed.pop(mid, None)
+            self.versions.pop(mid, None)
+            self.live.discard(mid)
+
+    async def request(self, ws: Any, method: str, mid: str) -> None:
+        self.request_id += 1
+        self.pending[self.request_id] = (method, mid)
+        await ws.send(json.dumps({"method": method, "requestId": self.request_id, "params": [PREDICT_WS_TOPIC + mid]}))
+
+    async def handle(self, ws: Any, raw: Any) -> None:
+        """One frame: a request's answer (R), a push (M) — a book, the heartbeat — or something else, ignored."""
+        try:
+            msg = json.loads(raw)
+        except (TypeError, ValueError):
+            self.dropped += 1
+            return
+        if not isinstance(msg, dict):
+            self.dropped += 1
+            return
+        kind = msg.get("type")
+        if kind == "R":
+            self.answered(msg)
+        elif kind == "M":
+            topic = str(msg.get("topic") or "")
+            if topic == PREDICT_WS_HEARTBEAT:
+                await ws.send(json.dumps({"method": "heartbeat", "data": msg.get("data")}))
+                self.heartbeats += 1
+                self.touch()
+            elif topic.startswith(PREDICT_WS_TOPIC):
+                self.book(topic[len(PREDICT_WS_TOPIC):], msg.get("data"))
+
+    def answered(self, msg: dict) -> None:
+        try:
+            rid = int(msg.get("requestId"))
+        except (TypeError, ValueError):
+            return
+        method, mid = self.pending.pop(rid, ("", ""))
+        if not mid:
+            return
+        error = msg.get("error")
+        if msg.get("success") is False or (msg.get("success") is None and error):
+            text = (f"{error.get('code') or '错误'}" + (f"：{error.get('message')}" if error.get("message") else "")) \
+                if isinstance(error, dict) else str(error or "拒绝")
+            if method == "subscribe":
+                self.subscribed.pop(mid, None)
+                self.refused[mid] = (text, time.monotonic())
+            self.error, self.error_at = f"{method} {PREDICT_WS_TOPIC}{mid}：{text}", time.time()
+        elif method == "subscribe":
+            self.refused.pop(mid, None)
+
+    def book(self, mid: str, data: Any) -> None:
+        """A pushed book into the feed: the levels replace the stored book's (a side left out keeps its own), its age
+        restarts, the read time is now (a REST answer asked for earlier is dropped), the express lane is told."""
+        target = self.subscribed.get(mid) or self.wanted.get(mid)
+        if target is None or not isinstance(data, dict):
+            self.dropped += 1
+            return
+        key, level = target
+        version = data.get("version")
+        if isinstance(version, (int, float)) and not isinstance(version, bool):
+            if version <= self.versions.get(mid, -1):
+                self.dropped += 1  # out of order, or sent again
+                return
+            self.versions[mid] = int(version)
+        bids = predict_levels(data.get("bids"), True) if isinstance(data.get("bids"), list) else None
+        asks = predict_levels(data.get("asks"), False) if isinstance(data.get("asks"), list) else None
+        if bids is None and asks is None:
+            self.dropped += 1
+            return
+        feed, now_ms, asked = self.feed, int(time.time() * 1000), time.monotonic()
+        row = (feed.ladder_rows.get(key) or {}).get(mid) if level else None
+        old = row.book if row is not None else None if level else feed.books.get(key)
+        if old is None or str(old.market_id) != str(mid):
+            self.dropped += 1  # no book of this market to put the levels in: the REST read comes first, or the key moved on
+            return
+        book = dataclasses.replace(old, bids=old.bids if bids is None else bids, asks=old.asks if asks is None else asks, fetched_ms=now_ms)
+        if level:
+            feed.ladder_rows[key][mid] = dataclasses.replace(row, book=book, error="")
+            feed.row_asked.setdefault(key, {})[mid] = asked
+            feed.ladder_publish(key)
+        else:
+            feed.books[key] = book
+            feed.book_asked[key] = asked
+            feed.errors.pop(key, None)
+            self.pushed.add(key)
+        self.live.add(mid)
+        self.books += 1
+        feed.updated(key)
+
+    def touch(self) -> None:
+        """The heartbeat says the connection lives: every book pushed on it is as current as it was, so its age restarts
+        (a market nobody traded on for two minutes is not stale for it, PREDICT_STALE_MS)."""
+        feed, now_ms = self.feed, int(time.time() * 1000)
+        for key, book in list(feed.books.items()):
+            if book.market_id in self.live:
+                feed.books[key] = dataclasses.replace(book, fetched_ms=now_ms)
+        for key, rows in list(feed.ladder_rows.items()):
+            touched = False
+            for mid, row in list(rows.items()):
+                if mid in self.live and row.book is not None:
+                    rows[mid] = dataclasses.replace(row, book=dataclasses.replace(row.book, fetched_ms=now_ms))
+                    touched = True
+            if touched:
+                feed.ladder_publish(key)
+
+    def note_rest(self, key: str, old: "PredictBook | None", new: "PredictBook") -> None:
+        """A REST read replacing a pushed single-market book (asked for after the push): compared at the top of the
+        book — a difference now and then is a change in the moment between, a steady rate is a stream missing changes."""
+        if key not in self.pushed:
+            return
+        self.pushed.discard(key)
+        self.replaced += 1
+        if old is not None and (old.bid != new.bid or old.ask != new.ask):
+            self.mismatch += 1
+            top = lambda b: f"买1 {cents(float(b.bid[0])) if b.bid else '—'} 卖1 {cents(float(b.ask[0])) if b.ask else '—'}"
+            self.last_mismatch = f"{key}：推送 {top(old)}，REST {top(new)}"
+
+    def line(self) -> str:
+        """The stream's state in a line (/diag)."""
+        if not self.enabled:
+            return "关（PREDICT_WS=off）" if self.feed.config.predict else "关"
+        if self.connected:
+            text = (f"已连接 {int(time.monotonic() - self.connected_at)} 秒（第 {self.connects} 次），订阅 {len(self.subscribed)} 个市场、"
+                    f"在推 {len(self.live)} 个，收到盘口 {self.books} 次、心跳 {self.heartbeats} 次，最近一帧 {time.monotonic() - self.last_frame:.0f} 秒前")
+        elif self.connects:
+            text = f"未连接（上次断开：{brief_error(self.closed_why, 60)}；{self.backoff:.0f} 秒后重连）"
+        else:
+            text = "尚未连接" + (f"（{brief_error(self.error, 60)}）" if self.error else "")
+        if self.refused:
+            mid, (why, _) = next(iter(self.refused.items()))
+            text += f"；被拒绝 {len(self.refused)} 个主题（{mid}：{brief_error(why, 40)}）"
+        if self.dropped:
+            text += f"；丢弃 {self.dropped} 帧"
+        if self.replaced:
+            text += f"；REST 覆盖推送 {self.replaced} 次，其中盘口不同 {self.mismatch} 次" + (f"（{self.last_mismatch}）" if self.mismatch else "")
+        return text
 
 
 # --- first-touch market (which barrier does BNB hit first?) ------------------------------------------
@@ -16446,6 +16804,8 @@ class Bot:
                     r = self.predict.round_info
                     detail += (f"｜上轮 {r['keys']} 个市场" + (f"（阶梯 {r['rows']} 档）" if r.get("rows") else "")
                                + (f"，最慢 {r['slowest'][0]} {r['slowest'][1] / 1000:.1f}s" if r.get("slowest") else ""))
+                if name == "Predict 盘口":
+                    detail += f"｜推送：{self.predict.stream.line()}"
                 lines.append(f"  {mark} {name}：{what}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{busy}{detail}{err}")
         else:
             lines.append("🔄 后台刷新：未启动（命令行诊断或测试环境）")
@@ -16619,6 +16979,8 @@ class Bot:
         result = await self.predict.refresh(self.predict_targets(now_ms), hot=hot, hot_rows=rows)
         if result is not False and self.config.sim:
             self.sim_wake = True
+        if result is not False:
+            self.predict.stream.want(self.predict.stream_targets(hot, rows))  # the stream follows the round's hot set (1.86.0)
         return result
 
     PREDICT_HOT_GAP = 0.05  # a market whose nearer side is within this of the taker's cap is refreshed every round
@@ -16885,6 +17247,8 @@ class Bot:
                 asyncio.create_task(self.commands_loop(), name="commands"),
                 asyncio.create_task(self.watchdog(), name="watchdog")]
         tasks = [*core, *self.reference_tasks]
+        if self.config.predict:  # Predict's WebSocket beside the REST rounds (PREDICT_WS=off: it idles)
+            tasks.append(asyncio.create_task(self.predict.stream.run(self.stopping), name="predict-ws"))
         if self.config.web_port:
             try:
                 self.web = WebServer(self, self.config.web_port, self.web_token)

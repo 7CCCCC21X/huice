@@ -134,7 +134,7 @@ async def run():
     assert "✅ Predict 盘口：3 秒前成功｜上次用时 1.8s｜共 90 轮｜上轮 14 个市场（阶梯 5 档），最慢 NIULAI 1.2s" in st, st
     assert "✅ 模拟交易：2 秒前成功｜上次用时 0.9s｜共 50 轮（决策内：盘口 0.1s、判断 0.0s、结算 0.0s、保存 0.0s；172 个市场、3000 条记录）" in st, st
     bot.predict.round_info = {"keys": 3, "rows": 0, "ms": 500, "slowest": None}
-    assert "｜上轮 3 个市场\n" in "\n".join(bot.diag_state(NOW)) + "\n"
+    assert "｜上轮 3 个市场｜推送：尚未连接\n" in "\n".join(bot.diag_state(NOW)) + "\n"  # 1.86.0: the stream's state follows the round's
 
     # /diag from Telegram (admin only): a "working on it" note, then the report
     await bot.process_message({"text": "/diag", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})
