@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.88.0"
+VERSION = "1.88.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5426,7 +5426,9 @@ async def ws_connect(url: str, headers: dict[str, str]) -> Any:
         from websockets.asyncio.client import connect
     except ImportError as error:
         raise RemoteError("websockets 包未安装（requirements.txt 已列出）") from error
-    return await connect(url, additional_headers=headers, open_timeout=15, ping_interval=20, ping_timeout=20, max_size=4 * 1024 * 1024)
+    # close_timeout: the closing handshake at a stop waits this long at most (the default ten seconds held a restart)
+    return await connect(url, additional_headers=headers, open_timeout=15, close_timeout=3, ping_interval=20, ping_timeout=20,
+                         max_size=4 * 1024 * 1024)
 
 
 class PredictStream:
@@ -5525,8 +5527,8 @@ class PredictStream:
                 why = clean_error(error) or type(error).__name__
             finally:
                 self.ws, self.connected_at = None, 0.0
-                with contextlib.suppress(Exception):
-                    await ws.close()
+                with contextlib.suppress(Exception):  # the closing handshake, bounded: a stop never waits on the server
+                    await asyncio.wait_for(ws.close(), 5)
             if stopping.is_set():
                 return
             self.closed_why = why or "连接结束"
@@ -5814,8 +5816,8 @@ class PushStream:
                 why = clean_error(error) or type(error).__name__
             finally:
                 self.ws, self.connected_at = None, 0.0
-                with contextlib.suppress(Exception):
-                    await ws.close()
+                with contextlib.suppress(Exception):  # the closing handshake, bounded: a stop never waits on the server
+                    await asyncio.wait_for(ws.close(), 5)
             if stopping.is_set():
                 return
             self.closed_why = why or "连接结束"
