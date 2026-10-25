@@ -160,7 +160,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
+                                "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60, "sim_shares_net": True} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert len(bot.sim_trades()) == 2
@@ -1194,7 +1194,23 @@ async def taker_shares():
     await step(cbot, NOW + 15_000, deep(NOW + 15_000))
     assert len([k for k in cbot.sim_trades() if k.startswith(tid)]) == 3  # at the cap: nothing more
     row = next(r for r in cbot.sim_checks(NOW + 15_000) if r["market"] == HSI_SLUG)
-    assert "这一边吃单已累计 250 份，达到上限 250 份" in row["taker"], row["taker"]
+    assert "这一边持仓 250 份，达到上限 250 份" in row["taker"], row["taker"]  # 1.91.0: SIM_SHARES_NET (default on) counts the position
+    # 1.91.0: SIM_SHARES_NET — the cap is on the side's net position: every fill here (makers' too) less the other side's fills
+    # (10-25: CXMT held 400 涨 against 400 跌, flat; "每边 500" would have stopped each side at 100 more)
+    nbot = m.Bot(m.Config.from_env({**cap_env, "SIM_TAKER_MAX_SHARES": "500"}), m.Store(":memory:"), FM(NOW), None)
+    pbot = m.Bot(m.Config.from_env({**cap_env, "SIM_TAKER_MAX_SHARES": "500", "SIM_SHARES_NET": "off"}), m.Store(":memory:"), FM(NOW), None)
+    assert nbot.config.sim_shares_net and not pbot.config.sim_shares_net and nbot.sim_version().get("sim_shares_net") is True and "sim_shares_net" not in pbot.sim_version()
+    mkt = deep(NOW).market
+    rec = lambda side, shares, maker=False, status="filled": {"market": mkt, "side": side, "status": status, "shares": shares, "order": shares, "maker": maker}
+    both = {f"{mkt}|up|吃": rec("up", 450), f"{mkt}|down|挂": rec("down", 400, maker=True)}
+    assert nbot.sim_taker_room(both, deep(NOW), "up") == (100.0, 450.0) and pbot.sim_taker_room(both, deep(NOW), "up") == (50.0, 450.0), "net 50 of 500 / 450 of 500"
+    assert nbot.sim_taker_room(both, deep(NOW), "down") == (100.0, 0.0) and pbot.sim_taker_room(both, deep(NOW), "down") == (100.0, 0.0)
+    flat = {f"{mkt}|up|吃": rec("up", 900), f"{mkt}|down|吃": rec("down", 400)}
+    assert nbot.sim_taker_room(flat, deep(NOW), "up") == (0.0, 900.0) and nbot.sim_taker_room(flat, deep(NOW), "down") == (100.0, 400.0), "net 500: up at the cap, down 500 under it"
+    assert nbot.sim_taker_full_text(flat, deep(NOW), "up", 900.0) == "这一边持仓 900 份减另一边 400 份、净 500 份，达到上限 500 份"
+    assert pbot.sim_taker_full_text(flat, deep(NOW), "up", 900.0) == "这一边吃单已累计 900 份，达到上限 500 份"
+    assert nbot.sim_taker_room({f"{mkt}|up|吃": rec("up", 480, maker=True)}, deep(NOW), "up") == (20.0, 0.0), "makers' fills count under the net cap"
+    assert pbot.sim_taker_room({f"{mkt}|up|吃": rec("up", 480, maker=True)}, deep(NOW), "up") == (100.0, 0.0), "...not under the per-side taker count"
     obot = m.Bot(m.Config.from_env({**cap_env, "SIM_TAKER_MAX_SHARES": "0"}), m.Store(":memory:"), FM(NOW), None)
     obot.sim_markets = lambda now: world["markets"]
     await step(obot, NOW, deep(NOW)); await step(obot, NOW + 5_000, deep(NOW + 5_000))
@@ -1636,7 +1652,19 @@ async def after_hours_cap():
     assert m.side_held_text(held) == "持仓 195.6 份 + 挂单 2 笔未成交 303.595 份 = 499.195 份"
     cbot = m.Bot(m.Config.from_env({**env, "SIM_AFTER_HOURS_MAX_SHARES": "500"}), m.Store(":memory:"), FM(NOW), None)
     assert cbot.sim_side_room(t5, after(NOW), "down") == (0.0, "盘后这一边持仓 195.6 份 + 挂单 2 笔未成交 303.595 份 = 499.195 份，离上限 500 份只差 0.805 份、不足 1 份（SIM_AFTER_HOURS_MAX_SHARES）"), cbot.sim_side_room(t5, after(NOW), "down")
-    assert cbot.sim_side_room(t5, after(NOW), "up") == (400.0, ""), "the other side counts its own records only"
+    room, _ = cbot.sim_side_room(t5, after(NOW), "up")
+    assert abs(room - 595.6) < 1e-9, (room, "1.91.0: net — the other side's 195.6 filled offset this side's 100 resting (its resting orders do not)")
+    pbot = m.Bot(m.Config.from_env({**env, "SIM_AFTER_HOURS_MAX_SHARES": "500", "SIM_SHARES_NET": "off"}), m.Store(":memory:"), FM(NOW), None)
+    assert pbot.sim_side_room(t5, after(NOW), "up") == (400.0, ""), "per side: the other side counts its own records only"
+    # the net cap, itemised: 400 涨 held against 400 跌 is flat (room 500 under a 500 cap); 900 against 400 is at it
+    nenv = {**env, "SIM_AFTER_HOURS_MAX_SHARES": "500"}
+    nbot = m.Bot(m.Config.from_env(nenv), m.Store(":memory:"), FM(NOW), None)
+    hedged = {"u": rec("filled", 400, 400, side="up", maker=False), "d": rec("filled", 400, 400, maker=False)}
+    assert nbot.sim_side_room(hedged, after(NOW), "up") == (500.0, "") and nbot.sim_side_room(hedged, after(NOW), "down") == (500.0, "")
+    assert pbot.sim_side_room(hedged, after(NOW), "up") == (100.0, "")
+    heavy = {"u": rec("filled", 900, 900, side="up", maker=False), "d": rec("filled", 400, 400, maker=False), "r": rec("resting", 0.0, 100, side="up")}
+    assert nbot.sim_side_room(heavy, after(NOW), "up") == (0.0, "盘后这一边持仓 900 份 + 挂单 1 笔未成交 100 份 = 1000 份，另一边持仓 400 份抵掉、净 600 份，达到上限 500 份（SIM_AFTER_HOURS_MAX_SHARES）"), nbot.sim_side_room(heavy, after(NOW), "up")
+    assert nbot.sim_side_room(heavy, after(NOW), "down") == (1000.0, ""), "down: 400 less the 900 filled on up — the 100 resting on up offsets nothing"
     assert abot.sim_side_room({"a": rec("filled", 300, 300, maker=False)}, after(NOW), "down") == (0.0, "盘后这一边持仓 300 份，达到上限 300 份（SIM_AFTER_HOURS_MAX_SHARES）")
     assert abot.sim_side_room({"b": rec("resting", 0.0, 300)}, after(NOW), "down") == (0.0, "盘后这一边挂单 1 笔未成交 300 份，达到上限 300 份（SIM_AFTER_HOURS_MAX_SHARES）")
     assert abot.sim_side_room({"b": rec("resting", 0.0, 299.5)}, after(NOW), "down") == (0.0, "盘后这一边挂单 1 笔未成交 299.5 份，离上限 300 份只差 0.5 份、不足 1 份（SIM_AFTER_HOURS_MAX_SHARES）")

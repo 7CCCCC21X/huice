@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.90.0"
+VERSION = "1.91.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -486,6 +486,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_AFTER_HOURS_SHARES", "盘后吃单每次最多买多少份", "0～1000000：开盘前、收盘后的吃单单独按这个份数；0 = 同盘中吃单的份数"),
     ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
+    ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限和盘后每边持仓上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
     ("SIM_MAX_FAIR_CENTS", "公平价最多按多少计（¢）", "50～100：这一边的公平价高于这个数时按这个数算净优势——模型再自信也只信到这里（出事时 95¢ 也能归零），接近必然的一边只在价格低到上限之下仍留足门槛时才吃、才挂：公平价 99.6¢、卖1 85¢，按 95 − 85.3 = 9.7¢ 判；100 = 按模型的公平价"),
     ("PROB_BIG_MOVE_SIGMAS", "大波动日放宽 σ（倍日 σ）", "0～10：指数 / 个股日涨跌卡片，今日相对参考收盘的涨跌幅超过这么多倍日 σ 时，剩余时段的 σ 按超出的比例放大（最多 2 倍，连续变化）：日 σ 来自 40 根日收盘，对当天的波动没有反应，大跌日里“跌 99.6¢”这种过度自信的公平价会被压回 90–97¢；0 = 关"),
@@ -611,6 +612,7 @@ class Config:
     sim_max_fair: float = 0.95                 # SIM_MAX_FAIR_CENTS: the trader judges a side by its fair price at most this high (the tail a normal model cannot see); 1 = as the card says
     big_move_sigmas: float = 1.5               # PROB_BIG_MOVE_SIGMAS: a daily card's σ ahead is widened once the day's move passes this many daily σ (big_move_widen); 0 = never
     sim_after_hours_max_shares: float = 300.0  # SIM_AFTER_HOURS_MAX_SHARES: after hours a market's side holds at most this many shares (positions and orders); 0 = no limit
+    sim_shares_net: bool = True   # SIM_SHARES_NET: the share caps count a side's net position — what it holds less the other side's fills; off = each side on its own
     sim_open_quiet_minutes: int = 3            # SIM_OPEN_QUIET_MINUTES: no new order on a daily card this long after its underlying opens; 0 = none
     sim_seconds: int = 5     # seconds between the trader's looks: the books judged, orders placed / withdrawn, real orders read back (SIM_SECONDS)
     sim_ways: str = "taker"  # which suggestions it takes: taker (吃单), maker (挂单) or both
@@ -805,6 +807,7 @@ class Config:
             sim_maker_spread=parse_bounded(e, "SIM_MAKER_SPREAD_CENTS", "0", 0, 99) / 100,
             sim_maker_deep_only=not off(e.get("SIM_MAKER_DEEP_ONLY", "off")),
             sim_maker_points=not off(e.get("SIM_MAKER_POINTS", "on")),
+            sim_shares_net=not off(e.get("SIM_SHARES_NET", "on")),
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -8678,6 +8681,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_MAKER_DEEP_MARKETS": {"kind": "detail", "group": "策略"},         # drawn inside the SIM_MAKER_DEEP_CENTS card
     "SIM_MAKER_DEEP_ONLY_MARKETS": {"kind": "detail", "group": "策略"},    # drawn inside the SIM_MAKER_DEEP_ONLY card
     "SIM_MAKER_POINTS": {"kind": "choice", "group": "策略", "options": [["off", "都挂"], ["on", "只挂积分已激活的"]]},
+    "SIM_SHARES_NET": {"kind": "choice", "group": "策略", "options": [["on", "按净头寸"], ["off", "每边单独"]]},
     "SIM_GROUP_USD": {"kind": "number", "group": "策略", "presets": ["0", "100", "300", "500", "1000"], "unit": "$", "zero": "不限"},
     "LIVE_MAX_ORDER_USD": {"kind": "number", "group": "风控", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
     "LIVE_MAX_OPEN_USD": {"kind": "number", "group": "风控", "presets": ["100", "300", "500", "1000", "3000"], "unit": "$"},
@@ -10551,7 +10555,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_skip:"详细选项排除的市场",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
   sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
   min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",big_move:"大波动日放宽 σ（倍日 σ）",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
@@ -13978,6 +13982,7 @@ class Bot:
                 **({"sim_maker_deep_markets": sorted(c.sim_maker_deep_markets)} if c.sim_maker_deep_markets else {}),
                 **({"sim_maker_deep_only_markets": sorted(c.sim_maker_deep_only_markets)} if c.sim_maker_deep_only_markets and c.sim_maker_deep_only else {}),
                 **({"sim_maker_points": True} if c.sim_maker_points else {}),
+                **({"sim_shares_net": True} if c.sim_shares_net else {}),
                 **({"sim_skip": sorted(c.sim_skip)} if c.sim_skip else {})}
 
     def evidence(self, build: Any) -> "LazyEvidence":
@@ -14370,7 +14375,7 @@ class Bot:
                         parts.append(f"{name}：无封顶价（公平价 {cents(fair)} 留不出 {cents(max(mk.need, self.sim_taker_bar(mk)))}）{capped}")
                     elif room < SIM_MIN_SHARES - 1e-9 and held is not None:
                         parts.append(f"{name}：" + (f"已有{sim_status(held)}，等它结束" if sim_in_flight(held) else
-                                                    f"这一边吃单已累计 {taken:g} 份，达到上限 {c.sim_taker_max_shares:g} 份" if c.sim_taker_max_shares > 0 else
+                                                    self.sim_taker_full_text(trades, mk, side, taken) if c.sim_taker_max_shares > 0 else
                                                     f"已有{sim_status(held)}（每边只吃一次）"))
                     elif q is None or q["got"] < SIM_MIN_SHARES - 1e-9:
                         parts.append(f"{name}：封顶 {cents(cap)}{capped}，之下没有卖单")
@@ -14425,7 +14430,7 @@ class Bot:
                 block = f"公平价 {cents(model)}{'（按上限 ' + cents(fair) + ' 计）' if cut > 0 else ''} 留不出 {cents(need)}"
             elif room < SIM_MIN_SHARES - 1e-9 and held is not None:
                 block = (f"已有{sim_status(held)}，等它结束" if sim_in_flight(held)
-                         else f"已吃 {taken:g} 份，达到上限 {c.sim_taker_max_shares:g} 份" if c.sim_taker_max_shares > 0
+                         else self.sim_taker_full_text(trades, mk, side, taken) if c.sim_taker_max_shares > 0
                          else f"已有{sim_status(held)}（每边只吃一次）")
             elif ask is None:
                 block = "没有卖单"
@@ -14548,12 +14553,32 @@ class Bot:
         if cap <= 0 or mk.in_session is not False:
             return math.inf, ""
         held = side_held(trades, mk.market, side)
-        room = cap - held["total"]
+        other = self.sim_other_held(trades, mk, side)  # SIM_SHARES_NET: the other side's fills offset (1.91.0)
+        used = held["total"] - other
+        room = cap - used
         if room < SIM_MIN_SHARES - 1e-9:
-            at_cap = held["total"] >= cap - 1e-9
-            return 0.0, (f"盘后这一边{side_held_text(held)}，" + (f"达到上限 {cap:g} 份" if at_cap else f"离上限 {cap:g} 份只差 {room:g} 份、不足 1 份")
+            at_cap = used >= cap - 1e-9
+            offset = f"，另一边持仓 {other:g} 份抵掉、净 {used:g} 份" if other > 1e-9 else ""
+            return 0.0, (f"盘后这一边{side_held_text(held)}{offset}，" + (f"达到上限 {cap:g} 份" if at_cap else f"离上限 {cap:g} 份只差 {room:g} 份、不足 1 份")
                          + "（SIM_AFTER_HOURS_MAX_SHARES）")
         return room, ""
+
+    def sim_other_held(self, trades: dict[str, dict], mk: SimMarket, side: str) -> float:
+        """The shares filled on the market's other side, which offset this side's under the share caps when
+        SIM_SHARES_NET is on (1.91.0: the caps are on the net position — 400 涨 against 400 跌 is flat, not two sides
+        at 400); its resting orders offset nothing (they may never fill). 0 with the setting off."""
+        if not self.config.sim_shares_net:
+            return 0.0
+        return side_held(trades, mk.market, "down" if side == "up" else "up")["positions"]
+
+    def sim_taker_full_text(self, trades: dict[str, dict], mk: SimMarket, side: str, taken: float) -> str:
+        """Why a side's takers stop: the cap (SIM_TAKER_MAX_SHARES) reached — by the takers' fills, or with
+        SIM_SHARES_NET by the net position (every fill here less the other side's)."""
+        cap = self.config.sim_taker_max_shares
+        if not self.config.sim_shares_net:
+            return f"这一边吃单已累计 {taken:g} 份，达到上限 {cap:g} 份"
+        mine, other = side_held(trades, mk.market, side)["positions"], self.sim_other_held(trades, mk, side)
+        return f"这一边持仓 {mine:g} 份" + (f"减另一边 {other:g} 份、净 {mine - other:g} 份" if other > 1e-9 else "") + f"，达到上限 {cap:g} 份"
 
     def sim_fair(self, mk: SimMarket, side: str) -> tuple[float, float]:
         """The fair price the trader judges ``side`` by, and what was cut off it: the card's, at most SIM_MAX_FAIR_CENTS.
@@ -14582,7 +14607,8 @@ class Bot:
         """(shares a taker may buy on this market's side now, shares its takers have already filled there). One taker
         order at a time: 0 while one is in flight. With SIM_TAKER_MAX_SHARES = 0 nothing after the first; else the
         count asked for (``want``: sim_taker_want; the per-buy count when not given), capped by what is left under
-        SIM_TAKER_MAX_SHARES (the last buy takes the remainder)."""
+        SIM_TAKER_MAX_SHARES (the last buy takes the remainder) — counted against the takers' fills, or with
+        SIM_SHARES_NET (1.91.0) against the side's net position: every fill here, makers' too, less the other side's."""
         c = self.config
         held = trades.get(f"{mk.market}|{side}|吃")
         taken = sum(float(t.get("shares") or 0) for t in trades_of_market(trades, mk.market)
@@ -14590,7 +14616,10 @@ class Bot:
         want = self.sim_taker_shares(mk) if want is None else want
         if held is not None and (c.sim_taker_max_shares <= 0 or sim_in_flight(held)):
             return 0.0, taken
-        return (want if c.sim_taker_max_shares <= 0 else min(want, max(c.sim_taker_max_shares - taken, 0.0))), taken
+        if c.sim_taker_max_shares <= 0:
+            return want, taken
+        used = side_held(trades, mk.market, side)["positions"] - self.sim_other_held(trades, mk, side) if c.sim_shares_net else taken
+        return min(want, max(c.sim_taker_max_shares - used, 0.0)), taken
 
     def sim_taker_after_hours(self, mk: SimMarket) -> bool:
         """Whether this market is taken under the after-hours taker mode now: a daily card outside its underlying's session
@@ -16892,6 +16921,7 @@ class Bot:
                   "SIM_TAKER_AFTER_HOURS_CENTS": f"{c.sim_taker_after_hours * 100:g}", "SIM_AFTER_HOURS_MAX_PRICE_CENTS": f"{c.sim_after_hours_max_price * 100:g}", "SIM_SKIP": ",".join(sorted(c.sim_skip)),
                   "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes), "SIM_MAKER_MIN_BID": plain(c.sim_maker_min_bid),
                   "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points),
+                  "SIM_SHARES_NET": flag(c.sim_shares_net),
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
                   "SIM_MAKER_SPREAD_CENTS": f"{c.sim_maker_spread * 100:g}", "SIM_MAKER_DEEP_ONLY": flag(c.sim_maker_deep_only),
                   "SIM_MAKER_AFTER_HOURS_MARKETS": ",".join(sorted(c.sim_maker_after_hours_markets)), "SIM_MAKER_DEEP_MARKETS": ",".join(sorted(c.sim_maker_deep_markets)),
