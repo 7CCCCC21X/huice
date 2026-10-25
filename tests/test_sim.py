@@ -160,7 +160,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60, "sim_shares_net": True} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
+                                "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60, "sim_shares_net": True, "sim_no_odds_withdraw": 30} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert len(bot.sim_trades()) == 2
@@ -1717,6 +1717,61 @@ async def after_hours_cap():
 
 
 asyncio.run(after_hours_cap())
+
+
+async def no_odds_withdraw():
+    """1.92.0: SIM_NO_ODDS_WITHDRAW_MINUTES — a resting order on a market the bot cannot price now (its card's odds
+    missing: the SSE card over the weekend, A50 closed; or its suggestion held) is withdrawn once that has lasted this
+    long, placed afresh when the odds return; 0 = it stands, as before. (10-25: a 300-share order stood on the SSE market
+    all weekend under 概率暂缺 — no new order goes on such a market, but the old one was never withdrawn.)"""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+           "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY, "SIM_GROUP_USD": "0"}
+    assert m.Config.from_env(env).sim_no_odds_withdraw == 30 and m.Config.from_env({**env, "SIM_NO_ODDS_WITHDRAW_MINUTES": "0"}).sim_no_odds_withdraw == 0
+    assert m.Config.from_env(env).sim_no_odds_withdraw == 30 and "sim_no_odds_withdraw" not in m.Bot(m.Config.from_env({**env, "SIM_NO_ODDS_WITHDRAW_MINUTES": "0"}), m.Store(":memory:"), FM(NOW), None).sim_version()
+    bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    bot.sim_markets = lambda now: world["markets"]
+    priced = lambda at, **kw: m.dataclasses.replace(hsi(0.70, [("0.55", "300")], [("0.58", "400")], at, **kw), in_session=True)
+    tid = f"{HSI_SLUG}|up|挂"
+    await step(bot, NOW, priced(NOW))
+    assert bot.sim_trades()[tid]["status"] == "resting" and bot.sim_trades()[tid]["price"] == 0.55 and bot.sim_unpriced_since == {}
+    bot.odds_items = lambda now_ms, only=None: [("恒生指数｜HSI", "A50 休市，10-26 09:00 开盘后恢复概率")]  # the card's odds gone: a string says why
+    world["markets"] = []  # nothing priced: the step meets the record with no market for it
+    await step(bot, NOW + 60_000)
+    assert bot.sim_trades()[tid]["status"] == "resting" and bot.sim_unpriced_since == {HSI_SLUG: NOW + 60_000}, "the clock starts"
+    await step(bot, NOW + 60_000 + 29 * 60_000)
+    assert bot.sim_trades()[tid]["status"] == "resting" and bot.sim_unpriced_since == {HSI_SLUG: NOW + 60_000}
+    await step(bot, NOW + 60_000 + 30 * 60_000)
+    t = bot.sim_trades()
+    assert tid not in t and t[f"{tid}#1"]["status"] == "cancelled" and float(t[f"{tid}#1"]["shares"]) == 0, t.get(f"{tid}#1")
+    assert "概率暂缺已超过 30 分钟（A50 休市，10-26 09:00 开盘后恢复概率），撤单" in t[f"{tid}#1"]["note"], t[f"{tid}#1"]["note"]
+    assert bot.sim_unpriced_since == {}, "nothing resting there any more: the clock is dropped"
+    # the odds back: the slot is free, the order placed afresh on the new view
+    at = NOW + 60_000 + 31 * 60_000
+    await step(bot, at, priced(at))
+    assert bot.sim_trades()[tid]["status"] == "resting" and bot.sim_unpriced_since == {}
+    # a held card (odds there, the suggestion held) counts the same; a priced step in between restarts the clock
+    await step(bot, at + 60_000, priced(at + 60_000, hold="数据有疑问"))
+    assert bot.sim_unpriced_since == {HSI_SLUG: at + 60_000}
+    await step(bot, at + 10 * 60_000, priced(at + 10 * 60_000))
+    assert bot.sim_unpriced_since == {} and bot.sim_trades()[tid]["status"] == "resting"
+    held_at = at + 20 * 60_000
+    await step(bot, held_at, priced(held_at, hold="数据有疑问"))
+    await step(bot, held_at + 29 * 60_000, priced(held_at + 29 * 60_000, hold="数据有疑问"))
+    assert bot.sim_trades()[tid]["status"] == "resting" and bot.sim_unpriced_since == {HSI_SLUG: held_at}
+    await step(bot, held_at + 30 * 60_000, priced(held_at + 30 * 60_000, hold="数据有疑问"))
+    t = bot.sim_trades()
+    assert tid not in t and "卡片暂不建议已超过 30 分钟（数据有疑问），撤单" in t[f"{tid}#2"]["note"], t.get(f"{tid}#2")
+    # 0 = never: the order stands through hours without odds
+    zbot = m.Bot(m.Config.from_env({**env, "SIM_NO_ODDS_WITHDRAW_MINUTES": "0"}), m.Store(":memory:"), FM(NOW), None)
+    zbot.sim_markets = lambda now: world["markets"]
+    await step(zbot, NOW, priced(NOW))
+    world["markets"] = []
+    await step(zbot, NOW + 60_000); await step(zbot, NOW + 5 * 3600_000)
+    assert zbot.sim_trades()[tid]["status"] == "resting" and zbot.sim_unpriced_since == {}
+    print("NO_ODDS_WITHDRAW_OK")
+
+
+asyncio.run(no_odds_withdraw())
 
 
 async def open_quiet():

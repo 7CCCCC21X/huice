@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.91.0"
+VERSION = "1.92.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -488,6 +488,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
     ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限和盘后每边持仓上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
+    ("SIM_NO_ODDS_WITHDRAW_MINUTES", "概率暂缺多久撤单（分钟）", "0～1440：卡片的概率暂缺（如上证卡周末 A50 休市、行情断流）或暂不建议持续这么多分钟后，这个市场挂着的单撤掉（低价挂单也撤），概率回来再按新公平价重挂；没有概率时本来就不开新单；0 = 不撤、挂着等"),
     ("SIM_MAX_FAIR_CENTS", "公平价最多按多少计（¢）", "50～100：这一边的公平价高于这个数时按这个数算净优势——模型再自信也只信到这里（出事时 95¢ 也能归零），接近必然的一边只在价格低到上限之下仍留足门槛时才吃、才挂：公平价 99.6¢、卖1 85¢，按 95 − 85.3 = 9.7¢ 判；100 = 按模型的公平价"),
     ("PROB_BIG_MOVE_SIGMAS", "大波动日放宽 σ（倍日 σ）", "0～10：指数 / 个股日涨跌卡片，今日相对参考收盘的涨跌幅超过这么多倍日 σ 时，剩余时段的 σ 按超出的比例放大（最多 2 倍，连续变化）：日 σ 来自 40 根日收盘，对当天的波动没有反应，大跌日里“跌 99.6¢”这种过度自信的公平价会被压回 90–97¢；0 = 关"),
     ("SIM_TAKER_SWEEP_SHARES", "吃单一次最多吃光多少份", "0～10000000：封顶价之下的卖单不止一档时一张单全吃掉（公平价 50¢，20¢ 和 30¢ 的卖单都够优势就一起吃），最多这么多份、不少于每次的份数；组上限或真实交易风控容不下这么多时退回按每次份数买；0 = 只按每次份数买"),
@@ -614,6 +615,7 @@ class Config:
     sim_after_hours_max_shares: float = 300.0  # SIM_AFTER_HOURS_MAX_SHARES: after hours a market's side holds at most this many shares (positions and orders); 0 = no limit
     sim_shares_net: bool = True   # SIM_SHARES_NET: the share caps count a side's net position — what it holds less the other side's fills; off = each side on its own
     sim_open_quiet_minutes: int = 3            # SIM_OPEN_QUIET_MINUTES: no new order on a daily card this long after its underlying opens; 0 = none
+    sim_no_odds_withdraw: int = 30             # SIM_NO_ODDS_WITHDRAW_MINUTES: a resting order on a market the bot cannot price (odds missing, suggestion held) this long is withdrawn; 0 = never
     sim_seconds: int = 5     # seconds between the trader's looks: the books judged, orders placed / withdrawn, real orders read back (SIM_SECONDS)
     sim_ways: str = "taker"  # which suggestions it takes: taker (吃单), maker (挂单) or both
     sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
@@ -790,6 +792,7 @@ class Config:
             big_move_sigmas=parse_bounded(e, "PROB_BIG_MOVE_SIGMAS", "1.5", 0, 10),
             sim_after_hours_max_shares=parse_bounded(e, "SIM_AFTER_HOURS_MAX_SHARES", "300", 0, 10_000_000),
             sim_open_quiet_minutes=bounded_int(e, "SIM_OPEN_QUIET_MINUTES", 3, 0, 60),
+            sim_no_odds_withdraw=bounded_int(e, "SIM_NO_ODDS_WITHDRAW_MINUTES", 30, 0, 1440),
             sim_ways=sim_ways, sim_markets=sim_markets, sim_skip=sim_skip, sources_off=sources_off,
             sim_maker_after_hours_markets=market_keys("SIM_MAKER_AFTER_HOURS_MARKETS"), sim_maker_deep_markets=market_keys("SIM_MAKER_DEEP_MARKETS"),
             sim_taker_after_hours_markets=market_keys("SIM_TAKER_AFTER_HOURS_MARKETS"),
@@ -8661,6 +8664,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PROB_BIG_MOVE_SIGMAS": {"kind": "number", "group": "高级", "presets": ["0", "1", "1.5", "2", "3"], "unit": "σ", "zero": "关"},
     "SIM_AFTER_HOURS_MAX_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "100", "200", "300", "500", "1000"], "unit": "份", "zero": "不限"},
     "SIM_OPEN_QUIET_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "1", "3", "5", "10"], "unit": "分钟", "zero": "不限"},
+    "SIM_NO_ODDS_WITHDRAW_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "10", "30", "60", "120"], "unit": "分钟", "zero": "不撤"},
     "SIM_WAYS": {"kind": "choice", "group": "策略", "options": [["taker", "只吃单"], ["maker", "只挂单"], ["both", "挂单和吃单"]]},
     "SIM_MARKETS": {"kind": "multi", "group": "策略", "options": [[k, n] for k, n in SIM_KINDS.items()]},
     "SIM_SKIP": {"kind": "detail", "group": "策略"},  # drawn inside the SIM_MARKETS card: one chip per market of the chosen kinds
@@ -10556,7 +10560,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
   session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
-  sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
+  sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",sim_no_odds_withdraw:"概率暂缺撤单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
   min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",big_move:"大波动日放宽 σ（倍日 σ）",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
@@ -12087,6 +12091,7 @@ class Bot:
         self.sim_lock = asyncio.Lock()      # the step's decisions and the express lane never run side by side
         self.sim_express_count = 0          # decisions made by the express lane (for /diag)
         self.sim_express_withdrawn: dict[str, float] = {}  # slot -> monotonic time the express lane withdrew its order (sim_quote's cooldown)
+        self.sim_unpriced_since: dict[str, int] = {}  # market -> when (ms) a step first found it unpriced with an order resting (sim_unpriced_reason)
         self.sim_step_ms: dict[str, int] = {}  # the last decision phase, by part (for /diag)
         self.sim_step_info: dict[str, int] = {}  # ...and its size: markets judged, records held
         self.sim_checked: dict[str, float] = {}  # market id -> monotonic time Predict was last asked for its result
@@ -13960,6 +13965,7 @@ class Bot:
         return {"code": VERSION, "sim_edge": c.sim_edge, "sim_shares": c.sim_shares, "sim_taker_max_shares": c.sim_taker_max_shares,
                 "sim_taker_sweep": c.sim_taker_sweep, "sim_max_fair": c.sim_max_fair, "sim_after_hours_max_shares": c.sim_after_hours_max_shares,
                 "sim_open_quiet_minutes": c.sim_open_quiet_minutes,
+                **({"sim_no_odds_withdraw": c.sim_no_odds_withdraw} if c.sim_no_odds_withdraw else {}),
                 "sim_ways": ways, "sim_markets": kinds,
                 **({"sim_taker_shares": c.sim_taker_shares} if c.sim_taker_shares else {}),
                 **({"sim_taker_after_hours_shares": c.sim_taker_after_hours_shares} if c.sim_taker_after_hours_shares else {}),
@@ -14751,6 +14757,35 @@ class Bot:
         exit_edge = self.config.sim_maker_exit
         return min(exit_edge, max(self.config.sim_edge - 0.005, 0.0)) if exit_edge > 0 else 0.0
 
+    def sim_unpriced_reason(self, trade: dict, mk: SimMarket | None, now_ms: int) -> str:
+        """Why a resting order on a market the bot cannot price now is withdrawn (SIM_NO_ODDS_WITHDRAW_MINUTES, 1.92.0):
+        the card's odds have been missing that long (``mk`` None: the SSE card over a weekend, the A50 proxy closed — no
+        new order goes on such a market, but one placed on Friday's view stood through the weekend, a free option for
+        whoever has a newer one) or its suggestion held that long (``mk.hold``). The clock starts at the first step that
+        finds the market unpriced with the order resting (sim_unpriced_since; a priced step clears it; a restart starts
+        it again). "" while the order stands, always with the setting at 0."""
+        minutes = self.config.sim_no_odds_withdraw
+        if not minutes or not trade.get("maker") or (mk is not None and not mk.hold):
+            return ""
+        since = self.sim_unpriced_since.setdefault(trade["market"], now_ms)
+        if now_ms - since < minutes * 60_000:
+            return ""
+        if mk is not None:
+            return f"卡片暂不建议已超过 {minutes} 分钟（{brief_error(mk.hold, 80)}），撤单"
+        why = self.sim_missing_why(trade, now_ms)
+        return f"概率暂缺已超过 {minutes} 分钟" + (f"（{why}）" if why else "") + "，撤单"
+
+    def sim_missing_why(self, trade: dict, now_ms: int) -> str:
+        """What a daily card says in place of its odds (概率暂缺：…) for the record's market; "" for the other kinds or
+        when the card has odds."""
+        if trade.get("kind") != "close" or not self.config.probability:
+            return ""
+        key = str(trade.get("key") or "")
+        for title, odds in self.odds_items(now_ms):
+            if isinstance(odds, str) and self.predict_key(title) == key:
+                return brief_error(odds, 80)
+        return ""
+
     def sim_requote_reason(self, trade: dict, mk: SimMarket | None, now_ms: int) -> str:
         """Why a resting order is withdrawn to be placed afresh when the chance returns (its slot is freed when nothing
         filled): the underlying is about to open or has just opened (SIM_OPEN_QUIET_MINUTES), is not in session
@@ -15187,7 +15222,10 @@ class Bot:
             self.sim_quote(mk, trades, now_ms, changed)
             self.sim_take(mk, trades, now_ms, changed)
         t2 = time.monotonic()
-        opened, rekeys = {tid for tid, _ in changed}, []
+        opened, rekeys, unpriced = {tid for tid, _ in changed}, [], set()
+        for mk in markets.values():
+            if not mk.hold:
+                self.sim_unpriced_since.pop(mk.market, None)  # priced now: the clock of sim_unpriced_reason is cleared
         for tid, trade in trades.items():
             if trade.get("final") or tid in opened:
                 continue  # settled and confirmed: nothing below applies (and no JSON round trip for it every step)
@@ -15203,7 +15241,8 @@ class Bot:
                 # and a presumed fill is never taken back
                 self.sim_fill(trade, mk, now_ms)
             if trade["status"] == "resting":
-                why = self.sim_withdraw_reason(trade, mk, now_ms) or self.sim_requote_reason(trade, mk, now_ms)
+                why = (self.sim_withdraw_reason(trade, mk, now_ms) or self.sim_requote_reason(trade, mk, now_ms)
+                       or self.sim_unpriced_reason(trade, mk, now_ms))
                 if why:
                     self.sim_withdraw(trade, why, now_ms)
                     if float(trade.get("shares") or 0) <= 1e-9:
@@ -15211,6 +15250,8 @@ class Bot:
                         # reason: withdrawn for a setting that is later flipped back (SIM_WAYS, SIM_MARKETS, SIM_SKIP), the
                         # record would otherwise hold the slot for the market's life ("已有已撤单")
                         rekeys.append(tid)
+                elif trade.get("maker") and (mk is None or mk.hold):
+                    unpriced.add(trade["market"])  # still resting on a market not priced now: its clock (sim_unpriced_reason) stays
             if mk is not None and not mk.book.stale(now_ms) and not book_crossed(mk.book):
                 self.sim_markout(trade, mk, now_ms)
             if not trade.get("final") and (trade["status"] in {"resting", "filled"} or trade.get("confirm") == "local"):
@@ -15225,6 +15266,7 @@ class Bot:
             if json.dumps(trade, sort_keys=True, default=str) != before:
                 changed.append((tid, trade))
         t3 = time.monotonic()
+        self.sim_unpriced_since = {market: since for market, since in self.sim_unpriced_since.items() if market in unpriced}
         for tid in rekeys:
             new_tid = self.sim_rekey(tid, trades[tid])
             trades[new_tid] = trades.pop(tid)
@@ -16915,7 +16957,7 @@ class Bot:
                   "SIM_TAKER_MAX_SHARES": plain(c.sim_taker_max_shares), "SIM_TAKER_SWEEP_SHARES": plain(c.sim_taker_sweep),
                   "SIM_MAX_FAIR_CENTS": f"{c.sim_max_fair * 100:g}", "SIM_AFTER_HOURS_MAX_SHARES": plain(c.sim_after_hours_max_shares),
                   "PROB_BIG_MOVE_SIGMAS": f"{c.big_move_sigmas:g}",
-                  "SIM_OPEN_QUIET_MINUTES": str(c.sim_open_quiet_minutes),
+                  "SIM_OPEN_QUIET_MINUTES": str(c.sim_open_quiet_minutes), "SIM_NO_ODDS_WITHDRAW_MINUTES": str(c.sim_no_odds_withdraw),
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
                   "SIM_GROUP_USD": plain(c.sim_group_usd), "SIM_TAKER_SESSION": flag(c.sim_taker_session),
                   "SIM_TAKER_AFTER_HOURS_CENTS": f"{c.sim_taker_after_hours * 100:g}", "SIM_AFTER_HOURS_MAX_PRICE_CENTS": f"{c.sim_after_hours_max_price * 100:g}", "SIM_SKIP": ",".join(sorted(c.sim_skip)),
