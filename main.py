@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.89.0"
+VERSION = "1.89.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -398,15 +398,19 @@ def parse_ref_code(value: str) -> str:
 
 
 def parse_ws_urls(spec: str, name: str) -> tuple[str, ...]:
-    """BINANCE_WS_URL="wss://host/stream, wss://other/stream": the stream addresses tried in turn (the query is appended)."""
+    """BINANCE_WS_URL="wss://host, wss://other": the stream servers tried in turn; the endpoint (/ws, /stream?streams=…)
+    is appended, so a /ws or /stream given is dropped."""
     out = []
     for part in spec.split(","):
         url = part.strip().rstrip("/")
         if not url:
             continue
+        for tail in ("/ws", "/stream"):
+            if url.endswith(tail):
+                url = url[:-len(tail)].rstrip("/")
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme not in ("wss", "ws") or not parsed.netloc or parsed.username or parsed.query or parsed.fragment:
-            raise ValueError(f"{name} 应为逗号分隔的 wss:// 地址（不带账号、查询参数），如 wss://fstream.binance.com/stream")
+            raise ValueError(f"{name} 应为逗号分隔的 wss:// 地址（不带账号、查询参数），如 wss://fstream.binance.com")
         out.append(url)
     return tuple(out)
 
@@ -584,7 +588,7 @@ class Config:
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
     hl_refresh: int = 10  # HL_REFRESH_SECONDS: how often the Hyperliquid quotes (the KR200 after-hours proxy among them) are read
     binance_ws: bool = True  # BINANCE_WS: Binance's trade streams beside the REST reads (BinanceStream: the contracts, the crypto cards' pairs); off = REST only
-    binance_ws_url: tuple[str, ...] = ()  # BINANCE_WS_URL: the futures stream's address(es) in place of wss://fstream.binance.com/stream (a relay, another host)
+    binance_ws_url: tuple[str, ...] = ()  # BINANCE_WS_URL: the futures stream's server(s) in place of wss://fstream.binance.com (a relay, another host)
     hl_ws: bool = True       # HL_WS: Hyperliquid's context stream beside the REST reads (HyperliquidStream); off = REST only
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
@@ -5757,8 +5761,8 @@ class PredictStream:
 
 
 # --- Binance's and Hyperliquid's streams: the prices pushed as they trade (1.87.0) ----------------------------------------
-BINANCE_WS_FUTURES = ("wss://fstream.binance.com/stream",)
-BINANCE_WS_SPOT = ("wss://data-stream.binance.vision/stream", "wss://stream.binance.com:9443/stream")  # market data only; the next host after a failure
+BINANCE_WS_FUTURES = ("wss://fstream.binance.com",)
+BINANCE_WS_SPOT = ("wss://data-stream.binance.vision", "wss://stream.binance.com:9443")  # market data only; the next host after a failure
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 PRICE_WS_BACKOFF = (2.0, 300.0)  # the wait before a new connection: doubled per failure within these bounds
 PRICE_WS_STEADY_SECONDS = 60.0   # a connection that lasted this long and delivered prices puts the backoff back to the shortest
@@ -5769,7 +5773,7 @@ class PushStream:
     """A WebSocket kept for as long as the bot runs (the connection loop PredictStream has, for the price feeds): made,
     used until it fails or falls silent (SILENT_SECONDS), made again after a growing pause (PRICE_WS_BACKOFF, back to
     the shortest once a connection lasted a minute and delivered a price: a mute connection — made, answering pings,
-    pushing nothing — backs off like a failed one), the next host of urls() after a failure. A subclass says what to
+    pushing nothing — backs off like a failed one), the next address of urls() after a failure or a mute connection. A subclass says what to
     connect to (urls, headers), what to send once connected (opened), what to do with a frame (frame) and every
     TICK_SECONDS (tick: a ping). ``connect`` (the tests): a coroutine function (url, headers) -> a connection."""
     NAME = "推送"
@@ -5790,6 +5794,8 @@ class PushStream:
         self.closed_why = ""
         self.backoff = PRICE_WS_BACKOFF[0]
         self.host_index = 0
+        self.url = ""             # the address of the connection in hand (or the last one)
+        self.last_session = (0.0, 0, 0)  # how long the last connection lasted, the frames and the prices it delivered
 
     @property
     def enabled(self) -> bool:
@@ -5833,7 +5839,7 @@ class PushStream:
                 self.backoff = min(self.backoff * 2, PRICE_WS_BACKOFF[1])
                 continue
             since, frames_before, pushed_before = time.monotonic(), self.frames, self.pushed
-            self.ws, self.connected_at, self.last_frame, self.connects = ws, since, since, self.connects + 1
+            self.ws, self.connected_at, self.last_frame, self.connects, self.url = ws, since, since, self.connects + 1, url
             LOG.info("%s已连接（第 %d 次）：%s", self.NAME, self.connects, url.partition("?")[0])
             why = ""
             try:
@@ -5852,10 +5858,17 @@ class PushStream:
             self.closed_why = why or "连接结束"
             self.error, self.error_at = self.closed_why, time.time()
             lasted, frames, pushed = time.monotonic() - since, self.frames - frames_before, self.pushed - pushed_before
+            self.last_session = (lasted, frames, pushed)
             steady = lasted >= PRICE_WS_STEADY_SECONDS and pushed > 0
             self.backoff = PRICE_WS_BACKOFF[0] if steady else min(self.backoff * 2, PRICE_WS_BACKOFF[1])
-            LOG.warning("%s断开：%s（本次连接 %.0f 秒，收到 %d 帧、%d 次行情；%.0f 秒后重连）", self.NAME, self.closed_why, lasted, frames, pushed, self.backoff)
+            if pushed == 0:
+                self.host_index += 1  # a mute connection: the next address (the other endpoint, the other host)
+            LOG.warning("%s断开：%s（本次连接 %s %.0f 秒，收到 %d 帧、%d 次行情；%.0f 秒后重连）", self.NAME, self.closed_why,
+                        self.address(), lasted, frames, pushed, self.backoff)
             await PredictStream.pause(stopping, self.backoff)
+
+    def address(self) -> str:
+        return self.url.partition("?")[0]
 
     async def session(self, ws: Any, stopping: asyncio.Event) -> str:
         reader = asyncio.create_task(self.read(ws), name=f"{self.NAME}-read")
@@ -5895,10 +5908,12 @@ class PushStream:
         if not self.urls():
             return "没有要订阅的市场"
         if self.connected:
-            text = (f"已连接 {int(time.monotonic() - self.connected_at)} 秒（第 {self.connects} 次），收到 {self.pushed} 次行情、"
+            text = (f"已连接 {int(time.monotonic() - self.connected_at)} 秒（第 {self.connects} 次，{self.address()}），收到 {self.pushed} 次行情、"
                     f"{self.frames} 帧，最近一帧 {time.monotonic() - self.last_frame:.0f} 秒前")
         elif self.connects:
-            text = f"未连接（上次断开：{brief_error(self.closed_why, 60)}；{self.backoff:.0f} 秒后重连）"
+            lasted, frames, pushed = self.last_session
+            text = (f"未连接（上次断开：{brief_error(self.closed_why, 60)}；上次连接 {self.address()} {lasted:.0f} 秒、收到 {frames} 帧、"
+                    f"{pushed} 次行情；{self.backoff:.0f} 秒后重连）")
         else:
             text = "尚未连接" + (f"（{brief_error(self.error, 60)}）" if self.error else "")
         return text + (f"；丢弃 {self.dropped} 帧" if self.dropped else "")
@@ -5912,9 +5927,12 @@ class BinanceStream(PushStream):
     while fresh (rows), the REST read seeds them (seed: a contract may not trade for minutes after the connection is
     made, and the quote wants its last trade).
 
-    Once connected the stream asks the server which streams it registered (LIST_SUBSCRIPTIONS, 1.89.0): a name the
-    address carried but the server did not register is subscribed again (SUBSCRIBE), and the answer is logged, so a
-    connection that stays mute shows whether the server took the streams at all. /diag lists each pair's last push."""
+    Two endpoints per server (1.89.1): the raw one (/ws, the streams subscribed by SUBSCRIBE messages once connected, the
+    way Binance's own connectors do) and the combined one (/stream?streams=…, the names in the address); futures tries
+    the raw one first, spot the combined one, and a mute connection moves to the next address (PushStream.run). Once
+    connected the stream asks the server which streams it registered (LIST_SUBSCRIPTIONS, 1.89.0): a name the server did
+    not register is subscribed again, and the answer is logged, so a connection that stays mute shows whether the server
+    took the streams at all. /diag lists each pair's last push."""
     NAME = "币安推送"
     FRESH_SECONDS = 10.0  # a symbol's row pushed within this stands in for the REST read (the mark price comes every second)
 
@@ -5926,7 +5944,8 @@ class BinanceStream(PushStream):
         self.row_at: dict[str, float] = {}  # symbol -> monotonic time of its last push
         self.request_id = 0
         self.asked: dict[int, str] = {}     # request id -> method, until the server answers
-        self.registered: list[str] | None = None  # the server's list of this connection's streams; None until it answers
+        self.registered: list[str] | None = None  # the server's latest list of the streams registered; None until a connection answers
+        self.listed_connect = 0             # the connection (connects) whose list that is
         self.answers = 0                    # answers to requests (frames that carry no price)
         self.resubscribed = 0               # names subscribed again because the server had not registered them
         self.fixing = False                 # the resubscription of this connection was sent
@@ -5955,20 +5974,29 @@ class BinanceStream(PushStream):
         return names
 
     def bases(self) -> tuple[str, ...]:
+        """The servers tried in turn (roots: the endpoint is appended)."""
         if self.venue == "futures":
             return tuple(getattr(self.bot.config, "binance_ws_url", ()) or ()) or BINANCE_WS_FUTURES
         return BINANCE_WS_SPOT
 
     def urls(self) -> list[str]:
+        """Every server's two endpoints: raw (/ws) and combined (/stream?streams=…), the raw ones first on futures."""
         names = self.names()
         if not names:
             return []
-        query = "?streams=" + "/".join(names)
-        return [base + query for base in self.bases()]
+        raw = [base + "/ws" for base in self.bases()]
+        combined = [base + "/stream?streams=" + "/".join(names) for base in self.bases()]
+        return raw + combined if self.venue == "futures" else combined + raw
+
+    def headers(self) -> dict[str, str]:
+        return {"User-Agent": f"CloseAlert/{VERSION}"}  # the REST reads' identity
 
     async def opened(self, ws: Any) -> None:
-        self.asked, self.registered, self.fixing, self.first_logged = {}, None, False, False
-        await self.request(ws, "LIST_SUBSCRIPTIONS")
+        self.asked, self.fixing, self.first_logged = {}, False, False
+        if "?streams=" not in self.url:  # the raw endpoint: the streams are asked for once connected (the answer brings the list)
+            await self.request(ws, "SUBSCRIBE", self.names())
+        else:
+            await self.request(ws, "LIST_SUBSCRIPTIONS")
 
     async def request(self, ws: Any, method: str, params: list[str] | None = None) -> None:
         self.request_id += 1
@@ -5999,7 +6027,7 @@ class BinanceStream(PushStream):
             return
         result = msg.get("result")
         got = [str(name) for name in result] if isinstance(result, list) else []
-        self.registered = got
+        self.registered, self.listed_connect = got, self.connects
         have = {name.lower() for name in got}
         missing = [name for name in self.names() if name.lower() not in have]
         if not missing:
@@ -6014,17 +6042,21 @@ class BinanceStream(PushStream):
             LOG.warning("%s：%s", self.NAME, self.error)
 
     async def frame(self, ws: Any, raw: Any) -> None:
-        """A combined-stream frame: {"stream": "<pair>@aggTrade", "data": {...}} — a trade (p, T) or a mark price (p, i, E);
-        or the answer to a request ({"result": ..., "id": n}, bare or wrapped)."""
+        """A frame: a trade (e: aggTrade — p, T) or a mark price (e: markPriceUpdate — p, i, E), bare (the raw endpoint)
+        or wrapped {"stream": "<pair>@aggTrade", "data": {...}} (the combined one); or the answer to a request
+        ({"result": ..., "id": n}, bare or wrapped)."""
         try:
             msg = json.loads(raw)
         except (TypeError, ValueError):
             self.dropped += 1
             return
-        if isinstance(msg, dict) and self.is_answer(msg):
+        if not isinstance(msg, dict):
+            self.dropped += 1
+            return
+        if self.is_answer(msg):
             await self.answered(ws, msg)
             return
-        data = msg.get("data") if isinstance(msg, dict) else None
+        data = msg if "e" in msg else msg.get("data")
         if not isinstance(data, dict):
             self.dropped += 1
             return
@@ -6059,11 +6091,15 @@ class BinanceStream(PushStream):
         text = super().line()
         if not self.enabled or not self.urls() or not self.connects:
             return text
-        if self.connected:
-            if self.registered is None:
-                text += "；订阅清单未回"
-            else:
-                text += f"；服务器登记 {len(self.registered)}/{len(self.names())} 个流" + (f"（补订过 {self.resubscribed} 个）" if self.resubscribed else "")
+        listed = f"服务器登记 {len(self.registered or ())}/{len(self.names())} 个流" + (f"（补订过 {self.resubscribed} 个）" if self.resubscribed else "")
+        if self.registered is None:
+            text += "；订阅清单未回" if self.connected else "；订阅清单从未回"
+        elif not self.connected:
+            text += f"；上次清单：{listed}（第 {self.listed_connect} 次连接）"
+        elif self.listed_connect == self.connects:
+            text += "；" + listed
+        else:
+            text += f"；订阅清单未回（第 {self.listed_connect} 次连接时{listed}）"
         now = time.monotonic()
         ages = [((now - self.row_at[s] if s in self.row_at else None), s) for s in self.symbols()]
         ages.sort(key=lambda item: (item[0] is None, item[0] or 0.0, item[1]))  # the freshest first, never pushed last
