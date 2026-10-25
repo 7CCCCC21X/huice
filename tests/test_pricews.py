@@ -1,4 +1,6 @@
-"""1.87.0: BinanceStream / HyperliquidStream — the prices pushed as they trade, beside the REST reads."""
+"""1.87.0: BinanceStream / HyperliquidStream — the prices pushed as they trade, beside the REST reads.
+1.89.0: the subscription check (LIST_SUBSCRIPTIONS, the missing names subscribed again), the per-pair ages in /diag, a
+mute connection backing off, BINANCE_WS_URL."""
 import asyncio, sys, time, json
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
@@ -48,6 +50,7 @@ class FakeMarket(m.Binance):
 
 async def run():
     m.PRICE_WS_BACKOFF = (0.01, 0.05)  # the tests do not wait seconds between connections
+    m.PRICE_WS_STEADY_SECONDS = 0.0    # any connection that delivered a price counts as steady
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
     assert cfg.binance_ws and cfg.hl_ws
     market = FakeMarket(cfg)
@@ -80,11 +83,41 @@ async def run():
     wsf = next(ws for ws in conns if "fstream" in ws.url); wss = next(ws for ws in conns if "data-stream" in ws.url); wsh = next(ws for ws in conns if "hyperliquid" in ws.url)
     assert [f["subscription"]["coin"] for f in wsh.sent] == ["xyz:UNITREE", "xyz:KR200", "HYPE", "SOL"] \
         and all(f["method"] == "subscribe" and f["subscription"]["type"] == "activeAssetCtx" for f in wsh.sent), wsh.sent
+    # Binance is asked which streams it registered; the answer is no price and not dropped (1.89.0)
+    assert fut.NAME == "币安合约推送" and spot.NAME == "币安现货推送" and wsf.sent == [{"method": "LIST_SUBSCRIPTIONS", "id": 1}] and wss.sent == [{"method": "LIST_SUBSCRIPTIONS", "id": 1}]
+    assert fut.registered is None and "订阅清单未回" in fut.line() and "最近推送：HYPEUSDT 从未、UNITREEUSDT 从未" in fut.line(), fut.line()
+    wsf.push({"result": ["unitreeusdt@aggTrade", "hypeusdt@aggTrade", "unitreeusdt@markPrice@1s", "hypeusdt@markPrice@1s"], "id": 1})
+    await asyncio.sleep(0.02)
+    assert fut.registered == ["unitreeusdt@aggTrade", "hypeusdt@aggTrade", "unitreeusdt@markPrice@1s", "hypeusdt@markPrice@1s"] and fut.answers == 1 \
+        and fut.dropped == 0 and fut.pushed == 0 and fut.frames == 1 and len(wsf.sent) == 1 and fut.asked == {}
+    assert "服务器登记 4/4 个流；最近推送：" in fut.line() and "补订" not in fut.line(), fut.line()
+    # the server registered two of spot's five names: the three missing are subscribed again, then the list is asked again (the answer may come wrapped)
+    wss.push({"result": ["bnbusdt@aggTrade", "ethusdt@aggTrade"], "id": 1})
+    await asyncio.sleep(0.02)
+    assert wss.sent[1] == {"method": "SUBSCRIBE", "params": ["solusdt@aggTrade", "btcusdt@aggTrade", "zecusdt@aggTrade"], "id": 2} and spot.resubscribed == 3, wss.sent
+    assert "服务器登记 2/5 个流（补订过 3 个）" in spot.line(), spot.line()
+    wss.push({"result": None, "id": 2})
+    await asyncio.sleep(0.02)
+    assert wss.sent[2] == {"method": "LIST_SUBSCRIPTIONS", "id": 3} and len(wss.sent) == 3
+    wss.push({"stream": "", "data": {"result": ["bnbusdt@aggTrade", "ethusdt@aggTrade", "solusdt@aggTrade", "btcusdt@aggTrade", "zecusdt@aggTrade"], "id": 3}})
+    await asyncio.sleep(0.02)
+    assert len(spot.registered) == 5 and len(wss.sent) == 3 and spot.answers == 3 and spot.dropped == 0 and spot.error == ""
+    assert "服务器登记 5/5 个流（补订过 3 个）" in spot.line(), spot.line()
+    # a refusal, in either shape, is noted (not dropped); a second list still short after the resubscription is noted too
+    wsf.push({"error": {"code": 2, "msg": "Invalid request: unknown"}, "id": 1}); wsf.push({"code": 0, "msg": "Unknown property", "id": 77})
+    await asyncio.sleep(0.02)
+    assert fut.error == "请求 被拒绝：0 Unknown property" and fut.answers == 3 and fut.dropped == 0, fut.error
+    spot.fixing, spot.asked = True, {9: "LIST_SUBSCRIPTIONS"}
+    wss.push({"result": ["bnbusdt@aggTrade"], "id": 9})
+    await asyncio.sleep(0.02)
+    assert spot.error.startswith("补订后服务器仍未登记 4 个流：solusdt@aggTrade") and len(wss.sent) == 3, spot.error
+    spot.error = ""
     # a mark price alone keeps the row fresh; with the seeded last trade the cycle takes the pushed rows, no REST request
     wsf.push({"stream": "unitreeusdt@markPrice@1s", "data": {"e": "markPriceUpdate", "E": NOW, "s": "UNITREEUSDT", "p": "70.7", "i": "70.65", "P": "70.7", "r": "0.0001", "T": NOW + 3600_000}})
     await asyncio.sleep(0.02)
     rows = fut.rows(["UNITREEUSDT"])
     assert rows == {"UNITREEUSDT": {"symbol": "UNITREEUSDT", "price": "70.5", "time": NOW - 1000, "markPrice": "70.7", "markTime": NOW, "indexPrice": "70.65"}}, rows
+    assert fut.line().endswith("最近推送：UNITREEUSDT 0 秒前、HYPEUSDT 从未"), fut.line()  # the freshest first, never pushed last
     assert await market.prices() == rows and market.calls == 2 and fut.rows(["UNITREEUSDT", "OTHER"]) is None
     # a trade: the contract's quote between cycles, the baseline kept; the key looked at after the gathering delay
     bot.snapshots["UNITREEUSDT"] = {"quote": m.Quote.parse(rows["UNITREEUSDT"], "UNITREEUSDT", NOW, cfg.max_age), "baseline": "kept"}
@@ -159,9 +192,10 @@ async def run():
     await asyncio.sleep(0.02)
     assert fut.dropped == 3 and hl.dropped == 1
     line = fut.line()
-    assert "已连接" in line and "收到 4 次行情" in line and "丢弃 3 帧" in line, line
+    assert "已连接" in line and "收到 4 次行情" in line and "丢弃 3 帧" in line and __import__("re").search(r"最近推送：HYPEUSDT \d 秒前、UNITREEUSDT \d 秒前$", line), line
     assert any(l.startswith("📡 行情推送：币安合约 已连接") and "币安现货 已连接" in l and "Hyperliquid 已连接" in l for l in bot.diag_state(NOW))
     # a broken connection: the rows no longer stand in, the cycle reads REST again; made anew after the backoff
+    m.PRICE_WS_STEADY_SECONDS, fut.backoff = 60.0, 0.05  # this connection is too short to count as steady: the state is checked before the next one
     wsf.push(ConnectionError("gone"))
     await asyncio.sleep(0.02)
     assert not fut.connected and fut.rows(["UNITREEUSDT"]) is None
@@ -169,12 +203,16 @@ async def run():
     await market.prices()
     assert market.calls == calls + 2
     await asyncio.sleep(0.3)
-    assert fut.connected and fut.connects == 2 and "gone" in fut.closed_why
+    assert fut.connected and fut.connects == 2 and "gone" in fut.closed_why and fut.backoff == 0.05
+    m.PRICE_WS_STEADY_SECONDS = 0.0
+    wsf2 = conns[-1]
+    assert wsf2 is not wsf and wsf2.sent == [{"method": "LIST_SUBSCRIPTIONS", "id": 2}] and fut.registered is None and fut.asked == {2: "LIST_SUBSCRIPTIONS"}, "asked again on the new connection"
     # silence: no frame for SILENT_SECONDS, the connection is made anew
     m.HyperliquidStream.SILENT_SECONDS = 0.1
     wsh.push({"channel": "pong"})  # the wait under way was given the old limit: one frame, then the new one applies
     await asyncio.sleep(0.5)
     assert hl.connects >= 2 and "没有收到任何帧" in hl.closed_why, (hl.connects, hl.closed_why)
+    assert hl.backoff >= 0.02, "a mute connection (made, nothing pushed) backs off like a failed one"
     m.HyperliquidStream.SILENT_SECONDS = 60.0
     # a host that cannot be reached: the next one is tried after the backoff
     spot_urls = []
@@ -200,6 +238,35 @@ async def run():
     assert nbot.binance_streams["spot"].line() == "没有要订阅的市场" and nbot.hl_stream.urls() == []
     stop2 = asyncio.Event(); run2 = asyncio.create_task(nbot.hl_stream.run(stop2)); await asyncio.sleep(0.05); stop2.set(); await asyncio.wait_for(run2, 2)
     assert nbot.hl_stream.connects == 0
+    # a mute connection doubles the wait; one that delivered puts it back to the shortest
+    mute = nbot.binance_streams["futures"]
+    mconns = []
+    async def mconnect(url, headers):
+        ws = FakeWs(url); mconns.append(ws); return ws
+    mute.connect, mute.backoff = mconnect, 0.04
+    stop3 = asyncio.Event(); run3 = asyncio.create_task(mute.run(stop3)); await asyncio.sleep(0.05)
+    mconns[0].push({"stream": "unitreeusdt@markPrice@1s", "data": {"e": "markPriceUpdate", "E": NOW, "s": "UNITREEUSDT", "p": "70.7"}})
+    mconns[0].push(ConnectionError("gone"))
+    await asyncio.sleep(0.1)
+    assert mute.backoff == 0.01 and len(mconns) == 2 and mute.pushed == 1, (mute.backoff, len(mconns))
+    mconns[1].push(ConnectionError("gone"))
+    await asyncio.sleep(0.1)
+    assert mute.backoff == 0.02 and len(mconns) == 3, (mute.backoff, len(mconns))
+    stop3.set(); await asyncio.wait_for(run3, 2)
+    # BINANCE_WS_URL: the futures stream's address(es), the query appended; the spot addresses stay
+    relay = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BINANCE_WS_URL": " wss://relay.example/stream/ , wss://fstream.binance.com/stream"})
+    assert relay.binance_ws_url == ("wss://relay.example/stream", "wss://fstream.binance.com/stream")
+    rbot = m.Bot(relay, m.Store(":memory:"), FakeMarket(relay), None)
+    rurls = rbot.binance_streams["futures"].urls()
+    assert len(rurls) == 2 and rurls[0].startswith("wss://relay.example/stream?streams=unitreeusdt@aggTrade/") and rurls[1].startswith("wss://fstream.binance.com/stream?streams=") \
+        and rbot.binance_streams["spot"].urls()[0].startswith("wss://data-stream.binance.vision/"), rurls
+    assert cfg.binance_ws_url == () and fut.bases() == m.BINANCE_WS_FUTURES
+    for bad in ("https://relay.example/stream", "wss://relay.example/stream?streams=a", "wss://user@relay.example/stream", "relay.example"):
+        try:
+            m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BINANCE_WS_URL": bad}); raise AssertionError(bad)
+        except ValueError as error:
+            assert "BINANCE_WS_URL" in str(error), error
+    assert m.age_text(5) == "5 秒前" and m.age_text(599) == "599 秒前" and m.age_text(600) == "10 分前" and m.age_text(36000) == "10 小时前" and m.age_text(-3) == "0 秒前"
     # a bot without the streams' attributes (the tests' stubs) still samples: prices() reads REST
     bare = FakeMarket(on)
     assert bare.stream is None and (await bare.prices())["UNITREEUSDT"]["price"] == "70.5"

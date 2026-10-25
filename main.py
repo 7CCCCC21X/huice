@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.88.2"
+VERSION = "1.89.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -158,6 +158,16 @@ def baseline_brief(base: "Baseline") -> str:
 
 def legend(style: str) -> str:
     return "🔴 涨 🟢 跌 ⚪ 平" if style == "cn" else "🟢 涨 🔴 跌 ⚪ 平"
+
+
+def age_text(seconds: float) -> str:
+    """12 秒前, 5 分前, 3 小时前: an age for a status line."""
+    seconds = max(0.0, seconds)
+    if seconds < 600:
+        return f"{int(seconds)} 秒前"
+    if seconds < 36000:
+        return f"{int(seconds // 60)} 分前"
+    return f"{int(seconds // 3600)} 小时前"
 
 
 def clean_error(error: BaseException | str) -> str:
@@ -387,6 +397,20 @@ def parse_ref_code(value: str) -> str:
     return code
 
 
+def parse_ws_urls(spec: str, name: str) -> tuple[str, ...]:
+    """BINANCE_WS_URL="wss://host/stream, wss://other/stream": the stream addresses tried in turn (the query is appended)."""
+    out = []
+    for part in spec.split(","):
+        url = part.strip().rstrip("/")
+        if not url:
+            continue
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in ("wss", "ws") or not parsed.netloc or parsed.username or parsed.query or parsed.fragment:
+            raise ValueError(f"{name} 应为逗号分隔的 wss:// 地址（不带账号、查询参数），如 wss://fstream.binance.com/stream")
+        out.append(url)
+    return tuple(out)
+
+
 def parse_deadlines(spec: str) -> dict[str, int]:
     """LADDER_DEADLINES="STRC-100=2026-12-31;OTHER=2027-01-15": a STOCK_HIT_MARKETS key -> 23:59 ET of that date, in ms."""
     out: dict[str, int] = {}
@@ -560,6 +584,7 @@ class Config:
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
     hl_refresh: int = 10  # HL_REFRESH_SECONDS: how often the Hyperliquid quotes (the KR200 after-hours proxy among them) are read
     binance_ws: bool = True  # BINANCE_WS: Binance's trade streams beside the REST reads (BinanceStream: the contracts, the crypto cards' pairs); off = REST only
+    binance_ws_url: tuple[str, ...] = ()  # BINANCE_WS_URL: the futures stream's address(es) in place of wss://fstream.binance.com/stream (a relay, another host)
     hl_ws: bool = True       # HL_WS: Hyperliquid's context stream beside the REST reads (HyperliquidStream); off = REST only
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
@@ -733,6 +758,7 @@ class Config:
             hl_index=parse_hl_tickers(e.get("HL_INDEX", DEFAULT_HL_INDEX), ("KR200",)),
             hl_refresh=bounded_int(e, "HL_REFRESH_SECONDS", 10, 3, 120),
             binance_ws=e.get("BINANCE_WS", "on").strip().lower() not in {"off", "0", "false", "no"},
+            binance_ws_url=parse_ws_urls(e.get("BINANCE_WS_URL", ""), "BINANCE_WS_URL"),
             hl_ws=e.get("HL_WS", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict=e.get("PREDICT", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
@@ -5735,13 +5761,15 @@ BINANCE_WS_FUTURES = ("wss://fstream.binance.com/stream",)
 BINANCE_WS_SPOT = ("wss://data-stream.binance.vision/stream", "wss://stream.binance.com:9443/stream")  # market data only; the next host after a failure
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 PRICE_WS_BACKOFF = (2.0, 300.0)  # the wait before a new connection: doubled per failure within these bounds
+PRICE_WS_STEADY_SECONDS = 60.0   # a connection that lasted this long and delivered prices puts the backoff back to the shortest
 WS_CLOSE_SECONDS = 1.0           # a connection's closing handshake is given this long at a stop or a reconnect (the socket is dropped after)
 
 
 class PushStream:
     """A WebSocket kept for as long as the bot runs (the connection loop PredictStream has, for the price feeds): made,
     used until it fails or falls silent (SILENT_SECONDS), made again after a growing pause (PRICE_WS_BACKOFF, back to
-    the shortest once a connection lasted a minute), the next host of urls() after a failure. A subclass says what to
+    the shortest once a connection lasted a minute and delivered a price: a mute connection — made, answering pings,
+    pushing nothing — backs off like a failed one), the next host of urls() after a failure. A subclass says what to
     connect to (urls, headers), what to send once connected (opened), what to do with a frame (frame) and every
     TICK_SECONDS (tick: a ping). ``connect`` (the tests): a coroutine function (url, headers) -> a connection."""
     NAME = "推送"
@@ -5804,7 +5832,7 @@ class PushStream:
                 await PredictStream.pause(stopping, self.backoff)
                 self.backoff = min(self.backoff * 2, PRICE_WS_BACKOFF[1])
                 continue
-            since = time.monotonic()
+            since, frames_before, pushed_before = time.monotonic(), self.frames, self.pushed
             self.ws, self.connected_at, self.last_frame, self.connects = ws, since, since, self.connects + 1
             LOG.info("%s已连接（第 %d 次）：%s", self.NAME, self.connects, url.partition("?")[0])
             why = ""
@@ -5823,9 +5851,10 @@ class PushStream:
                 return
             self.closed_why = why or "连接结束"
             self.error, self.error_at = self.closed_why, time.time()
-            lasted = time.monotonic() - since
-            self.backoff = PRICE_WS_BACKOFF[0] if lasted >= 60 else min(self.backoff * 2, PRICE_WS_BACKOFF[1])
-            LOG.warning("%s断开：%s（%.0f 秒后重连）", self.NAME, self.closed_why, self.backoff)
+            lasted, frames, pushed = time.monotonic() - since, self.frames - frames_before, self.pushed - pushed_before
+            steady = lasted >= PRICE_WS_STEADY_SECONDS and pushed > 0
+            self.backoff = PRICE_WS_BACKOFF[0] if steady else min(self.backoff * 2, PRICE_WS_BACKOFF[1])
+            LOG.warning("%s断开：%s（本次连接 %.0f 秒，收到 %d 帧、%d 次行情；%.0f 秒后重连）", self.NAME, self.closed_why, lasted, frames, pushed, self.backoff)
             await PredictStream.pause(stopping, self.backoff)
 
     async def session(self, ws: Any, stopping: asyncio.Event) -> str:
@@ -5881,15 +5910,27 @@ class BinanceStream(PushStream):
     HYPEUSDT's ladder, on spot the crypto cards' pairs — pushed where the REST reads put them (Bot.price_pushed): the
     contract's quote between sampling cycles, the cards' prices. The rows stand in for the sampling cycle's REST read
     while fresh (rows), the REST read seeds them (seed: a contract may not trade for minutes after the connection is
-    made, and the quote wants its last trade)."""
+    made, and the quote wants its last trade).
+
+    Once connected the stream asks the server which streams it registered (LIST_SUBSCRIPTIONS, 1.89.0): a name the
+    address carried but the server did not register is subscribed again (SUBSCRIBE), and the answer is logged, so a
+    connection that stays mute shows whether the server took the streams at all. /diag lists each pair's last push."""
     NAME = "币安推送"
     FRESH_SECONDS = 10.0  # a symbol's row pushed within this stands in for the REST read (the mark price comes every second)
 
     def __init__(self, bot: "Bot", venue: str, connect: Any = None):
         super().__init__(connect)
         self.bot, self.venue = bot, venue
+        self.NAME = "币安合约推送" if venue == "futures" else "币安现货推送"
         self.latest: dict[str, dict] = {}   # symbol -> the row in the REST read's shape: symbol, price, time, markPrice, markTime, indexPrice
         self.row_at: dict[str, float] = {}  # symbol -> monotonic time of its last push
+        self.request_id = 0
+        self.asked: dict[int, str] = {}     # request id -> method, until the server answers
+        self.registered: list[str] | None = None  # the server's list of this connection's streams; None until it answers
+        self.answers = 0                    # answers to requests (frames that carry no price)
+        self.resubscribed = 0               # names subscribed again because the server had not registered them
+        self.fixing = False                 # the resubscription of this connection was sent
+        self.first_logged = False           # the connection's first price was logged
 
     @property
     def enabled(self) -> bool:
@@ -5905,26 +5946,90 @@ class BinanceStream(PushStream):
             out += [spec.symbol for spec in RANGE_MARKETS if spec.venue == self.venue]
         return list(dict.fromkeys(out))
 
-    def urls(self) -> list[str]:
+    def names(self) -> list[str]:
+        """The stream names subscribed: every pair's aggTrade, on futures its mark price every second too."""
         symbols = self.symbols()
-        if not symbols:
-            return []
         names = [f"{s.lower()}@aggTrade" for s in symbols]
         if self.venue == "futures":
             names += [f"{s.lower()}@markPrice@1s" for s in symbols]
+        return names
+
+    def bases(self) -> tuple[str, ...]:
+        if self.venue == "futures":
+            return tuple(getattr(self.bot.config, "binance_ws_url", ()) or ()) or BINANCE_WS_FUTURES
+        return BINANCE_WS_SPOT
+
+    def urls(self) -> list[str]:
+        names = self.names()
+        if not names:
+            return []
         query = "?streams=" + "/".join(names)
-        return [base + query for base in (BINANCE_WS_FUTURES if self.venue == "futures" else BINANCE_WS_SPOT)]
+        return [base + query for base in self.bases()]
+
+    async def opened(self, ws: Any) -> None:
+        self.asked, self.registered, self.fixing, self.first_logged = {}, None, False, False
+        await self.request(ws, "LIST_SUBSCRIPTIONS")
+
+    async def request(self, ws: Any, method: str, params: list[str] | None = None) -> None:
+        self.request_id += 1
+        self.asked[self.request_id] = method
+        body: dict[str, Any] = {"method": method, "id": self.request_id}
+        if params:
+            body["params"] = params
+        await ws.send(json.dumps(body))
+
+    @staticmethod
+    def is_answer(msg: dict) -> bool:
+        return "id" in msg and "e" not in msg and ("result" in msg or "error" in msg or "code" in msg)
+
+    async def answered(self, ws: Any, msg: dict) -> None:
+        """The server's answer to a request: the list of registered streams (checked against the names asked for, the
+        missing ones subscribed again once), a subscription taken (the list is asked again), or a refusal (noted)."""
+        self.answers += 1
+        method = self.asked.pop(msg.get("id"), "") if isinstance(msg.get("id"), int) else ""
+        error = msg.get("error") if isinstance(msg.get("error"), dict) else (msg if "result" not in msg else None)
+        if error is not None:
+            self.error, self.error_at = brief_error(f"{method or '请求'} 被拒绝：{error.get('code', '')} {error.get('msg', '')}".strip(), 120), time.time()
+            LOG.warning("%s：%s", self.NAME, self.error)
+            return
+        if method == "SUBSCRIBE":
+            await self.request(ws, "LIST_SUBSCRIPTIONS")
+            return
+        if method != "LIST_SUBSCRIPTIONS":
+            return
+        result = msg.get("result")
+        got = [str(name) for name in result] if isinstance(result, list) else []
+        self.registered = got
+        have = {name.lower() for name in got}
+        missing = [name for name in self.names() if name.lower() not in have]
+        if not missing:
+            LOG.info("%s：服务器登记了 %d 个流（%s）", self.NAME, len(got), "、".join(got[:12]) + ("…" if len(got) > 12 else ""))
+        elif not self.fixing:
+            self.fixing = True
+            self.resubscribed += len(missing)
+            LOG.warning("%s：服务器登记了 %d/%d 个流，补订 %d 个：%s", self.NAME, len(got), len(self.names()), len(missing), "、".join(missing))
+            await self.request(ws, "SUBSCRIBE", missing)
+        else:
+            self.error, self.error_at = brief_error(f"补订后服务器仍未登记 {len(missing)} 个流：{'、'.join(missing)}", 120), time.time()
+            LOG.warning("%s：%s", self.NAME, self.error)
 
     async def frame(self, ws: Any, raw: Any) -> None:
-        """A combined-stream frame: {"stream": "<pair>@aggTrade", "data": {...}} — a trade (p, T) or a mark price (p, i, E)."""
+        """A combined-stream frame: {"stream": "<pair>@aggTrade", "data": {...}} — a trade (p, T) or a mark price (p, i, E);
+        or the answer to a request ({"result": ..., "id": n}, bare or wrapped)."""
         try:
             msg = json.loads(raw)
         except (TypeError, ValueError):
             self.dropped += 1
             return
+        if isinstance(msg, dict) and self.is_answer(msg):
+            await self.answered(ws, msg)
+            return
         data = msg.get("data") if isinstance(msg, dict) else None
         if not isinstance(data, dict):
             self.dropped += 1
+            return
+        if self.is_answer(data):
+            await self.answered(ws, data)
             return
         kind, symbol = data.get("e"), str(data.get("s") or "").upper()
         if not symbol or kind not in ("aggTrade", "markPriceUpdate"):
@@ -5943,8 +6048,27 @@ class BinanceStream(PushStream):
             return
         self.row_at[symbol] = time.monotonic()
         self.pushed += 1
+        if not self.first_logged:
+            self.first_logged = True
+            LOG.info("%s：连接后 %.1f 秒收到第一个价格（%s %s）", self.NAME, time.monotonic() - self.connected_at, symbol, kind)
         if kind == "aggTrade" or symbol in self.bot.config.symbols:  # a mark price matters to a contract's quote alone
             self.bot.price_pushed(self.venue, symbol, row)
+
+    def line(self) -> str:
+        """The connection's line, then what the server registered and each pair's last push (/diag)."""
+        text = super().line()
+        if not self.enabled or not self.urls() or not self.connects:
+            return text
+        if self.connected:
+            if self.registered is None:
+                text += "；订阅清单未回"
+            else:
+                text += f"；服务器登记 {len(self.registered)}/{len(self.names())} 个流" + (f"（补订过 {self.resubscribed} 个）" if self.resubscribed else "")
+        now = time.monotonic()
+        ages = [((now - self.row_at[s] if s in self.row_at else None), s) for s in self.symbols()]
+        ages.sort(key=lambda item: (item[0] is None, item[0] or 0.0, item[1]))  # the freshest first, never pushed last
+        text += "；最近推送：" + "、".join(f"{s} {age_text(age) if age is not None else '从未'}" for age, s in ages)
+        return text
 
     def rows(self, symbols: Any) -> dict[str, dict] | None:
         """The pushed rows for ``symbols`` in the REST read's shape, when the connection lives and every one is fresh
