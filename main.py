@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.88.1"
+VERSION = "1.88.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5426,8 +5426,8 @@ async def ws_connect(url: str, headers: dict[str, str]) -> Any:
         from websockets.asyncio.client import connect
     except ImportError as error:
         raise RemoteError("websockets 包未安装（requirements.txt 已列出）") from error
-    # close_timeout: the closing handshake at a stop waits this long at most (the default ten seconds held a restart)
-    return await connect(url, additional_headers=headers, open_timeout=15, close_timeout=3, ping_interval=20, ping_timeout=20,
+    # close_timeout: the closing handshake waits this long at most for the server (its default of ten seconds held a stop)
+    return await connect(url, additional_headers=headers, open_timeout=15, close_timeout=1, ping_interval=20, ping_timeout=20,
                          max_size=4 * 1024 * 1024)
 
 
@@ -5528,7 +5528,7 @@ class PredictStream:
             finally:
                 self.ws, self.connected_at = None, 0.0
                 with contextlib.suppress(Exception):  # the closing handshake, bounded: a stop never waits on the server
-                    await asyncio.wait_for(ws.close(), 5)
+                    await asyncio.wait_for(ws.close(), WS_CLOSE_SECONDS)
             if stopping.is_set():
                 return
             self.closed_why = why or "连接结束"
@@ -5735,6 +5735,7 @@ BINANCE_WS_FUTURES = ("wss://fstream.binance.com/stream",)
 BINANCE_WS_SPOT = ("wss://data-stream.binance.vision/stream", "wss://stream.binance.com:9443/stream")  # market data only; the next host after a failure
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 PRICE_WS_BACKOFF = (2.0, 300.0)  # the wait before a new connection: doubled per failure within these bounds
+WS_CLOSE_SECONDS = 1.0           # a connection's closing handshake is given this long at a stop or a reconnect (the socket is dropped after)
 
 
 class PushStream:
@@ -5817,7 +5818,7 @@ class PushStream:
             finally:
                 self.ws, self.connected_at = None, 0.0
                 with contextlib.suppress(Exception):  # the closing handshake, bounded: a stop never waits on the server
-                    await asyncio.wait_for(ws.close(), 5)
+                    await asyncio.wait_for(ws.close(), WS_CLOSE_SECONDS)
             if stopping.is_set():
                 return
             self.closed_why = why or "连接结束"
