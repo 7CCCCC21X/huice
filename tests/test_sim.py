@@ -1421,7 +1421,7 @@ async def faster():
     assert fbot.sim_wake and ("hang-seng-index-up-or-down-on-october-5-2026", 0.71) in fbot.fair_sig
     fbot.sim_wake = False; fbot.note_job("上证/A50", NOW)
     assert not fbot.sim_wake, "within the second: not looked at"
-    # the express lane (1.66.0): a market's book just came in -> its taker is decided now, without the step; makers wait
+    # the express lane (1.66.0; 1.88.0 the makers too): a market's book just came in -> its taker and its maker are decided now, without the step
     xbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
                                     "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}), m.Store(":memory:"), FM(NOW), None)
     xbot.sim_markets = lambda now: world["markets"]
@@ -1430,13 +1430,50 @@ async def faster():
     await xbot.sim_express("KOSPI")
     assert not xbot.sim_trades() and xbot.sim_express_count == 0, "another key: nothing here"
     await xbot.sim_express("HSI")
-    assert sorted(xbot.sim_trades()) == [f"{HSI_SLUG}|up|吃"] and xbot.sim_express_count == 1, sorted(xbot.sim_trades())
+    both = [f"{HSI_SLUG}|up|吃", f"{HSI_SLUG}|up|挂"]
+    assert sorted(xbot.sim_trades()) == both and xbot.sim_express_count == 1, sorted(xbot.sim_trades())
     await xbot.sim_express("HSI")
-    assert xbot.sim_express_count == 1 and len(xbot.sim_trades()) == 1, "the slot is taken: nothing twice"
+    assert xbot.sim_express_count == 1 and len(xbot.sim_trades()) == 2, "the slots are taken: nothing twice"
     xbot.predict.updated("HSI"); await asyncio.sleep(0.05)  # the feed's hook schedules the same
     assert xbot.sim_express_count == 1 and not xbot.predict.express_tasks
-    await step(xbot, NOW + 5_000)  # the step adds the maker and leaves the taker alone
-    assert sorted(xbot.sim_trades()) == [f"{HSI_SLUG}|up|吃", f"{HSI_SLUG}|up|挂"] and set(xbot.sim_step_ms) == {"盘口", "判断", "结算", "保存"}
+    await step(xbot, NOW + 5_000)  # the step finds both slots taken and leaves them alone
+    assert sorted(xbot.sim_trades()) == both and set(xbot.sim_step_ms) == {"盘口", "判断", "结算", "保存"}
+    # 1.88.0: the lane withdraws a resting order whose edge is gone (the exit line), frees its slot and quotes it again only
+    # after its cooldown; a 买1 that moved (the follow) is the step's business
+    tid = f"{HSI_SLUG}|up|挂"
+    ebot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                    "SIM_WAYS": "maker", "SIM_MARKETS": "all", **LEGACY, "SIM_MAKER_EXIT_CENTS": "5"}), m.Store(":memory:"), FM(NOW), None)
+    ebot.sim_markets = lambda now: world["markets"]
+    world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW)]
+    await ebot.sim_express("HSI")
+    assert sorted(ebot.sim_trades()) == [tid] and abs(ebot.sim_trades()[tid]["edge"] - 0.15) < 1e-9
+    world["markets"] = [hsi(0.58, [(0.55, 100)], [(0.60, 100)], NOW)]  # 3¢ left under the 5¢ line
+    await ebot.sim_express("HSI")
+    t = ebot.sim_trades()
+    assert sorted(t) == [f"{tid}#1"] and t[f"{tid}#1"]["status"] == "cancelled" and t[f"{tid}#1"]["withdrawn"]["why"] == "净优势降到 3.0¢，低于撤单线 5.0¢" \
+        and tid in ebot.sim_express_withdrawn and ebot.sim_express_count == 2, t
+    world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW)]  # the edge is back within the cooldown: the lane leaves the slot alone
+    await ebot.sim_express("HSI")
+    assert sorted(ebot.sim_trades()) == [f"{tid}#1"] and ebot.sim_express_count == 2, "within the cooldown"
+    ebot.sim_express_withdrawn[tid] = -1e9
+    await ebot.sim_express("HSI")
+    assert sorted(ebot.sim_trades()) == [tid, f"{tid}#1"] and ebot.sim_trades()[tid]["status"] == "resting"
+    assert m.Bot.requote_urgent("净优势降到 3.0¢，低于撤单线 5.0¢") and m.Bot.requote_urgent("盘后只挂净优势 ≥ 15.0¢ 的，现 9.0¢ 低于撤单线 14.0¢") \
+        and m.Bot.requote_urgent("触发门槛已改为 12.0¢，现净优势 11.0¢ 不达标") and not m.Bot.requote_urgent("买1 移到 57.0¢，改跟") \
+        and not m.Bot.requote_urgent("每次份数已改为 50 份，按新份数重挂") and not m.Bot.requote_urgent("积分已停止发放，不挂")
+    fbot2 = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                     "SIM_WAYS": "maker", "SIM_MARKETS": "all", **LEGACY, "SIM_MAKER_MIN_BID": "100"}), m.Store(":memory:"), FM(NOW), None)
+    fbot2.sim_markets = lambda now: world["markets"]
+    world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW)]
+    await fbot2.sim_express("HSI")
+    assert sorted(fbot2.sim_trades()) == [tid] and fbot2.sim_trades()[tid]["price"] == 0.55
+    world["markets"] = [hsi(0.70, [(0.57, 100)], [(0.60, 100)], NOW)]
+    await fbot2.sim_express("HSI")
+    assert fbot2.sim_trades()[tid]["status"] == "resting" and fbot2.sim_trades()[tid]["price"] == 0.55, "the 买1 moved: the step's business"
+    await step(fbot2, NOW + 5_000)
+    assert sorted(fbot2.sim_trades()) == [f"{tid}#1"] and fbot2.sim_trades()[f"{tid}#1"]["withdrawn"]["why"] == "买1 移到 57.0¢，改跟"
+    await step(fbot2, NOW + 10_000)
+    assert sorted(fbot2.sim_trades()) == [tid, f"{tid}#1"] and fbot2.sim_trades()[tid]["price"] == 0.57
     print("FASTER_OK")
 
 

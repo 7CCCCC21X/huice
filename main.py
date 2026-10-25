@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.87.0"
+VERSION = "1.88.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -809,7 +809,15 @@ class Config:
 
 
 class Store:
-    """Small persistent JSON records in SQLite. All calls use the event-loop thread."""
+    """Small persistent JSON records in SQLite. Reads, and the structural writes (replace, delete_*), use the event-loop
+    thread's connection; the records written (put, put_many) are queued for a writer thread, which commits them in
+    batches — one transaction, one fsync — so a step's save (hundreds of records) no longer holds the event loop for the
+    fsync while the streams' frames wait (1.88.0). A write is read back at once: the queued records overlay the table
+    (get, items, keys) until they are committed. flush() waits for the queue to be on disk: before a real order goes out
+    (its hash), before a structural write (a delete queued behind a put of the same key must not be undone by it), at
+    the close. A ":memory:" store writes synchronously: a memory database belongs to one connection."""
+    FLUSH_SECONDS = 10.0
+
     def __init__(self, path: str):
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -819,33 +827,66 @@ class Store:
         self.conn.execute("CREATE TABLE IF NOT EXISTS records (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         self.conn.commit()
         self.touched: dict[str, int] = {}  # key family ("sim", "notice"...) -> how many writes it has seen: in-memory views check this
+        self.lock = threading.Condition()
+        self.queue: list[tuple[int, list[tuple[str, str]]]] = []  # (version, rows) batches for the writer, oldest first
+        self.pending: dict[str, tuple[int, str]] = {}  # key -> (the version of its latest queued write, its JSON): read from here until committed
+        self.version = 0       # the last version queued
+        self.written = 0       # the last version committed
+        self.closing = False
+        self.write_error = ""  # the writer's last failure (it tries again every second; the records stay readable meanwhile)
+        self.writer: threading.Thread | None = None
+        self.writer_conn: sqlite3.Connection | None = None
+        if path != ":memory:":
+            self.writer_conn = sqlite3.connect(path, check_same_thread=False)
+            self.writer_conn.execute("PRAGMA synchronous=FULL")
+            self.writer = threading.Thread(target=self.write_loop, name="store-writer", daemon=True)
+            self.writer.start()
 
     def _bump(self, key: str) -> None:
         family = key.partition(":")[0]
         self.touched[family] = self.touched.get(family, 0) + 1
 
     def get(self, key: str, default: Any = None) -> Any:
+        with self.lock:
+            queued = self.pending.get(key)
+        if queued is not None:
+            return json.loads(queued[1])
         row = self.conn.execute("SELECT v FROM records WHERE k=?", (key,)).fetchone()
         return json.loads(row[0]) if row else copy.deepcopy(default)
 
     UPSERT = "INSERT INTO records(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v"
 
     def put(self, key: str, value: Any) -> None:
-        with self.conn:
-            self.conn.execute(self.UPSERT, (key, json.dumps(value, ensure_ascii=False)))
-        self._bump(key)
+        self.put_many([(key, value)])
 
     def put_many(self, pairs: Any) -> None:
-        """Several records in one transaction (one fsync instead of one per record)."""
+        """Several records in one transaction (one fsync instead of one per record): queued for the writer thread, or
+        written here when the store has none (":memory:")."""
         rows = [(key, json.dumps(value, ensure_ascii=False)) for key, value in pairs]
-        if rows:
+        if not rows:
+            return
+        if self.writer is None:
             with self.conn:
                 self.conn.executemany(self.UPSERT, rows)
-            for key, _ in rows:
-                self._bump(key)
+        else:
+            with self.lock:
+                self.version += 1
+                for key, text in rows:
+                    self.pending[key] = (self.version, text)
+                self.queue.append((self.version, rows))
+                self.lock.notify_all()
+        for key, _ in rows:
+            self._bump(key)
+
+    def _overlay(self, prefix: str) -> dict[str, str]:
+        """The queued records under ``prefix``: key -> JSON."""
+        with self.lock:
+            return {k: text for k, (_, text) in self.pending.items() if k.startswith(prefix)}
 
     def keys(self, prefix: str) -> list[str]:
-        return [k for (k,) in self.conn.execute("SELECT k FROM records WHERE k >= ? AND k < ? ORDER BY k", self._bounds(prefix))]
+        found = {k for (k,) in self.conn.execute("SELECT k FROM records WHERE k >= ? AND k < ?", self._bounds(prefix))}
+        found.update(self._overlay(prefix))
+        return sorted(found)
 
     @staticmethod
     def _bounds(prefix: str) -> tuple[str, str]:
@@ -853,19 +894,22 @@ class Store:
         return prefix, (prefix[:-1] + chr(ord(prefix[-1]) + 1)) if prefix else "\U0010ffff"
 
     def items(self, prefix: str) -> list[tuple[str, Any]]:
-        rows = self.conn.execute("SELECT k, v FROM records WHERE k >= ? AND k < ? ORDER BY k", self._bounds(prefix))
-        return [(k, json.loads(v)) for k, v in rows]
+        rows = dict(self.conn.execute("SELECT k, v FROM records WHERE k >= ? AND k < ?", self._bounds(prefix)))
+        rows.update(self._overlay(prefix))
+        return [(k, json.loads(rows[k])) for k in sorted(rows)]
 
     def count(self, prefix: str) -> int:
-        return int(self.conn.execute("SELECT count(*) FROM records WHERE k >= ? AND k < ?", self._bounds(prefix)).fetchone()[0])
+        return len(self.keys(prefix))
 
     def delete_prefix(self, prefix: str) -> None:
+        self.flush()
         with self.conn:
             self.conn.execute("DELETE FROM records WHERE k >= ? AND k < ?", self._bounds(prefix))
         self._bump(prefix)
 
     def delete_keys(self, keys: list[str]) -> None:
         if keys:
+            self.flush()
             with self.conn:
                 self.conn.executemany("DELETE FROM records WHERE k=?", [(k,) for k in keys])
             for key in keys:
@@ -875,6 +919,7 @@ class Store:
         """Delete ``keys`` and write ``pairs`` in one transaction: a record moved to another key is at no moment gone
         from the database (two transactions left a crash in between with the record — a real position's — lost)."""
         rows = [(key, json.dumps(value, ensure_ascii=False)) for key, value in pairs]
+        self.flush()
         with self.conn:
             if keys:
                 self.conn.executemany("DELETE FROM records WHERE k=?", [(k,) for k in keys])
@@ -883,7 +928,64 @@ class Store:
         for key in [*keys, *(key for key, _ in rows)]:
             self._bump(key)
 
+    def write_loop(self) -> None:
+        """The writer thread: every batch queued, in one transaction; a failure (the disk) is noted and the batch tried
+        again a second later, its records readable from the overlay meanwhile."""
+        while True:
+            with self.lock:
+                while not self.queue and not self.closing:
+                    self.lock.wait()
+                if not self.queue:
+                    return
+                batch = list(self.queue)
+            rows = [row for _, rows in batch for row in rows]
+            through = batch[-1][0]
+            try:
+                with self.writer_conn:  # type: ignore[union-attr]
+                    self.writer_conn.executemany(self.UPSERT, rows)  # type: ignore[union-attr]
+            except Exception as error:
+                with self.lock:
+                    self.write_error = f"{type(error).__name__}: {str(error)[:80]}"
+                    self.lock.notify_all()
+                time.sleep(1.0)
+                continue
+            with self.lock:
+                del self.queue[:len(batch)]
+                self.written, self.write_error = through, ""
+                for key in [k for k, (ver, _) in self.pending.items() if ver <= through]:
+                    del self.pending[key]
+                self.lock.notify_all()
+
+    def flush(self, timeout: float = FLUSH_SECONDS) -> bool:
+        """Wait until everything queued is committed; False when it is not within ``timeout`` (the writer failing)."""
+        if self.writer is None:
+            return True
+        deadline = time.monotonic() + timeout
+        with self.lock:
+            while self.written < self.version:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self.lock.wait(left)
+        return True
+
+    def line(self) -> str:
+        """The writer's state in a line (/diag)."""
+        if self.writer is None:
+            return "同步写入（内存库）"
+        with self.lock:
+            queued, error = len(self.queue), self.write_error
+        return (f"后台写入，排队 {queued} 批" if queued else "后台写入，无积压") + (f"；最近错误：{error}" if error else "")
+
     def close(self) -> None:
+        if self.writer is not None:
+            self.flush()
+            with self.lock:
+                self.closing = True
+                self.lock.notify_all()
+            self.writer.join(timeout=5)
+            if self.writer_conn is not None:
+                self.writer_conn.close()
         self.conn.close()
 
 
@@ -8512,6 +8614,7 @@ class TradeMap(dict):
         super().__init__(*args, **kwargs)
         self._by_market: dict[str, list[dict]] | None = None
         self._by_driver: dict[str, list[dict]] | None = None
+        self._ids_by_market: dict[str, list[str]] | None = None
 
     def of_market(self, market: str) -> list[dict]:
         """The records of one market, in the map's order (not to be changed by the caller)."""
@@ -8521,6 +8624,15 @@ class TradeMap(dict):
                 index.setdefault(str(t.get("market") or ""), []).append(t)
             self._by_market = index
         return self._by_market.get(market, [])
+
+    def ids_of_market(self, market: str) -> list[str]:
+        """The ids of one market's records, in the map's order (the express lane's look at its resting orders)."""
+        if self._ids_by_market is None:
+            index: dict[str, list[str]] = {}
+            for tid, t in self.items():
+                index.setdefault(str(t.get("market") or ""), []).append(tid)
+            self._ids_by_market = index
+        return self._ids_by_market.get(market, [])
 
     def of_driver(self, driver: str) -> list[dict]:
         """The records settling on one driver (trade_driver), in the map's order."""
@@ -8532,7 +8644,7 @@ class TradeMap(dict):
         return self._by_driver.get(driver, [])
 
     def _changed(self) -> None:
-        self._by_market = self._by_driver = None
+        self._by_market = self._by_driver = self._ids_by_market = None
 
     def __setitem__(self, key: str, value: dict) -> None:
         super().__setitem__(key, value)
@@ -8573,6 +8685,12 @@ def trades_of_market(trades: Mapping, market: str) -> list[dict]:
     """The records of one market: from the map's index when it has one (TradeMap), else by scanning."""
     of = getattr(trades, "of_market", None)
     return of(market) if of is not None else [t for t in trades.values() if t.get("market") == market]
+
+
+def trade_ids_of_market(trades: Mapping, market: str) -> list[str]:
+    """The ids of one market's records: from the map's index when it has one (TradeMap), else by scanning."""
+    of = getattr(trades, "ids_of_market", None)
+    return of(market) if of is not None else [tid for tid, t in trades.items() if t.get("market") == market]
 
 
 def trades_of_driver(trades: Mapping, driver: str) -> list[dict]:
@@ -11751,7 +11869,8 @@ class Bot:
         self.fair_sig: tuple | None = None  # the fair prices as of the last feed refresh (note_job): a change wakes the trader
         self.fair_sig_at = -1e9
         self.sim_lock = asyncio.Lock()      # the step's decisions and the express lane never run side by side
-        self.sim_express_count = 0          # taker decisions made by the express lane (for /diag)
+        self.sim_express_count = 0          # decisions made by the express lane (for /diag)
+        self.sim_express_withdrawn: dict[str, float] = {}  # slot -> monotonic time the express lane withdrew its order (sim_quote's cooldown)
         self.sim_step_ms: dict[str, int] = {}  # the last decision phase, by part (for /diag)
         self.sim_step_info: dict[str, int] = {}  # ...and its size: markets judged, records held
         self.sim_checked: dict[str, float] = {}  # market id -> monotonic time Predict was last asked for its result
@@ -14824,22 +14943,7 @@ class Bot:
         for mk in markets.values():
             if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
                 continue  # positions filled in other kinds (SIM_MARKETS narrowed) still settle below; resting ones are withdrawn
-            maker = self.sim_maker_reason(mk, trades, now_ms)[0]  # the side and the valid 买1 it joins, past every gate (session, points, depth, bar, slot)
-            if maker is not None:
-                side = "up" if maker.side == "涨" else "down"
-                tid = f"{mk.market}|{side}|挂"
-                held = trades.get(tid)  # one order per market, side and way at a time; a position from a filled one lets the next in
-                if held is None or sim_position(held):
-                    count, why = self.sim_maker_pick(mk, trades, side, maker, now_ms)  # SIM_SHARES, or the most the caps take
-                    if why:
-                        self.sim_note_block(tid, mk, "挂" + mk.sides[0 if side == "up" else 1], maker.price, why, now_ms)
-                    else:
-                        if held is not None:  # the position moves to tid#n (it settles there); the slot takes the fresh order
-                            new_tid = self.sim_rekey(tid, held)
-                            trades[new_tid] = trades.pop(tid)
-                            changed = [(new_tid if k == tid else k, t) for k, t in changed]
-                        trades[tid] = self.sim_open(mk, side, now_ms, maker=maker, shares=count)
-                        changed.append((tid, trades[tid]))
+            self.sim_quote(mk, trades, now_ms, changed)
             self.sim_take(mk, trades, now_ms, changed)
         t2 = time.monotonic()
         opened, rekeys = {tid for tid, _ in changed}, []
@@ -14890,6 +14994,69 @@ class Bot:
                             "保存": int((time.monotonic() - t3) * 1000)}
         self.sim_step_info = {"markets": len(markets), "records": len(trades)}
         return confirm
+
+    SIM_EXPRESS_COOLDOWN_SECONDS = 3.0  # a slot the express lane withdrew is not quoted again by it for this long (the step may)
+
+    def sim_quote(self, mk: SimMarket, trades: dict[str, dict], now_ms: int, changed: list, express: bool = False) -> None:
+        """The maker decision on one market (the step's and the express lane's): the side and the valid 买1 it joins,
+        past every gate (sim_maker_reason), opened under its slot (a position there moves to tid#n); ``trades`` and
+        ``changed`` are updated in place. The express lane leaves a slot it withdrew within SIM_EXPRESS_COOLDOWN_SECONDS
+        alone (a fair price flickering about the bar would otherwise place and withdraw several times a second)."""
+        maker = self.sim_maker_reason(mk, trades, now_ms)[0]  # the side and the valid 买1 it joins, past every gate (session, points, depth, bar, slot)
+        if maker is None:
+            return
+        side = "up" if maker.side == "涨" else "down"
+        tid = f"{mk.market}|{side}|挂"
+        if express and time.monotonic() - self.sim_express_withdrawn.get(tid, -1e9) < self.SIM_EXPRESS_COOLDOWN_SECONDS:
+            return
+        held = trades.get(tid)  # one order per market, side and way at a time; a position from a filled one lets the next in
+        if held is not None and not sim_position(held):
+            return
+        count, why = self.sim_maker_pick(mk, trades, side, maker, now_ms)  # SIM_SHARES, or the most the caps take
+        if why:
+            self.sim_note_block(tid, mk, "挂" + mk.sides[0 if side == "up" else 1], maker.price, why, now_ms)
+            return
+        if held is not None:  # the position moves to tid#n (it settles there); the slot takes the fresh order
+            new_tid = self.sim_rekey(tid, held)
+            trades[new_tid] = trades.pop(tid)
+            changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]
+        trades[tid] = self.sim_open(mk, side, now_ms, maker=maker, shares=count)
+        changed.append((tid, trades[tid]))
+
+    @staticmethod
+    def requote_urgent(why: str) -> bool:
+        """Whether a re-quote reason (sim_requote_reason) is about the order's edge — gone under the exit line, under the
+        mode's line, under a changed bar — which the express lane acts on at once; the rest (the 买1 to follow, the
+        session, the points, a setting) waits for the step: following a moving bid every few hundred milliseconds would
+        lose the queue each time."""
+        return "净优势" in why
+
+    def sim_express_rest(self, mk: SimMarket, trades: dict[str, dict], now_ms: int, changed: list) -> None:
+        """The express lane's look at a market's resting orders: the fills this book shows, then the withdrawal of an
+        order the market's end or scope no longer allows (sim_withdraw_reason) or whose edge is gone (requote_urgent);
+        a withdrawn order with nothing filled frees its slot (tid#n), to be quoted again after the cooldown."""
+        rekeys = []
+        for tid in list(trade_ids_of_market(trades, mk.market)):
+            trade = trades.get(tid)
+            if trade is None or trade.get("final") or trade["status"] != "resting":
+                continue
+            before = json.dumps(trade, sort_keys=True, default=str)
+            self.sim_fill(trade, mk, now_ms)
+            if trade["status"] == "resting":
+                why = self.sim_withdraw_reason(trade, mk, now_ms)
+                if not why and self.requote_urgent(reason := self.sim_requote_reason(trade, mk, now_ms)):
+                    why = reason
+                if why:
+                    self.sim_withdraw(trade, why, now_ms)
+                    self.sim_express_withdrawn[tid] = time.monotonic()
+                    if float(trade.get("shares") or 0) <= 1e-9:
+                        rekeys.append(tid)
+            if json.dumps(trade, sort_keys=True, default=str) != before:
+                changed.append((tid, trade))
+        for tid in rekeys:
+            new_tid = self.sim_rekey(tid, trades[tid])
+            trades[new_tid] = trades.pop(tid)
+            changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]
 
     def sim_take(self, mk: SimMarket, trades: dict[str, dict], now_ms: int, changed: list) -> None:
         """The taker decision on one market (the step's and the express lane's): the side with the most edge whose asks
@@ -15027,10 +15194,13 @@ class Bot:
         return math.inf
 
     async def sim_express(self, key: str) -> None:
-        """The express lane (PredictFeed.on_update): a market's book just came in — when an ask under the taker's cap
-        is there, the order is decided now, under the step's lock but without the step (its settlements, markouts and
-        maker logic over every market), and in real trading sent at once (sim_express_after). Makers wait for the step."""
-        if not (self.config.sim and self.config.predict) or self.config.sim_ways == "maker":
+        """The express lane (PredictFeed.on_update: a market's book just came in, or a price that moves it): the key's
+        markets are judged now, under the step's lock but without the step (its settlements, markouts and every other
+        market) — a resting order's presumed fills and its withdrawal when its edge is gone or the market's end is near
+        (sim_express_rest), then a fresh resting order where a slot is free and the chance there (sim_quote), then the
+        taker (sim_take); in real trading the orders and the cancels go out at once (sim_express_after). Before 1.88.0
+        the lane decided takers alone; makers waited for the step, up to five seconds."""
+        if not (self.config.sim and self.config.predict):
             return
         now_ms = self.market.now_ms()
         changed: list[tuple[str, dict]] = []
@@ -15039,6 +15209,9 @@ class Bot:
             for mk in self.sim_markets_for(key, now_ms):  # this key's markets alone: the other cards and ladders are not priced for it
                 if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
                     continue
+                self.sim_express_rest(mk, trades, now_ms, changed)
+                if self.config.sim_ways != "taker":
+                    self.sim_quote(mk, trades, now_ms, changed, express=True)
                 self.sim_take(mk, trades, now_ms, changed)
             if changed:
                 self.sim_save(changed)
@@ -17128,6 +17301,7 @@ class Bot:
             lines.append(f"🔌 HTTP 连接：新建 {st['new']}｜复用 {st['reused']}（{st['reused'] * 100 // max(total, 1)}%）｜对方已关、换新连接重发 {st['retried']} 次")
         lines.append("📡 行情推送：" + "｜".join(f"{name} {stream.line()}" for name, stream in (
             ("币安合约", self.binance_streams["futures"]), ("币安现货", self.binance_streams["spot"]), ("Hyperliquid", self.hl_stream))))
+        lines.append(f"💾 数据库：{self.store.line()}")
         if self.reference_state:
             lines.append("🔄 后台刷新")
             for name, _ in self.reference_jobs():
@@ -17156,7 +17330,7 @@ class Bot:
                     detail += ("（决策内：" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in self.sim_step_ms.items())
                                + (f"；{size['markets']} 个市场、{size['records']} 条记录" if size else "") + "）")
                 if name == "模拟交易" and self.sim_express_count:
-                    detail += f"｜快车道吃单决定 {self.sim_express_count} 次"
+                    detail += f"｜快车道决定 {self.sim_express_count} 次"
                 latency = getattr(self, "live_latency", None)
                 if name == "模拟交易" and latency and (lat := latency()):
                     span = lambda s: f"中位 {s['median']:.1f}s / 最长 {s['max']:.1f}s" if s else "—"

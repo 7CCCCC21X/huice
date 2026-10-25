@@ -1467,12 +1467,20 @@ class LiveBot(core.Bot):
             self.live_placing.discard(tid)
 
     async def sim_express_after(self, now_ms: int) -> None:
-        """An express decision in real trading: its order goes out now (the step's own placements skip it)."""
+        """An express decision in real trading: its orders go out now, and the cancels of the orders it withdrew (the
+        step's own placements and its sync skip what is done)."""
         if self.config.live_mode != "off":
             try:
                 await self.live_place_pending(now_ms)
             except Exception as error:
                 self.live_note_error(f"快车道下单失败：{core.clean_error(error) or type(error).__name__}")
+        cancelling = {tid: t for tid, t in self.sim_trades().items() if isinstance(t.get("live"), dict) and t["live"].get("state") == "cancelling"
+                      and t["live"].get("order_id") and not t["live"].get("cancel_sent")}
+        if cancelling and self.live.ready:
+            try:
+                await self.live_cancel_blind(cancelling, now_ms)
+            except Exception as error:
+                self.live_note_error(f"快车道撤单失败：{core.clean_error(error) or type(error).__name__}")
 
     async def live_place_order(self, tid: str, trade: dict, now_ms: int) -> None:
         """Build, sign and send the order of a pending record. The hash is saved (state "placing") before the request
@@ -1508,6 +1516,9 @@ class LiveBot(core.Bot):
                       price_per_share=from_wei(amounts["price_per_share"]), usd_cap=from_wei(amounts["maker"]),
                       shares_requested=from_wei(amounts["amount"]))
             self.sim_save([(tid, trade)])
+            if not await asyncio.to_thread(self.store.flush):  # the hash on disk before the request goes out: a crash in between is reconciled by it
+                st.update(state="pending", hash="")
+                return self.live_defer(tid, trade, f"数据库写入未完成（{self.store.write_error or '超时'}），暂不发单", now_ms)
             # the order path's timing points (live_latency, /diag): the book's read (want.book_ms), the decision (opened), the
             # request sent, its answer — read off the clock as they happen (1.83.0: the step's clock left out the time the
             # decisions, the sign-in, the signing and the save took before the request went out)
