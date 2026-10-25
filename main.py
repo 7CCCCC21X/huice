@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.89.2"
+VERSION = "1.90.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -521,7 +521,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_MAX_DAILY_LOSS_USD", "当日已结算亏损停机线（$）", "0 = 不限"),
     ("LIVE_TAKER_WAIT_SECONDS", "吃单的限价单等多久（秒）", "5～3600：吃单的限价单挂出后，这么多秒内没成交的部分撤掉；公平价变到限价高于封顶价时提前撤"),
     ("LIVE_TAKER_PRICE", "吃单的限价挂在哪", "book = 盘口里实际要吃的最后一档的价格（成交价不会高于看到的，1～2 秒内新出现的更贵卖单留给下一轮）；cap = 封顶价（留足门槛的最高价，新出现的更贵卖单也一并吃）"),
-    ("LIVE_RETRY_SECONDS", "下单失败后回避（秒）", "10～86400"),
+    ("LIVE_RETRY_SECONDS", "下单失败后回避（秒）", "10～86400：Predict 拒绝、发送出错之后"),
+    ("LIVE_TAKER_RETRY_SECONDS", "吃单没成交后回避（秒）", "1～3600：吃单一份没成交（到时撤掉、公平价变了撤掉）或发送前复核作废之后，同一市场同一边多久内不再吃单；机会还在就按这个短间隔再试"),
     ("LIVE_AUTO_REDEEM", "自动领取已结算持仓", "开 = 市场结算后自动在链上领取赢的一边（签名钱包需有 BNB 付 gas）"),
     ("LIVE_NOTIFY", "真实订单的 Telegram 通知", "开 = 真实下单、成交、撤单、失败都发 Telegram 通知"),
 )
@@ -658,7 +659,8 @@ class Config:
     live_rpc: str = ""                 # BSC_RPC_URL: JSON-RPC node for balances, allowances, approvals, redeeming; "" = the chain's public node
     live_taker_wait: int = 60          # LIVE_TAKER_WAIT_SECONDS: a taker's LIMIT order (capped at the dearest acceptable price) is cancelled after this
     live_taker_price: str = "book"     # LIVE_TAKER_PRICE: a taker's LIMIT price — book = the dearest level its quote walks, cap = the dearest acceptable price
-    live_retry: int = 300              # LIVE_RETRY_SECONDS: a market and side whose order failed or filled nothing waits this long
+    live_retry: int = 300              # LIVE_RETRY_SECONDS: a market and side whose order Predict refused (or whose send broke) waits this long
+    live_taker_retry: int = 30         # LIVE_TAKER_RETRY_SECONDS: ...whose taker filled nothing (the timer, the bot's own re-judgement) or was dropped at the re-check
     live_max_order_usd: float = 100.0  # LIVE_MAX_ORDER_USD: the most one order may cost
     live_max_open_usd: float = 500.0   # LIVE_MAX_OPEN_USD: filled positions plus resting orders, at cost
     live_max_daily_loss_usd: float = 200.0  # LIVE_MAX_DAILY_LOSS_USD: realised loss per Beijing day that stops new orders; 0 = no limit
@@ -827,6 +829,7 @@ class Config:
             live=live, live_mode=live_mode, live_allowed=live_allowed, live_key=live_key, live_account=live_account, live_chain=live_chain, live_rpc=live_rpc,
             live_taker_wait=bounded_int(e, "LIVE_TAKER_WAIT_SECONDS", 60, 5, 3600), live_taker_price=live_taker_price,
             live_retry=bounded_int(e, "LIVE_RETRY_SECONDS", 300, 10, 86400),
+            live_taker_retry=bounded_int(e, "LIVE_TAKER_RETRY_SECONDS", 30, 1, 3600),
             live_max_order_usd=parse_bounded(e, "LIVE_MAX_ORDER_USD", "100", 1, 1_000_000),
             live_max_open_usd=parse_bounded(e, "LIVE_MAX_OPEN_USD", "500", 1, 100_000_000),
             live_max_daily_loss_usd=parse_bounded(e, "LIVE_MAX_DAILY_LOSS_USD", "200", 0, 100_000_000),
@@ -8687,6 +8690,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "LIVE_TAKER_WAIT_SECONDS": {"kind": "number", "group": "高级", "presets": ["15", "30", "60", "120"], "unit": "秒"},
     "LIVE_TAKER_PRICE": {"kind": "choice", "group": "高级", "options": [["book", "盘口价"], ["cap", "封顶价"]]},
     "LIVE_RETRY_SECONDS": {"kind": "number", "group": "高级", "presets": ["60", "300", "600", "1800"], "unit": "秒"},
+    "LIVE_TAKER_RETRY_SECONDS": {"kind": "number", "group": "高级", "presets": ["10", "30", "60", "120"], "unit": "秒"},
     "LIVE_AUTO_REDEEM": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
     "LIVE_NOTIFY": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
 }
@@ -16898,7 +16902,8 @@ class Bot:
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,
-                  "LIVE_RETRY_SECONDS": str(c.live_retry), "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify)}
+                  "LIVE_RETRY_SECONDS": str(c.live_retry), "LIVE_TAKER_RETRY_SECONDS": str(c.live_taker_retry),
+                  "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify)}
         return values.get(key, "")
 
     def control_records(self, trades: dict[str, dict], history: int = 200) -> list[dict]:

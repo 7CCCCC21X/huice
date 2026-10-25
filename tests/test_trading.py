@@ -26,6 +26,7 @@ c = m.Config.from_env({**base, "LIVE": "on", "PREDICT_PRIVATE_KEY": KEY[2:], "PR
 assert c.live and c.live_key == KEY[2:] and c.live_account == PA and c.live_max_order_usd == 50
 assert c.live_max_open_usd == 300 and c.live_max_daily_loss_usd == 0 and not c.live_auto_redeem
 assert c.live_chain == 97 and c.live_rpc == "https://rpc.example"
+assert c.live_retry == 300 and c.live_taker_retry == 30 and m.Config.from_env({**base, "LIVE_TAKER_RETRY_SECONDS": "45"}).live_taker_retry == 45  # 1.90.0
 for bad in ({"LIVE": "on"}, {"LIVE": "on", "PREDICT_PRIVATE_KEY": "abc"}, {"PREDICT_PRIVATE_KEY": KEY, "PREDICT_ACCOUNT": "0x12"},
             {"LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT_CHAIN_ID": "1"}, {"BSC_RPC_URL": "ftp://x"},
             {"LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "SIM": "off"}, {"LIVE": "on", "PREDICT_PRIVATE_KEY": KEY, "PREDICT": "off"}):
@@ -456,7 +457,8 @@ async def run():
     assert "deep|up|吃" not in trades and trades["deep|up|吃#1"]["status"] == "cancelled" and "103" in fake.closed
     assert trades["deep|up|吃#1"]["live"]["final"] == "failed" and "吃单未成交" in trades["deep|up|吃#1"]["note"]
     assert ("deep", "up") in bot.live_backoff and "再试" in bot.live_room(trades, deep(NOW + 121_000), "up", 0.58, 100)
-    await step(bot, NOW + 131_000, deep(NOW + 131_000))  # within LIVE_RETRY_SECONDS: refused, and the refusal recorded
+    assert 0 < bot.live_backoff[("deep", "up")][0] - time.monotonic() <= 30, "the timer's cancel: the taker's short wait (1.90.0), not a failure's"
+    await step(bot, NOW + 131_000, deep(NOW + 131_000))  # within LIVE_TAKER_RETRY_SECONDS: refused, and the refusal recorded
     assert "deep|up|吃" not in bot.sim_trades() and any(b["id"] == "deep|up|吃" and "再试" in b["why"] for b in bot.sim_blocks())
     bot.live_backoff[("deep", "up")] = (time.monotonic() - 1, "x")
     await step(bot, NOW + 141_000, deep(NOW + 141_000))
@@ -475,6 +477,7 @@ async def run():
     trades = bot.sim_trades()
     assert "thin|up|吃" not in trades and trades["thin|up|吃#1"]["status"] == "cancelled" and "下单失败：HTTP 400" in trades["thin|up|吃#1"]["note"]
     assert trades["thin|up|吃#1"]["live"]["state"] == "done" and ("thin", "up") in bot.live_backoff and bot.live_errors[-1].endswith("insufficient balance")
+    assert bot.live_backoff[("thin", "up")][0] - time.monotonic() > 290, "Predict's refusal: LIVE_RETRY_SECONDS"
     # a request whose outcome is unknown (the network dropped) stays "placing": adopted by its hash when Predict lists it,
     # given up (never re-sent) when it does not within the grace period
     fake.fail_create = "网络错误 (TimeoutError)"
@@ -711,7 +714,7 @@ async def run():
     # longer leaves the bar (the cap recomputed each step), or the card holds, the rest is cancelled
     deep_at = lambda at, fair=0.70, hold="": m.SimMarket("deep", "deep", "close", "X", fair, book([], [("0.58", "100"), ("0.70", "1000")], at, "deep", mid="103"), 0.03, hold, ("涨", "跌"),
                                                          {"key": "X", "target": "2026-10-05", "line": 1.0, "close_ms": CLOSE})
-    for move, why in ((dict(fair=0.60), "公平价变了：限价 58.0¢ 已高于现在的封顶价 49.0¢，剩余吃单撤掉"), (dict(hold="数据有疑问"), "卡片暂不建议（数据有疑问），剩余吃单撤掉")):
+    for move, why in ((dict(fair=0.60), "公平价变了：限价 58.0¢ 已高于现在的封顶价 51.0¢（按门槛低 2.0¢ 的撤单线算），剩余吃单撤掉"), (dict(hold="数据有疑问"), "卡片暂不建议（数据有疑问），剩余吃单撤掉")):
         sbot = make_bot(SIM_WAYS="taker")
         await sbot.live_prepare(); sfake = sbot.live.api
         sfake.markets["103"] = market_json("103")
@@ -725,6 +728,26 @@ async def run():
         await step(sbot, NOW + 20_000, deep_at(NOW + 20_000, **move))
         tt = sbot.sim_trades()["deep|up|吃#1"]
         assert tt["live"]["cancel_why"] == why and ("remove", [st["order_id"]]) in sfake.calls and tt["status"] == "cancelled", (tt["live"], sfake.calls[-2:])
+        assert 0 < sbot.live_backoff[("deep", "up")][0] - time.monotonic() <= 30 and sbot.live_backoff[("deep", "up")][1].startswith("吃单未成交（"), "the bot's own withdrawal: the short wait (1.90.0)"
+    # 1.90.0: a wobble of a few tenths across a cent boundary is not a move — the rest stays while its limit keeps the bar
+    # less 2¢ (LIVE_TAKER_REST_SLACK); a real move still cancels it. (10-25: CXMT's rest at 48¢ was cancelled on a 0.3¢ dip of
+    # the fair price, 48¢ -> 47¢ of cap, and its side then sat out 300 s with 649 shares on offer at 48¢ and +15¢ of edge)
+    sbot = make_bot(SIM_WAYS="taker")
+    await sbot.live_prepare(); sfake = sbot.live.api
+    sfake.markets["103"] = market_json("103")
+    world["markets"] = [deep_at(NOW)]
+    await sbot.live_prefetch(NOW)
+    await step(sbot, NOW)
+    st = sbot.sim_trades()["deep|up|吃"]["live"]
+    assert st["state"] == "open" and st["want"]["limit"] == 0.58
+    wobble = deep_at(NOW + 10_000, fair=0.685)  # the strict cap is 57¢, under the 58¢ limit; with the slack 59¢
+    assert sbot.sim_taker_cap(wobble, "up", 200) == 0.57 and sbot.sim_taker_cap(wobble, "up", 200, slack=0.02) == 0.59
+    await step(sbot, NOW + 10_000, wobble)
+    assert sbot.sim_trades()["deep|up|吃"]["live"]["state"] == "open" and ("remove", [st["order_id"]]) not in sfake.calls, "it stays"
+    assert sbot.live_taker_stale(sbot.sim_trades()["deep|up|吃"], wobble, NOW + 10_000) == ""
+    await step(sbot, NOW + 20_000, deep_at(NOW + 20_000, fair=0.66))  # 4¢ down: 57¢ even with the slack
+    tt = sbot.sim_trades()["deep|up|吃#1"]
+    assert tt["live"]["cancel_why"] == "公平价变了：限价 58.0¢ 已高于现在的封顶价 57.0¢（按门槛低 2.0¢ 的撤单线算），剩余吃单撤掉" and ("remove", [st["order_id"]]) in sfake.calls, tt["live"]["cancel_why"]
     assert abs(wbot.live_fit_shares({}, 0.69) - 80 / 0.69) < 1e-9 and wbot.live_fit_shares({}, 0) == float("inf")
     wbot.config = dataclasses.replace(wbot.config, live_max_open_usd=100)  # the open order ($79.35 reserved) counts against the exposure limit
     assert 0 < wbot.live_fit_shares(wbot.sim_trades(), 0.69) < 40, wbot.live_fit_shares(wbot.sim_trades(), 0.69)
@@ -1705,6 +1728,7 @@ async def send_rechecks():
         assert not created(bot) and t["live"]["final"] == "failed", (case, t["live"])
         assert {"moved": "公平价变了：限价 58.0¢ 已高于现在的封顶价",
                 "held": "卡片暂不建议（测试暂不建议），5 秒前的吃单决定作废"}[case] in t["note"], (case, t["note"])
+        assert 0 < bot.live_backoff[(HSI_SLUG, "up")][0] - time.monotonic() <= 30, (case, "the re-check's drop: the short wait (1.90.0)")
     # 1.83.1: a decision on a book 89 s old, its sign-in taking 1.5 s — the book is past PREDICT_STALE_MS at the re-check:
     # the order waits (it used to fail, its side backed off for 300 s), goes out once a fresh book still allows its limit,
     # and is given up only when the decision itself is too old to send

@@ -1426,10 +1426,12 @@ class LiveBot(core.Bot):
         if why and wait:
             self.live_defer(tid, trade, why, now_ms)
         elif why:
-            self.live_fail(tid, trade, f"未下单：{why}", now_ms)
+            self.live_fail(tid, trade, f"未下单：{why}", now_ms, retry=self.config.live_taker_retry)  # the bot's own re-judgement: no failure
         return not why
 
     LIVE_TAKER_RECHECK_MS = 1_000  # a taker decided longer ago than this (held by a cooldown, a sign-in) is priced again before it goes out
+    LIVE_TAKER_REST_SLACK = 0.02   # a taker's unfilled rest stays while its limit keeps the bar less this (1.90.0: a fair price wobbling a few
+    #                                tenths across a cent boundary cancelled the rest, and its side then sat out LIVE_RETRY_SECONDS)
 
     def live_taker_recheck(self, trade: dict, now_ms: int) -> tuple[str, bool]:
         """(why, wait) for a taker decided a while ago — held by a cooldown or a sign-in, up to LIVE_DECISION_MAX_MS —
@@ -1573,17 +1575,20 @@ class LiveBot(core.Bot):
             st["events"].append({"at": now_ms, "what": f"暂未发送：{why}"})
             self.sim_save([(tid, trade)])
 
-    def live_fail(self, tid: str, trade: dict, why: str, now_ms: int) -> None:
+    def live_fail(self, tid: str, trade: dict, why: str, now_ms: int, retry: int | None = None) -> None:
         """An order that never went out (or filled nothing): the record is kept under a numbered key so the journal
-        shows the attempt, the slot is free for the next decision after LIVE_RETRY_SECONDS."""
+        shows the attempt, the slot is free for the next decision after ``retry`` seconds — LIVE_RETRY_SECONDS unless
+        given (LIVE_TAKER_RETRY_SECONDS for a taker that filled nothing or was dropped by the bot's own re-check: the
+        market, not Predict, said no, and the chance may be back in seconds)."""
         st = trade["live"]
         st.update(state="done", final="failed", error=why)
         st["events"].append({"at": now_ms, "what": why})
         trade.update(status="cancelled", unfilled=float(trade.get("order") or 0), note=why)
         st["rekeyed"] = self.live_rekey(tid, trade)
-        self.live_backoff[(trade["market"], trade["side"])] = (time.monotonic() + self.config.live_retry, why)
+        wait = self.config.live_retry if retry is None else retry
+        self.live_backoff[(trade["market"], trade["side"])] = (time.monotonic() + wait, why)
         self.live_note_error(f"{trade['item']} {trade['label']}：{why}")
-        self.live_notify(f"⚠️ {trade['item']} {trade['label']} {why}；{self.config.live_retry} 秒后再看。", key=f"fail:{trade['market']}:{trade['side']}")
+        self.live_notify(f"⚠️ {trade['item']} {trade['label']} {why}；{wait} 秒后再看。", key=f"fail:{trade['market']}:{trade['side']}")
 
     def live_rekey(self, tid: str, trade: dict) -> str:
         """Move a record to tid#n, freeing the paper trader's one slot per market, side and way."""
@@ -1793,17 +1798,20 @@ class LiveBot(core.Bot):
             await self.live_cancel(tid, trade, by_id, mk, now_ms)
 
     def live_taker_stale(self, trade: dict, mk: Any, now_ms: int) -> str:
-        """Why a taker's unfilled rest should not go on waiting: its limit is over the cap the fair price allows now,
-        or the card holds its suggestion. "" while it may rest (a stale book decides nothing: the timer does)."""
+        """Why a taker's unfilled rest should not go on waiting: its limit is over the cap the fair price allows now
+        with LIVE_TAKER_REST_SLACK off the bar (the rest is not re-placed, so it keeps a little room: a wobble of a few
+        tenths of a cent is not a move), or the card holds its suggestion. "" while it may rest (a stale book decides
+        nothing: the timer does)."""
         if mk.book.stale(now_ms):
             return ""
         if mk.hold:
             return f"卡片暂不建议（{mk.hold}），剩余吃单撤掉"
         bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
-        cap = self.sim_taker_cap(mk, str(trade.get("side") or "up"), bps)
+        cap = self.sim_taker_cap(mk, str(trade.get("side") or "up"), bps, slack=self.LIVE_TAKER_REST_SLACK)
         limit = self.live_unit_cap(trade)
         if cap <= 0 or limit > cap + 1e-9:
-            return f"公平价变了：限价 {core.cents(limit)} 已高于现在的封顶价 {core.cents(cap)}，剩余吃单撤掉"
+            return (f"公平价变了：限价 {core.cents(limit)} 已高于现在的封顶价 {core.cents(cap)}"
+                    f"（按门槛低 {core.cents(self.LIVE_TAKER_REST_SLACK)} 的撤单线算），剩余吃单撤掉")
         return ""
 
     async def live_cancel(self, tid: str, trade: dict, by_id: dict, mk: Any, now_ms: int) -> None:
@@ -2064,8 +2072,8 @@ class LiveBot(core.Bot):
         elif trade.get("maker"):
             trade.update(status="cancelled", unfilled=order, note=f"挂单结束（{status or '不在盘口'}），一份都没成交")
             self.live_notify(f"ℹ️ {trade['item']} {trade['label']} 挂单结束（{status or '不在盘口'}），一份都没成交。")
-        else:
-            self.live_fail(tid, trade, f"吃单未成交（{st.get('cancel_why') or status or '不在盘口'}）", now_ms)
+        else:  # the market said no (nothing at the limit in time, or the bot withdrew the rest): the short wait, not a failure's
+            self.live_fail(tid, trade, f"吃单未成交（{st.get('cancel_why') or status or '不在盘口'}）", now_ms, retry=self.config.live_taker_retry)
 
     # --- redeeming resolved positions -------------------------------------------------------------------------------------
     async def live_redeem(self, now_ms: int) -> list[str]:
