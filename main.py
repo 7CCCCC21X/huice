@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.92.0"
+VERSION = "1.92.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -15409,12 +15409,27 @@ class Bot:
         def fits(n: int) -> bool:  # the paper cap alone while searching; the real-trading limits are counted once, below
             qn = quote(n)
             return bool(qn) and qn["got"] >= SIM_MIN_SHARES - 1e-9 and not Bot.sim_group_room(self, trades, mk, side, qn["cost"], qn["got"], taker=qn)
-        best = self.sim_size_down(self.sim_size_top(trades, q["want"], self.sim_taker_limit(q)), fits)
+        limit = self.sim_taker_limit(q)
+        best = self.sim_size_down(self.sim_size_top(trades, q["want"], limit), fits)
         if best is not None:
             qb = quote(best)
-            if qb is not None and not self.sim_group_room(trades, mk, side, qb["cost"], qb["got"], taker=qb):
-                return qb, ""
-        return q, why
+            if qb is not None:
+                again = self.sim_group_room(trades, mk, side, qb["cost"], qb["got"], taker=qb)
+                if not again:
+                    return qb, ""
+                # the smaller order is refused too, for what the full one never reached (the order limit is checked
+                # first): that is the refusal that matters (1.92.1: "单笔 $133.70 超过 LIVE_MAX_ORDER_USD" stood for an
+                # exposure limit with no room left — the bot looked unwilling to buy $100 of a 177-share chance)
+                return q, f"缩到 {qb['got']:g} 份（${limit * qb['got']:,.2f}）仍被拦：{again}"
+        return q, self.sim_no_fit_why(trades, limit) or why
+
+    def sim_no_fit_why(self, trades: dict[str, dict], price: float) -> str:
+        """Why not even a share of a smaller order fits the real-trading limits at ``price`` (live_fit_why: an exposure
+        limit or a balance with less than Predict's minimum order left); "" on paper and when something fits."""
+        return self.live_fit_why(trades, price) if self.live_fit_shares(trades, price) < SIM_MIN_SHARES - 1e-9 else ""
+
+    def live_fit_why(self, trades: dict[str, dict], price: float) -> str:
+        return ""  # no limit on paper (the real trader names the one with no room left)
 
     def sim_maker_pick(self, mk: SimMarket, trades: dict[str, dict], side: str, maker: BookEdge, now_ms: int) -> tuple[float, str]:
         """The resting order's count as the trader places it now: SIM_SHARES when the quiet window and the caps allow
@@ -15438,9 +15453,12 @@ class Bot:
             return want, ""
         best = self.sim_size_down(self.sim_size_top(trades, want, maker.price),
                                   lambda n: not Bot.sim_group_room(self, trades, mk, side, maker.price, float(n)))
-        if best is not None and not self.sim_group_room(trades, mk, side, maker.price, float(best)):
-            return float(best), ""
-        return want, why
+        if best is not None:
+            again = self.sim_group_room(trades, mk, side, maker.price, float(best))
+            if not again:
+                return float(best), ""
+            return want, f"缩到 {best:g} 份（${maker.price * best:,.2f}）仍被拦：{again}"  # (1.92.1: the refusal that matters)
+        return want, self.sim_no_fit_why(trades, maker.price) or why
 
     def sim_taker_limit(self, q: dict) -> float:
         """The most a share of this taker quote may cost, for the caps that count a whole order: the cap (the real

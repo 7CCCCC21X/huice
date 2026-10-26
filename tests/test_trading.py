@@ -699,6 +699,28 @@ async def run():
         assert body["order"]["takerAmount"] == str(shares * WEI) and body["pricePerShare"] == str(62 * 10 ** 16), (max_usd, body)
         assert body["order"]["makerAmount"] == str(62 * shares * WEI // 100) and t["order"] == shares and t["live"]["want"]["shares"] == shares, (max_usd, t["live"]["want"])
         assert not wbot.sim_blocks(), "a smaller order, not a refusal"
+    # 1.92.1: when the smaller order is refused too, the refusal shown is that one, not the order limit's (10-26: "单笔
+    # $133.70 超过 LIVE_MAX_ORDER_USD $100" on the SSE card stood for an exposure limit with no room left)
+    three = lambda at: m.SimMarket("three", "three", "close", "X3", 0.80, book([], [("0.58", "40"), ("0.62", "200")], at, "three", mid="104"), 0.03, "", ("涨", "跌"), {})
+    wbot.config = dataclasses.replace(wbot.config, live_max_open_usd=80.5)  # the open order above reserves 129 × 62¢ = $79.98: 52¢ left, under a share
+    wbot.live.api.markets["104"] = market_json("104")
+    world["markets"] = [three(NOW + 10_000)]
+    assert abs(wbot.live_exposure(wbot.sim_trades()) - 79.98) < 1e-6 and wbot.live_fit_shares(wbot.sim_trades(), 0.62) == 0.0
+    assert wbot.live_fit_why(wbot.sim_trades(), 0.62) == "持仓+挂单 $79.98 已占满 LIVE_MAX_OPEN_USD $80.5（剩 $0.52，不够一份）"
+    row = next(r for r in wbot.sim_checks(NOW + 10_000) if r["market"] == "three")
+    assert "持仓+挂单 $79.98 已占满 LIVE_MAX_OPEN_USD $80.5（剩 $0.52，不够一份）" in row["taker"] and "超过 LIVE_MAX_ORDER_USD" not in row["taker"], row["taker"]
+    await step(wbot, NOW + 10_000)
+    assert "three|up|吃" not in wbot.sim_trades()
+    # the smaller order refused for what the full one never reached (its market's details unread): named
+    ubot = make_bot(SIM_WAYS="taker", SIM_TAKER_SWEEP_SHARES="300", LIVE_MAX_ORDER_USD="100", LIVE_MAX_OPEN_USD="1000")
+    await ubot.live_prepare()
+    world["markets"] = [three(NOW)]
+    await ubot.live_prefetch(NOW)
+    ubot.live.markets.pop("104", None)  # the details gone: 240 shares at 62¢ ($148.80) are over the order limit; 161 ($99.82) fit it, and then meet the unread market
+    row = next(r for r in ubot.sim_checks(NOW) if r["market"] == "three")
+    assert "缩到 161 份（$99.82）仍被拦：市场信息（结果代币、费率）尚未读到，稍后再试" in row["taker"], row["taker"]
+    assert not any(r["market"] == "three" and "超过 LIVE_MAX_ORDER_USD" in r["taker"] for r in ubot.sim_checks(NOW))
+    assert ubot.live_fit_why(ubot.sim_trades(), 0.62) == "" and ubot.sim_no_fit_why(ubot.sim_trades(), 0.62) == ""
     # LIVE_TAKER_PRICE=cap: the limit at the cap, as before 1.71.0 (asks that show up under it in the next second are taken too)
     cbot = make_bot(SIM_WAYS="taker", LIVE_TAKER_PRICE="cap")
     await cbot.live_prepare()

@@ -1133,6 +1133,23 @@ class LiveBot(core.Bot):
             room = min(room, usd)
         return room / price if room >= MIN_ORDER_USD - 1e-9 else 0.0
 
+    def live_fit_why(self, trades: dict[str, dict], price: float) -> str:
+        """Why not even a share fits the real-trading limits at ``price``: the exposure limit (LIVE_MAX_OPEN_USD less the
+        open records) or the USDT balance leaves less than Predict's minimum order; "" when something fits (1.92.1)."""
+        c = self.config
+        if c.live_mode == "off" or price <= 0:
+            return ""
+        exposure = self.live_exposure(trades)
+        left = c.live_max_open_usd - exposure
+        if left < MIN_ORDER_USD - 1e-9:
+            return f"持仓+挂单 ${exposure:,.2f} 已占满 LIVE_MAX_OPEN_USD ${c.live_max_open_usd:g}（剩 ${max(left, 0.0):,.2f}，不够一份）"
+        usd = self.live.usd()
+        if usd is not None and usd < MIN_ORDER_USD - 1e-9:
+            return f"USDT 余额 ${usd:,.2f} 不够一份"
+        if c.live_max_order_usd < MIN_ORDER_USD - 1e-9:
+            return f"LIVE_MAX_ORDER_USD ${c.live_max_order_usd:g} 不够一份"
+        return ""
+
     def live_daily_pnl(self, trades: dict[str, dict], now_ms: int) -> float:
         today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
         since = int(today.timestamp() * 1000)
