@@ -1850,6 +1850,62 @@ async def open_quiet():
 asyncio.run(open_quiet())
 
 
+async def taker_hold():
+    """1.93.0: SIM_TAKER_HOLD_SECONDS — a taker buys only once its side has been buyable at every look for that long.
+    Binance's trades are pushed as they print and Predict's book lags them: a wick lifts the fair price for a second,
+    the book looks cheap against it, and without this the bot took it at once (the decision of the very second is sent
+    as made). A run of looks is broken by a look that finds the side not buyable, or cannot judge the market."""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+           "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_TAKER_HOLD_SECONDS": "3", **LEGACY}
+    hbot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    hbot.sim_markets = lambda now: world["markets"]
+    assert hbot.config.sim_taker_hold == 3 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).sim_taker_hold == 0  # off by default
+    for bad in ({"SIM_TAKER_HOLD_SECONDS": "-1"}, {"SIM_TAKER_HOLD_SECONDS": "601"}):
+        try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
+        except ValueError: pass
+    taker, maker = f"{HSI_SLUG}|up|吃", f"{HSI_SLUG}|up|挂"
+    good = lambda at: hsi(0.70, [("0.55", "300")], [("0.58", "400")], at)  # 58¢ ask against 70¢ fair: buyable
+    # the first look: buyable, but seen so for 0 s — the maker is placed as ever, the taker waits
+    await step(hbot, NOW, good(NOW))
+    assert sorted(hbot.sim_trades()) == [maker] and hbot.sim_taker_seen == {taker: NOW}, sorted(hbot.sim_trades())
+    gap = hbot.sim_taker_gap(good(NOW), hbot.sim_trades(), NOW)
+    assert gap["state"] == "blocked" and gap["text"] == "吃涨可买 100 份，但净优势要连续保持 3 秒才吃，还差 3 秒（SIM_TAKER_HOLD_SECONDS）", gap
+    blocks = hbot.sim_blocks()
+    assert len(blocks) == 1 and blocks[0]["id"] == taker and blocks[0]["why"] == "净优势要连续保持 3 秒才吃（SIM_TAKER_HOLD_SECONDS）", blocks
+    # 2 s on, still buyable: not yet (the run started at NOW); the one block is not noted again
+    await step(hbot, NOW + 2_000, good(NOW + 2_000))
+    assert taker not in hbot.sim_trades() and hbot.sim_taker_seen == {taker: NOW} and len(hbot.sim_blocks()) == 1
+    assert "还差 1 秒" in hbot.sim_taker_gap(good(NOW + 2_000), hbot.sim_trades(), NOW + 2_000)["text"]
+    # the wick: at 2.5 s the fair price is back at 60¢ (58¢ + fee leaves under 10¢): the run ends and starts over
+    await step(hbot, NOW + 2_500, hsi(0.60, [("0.55", "300")], [("0.58", "400")], NOW + 2_500))
+    assert taker not in hbot.sim_trades() and hbot.sim_taker_seen == {}
+    await step(hbot, NOW + 4_000, good(NOW + 4_000))
+    assert taker not in hbot.sim_trades() and hbot.sim_taker_seen == {taker: NOW + 4_000}, "a new run"
+    # a look that cannot judge the market (the card holds) ends the run too
+    await step(hbot, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000, hold="行情过期"))
+    assert hbot.sim_taker_seen == {}
+    # the express lane counts as a look: a run of 3 s across the lane and the step buys
+    await step(hbot, NOW + 6_000, good(NOW + 6_000))
+    hbot.market.now = NOW + 7_500
+    await hbot.sim_express("HSI")
+    assert taker not in hbot.sim_trades() and hbot.sim_taker_seen == {taker: NOW + 6_000}
+    hbot.market.now = NOW + 9_000
+    await hbot.sim_express("HSI")
+    t = hbot.sim_trades()[taker]
+    assert t["status"] == "filled" and t["shares"] == 100 and t["opened"] == NOW + 9_000 and t["version"]["sim_taker_hold"] == 3, t
+    assert hbot.sim_taker_gap(good(NOW + 9_000), hbot.sim_trades(), NOW + 9_000)["sides"][0]["block"] == "已有持仓（每边只吃一次）", "one buy per side under LEGACY"
+    # the setting off: the first look buys, as before 1.93.0
+    obot = m.Bot(m.Config.from_env({**env, "SIM_TAKER_HOLD_SECONDS": "0"}), m.Store(":memory:"), FM(NOW), None)
+    obot.sim_markets = lambda now: world["markets"]
+    await step(obot, NOW, good(NOW))
+    assert sorted(obot.sim_trades()) == [taker, maker] and obot.sim_taker_hold_left(good(NOW), "up", NOW) == 0.0
+    assert "sim_taker_hold" not in obot.sim_trades()[taker]["version"]
+    print("TAKER_HOLD_OK")
+
+
+asyncio.run(taker_hold())
+
+
 async def after_hours_markets():
     """1.76.0: SIM_TAKER_AFTER_HOURS_MARKETS — after hours only the chosen daily cards are taken, whatever SIM_TAKER_SESSION
     says (10-16: 希音 out of the after-hours trading); the after-hours taker mode and its bar apply on them; in session every
