@@ -158,7 +158,7 @@ async def run():
     assert s["SIM_OPEN_QUIET_MINUTES"]["value"] == "3" and s["SIM_OPEN_QUIET_MINUTES"]["unit"] == "分钟" and s["SIM_OPEN_QUIET_MINUTES"]["zero"] == "不限"
     assert s["SIM_NO_ODDS_WITHDRAW_MINUTES"]["value"] == "30" and s["SIM_NO_ODDS_WITHDRAW_MINUTES"]["zero"] == "不撤" and s["SIM_NO_ODDS_WITHDRAW_MINUTES"]["unit"] == "分钟" and "60" in s["SIM_NO_ODDS_WITHDRAW_MINUTES"]["presets"]  # 1.92.0
     assert s["SIM_SECONDS"]["kind"] == "number" and s["SIM_SECONDS"]["group"] == "高级" and s["SIM_SECONDS"]["value"] == "5" and s["SIM_SECONDS"]["unit"] == "秒" and "3" in s["SIM_SECONDS"]["presets"]
-    assert s["PREDICT_POLL_SECONDS"]["kind"] == "number" and s["PREDICT_POLL_SECONDS"]["value"] == "10" and "5" in s["PREDICT_POLL_SECONDS"]["presets"] and data["cadence"] == {"sim": 5, "book": 10, "cold": 60}
+    assert s["PREDICT_POLL_SECONDS"]["kind"] == "number" and s["PREDICT_POLL_SECONDS"]["value"] == "10" and "5" in s["PREDICT_POLL_SECONDS"]["presets"] and data["cadence"] == {"sim": 5, "book": 10, "cold": 30}
     assert 'id="checksnote"' in body.decode() and "renderCadence" in body.decode()
     assert s["SIM_MAKER_DEEP_MARKETS"]["kind"] == "detail" and s["SIM_MAKER_DEEP_MARKETS"]["value"] == "" and s["SIM_MAKER_AFTER_HOURS_MARKETS"]["kind"] == "detail"
     assert s["SIM_TAKER_AFTER_HOURS_MARKETS"]["kind"] == "detail" and s["SIM_TAKER_AFTER_HOURS_MARKETS"]["value"] == "" and s["SIM_TAKER_AFTER_HOURS_MARKETS"]["group"] == "策略"  # 1.76.0
@@ -213,7 +213,7 @@ async def run():
     assert st == 200 and j["message"] == "已保存，设置没有变化。"
     # the cadence: the trader and the orderbook feed (its own reference to the config) both run on the new numbers at once
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SECONDS": "3", "PREDICT_POLL_SECONDS": "5"}})
-    assert st == 200 and bot.config.sim_seconds == 3 and bot.predict.config.predict_poll == 5 and (await get_json(port, "control.json"))["cadence"] == {"sim": 3, "book": 5, "cold": 60}, (st, j)
+    assert st == 200 and bot.config.sim_seconds == 3 and bot.predict.config.predict_poll == 5 and (await get_json(port, "control.json"))["cadence"] == {"sim": 3, "book": 5, "cold": 30}, (st, j)
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SECONDS": "2"}})
     assert st == 400 and j == {"ok": False, "message": "SIM_SECONDS 必须在 3～60 之间"} and bot.config.sim_seconds == 3, (st, j)
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_SECONDS": "", "PREDICT_POLL_SECONDS": ""}})

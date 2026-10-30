@@ -134,7 +134,7 @@ async def run():
     await bot.predict.refresh(targets); await asyncio.sleep(0.05)
     assert "SSE" in seen_keys and "CXMTUSDT" in seen_keys and "HSI" not in seen_keys, seen_keys
     bot.predict.on_update = None
-    assert cfg.predict_cold_poll == 60 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_COLD_POLL_SECONDS": "80"}).predict_cold_poll == 80
+    assert cfg.predict_cold_poll == 30 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_COLD_POLL_SECONDS": "80"}).predict_cold_poll == 80
     try:
         m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_COLD_POLL_SECONDS": "500"}); raise AssertionError("over PREDICT_STALE_MS")
     except ValueError as error:

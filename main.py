@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.94.0"
+VERSION = "1.94.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -600,7 +600,7 @@ class Config:
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
     predict_poll: int = 10   # seconds between orderbook refreshes (PREDICT_POLL_SECONDS)
     predict_ws: bool = True  # PREDICT_WS: Predict's WebSocket beside the REST rounds, the hot markets' books pushed as they change (PredictStream); off = REST only
-    predict_cold_poll: int = 60  # ...for the markets nothing is near on (PREDICT_COLD_POLL_SECONDS; under PREDICT_STALE_MS)
+    predict_cold_poll: int = 30  # ...for the markets nothing is near on (PREDICT_COLD_POLL_SECONDS; under PREDICT_STALE_MS; 1.94.1: 30, was 60)
     predict_ref: str = "B00EA"  # referral code appended to Predict market links (?ref=); empty = none
     predict_fee_bps: int = 200   # taker fee rate when a market states none (Predict: 2% × min(p, 1 − p); makers 0)
     predict_trade_usd: float = 100.0  # trade size a taker edge is priced for (walks the book's depth)
@@ -779,7 +779,7 @@ class Config:
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
             predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 10, 3, 3600),
             predict_ws=e.get("PREDICT_WS", "on").strip().lower() not in {"off", "0", "false", "no"},
-            predict_cold_poll=bounded_int(e, "PREDICT_COLD_POLL_SECONDS", 60, 3, 80),
+            predict_cold_poll=bounded_int(e, "PREDICT_COLD_POLL_SECONDS", 30, 3, 80),
             predict_ref=parse_ref_code(e.get("PREDICT_REF_CODE", "B00EA")),
             predict_fee_bps=bounded_int(e, "PREDICT_FEE_BPS", 200, 0, 1000),
             predict_trade_usd=parse_bounded(e, "PREDICT_TRADE_USD", "100", 1, 1_000_000),
@@ -8702,7 +8702,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREDICT_TRADE_USD": {"kind": "number", "group": "高级", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
     "SIM_SECONDS": {"kind": "number", "group": "高级", "presets": ["3", "5", "10", "15"], "unit": "秒"},
     "PREDICT_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["3", "5", "10", "15", "30"], "unit": "秒"},
-    "PREDICT_COLD_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["15", "30", "60", "80"], "unit": "秒"},
+    "PREDICT_COLD_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["10", "15", "30", "60", "80"], "unit": "秒"},
     "LIVE_TAKER_WAIT_SECONDS": {"kind": "number", "group": "高级", "presets": ["15", "30", "60", "120"], "unit": "秒"},
     "LIVE_TAKER_PRICE": {"kind": "choice", "group": "高级", "options": [["book", "盘口价"], ["cap", "封顶价"]]},
     "LIVE_RETRY_SECONDS": {"kind": "number", "group": "高级", "presets": ["60", "300", "600", "1800"], "unit": "秒"},
