@@ -439,7 +439,7 @@ async def run():
     await bot.sim_step(NOW)
     assert bot.sim_trades() == {}  # price ladders are outside the paper trader's default scope (SIM_MARKETS=close)
     bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
-                                    "SIM_MARKETS": "range", "SIM_WAYS": "both"})  # even with makers allowed: a ladder level takes none
+                                    "SIM_MARKETS": "range", "SIM_WAYS": "both", "SIM_TAKER_HOLD_RANGE_SECONDS": "0"})  # even with makers allowed: a ladder level takes none (1.94.0: bought at once here, not after the ladder's 30 s wait)
     bot.sim_ran = -1e9
     await bot.sim_step(NOW)
     trades = bot.sim_trades()

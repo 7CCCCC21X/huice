@@ -75,7 +75,7 @@ class Telegram:
 def fixture():
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "PROBABILITY": "off",
                              "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
-                             "SIM_MARKETS": "range", "SIM_WAYS": "both"})  # the paper trader's default scope leaves ladders out
+                             "SIM_MARKETS": "range", "SIM_WAYS": "both", "SIM_TAKER_HOLD_RANGE_SECONDS": "0"})  # the paper trader's default scope leaves ladders out; 1.94.0: no 30 s wait here
     clock, telegram = Clock(), Telegram()
     bot = m.Bot(cfg, m.Store(":memory:"), clock, telegram)
     bot.touches, bot.updowns, bot.flips, bot.caps = {}, {}, {}, {}

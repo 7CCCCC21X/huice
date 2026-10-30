@@ -160,7 +160,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60, "sim_shares_net": True, "sim_no_odds_withdraw": 30} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
+                                "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60, "sim_shares_net": True, "sim_no_odds_withdraw": 30, "sim_taker_hold_range": 30.0} and maker["market_id"] == "101"  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert len(bot.sim_trades()) == 2
@@ -1900,6 +1900,26 @@ async def taker_hold():
     await step(obot, NOW, good(NOW))
     assert sorted(obot.sim_trades()) == [taker, maker] and obot.sim_taker_hold_left(good(NOW), "up", NOW) == 0.0
     assert "sim_taker_hold" not in obot.sim_trades()[taker]["version"]
+    # 1.94.0: a price ladder has its own wait, SIM_TAKER_HOLD_RANGE_SECONDS (30 s by default): its levels are priced from
+    # every Binance trade while their books refresh by the minute, so a wick's false edge takes longest to show there
+    assert obot.config.sim_taker_hold_range == 30 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_TAKER_HOLD_RANGE_SECONDS": "0"}).sim_taker_hold_range == 0
+    level = lambda at, fair=0.70: m.dataclasses.replace(hsi(fair, [("0.55", "300")], [("0.58", "400")], at), kind="range", market="btc#7", item="BTC 7 万档", key="BTC", settle={"key": "BTC", "target": 70000.0, "dir": "up", "end": CLOSE})
+    rtid = "btc#7|up|吃"
+    assert obot.sim_taker_hold(level(NOW)) == 30 and obot.sim_taker_hold(good(NOW)) == 0
+    await step(obot, NOW + 10_000, level(NOW + 10_000))
+    assert rtid not in obot.sim_trades() and obot.sim_taker_seen[rtid] == NOW + 10_000, "the global 0 does not apply to a ladder level"
+    gap = obot.sim_taker_gap(level(NOW + 10_000), obot.sim_trades(), NOW + 10_000)
+    assert gap["state"] == "blocked" and gap["text"] == "吃涨可买 100 份，但净优势要连续保持 30 秒才吃，还差 30 秒（SIM_TAKER_HOLD_RANGE_SECONDS）", gap
+    assert any(b["id"] == rtid and b["why"] == "净优势要连续保持 30 秒才吃（SIM_TAKER_HOLD_RANGE_SECONDS）" for b in obot.sim_blocks())
+    await step(obot, NOW + 39_000, level(NOW + 39_000))
+    assert rtid not in obot.sim_trades() and "还差 1 秒" in obot.sim_taker_gap(level(NOW + 39_000), obot.sim_trades(), NOW + 39_000)["text"]
+    await step(obot, NOW + 40_000, level(NOW + 40_000))
+    t = obot.sim_trades()[rtid]
+    assert t["status"] == "filled" and t["opened"] == NOW + 40_000 and t["version"]["sim_taker_hold_range"] == 30, t
+    zbot = m.Bot(m.Config.from_env({**env, "SIM_TAKER_HOLD_SECONDS": "3", "SIM_TAKER_HOLD_RANGE_SECONDS": "0"}), m.Store(":memory:"), FM(NOW), None)
+    zbot.sim_markets = lambda now: world["markets"]
+    await step(zbot, NOW, level(NOW))
+    assert rtid in zbot.sim_trades(), "a ladder level set to 0 buys at once while the other markets wait 3 s"
     print("TAKER_HOLD_OK")
 
 

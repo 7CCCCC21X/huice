@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.93.0"
+VERSION = "1.94.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -493,6 +493,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PROB_BIG_MOVE_SIGMAS", "大波动日放宽 σ（倍日 σ）", "0～10：指数 / 个股日涨跌卡片，今日相对参考收盘的涨跌幅超过这么多倍日 σ 时，剩余时段的 σ 按超出的比例放大（最多 2 倍，连续变化）：日 σ 来自 40 根日收盘，对当天的波动没有反应，大跌日里“跌 99.6¢”这种过度自信的公平价会被压回 90–97¢；0 = 关"),
     ("SIM_TAKER_SWEEP_SHARES", "吃单一次最多吃光多少份", "0～10000000：封顶价之下的卖单不止一档时一张单全吃掉（公平价 50¢，20¢ 和 30¢ 的卖单都够优势就一起吃），最多这么多份、不少于每次的份数；组上限或真实交易风控容不下这么多时退回按每次份数买；0 = 只按每次份数买"),
     ("SIM_TAKER_HOLD_SECONDS", "吃单前净优势至少连续保持多少秒", "0～600：卖1 要连续这么多秒都在封顶价之下（每次看都够优势、买得到）才吃，中途一次不够就重新计时：币安一根插针把公平价推上去又回来的那一两秒不吃；0 = 一够就吃"),
+    ("SIM_TAKER_HOLD_RANGE_SECONDS", "价格阶梯吃单前净优势至少连续保持多少秒", "0～600：价格阶梯（BTC / ETH 等按币安现货实时定价的各档）单独按这个秒数，不按上一项：几十个档位的盘口每分钟才刷一次，一根插针推出的假优势要等更久才露馅；0 = 一够就吃"),
     ("SIM_WAYS", "做哪种单", "吃单 = 算出仍留足净优势的最高价位（封顶价），盘口在它之下的立即买（真实交易用封顶限价单）；挂单 = 按建议价挂着等成交"),
     ("SIM_MARKETS", "做哪些市场", "可多选；全选 = all；展开详细选项可按市场逐个排除"),
     ("SIM_SKIP", "不做的市场（详细选项）", "逗号分隔的市场代码；在“做哪些市场”卡片展开详细选项点选，空 = 所选类型里的市场都做"),
@@ -612,6 +613,7 @@ class Config:
     sim_taker_max_shares: float = 300.0        # SIM_TAKER_MAX_SHARES: takers buy again on a market's side until this many shares are held there; 0 = once only
     sim_taker_sweep: float = 300.0             # SIM_TAKER_SWEEP_SHARES: a taker takes every ask under its cap in one order, up to this many shares; 0 = the per-buy count only
     sim_taker_hold: float = 0.0                # SIM_TAKER_HOLD_SECONDS: a taker buys only once its side has been buyable at every look for this long (a price wick is not); 0 = at once
+    sim_taker_hold_range: float = 30.0         # SIM_TAKER_HOLD_RANGE_SECONDS: ...on a price ladder (the crypto levels: priced from every trade, their books refreshed by the minute)
     sim_max_fair: float = 0.95                 # SIM_MAX_FAIR_CENTS: the trader judges a side by its fair price at most this high (the tail a normal model cannot see); 1 = as the card says
     big_move_sigmas: float = 1.5               # PROB_BIG_MOVE_SIGMAS: a daily card's σ ahead is widened once the day's move passes this many daily σ (big_move_widen); 0 = never
     sim_after_hours_max_shares: float = 300.0  # SIM_AFTER_HOURS_MAX_SHARES: after hours a market's side holds at most this many shares (positions and orders); 0 = no limit
@@ -791,6 +793,7 @@ class Config:
             sim_taker_max_shares=parse_bounded(e, "SIM_TAKER_MAX_SHARES", "300", 0, 10_000_000),
             sim_taker_sweep=parse_bounded(e, "SIM_TAKER_SWEEP_SHARES", "300", 0, 10_000_000),
             sim_taker_hold=parse_bounded(e, "SIM_TAKER_HOLD_SECONDS", "0", 0, 600),
+            sim_taker_hold_range=parse_bounded(e, "SIM_TAKER_HOLD_RANGE_SECONDS", "30", 0, 600),
             sim_max_fair=parse_bounded(e, "SIM_MAX_FAIR_CENTS", "95", 50, 100) / 100,
             big_move_sigmas=parse_bounded(e, "PROB_BIG_MOVE_SIGMAS", "1.5", 0, 10),
             sim_after_hours_max_shares=parse_bounded(e, "SIM_AFTER_HOURS_MAX_SHARES", "300", 0, 10_000_000),
@@ -8664,6 +8667,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_TAKER_MAX_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "100", "200", "300", "500", "1000"], "unit": "份", "zero": "只吃一次"},
     "SIM_TAKER_SWEEP_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "200", "300", "500", "1000", "2000"], "unit": "份", "zero": "只按每次份数"},
     "SIM_TAKER_HOLD_SECONDS": {"kind": "number", "group": "策略", "presets": ["0", "2", "3", "5", "10", "30"], "unit": "秒", "zero": "一够就吃"},
+    "SIM_TAKER_HOLD_RANGE_SECONDS": {"kind": "number", "group": "策略", "presets": ["0", "5", "10", "30", "60", "120"], "unit": "秒", "zero": "一够就吃"},
     "SIM_MAX_FAIR_CENTS": {"kind": "number", "group": "策略", "presets": ["90", "95", "97", "99", "100"], "unit": "¢"},
     "PROB_BIG_MOVE_SIGMAS": {"kind": "number", "group": "高级", "presets": ["0", "1", "1.5", "2", "3"], "unit": "σ", "zero": "关"},
     "SIM_AFTER_HOURS_MAX_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "100", "200", "300", "500", "1000"], "unit": "份", "zero": "不限"},
@@ -10564,7 +10568,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
   session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
-  sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_taker_hold:"吃单前优势保持（秒）",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",sim_no_odds_withdraw:"概率暂缺撤单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
+  sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_taker_hold:"吃单前优势保持（秒）",sim_taker_hold_range:"价格阶梯吃单前优势保持（秒）",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",sim_no_odds_withdraw:"概率暂缺撤单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
   min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",big_move:"大波动日放宽 σ（倍日 σ）",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
@@ -13971,7 +13975,7 @@ class Bot:
                 "sim_taker_sweep": c.sim_taker_sweep, "sim_max_fair": c.sim_max_fair, "sim_after_hours_max_shares": c.sim_after_hours_max_shares,
                 "sim_open_quiet_minutes": c.sim_open_quiet_minutes,
                 **({"sim_no_odds_withdraw": c.sim_no_odds_withdraw} if c.sim_no_odds_withdraw else {}),
-                **({"sim_taker_hold": c.sim_taker_hold} if c.sim_taker_hold else {}),
+                **({"sim_taker_hold": c.sim_taker_hold} if c.sim_taker_hold else {}), "sim_taker_hold_range": c.sim_taker_hold_range,
                 "sim_ways": ways, "sim_markets": kinds,
                 **({"sim_taker_shares": c.sim_taker_shares} if c.sim_taker_shares else {}),
                 **({"sim_taker_after_hours_shares": c.sim_taker_after_hours_shares} if c.sim_taker_after_hours_shares else {}),
@@ -14464,7 +14468,7 @@ class Bot:
             more = f"（已吃 {s['taken']:g} 份，上限 {c.sim_taker_max_shares:g}）" if s["taken"] > 0 and c.sim_taker_max_shares > 0 else ""
             left = self.sim_taker_hold_left(mk, s["side"], now_ms) if not hold else 0.0
             if left > 0:  # SIM_TAKER_HOLD_SECONDS: buyable, but not for long enough yet
-                hold = f"净优势要连续保持 {c.sim_taker_hold:g} 秒才吃，还差 {math.ceil(left - 1e-9)} 秒（SIM_TAKER_HOLD_SECONDS）"
+                hold = f"净优势要连续保持 {self.sim_taker_hold(mk):g} 秒才吃，还差 {math.ceil(left - 1e-9)} 秒（{self.sim_taker_hold_name(mk)}）"
             if hold:
                 return {**out, "state": "blocked", "label": s["label"], "gap": s["gap"],
                         "text": f"{s['label']}可买 {got:g} 份，但{hold}", "short": f"{s['label']} 可买，但{hold}"}
@@ -15381,7 +15385,7 @@ class Bot:
         held = trades.get(tid)  # a finished taker record (a position, a lapsed order): it moves to tid#n, the slot takes the next buy
         q, why = self.sim_taker_pick(mk, trades, side, q, now_ms)
         if not why and self.sim_taker_hold_left(mk, side, now_ms) > 0:
-            why = f"净优势要连续保持 {self.config.sim_taker_hold:g} 秒才吃（SIM_TAKER_HOLD_SECONDS）"  # one wording: noted once, not every look
+            why = f"净优势要连续保持 {self.sim_taker_hold(mk):g} 秒才吃（{self.sim_taker_hold_name(mk)}）"  # one wording: noted once, not every look
         if why:
             self.sim_note_block(tid, mk, "吃" + mk.sides[0 if side == "up" else 1], q["cost"], why, now_ms)
             return
@@ -15410,10 +15414,20 @@ class Bot:
         for side in ("up", "down"):
             self.sim_taker_seen.pop(f"{mk.market}|{side}|吃", None)
 
+    def sim_taker_hold(self, mk: SimMarket) -> float:
+        """How long a side of this market has to stay buyable before a taker buys it: SIM_TAKER_HOLD_RANGE_SECONDS on
+        a price ladder (its levels are priced from every Binance trade while their books refresh by the minute: a wick's
+        false edge takes longest to show there), SIM_TAKER_HOLD_SECONDS elsewhere."""
+        return self.config.sim_taker_hold_range if mk.kind == "range" else self.config.sim_taker_hold
+
+    @staticmethod
+    def sim_taker_hold_name(mk: SimMarket) -> str:
+        return "SIM_TAKER_HOLD_RANGE_SECONDS" if mk.kind == "range" else "SIM_TAKER_HOLD_SECONDS"
+
     def sim_taker_hold_left(self, mk: SimMarket, side: str, now_ms: int) -> float:
         """Seconds this side's run of buyable looks still has to last before a taker buys it (SIM_TAKER_HOLD_SECONDS);
         0 when it may buy now (the setting off, or the run long enough). A side never seen buyable has the whole wait."""
-        hold = self.config.sim_taker_hold
+        hold = self.sim_taker_hold(mk)
         if hold <= 0:
             return 0.0
         since = self.sim_taker_seen.get(f"{mk.market}|{side}|吃")
@@ -17016,7 +17030,7 @@ class Bot:
         values = {"LIVE": c.live_mode, "SIM_EDGE_CENTS": f"{c.sim_edge * 100:g}", "SIM_SHARES": plain(c.sim_shares), "SIM_WAYS": c.sim_ways,
                   "SIM_TAKER_SHARES": plain(c.sim_taker_shares), "SIM_TAKER_AFTER_HOURS_SHARES": plain(c.sim_taker_after_hours_shares),
                   "SIM_TAKER_MAX_SHARES": plain(c.sim_taker_max_shares), "SIM_TAKER_SWEEP_SHARES": plain(c.sim_taker_sweep),
-                  "SIM_TAKER_HOLD_SECONDS": f"{c.sim_taker_hold:g}",
+                  "SIM_TAKER_HOLD_SECONDS": f"{c.sim_taker_hold:g}", "SIM_TAKER_HOLD_RANGE_SECONDS": f"{c.sim_taker_hold_range:g}",
                   "SIM_MAX_FAIR_CENTS": f"{c.sim_max_fair * 100:g}", "SIM_AFTER_HOURS_MAX_SHARES": plain(c.sim_after_hours_max_shares),
                   "PROB_BIG_MOVE_SIGMAS": f"{c.big_move_sigmas:g}",
                   "SIM_OPEN_QUIET_MINUTES": str(c.sim_open_quiet_minutes), "SIM_NO_ODDS_WITHDRAW_MINUTES": str(c.sim_no_odds_withdraw),
