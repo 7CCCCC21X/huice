@@ -122,9 +122,9 @@ async def run():
     assert (mk.kind, mk.market, mk.item, mk.sides) == ("updown", SPEC.slug, "BTC 11-04 涨跌", ("涨", "跌"))
     assert mk.settle == {"end": SPEC.end_ms, "start": SPEC.start_ms, "day": "2026-11-04"} and mk.fair_up == odds.fair_up
     NONE = m.TradeMap()
-    assert bot.sim_order_cap(mk) == 10 and bot.sim_market_room(NONE, mk) == (100, "")
+    assert bot.sim_order_cap(mk) == 10 and bot.sim_market_room(NONE, mk, "up") == (100, "")
     other = m.dataclasses.replace(mk, kind="updown", settle={"end": SPEC.end_ms})  # a monthly up/down market: none of it
-    assert bot.sim_order_cap(other) == math.inf and bot.sim_market_room(NONE, other) == (math.inf, "") and bot.sim_crypto_day_version(other) == {}
+    assert bot.sim_order_cap(other) == math.inf and bot.sim_market_room(NONE, other, "up") == (math.inf, "") and bot.sim_crypto_day_version(other) == {}
     # a taker sweeps every ask under its cap (SIM_TAKER_SWEEP_SHARES 300) — here no more than a buy: 10 shares
     cap = bot.sim_taker_cap(mk, "up", 200)
     assert cap >= 0.45 and bot.sim_taker_shares(mk) == 10 and bot.sim_taker_want(mk, "up", cap) == 10
@@ -133,21 +133,23 @@ async def run():
     taker = trades[f"{SPEC.slug}|up|吃"]
     assert (taker["status"], taker["order"], taker["shares"], taker["price"] < 0.41) == ("filled", 10, 10, True), taker
     assert taker["settle"] == mk.settle and taker["driver"] == "BTCUSDT"
-    assert {k: taker["version"][k] for k in ("sim_crypto_day_shares", "sim_crypto_day_max_shares", "sim_crypto_day_quiet")} == {
-        "sim_crypto_day_shares": 10, "sim_crypto_day_max_shares": 100, "sim_crypto_day_quiet": 30}
+    assert {k: v for k, v in taker["version"].items() if k.startswith("sim_crypto_day_")} == {
+        "sim_crypto_day_shares": 10, "sim_crypto_day_max_shares": 100, "sim_crypto_day_quiet": 30, "sim_crypto_day_edge": 0}
     # a resting order: 10 shares, not SIM_SHARES' 100
     bot.sim_quote(mk, trades, EVENING, changed)
     resting = [t for t in trades.values() if t.get("maker")]
     assert len(resting) == 1 and resting[0]["order"] == 10 and resting[0]["status"] == "resting", resting
 
-    # --- the cap: both sides' positions and orders, in flight or resting, deep or not ---------------------------------------
+    # --- the cap, each side its own (1.98.0): its positions and orders, in flight or resting, deep or not ---------------------
     base = {"v": 2, "market": SPEC.slug, "slug": SPEC.slug, "item": SPEC.name, "kind": "updown", "key": "BTC-DAY", "fills": [],
             "revisions": [], "settle": mk.settle, "driver": "BTCUSDT", "driver_name": "BTC", "opened": EVENING - H}
-    held = m.TradeMap({f"{SPEC.slug}|up|吃#1": {**base, "side": "up", "label": "吃涨", "maker": False, "status": "filled", "shares": 60.0,
-                                                 "order": 60.0, "price": 0.40},
-                       f"{SPEC.slug}|down|挂": {**base, "side": "down", "label": "挂跌", "maker": True, "status": "resting", "shares": 5.0,
-                                               "order": 35.0, "price": 0.55}})
-    assert bot.sim_market_room(held, mk) == (5.0, "")
+    fill = lambda side, n, tid, price: (f"{SPEC.slug}|{side}|吃#{tid}", {**base, "side": side, "label": "吃" + ("涨" if side == "up" else "跌"),
+                                                                        "maker": False, "status": "filled", "shares": float(n), "order": float(n), "price": price})
+    held = m.TradeMap(dict([fill("up", 60, 1, 0.40), fill("down", 100, 1, 0.55),
+                            (f"{SPEC.slug}|up|挂", {**base, "side": "up", "label": "挂涨", "maker": True, "status": "resting", "shares": 5.0,
+                                                    "order": 35.0, "price": 0.36})]))
+    # 涨 holds 60 + 35 = 95: 5 left; 跌's 100 neither counts against it nor offsets it
+    assert bot.sim_market_room(held, mk, "up") == (5.0, "")
     q = m.taker_quote(mk.book, "up", 10, 200, cap)
     picked, why = bot.sim_taker_pick(mk, held, "up", q, EVENING)
     assert why == "" and picked["got"] == 5, (picked, why)  # cut to what is left, not refused
@@ -155,13 +157,15 @@ async def run():
     assert bot.sim_maker_pick(mk, held, "up", maker, EVENING) == (5.0, "")
     deep = m.dataclasses.replace(maker, front=True)  # a deep-bid order too: no order outside this cap
     assert bot.sim_maker_pick(mk, held, "up", deep, EVENING) == (5.0, "")
-    full = m.TradeMap({**held, f"{SPEC.slug}|up|吃#2": {**base, "side": "up", "label": "吃涨", "maker": False, "status": "filled", "shares": 5.0,
-                                                          "order": 5.0, "price": 0.41}})
-    room, why = bot.sim_market_room(full, mk)
-    assert room == 0 and why == "这个市场两边持仓加挂单已有 100 份，达到加密日涨跌上限 100 份（内测，SIM_CRYPTO_DAY_MAX_SHARES）", why
-    assert bot.sim_taker_pick(mk, full, "up", q, EVENING)[1] == why and bot.sim_maker_pick(mk, full, "down", maker, EVENING)[1] == why
+    down_full = "跌这一边持仓加挂单已有 100 份，达到加密日涨跌每边上限 100 份（内测，SIM_CRYPTO_DAY_MAX_SHARES）"
+    assert bot.sim_market_room(held, mk, "down") == (0.0, down_full)
+    assert bot.sim_taker_pick(mk, held, "down", m.taker_quote(mk.book, "down", 10, 200), EVENING)[1] == down_full
+    full = m.TradeMap({**held, **dict([fill("up", 5, 2, 0.41)])})
+    room, why = bot.sim_market_room(full, mk, "up")
+    assert room == 0 and why == "涨这一边持仓加挂单已有 100 份，达到加密日涨跌每边上限 100 份（内测，SIM_CRYPTO_DAY_MAX_SHARES）", why
+    assert bot.sim_taker_pick(mk, full, "up", q, EVENING)[1] == why and bot.sim_maker_pick(mk, full, "up", maker, EVENING)[1] == why
     settled = m.TradeMap({**full, f"{SPEC.slug}|up|吃#2": {**full[f"{SPEC.slug}|up|吃#2"], "status": "settled"}})
-    assert bot.sim_market_room(settled, mk) == (5.0, "")  # a settled record holds nothing
+    assert bot.sim_market_room(settled, mk, "up") == (5.0, "")  # a settled record holds nothing
 
     # --- nothing bought in the last half hour; a resting order withdrawn ---------------------------------------------------------
     late, early = et(2026, 11, 4, 11, 31, -5), et(2026, 11, 4, 11, 29, -5)
@@ -175,11 +179,30 @@ async def run():
     assert longer.sim_quiet(mk.settle, et(2026, 11, 4, 11, 20, -5)) == "结束前 45 分钟不交易"  # the longer of the two
     # the limits off: the general counts alone
     free = m.Bot(m.Config.from_env({**ENV, **{k: "0" for k in KEYS}}), m.Store(":memory:"), FM(EVENING), None)
-    assert free.sim_order_cap(mk) == math.inf and free.sim_market_room(full, mk) == (math.inf, "") and free.sim_quiet(mk.settle, late) == ""
+    assert free.sim_order_cap(mk) == math.inf and free.sim_market_room(full, mk, "up") == (math.inf, "") and free.sim_quiet(mk.settle, late) == ""
     assert free.sim_taker_shares(mk) == 100 and free.sim_maker_pick(mk, NONE, "up", maker, EVENING) == (100.0, "")
     # the settings, as the control page and /sim show them
-    assert [bot.control_value(k) for k in KEYS] == ["10", "100", "30"]
-    assert "加密日涨跌（BTC / ETH / BNB，内测）：每次最多买 10 份，每个市场两边持仓加挂单最多 100 份，结束（12:00 ET）前 30 分钟起不买、撤掉挂单" in bot.sim_text()
+    assert [bot.control_value(k) for k in KEYS] == ["10", "100", "30"] and bot.control_value("SIM_CRYPTO_DAY_EDGE_CENTS") == "0"
+    assert "加密日涨跌（BTC / ETH / BNB，内测）：每次最多买 10 份，每个市场每边持仓加挂单最多 100 份，结束（12:00 ET）前 30 分钟起不买、撤掉挂单" in bot.sim_text()
+
+    # --- the entry bar: SIM_EDGE_CENTS (10¢) unless SIM_CRYPTO_DAY_EDGE_CENTS gives these markets their own --------------------
+    assert bot.sim_edge_bar(mk) == bot.sim_taker_bar(mk) == bot.sim_maker_mode(mk)[0] == 0.10 == bot.sim_edge_bar(other)
+    six = m.Bot(m.Config.from_env({**ENV, "SIM_CRYPTO_DAY_EDGE_CENTS": "6"}), m.Store(":memory:"), FM(EVENING), None)
+    assert six.sim_edge_bar(mk) == six.sim_taker_bar(mk) == six.sim_maker_mode(mk)[0] == 0.06 and six.sim_edge_bar(other) == 0.10
+    assert six.sim_taker_cap(mk, "up", 200) > cap and six.control_value("SIM_CRYPTO_DAY_EDGE_CENTS") == "6"  # a lower bar pays more
+    assert "加密日涨跌（BTC / ETH / BNB，内测）：净优势 ≥ 6.0¢ 才买，每次最多买 10 份" in six.sim_text()
+    for bad in ("51", "-1"):
+        try:
+            m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_CRYPTO_DAY_EDGE_CENTS": bad}); assert False, bad
+        except ValueError:
+            pass
+    # the withdrawal line stays half a cent under the market's own bar (a 4¢ bar: 3.5¢, not the 5¢ line of the rest)
+    four = m.Bot(m.Config.from_env({**ENV, "SIM_CRYPTO_DAY_EDGE_CENTS": "4", "SIM_MAKER_EXIT_CENTS": "5"}), m.Store(":memory:"), FM(EVENING), None)
+    assert abs(four.sim_maker_exit(mk) - 0.035) < 1e-12 and four.sim_maker_exit(other) == four.sim_maker_exit() == 0.05
+    # a resting order placed under another bar is judged again by today's: 7¢ of edge was enough at 6¢, not at 10¢
+    seven = {**resting[0], "price": round(mk.fair_up - 0.07, 6), "version": {**resting[0]["version"], "sim_crypto_day_edge": 0.06}}
+    assert bot.sim_requote_reason(seven, mk, EVENING).startswith("触发门槛已改为 10.0¢，现净优势 7.0¢ 不达标"), bot.sim_requote_reason(seven, mk, EVENING)
+    assert six.sim_requote_reason({**seven, "version": resting[0]["version"]}, mk, EVENING) == ""  # placed at 10¢, 7¢ still clears 6¢
 
     # --- the day ends: the final candle read, the card moves on, the day's positions settle on its closes ---------------------
     eth.get = binance({ETH.day_spec(NOV4).start_ms: "2500"}, clock, "2510")  # Binance never gives ETH's final candle here
@@ -227,3 +250,65 @@ async def run():
 
 
 asyncio.run(run())
+
+
+async def backtest():
+    """1.98.0: the threshold backtest. Every SHADOW_EVERY_MS each daily market's two sides as a taker finds them — the net
+    edge of buying the ask for one buy, kept from 2¢ when a buy was possible then, whatever the entry bar — and /calib's
+    report of every bar once the market has a result: how many, on how many markets, the edge claimed, the gain a share."""
+    store = m.Store(":memory:")
+    bot = m.Bot(m.Config.from_env(ENV), store, FM(EVENING), None)
+    btc = bot.updowns["BTC-DAY"]
+    store.put(f"updown:{SPEC.slug}:start", {"open": SPEC.start_ms, "close": "70000"})
+    btc.price, btc.priced_ms, btc.sigma, btc.sigma_ms = D("70500"), EVENING, 0.4, EVENING
+    bot.predict.info[SPEC.slug] = {"outcomes": ["Up", "Down"], "created_ms": 0}
+    bot.predict.books["BTC-DAY"] = book(SPEC.slug, [("0.35", "500")], [("0.40", "500")])
+    fair = btc.odds(EVENING).fair_up
+    cost = lambda ask: ask + 0.02 * min(ask, 1 - ask)  # Predict's taker fee when the market states none
+    bot.shadow_sample(EVENING)
+    rows = dict(store.items("shadow:"))
+    assert list(rows) == [f"shadow:{SPEC.slug}|up|{EVENING}"], rows  # 涨 at 40¢ is cheap; 跌 at 65¢ (1 − the 35¢ bid) is dear
+    first = rows[f"shadow:{SPEC.slug}|up|{EVENING}"]
+    assert (first["side"], first["kind"], first["key"], first["settle"]["day"]) == ("up", "updown", "BTC-DAY", "2026-11-04")
+    assert abs(first["cost"] - cost(0.40)) < 1e-12 and abs(first["edge"] - (fair - cost(0.40))) < 1e-12 and first["edge"] > 0.2
+    bot.shadow_sample(EVENING + MIN)  # within five minutes: nothing more
+    assert store.count("shadow:") == 1
+    # five minutes on, the 涨 ask at the price leaving about 5¢
+    ask = next(a / 100 for a in range(99, 1, -1) if fair - cost(a / 100) >= 0.04)
+    later = EVENING + 5 * MIN
+    btc.priced_ms = btc.sigma_ms = later
+    bot.predict.books["BTC-DAY"] = book(SPEC.slug, [("0.35", "500")], [(f"{ask:.2f}", "500")], at=later)
+    bot.shadow_sample(later)
+    second = store.get(f"shadow:{SPEC.slug}|up|{later}")
+    assert second is not None and 0.04 <= second["edge"] < 0.06 and second["need"] < 0.04, second
+    # nothing kept when the trader could not buy: the last half hour, a stale book, a card that holds back
+    late = et(2026, 11, 4, 11, 31, -5)
+    btc.priced_ms = btc.sigma_ms = late
+    bot.predict.books["BTC-DAY"] = book(SPEC.slug, [("0.35", "500")], [("0.40", "500")], at=late)
+    bot.shadow_sample(late)
+    stale = late - 30 * MIN  # (sampled at half past ten, its book read at ten)
+    btc.priced_ms = btc.sigma_ms = stale
+    bot.predict.books["BTC-DAY"] = book(SPEC.slug, [("0.35", "500")], [("0.40", "500")], at=stale - 30 * MIN)
+    bot.shadow_sample(stale)
+    assert store.count("shadow:") == 2
+    # before the result: counted, not scored
+    head = ("🧪 加密日涨跌吃单门槛回测（每 5 分钟看一次每个市场的两边：按卖1 买一笔的净优势 ≥ 2¢、当时能买就记一条；"
+            "不下单，出结果后按每份实际赚赔评分，保留 60 天）：")
+    assert bot.shadow_report() == [head, "  已记 2 条 / 1 个市场，还没有出结果的"]
+    # the result: 69,000 under 70,000 is Down, so every 涨 bought lost what it cost
+    store.put(f"updown:{SPEC.slug}:end", {"open": SPEC.end_ms, "close": "69000"})
+    lines = bot.shadow_report()
+    pct = lambda x: f"{x * 100:+.1f}¢"
+    both = f"2 次 / 1 个市场，下单时平均净优势 {pct((first['edge'] + second['edge']) / 2)}，实际每份 {pct(-(first['cost'] + second['cost']) / 2)}，赚的占 0%"
+    alone = f"1 次 / 1 个市场，下单时平均净优势 {pct(first['edge'])}，实际每份 {pct(-first['cost'])}，赚的占 0%"
+    assert lines == [head, f"  门槛 2¢：{both}", f"  门槛 4¢：{both}", *(f"  门槛 {bar:g}¢：{alone}" for bar in (6, 8, 10, 12, 15, 20)),
+                     "  （同一个市场的几次一起输赢，可信度看市场数：不到 30 个市场时差别多半是运气）"], lines
+    assert bot.calibration_text().endswith("\n".join(lines))  # /calib carries it
+    # the samples are pruned after SHADOW_KEEP_DAYS
+    bot.shadow_pruned, bot.shadow_last = 0.0, -10**15
+    bot.shadow_sample(EVENING + m.SHADOW_KEEP_DAYS * m.DAY_MS + 3 * MIN)  # the first is 60 days and 3 minutes old, the second not yet 60 days
+    assert store.count("shadow:") == 1 and store.get(f"shadow:{SPEC.slug}|up|{later}") is not None
+    print("BACKTEST_OK")
+
+
+asyncio.run(backtest())

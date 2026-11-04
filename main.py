@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.97.0"
+VERSION = "1.98.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -505,7 +505,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_AFTER_HOURS_MAX_PRICE_CENTS", "盘后只买这个价以下的（¢）", "1～99：指数/个股日涨跌开盘前、收盘后，吃单只买这个价以下的卖单、挂单只挂这个价以下的，挂着的高于它就撤；默认 60；0 = 不限"),
     ("SIM_QUIET_MINUTES", "结束前多少分钟不交易", "0～1440：从标的收盘 / 市场截止前这么多分钟起不开新单，未成交的挂单撤掉；0 = 不限"),
     ("SIM_CRYPTO_DAY_SHARES", "加密日涨跌每次最多买多少份（内测）", "0～1000000：BTC / ETH / BNB 每日涨跌市场（每天 12:00 ET 结算）的吃单、挂单每次最多这么多份，上面的份数设置更小时按更小的；0 = 不另设"),
-    ("SIM_CRYPTO_DAY_MAX_SHARES", "加密日涨跌每个市场最多持有多少份（内测）", "0～10000000：同一个每日涨跌市场两边的持仓加挂单（含发送中、撤单待确认的）合计不超过这个数，超出的部分不买、只买剩下的额度；0 = 不另设"),
+    ("SIM_CRYPTO_DAY_MAX_SHARES", "加密日涨跌每个市场每边最多持有多少份（内测）", "0～10000000：每日涨跌市场的涨、跌两边各自的持仓加挂单（含发送中、撤单待确认、低价挂单）不超过这个数，两边各算各的、不互相抵；超出的部分不买、只买剩下的额度；0 = 不另设"),
+    ("SIM_CRYPTO_DAY_EDGE_CENTS", "加密日涨跌触发买入的净优势（¢/份，内测）", "0～50：每日涨跌市场单独的买入门槛，吃单、挂单都按它（模型误差更大时按模型误差），挂单撤单线随之不高于它减 0.5¢；0 = 同“触发买入的净优势”。怎么定：看 /calib 里的“加密日涨跌吃单门槛回测”"),
     ("SIM_CRYPTO_DAY_QUIET_MINUTES", "加密日涨跌结束前多少分钟不买（内测）", "0～1440：每日涨跌市场在结算那根 1 分钟 K（12:00 ET）之前这么多分钟起不开新单，未成交的挂单撤掉；和“结束前多少分钟不交易”取较长的；0 = 只按那一项"),
     ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
     ("SIM_MAKER_EXIT_CENTS", "挂单撤单线（¢/份）", "0～50：挂着的单净优势降到这个数以下就撤掉（不会高于触发门槛）；0 = 不撤"),
@@ -638,10 +639,12 @@ class Config:
     # paper order; a resting one is withdrawn (the real one cancelled). 0 = off
     sim_crypto_day_shares: float = 10.0       # SIM_CRYPTO_DAY_SHARES: on a daily crypto up/down market (BTC / ETH / BNB, in beta) one buy, taker or
     # maker, asks for at most this many shares (a smaller general count wins); 0 = the general counts alone
-    sim_crypto_day_max_shares: float = 100.0  # SIM_CRYPTO_DAY_MAX_SHARES: ...one such market holds at most this many shares, both sides' positions
-    # and orders resting or in flight together; 0 = no limit of its own
+    sim_crypto_day_max_shares: float = 100.0  # SIM_CRYPTO_DAY_MAX_SHARES: ...each side of one such market holds at most this many shares, its
+    # positions and orders resting or in flight together (each side its own cap, not netted); 0 = no limit of its own
     sim_crypto_day_quiet: int = 30            # SIM_CRYPTO_DAY_QUIET_MINUTES: ...nothing is bought on one from this many minutes before its final
     # candle (12:00 ET), resting orders withdrawn; the longer of this and SIM_QUIET_MINUTES; 0 = SIM_QUIET_MINUTES alone
+    sim_crypto_day_edge: float = 0.0         # SIM_CRYPTO_DAY_EDGE_CENTS / 100: ...the net edge a buy on one needs, taker and maker (the
+    # withdrawal line kept half a cent under it); 0 = SIM_EDGE_CENTS
     sim_maker_min_bid: float = 100.0  # SIM_MAKER_MIN_BID: a resting order joins the first bid level holding this many shares besides ours and follows
     # it (withdrawn and re-placed when the valid 买1 moves a cent); 0 = the top level whatever its size, and no following
     sim_maker_exit: float = 0.05      # SIM_MAKER_EXIT_CENTS / 100: a resting order is withdrawn when its edge falls under this; 0 = never
@@ -820,6 +823,7 @@ class Config:
             sim_crypto_day_shares=parse_bounded(e, "SIM_CRYPTO_DAY_SHARES", "10", 0, 1_000_000),
             sim_crypto_day_max_shares=parse_bounded(e, "SIM_CRYPTO_DAY_MAX_SHARES", "100", 0, 10_000_000),
             sim_crypto_day_quiet=bounded_int(e, "SIM_CRYPTO_DAY_QUIET_MINUTES", 30, 0, 1440),
+            sim_crypto_day_edge=parse_bounded(e, "SIM_CRYPTO_DAY_EDGE_CENTS", "0", 0, 50) / 100,
             sim_maker_min_bid=parse_bounded(e, "SIM_MAKER_MIN_BID", "100", 0, 10_000_000),
             sim_maker_exit=parse_bounded(e, "SIM_MAKER_EXIT_CENTS", "5", 0, 50) / 100,
             sim_maker_session=not off(e.get("SIM_MAKER_SESSION", "on")),
@@ -4228,6 +4232,10 @@ BETA_REFRESH_SECONDS = 3600   # the fit is redone this often (new outcomes arriv
 PRED_KEEP_DAYS = 400          # snapshots older than this are pruned (a year of /calib history, not an ever-growing table)
 MARK_EVERY_MS = 2 * 3_600_000  # one saved snapshot of every priced Predict market (ladder levels included) per 2 hours
 MARK_KEEP_DAYS = 120           # ...kept this long: scored by /calib against the market's own middle once it has a result
+SHADOW_EVERY_MS = 5 * 60_000   # the daily crypto markets' taker chances, sampled this often for the threshold backtest (/calib)
+SHADOW_FLOOR = 0.02            # ...a side is kept when buying its ask then would have had at least this much net edge
+SHADOW_KEEP_DAYS = 60          # ...for this long
+SHADOW_BARS = (0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20)  # the entry bars /calib scores them at
 CALIB_MIN_DAYS = 10           # walk-forward: target days used only for training before the first test day
 
 
@@ -8692,6 +8700,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_QUIET_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "5", "10", "15", "30", "60"], "unit": "分钟", "zero": "不限"},
     "SIM_CRYPTO_DAY_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "5", "10", "20", "50", "100"], "unit": "份", "zero": "不另设"},
     "SIM_CRYPTO_DAY_MAX_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "50", "100", "200", "300", "500"], "unit": "份", "zero": "不另设"},
+    "SIM_CRYPTO_DAY_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "5", "6", "8", "10", "15"], "unit": "¢", "zero": "同触发门槛"},
     "SIM_CRYPTO_DAY_QUIET_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "10", "15", "30", "60", "120"], "unit": "分钟", "zero": "同结束前不交易"},
     "SIM_MAKER_MIN_BID": {"kind": "number", "group": "策略", "presets": ["0", "20", "50", "100", "200", "500"], "unit": "份", "zero": "不限、不改跟"},
     "SIM_MAKER_EXIT_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "2", "3", "5", "8"], "unit": "¢", "zero": "不撤"},
@@ -10578,7 +10587,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_crypto_day_shares:"加密日涨跌每笔份数",sim_crypto_day_max_shares:"加密日涨跌每市场上限",sim_crypto_day_quiet:"加密日涨跌结束前不买（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_crypto_day_shares:"加密日涨跌每笔份数",sim_crypto_day_max_shares:"加密日涨跌每边上限",sim_crypto_day_edge:"加密日涨跌买入门槛",sim_crypto_day_quiet:"加密日涨跌结束前不买（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
   sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_taker_hold:"吃单前优势保持（秒）",sim_taker_hold_range:"价格阶梯吃单前优势保持（秒）",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",sim_no_odds_withdraw:"概率暂缺撤单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
   min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",big_move:"大波动日放宽 σ（倍日 σ）",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
@@ -12149,6 +12158,8 @@ class Bot:
         self.pred_pruned = 0.0  # when old prediction snapshots were last pruned
         self.mark_last = -10**15  # ms of the last all-market snapshot (record_marks)
         self.mark_pruned = 0.0
+        self.shadow_last = -10**15  # ms of the last sample of the daily crypto markets' taker chances (shadow_sample)
+        self.shadow_pruned = 0.0
         self.beta_cache: dict[str, tuple[float, float, str]] = {}  # index -> (fitted at, β, how it was obtained)
         self.vol_errors: dict[str, str] = {}  # symbol -> why its exchange daily bars could not be read (σ is the prior)
         self.stopping = asyncio.Event()
@@ -12838,6 +12849,7 @@ class Bot:
         price for 涨 / Yes, the book's middle, the bar and whether the card held back. /calib scores them by kind once
         the markets have results: the model against the market it was trading against, which the index snapshots
         (pred:, every 30 minutes, with the proxy fit's inputs) cannot say for the crypto and ladder cards."""
+        self.shadow_sample(now_ms)  # every SHADOW_EVERY_MS, apart from the two-hourly snapshots
         if now_ms - self.mark_last < MARK_EVERY_MS:
             return False
         self.mark_last = now_ms
@@ -12856,6 +12868,78 @@ class Bot:
             if old:
                 self.store.delete_keys(old)
         return Refreshed("ok")
+
+    def shadow_sample(self, now_ms: int) -> None:
+        """Every SHADOW_EVERY_MS, each daily crypto up/down market's two sides as a taker finds them: the net edge of
+        buying the ask for one buy's count (the fee included, at the fair price the trader judges by), kept when it
+        reaches SHADOW_FLOOR and the trader could buy there (the card suggests, the book is fresh and not crossed, the
+        market is not in its last minutes) — whatever SIM_EDGE_CENTS, SIM_CRYPTO_DAY_EDGE_CENTS and SIM_MARKETS say.
+        Nothing is bought: /calib scores them once their markets have results (shadow_report), the realized gain of
+        every entry bar, the ones under today's bar too."""
+        if now_ms - self.shadow_last < SHADOW_EVERY_MS or not self.updown_daily:
+            return
+        self.shadow_last = now_ms
+        rows = []
+        for key in self.updown_daily:
+            for mk in self.sim_markets_for(key, now_ms):
+                if mk.hold or mk.book.stale(now_ms) or book_crossed(mk.book) or self.sim_quiet(mk.settle, now_ms):
+                    continue
+                bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
+                for side in ("up", "down"):
+                    q = taker_quote(mk.book, side, self.sim_taker_shares(mk), bps)
+                    fair, _ = self.sim_fair(mk, side)
+                    if not q or q["got"] < SIM_MIN_SHARES - 1e-9 or fair - q["cost"] < SHADOW_FLOOR - 1e-9:
+                        continue
+                    rows.append((f"shadow:{mk.market}|{side}|{now_ms}", {
+                        "market": mk.market, "item": mk.item, "kind": mk.kind, "key": mk.key, "side": side, "t": now_ms,
+                        "fair": fair, "cost": q["cost"], "edge": fair - q["cost"], "need": mk.need, "settle": mk.settle}))
+        if rows:
+            self.store.put_many(rows)
+        if time.time() - self.shadow_pruned > 86400:
+            self.shadow_pruned = time.time()
+            cutoff = now_ms - SHADOW_KEEP_DAYS * DAY_MS
+            old = [k for k in self.store.keys("shadow:") if k.rsplit("|", 1)[-1].isdigit() and int(k.rsplit("|", 1)[-1]) < cutoff]
+            if old:
+                self.store.delete_keys(old)
+
+    def shadow_report(self) -> list[str]:
+        """The daily crypto markets' threshold backtest (shadow_sample), scored once their markets have results: for each
+        entry bar every sampled chance at least that good (and over the card's own error), as if a share had been bought
+        at its ask — how many, on how many markets (a market's samples share one result: the markets are the sample
+        size), the edge they claimed and what they made a share."""
+        rows = [v for _, v in self.store.items("shadow:") if isinstance(v, dict) and v.get("edge") is not None and v.get("market")]
+        if not rows:
+            return []
+        now_ms = self.market.now_ms()
+        results: dict[str, float | None] = {}
+        for r in rows:
+            if r["market"] in results:
+                continue
+            pseudo = {"kind": r.get("kind"), "key": r.get("key"), "market": r["market"], "slug": r["market"],
+                      "settle": r.get("settle") or {}, "side": "up"}
+            try:
+                res = self.sim_result(pseudo, now_ms)
+            except Exception:  # a record the bot can no longer read: not scored
+                res = None
+            results[r["market"]] = res[0] if res else None
+        scored = [(r, sim_payout(r["side"], float(results[r["market"]])) - float(r["cost"])) for r in rows if results.get(r["market"]) is not None]
+        pending = len({r["market"] for r in rows if results.get(r["market"]) is None})
+        lines = [f"🧪 加密日涨跌吃单门槛回测（每 {SHADOW_EVERY_MS // 60_000} 分钟看一次每个市场的两边：按卖1 买一笔的净优势 ≥ "
+                 f"{SHADOW_FLOOR * 100:g}¢、当时能买就记一条；不下单，出结果后按每份实际赚赔评分，保留 {SHADOW_KEEP_DAYS} 天）："]
+        if not scored:
+            lines.append(f"  已记 {len(rows)} 条 / {pending} 个市场，还没有出结果的")
+            return lines
+        for bar in SHADOW_BARS:
+            picked = [(r, pnl) for r, pnl in scored if float(r["edge"]) >= max(bar, float(r.get("need") or 0)) - 1e-9]
+            if not picked:
+                lines.append(f"  门槛 {bar * 100:g}¢：没有")
+                continue
+            n, markets = len(picked), len({r["market"] for r, _ in picked})
+            lines.append(f"  门槛 {bar * 100:g}¢：{n} 次 / {markets} 个市场，下单时平均净优势 {sum(float(r['edge']) for r, _ in picked) / n * 100:+.1f}¢，"
+                         f"实际每份 {sum(p for _, p in picked) / n * 100:+.1f}¢，赚的占 {sum(p > 0 for _, p in picked) / n:.0%}")
+        lines.append("  （同一个市场的几次一起输赢，可信度看市场数：不到 30 个市场时差别多半是运气"
+                     + (f"；另有 {pending} 个市场还没出结果）" if pending else "）"))
+        return lines
 
     def mark_report(self) -> list[str]:
         """The all-market snapshots scored by kind, each market weighted once (its snapshots share one result): the
@@ -12957,7 +13041,7 @@ class Bot:
         preds = [v for v in saved if self.PRED_FIELDS <= v.keys()]  # snapshots from before 1.14 lack the fit's inputs
         outcomes = {k.removeprefix("outcome:"): float(v) for k, v in self.store.items("outcome:")}
         skipped = f"（忽略 {len(saved) - len(preds)} 条旧格式快照）" if len(saved) > len(preds) else ""
-        return "\n".join([f"📐 概率模型回测（只评估，不会自动改参数）{skipped}"] + calibration_report(preds, outcomes) + self.mark_report())
+        return "\n".join([f"📐 概率模型回测（只评估，不会自动改参数）{skipped}"] + calibration_report(preds, outcomes) + self.mark_report() + self.shadow_report())
 
     async def cmd_calib(self, req: Request) -> str:
         return self.calibration_text()
@@ -14227,19 +14311,21 @@ class Bot:
         cap = self.config.sim_crypto_day_shares
         return cap if cap > 0 and mk.kind == "updown" and mk.settle.get("day") else math.inf
 
-    def sim_market_room(self, trades: dict[str, dict], mk: SimMarket) -> tuple[float, str]:
-        """How many more shares a daily crypto up/down market (in beta) may take under SIM_CRYPTO_DAY_MAX_SHARES: the cap
-        less everything it holds — both sides' positions and their orders resting or in flight at their whole count,
-        deep-bid ones too — and why none when no share is left. (inf, "") on any other market or with the cap off."""
+    def sim_market_room(self, trades: dict[str, dict], mk: SimMarket, side: str) -> tuple[float, str]:
+        """How many more shares one side of a daily crypto up/down market (in beta) may take under SIM_CRYPTO_DAY_MAX_SHARES:
+        the cap less what that side holds — its positions and its orders resting or in flight at their whole count,
+        deep-bid ones too; each side has its own cap, the other side's shares neither count nor offset (1.98.0: "每边各
+        100 份") — and why none when no share is left. (inf, "") on any other market or with the cap off."""
         cap = self.config.sim_crypto_day_max_shares
         if cap <= 0 or mk.kind != "updown" or not mk.settle.get("day"):
             return math.inf, ""
-        used = sum(h["total"] + h["deep"] for h in (side_held(trades, mk.market, side) for side in ("up", "down")))
+        held = side_held(trades, mk.market, side)
+        used = held["total"] + held["deep"]
         room = cap - used
         if room >= SIM_MIN_SHARES - 1e-9:
             return room, ""
-        return 0.0, (f"这个市场两边持仓加挂单已有 {used:g} 份，" + ("达到" if used >= cap - 1e-9 else "离")
-                     + f"加密日涨跌上限 {cap:g} 份" + ("" if used >= cap - 1e-9 else "不足 1 份") + "（内测，SIM_CRYPTO_DAY_MAX_SHARES）")
+        return 0.0, (f"{mk.sides[0 if side == 'up' else 1]}这一边持仓加挂单已有 {used:g} 份，" + ("达到" if used >= cap - 1e-9 else "离")
+                     + f"加密日涨跌每边上限 {cap:g} 份" + ("" if used >= cap - 1e-9 else "不足 1 份") + "（内测，SIM_CRYPTO_DAY_MAX_SHARES）")
 
     def sim_crypto_day_version(self, mk: SimMarket) -> dict:
         """The beta limits a daily crypto up/down trade was made under (beside sim_version's settings, on that market only)."""
@@ -14247,7 +14333,7 @@ class Bot:
             return {}
         c = self.config
         return {"sim_crypto_day_shares": c.sim_crypto_day_shares, "sim_crypto_day_max_shares": c.sim_crypto_day_max_shares,
-                "sim_crypto_day_quiet": c.sim_crypto_day_quiet}
+                "sim_crypto_day_quiet": c.sim_crypto_day_quiet, "sim_crypto_day_edge": c.sim_crypto_day_edge}
 
     def sim_withdraw_reason(self, trade: dict, mk: SimMarket | None, now_ms: int | None = None) -> str:
         """Why a resting paper order is withdrawn now rather than left to the result: the trader no longer places such
@@ -14708,11 +14794,17 @@ class Bot:
             return f"{self.sim_closed(mk)}，不吃单"
         return ""
 
+    def sim_edge_bar(self, mk: SimMarket | None) -> float:
+        """The entry bar on this market: SIM_CRYPTO_DAY_EDGE_CENTS on a daily crypto up/down market when it is set, else
+        SIM_EDGE_CENTS (the modes and the card's own error may raise it, never lower it)."""
+        day = self.config.sim_crypto_day_edge
+        return day if mk is not None and day > 0 and mk.kind == "updown" and mk.settle.get("day") else self.config.sim_edge
+
     def sim_taker_bar(self, mk: SimMarket) -> float:
-        """The net edge a taker needs on this market now: SIM_EDGE_CENTS, after hours in the after-hours taker mode
-        SIM_TAKER_AFTER_HOURS_CENTS (never under SIM_EDGE_CENTS)."""
-        c = self.config
-        return max(c.sim_edge, c.sim_taker_after_hours) if self.sim_taker_after_hours(mk) else c.sim_edge
+        """The net edge a taker needs on this market now: its entry bar (sim_edge_bar), after hours in the after-hours
+        taker mode SIM_TAKER_AFTER_HOURS_CENTS (never under the entry bar)."""
+        c, bar = self.config, self.sim_edge_bar(mk)
+        return max(bar, c.sim_taker_after_hours) if self.sim_taker_after_hours(mk) else bar
 
     def sim_after_hours_price(self, mk: SimMarket) -> float | None:
         """Outside its session a daily card's orders, taker and maker, only at or under SIM_AFTER_HOURS_MAX_PRICE_CENTS: a
@@ -14743,7 +14835,7 @@ class Bot:
         the deep-bid mode quotes on — ``deep`` overrides that test for an order already resting) and the name of its
         withdrawal line. A mode only tightens the bar, and when both apply the higher one wins."""
         c = self.config
-        bar, modes, names = c.sim_edge, [], []
+        bar, modes, names = self.sim_edge_bar(mk), [], []
         if self.sim_after_hours(mk):
             bar, modes, names = max(bar, c.sim_maker_after_hours), ["盘后"], ["盘后"]
         wide = self.sim_deep_book(mk)
@@ -14810,13 +14902,14 @@ class Bot:
         """The edge under which a resting order is withdrawn: under a mode a cent under the mode's bar (so a move of a few
         tenths does not withdraw and re-place it), never under the ordinary exit line; otherwise the exit line."""
         bar, mode, _ = self.sim_maker_mode(mk, deep)
-        return max(bar - SIM_MAKER_MODE_SLACK, self.sim_maker_exit()) if mode else self.sim_maker_exit()
+        return max(bar - SIM_MAKER_MODE_SLACK, self.sim_maker_exit(mk)) if mode else self.sim_maker_exit(mk)
 
-    def sim_maker_exit(self) -> float:
+    def sim_maker_exit(self, mk: SimMarket | None = None) -> float:
         """The edge under which a resting order is withdrawn: SIM_MAKER_EXIT_CENTS, kept half a cent under the entry bar
-        so an order is never withdrawn the moment it is placed; 0 = never."""
+        (``mk``'s, sim_edge_bar: a daily crypto market's own; without one SIM_EDGE_CENTS) so an order is never withdrawn
+        the moment it is placed; 0 = never."""
         exit_edge = self.config.sim_maker_exit
-        return min(exit_edge, max(self.config.sim_edge - 0.005, 0.0)) if exit_edge > 0 else 0.0
+        return min(exit_edge, max(self.sim_edge_bar(mk) - 0.005, 0.0)) if exit_edge > 0 else 0.0
 
     def sim_unpriced_reason(self, trade: dict, mk: SimMarket | None, now_ms: int) -> str:
         """Why a resting order on a market the bot cannot price now is withdrawn (SIM_NO_ODDS_WITHDRAW_MINUTES, 1.92.0):
@@ -14879,7 +14972,7 @@ class Bot:
         side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)
         fair, _ = self.sim_fair(mk, side)  # the edge as the order was judged: at most SIM_MAX_FAIR_CENTS
         edge = fair - price
-        exit_edge = self.sim_maker_exit()
+        exit_edge = self.sim_maker_exit(mk)
         if exit_edge > 0 and edge < exit_edge - 1e-9:
             return f"净优势降到 {cents(edge)}，低于撤单线 {cents(exit_edge)}"
         only = (c.sim_maker_deep > 0 and c.sim_maker_deep_only and self.sim_mode_market(mk, c.sim_maker_deep_markets)
@@ -14890,9 +14983,10 @@ class Bot:
         bar, mode, line_name = self.sim_maker_mode(mk, deep)
         if mode and edge < self.sim_maker_line(mk, deep) - 1e-9:  # the close re-judges every order by the after-hours bar too
             return f"{mode}只挂净优势 ≥ {cents(bar)} 的，现 {cents(edge)} 低于{line_name} {cents(self.sim_maker_line(mk, deep))}"
-        placed_bar = float((trade.get("version") or {}).get("sim_edge") or c.sim_edge)
-        if abs(placed_bar - c.sim_edge) > 1e-12 and edge < c.sim_edge - 1e-9:
-            return f"触发门槛已改为 {cents(c.sim_edge)}，现净优势 {cents(edge)} 不达标"  # a changed setting re-judges the order by the entry bar
+        version, now_bar = trade.get("version") or {}, self.sim_edge_bar(mk)  # a daily crypto market's own bar, when set
+        placed_bar = float(version.get("sim_crypto_day_edge") or version.get("sim_edge") or now_bar)
+        if abs(placed_bar - now_bar) > 1e-12 and edge < now_bar - 1e-9:
+            return f"触发门槛已改为 {cents(now_bar)}，现净优势 {cents(edge)} 不达标"  # a changed setting re-judges the order by the entry bar
         deep_order = bool(trade.get("deep"))
         if c.sim_maker_min_bid > 0 or deep_order:  # SIM_MAKER_MIN_BID=0: an ordinary order is not re-quoted; a deep-bid order keeps its place whatever the setting
             own = max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0) if isinstance(trade.get("live"), dict) else 0.0
@@ -15495,14 +15589,14 @@ class Bot:
         room, full = self.sim_side_room(trades, mk, side)  # SIM_AFTER_HOURS_MAX_SHARES: what the side may still hold after hours
         if full:
             return q, full
-        mroom, full = self.sim_market_room(trades, mk)  # SIM_CRYPTO_DAY_MAX_SHARES: what a daily crypto market may still hold
+        mroom, full = self.sim_market_room(trades, mk, side)  # SIM_CRYPTO_DAY_MAX_SHARES: what a daily crypto market's side may still hold
         if full:
             return q, full
         if q["want"] > min(room, mroom) + 1e-9:
             left = min(room, mroom)
             smaller = taker_quote(mk.book, side, float(math.floor(left + 1e-9)), bps, q["cap"])
             if not smaller or smaller["got"] < SIM_MIN_SHARES - 1e-9:
-                return q, (f"这个市场只剩 {left:g} 份额度（加密日涨跌上限），封顶价之下买不到一份" if mroom < room
+                return q, (f"这一边只剩 {left:g} 份额度（加密日涨跌每边上限），封顶价之下买不到一份" if mroom < room
                            else f"盘后这一边只剩 {room:g} 份额度，封顶价之下买不到一份")
             q = smaller
         why = self.sim_group_room(trades, mk, side, q["cost"], q["got"], taker=q)
@@ -15551,7 +15645,7 @@ class Bot:
         quiet = self.sim_quiet(mk.settle, now_ms) or self.sim_open_quiet(mk, now_ms)
         if quiet:
             return want, quiet
-        room, full = self.sim_market_room(trades, mk)  # SIM_CRYPTO_DAY_MAX_SHARES: every order there, a deep-bid one too
+        room, full = self.sim_market_room(trades, mk, side)  # SIM_CRYPTO_DAY_MAX_SHARES: every order on the side, a deep-bid one too
         if full:
             return want, full
         if room < want - 1e-9:
@@ -15790,8 +15884,9 @@ class Bot:
         if self.config.sim_quiet_minutes:
             how.append(f"每个市场结束前 {self.config.sim_quiet_minutes} 分钟起不开新单、撤掉未成交挂单（SIM_QUIET_MINUTES）")
         c = self.config
-        beta = [part for part in (f"每次最多买 {c.sim_crypto_day_shares:g} 份" if c.sim_crypto_day_shares > 0 else "",
-                                  f"每个市场两边持仓加挂单最多 {c.sim_crypto_day_max_shares:g} 份" if c.sim_crypto_day_max_shares > 0 else "",
+        beta = [part for part in (f"净优势 ≥ {cents(c.sim_crypto_day_edge)} 才买" if c.sim_crypto_day_edge > 0 else "",
+                                  f"每次最多买 {c.sim_crypto_day_shares:g} 份" if c.sim_crypto_day_shares > 0 else "",
+                                  f"每个市场每边持仓加挂单最多 {c.sim_crypto_day_max_shares:g} 份" if c.sim_crypto_day_max_shares > 0 else "",
                                   f"结束（12:00 ET）前 {max(c.sim_crypto_day_quiet, c.sim_quiet_minutes)} 分钟起不买、撤掉挂单"
                                   if max(c.sim_crypto_day_quiet, c.sim_quiet_minutes) else "") if part]
         if beta and self.updown_daily and "updown" in c.sim_markets:
@@ -17105,7 +17200,7 @@ class Bot:
                   "SIM_TAKER_AFTER_HOURS_CENTS": f"{c.sim_taker_after_hours * 100:g}", "SIM_AFTER_HOURS_MAX_PRICE_CENTS": f"{c.sim_after_hours_max_price * 100:g}", "SIM_SKIP": ",".join(sorted(c.sim_skip)),
                   "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes), "SIM_MAKER_MIN_BID": plain(c.sim_maker_min_bid),
                   "SIM_CRYPTO_DAY_SHARES": plain(c.sim_crypto_day_shares), "SIM_CRYPTO_DAY_MAX_SHARES": plain(c.sim_crypto_day_max_shares),
-                  "SIM_CRYPTO_DAY_QUIET_MINUTES": str(c.sim_crypto_day_quiet),
+                  "SIM_CRYPTO_DAY_QUIET_MINUTES": str(c.sim_crypto_day_quiet), "SIM_CRYPTO_DAY_EDGE_CENTS": f"{c.sim_crypto_day_edge * 100:g}",
                   "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points),
                   "SIM_SHARES_NET": flag(c.sim_shares_net),
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
