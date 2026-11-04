@@ -3,7 +3,7 @@
 Chainlink's UNITREE/USDT data stream settles it, which "uses the index price (field i) from Binance's USDS-Margined Futures
 Mark Price Stream": the card reads that index (pushed every second, read when the push is late) and each boundary's value as
 the close of the index's 1-minute candle ending there. In beta: at most 10 shares a buy, 100 on each side of one window,
-nothing in a window's last 120 seconds."""
+no order of any kind in a window's last 90 seconds (1.102.1; 120 in 1.102.0), resting ones withdrawn."""
 import asyncio, json, math, sys, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
@@ -72,7 +72,7 @@ def book(fair_bid, fair_ask, at, slug, mid="701"):
 async def run():
     # --- the settings ------------------------------------------------------------------------------------------------------
     c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"})
-    assert (c.sim_crypto_15m_shares, c.sim_crypto_15m_max_shares, c.sim_crypto_15m_quiet, c.sim_crypto_15m_edge) == (10, 100, 120, 0)
+    assert (c.sim_crypto_15m_shares, c.sim_crypto_15m_max_shares, c.sim_crypto_15m_quiet, c.sim_crypto_15m_edge) == (10, 100, 90, 0)
     for bad in ({"SIM_CRYPTO_15M_QUIET_SECONDS": "601"}, {"SIM_CRYPTO_15M_EDGE_CENTS": "51"}, {"SIM_CRYPTO_15M_SHARES": "-1"}):
         try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
         except ValueError: pass
@@ -90,7 +90,7 @@ async def run():
     futures = bot.binance_streams["futures"]
     assert futures.symbols()[:2] == ["SKHYNIXUSDT", "UNITREEUSDT"] and "unitreeusdt@markPrice@1s" in futures.names()  # not in SYMBOLS: streamed all the same
     assert bot.predict_targets(T0 + 5_000)["UNITREE-15M"] == spec.slug and spec.slug in bot.predict.want_info
-    assert bot.control_value("SIM_CRYPTO_15M_SHARES") == "10" and bot.control_value("SIM_CRYPTO_15M_QUIET_SECONDS") == "120"
+    assert bot.control_value("SIM_CRYPTO_15M_SHARES") == "10" and bot.control_value("SIM_CRYPTO_15M_QUIET_SECONDS") == "90"
     # before the start's candle is read
     assert card.odds(T0 + 5_000) == "等待币安 UNITREEUSDT 22:00 ET（北京 11:00）的指数价（起点）"
     fm.index[T0 - 60_000], fm.premium = "90.0000", ("90.1200", T0 + 4_500)
@@ -151,7 +151,7 @@ async def run():
     assert (mk.kind, mk.market, mk.settle) == ("updown", spec.slug, {"end": T1 - 60_000, "start": T0 - 60_000, "window": "15m"})
     assert bot.sim_order_cap(mk) == 10 and bot.sim_taker_shares(mk) == 10 and bot.sim_market_room({}, mk, "up") == (100, "")
     assert bot.sim_edge_bar(mk) == bot.config.sim_edge and bot.sim_crypto_day_version(mk) == {
-        "sim_crypto_15m_shares": 10, "sim_crypto_15m_max_shares": 100, "sim_crypto_15m_quiet": 120, "sim_crypto_15m_edge": 0}
+        "sim_crypto_15m_shares": 10, "sim_crypto_15m_max_shares": 100, "sim_crypto_15m_quiet": 90, "sim_crypto_15m_edge": 0}
     trades, changed = m.TradeMap(), []
     bot.sim_take(mk, trades, now, changed)
     taken = [t for _, t in changed if not t["maker"]]
@@ -163,14 +163,24 @@ async def run():
             "settle": mk.settle, "opened": now}
     room, why = bot.sim_market_room(m.TradeMap({f"{spec.slug}|up|吃": held}), mk, "up")
     assert room == 0 and why == "涨这一边持仓加挂单已有 100 份，达到15 分钟涨跌每边上限 100 份（内测，SIM_CRYPTO_15M_MAX_SHARES）", why
-    assert bot.sim_quiet(mk.settle, T1 - 121_000) == "" and bot.sim_quiet(mk.settle, T1 - 119_000) == "15 分钟涨跌结束前 120 秒不买（内测，SIM_CRYPTO_15M_QUIET_SECONDS）"
+    assert bot.sim_quiet(mk.settle, T1 - 91_000) == "" and bot.sim_quiet(mk.settle, T1 - 89_000) == "15 分钟涨跌结束前 90 秒不下单（内测，SIM_CRYPTO_15M_QUIET_SECONDS）"
+    # the last 90 seconds: no order of any kind — a taker the book would fill is not bought, a resting order is withdrawn
+    late = lambda at: dataclasses_replace(mk, book=book("0.40", "0.45", at, spec.slug))
+    for at, want in ((T1 - 91_000, [("吃涨", 10.0)]), (T1 - 89_000, [])):
+        got = []
+        bot.sim_take(late(at), m.TradeMap(), at, got)
+        bot.sim_quote(late(at), m.TradeMap(), at, got)
+        assert [(t["label"], t["order"]) for _, t in got if not t["maker"]] == want and (at < T1 - 90_000 or not got), (at, got)
+    resting = {**held, "maker": True, "label": "挂涨", "status": "resting", "shares": 0.0, "price": 0.30}
+    assert bot.sim_withdraw_reason(resting, late(T1 - 89_000), T1 - 89_000) == "15 分钟涨跌结束前 90 秒不下单（内测，SIM_CRYPTO_15M_QUIET_SECONDS）"
+    assert bot.sim_withdraw_reason(resting, late(T1 - 91_000), T1 - 91_000) == ""
     assert bot.sim_quiet(mk.settle, T1 - 59_000) == "已到结束时间，等结果出来：不开新单，挂单撤掉"  # the final minute: never
     long_quiet = m.Bot(m.Config.from_env({**ENV, "SIM_QUIET_MINUTES": "10", "SIM_CRYPTO_15M_QUIET_SECONDS": "0", "SIM_CRYPTO_15M_EDGE_CENTS": "6"}),
                        m.Store(":memory:"), FM(now), None)
     assert long_quiet.sim_quiet(mk.settle, T1 - 9 * 60_000) == ""  # SIM_QUIET_MINUTES would take most of the window: not applied here
     assert abs(long_quiet.sim_edge_bar(mk) - 0.06) < 1e-12 and long_quiet.sim_edge_bar(dataclasses_replace(mk, settle={"end": 1})) == long_quiet.config.sim_edge
     text = bot.sim_text()
-    assert "15 分钟涨跌（宇树，内测）：每次最多买 10 份，每个市场每边持仓加挂单最多 100 份，每个窗口最后 120 秒不买、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
+    assert "15 分钟涨跌（宇树，内测）：每次最多买 10 份，每个市场每边持仓加挂单最多 100 份，每个窗口最后 90 秒不下单、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
     # no Telegram alert: a quarter-hour window is over before an alert confirmed over a minute is acted on by hand
     seen = []
     bot.edge_observe = lambda state, market, mk_, *a, **k: seen.append(market)

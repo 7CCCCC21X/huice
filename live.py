@@ -1424,6 +1424,8 @@ class LiveBot(core.Bot):
         decided = self.live_decided(trade, now_ms)
         if now_ms - decided > self.LIVE_DECISION_MAX_MS:
             return f"决定已过时（{(now_ms - decided) // 1000} 秒前的盘口），不下单"
+        if quiet := self.sim_quiet(trade.get("settle"), now_ms):
+            return quiet  # decided before the market's last minutes, sent inside them: not sent (1.102.1: 15 分钟涨跌最后 90 秒)
         notional = float((st.get("want") or {}).get("shares") or trade.get("order") or 0) * self.live_unit_cap(trade)
         if notional > c.live_max_order_usd + 1e-9:
             return f"单笔最多 ${notional:,.2f} 超过 LIVE_MAX_ORDER_USD ${c.live_max_order_usd:g}"

@@ -1906,3 +1906,18 @@ async def spent_slots():
 
 
 asyncio.run(spent_slots())
+
+
+async def quiet_send():
+    """1.102.1: an order decided before a market's last minutes but signed inside them is not sent — the quiet rules hold to
+    the second (宇树 15 分钟涨跌: no order of any kind in a window's last 90 seconds)."""
+    bot = make_bot(SIM_QUIET_MINUTES="10")
+    await bot.live_prepare(); await bot.live_prefetch(NOW)
+    mk = hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)
+    t = bot.sim_open(mk, "up", CLOSE - 11 * 60_000, maker=m.BookEdge("涨", True, 0.55, 0.15, 300.0, 0.15), shares=100)
+    assert t["live"]["state"] == "pending" and bot.live_send_block(t, {}, CLOSE - 10 * 60_000 - 1_000) == ""
+    assert bot.live_send_block(t, {}, CLOSE - 10 * 60_000 + 1_000) == "结束前 10 分钟不交易"
+    print("QUIET_SEND_OK")
+
+
+asyncio.run(quiet_send())
