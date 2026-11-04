@@ -6,6 +6,8 @@ import asyncio, re, sys, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+import retired  # the markets main no longer lists (their windows are over), put back as this suite's fixtures
+retired.install()
 D = m.D
 BJ = lambda mo, d, h, mi=0, s=0: int(dt.datetime(2026, mo, d, h, mi, s, tzinfo=m.BEIJING).timestamp() * 1000)
 NOW = BJ(10, 5, 10, 0)
@@ -288,6 +290,14 @@ async def run():
     assert any(t.startswith("🟢 新机会｜恒生指数（10-05）\n挂跌 @ 52.0¢｜净优势 +8.0¢") and "提醒门槛 5.0¢" in t for _, t in atg.sent), atg.sent
     r = await ask("/edge 清空"); assert "已取消全部单独门槛" in r and abot.settings()["edge_bars"] == {} and abs(abot.edge_bar(mk_hsi) - 0.10) < 1e-12
     assert abs(abot.edge_default() - 0.10) < 1e-12
+    # 1.95.0: the examples /help and /edge give name what the bot lists (牛来 went with the ladders that ended 10-31)
+    with retired.live():
+        lbot = m.Bot(acfg, m.Store(":memory:"), FM(NOW), AnyTelegram())
+        assert [lbot.edge_target(words.split()) for words in ("价格阶梯", "恒指", "BTC 2027前 150k")] == [
+            ("group:levels", "价格阶梯"), ("key:HSI", "恒生指数"), ("level:BTC-HIT-2027|150k", "BTC 2027前价格 150k")]
+        assert "/edge 恒指 4" in lbot.edge_text() and "/edge BTC 2027前 150k 3" in lbot.edge_text() and "牛来" not in lbot.edge_text()
+    edge_cmd = next(c for c in m.COMMANDS if c.name == "edge")
+    assert edge_cmd.example == "恒指 4" and "/edge BTC 2027前 150k 3" in edge_cmd.note and "牛来" not in edge_cmd.help_line()
 
 
 asyncio.run(run())

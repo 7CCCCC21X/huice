@@ -6,6 +6,8 @@ import asyncio, sys, time, json
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+import retired  # the markets main no longer lists (their windows are over), put back as this suite's fixtures
+retired.install()
 
 D = m.D
 NOW = int(time.time() * 1000)

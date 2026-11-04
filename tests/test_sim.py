@@ -12,6 +12,8 @@ import asyncio, csv, io, os, sys, json, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+import retired  # the markets main no longer lists (their windows are over), put back as this suite's fixtures
+retired.install()
 D = m.D
 BJ = lambda mo, d, h, mi=0: int(dt.datetime(2026, mo, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
 NOW = BJ(10, 5, 10, 0)
@@ -1993,3 +1995,49 @@ fstore.conn = fstore.conn.conn
 fstore.replace(["sim:a"], [("sim:a#1", {"x": 2})])
 assert fstore.get("sim:a") is None and fstore.get("sim:a#1") == {"x": 2} and fstore.touched["sim"] >= 3
 print("REPLACE_OK")
+
+
+async def retired_records():
+    """1.95.0: a market main stopped listing once its window was over still settles what was bought on it. A filled
+    paper trade on the 牛来 ladder or on BTC's October price ladder has no card left to pre-settle it on (the bot's own
+    data for it is gone with the card), so it waits for Predict's result, asked by the market id on the record, and is
+    settled on that; its risk group is the driver saved at the order, and the review page lists it as before."""
+    with retired.live():
+        rbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                        "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}), m.Store(":memory:"), FM(NOW), None)
+        assert "NIULAI" not in rbot.caps and "BTC-HIT-10" not in rbot.ranges and not rbot.caps
+        end = m.et_ms(2026, 10, 31, 23, 59, -4)
+        after = end + rbot.SIM_SETTLE_MS + 60_000
+        base = {"v": 2, "fills": [], "revisions": [], "order": 100.0, "maker": False, "fair": 0.6, "edge": 0.12, "price": 0.48,
+                "status": "filled", "shares": 100.0, "opened": end - 5 * m.DAY_MS, "filled": end - 5 * m.DAY_MS}
+        niu = {**base, "market": "what-marketcap-will-niu-lai-hit-before-nov-2026#77", "slug": "what-marketcap-will-niu-lai-hit-before-nov-2026",
+               "market_id": "77", "item": "$牛来 市值 $300M", "kind": "ladder", "key": "NIULAI", "side": "up", "label": "吃Yes",
+               "settle": {"target": "300000000", "end": end}, "driver": "NIULAI", "driver_name": "$牛来 市值"}
+        btc = {**base, "market": "what-price-will-bitcoin-hit-in-october-2026#41", "slug": "what-price-will-bitcoin-hit-in-october-2026",
+               "market_id": "41", "item": "BTC 10月价格 ↓ $105k", "kind": "range", "key": "BTC-HIT-10", "side": "down", "label": "吃No",
+               "settle": {"target": "105000", "dir": "down", "end": end}, "driver": "BTCUSDT", "driver_name": "BTC"}
+        rbot.sim_save([("niu|up|吃", niu), ("btc10|down|吃", btc)])
+        trades = rbot.sim_trades()
+        assert [rbot.sim_result(trades[t], after) for t in ("niu|up|吃", "btc10|down|吃")] == [None, None]  # no card to decide on
+        assert rbot.sim_due(trades["niu|up|吃"], after) and not rbot.sim_due(trades["niu|up|吃"], end)
+        assert [m.trade_driver(trades[t]) for t in ("niu|up|吃", "btc10|down|吃")] == [("NIULAI", "$牛来 市值"), ("BTCUSDT", "BTC")]
+        asked = []
+
+        async def details(mid):
+            asked.append(mid)
+            name = {"77": "Yes", "41": "No"}[mid]
+            return {"outcomes": ["Yes", "No"], "status": "RESOLVED", "resolved": {"name": name, "index": ["Yes", "No"].index(name)}}
+        rbot.predict.market_details = details
+        await rbot.sim_confirm(rbot.sim_trades(), after)
+        done = rbot.sim_trades()
+        assert sorted(asked) == ["41", "77"], asked
+        assert (done["niu|up|吃"]["status"], done["niu|up|吃"]["payout"], done["niu|up|吃"]["confirm"]) == ("settled", 1.0, "confirmed")
+        assert (done["btc10|down|吃"]["status"], done["btc10|down|吃"]["payout"]) == ("settled", 1.0)  # No won: the No bought pays
+        page = rbot.journal_payload(full=True)
+        m.json.dumps(page)
+        assert {r["item"] for r in page["trades"]} == {"$牛来 市值 $300M", "BTC 10月价格 ↓ $105k"}, page["trades"]
+        assert {k["key"] for k in page["kinds"]} == {"ladder", "range"} and page["total"]["settled"] == 2, (page["kinds"], page["total"])
+    print("RETIRED_RECORDS_OK")
+
+
+asyncio.run(retired_records())

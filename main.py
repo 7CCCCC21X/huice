@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.94.1"
+VERSION = "1.95.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -6302,11 +6302,9 @@ TOUCH_MARKETS = (
     TouchSpec("BNB", "will-bnb-hit-700-or-900", "BNBUSDT", D("700"), D("900")),
     TouchSpec("SOL", "will-solana-hit-60-or-140-first", "SOLUSDT", D("60"), D("140"),
               int(dt.datetime(2026, 3, 12, 13, 27, 8, 415000, tzinfo=dt.timezone.utc).timestamp() * 1000)),
-    # "between August 25th, 2026 at 10:00 AM ET and October 25th, 2026 at 11:59 PM ET" (both EDT)
-    TouchSpec("BTC", "will-btc-hit-70000-or-90000-first", "BTCUSDT", D("70000"), D("90000"),
-              et_ms(2026, 8, 25, 10, 0, -4), et_ms(2026, 10, 25, 23, 59, -4), -4, fixed_start=True),
     # window opens at the market's creation (from Predict; the rules give no date)
     TouchSpec("ETH", "will-ethereum-hit-1k-or-3k-first", "ETHUSDT", D("1000"), D("3000")),
+    # (BTC 先触 70k / 90k, a window the rules date, ended 10-25 23:59 ET; tests/retired.py keeps its line)
 )
 TOUCH_SPOT = ("https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com")
 YEAR_MS = 365 * 24 * 3600 * 1000
@@ -6708,14 +6706,8 @@ class UpDownSpec:
         return f"{et:%m-%d %H:%M} ET，北京 {bj}" if plain else f"{et:%m-%d %H:%M} ET（北京 {bj}）"
 
 
-UPDOWN_MARKETS = (
-    # "the Binance 1 minute candle for BTC/USDT Sep 30 '26 11:59 PM in the ET timezone" against the one for
-    # "Oct 31 '26 11:59 PM ET" (both EDT: daylight time ends on Nov 1)
-    UpDownSpec("BTC-2026-10", "btc-up-down-october-2026", "BTCUSDT", "BTC 10月涨跌",
-               et_ms(2026, 9, 30, 23, 59, -4), et_ms(2026, 10, 31, 23, 59, -4)),
-    # the same two minutes on ETH/USDT ("ETH closed September at $2,696.07 on Binance": the starting candle's close)
-    UpDownSpec("ETH-2026-10", "eth-up-down-october-2026", "ETHUSDT", "ETH 10月涨跌",
-               et_ms(2026, 9, 30, 23, 59, -4), et_ms(2026, 10, 31, 23, 59, -4)),
+UPDOWN_MARKETS: tuple[UpDownSpec, ...] = (
+    # none listed now: BTC / ETH 10月涨跌 ended 10-31 23:59 ET; tests/retired.py keeps their lines
 )
 
 
@@ -6891,11 +6883,8 @@ class FlipSpec:
                 f"{stamp(self.end_ms, seconds=False)}）")
 
 
-FLIP_MARKETS = (
-    # "at any point between October 2, 2026, 04:00 AM ET and October 31, 2026, 11:59 PM ET" (both EDT): the HYPE/USDC
-    # and SOL/USDC 1-minute closes with the same timestamp on Hyperliquid
-    FlipSpec("HYPE-SOL", "will-hype-flip-sol-by-nov-26", "HYPE 反超 SOL", "HYPE", "SOL",
-             et_ms(2026, 10, 2, 4, 0, -4), et_ms(2026, 10, 31, 23, 59, -4)),
+FLIP_MARKETS: tuple[FlipSpec, ...] = (
+    # none listed now: HYPE 反超 SOL (will-hype-flip-sol-by-nov-26) ended 10-31 23:59 ET; tests/retired.py keeps its line
 )
 
 
@@ -7125,51 +7114,10 @@ class CapSpec:
     gecko_pool: str = ""  # the GeckoTerminal pool for the bars; "" = the token's most liquid pool, looked up by its address
 
 
-CAP_MARKETS = (
-    # "from 11:30 PM ET on August 16, 2026 to 11:59 PM ET on October 31, 2026" (both EDT); settles on Flap.sh
-    CapSpec("NIULAI", "what-marketcap-will-niu-lai-hit-before-nov-2026", "$牛来 市值", "0xbeea1d618e533a387d941f58a7d4c9b7bd377777",
-            et_ms(2026, 8, 16, 23, 30, -4), et_ms(2026, 10, 31, 23, 59, -4),
-            (D("2e8"), D("3e8"), D("5e8"), D("1e9")), "Predict 交易至北京 11-01 07:59"),
-    # "between market creation on August 17, 13:00 PM ET to 11:59 PM ET on October 31, 2026"; FDV = price × total supply
-    CapSpec("ANSEM", "what-fdv-will-ansem-hit-before-nov-2026", "$ANSEM FDV", "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump",
-            et_ms(2026, 8, 17, 13, 0, -4), et_ms(2026, 10, 31, 23, 59, -4),
-            tuple(D(f"{n}e8") for n in (5, 6, 7, 8, 9)) + (D("1e9"),),
-            chain="solana", supply="fdv", gecko="solana", metric="FDV", settle="pump.fun"),
-    # "between market creation on August 31, 2026 at 06:00 AM ET to October 31, 2026 at 11:59 PM ET"; the rules' own
-    # source is this DexScreener pair; FDV = (total supply − burned) × price
-    CapSpec("PONS", "what-fdv-will-pons-hit-before-nov-2026", "$PONS FDV", "0x39dBED3a2bd333467115dE45665cC57F813C4571",
-            et_ms(2026, 8, 31, 6, 0, -4), et_ms(2026, 10, 31, 23, 59, -4),
-            (D("7e8"), D("8e8"), D("9e8"), D("1e9")),
-            chain="robinhood", pair="0x10cc6bd38112cac182db90b6a71d8bb5939526ba", supply="fdv", gecko="",
-            metric="FDV", settle="DexScreener"),
-    # three more Robinhood-chain FDV ladders settled on the rules' own DexScreener pairs (FDV = (total − burned) × price);
-    # their levels are not listed here: the card shows the ones Predict's market titles carry
-    # "between market creation on September 4 at 6:00 AM ET, 2026 to October 31, 2026 at 11:59 PM ET" (MEME/USDG)
-    CapSpec("MEME", "what-fdv-will-meme-hit-before-november-2026", "$MEME FDV", "0x385F4f8ae47651ce5F58F5265395a669f8281e18",
-            et_ms(2026, 9, 4, 6, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
-            chain="robinhood", pair="0xc6e298e137f2905398db87e6eae49ede64d231fee37330fa433fec917f4618b6", supply="fdv", gecko="",
-            metric="FDV", settle="DexScreener"),
-    # "between market creation on September 2, 2026 at 01:00 AM ET to October 31, 2026 at 11:59 PM ET" (CASHCAT/WETH)
-    CapSpec("CASHCAT", "what-fdv-will-cashcat-hit-before-november-2026", "$CASHCAT FDV", "0x020bfC650A365f8BB26819deAAbF3E21291018b4",
-            et_ms(2026, 9, 2, 1, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
-            chain="robinhood", pair="0xa70fc67c9f69da90b63a0e4c05d229954574e313", supply="fdv", gecko="", metric="FDV", settle="DexScreener"),
-    # "between market creation on September 1, 2026 at 5:00 AM ET to October 31, 2026 at 11:59 PM ET" (the AI pair)
-    CapSpec("AI", "what-fdv-will-ai-hit-before-nov-2026", "$AI FDV", "0x2E8c31162b855A2ffa90F6F8634643Ad6F111e18",
-            et_ms(2026, 9, 1, 5, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
-            chain="robinhood", pair="0xcbdfea90430a30ee4469c9902e120a77e7c7e4711d5643671c1d1957f2f1ce27", supply="fdv", gecko="",
-            metric="FDV", settle="DexScreener"),
-    # "between market creation on September 6 at 04:00 AM ET, 2026 to October 31, 2026 at 11:59 PM ET" (STONK/SOL on Solana);
-    # the rules' own DexScreener pair settles it, FDV = (total − burned) × price; the pair is spelt as the rules' link spells it
-    # (DexScreener reads it either way), which GeckoTerminal would not accept as a pool path; the hourly bars (σ, the window's
-    # high since 09-06) come from the mint's pool whose address matches it without regard to case, else its most liquid pool
-    CapSpec("STONK", "what-fdv-will-stonk-hit-before-november-2026", "$STONK FDV", "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
-            et_ms(2026, 9, 6, 4, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
-            chain="solana", pair="afrddtgywcveqb1gxcahr8i48o6qtxyqksdvkeludehg", supply="fdv", gecko="solana", metric="FDV", settle="DexScreener"),
-    # "between market creation on September 1, 2026 at 3:45 AM ET to October 31, 2026 at 11:59 PM ET" (STONKBROKER/WETH)
-    CapSpec("STONKBROKER", "what-fdv-will-stonkbroker-hit-by-november-2026", "$STONKBROKER FDV", "0xe934e36A439C94017B64a3FecE66AF12099aBF50",
-            et_ms(2026, 9, 1, 3, 45, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
-            chain="robinhood", pair="0xd33c8fd38b06e989cdbd4dffdefab71c4bdd415b24964c8d69e38ff35b068f92", supply="fdv", gecko="",
-            metric="FDV", settle="DexScreener"),
+CAP_MARKETS: tuple[CapSpec, ...] = (
+    # none listed now: the eight "before November" ladders ended 10-31 23:59 ET (tests/retired.py keeps them, as the
+    # suites' fixtures and as examples of each kind of line: a BSC market cap settled on Flap.sh, a Solana FDV with
+    # GeckoTerminal bars, FDVs settled on the rules' own DexScreener pair with the levels read from Predict)
 )
 BSC_RPC = ("https://bsc-dataseed.bnbchain.org", "https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com")
 BURN_ADDRESSES = ("0x000000000000000000000000000000000000dead", "0x0000000000000000000000000000000000000000")
@@ -7747,16 +7695,11 @@ class RangeSpec:
 
 
 RANGE_MARKETS = (
-    # "from 00:00 AM ET on the first day to 11:59 PM ET on the last" (October: EDT throughout); Binance 1m candles
-    RangeSpec("BTC-HIT-10", "what-price-will-bitcoin-hit-in-october-2026", "BTCUSDT", "spot", "BTC 10月价格",
-              et_ms(2026, 10, 1, 0, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), "down"),
-    RangeSpec("ETH-HIT-10", "what-price-will-ethereum-hit-in-october-2026", "ETHUSDT", "spot", "ETH 10月价格",
-              et_ms(2026, 10, 1, 0, 0, -4), et_ms(2026, 10, 31, 23, 59, -4)),
-    RangeSpec("SOL-HIT-10", "what-price-will-solana-hit-in-october-2026", "SOLUSDT", "spot", "SOL 10月价格",
-              et_ms(2026, 10, 1, 0, 0, -4), et_ms(2026, 10, 31, 23, 59, -4)),
-    # HYPEUSDT on Binance futures (the rules link binance.com/en/futures/HYPEUSDT)
-    RangeSpec("HYPE-HIT-10", "what-price-will-hyperliquid-hit-in-october-2026", "HYPEUSDT", "futures", "HYPE 10月价格",
-              et_ms(2026, 10, 1, 0, 0, -4), et_ms(2026, 10, 31, 23, 59, -4)),
+    # "from 00:00 AM ET on the first day to 11:59 PM ET on the last", Binance 1m candles of ETH/USDT spot. November opens
+    # in daylight time (it ends at 02:00 on Sunday 11-01) and closes in standard time: 11-01 04:00 UTC to 12-01 04:59 UTC.
+    # (The October ladders of BTC, ETH, SOL and HYPE ended 10-31 23:59 ET; tests/retired.py keeps their lines.)
+    RangeSpec("ETH-HIT-11", "what-price-will-ethereum-hit-in-november-2026", "ETHUSDT", "spot", "ETH 11月价格",
+              et_ms(2026, 11, 1, 0, 0, -4), et_ms(2026, 11, 30, 23, 59, -5)),
     # "between November 24, 2025, 14:00 and December 31, 2026, 23:59 in the ET timezone" (EST at both ends), a High at or
     # over the level: the whole of 2026 on one card
     RangeSpec("BTC-HIT-2027", "what-price-will-bitcoin-hit-before-2027", "BTCUSDT", "spot", "BTC 2027前价格",
@@ -11840,8 +11783,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("resume", "恢复当前订阅"),
     Command("prob", "查看各标的下个收盘涨跌概率及计算过程"),
     Command("book", "对比 Predict 订单簿和模型公平价，看挂涨还是挂跌优势大"),
-    Command("edge", "优势提醒门槛：按栏目 / 市场 / 档位单独设置几¢才提醒", "牛来 4",
-            "不带参数查看；/edge 6 改默认；/edge 市值阶梯 6、/edge 牛来 4、/edge 牛来 300M 3；末尾 off 取消；/edge 清空"),
+    Command("edge", "优势提醒门槛：按栏目 / 市场 / 档位单独设置几¢才提醒", "恒指 4",
+            "不带参数查看；/edge 6 改默认；/edge 价格阶梯 6、/edge 恒指 4、/edge BTC 2027前 150k 3；末尾 off 取消；/edge 清空"),
     Command("web", "获取概率网页链接（自动刷新）"),
     Command("calib", "用已保存的预测快照和实际收盘给概率模型打分（Brier/校准/逐日向前拟合）"),
     Command("sim", "模拟交易：净优势 ≥10¢ 时买 100 份，看长期是赚还是亏（只记账，不下单）"),
@@ -16825,8 +16768,8 @@ class Bot:
             lines += [f"· {names.get(k, k)}：≥{bars[k]:g}¢" for k in extra]
         else:
             lines.append("没有单独设置的栏目、市场或档位。")
-        lines.append("用法：/edge 6 改默认；/edge 市值阶梯 6（栏目：指数 / 合约标的 / 加密 / 价格阶梯 / 市值阶梯）；"
-                     "/edge 牛来 4（市场：名字、别名或代码）；/edge 牛来 300M 3（档位）；末尾写 off 取消；/edge 清空 全部取消。"
+        lines.append("用法：/edge 6 改默认；/edge 价格阶梯 6（栏目：指数 / 合约标的 / 加密 / 价格阶梯 / 市值阶梯）；"
+                     "/edge 恒指 4（市场：名字、别名或代码）；/edge BTC 2027前 150k 3（档位）；末尾写 off 取消；/edge 清空 全部取消。"
                      "网页红框的门槛另在网页 ✎ 自定义里设置。")
         return "\n".join(lines)
 
@@ -16854,7 +16797,7 @@ class Bot:
             try:
                 cents = float(value)
             except ValueError:
-                raise ValueError("用法：/edge 6（默认）、/edge 市值阶梯 6、/edge 牛来 4、/edge 牛来 300M 3、/edge 牛来 off；"
+                raise ValueError("用法：/edge 6（默认）、/edge 价格阶梯 6、/edge 恒指 4、/edge BTC 2027前 150k 3、/edge 恒指 off；"
                                  "单位 ¢，0.5～50") from None
             if not 0.5 <= cents <= 50:
                 raise ValueError("门槛范围 0.5～50¢")

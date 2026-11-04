@@ -7,6 +7,8 @@ import asyncio, csv, io, sys, json, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+import retired  # the markets main no longer lists (their windows are over), put back as this suite's fixtures
+retired.install()
 D = m.D
 BJ = lambda mo, d, h, mi=0: int(dt.datetime(2026, mo, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
 NOW = BJ(10, 7, 10, 0)

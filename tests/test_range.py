@@ -2,12 +2,27 @@ import asyncio, os, re, sys, math, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+import retired  # 1.95.0: the October ladders left main's table when their window ended; they stay this suite's examples
 D = m.D
+LIVE = retired.LIVE["RANGE_MARKETS"]  # what main lists: November's ETH ladder and the two "before 2027"
+retired.install()
 BTC, ETH, SOL, HYPE, BTC27, ZEC27 = m.RANGE_MARKETS
 H = 3_600_000
 utc = lambda *a: int(dt.datetime(*a, tzinfo=dt.timezone.utc).timestamp() * 1000)
 
-# --- the four markets as their rules state them -------------------------------------------------------------------
+# --- 1.95.0: the table main runs with. ETH's November ladder replaced its October one; the BTC, SOL and HYPE October
+# ladders ended 10-31 23:59 ET and were taken out, as every market whose window is over ----------------------------
+ETH11 = LIVE[0]
+assert [s.key for s in LIVE] == ["ETH-HIT-11", "BTC-HIT-2027", "ZEC-HIT-2027"] and LIVE[1:] == (BTC27, ZEC27)
+assert (ETH11.slug, ETH11.symbol, ETH11.venue, ETH11.name, ETH11.default_dir) == (
+    "what-price-will-ethereum-hit-in-november-2026", "ETHUSDT", "spot", "ETH 11月价格", "up")
+# "from 00:00 AM ET on the first day to 11:59 PM ET on the last": 11-01 00:00 is still daylight time (it ends at 02:00
+# that Sunday), 11-30 23:59 is standard time; whole hours either way, so the hourly candles cover the window exactly
+assert ETH11.start_ms == utc(2026, 11, 1, 4, 0) and ETH11.end_ms == utc(2026, 12, 1, 4, 59) and ETH11.start_ms % H == 0
+assert ETH11.label(ETH11.start_ms) == "11-01 00:00 ET（北京 11-01 12:00）" and ETH11.label(ETH11.end_ms) == "11-30 23:59 ET（北京 12-01 12:59）"
+assert all(s.end_ms > utc(2026, 11, 4) for s in LIVE)  # nothing listed had ended when the ended ones were taken out
+
+# --- the four October markets as their rules state them -----------------------------------------------------------
 assert BTC.start_ms == utc(2026, 10, 1, 4, 0) and BTC.end_ms == utc(2026, 11, 1, 3, 59)  # 10-01 00:00 → 10-31 23:59 EDT
 assert all(s.start_ms == BTC.start_ms and s.end_ms == BTC.end_ms for s in m.RANGE_MARKETS[:4])
 assert [s.slug for s in m.RANGE_MARKETS[:4]] == [f"what-price-will-{c}-hit-in-october-2026" for c in ("bitcoin", "ethereum", "solana", "hyperliquid")]
@@ -845,7 +860,82 @@ async def creation_window():
     print("CREATION_WINDOW_OK")
 
 
+async def november():
+    """1.95.0: ETH's November ladder, the one main lists. Its window opens in daylight time and closes in standard time
+    (11-01 00:00 EDT = 04:00 UTC to the 1-minute candle of 11-30 23:59 EST = 12-01 04:59 UTC): the hourly candles are
+    read from its first hour through its last, October's last hour and December's first never count, and once it is
+    read to its end the levels it never reached are worth 0. The bot built from main's own tables shows it as the card
+    ETH 11月价格, beside the three 先触 cards, the two "before 2027" ladders and STRC: no 涨跌, 反超 or 市值阶梯 card."""
+    S, E = ETH11.start_ms, ETH11.end_ms + 60_000  # E: 12-01 05:00 UTC, the end of the window's last hour
+    hours = []
+    for t in range(S - 800 * H, E + 3 * H, H):
+        close = 3000.0 * (1.004 if t // H % 2 else 1.0)  # alternating closes: σ ≈ 37%
+        high, low = close * 1.001, close * 0.999
+        if t == S - H: high, low = 4000.0, 2000.0  # 10-31 23:00 EDT: October's last hour
+        if t == S + 30 * H: high = 3300.0          # the month's high
+        if t == E - H: low = 2700.0                # 11-30 23:00 EST: the window's last hour, which counts
+        if t == E: high, low = 5000.0, 1000.0      # 12-01 00:00 EST: December's first hour
+        hours.append([t, f"{close:.2f}", f"{high:.2f}", f"{low:.2f}", f"{close:.2f}", "1", t + H - 1, "0", 1, "0", "0", "0"])
+    calls, clock = [], [0]
+
+    async def get(path, **params):
+        calls.append((path, params))
+        if path == "ticker/price":
+            return {"symbol": params["symbol"], "price": "3001.5"}
+        assert path == "klines" and params["symbol"] == "ETHUSDT" and params["interval"] == "1h", (path, params)
+        seen = [r for r in hours if r[0] <= clock[0]]  # Binance has no candle from after now
+        if "startTime" in params:
+            return [r for r in seen if params["startTime"] <= r[0] <= params["endTime"]][:params["limit"]]
+        return seen[-params["limit"]:]
+
+    rm = m.RangeMarket(m.Store(":memory:"), ETH11)
+    rm.get = get
+    assert rm.window_end == E and rm.range_word == "本月" and rm.window_label() == "11-01 00:00 ET（北京 11-01 12:00）起"
+    MID = clock[0] = S + 100 * H + 10 * 60_000  # 11-05 03:10 EST
+    await rm.refresh(MID)
+    first = next(r for r in hours if r[0] == S)
+    assert rm.error == "" and rm.price == D("3001.5") and rm.history["start"] == S and rm.history["through"] == S + 100 * H, (rm.error, rm.history)
+    assert rm.history["open"] == float(first[1]) == rm.reference() and (rm.history["high"], rm.history["high_at"]) == (3300.0, S + 30 * H)
+    assert rm.history["low"] > 2990.0 and rm.advice_problem(MID) == "", rm.history  # October's 2,000 is not November's low
+    AFTER = clock[0] = E + 2 * H + 10 * 60_000
+    rm.times["scan"] = -1e9
+    await rm.refresh(AFTER)
+    assert rm.complete() and rm.running == {} and rm.history["through"] == E, rm.history
+    assert (rm.history["high"], rm.history["low"], rm.history["low_at"]) == (3300.0, 2700.0, E - H), rm.history  # not December's
+    assert rm.probability(D("3300"), "up", AFTER) == 1.0 and rm.probability(D("3301"), "up", AFTER) == 0.0
+    assert rm.probability(D("2700"), "down", AFTER) == 1.0 and rm.probability(D("2699"), "down", AFTER) == 0.0
+    assert all(c[1]["startTime"] >= S and c[1]["endTime"] < E for c in calls if "startTime" in c[1]), calls
+    assert rm.advice_problem(AFTER) == "窗口已结束，等待结算"
+
+    class FakeMarket:
+        def __init__(self): self.config = None
+        def now_ms(self): return MID
+        async def get(self, path, **params): return {"symbol": params.get("symbol"), "price": "45.12"}
+
+    with retired.live():
+        cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
+        bot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(), None)
+        assert list(bot.ranges) == ["ETH-HIT-11", "BTC-HIT-2027", "ZEC-HIT-2027", "STRC-100"] and list(bot.touches) == ["BNB", "SOL", "ETH"]
+        assert not bot.updowns and not bot.flips and not bot.caps
+        targets = bot.predict_targets(MID)
+        assert targets["ETH-HIT-11"] == ETH11.slug and "ETH-HIT-11" in bot.predict.ladder_keys and "ETH-HIT-10" not in targets
+        card = bot.range_payload(bot.ranges["ETH-HIT-11"], MID)
+        assert (card["name"], card["group"], card["close_ms"]) == ("ETH 11月价格", "levels", ETH11.end_ms), card
+        assert card["close_label"] == "11-30 23:59 ET（北京 12-01 12:59）这根 1 分钟 K 为止" and card["source"] == "币安现货", card
+        assert card["predict"]["url"].startswith("https://predict.fun/zh-cn/market/what-price-will-ethereum-hit-in-november-2026")
+        assert (card["ladder"]["window"], card["ladder"]["window_word"]) == ("11-01 00:00 ET（北京 11-01 12:00）起", "本月"), card["ladder"]
+        items = [(i["group"], i["name"]) for i in bot.odds_payload()["items"] if i["group"] in {"crypto", "levels", "ladder"}]
+        assert items == [("crypto", "BNB 先触 700/900"), ("crypto", "SOL 先触 60/140"), ("crypto", "ETH 先触 1k/3k"),
+                         ("levels", "ETH 11月价格"), ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格"),
+                         ("levels", "STRC 触及 $100")], items
+        # the price streams follow: no HYPEUSDT on futures, no HYPE / SOL on Hyperliquid (the flip is gone)
+        assert bot.binance_streams["spot"].symbols() == ["BNBUSDT", "SOLUSDT", "ETHUSDT", "BTCUSDT", "ZECUSDT"]
+        assert bot.binance_streams["futures"].symbols() == ["UNITREEUSDT"] and not {"HYPE", "SOL"} & set(bot.hl_stream.coins())
+    print("NOVEMBER_OK")
+
+
 bot = asyncio.run(run())
 asyncio.run(browser_check(bot))
 asyncio.run(creation_window())
+asyncio.run(november())
 print("RANGE_OK")
