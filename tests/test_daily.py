@@ -141,7 +141,9 @@ async def run():
     resting = [t for t in trades.values() if t.get("maker")]
     assert len(resting) == 1 and resting[0]["order"] == 10 and resting[0]["status"] == "resting", resting
 
-    # --- the cap, each side its own (1.98.0): its positions and orders, in flight or resting, deep or not ---------------------
+    # --- the cap (1.98.0: each side its own — SIM_SHARES_NET=off; 1.104.11: on the net position with the setting on, the
+    # default, as the taker and after-hours caps: Predict merges one market's 涨 and 跌 shares) -------------------------------
+    sep = m.Bot(m.Config.from_env({**ENV, "SIM_SHARES_NET": "off"}), m.Store(":memory:"), FM(EVENING), None)
     base = {"v": 2, "market": SPEC.slug, "slug": SPEC.slug, "item": SPEC.name, "kind": "updown", "key": "BTC-DAY", "fills": [],
             "revisions": [], "settle": mk.settle, "driver": "BTCUSDT", "driver_name": "BTC", "opened": EVENING - H}
     fill = lambda side, n, tid, price: (f"{SPEC.slug}|{side}|吃#{tid}", {**base, "side": side, "label": "吃" + ("涨" if side == "up" else "跌"),
@@ -149,24 +151,33 @@ async def run():
     held = m.TradeMap(dict([fill("up", 60, 1, 0.40), fill("down", 100, 1, 0.55),
                             (f"{SPEC.slug}|up|挂", {**base, "side": "up", "label": "挂涨", "maker": True, "status": "resting", "shares": 5.0,
                                                     "order": 35.0, "price": 0.36})]))
-    # 涨 holds 60 + 35 = 95: 5 left; 跌's 100 neither counts against it nor offsets it
-    assert bot.sim_market_room(held, mk, "up") == (5.0, "")
+    # each side its own: 涨 holds 60 + 35 = 95: 5 left; 跌's 100 neither counts against it nor offsets it
+    assert sep.sim_market_room(held, mk, "up") == (5.0, "")
     q = m.taker_quote(mk.book, "up", 10, 200, cap)
-    picked, why = bot.sim_taker_pick(mk, held, "up", q, EVENING)
+    picked, why = sep.sim_taker_pick(mk, held, "up", q, EVENING)
     assert why == "" and picked["got"] == 5, (picked, why)  # cut to what is left, not refused
     maker = m.BookEdge("涨", True, 0.36, 0.2, 500)
-    assert bot.sim_maker_pick(mk, held, "up", maker, EVENING) == (5.0, "")
+    assert sep.sim_maker_pick(mk, held, "up", maker, EVENING) == (5.0, "")
     deep = m.dataclasses.replace(maker, front=True)  # a deep-bid order too: no order outside this cap
-    assert bot.sim_maker_pick(mk, held, "up", deep, EVENING) == (5.0, "")
+    assert sep.sim_maker_pick(mk, held, "up", deep, EVENING) == (5.0, "")
     down_full = "跌这一边持仓加挂单已有 100 份，达到加密日涨跌每边上限 100 份（内测，SIM_CRYPTO_DAY_MAX_SHARES）"
-    assert bot.sim_market_room(held, mk, "down") == (0.0, down_full)
-    assert bot.sim_taker_pick(mk, held, "down", m.taker_quote(mk.book, "down", 10, 200), EVENING)[1] == down_full
+    assert sep.sim_market_room(held, mk, "down") == (0.0, down_full)
+    assert sep.sim_taker_pick(mk, held, "down", m.taker_quote(mk.book, "down", 10, 200), EVENING)[1] == down_full
     full = m.TradeMap({**held, **dict([fill("up", 5, 2, 0.41)])})
-    room, why = bot.sim_market_room(full, mk, "up")
+    room, why = sep.sim_market_room(full, mk, "up")
     assert room == 0 and why == "涨这一边持仓加挂单已有 100 份，达到加密日涨跌每边上限 100 份（内测，SIM_CRYPTO_DAY_MAX_SHARES）", why
-    assert bot.sim_taker_pick(mk, full, "up", q, EVENING)[1] == why and bot.sim_maker_pick(mk, full, "up", maker, EVENING)[1] == why
+    assert sep.sim_taker_pick(mk, full, "up", q, EVENING)[1] == why and sep.sim_maker_pick(mk, full, "up", maker, EVENING)[1] == why
     settled = m.TradeMap({**full, f"{SPEC.slug}|up|吃#2": {**full[f"{SPEC.slug}|up|吃#2"], "status": "settled"}})
-    assert bot.sim_market_room(settled, mk, "up") == (5.0, "")  # a settled record holds nothing
+    assert sep.sim_market_room(settled, mk, "up") == (5.0, "")  # a settled record holds nothing
+    # on the net position (the default): the other side's fills offset — 涨's 95 against 跌's 100 (the resting order's 5 filled
+    # count as 涨's too: 65) leaves both sides room; 11-04: 99.6 涨 bought against 89.8 跌 were 9.9 涨 on the account
+    assert bot.config.sim_shares_net and bot.sim_market_room(held, mk, "up") == (105.0, "") and bot.sim_market_room(held, mk, "down") == (65.0, "")
+    assert bot.sim_market_room(full, mk, "up") == (100.0, "") and bot.sim_taker_pick(mk, full, "up", q, EVENING)[1] == "" \
+        and bot.sim_maker_pick(mk, full, "up", maker, EVENING) == (10.0, "")
+    net_full = m.TradeMap(dict([fill("down", 110, 1, 0.55), fill("up", 10, 1, 0.40)]))
+    assert bot.sim_market_room(net_full, mk, "up") == (200.0, "")
+    assert bot.sim_market_room(net_full, mk, "down") == (0.0, "跌这一边持仓加挂单已有 110 份、另一边持仓 10 份抵掉、净 100 份，达到加密日涨跌每边上限 100 份（内测，SIM_CRYPTO_DAY_MAX_SHARES）")
+    assert bot.sim_market_room(m.TradeMap(dict([fill("down", 100, 1, 0.55), fill("up", 10, 1, 0.40)])), mk, "down") == (10.0, "")
 
     # --- nothing bought in the last half hour; a resting order withdrawn ---------------------------------------------------------
     late, early = et(2026, 11, 4, 11, 31, -5), et(2026, 11, 4, 11, 29, -5)

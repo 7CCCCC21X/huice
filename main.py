@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.104.10"
+VERSION = "1.104.11"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -488,7 +488,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_AFTER_HOURS_SHARES", "盘后吃单每次最多买多少份", "0～1000000：开盘前、收盘后的吃单单独按这个份数；0 = 同盘中吃单的份数"),
     ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
-    ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限和盘后每边持仓上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
+    ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限、盘后每边持仓上限、加密日涨跌和 15 分钟涨跌的每边上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
     ("SIM_NO_ODDS_WITHDRAW_MINUTES", "概率暂缺多久撤单（分钟）", "0～1440：卡片的概率暂缺（如上证卡周末 A50 休市、行情断流）或暂不建议持续这么多分钟后，这个市场挂着的单撤掉（低价挂单也撤），概率回来再按新公平价重挂；没有概率时本来就不开新单；0 = 不撤、挂着等"),
     ("SIM_MAX_FAIR_CENTS", "公平价最多按多少计（¢）", "50～100：这一边的公平价高于这个数时按这个数算净优势——模型再自信也只信到这里（出事时 95¢ 也能归零），接近必然的一边只在价格低到上限之下仍留足门槛时才吃、才挂：公平价 99.6¢、卖1 85¢，按 95 − 85.3 = 9.7¢ 判；100 = 按模型的公平价"),
@@ -507,11 +507,11 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_AFTER_HOURS_MAX_PRICE_CENTS", "盘后只买这个价以下的（¢）", "1～99：指数/个股日涨跌开盘前、收盘后，吃单只买这个价以下的卖单、挂单只挂这个价以下的，挂着的高于它就撤；默认 60；0 = 不限"),
     ("SIM_QUIET_MINUTES", "结束前多少分钟不交易", "0～1440：从标的收盘 / 市场截止前这么多分钟起不开新单，未成交的挂单撤掉；0 = 不限"),
     ("SIM_CRYPTO_DAY_SHARES", "加密日涨跌每次最多买多少份（内测）", "0～1000000：BTC / ETH / BNB 每日涨跌市场（每天 12:00 ET 结算）的吃单、挂单每次最多这么多份，上面的份数设置更小时按更小的；0 = 不另设"),
-    ("SIM_CRYPTO_DAY_MAX_SHARES", "加密日涨跌每个市场每边最多持有多少份（内测）", "0～10000000：每日涨跌市场的涨、跌两边各自的持仓加挂单（含发送中、撤单待确认、低价挂单）不超过这个数，两边各算各的、不互相抵；超出的部分不买、只买剩下的额度；0 = 不另设"),
+    ("SIM_CRYPTO_DAY_MAX_SHARES", "加密日涨跌每个市场每边最多持有多少份（内测）", "0～10000000：每日涨跌市场的涨、跌两边各自的持仓加挂单（含发送中、撤单待确认、低价挂单）不超过这个数，两边各算各的，SIM_SHARES_NET=on（默认）时按净头寸、另一边已成交的持仓抵掉（Predict 会把同一市场两边的份额合并成 USDT，账户上只剩净头寸）；超出的部分不买、只买剩下的额度；0 = 不另设"),
     ("SIM_CRYPTO_DAY_EDGE_CENTS", "加密日涨跌触发买入的净优势（¢/份，内测）", "0～50：每日涨跌市场单独的买入门槛，吃单、挂单都按它（模型误差更大时按模型误差），挂单撤单线随之不高于它减 0.5¢；0 = 同“触发买入的净优势”。怎么定：看 /calib 里的“加密日涨跌吃单门槛回测”"),
     ("SIM_CRYPTO_DAY_QUIET_MINUTES", "加密日涨跌结束前多少分钟不买（内测）", "0～1440：每日涨跌市场在结算那根 1 分钟 K（12:00 ET）之前这么多分钟起不开新单，未成交的挂单撤掉；和“结束前多少分钟不交易”取较长的；0 = 只按那一项"),
     ("SIM_CRYPTO_15M_SHARES", "15 分钟涨跌每次最多买多少份（内测）", "0～1000000：宇树、SK 海力士 15 分钟涨跌市场（交易时段里每 15 分钟一个，按币安合约指数价结算）的吃单、挂单每次最多这么多份，上面的份数设置更小时按更小的；0 = 不另设"),
-    ("SIM_CRYPTO_15M_MAX_SHARES", "15 分钟涨跌每个市场每边最多持有多少份（内测）", "0～10000000：每个 15 分钟市场的涨、跌两边各自的持仓加挂单（含发送中、撤单待确认、低价挂单）不超过这个数，两边各算各的；超出的部分不买、只买剩下的额度；0 = 不另设"),
+    ("SIM_CRYPTO_15M_MAX_SHARES", "15 分钟涨跌每个市场每边最多持有多少份（内测）", "0～10000000：每个 15 分钟市场的涨、跌两边各自的持仓加挂单（含发送中、撤单待确认、低价挂单）不超过这个数，两边各算各的，SIM_SHARES_NET=on 时按净头寸、另一边已成交的持仓抵掉；超出的部分不买、只买剩下的额度；0 = 不另设"),
     ("SIM_CRYPTO_15M_EDGE_CENTS", "15 分钟涨跌触发买入的净优势（¢/份，内测）", "0～50：15 分钟涨跌市场单独的买入门槛，吃单、挂单都按它（模型误差更大时按模型误差），挂单撤单线随之不高于它减 0.5¢；0 = 同“触发买入的净优势”"),
     ("SIM_CRYPTO_15M_QUIET_SECONDS", "15 分钟涨跌结束前多少秒不下单（内测）", "0～600：每个 15 分钟窗口结束前这么多秒起不下任何订单（吃单、挂单都不下，真实订单在这之前决定、发出时已进入这段时间的也不发），未成交的挂单撤掉；默认 90；最后一分钟（结算价那根 1 分钟 K）本来就不交易；只管 15 分钟涨跌，“结束前多少分钟不交易”不管这类市场"),
     ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
@@ -15194,19 +15194,25 @@ class Bot:
     def sim_market_room(self, trades: dict[str, dict], mk: SimMarket, side: str) -> tuple[float, str]:
         """How many more shares one side of a market in beta (a daily crypto up/down market, a 15-minute one) may take
         under its cap (SIM_CRYPTO_DAY_MAX_SHARES, SIM_CRYPTO_15M_MAX_SHARES: sim_beta): the cap less what that side holds —
-        its positions and its orders resting or in flight at their whole count, deep-bid ones too; each side has its own
-        cap, the other side's shares neither count nor offset (1.98.0: "每边各 100 份") — and why none when no share is
-        left. (inf, "") on any other market or with the cap off."""
+        its positions and its orders resting or in flight at their whole count, deep-bid ones too — less, with
+        SIM_SHARES_NET (on by default), the other side's fills (sim_other_held): the cap is on the side's net position,
+        as the taker and after-hours caps have been since 1.91.0. 1.98.0 counted each side on its own ("每边各 100 份");
+        1.104.11: Predict merges one market's 涨 and 跌 shares into USDT, so the 99.6 涨 bought on 11-04 against 89.8 跌
+        were 9.9 涨 on the account, not 99.6, and the side was refused at a cap it was nowhere near. Why none when no
+        share is left. (inf, "") on any other market or with the cap off."""
         beta = self.sim_beta(mk.settle)
         if beta is None or beta.max_shares <= 0:
             return math.inf, ""
         cap = beta.max_shares
         held = side_held(trades, mk.market, side)
-        used = held["total"] + held["deep"]
+        gross = held["total"] + held["deep"]
+        other = self.sim_other_held(trades, mk, side)  # SIM_SHARES_NET: the other side's fills offset
+        used = gross - other
         room = cap - used
         if room >= SIM_MIN_SHARES - 1e-9:
             return room, ""
-        return 0.0, (f"{mk.sides[0 if side == 'up' else 1]}这一边持仓加挂单已有 {used:g} 份，" + ("达到" if used >= cap - 1e-9 else "离")
+        offset = f"、另一边持仓 {other:g} 份抵掉、净 {used:g} 份" if other > 1e-9 else ""
+        return 0.0, (f"{mk.sides[0 if side == 'up' else 1]}这一边持仓加挂单已有 {gross:g} 份{offset}，" + ("达到" if used >= cap - 1e-9 else "离")
                      + f"{beta.name}每边上限 {cap:g} 份" + ("" if used >= cap - 1e-9 else "不足 1 份") + f"（内测，{beta.env}_MAX_SHARES）")
 
     def sim_beta_version(self, mk: SimMarket) -> dict:
