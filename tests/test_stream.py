@@ -87,7 +87,13 @@ async def run():
     ws.push({"type": "M", "topic": "predictOrderbook/7", "data": {"version": 6, "asks": [{"price": "0.84", "size": "20"}]}})
     await asyncio.sleep(0.05)
     book = feed.books["HSI"]
-    assert stream.dropped == 2 and book.bids[0] == (D("0.81"), D("110.5")) and book.asks == ((D("0.84"), D("20")),) and stream.books == 2, (stream.dropped, book)
+    assert stream.dropped == 1 and stream.repeated == 1 and book.bids[0] == (D("0.81"), D("110.5")) and book.asks == ((D("0.84"), D("20")),) and stream.books == 2, (stream.dropped, book)
+    # the repeat (1.104.1: the server re-sends an unchanged book every second or so) restarts the book's age, nothing else
+    feed.books["HSI"] = m.dataclasses.replace(feed.books["HSI"], fetched_ms=NOW - 100_000)
+    ws.push({"type": "M", "topic": "predictOrderbook/7", "data": {"version": 6, "bids": [["0.5", "1"]], "asks": [["0.6", "1"]]}})
+    await asyncio.sleep(0.05)
+    assert stream.repeated == 2 and feed.books["HSI"].fetched_ms >= NOW and feed.books["HSI"].asks == ((D("0.84"), D("20")),) and stream.books == 2
+    assert "重复 2 帧" in stream.line() and "丢弃 1 帧" in stream.line()
     # a ladder level: its row's book, the ladder republished, the express lane told
     ws.push({"type": "M", "topic": "predictOrderbook/41", "data": {"version": 1, "bids": [["0.12", "30"]], "asks": [["0.19", "40"]]}})
     await asyncio.sleep(0.05)
@@ -99,7 +105,7 @@ async def run():
     ws.push({"type": "M", "topic": "predictOrderbook/99", "data": {"bids": [], "asks": []}})
     ws.push("not json")
     await asyncio.sleep(0.05)
-    assert stream.books == 3 and stream.dropped == 4 and seen == ["HSI", "HSI", "BTC-HIT-10"], (stream.books, stream.dropped, seen)
+    assert stream.books == 3 and stream.dropped == 3 and seen == ["HSI", "HSI", "BTC-HIT-10"], (stream.books, stream.dropped, seen)
     # the heartbeat: echoed with the server's own data; the pushed books' age restarts, a market never pushed is left alone
     feed.books["HSI"] = m.dataclasses.replace(feed.books["HSI"], fetched_ms=NOW - 100_000)
     feed.ladder_rows["BTC-HIT-10"]["41"] = m.dataclasses.replace(row, book=m.dataclasses.replace(row.book, fetched_ms=NOW - 100_000))
@@ -122,7 +128,7 @@ async def run():
     stream.note_rest("HSI", feed.books["HSI"], feed.books["HSI"])
     assert stream.replaced == 1 and "HSI" not in stream.pushed
     line = stream.line()
-    assert "订阅 1 个市场、在推 1 个" in line and "收到盘口 3 次、心跳 1 次" in line and "被拒绝 1 个主题（8：invalid_topic" in line and "丢弃 5 帧" in line \
+    assert "订阅 1 个市场、在推 1 个" in line and "收到盘口 3 次、心跳 1 次" in line and "被拒绝 1 个主题（8：invalid_topic" in line and "重复 2 帧" in line and "丢弃 4 帧" in line \
         and "REST 覆盖推送 1 次，其中盘口不同 1 次" in line, line
     # the connection drops: made anew after the backoff, the subscriptions sent afresh, the versions and the live set forgotten
     stream.refused.clear()

@@ -218,3 +218,48 @@ async def run():
 
 
 asyncio.run(run())
+
+
+async def bar_gate():
+    """1.104.1: the 15:00 five-minute bar is not read for the anchor within five minutes of the close (Sina's bar is not
+    final at once: an anchor read at 15:00:0x came out five points off the bar read later); the print at the close stands
+    in — an exact one (within a minute) for good, a late one until the bar is final."""
+    SINA_MON = ('var _CHA50CFD_5=([{"d":"2026-09-28 14:55:00","o":"14240","h":"14250","l":"14235","c":"14245","v":"1"},'
+                '{"d":"2026-09-28 15:00:00","o":"14245","h":"14260","l":"14240","c":"14255","v":"1"}]);').encode()
+
+    async def get(url, timeout=15, headers=None):
+        if "getMink" in url:
+            return SINA_MON
+        raise m.RemoteError("offline")
+    m.http_get = get
+    close = bj(9, 28, 15, 0)
+    day_close = m.DailyClose(dt.date(2026, 9, 28), D("3901.55"), D("3888.37"), "腾讯日K", close + 30_000)
+    # an exact print at 15:00:20, the close known at 15:00:30: the print, not the bar (not final yet); and kept
+    bot = make_bot()
+    bot.cn.close = day_close
+    bot.cn.a50 = m.IndexQuote("A50期货", D("14250"), D("14181"), None, None, None, close + 20_000, "新浪CFD")
+    await bot.refresh_odds_inputs(close + 30_000)
+    assert bot.anchors["A50"] == (close, D("14250")) and bot.a50_anchor_note == "15:00 后 20 秒首笔", (bot.anchors, bot.a50_anchor_note)
+    bot.anchor_tries.clear()
+    await bot.refresh_odds_inputs(close + 20 * 60_000)
+    assert bot.anchors["A50"] == (close, D("14250")) and bot.a50_anchor_note == "15:00 后 20 秒首笔"
+    # a late print (15:03) stands in until the bar is final; then the bar
+    bot2 = make_bot()
+    bot2.cn.close = day_close
+    bot2.cn.a50 = m.IndexQuote("A50期货", D("14262"), D("14181"), None, None, None, close + 3 * 60_000, "新浪CFD")
+    await bot2.refresh_odds_inputs(close + 3 * 60_000 + 10_000)
+    assert bot2.anchors["A50"] == (close, D("14262")) and bot2.a50_anchor_note == "15:00 后 3 分钟首笔近似", bot2.a50_anchor_note
+    bot2.anchor_tries.clear()
+    await bot2.refresh_odds_inputs(close + 6 * 60_000)
+    assert bot2.anchors["A50"] == (close, D("14255")) and bot2.a50_anchor_note == "15:00 五分钟K近似", (bot2.anchors, bot2.a50_anchor_note)
+    assert bot2.store.get("anchor:A50")[2:] == ["15:00 五分钟K近似", "新浪CFD"]
+    # started after the close with the bar final: the bar straight away
+    bot3 = make_bot()
+    bot3.cn.close = day_close
+    bot3.cn.a50 = m.IndexQuote("A50期货", D("14270"), D("14181"), None, None, None, close + 10 * 60_000, "新浪CFD")
+    await bot3.refresh_odds_inputs(close + 10 * 60_000)
+    assert bot3.anchors["A50"] == (close, D("14255")) and bot3.a50_anchor_note == "15:00 五分钟K近似", (bot3.anchors, bot3.a50_anchor_note)
+    print("A50_BAR_GATE_OK")
+
+
+asyncio.run(bar_gate())

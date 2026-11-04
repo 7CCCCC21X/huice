@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.104.0"
+VERSION = "1.104.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -3274,6 +3274,10 @@ def parse_sina_bars(raw: bytes, label: str = "A50") -> list[tuple[str, D]]:
     return sorted(bars)
 
 
+A50_BAR_SETTLE_MS = 5 * 60_000  # the 15:00 five-minute bar is read for the anchor only this long after the close: read at
+# 15:00:0x it was not final (11-03: 12,800.88 then, 12,806.19 once the bar had closed); the print at the close stands in meanwhile
+
+
 def a50_print_note(quoted_ms: int, close_ms: int) -> str:
     """Label of an A50 anchor taken from the first live print after the 15:00 close: within a minute it is the price
     at the close for all practical purposes ('15:00 后 12 秒首笔'), later it is an approximation and says so."""
@@ -4278,6 +4282,7 @@ WSAMPLE_HORIZONS = {"window": (14 * 60, 10 * 60, 5 * 60, 2 * 60), "day": (12 * 3
 # rolling card's market when it is sampled (Bot.window_sample): a 15-minute window a minute in, then at 10, 5 and 2 minutes left
 WSAMPLE_LATE_MS = 60_000       # a sample due longer ago than this (a restart) is not taken: it would be of another moment
 WSAMPLE_KEEP_DAYS = 60         # the samples are kept this long
+WINDOW_LEAD_MS = 15 * 60_000   # a 15-minute card's market is followed (its book, its outcome names, the index every 2 s) from this long before its window
 SHADOW_FLOOR = 0.02            # ...a side is kept when buying its ask then would have had at least this much net edge
 SHADOW_KEEP_DAYS = 60          # ...for this long
 SHADOW_BARS = (0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20)  # the entry bars /calib scores them at
@@ -4609,6 +4614,7 @@ PREDICT_POINTS_STALE_SECONDS = 3 * PREDICT_META_SECONDS  # other markets' points
 PREDICT_STRIKE_SECONDS = 300   # a known target price is re-read this often (the site may correct it)
 PREDICT_MISS_SECONDS = 60      # an unknown slug is looked up again after this long (new markets show up within a minute)
 PREDICT_LIST_SECONDS = 600     # a category's market list is read again this often: levels and deadlines Predict adds later
+PREDICT_GRAPHQL_PAUSE_SECONDS = 1800  # after a 403 from the GraphQL endpoint (a region it does not serve) it is left alone this long: REST carries on
 PREDICT_MARKETS_PAGE = 20      # markets per GraphQL page: a category answering this many may hold more (the REST category is read too)
 PREDICT_DEPTH = 20            # levels kept per side: a fill for the trade size is judged on these (a book "too thin" at
 #                               5 levels was often only cut off there), the page and the evidence show the top of them
@@ -4640,6 +4646,25 @@ def predict_levels(rows: Any, bids: bool) -> tuple[tuple[D, D], ...]:
             out.append((price, size))
     out.sort(key=lambda level: level[0], reverse=bids)
     return tuple(out[:PREDICT_DEPTH])
+
+
+def market_start_price(market: Any) -> D | None:
+    """The target price (price to beat) a market's details may carry, under whichever name — startPrice, priceToBeat,
+    targetPrice, strikePrice, referencePrice, at the top or under marketData / metadata; None when none, or not a
+    positive number."""
+    if not isinstance(market, Mapping):
+        return None
+    rows = [market, *(market.get(k) for k in ("marketData", "metadata") if isinstance(market.get(k), Mapping))]
+    for row in rows:
+        for name in ("startPrice", "priceToBeat", "targetPrice", "strikePrice", "referencePrice"):
+            value = row.get(name)
+            if value in (None, "", 0, False):
+                continue
+            with contextlib.suppress(decimal.InvalidOperation, ValueError, TypeError):
+                found = D(str(value))
+                if found.is_finite() and found > 0:
+                    return found
+    return None
 
 
 def predict_markets(data: Any) -> list[dict]:
@@ -5019,6 +5044,8 @@ class PredictFeed:
         self.types: dict[str, str] = {}                          # slug -> GraphQL category type
         self.strikes: dict[str, tuple[D | None, float]] = {}     # slug -> (target price shown on the site, when)
         self.no_strike: set[str] = set()                         # category types without marketData.startPrice
+        self.graphql_until = 0.0                                 # monotonic: after a 403 from GraphQL, no GraphQL request before this
+        self.graphql_error = ""                                  # the refusal
         self.info: dict[str, dict] = {}                          # slug -> {"outcomes": [...], "created_ms": int}
         self.want_info: set[str] = set()                         # slugs whose outcome names / creation time matter
         self.market_lists: dict[str, tuple[list[dict] | None, float]] = {}  # slug -> every market of the category
@@ -5069,10 +5096,28 @@ class PredictFeed:
             raise RemoteError("Predict 接口未返回有效 JSON") from None
 
     async def graphql(self, query: str, variables: dict) -> Any:
-        data = await self.fetch(PREDICT_GRAPHQL, {"query": query, "variables": variables})
+        """A GraphQL query; refused outright (403: a region the endpoint does not serve, 1.104.1) it is not asked again for
+        PREDICT_GRAPHQL_PAUSE_SECONDS — the market lists come from REST meanwhile, as they did after each refusal, without
+        the refused request first."""
+        left = self.graphql_until - time.monotonic()
+        if left > 0:
+            raise RemoteError(f"Predict GraphQL 已暂停（{self.graphql_error}；{int(left) + 1} 秒后再试）")
+        try:
+            data = await self.fetch(PREDICT_GRAPHQL, {"query": query, "variables": variables})
+        except RemoteError as error:
+            if "403" in str(error):
+                self.graphql_until, self.graphql_error = time.monotonic() + PREDICT_GRAPHQL_PAUSE_SECONDS, "HTTP 403"
+            raise
         if isinstance(data, dict) and data.get("errors"):
             raise RemoteError("Predict GraphQL 错误：" + clean_error(json.dumps(data["errors"], ensure_ascii=False))[:120])
         return data.get("data") if isinstance(data, dict) else None
+
+    def graphql_note(self) -> str:
+        """The pause, for /diag: "" while GraphQL is asked."""
+        left = self.graphql_until - time.monotonic()
+        if left <= 0:
+            return ""
+        return (f"GraphQL 已暂停（{self.graphql_error}，{int(left) // 60 + 1} 分钟后再试；市场列表走 REST，目标价只在市场详情里带有时才核对）")
 
     async def resolve(self, slug: str) -> dict | None:
         """slug -> its (first) market; see find()."""
@@ -5185,6 +5230,10 @@ class PredictFeed:
                     self.no_strike.add(kind)  # schema answer: never ask this type again
             except (TimeoutError, OSError, ValueError, TypeError, decimal.InvalidOperation):
                 pass
+        if value is None:  # the market's details (read for the fee every PREDICT_META_SECONDS) may carry it: no request of its own
+            meta = self.market_meta.get(str(market_id))
+            if meta and isinstance(meta[0], dict) and meta[0].get("start_price"):
+                value = meta[0]["start_price"]
         self.strikes[slug] = (value, time.monotonic())
         return value
 
@@ -5203,7 +5252,7 @@ class PredictFeed:
         with contextlib.suppress(ValueError, TypeError):  # absent (None) or not a number: not stated
             stated = int(market.get("feeRateBps"))
             fee = stated if 0 <= stated <= 10_000 else None
-        return {"outcomes": [str(o.get("name") or "") for o in rows], "created_ms": created,
+        return {"outcomes": [str(o.get("name") or "") for o in rows], "created_ms": created, "start_price": market_start_price(market),
                 "status": str(market.get("status") or ""), "fee_bps": fee, "resolved": predict_resolution(market),
                 "rules": str(market.get("description") or market.get("rules") or "")[:3000],
                 "question": str(market.get("question") or ""),
@@ -5603,6 +5652,7 @@ class PredictStream:
         self.heartbeats = 0
         self.books = 0                # pushed books applied
         self.dropped = 0              # pushes dropped: unreadable, an older version, a market with no book of its own to put them in
+        self.repeated = 0             # the same book (version) pushed again — the server does so every second or so: its age restarts
         self.replaced = 0             # pushed books a later REST read replaced...
         self.mismatch = 0             # ...of which with another top of book
         self.last_mismatch = ""
@@ -5788,8 +5838,12 @@ class PredictStream:
         key, level = target
         version = data.get("version")
         if isinstance(version, (int, float)) and not isinstance(version, bool):
-            if version <= self.versions.get(mid, -1):
-                self.dropped += 1  # out of order, or sent again
+            if version < self.versions.get(mid, -1):
+                self.dropped += 1  # out of order
+                return
+            if version == self.versions.get(mid, -1):
+                self.repeated += 1  # sent again (1.104.1: 7427 of them in six minutes once read as dropped): the book is as current as it was
+                self.refresh_age(key, level, mid)
                 return
             self.versions[mid] = int(version)
         bids = predict_levels(data.get("bids"), True) if isinstance(data.get("bids"), list) else None
@@ -5816,6 +5870,18 @@ class PredictStream:
         self.live.add(mid)
         self.books += 1
         feed.updated(key)
+
+    def refresh_age(self, key: str, level: bool, mid: str) -> None:
+        """A market's stored book is as current as it was (its book pushed again unchanged): its age restarts."""
+        feed, now_ms = self.feed, int(time.time() * 1000)
+        if level:
+            row = (feed.ladder_rows.get(key) or {}).get(mid)
+            if row is not None and row.book is not None and str(row.book.market_id) == str(mid):
+                feed.ladder_rows[key][mid] = dataclasses.replace(row, book=dataclasses.replace(row.book, fetched_ms=now_ms))
+        else:
+            book = feed.books.get(key)
+            if book is not None and str(book.market_id) == str(mid):
+                feed.books[key] = dataclasses.replace(book, fetched_ms=now_ms)
 
     def touch(self) -> None:
         """The heartbeat says the connection lives: every book pushed on it is as current as it was, so its age restarts
@@ -5859,6 +5925,8 @@ class PredictStream:
         if self.refused:
             mid, (why, _) = next(iter(self.refused.items()))
             text += f"；被拒绝 {len(self.refused)} 个主题（{mid}：{brief_error(why, 40)}）"
+        if self.repeated:
+            text += f"；重复 {self.repeated} 帧（同一版本的盘口再推一次，只当作还活着）"
         if self.dropped:
             text += f"；丢弃 {self.dropped} 帧"
         if self.replaced:
@@ -6257,6 +6325,10 @@ class BinanceStream(PushStream):
         ages = [((now - self.row_at[s] if s in self.row_at else None), s) for s in self.symbols()]
         ages.sort(key=lambda item: (item[0] is None, item[0] or 0.0, item[1]))  # the freshest first, never pushed last
         text += "；最近推送：" + "、".join(f"{s} {age_text(age) if age is not None else '从未'}" for age, s in ages)
+        mute = ((self.connected and self.pushed == 0 and now - self.connected_at >= 30)
+                or (not self.connected and self.connects > 0 and self.last_session[2] == 0 and self.last_session[0] >= 30))
+        if mute and self.venue == "futures":  # (1.104.1: a Railway host connected, subscribed and heard nothing, five times over)
+            text += "；连上了却没有行情：币安合约推送可能不对这个部署地区开放（REST 正常）——合约报价照旧按 REST 采样，15 分钟指数价窗口前后每 2 秒读一次"
         return text
 
     def rows(self, symbols: Any) -> dict[str, dict] | None:
@@ -7149,8 +7221,10 @@ class IndexUpDownMarket(UpDownMarket):
     second (markPrice@1s, field i: push_index) or read (premiumIndex) when the push is late, σ from its last hours of
     1-minute candles (minute_vol), and the two boundary values — each the close of the index's 1-minute candle ending at
     it (indexPriceKlines) — kept as UpDownMarket keeps its candle closes. Trades never price it."""
-    PRICE_SECONDS = 5            # the index is read this often while no push brings it
-    VOL_SECONDS = 60
+    PRICE_SECONDS = 2            # the index is read this often while no push brings it, from WINDOW_LEAD_MS before the window to its end
+    PRICE_IDLE_SECONDS = 30      # ...and this often the rest of the time (a window hours away, the night)
+    VOL_SECONDS = 60             # σ, likewise
+    VOL_IDLE_SECONDS = 600
     CANDLE_SECONDS = 5           # a boundary value still missing is asked for again this often
     CANDLE_GRACE_MS = 1_500      # and only this long after its minute ended
     PRICE_STALE_MS = 60_000      # an index older than this prices nothing
@@ -7209,16 +7283,24 @@ class IndexUpDownMarket(UpDownMarket):
             raise ValueError(f"币安没有返回 {self.point(open_ms)}的指数 1 分钟 K 线")
         return number(row[4], f"{self.spec.symbol} 指数价")
 
+    def cadence(self, now_ms: int) -> tuple[int, int]:
+        """(seconds between index reads, between σ reads): the near ones from WINDOW_LEAD_MS before the window, the idle ones
+        otherwise. A push every second (markPrice@1s) defers the index read; where the futures stream is mute (a region
+        Binance does not serve it in: it connects and sends nothing) the read is what prices the card."""
+        near = now_ms >= self.spec.start_ms + 60_000 - WINDOW_LEAD_MS
+        return (self.PRICE_SECONDS, self.VOL_SECONDS) if near else (self.PRICE_IDLE_SECONDS, self.VOL_IDLE_SECONDS)
+
     async def read_quote(self, now_ms: int, mono: float) -> None:
-        """The index (premiumIndex) every PRICE_SECONDS unless the push brought a newer one, σ from the 1-minute index
-        candles every VOL_SECONDS."""
-        if mono - self.times["price"] >= self.PRICE_SECONDS:
+        """The index (premiumIndex) unless the push brought a newer one, σ from the 1-minute index candles, at the cadence
+        of the moment (cadence)."""
+        price_every, vol_every = self.cadence(now_ms)
+        if mono - self.times["price"] >= price_every:
             self.times["price"] = mono
             data = await self.get("premiumIndex", symbol=self.spec.symbol)
             at = int((data or {}).get("time") or now_ms)
             if at > self.index_ms:
                 self.index_ms, self.price, self.priced_ms = at, number(data["indexPrice"], f"{self.spec.symbol} 指数价"), now_ms
-        if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
+        if mono - self.times["vol"] >= vol_every or self.sigma is None:
             self.times["vol"] = mono
             # the session's minutes alone when the windows follow one (the index stands still outside it: a σ over the night
             # or the lunch break would call the open near certain); enough candles to reach the previous session
@@ -13216,6 +13298,9 @@ class Bot:
             # The anchor must come from the same record as the live quote, or the two cannot be compared.
             chain = ([(self.cn.a50_sina_five_minute_at, "15:00 五分钟K近似")] if live == "新浪CFD" else
                      [(self.cn.a50_at, "15:00"), (self.cn.a50_five_minute_at, "15:00 五分钟K近似")])
+            settled = now_ms - close_ms >= A50_BAR_SETTLE_MS
+            if not settled:
+                chain = []  # the bars are not final yet: the print at the close (a50_print) or the first quote after it stands in
             wrong = (not anchor or anchor[0] != close_ms or self.a50_anchor_source == "未知"
                      or a50_family(self.a50_anchor_source) != live)
             if wrong and self.retry_ok("A50"):
@@ -13246,6 +13331,14 @@ class Bot:
                     self.anchors["A50"] = (close_ms, price)
                     self.a50_anchor_note, self.a50_anchor_source = "15:00", "东方财富"
                     self.store.put("anchor:A50", [close_ms, str(price), "15:00", "东方财富"])
+            elif (not wrong and live == "新浪CFD" and self.a50_anchor_note.endswith("分钟首笔近似") and settled
+                  and self.retry_ok("A50-bar", every=600)):
+                # a print minutes after the close stood in: the 15:00 five-minute bar, once final, is the closer figure
+                with contextlib.suppress(Exception):
+                    price = await self.cn.a50_sina_five_minute_at(day)
+                    self.anchors["A50"] = (close_ms, price)
+                    self.a50_anchor_note, self.a50_anchor_source = "15:00 五分钟K近似", "新浪CFD"
+                    self.store.put("anchor:A50", [close_ms, str(price), "15:00 五分钟K近似", "新浪CFD"])
         if self.vols.due("SSE") and len(self.cn.bars) > 2:  # the dated bars CnIndex already read
             self.vols.refreshed["SSE"] = time.monotonic()
             done = finished_bars(self.cn.bars, "sh", now_ms)
@@ -17799,12 +17892,10 @@ class Bot:
             targets.update({key: mkt.spec.slug for key, mkt in self.updowns.items() if self.updown_wanted(mkt, now_ms)})  # a daily card: the day it is on; a 15-minute card: its window, from a quarter hour before
         return targets
 
-    WINDOW_LEAD_MS = 15 * 60_000  # a 15-minute card's market is followed (its book, its outcome names) from this long before its window
-
     def updown_wanted(self, mkt: UpDownMarket, now_ms: int) -> bool:
         """Whether the Predict feed follows this card's market now: a daily card's always; a 15-minute card's from
         WINDOW_LEAD_MS before its window — not through a lunch break or a night for a window hours away."""
-        return not isinstance(mkt, IndexUpDownMarket) or now_ms >= mkt.spec.start_ms + 60_000 - self.WINDOW_LEAD_MS
+        return not isinstance(mkt, IndexUpDownMarket) or now_ms >= mkt.spec.start_ms + 60_000 - WINDOW_LEAD_MS
 
     def edge_costs(self) -> EdgeCosts:
         return EdgeCosts(self.config.predict_fee_bps, self.config.predict_trade_usd)
@@ -18789,6 +18880,8 @@ class Bot:
                                + (f"，最慢 {r['slowest'][0]} {r['slowest'][1] / 1000:.1f}s" if r.get("slowest") else ""))
                 if name == "Predict 盘口":
                     detail += f"｜推送：{self.predict.stream.line()}"
+                    if note := self.predict.graphql_note():
+                        detail += "｜" + note
                 lines.append(f"  {mark} {name}：{what}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{busy}{detail}{err}")
         else:
             lines.append("🔄 后台刷新：未启动（命令行诊断或测试环境）")

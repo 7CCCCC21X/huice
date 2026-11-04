@@ -120,6 +120,9 @@ async def run():
     assert bot.control_value("SIM_CRYPTO_15M_SHARES") == "10" and bot.control_value("SIM_CRYPTO_15M_QUIET_SECONDS") == "90"
     # before the start's candle is read
     assert card.odds(T0 + 5_000) == "等待币安 UNITREEUSDT 11:00 的指数价（起点）" and card.exchange == "sh" and card.trading(T0)
+    # the index is read every 2 s from a quarter hour before the window to its end, every 30 s otherwise (σ: 60 s / 600 s)
+    far = card.at(W.window_spec(T0 + 7_200_000))
+    assert card.cadence(T0 + 5_000) == (2, 60) and far.cadence(T0 + 5_000) == (30, 600) and far.cadence(T0 + 7_200_000 - 15 * 60_000) == (2, 60)
     fm.index[T0 - 60_000], fm.premium = "90.0000", ("90.1200", T0 + 4_500)
     await card.refresh(T0 + 5_000)
     assert card.close_of("start") == D("90.0000") and card.price == D("90.1200") and card.sigma > 0 and card.error == "", card.error

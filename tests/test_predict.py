@@ -415,4 +415,41 @@ async def book_order():
 
 
 asyncio.run(book_order())
+
+
+async def graphql_pause():
+    """1.104.1: a 403 from the GraphQL endpoint (a region it does not serve) pauses it for half an hour — the market list
+    comes from REST meanwhile, as it did after each refusal, without the refused request first — and the target price is
+    read from the market's details when they carry one."""
+    feed = m.PredictFeed(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}))
+    calls = []
+
+    async def fetch(url, payload=None):
+        calls.append(url)
+        if url == m.PREDICT_GRAPHQL:
+            raise m.RemoteError("HTTP 403: 访问被拒绝；请核对权限与服务地区")
+        if url.endswith("/categories/x-slug"):
+            return {"data": {"markets": [{"id": "9", "conditionId": "0x9", "title": "X", "question": "X?"}]}}
+        raise AssertionError(url)
+    feed.fetch = fetch
+    found = await feed.find("x-slug")
+    assert [mk["id"] for mk in found] == ["9"] and calls == [m.PREDICT_GRAPHQL, m.PREDICT_REST + "/categories/x-slug"], calls
+    assert feed.graphql_until > time.monotonic() and feed.graphql_note().startswith("GraphQL 已暂停（HTTP 403，30 分钟后再试"), feed.graphql_note()
+    assert [mk["id"] for mk in await feed.find("x-slug")] == ["9"] and calls[2:] == [m.PREDICT_REST + "/categories/x-slug"]  # paused: REST alone
+    try:
+        await feed.graphql("query { x }", {}); assert False
+    except m.RemoteError as error:
+        assert "已暂停" in str(error) and len(calls) == 3
+    feed.graphql_until = 0.0
+    assert feed.graphql_note() == ""
+    # the target price in the market's details, under whichever name
+    assert m.market_start_price({"startPrice": "96.62"}) == D("96.62") and m.market_start_price({"marketData": {"startPrice": 96.62}}) == D("96.62")
+    assert m.market_start_price({"priceToBeat": "0"}) is None and m.market_start_price({}) is None and m.market_start_price({"targetPrice": "x"}) is None
+    assert m.market_start_price([1]) is None and m.market_start_price({"metadata": {"referencePrice": "1,234"}}) is None
+    feed.market_meta["9"] = ({"start_price": D("96.62")}, time.monotonic())
+    assert await feed.strike("x-slug", "9") == D("96.62") and feed.strikes["x-slug"][0] == D("96.62")
+    print("GRAPHQL_PAUSE_OK")
+
+
+asyncio.run(graphql_pause())
 print("PREDICT_OK")
