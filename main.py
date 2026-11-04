@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.104.2"
+VERSION = "1.104.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -517,6 +517,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
     ("SIM_MAKER_DEEPER", "买1 不够门槛时跟更深的买价", "开 = 跟买1 的净优势不够门槛（或不超过模型误差）时，挂到下面第一个够门槛的买价档位（买2、买3…，同样要有“买1 至少多少份”那么多别人的单），等有人砸穿买1 时接；涨、跌两边各按各的；关 = 只跟买1，不够就不挂"),
     ("SIM_MAKER_EXIT_CENTS", "挂单撤单线（¢/份）", "0～50：挂着的单净优势降到这个数以下就撤掉（不会高于触发门槛）；0 = 不撤"),
+    ("SIM_MAKER_FOLLOW_SETTLE_SECONDS", "买1 变了多久才改跟（秒）", "0～60：有效买1 移开、低价挂单被顶、击穿单下面的买单变了，新位置要连续保持这么多秒才撤了改挂；做市机器人每半秒撤了重挂一遍的盘口，不等一下就会跟着它反复撤挂、每次都排到队尾；0 = 一变就改。优势没了的撤单不受它影响"),
     ("SIM_MAKER_SESSION", "只在标的开盘时段挂单", "开 = 指数/个股日涨跌的挂单只在标的开盘时段挂着，开盘前、收盘后全部撤掉；加密市场不受影响"),
     ("SIM_MAKER_SPREAD_CENTS", "挂单价差上限（¢）", "0～99：平时只在买卖价差不超过这个数的双边盘口挂单；0 = 不限，价差再宽、只有单边的盘口也跟有效买1 挂（门槛不变）"),
     ("SIM_MAKER_DEEP_CENTS", "低价挂单模式（¢/份）", "0～90：按挂价算净优势不低于这个数（不低于触发门槛）的单挂在最高买价之上 1¢、排在最前，多付 1¢ 换先成交；有人（至少 1 份）挂到它之上或同价就撤了重挂到他之上 1¢，挂价留不足这个数就原地不动；价差超过上限的盘口也挂、只挂这种单，在那种盘口上净优势降到它 1¢ 以下撤掉；不分时段，盘后另要满足盘后门槛；0 = 关"),
@@ -659,6 +660,8 @@ class Config:
     sim_maker_min_bid: float = 100.0  # SIM_MAKER_MIN_BID: a resting order joins the first bid level holding this many shares besides ours and follows
     # it (withdrawn and re-placed when the valid 买1 moves a cent); 0 = the top level whatever its size, and no following
     sim_maker_exit: float = 0.05      # SIM_MAKER_EXIT_CENTS / 100: a resting order is withdrawn when its edge falls under this; 0 = never
+    sim_maker_follow_settle: float = 2.0  # SIM_MAKER_FOLLOW_SETTLE_SECONDS: a re-quote (the 买1 moved, a deep-bid order pushed off the front,
+    # a sweep order's bids changed) waits until the new place has held this long; 0 = at once
     sim_maker_session: bool = True    # SIM_MAKER_SESSION: a daily card's resting orders only while its underlying trades (withdrawn before the open)
     sim_maker_deep_only: bool = False  # SIM_MAKER_DEEP_ONLY: with the deep-bid mode on, only its orders are placed (no joining the 买1 queue)
     sim_maker_spread: float = 0.0     # SIM_MAKER_SPREAD_CENTS / 100: resting orders only on two-sided books no wider than this; 0 = any book
@@ -844,6 +847,7 @@ class Config:
             sim_crypto_15m_edge=parse_bounded(e, "SIM_CRYPTO_15M_EDGE_CENTS", "0", 0, 50) / 100,
             sim_maker_min_bid=parse_bounded(e, "SIM_MAKER_MIN_BID", "100", 0, 10_000_000),
             sim_maker_exit=parse_bounded(e, "SIM_MAKER_EXIT_CENTS", "5", 0, 50) / 100,
+            sim_maker_follow_settle=parse_bounded(e, "SIM_MAKER_FOLLOW_SETTLE_SECONDS", "2", 0, 60),
             sim_maker_session=not off(e.get("SIM_MAKER_SESSION", "on")),
             sim_maker_deeper=not off(e.get("SIM_MAKER_DEEPER", "on")),
             sim_maker_after_hours=parse_bounded(e, "SIM_MAKER_AFTER_HOURS_CENTS", "0", 0, 50) / 100,
@@ -9120,6 +9124,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_CRYPTO_15M_QUIET_SECONDS": {"kind": "number", "group": "策略", "presets": ["0", "60", "90", "120", "180", "300"], "unit": "秒", "zero": "只停最后一分钟"},
     "SIM_MAKER_MIN_BID": {"kind": "number", "group": "策略", "presets": ["0", "20", "50", "100", "200", "500"], "unit": "份", "zero": "不限、不改跟"},
     "SIM_MAKER_EXIT_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "2", "3", "5", "8"], "unit": "¢", "zero": "不撤"},
+    "SIM_MAKER_FOLLOW_SETTLE_SECONDS": {"kind": "number", "group": "策略", "presets": ["0", "1", "2", "3", "5", "10"], "unit": "秒", "zero": "一变就改"},
     "SIM_MAKER_SESSION": {"kind": "choice", "group": "策略", "options": [["off", "盘前盘后也挂"], ["on", "只在开盘时段挂"]]},
     "SIM_MAKER_DEEPER": {"kind": "choice", "group": "策略", "options": [["on", "不够就跟买2、买3"], ["off", "只跟买1"]]},
     "SIM_MAKER_AFTER_HOURS_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "5", "8", "10", "15", "20"], "unit": "¢", "zero": "关"},
@@ -12655,6 +12660,7 @@ class Bot:
         self.sim_lock = asyncio.Lock()      # the step's decisions and the express lane never run side by side
         self.sim_express_count = 0          # decisions made by the express lane (for /diag)
         self.sim_express_withdrawn: dict[str, float] = {}  # slot -> monotonic time the express lane withdrew its order (sim_quote's cooldown)
+        self.sim_follow_since: dict[str, tuple[float, int]] = {}  # market|side -> (the place a resting order would move to, since when it has been that: sim_follow_settled)
         self.sim_taker_seen: dict[str, int] = {}  # taker slot -> when (ms) its side was first buyable in the run of looks that still finds it so (SIM_TAKER_HOLD_SECONDS)
         self.sim_unpriced_since: dict[str, int] = {}  # market -> when (ms) a step first found it unpriced with an order resting (sim_unpriced_reason)
         self.sim_step_ms: dict[str, int] = {}  # the last decision phase, by part (for /diag)
@@ -15975,6 +15981,7 @@ class Bot:
             level = maker_level(mk.book, side, max(c.sim_maker_min_bid, SIM_MAKER_FRONT_MIN) if deep_order else c.sim_maker_min_bid, own, price)
             if level is None:
                 return f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟" if c.sim_maker_min_bid > 0 else ""  # nobody else bids: a deep-bid order stays
+            move: tuple[float, str] | None = None  # (the place the order would move to, why), to go once that place has held (sim_follow_settled)
             if not deep_order:
                 if abs(level[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
                     # the 买1 moved up to where no fresh order would be placed (the bar a fresh order faces on this book — the
@@ -15982,31 +15989,50 @@ class Bot:
                     # is, still with its edge, rather than being withdrawn for a replacement that never comes (10-08: a 55¢
                     # bid with 11¢ left was withdrawn to "follow" a 57¢ level worth 9¢, and nothing took its place)
                     fresh_bar = self.sim_maker_mode(mk)[0]
-                    if level[0] > price and (fair - level[0] < fresh_bar - 1e-9 or fair - level[0] <= mk.need
-                                             or (limit is not None and level[0] > limit + 1e-9)):
-                        return ""
-                    return f"买1 移到 {cents(level[0])}，改跟"
+                    if not (level[0] > price and (fair - level[0] < fresh_bar - 1e-9 or fair - level[0] <= mk.need
+                                                  or (limit is not None and level[0] > limit + 1e-9))):
+                        move = (level[0], f"买1 移到 {cents(level[0])}，改跟")
+            else:
+                # a deep-bid order keeps a cent over the best bid of anyone else: pushed off the front (a bid at or over its
+                # price, dust aside) it goes back over the pusher while the edge there still clears the mode's bar, otherwise it
+                # stays where it is; the bids under it falling away, it comes down to a cent over what is left
+                target = self.sim_maker_price(mk.book, side, level, True, own, price)[0]
+                if trade.get("sweep"):  # a sweep order: to the front once that has the edge, else a cent over the next bid under the threshold
+                    if fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9:
+                        move = (target, f"盘口离公平价远了，击穿单改挂到买1 之上 1¢（{cents(target)}）")
+                    else:
+                        deep_bar = self.sim_maker_mode(mk, True)[0]
+                        sweep = self.sweep_price(mk.book, side, fair, deep_bar, own, price)
+                        if sweep is None:
+                            return f"公平价 {cents(fair)} 留不出 {cents(deep_bar)}，击穿单撤掉"
+                        if abs(sweep[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
+                            move = (sweep[0], f"下面的买单变了，击穿单改挂 {cents(sweep[0])}")
+                elif target > price + 1e-9:
+                    if fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9:
+                        move = (target, f"买1 被顶到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
+                elif price - target >= SIM_MAKER_FOLLOW - 1e-9:
+                    move = (target, f"买1 移到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
+            key = f"{trade.get('market')}|{side}"
+            if move is None:
+                self.sim_follow_since.pop(key, None)
                 return ""
-            # a deep-bid order keeps a cent over the best bid of anyone else: pushed off the front (a bid at or over its
-            # price, dust aside) it goes back over the pusher while the edge there still clears the mode's bar, otherwise it
-            # stays where it is; the bids under it falling away, it comes down to a cent over what is left
-            target = self.sim_maker_price(mk.book, side, level, True, own, price)[0]
-            if trade.get("sweep"):  # a sweep order: to the front once that has the edge, else a cent over the next bid under the threshold
-                if fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9:
-                    return f"盘口离公平价远了，击穿单改挂到买1 之上 1¢（{cents(target)}）"
-                deep_bar = self.sim_maker_mode(mk, True)[0]
-                sweep = self.sweep_price(mk.book, side, fair, deep_bar, own, price)
-                if sweep is None:
-                    return f"公平价 {cents(fair)} 留不出 {cents(deep_bar)}，击穿单撤掉"
-                if abs(sweep[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
-                    return f"下面的买单变了，击穿单改挂 {cents(sweep[0])}"
-                return ""
-            if target > price + 1e-9:
-                if fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9:
-                    return f"买1 被顶到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}"
-            elif price - target >= SIM_MAKER_FOLLOW - 1e-9:
-                return f"买1 移到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}"
+            return move[1] if self.sim_follow_settled(key, move[0], now_ms) else ""
         return ""
+
+    def sim_follow_settled(self, key: str, target: float, now_ms: int) -> bool:
+        """Whether a resting order's re-quote to ``target`` goes now: that place has held SIM_MAKER_FOLLOW_SETTLE_SECONDS
+        (the clock starts when it is first seen, again when the place changes; 0 = at once). A market maker on the 11-04
+        SK 海力士 15 分 book pulled and re-posted its three-level stack every half second, the 买1 a cent or two away each
+        time and gone for a moment in between: an order following every look would have been withdrawn and placed again
+        all day, last in the queue each time (1.104.3)."""
+        settle = self.config.sim_maker_follow_settle
+        if settle <= 0:
+            return True
+        held = self.sim_follow_since.get(key)
+        if held is None or abs(held[0] - target) >= SIM_MAKER_FOLLOW - 1e-9:
+            self.sim_follow_since[key] = (target, now_ms)
+            return False
+        return now_ms - held[1] >= settle * 1000 - 1e-9
 
     def sim_rekey(self, tid: str, trade: dict) -> str:
         """Move a record to tid#n: the slot (one order per market, side and way of trading) is free for a fresh order,
@@ -18210,7 +18236,7 @@ class Bot:
                   "SIM_CRYPTO_DAY_QUIET_MINUTES": str(c.sim_crypto_day_quiet), "SIM_CRYPTO_DAY_EDGE_CENTS": f"{c.sim_crypto_day_edge * 100:g}",
                   "SIM_CRYPTO_15M_SHARES": plain(c.sim_crypto_15m_shares), "SIM_CRYPTO_15M_MAX_SHARES": plain(c.sim_crypto_15m_max_shares),
                   "SIM_CRYPTO_15M_QUIET_SECONDS": str(c.sim_crypto_15m_quiet), "SIM_CRYPTO_15M_EDGE_CENTS": f"{c.sim_crypto_15m_edge * 100:g}",
-                  "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points), "SIM_MAKER_DEEPER": flag(c.sim_maker_deeper),
+                  "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": plain(c.sim_maker_follow_settle), "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points), "SIM_MAKER_DEEPER": flag(c.sim_maker_deeper),
                   "SIM_SHARES_NET": flag(c.sim_shares_net),
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
                   "SIM_MAKER_SPREAD_CENTS": f"{c.sim_maker_spread * 100:g}", "SIM_MAKER_DEEP_ONLY": flag(c.sim_maker_deep_only),
