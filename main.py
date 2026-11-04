@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.100.0"
+VERSION = "1.100.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -15030,6 +15030,10 @@ class Bot:
                 and self.sim_mode_market(mk, c.sim_maker_deep_only_markets) and not book_crossed(mk.book))
         if only and not trade.get("deep"):
             return "已改为只挂低价挂单，平时的挂单撤掉"
+        if trade.get("sweep") and not only:
+            # a sweep order exists only under SIM_MAKER_DEEP_ONLY: with it off here it would hold the side's slot (one order
+            # per side) at its sweep price — a 1¢ bid where the side's ordinary order would rest at 57¢ — for good (1.100.1)
+            return "已关闭只挂低价挂单，击穿单撤掉"
         deep = bool(trade.get("deep")) and (self.sim_deep_book(mk) or only)
         bar, mode, line_name = self.sim_maker_mode(mk, deep)
         if mode and edge < self.sim_maker_line(mk, deep) - 1e-9:  # the close re-judges every order by the after-hours bar too

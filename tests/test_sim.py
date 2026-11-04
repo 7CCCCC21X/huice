@@ -2139,3 +2139,38 @@ async def deeper_levels():
 
 
 asyncio.run(deeper_levels())
+
+
+async def sweep_off():
+    """1.100.1: 击穿单 (sweep orders) exist only under SIM_MAKER_DEEP_ONLY. Turned off, a sweep order is withdrawn so the side's
+    ordinary order can rest (one order per side): the 11-04 KOSPI card (涨 17.4¢ fair, 买1 5¢×100, 卖1 43¢×300) under 只挂低价挂单
+    with a 25¢ bar had 跌 at 1¢ (nothing under its 57¢ 买1 to sit over) and nothing on 涨; turned off, it kept the 1¢ bid for
+    good. Now 跌 goes back to 57¢ (25.6¢) and 涨 rests at 5¢ (12.4¢)."""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "SIM_WAYS": "both", "SIM_MARKETS": "all",
+           "SIM_MAKER_POINTS": "off", "SIM_MAKER_DEEP_CENTS": "25"}
+    slug = "kospi-composite-index-up-or-down-on-october-5-2026"
+    mk = m.SimMarket(slug, "KOSPI", "close", "KOSPI", 0.174, book([("0.05", "100")], [("0.43", "300")], slug=slug, key="KOSPI", mid="202"),
+                     0.04, "", ("涨", "跌"), {"key": "KOSPI", "target": "2026-10-05", "line": 5648.79, "close_ms": CLOSE}, {}, in_session=True)
+    bot = m.Bot(m.Config.from_env({**env, "SIM_MAKER_DEEP_ONLY": "on"}), m.Store(":memory:"), FM(NOW), None)
+    bot.sim_markets = lambda now, only=None: world["markets"]
+    await step(bot, NOW, mk)
+    await step(bot, NOW + 10_000, mk)
+    held = {k: (t["label"], t["price"], t["status"], t.get("sweep", False)) for k, t in bot.sim_trades().items()}
+    assert held == {f"{slug}|down|挂": ("挂跌", 0.01, "resting", True)}, held  # 涨 17.4¢ never makes a 25¢ bar
+    bot.config = m.Config.from_env({**env, "SIM_MAKER_DEEP_ONLY": "off"})  # as the control page applies a change
+    sweep = bot.sim_trades()[f"{slug}|down|挂"]
+    assert bot.sim_requote_reason(sweep, mk, NOW + 20_000) == "已关闭只挂低价挂单，击穿单撤掉"
+    await step(bot, NOW + 20_000, mk)
+    await step(bot, NOW + 30_000, mk)
+    trades = bot.sim_trades()
+    gone = trades[f"{slug}|down|挂#1"]
+    assert gone["status"] == "cancelled" and gone["note"] == "撤单：已关闭只挂低价挂单，击穿单撤掉，一份都没成交", gone
+    now = {k: (t["label"], t["price"], t["status"]) for k, t in trades.items() if t["status"] == "resting"}
+    assert now == {f"{slug}|down|挂": ("挂跌", 0.57, "resting"), f"{slug}|up|挂": ("挂涨", 0.05, "resting")}, now
+    # still on: a sweep order stands (nothing about it changed)
+    on = m.Bot(m.Config.from_env({**env, "SIM_MAKER_DEEP_ONLY": "on"}), m.Store(":memory:"), FM(NOW), None)
+    assert on.sim_requote_reason(sweep, mk, NOW + 20_000) == ""
+    print("SWEEP_OFF_OK")
+
+
+asyncio.run(sweep_off())
