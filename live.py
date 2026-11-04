@@ -1496,23 +1496,37 @@ class LiveBot(core.Bot):
         finally:
             self.live_placing.discard(tid)
 
+    def live_cancels_unsent(self, skip: Any = ()) -> dict[str, dict]:
+        """The records whose cancel is decided but not sent yet (state cancelling, an order id known), by tid."""
+        return {tid: t for tid, t in self.sim_trades().items() if tid not in skip and isinstance(t.get("live"), dict)
+                and t["live"].get("state") == "cancelling" and t["live"].get("order_id") and not t["live"].get("cancel_sent")}
+
     async def sim_express_after(self, now_ms: int) -> None:
-        """An express decision in real trading: its orders go out now, and the cancels of the orders it withdrew (the
-        step's own placements and its sync skip what is done); a slot whose cancel Predict confirms is quoted again at
-        once and that order sent too (live_requote_freed)."""
-        if self.config.live_mode != "off":
-            try:
-                await self.live_place_pending(now_ms)
-            except Exception as error:
-                self.live_note_error(f"快车道下单失败：{core.clean_error(error) or type(error).__name__}")
-        cancelling = {tid: t for tid, t in self.sim_trades().items() if isinstance(t.get("live"), dict) and t["live"].get("state") == "cancelling"
-                      and t["live"].get("order_id") and not t["live"].get("cancel_sent")}
-        if cancelling and self.live.ready:
-            try:
-                await self.live_cancel_blind(cancelling, now_ms)
-            except Exception as error:
-                self.live_note_error(f"快车道撤单失败：{core.clean_error(error) or type(error).__name__}")
-            await self.live_requote_freed(list(cancelling), now_ms)
+        """An express decision in real trading: its orders go out now and the cancels of the orders it withdrew, side by
+        side (1.104.8: a cancel used to wait behind the pass's placements — the step's own placements and its sync skip
+        what is done); a slot whose cancel Predict confirms is quoted again at once and that order sent too
+        (live_requote_freed)."""
+        cancelling = self.live_cancels_unsent()
+
+        async def place() -> None:
+            if self.config.live_mode != "off":
+                try:
+                    await self.live_place_pending(now_ms)
+                except Exception as error:
+                    self.live_note_error(f"快车道下单失败：{core.clean_error(error) or type(error).__name__}")
+
+        async def cancel(records: dict[str, dict]) -> None:
+            if records and self.live.ready:
+                try:
+                    await self.live_cancel_blind(records, now_ms)
+                except Exception as error:
+                    self.live_note_error(f"快车道撤单失败：{core.clean_error(error) or type(error).__name__}")
+
+        await asyncio.gather(cancel(cancelling), place())
+        late = self.live_cancels_unsent(cancelling)  # withdrawn while its placement was in flight (the id just came back): cancelled now too
+        await cancel(late)
+        if (cancelling or late) and self.live.ready:
+            await self.live_requote_freed([*cancelling, *late], now_ms)
 
     def sim_requote_freed(self, markets: dict, freed: dict[str, dict], trades: dict[str, dict], now_ms: int, changed: list) -> None:
         if self.config.live_mode != "off":

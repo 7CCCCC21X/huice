@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.104.7"
+VERSION = "1.104.8"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -12680,6 +12680,7 @@ class Bot:
         self.sim_requote_count = 0          # orders placed in the very look that withdrew the slot's last one, or right after its confirmed cancel (for /diag)
         self.sim_requote_live = 0           # ...of which real orders (LiveBot.live_requote_freed)
         self.sim_follow_since: dict[str, tuple[float, int]] = {}  # market|side -> (the place a resting order would move to, since when it has been that: sim_follow_settled)
+        self.sim_follow_timers: dict[str, asyncio.TimerHandle] = {}  # book key -> the express look due when a follow's settle runs out (sim_follow_wake)
         self.sim_taker_seen: dict[str, int] = {}  # taker slot -> when (ms) its side was first buyable in the run of looks that still finds it so (SIM_TAKER_HOLD_SECONDS)
         self.sim_unpriced_since: dict[str, int] = {}  # market -> when (ms) a step first found it unpriced with an order resting (sim_unpriced_reason)
         self.sim_step_ms: dict[str, int] = {}  # the last decision phase, by part (for /diag)
@@ -16052,10 +16053,10 @@ class Bot:
             if move is None:
                 self.sim_follow_since.pop(key, None)
                 return ""
-            return move[1] if self.sim_follow_settled(key, move[0], now_ms) else ""
+            return move[1] if self.sim_follow_settled(key, move[0], now_ms, mk.key) else ""
         return ""
 
-    def sim_follow_settled(self, key: str, target: float, now_ms: int) -> bool:
+    def sim_follow_settled(self, key: str, target: float, now_ms: int, book_key: str = "") -> bool:
         """Whether a resting order's re-quote to ``target`` goes now: that place has held SIM_MAKER_FOLLOW_SETTLE_SECONDS
         (the clock starts when it is first seen, again when the place changes; 0 = at once). A market maker on the 11-04
         SK 海力士 15 分 book pulled and re-posted its three-level stack every half second, the 买1 a cent or two away each
@@ -16067,8 +16068,31 @@ class Bot:
         held = self.sim_follow_since.get(key)
         if held is None or abs(held[0] - target) >= SIM_MAKER_FOLLOW - 1e-9:
             self.sim_follow_since[key] = (target, now_ms)
+            self.sim_follow_wake(book_key, settle)  # the lane looks again by itself once the settle has run out
             return False
         return now_ms - held[1] >= settle * 1000 - 1e-9
+
+    def sim_follow_wake(self, book_key: str, settle: float) -> None:
+        """The express lane is asked to look at a market again once a follow's settle has run out (sim_follow_settled:
+        the clock just started), in case no push comes in between — the 买1 that held its new place is then followed
+        right at the settle, by the lane, not by the step up to five seconds later (1.104.8: the first /diag on 1.104.7
+        had the withdrawal decision to the cancel request at a median of 0.9 s — half the follows still went by the
+        step, whose cancels wait behind its sync's read of the open list). One timer per market, re-armed when the place
+        changes; a market the feed does not hold (a test's stub) gets none."""
+        if not (self.config.sim and self.config.predict) or not book_key or (book_key not in self.predict.books and book_key not in self.predict.ladders):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        old = self.sim_follow_timers.pop(book_key, None)
+        if old is not None:
+            old.cancel()
+        self.sim_follow_timers[book_key] = loop.call_later(settle + 0.1, self.sim_follow_fire, book_key)
+
+    def sim_follow_fire(self, book_key: str) -> None:
+        self.sim_follow_timers.pop(book_key, None)
+        self.predict.updated(book_key)
 
     def sim_rekey(self, tid: str, trade: dict) -> str:
         """Move a record to tid#n: the slot (one order per market, side and way of trading) is free for a fresh order,

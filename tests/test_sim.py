@@ -1535,6 +1535,24 @@ async def faster():
     t = fbot3.sim_trades()
     assert sorted(t) == [tid, f"{tid}#1"] and t[f"{tid}#1"]["withdrawn"]["why"] == "买1 移到 57.0¢，改跟" and t[f"{tid}#1"]["withdrawn"]["rule"] is True \
         and t[tid]["price"] == 0.57 and t[tid]["status"] == "resting" and fbot3.sim_express_count == 3, t
+    assert fbot3.sim_follow_timers == {}, "a market the feed does not hold (the stub) arms no timer"
+    # 1.104.8: a 买1 just moved arms a timer for the settle — with no push in between, the lane looks again by itself right then
+    fbot4 = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                     "SIM_WAYS": "maker", "SIM_MARKETS": "all", **LEGACY, "SIM_MAKER_MIN_BID": "100", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0.4"}),
+                 m.Store(":memory:"), FM(NOW), None)
+    fbot4.sim_markets = lambda now: world["markets"]
+    fbot4.predict.books["HSI"] = hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW).book  # the feed holds the key: a timer is armed for it
+    world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW)]
+    await fbot4.sim_express("HSI")
+    world["markets"] = [hsi(0.70, [(0.57, 100)], [(0.60, 100)], NOW)]
+    await fbot4.sim_express("HSI")  # the move seen: the clock starts, the timer is armed, the order stays
+    assert sorted(fbot4.sim_trades()) == [tid] and "HSI" in fbot4.sim_follow_timers and fbot4.sim_express_count == 2  # (the queue place updated)
+    fbot4.market.now = NOW + 1_000  # the fake clock past the settle by the time the timer fires
+    world["markets"] = [hsi(0.70, [(0.57, 100)], [(0.60, 100)], NOW + 1_000)]
+    await asyncio.sleep(0.8)
+    t = fbot4.sim_trades()
+    assert sorted(t) == [tid, f"{tid}#1"] and t[tid]["price"] == 0.57 and t[f"{tid}#1"]["withdrawn"]["why"] == "买1 移到 57.0¢，改跟" \
+        and "HSI" not in fbot4.sim_follow_timers and fbot4.sim_express_count == 3, (t, fbot4.sim_follow_timers)
     print("FASTER_OK")
 
 
