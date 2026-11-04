@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.100.1"
+VERSION = "1.101.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -9725,6 +9725,9 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 .tk{margin-top:6px;font-size:12px;color:var(--muted);line-height:1.45;display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 6px}
 .tk b{color:var(--text);font-variant-numeric:tabular-nums}.tk.ready{color:var(--best);font-weight:600}.tk.wait,.tk.held{color:var(--faint)}.tk.blocked{color:var(--warn)}
 .tkm{font-size:10.5px;border-radius:6px;padding:0 5px;background:var(--chip);color:var(--muted);font-weight:600}
+.why{margin-top:4px;font-size:12px}.whyh{background:none;border:0;padding:0;color:var(--muted);font:inherit;cursor:pointer;text-align:left}.whyh:hover{color:var(--text)}
+.whyb{margin-top:4px;padding:6px 8px;border-radius:8px;background:var(--chip);display:flex;flex-direction:column;gap:6px;line-height:1.45}
+.whyt{color:var(--muted);font-weight:600}.whyl b{color:var(--text);margin-right:4px}.whyl.ready{color:var(--best)}.whyl.blocked{color:var(--warn)}.whyl.wait,.whyl.off{color:var(--muted)}
 .simnear{display:flex;flex-direction:column;gap:2px;font-size:12.5px;margin:4px 0}.simnear .tk{margin:0}.simnear .tk .it{color:var(--text);font-weight:600}
 .pwhy.ok{color:var(--best)}
 .simg{display:grid;grid-template-columns:auto auto auto 1fr;gap:3px 12px;font-size:12.5px;font-variant-numeric:tabular-nums;margin-top:4px;padding:8px 10px;border-radius:10px;background:var(--chip)}.simg .lh{color:var(--faint);font-size:11px}.simg .ln{text-align:right}
@@ -10042,6 +10045,7 @@ function book(p,key){
   const v=bookView(p);
   if(v.edges.length){w.append(chips(key,v,{...ctxOf(p),hot:hotByCard[key]??HOT}));if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}  // framed = suggested, grey = not big enough
   const tl=takerLine(p.taker);if(tl)w.append(tl);
+  const wr=whyRow(p);if(wr)w.append(wr);
   return w}
 function takerLine(t){  // 距吃单: how far the trader itself (its own bar, cap, size and fee, not the viewer's amount) is from taking this book
   if(!t||t.state==="off")return null;
@@ -10049,6 +10053,39 @@ function takerLine(t){  // 距吃单: how far the trader itself (its own bar, ca
   if(t.state==="near"){const i=t.text.indexOf("：");d.append(icon+"距吃单 ",$("b","",cent(t.gap)),i>=0?t.text.slice(i):"")}else d.append(icon+t.text);
   if(t.after)d.append($("span","tkm","盘后"));
   d.title=(t.detail||t.text)+(t.bar!=null?"；机器人的吃单门槛：净优势 ≥"+cent(t.bar)+"，按它自己的份数、封顶价和手续费算，不是上面按试算金额算的四个方向":"");return d}
+// 为什么挂 / 不挂单: what the trader rests or takes on this book and why not, each side apart (why.json). Read when a row is
+// opened and every few seconds while one is; it holds an account's orders, so with real trading set up it asks for the
+// control key (WEB_CONTROL_KEY) once and keeps it in this tab, as the review page does
+let whyData=null,whyAt=0,whyBusy=false,whyErr="",whyKeyBad=false;
+function whyKey(){try{return sessionStorage.getItem("ctlkey")||""}catch(e){return ""}}
+function whyAsk(msg){const k=prompt(msg+"\\n下单情况里有实盘账户的挂单和持仓，需要控制口令（环境变量 WEB_CONTROL_KEY）：","");
+  if(k===null||!k.trim()){whyKeyBad=true;return false}try{sessionStorage.setItem("ctlkey",k.trim())}catch(e){}whyKeyBad=false;return true}
+async function loadWhy(force){
+  if(whyBusy||(!force&&(whyKeyBad||Date.now()-whyAt<5000)))return;whyBusy=true;let again=false;
+  try{const key=whyKey(),r=await fetch(location.pathname.replace(/\\/$/,"")+"/why.json",{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
+    if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}
+      if(r.status===403&&whyAsk(j.message||"需要控制口令"))again=true;throw new Error(j.message||("HTTP "+r.status))}
+    if(!r.ok)throw new Error("HTTP "+r.status);whyData=await r.json();whyAt=Date.now();whyErr=""}
+  catch(e){whyErr="读取失败："+(e.message||"网络错误")+(whyKeyBad?"（点标题重新输入口令）":"")}
+  finally{whyBusy=false}
+  if(again)return loadWhy(true);
+  if(last)render(last)}
+function whyRow(p){
+  if(!p||!p.market_id||!p.taker)return null;  // the books the trader prices: they carry its distance to a taker buy
+  const id="why#"+p.market_id,on=open.has(id),d=$("div","why"),h=$("button","whyh",(on?"▾ ":"▸ ")+"为什么挂 / 不挂单");
+  h.type="button";h.setAttribute("aria-expanded",on?"true":"false");h.title="机器人在这个盘口现在挂什么、吃什么，两边各自为什么挂或不挂";
+  h.addEventListener("click",e=>{e.stopPropagation();if(open.has(id))open.delete(id);else{open.add(id);loadWhy(true)}if(last)render(last)});
+  d.append(h);
+  if(on){const w=whyData&&whyData.markets?whyData.markets[p.market_id]:null;
+    d.append(w?whyBody(w):$("div","small mut",whyErr||(whyBusy||!whyData?"读取中…":"机器人现在没给这个盘口定价（概率暂缺或盘口没读到）")))}
+  return d}
+function whyBody(w){const b=$("div","whyb");
+  if(w.error){b.append($("div","warn","读取失败："+w.error));return b}
+  const part=(title,x)=>{if(!x)return;const s=$("div","whys");s.append($("div","whyt",title+(x.text?"："+x.text:"")));
+    for(const r of x.sides||[]){const l=$("div","whyl "+(r.state||""));l.append($("b","",r.label+"："),r.text);s.append(l)}b.append(s)};
+  part("挂单",w.maker);part("吃单",w.taker);
+  if(whyData&&whyData.generated_at)b.append($("div","small mut","数据 "+whyData.generated_at));
+  return b}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
 function simCard(c,it){
   // paper trading: would buying every suggestion of 10¢ or more have made money? Results only, nothing is ever ordered
@@ -10229,6 +10266,7 @@ function rowNote(r,L,it){  // one line about a ladder level itself, above its fo
   if(r.points_active!==undefined){const point=r.points_note||"积分状态暂缺",why=r.maker_note||r.points_why;d.append($("div","",point+(r.points_active===true&&r.points_rate!=null?" · "+qty(r.points_rate)+" PP/小时":"")));
     if(r.points_ok===false&&why&&why!==point)d.append($("div","warn",why))}
   const tl=takerLine(r.taker);if(tl)d.append(tl);
+  const wr=whyRow(r);if(wr)d.append(wr);  // each level is a market of its own: its own 为什么挂 / 不挂单
   if(r.error)d.append($("span","warn","⚠️ "+r.error));
   if(r.dir_note)d.append($("span","warn",r.dir_note));
   if(r.hold&&!r.error&&r.hold!==r.dir_note)d.append($("span","warn","暂不建议："+r.hold));
@@ -10441,6 +10479,7 @@ function load(){
     const sig=JSON.stringify(d.items),same=!!last&&sig===lastSig;lastSig=sig;  // books move every 15 s, crypto quotes every 30 s: a repeat
     last=d;if(!same||drag)render(d);                                            // rebuilds nothing (a drag still notes it); the stream patches the daily cards between answers
     drawMeta(d);
+    if([...open].some(k=>k.startsWith("why#")))loadWhy(false);  // an open 为什么挂 / 不挂单 row follows the refreshes (at most every 5 s)
     if(!same)drawLegend();
     document.getElementById("foot").textContent=d.note;tick();
   }catch(e){failMsg=e.name==="AbortError"?"超过 "+LOAD_TIMEOUT_MS/1000+" 秒没有响应":(e.message||"网络错误");
@@ -11255,7 +11294,7 @@ class WebServer:
     """
     MAX_HEADER_BYTES = 8192
     GZIP_MIN_BYTES = 512  # below this a gzip header costs about as much as it saves
-    CACHE_SECONDS = {"data.json": 1.0, "journal.json": 5.0, "live.json": 1.0, "control.json": 1.0}  # several tabs (or a scanner) share one build per interval
+    CACHE_SECONDS = {"data.json": 1.0, "journal.json": 5.0, "live.json": 1.0, "control.json": 1.0, "why.json": 2.0}  # several tabs (or a scanner) share one build per interval
     CONTROL_BODY_MAX = 16384   # bytes a control request may carry
     CONTROL_TRIES = 5          # wrong keys within CONTROL_LOCK_SECONDS that lock the control route for as long
     CONTROL_GLOBAL_TRIES = 50  # wrong keys from every address together that lock the route for everyone (addresses can be forged)
@@ -11324,6 +11363,9 @@ class WebServer:
                 return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
             if parts[2] == "summary.csv":
                 return 200, "text/csv; charset=utf-8", self.bot.journal_summary_csv().encode("utf-8")
+            if parts[2] == "why.json":  # the cards' "为什么挂 / 不挂单": an account's orders, keyed as the review data is (handle)
+                return 200, "application/json; charset=utf-8", self.cached(
+                    "why.json", lambda: json.dumps(self.bot.why_payload(), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "control":
                 return 200, "text/html; charset=utf-8", self.pages["control"]
         return 404, "text/plain; charset=utf-8", b"not found"
@@ -11480,7 +11522,7 @@ class WebServer:
             elif method.upper() in {"GET", "HEAD"} and self.is_control(path, "control.json"):
                 status, ctype, body = self.control_json(rest, self.client_of(rest, writer))
             elif method.upper() in {"GET", "HEAD"} and self.journal_locked() and (self.is_control(path, "journal.json") or self.is_control(path, "journal.csv")
-                                                                                 or self.is_control(path, "summary.csv")):
+                                                                                 or self.is_control(path, "summary.csv") or self.is_control(path, "why.json")):
                 status, ctype, body = self.journal_keyed(path, query, rest, self.client_of(rest, writer))
             else:
                 status, ctype, body = self.route(method.upper(), path, query)
@@ -14408,35 +14450,48 @@ class Bot:
                 out.append({**row, "skipped": str(row["key"]).upper() in self.config.sim_skip})
         return out
 
-    def sim_maker_reason(self, mk: SimMarket, trades: dict[str, dict], now_ms: int, skip: Iterable[str] = ()) -> tuple[BookEdge | None, str]:
-        """The resting order the paper trader places on this market now (the side, the valid 买1 it joins — maker_level:
-        the first level holding SIM_MAKER_MIN_BID shares besides ours — and the edge), or why none, in the order check's
-        words: scope, SIM_WAYS, the card, the book, the session, the points, the depth, the bar, the slot. The quiet
-        window, the group cap and the real-trading checks come after (sim_quiet, sim_group_room); a side they refused this
-        look is passed over (``skip``: "up" / "down"), for the other side if it clears the bar on its own."""
+    def sim_maker_gate(self, mk: SimMarket, now_ms: int) -> str:
+        """Why no resting order goes on this market at all now — both sides alike — in the order check's words: scope,
+        SIM_WAYS, the card, the book, the session, the points, the spread. "" when the sides may be judged."""
         c = self.config
         if mk.kind not in c.sim_markets:
-            return None, "不在 SIM_MARKETS 范围"
+            return "不在 SIM_MARKETS 范围"
         if str(mk.key).upper() in c.sim_skip:
-            return None, "详细选项里已排除这个市场"
+            return "详细选项里已排除这个市场"
         if c.sim_ways == "taker":
-            return None, "SIM_WAYS=taker：只吃单" + ("（盘后挂单 / 低价挂单模式要先打开挂单）" if c.sim_maker_after_hours > 0 or c.sim_maker_deep > 0 else "")
+            return "SIM_WAYS=taker：只吃单" + ("（盘后挂单 / 低价挂单模式要先打开挂单）" if c.sim_maker_after_hours > 0 or c.sim_maker_deep > 0 else "")
         if not mk.makers:
-            return None, f"{SIM_KINDS.get(mk.kind, mk.kind)}只做吃单"
+            return f"{SIM_KINDS.get(mk.kind, mk.kind)}只做吃单"
         if mk.hold:
-            return None, f"卡片暂不建议（{mk.hold}）"
+            return f"卡片暂不建议（{mk.hold}）"
         if mk.book.stale(now_ms):
-            return None, "盘口过期"
+            return "盘口过期"
         if c.sim_maker_session and mk.in_session is False and not self.sim_after_hours(mk):
-            return None, f"{self.sim_closed(mk)}，不挂单" + ("（盘后挂单模式未选这个市场）" if c.sim_maker_after_hours > 0 else "")
+            return f"{self.sim_closed(mk)}，不挂单" + ("（盘后挂单模式未选这个市场）" if c.sim_maker_after_hours > 0 else "")
         if c.sim_maker_points:
             status = self.points_status(mk.book.market_id, mk.book, now_ms, PREDICT_POINTS_STALE_SECONDS) if mk.book.market_id \
                 else {"points_active": None, "points_note": "积分状态暂缺"}
             if status["points_active"] is not True:
-                return None, f"{status['points_note']}，不挂"
+                return f"{status['points_note']}，不挂"
         if (why := sim_maker_block(mk.book, c.sim_maker_spread)) and not self.sim_deep_book(mk):
             unchosen = c.sim_maker_deep > 0 and not book_crossed(mk.book) and not self.sim_mode_market(mk, c.sim_maker_deep_markets)
-            return None, why + ("（低价挂单模式未选这个市场）" if unchosen else "")
+            return why + ("（低价挂单模式未选这个市场）" if unchosen else "")
+        return ""
+
+    def sim_maker_reason(self, mk: SimMarket, trades: dict[str, dict], now_ms: int, skip: Iterable[str] = (),
+                         notes: dict | None = None) -> tuple[BookEdge | None, str]:
+        """The resting order the paper trader places on this market now (the side, the valid 买1 it joins — maker_level:
+        the first level holding SIM_MAKER_MIN_BID shares besides ours — and the edge), or why none, in the order check's
+        words: scope, SIM_WAYS, the card, the book, the session, the points, the depth, the bar, the slot. The quiet
+        window, the group cap and the real-trading checks come after (sim_quiet, sim_group_room); a side they refused this
+        look is passed over (``skip``: "up" / "down"), for the other side if it clears the bar on its own. ``notes``, when
+        given, is filled for the page (sim_why): the gate, each side's order or why it has none, the bar, the error."""
+        c = self.config
+        if gate := self.sim_maker_gate(mk, now_ms):
+            if notes is not None:
+                notes["gate"] = gate
+            return None, gate
+        sides_seen = notes.setdefault("sides", {}) if notes is not None else {}
         wide = self.sim_deep_book(mk)  # a book the ordinary rule refuses: the deep-bid mode takes it, a cent in front, at its bar
         front_ok = c.sim_maker_deep > 0 and self.sim_mode_market(mk, c.sim_maker_deep_markets) and not book_crossed(mk.book)
         only = front_ok and c.sim_maker_deep_only and self.sim_mode_market(mk, c.sim_maker_deep_only_markets)  # SIM_MAKER_DEEP_ONLY (on its markets): the joining orders are not placed at all
@@ -14451,6 +14506,8 @@ class Bot:
             own, own_price = self.sim_own_resting(trades, mk.market, side)
             level = maker_level(mk.book, side, c.sim_maker_min_bid, own, own_price)
             if level is None:
+                sides_seen[side] = {"why": (f"没有不少于 {c.sim_maker_min_bid:g} 份的买价档位可跟（SIM_MAKER_MIN_BID）" if c.sim_maker_min_bid > 0
+                                            else "没有买价可跟")}
                 continue
             front = self.sim_maker_price(mk.book, side, level, True, own, own_price)
             in_front = front[0] > level[0] + 1e-9  # a cent over the 买1 is possible (the best ask is not right there)
@@ -14464,6 +14521,7 @@ class Bot:
                 sweep = self.sweep_price(mk.book, side, fair, deep_bar, own, own_price)
                 if sweep is None:
                     joined = max(joined if joined is not None else -1.0, fair - level[0])
+                    sides_seen[side] = {"why": f"只挂低价挂单：买1 之上 1¢ 和下面都留不出 {cents(deep_bar)}（跟买1 也只有 {cents(fair - level[0])}）"}
                     continue
             price, queued = (sweep[0], sweep[1]) if sweep else front if use_front else level
             rank = 1
@@ -14476,9 +14534,14 @@ class Bot:
                     price, queued, rank = lower
             if limit is not None and price > limit + 1e-9:
                 dear = max(dear if dear is not None else -1.0, price)
+                sides_seen[side] = {"why": f"盘后只挂 {cents(limit)} 以下的，可挂的价位 {cents(price)} 高于它"}
                 continue
             edge = fair - price
             cands.append(BookEdge(name, True, price, edge, queued, edge, front=use_front or sweep is not None, sweep=sweep is not None, level=rank))
+            sides_seen[side] = {"cand": cands[-1]}
+        if notes is not None:
+            notes["bar"], notes["mode"], _ = self.sim_maker_mode(mk)
+            notes["need"] = mk.need
         cands.sort(key=lambda b: b.edge, reverse=True)
         cut_note = f"；{'；'.join(capped)}" if capped else ""
         best = cands[0] if cands else None
@@ -14665,6 +14728,86 @@ class Bot:
             return {**out, "state": "near", "label": s["label"], "gap": s["gap"],
                     "text": f"距吃单 {cents(s['gap'])}：{s['label']} 卖1 {cents(s['ask'])}，封顶 {cents(s['cap'])}{s['capped']}", "short": f"{s['label']} 差 {cents(s['gap'])}"}
         return {**out, "state": "held", "text": out["detail"], "short": sides[0]["block"] or sides[1]["block"] or "没有卖单"}
+
+    @staticmethod
+    def maker_place_text(b: BookEdge) -> str:
+        """Where a resting order sits, in words: 跟买1 / 跟买2 (SIM_MAKER_DEEPER) / 买1 之上 1¢ (the deep-bid mode) / 击穿单."""
+        place = "击穿单" if b.sweep else "买1 之上 1¢" if b.front else f"跟买{b.level}"
+        return place + (f"，排在 {b.size:g} 份之后" if b.size > 0 and not b.front else "")
+
+    def sim_why(self, mk: SimMarket, trades: dict[str, dict], now_ms: int) -> dict:
+        """Why the trader rests or takes what it does on this market now, each side apart, for the odds page's card (why.json):
+        the resting order a side has (and why it goes next look, when it does), else the order it would place and what
+        stops it — the gates of both sides, the depth, the bar and the card's error, the caps (sim_maker_pick) — and the
+        taker's distance (sim_taker_gap). A side's position is named beside it."""
+        notes: dict = {}
+        self.sim_maker_reason(mk, trades, now_ms, notes=notes)
+        gate, seen = notes.get("gate", ""), notes.get("sides") or {}
+        bar, mode, need = notes.get("bar"), notes.get("mode", ""), float(notes.get("need") or mk.need)
+        rows = []
+        for side in ("up", "down"):
+            name = mk.sides[0 if side == "up" else 1]
+            label = "挂" + name
+            held = side_held(trades, mk.market, side)["positions"]
+            own = f"持仓 {held:g} 份；" if held > 1e-9 else ""
+            rest = trades.get(f"{mk.market}|{side}|挂")
+            if rest is not None and rest.get("status") == "resting":
+                place = ("击穿单" if rest.get("sweep") else "买1 之上 1¢" if rest.get("deep")
+                         else f"跟买{rest['join_level']}" if rest.get("join_level") else "跟买1")
+                filled = float(rest.get("shares") or 0)
+                leave = (self.sim_withdraw_reason(rest, mk, now_ms) or self.sim_requote_reason(rest, mk, now_ms)).removesuffix("，撤单")
+                rows.append({"side": side, "label": label, "state": "resting", "short": f"{label} 挂单中 {cents(float(rest.get('price') or 0))}",
+                             "text": own + f"挂单中：{cents(float(rest.get('price') or 0))}×{float(rest.get('order') or 0):g} 份（{place}"
+                                     + (f"，已成交 {filled:g} 份" if filled > 1e-9 else "") + "）" + (f"；下一轮撤掉：{leave}" if leave else "")})
+                continue
+            if gate:
+                rows.append({"side": side, "label": label, "state": "off", "short": f"{label} 不挂", "text": own + gate})
+                continue
+            cand = (seen.get(side) or {}).get("cand")
+            if cand is None:
+                rows.append({"side": side, "label": label, "state": "wait", "short": f"{label} 不挂",
+                             "text": own + ((seen.get(side) or {}).get("why") or "没有可挂的价位")})
+                continue
+            at = f"{cents(cand.price)}（{self.maker_place_text(cand)}）"
+            if cand.edge <= need:
+                rows.append({"side": side, "label": label, "state": "wait", "short": f"{label} 不挂",
+                             "text": own + f"{at}净优势 {cents(cand.edge)}，不超过模型误差 {cents(need)}"})
+                continue
+            if bar is not None and cand.edge < bar - 1e-9:
+                rows.append({"side": side, "label": label, "state": "wait", "short": f"{label} 不挂",
+                             "text": own + f"{at}净优势 {cents(cand.edge)}，低于{mode + '的' if mode else '触发'}门槛 {cents(bar)}"})
+                continue
+            count, why = self.sim_maker_pick(mk, trades, side, cand, now_ms)
+            if why:
+                rows.append({"side": side, "label": label, "state": "blocked", "short": f"{label} 被拦",
+                             "text": own + f"{at}净优势 {cents(cand.edge)}，但被拦：{why}"})
+            else:
+                rows.append({"side": side, "label": label, "state": "ready", "short": f"{label} 可挂 {cents(cand.price)}",
+                             "text": own + f"可挂 {cents(cand.price)}×{count:g} 份（{self.maker_place_text(cand)}，净优势 {cents(cand.edge)}），"
+                                           "下一轮挂出"})
+        gap = self.sim_taker_gap(mk, trades, now_ms)
+        takers = [{"side": s["side"], "label": s["label"],
+                   "text": s["block"] or (f"卖1 {cents(s['ask'])}，封顶 {cents(s['cap'])}{s['capped']}"
+                                          + (f"，可买 {s['got']:g} 份" if s["got"] else f"，差 {cents(s['gap'])}" if s.get("gap") is not None else ""))}
+                  for s in gap.get("sides") or []]
+        return {"item": mk.item, "market": mk.market,
+                "maker": {"text": f"不挂单：{gate}" if gate else "；".join(r["short"] for r in rows), "sides": rows},
+                "taker": {"text": gap.get("text", ""), "state": gap.get("state", ""), "sides": takers if gap.get("state") != "off" else []}}
+
+    def why_payload(self) -> dict:
+        """why.json: every market the trader prices, by Predict market id, with why it rests or takes what it does (sim_why)."""
+        now_ms = self.market.now_ms()
+        trades = self.sim_trades()
+        out = {}
+        for mk in self.sim_markets(now_ms):
+            if mk.book.market_id in (None, ""):
+                continue
+            try:
+                out[str(mk.book.market_id)] = self.sim_why(mk, trades, now_ms)
+            except Exception as error:  # one market's reasons never take the others down
+                out[str(mk.book.market_id)] = {"item": mk.item, "market": mk.market, "error": clean_error(error) or type(error).__name__}
+        return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）",
+                "enabled": self.config.sim and self.config.predict, "ways": sim_scope(self.config)[0], "markets": out}
 
     def sim_taker_gaps(self, now_ms: int) -> dict[str, dict]:
         """Every market the trader prices, by Predict market id: how far each is from a taker buy (sim_taker_gap)."""

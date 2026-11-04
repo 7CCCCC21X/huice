@@ -318,6 +318,11 @@ async def run():
     st, j = await post(port, {"key": KEY, "action": "reset"}); assert st == 200
     # the review data needs the key once a real-trading key is configured (it is an account's activity); the odds page withholds the trade list
     assert (await get_json(port, "data.json", key=""))["items"] and not next(c for c in (await get_json(port, "data.json", key=""))["items"] if c.get("kind") == "sim")["sim"]["private"]
+    # 1.101.0: the cards' 为什么挂 / 不挂单 (why.json) is open while the review data is, and the page reads it from there
+    st, _, body = await request(port, f"GET /p/{TOKEN}/why.json HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    assert st == 200 and isinstance(json.loads(body)["markets"], dict) and json.loads(body)["version"] == m.VERSION, body[:200]
+    st, _, page = await request(port, f"GET /p/{TOKEN} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    assert st == 200 and "为什么挂 / 不挂单" in page.decode() and "/why.json" in page.decode() and 'sessionStorage.getItem("ctlkey")' in page.decode()
     lbot = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY, "PREDICT_PRIVATE_KEY": "0x" + "a" * 64}), m.Store(":memory:"), FM(NOW), None)
     webl = m.WebServer(lbot, 0, TOKEN); webl.CACHE_SECONDS = {}; portl = await webl.start()
     st, _, body = await request(portl, f"GET /p/{TOKEN}/journal.json HTTP/1.1\r\nHost: x\r\n\r\n".encode()); assert st == 403 and b'"locked": true' in body, body[:200]
@@ -326,6 +331,10 @@ async def run():
     st, _, body = await request(portl, f"GET /p/{TOKEN}/journal.json HTTP/1.1\r\nHost: x\r\nX-Control-Key: {KEY}\r\n\r\n".encode()); assert st == 200 and b'"trades"' in body
     st, _, body = await request(portl, f"GET /p/{TOKEN}/journal.csv HTTP/1.1\r\nHost: x\r\nX-Control-Key: {KEY}\r\n\r\n".encode()); assert st == 200 and body.startswith("\ufeff编号".encode())
     st, _, body = await request(portl, f"GET /p/{TOKEN}/journal HTTP/1.1\r\nHost: x\r\n\r\n".encode()); assert st == 200 and b"askKey" in body  # the page itself asks for the key
+    # ...and so does why.json: an account's orders and positions, behind the same key (a wrong one refused)
+    st, _, body = await request(portl, f"GET /p/{TOKEN}/why.json HTTP/1.1\r\nHost: x\r\n\r\n".encode()); assert st == 403 and b'"locked": true' in body, body[:200]
+    st, _, body = await request(portl, f"GET /p/{TOKEN}/why.json HTTP/1.1\r\nHost: x\r\nX-Control-Key: wrong-key-123456\r\n\r\n".encode()); assert st == 403
+    st, _, body = await request(portl, f"GET /p/{TOKEN}/why.json HTTP/1.1\r\nHost: x\r\nX-Control-Key: {KEY}\r\n\r\n".encode()); assert st == 200 and b'"markets"' in body
     simcard = next(c for c in (await get_json(portl, "data.json", key=""))["items"] if c.get("kind") == "sim")["sim"]
     assert simcard["private"] is True and simcard["rows"] == [] and "total" in simcard
     assert lbot.journal_payload()["trades"] == [] and lbot.sim_report()["private"] is False  # the review payload itself is unchanged (served behind the key)

@@ -599,6 +599,18 @@ async def browser_check(bot):
         await card.locator(".lrow .edge").nth(0).click()
         assert "暂不建议：标题的箭头和规则写的方向相反" in await card.locator(".lrow .edet").inner_text()
         await card.locator(".pg .lt:text-is('↑ $125k')").click()
+        # 1.101.0: each level is a market of its own, with its own 为什么挂 / 不挂单 (why.json), closed until tapped
+        await card.locator(".pg .lt:text-is('↑ $120k')").click()
+        why = card.locator(".lrow .whyh")
+        assert await why.inner_text() == "▸ 为什么挂 / 不挂单" and await card.locator(".lrow .whyb").count() == 0
+        await why.click()
+        await card.locator(".lrow .whyb").wait_for(timeout=10000)
+        body = await card.locator(".lrow .whyb").inner_text()
+        assert "挂单：不挂单：价格阶梯只做吃单" in body and "吃单：" in body and "数据 " in body, body
+        assert await card.locator(".lrow .whyh").inner_text() == "▾ 为什么挂 / 不挂单" and await card.locator(".lrow").count() == 1
+        await card.locator(".lrow .whyh").click()
+        assert await card.locator(".lrow .whyb").count() == 0 and await card.locator(".lrow").count() == 1  # the level stays open
+        await card.locator(".pg .lt:text-is('↑ $120k')").click()
         # the strip on top lists every red-framed suggestion; tapping one jumps to its card (hidden while customising)
         strip = await page.inner_text("#opps")
         # makers (挂单) and takers (吃单) are listed apart: 甲's maker under 挂单, then BTC's taker under 吃单
@@ -667,7 +679,7 @@ async def browser_check(bot):
         assert (await page.inner_text("#opps")).startswith("🔥 机会 2")
         # a folded section still counts its red-framed cards in its title; the strip unfolds it before jumping in
         await page.click("#h-levels .fold")
-        assert not await page.is_visible("#g-levels") and await page.inner_text("#h-levels .fs") == "5 张 · 🔥 1"
+        assert not await page.is_visible("#g-levels") and await page.inner_text("#h-levels .fs") == "7 张 · 🔥 1"
         await page.locator("#opps .opp").nth(1).click(); await page.wait_for_timeout(300)
         assert await page.is_visible("#g-levels .card") and await card.evaluate("c => c.classList.contains('flash')")
         assert await page.evaluate("localStorage.getItem('folded')") == "[]"

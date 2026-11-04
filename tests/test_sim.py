@@ -2174,3 +2174,86 @@ async def sweep_off():
 
 
 asyncio.run(sweep_off())
+
+
+async def why_rows():
+    """1.101.0: the odds page's 为什么挂 / 不挂单 row (why.json, sim_why). Each card the trader prices, each side apart: the
+    order resting there (and why the next look takes it off, when it will), else the order it would place and what stops it
+    — the gates of both sides, the depth, the bar and the card's error, the caps — beside the taker's distance. The 11-04
+    SK 海力士 card: 涨 17.7¢ fair, bids 10¢×212 / 5¢×312.1 / 1¢×1000, asks from 35¢×127.1."""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_WAYS": "both",
+           "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off"}
+    slug = "sk-hynix-inc-up-or-down-on-october-5-2026"
+    settle = {"key": "SKHYNIXUSDT", "target": "2026-10-05", "line": 1398000.0, "close_ms": CLOSE}
+    asks = [("0.35", "127.1"), ("0.43", "175"), ("0.44", "178"), ("0.45", "112.1"), ("0.80", "100")]
+    ladder = [("0.10", "212"), ("0.05", "312.1"), ("0.01", "1000")]
+    card = lambda fair=0.177, bids=ladder, a=asks, at=NOW, mid="201": m.SimMarket(
+        slug, "SK 海力士", "close", "SKHYNIXUSDT", fair, book(bids, a, at, slug=slug, key="SKHYNIXUSDT", mid=mid), 0.04, "", ("涨", "跌"),
+        settle, {}, in_session=True)
+    bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    cards = [card()]
+    bot.sim_markets = lambda now, only=None: cards
+    sides = lambda b=bot: {r["label"]: (r["state"], r["text"]) for r in b.why_payload()["markets"]["201"]["maker"]["sides"]}
+    # nothing held: both sides would rest, 涨 at 买2 (买1 10¢ leaves 7.7¢), 跌 at 买1
+    w = bot.why_payload()
+    assert w["version"] == m.VERSION and w["ways"] == "挂单和吃单" and w["enabled"] is True and set(w["markets"]) == {"201"}, w
+    why = w["markets"]["201"]
+    assert why["item"] == "SK 海力士" and why["market"] == slug and why["maker"]["text"] == "挂涨 可挂 5.0¢；挂跌 可挂 65.0¢", why
+    assert sides() == {"挂涨": ("ready", "可挂 5.0¢×100 份（跟买2，排在 312.1 份之后，净优势 12.7¢），下一轮挂出"),
+                       "挂跌": ("ready", "可挂 65.0¢×100 份（跟买1，排在 127.1 份之后，净优势 17.3¢），下一轮挂出")}, sides()
+    assert why["taker"]["state"] == "near" and why["taker"]["text"] == "距吃单 19.0¢：吃跌 卖1 90.0¢，封顶 71.0¢", why["taker"]
+    assert [(s["label"], s["text"]) for s in why["taker"]["sides"]] == [("吃涨", "卖1 35.0¢，封顶 7.0¢，差 28.0¢"), ("吃跌", "卖1 90.0¢，封顶 71.0¢，差 19.0¢")]
+    # a 跌 position past the group cap: 挂跌 refused (its position named), 挂涨 placed at 买2 and resting
+    driver = m.market_driver("close", "SKHYNIXUSDT", settle, "SK 海力士")
+    held = {"v": 2, "market": slug, "slug": slug, "market_id": "201", "item": "SK 海力士", "kind": "close", "key": "SKHYNIXUSDT",
+            "side": "down", "label": "挂跌", "maker": True, "status": "filled", "shares": 470.0, "order": 470.0, "price": 0.66,
+            "fills": [], "revisions": [], "settle": settle, "driver": driver[0], "driver_name": driver[1], "opened": NOW - 3_600_000}
+    trades, changed = m.TradeMap({f"{slug}|down|挂#1": held}), []
+    bot.sim_quote(cards[0], trades, NOW, changed)
+    assert [(t["label"], t["price"], t.get("join_level")) for _, t in changed] == [("挂涨", 0.05, 2)], changed
+    bot.sim_save(trades.items())
+    got = sides()
+    assert got["挂涨"] == ("resting", "挂单中：5.0¢×100 份（跟买2）"), got
+    assert got["挂跌"][0] == "blocked" and got["挂跌"][1].startswith("持仓 470 份；65.0¢（跟买1，排在 127.1 份之后）净优势 17.3¢，但被拦：") \
+        and "超过组上限 $300" in got["挂跌"][1], got
+    assert bot.why_payload()["markets"]["201"]["maker"]["text"] == "挂涨 挂单中 5.0¢；挂跌 被拦"
+    # the next look moves the 涨 order: the fair price at 25¢ makes 买1 (10¢) worth 15¢
+    cards[0] = card(0.25)
+    assert sides()["挂涨"] == ("resting", "挂单中：5.0¢×100 份（跟买2）；下一轮撤掉：买1 移到 10.0¢，改跟"), sides()
+    # under the bar, within the card's error, short of depth: each side says which (跌 kept out of the way by asks at 20¢)
+    off = m.Bot(m.Config.from_env({**env, "SIM_MAKER_DEEPER": "off"}), m.Store(":memory:"), FM(NOW), None)
+    off.sim_markets = lambda now, only=None: [card(bids=ladder, a=[("0.20", "500")])]
+    assert sides(off) == {"挂涨": ("wait", "10.0¢（跟买1，排在 212 份之后）净优势 7.7¢，低于触发门槛 10.0¢"),
+                          "挂跌": ("wait", "80.0¢（跟买1，排在 500 份之后）净优势 2.3¢，不超过模型误差 4.0¢")}, sides(off)
+    cards[0] = card(bids=[("0.10", "20")], a=[("0.20", "500")])
+    assert sides()["挂涨"] == ("resting", "挂单中：5.0¢×100 份（跟买2）；下一轮撤掉：买1 不足 100 份，不跟"), sides()
+    fresh = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    fresh.sim_markets = lambda now, only=None: cards
+    assert sides(fresh)["挂涨"] == ("wait", "没有不少于 100 份的买价档位可跟（SIM_MAKER_MIN_BID）"), sides(fresh)
+    # what holds both sides is said once for the card, and on each side
+    cards[0] = card(at=NOW - 3_600_000)
+    stale = bot.why_payload()["markets"]["201"]["maker"]
+    assert stale["text"] == "不挂单：盘口过期" and [(r["state"], r["text"]) for r in stale["sides"]] == [("resting", "挂单中：5.0¢×100 份（跟买2）；下一轮撤掉：盘口断流超过 5 分钟"), ("off", "持仓 470 份；盘口过期")], stale
+    taker = m.Bot(m.Config.from_env({**env, "SIM_WAYS": "taker"}), m.Store(":memory:"), FM(NOW), None)
+    taker.sim_markets = lambda now, only=None: [card()]
+    tw = taker.why_payload()
+    assert tw["ways"] == "只吃单" and tw["markets"]["201"]["maker"]["text"] == "不挂单：SIM_WAYS=taker：只吃单"
+    assert sides(taker) == {"挂涨": ("off", "SIM_WAYS=taker：只吃单"), "挂跌": ("off", "SIM_WAYS=taker：只吃单")}
+    # 只挂低价挂单 (SIM_MAKER_DEEP_ONLY, a 25¢ bar): the 11-04 KOSPI card, 涨 17.4¢ fair, 买1 5¢×100, 卖1 43¢×300
+    deep = m.Bot(m.Config.from_env({**env, "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_ONLY": "on"}), m.Store(":memory:"), FM(NOW), None)
+    deep.sim_markets = lambda now, only=None: [card(0.174, [("0.05", "100")], [("0.43", "300")])]
+    got = sides(deep)
+    assert got["挂涨"] == ("wait", "只挂低价挂单：买1 之上 1¢ 和下面都留不出 25.0¢（跟买1 也只有 12.4¢）"), got
+    assert got["挂跌"][0] == "ready" and got["挂跌"][1].startswith("可挂 1.0¢×100 份（击穿单，净优势 "), got
+    # a market without a Predict id is left out; one whose reasons fail says so and the others stand
+    cards[:] = [card(mid=""), card(mid="201"), card(mid="202")]
+    real = bot.sim_why
+    bot.sim_why = lambda mk, trades, now_ms: (_ for _ in ()).throw(RuntimeError("坏了")) if mk.book.market_id == "202" else real(mk, trades, now_ms)
+    w = bot.why_payload()
+    assert set(w["markets"]) == {"201", "202"} and w["markets"]["202"] == {"item": "SK 海力士", "market": slug, "error": "坏了"}, w["markets"]["202"]
+    assert "maker" in w["markets"]["201"]
+    m.json.dumps(w)
+    print("WHY_ROWS_OK")
+
+
+asyncio.run(why_rows())
