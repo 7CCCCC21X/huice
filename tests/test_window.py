@@ -19,8 +19,25 @@ assert (W.key, W.stem, W.symbol, W.coin, W.minutes) == ("UNITREE-15M", "unitree"
 spec = W.current(BJ(11, 5, 30))
 assert spec.slug == "unitree-updown-15m-1793761200" and T0 // 1000 == 1793761200 and spec.name == "宇树 15分涨跌 11:00–11:15", spec
 assert (spec.start_ms, spec.end_ms) == (T0 - 60_000, T1 - 60_000)  # the index candles that end at 11:00 and at 11:15
-assert W.current(T0) == spec and W.current(T1 - 1) == spec and W.current(T1).slug == "unitree-updown-15m-1793762100"
+assert W.current(T0) == spec and W.current(T1 - 1) == spec and W.current(T1).slug == "unitree-updown-15m-1793768400"  # 13:00: no 11:15 window
 assert W.before(spec) == W.current(T0 - 1) and W.before(spec).slug == "unitree-updown-15m-1793760300" and W.tag(spec) == {"window": "15m"}
+# the schedule (1.103.0): 宇树's windows follow the Shanghai session (09:30–11:30, 13:00–15:00), the quarter hour before each close
+# without a market (the Predict page lists windows ending 09:45 … 11:15 and 13:15 … 14:45); weekends and holidays skipped
+at = lambda h, mi, d=4: int(dt.datetime(2026, 11, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+first = lambda ms, hol=frozenset(): m.stamp(W.current(ms, hol).start_ms + 60_000, seconds=False)
+assert W.exchange == "sh" and [first(at(h, mi)) for h, mi in ((9, 0), (9, 30), (11, 14), (11, 15), (12, 59), (13, 0), (14, 30), (14, 45), (15, 10))] == [
+    "11-04 09:30", "11-04 09:30", "11-04 11:00", "11-04 13:00", "11-04 13:00", "11-04 13:00", "11-04 14:30", "11-05 09:30", "11-05 09:30"]
+assert first(at(15, 10, 6)) == "11-09 09:30" and first(at(15, 10, 6), frozenset({dt.date(2026, 11, 9)})) == "11-10 09:30"
+assert [W.exists(at(h, mi)) for h, mi in ((9, 15), (9, 30), (11, 0), (11, 15), (13, 0), (14, 30), (14, 45))] == [False, True, True, False, True, True, False]
+last = lambda ms, hol=frozenset(): m.stamp(W.before(W.current(ms, hol), hol).start_ms + 60_000, seconds=False)
+assert last(at(13, 0)) == "11-04 11:00" and last(at(9, 30)) == "11-03 14:30" and last(at(9, 30, 9)) == "11-06 14:30"
+assert last(at(9, 30, 10), frozenset({dt.date(2026, 11, 9)})) == "11-06 14:30"
+# SK 海力士: the KRX session (09:00–15:30 KST = 08:00–14:30 Beijing), the user's link the 11:45 Beijing (12:45 KST) window
+K = m.WINDOW_UPDOWN_MARKETS[1]
+assert (K.key, K.stem, K.symbol, K.coin, K.exchange, K.minutes) == ("SKHYNIX-15M", "skhynix", "SKHYNIXUSDT", "SK 海力士", "kr", 15)
+assert m.stamp(K.current(at(7, 50)).start_ms + 60_000, seconds=False) == "11-04 08:00" and K.exists(at(14, 0)) and not K.exists(at(14, 15))
+assert K.current(at(11, 50)).slug == "skhynix-updown-15m-1793763900" and K.current(at(11, 50)).name == "SK 海力士 15分涨跌 11:45–12:00"
+assert m.stamp(K.before(K.current(at(8, 0))).start_ms + 60_000, seconds=False) == "11-03 14:00"
 assert W.ROLL_WAIT_MS == 60_000 and m.DailyUpDownSpec.ROLL_WAIT_MS == 10 * 60_000
 
 # --- σ from the index's 1-minute candles: the last four hours, or the last hour when it moves more ---------------------------
@@ -35,6 +52,13 @@ try:
     m.minute_vol(rows(["90"] * 30, T0), T0); assert False
 except ValueError as error:
     assert str(error) == "指数 1 分钟 K 线不足"
+# the session's minutes alone count for σ (1.103.0): the flat lunch break and the jump over it are left out
+calm_m = lambda n, base: [str(base * (1 + 0.0002 * (i % 2))) for i in range(n)]
+day_rows = rows(calm_m(121, 90), BJ(11, 30)) + rows(["95"] * 90, BJ(13, 0)) + rows(calm_m(61, 95), BJ(14, 1))
+session_vol = m.minute_vol(day_rows, BJ(14, 1), 240, m.session_minute_fn("sh"))
+assert abs(session_vol - m.minute_vol(rows(calm_m(241, 90), BJ(11, 30)), BJ(11, 30))) < 0.02 < 1 < m.minute_vol(day_rows, BJ(14, 1), 240)
+assert m.session_minute_fn("sh")(at(9, 30)) and not m.session_minute_fn("sh")(at(11, 30)) and not m.session_minute_fn("sh")(at(9, 30, 7))
+assert m.session_segments("sh", dt.date(2026, 11, 4)) == [(at(9, 30), at(11, 30)), (at(13, 0), at(15, 0))] and m.session_segments("kr", dt.date(2026, 11, 7)) == []
 
 
 class FM:
@@ -86,13 +110,16 @@ async def run():
     bot = m.Bot(m.Config.from_env(ENV), store, fm, None)
     card = bot.updowns["UNITREE-15M"]
     assert isinstance(card, m.IndexUpDownMarket) and card.spec == spec and bot.updown_rolling["UNITREE-15M"] is W
-    assert bot.index_markets == {"UNITREEUSDT": [card]} and all(card not in v for v in bot.pair_markets.values())
+    assert bot.index_markets["UNITREEUSDT"] == [card] and set(bot.index_markets) == {"UNITREEUSDT", "SKHYNIXUSDT"} and all(card not in v for v in bot.pair_markets.values())
+    sk = bot.updowns["SKHYNIX-15M"]
+    assert isinstance(sk, m.IndexUpDownMarket) and sk.exchange == "kr" and sk.spec == K.before(K.current(T0 + 5_000))  # its 10:45 window's end unread: settled first
+    assert sk.point(sk.spec.start_ms) == "10:45（韩国时间 11:45）" and sk.spec.name == "SK 海力士 15分涨跌 10:45–11:00"
     futures = bot.binance_streams["futures"]
     assert futures.symbols()[:2] == ["SKHYNIXUSDT", "UNITREEUSDT"] and "unitreeusdt@markPrice@1s" in futures.names()  # not in SYMBOLS: streamed all the same
     assert bot.predict_targets(T0 + 5_000)["UNITREE-15M"] == spec.slug and spec.slug in bot.predict.want_info
     assert bot.control_value("SIM_CRYPTO_15M_SHARES") == "10" and bot.control_value("SIM_CRYPTO_15M_QUIET_SECONDS") == "90"
     # before the start's candle is read
-    assert card.odds(T0 + 5_000) == "等待币安 UNITREEUSDT 22:00 ET（北京 11:00）的指数价（起点）"
+    assert card.odds(T0 + 5_000) == "等待币安 UNITREEUSDT 11:00 的指数价（起点）" and card.exchange == "sh" and card.trading(T0)
     fm.index[T0 - 60_000], fm.premium = "90.0000", ("90.1200", T0 + 4_500)
     await card.refresh(T0 + 5_000)
     assert card.close_of("start") == D("90.0000") and card.price == D("90.1200") and card.sigma > 0 and card.error == "", card.error
@@ -118,7 +145,7 @@ async def run():
     # paused: an index a minute old; an index that has not moved for hours
     assert card.odds(T0 + 6_000 + 61_000).startswith("指数价停在 ") and "暂停概率" in card.odds(T0 + 67_000)
     sigma, card.sigma = card.sigma, 0.0
-    assert card.odds(T0 + 7_000) == "指数近 4 小时没有变动（标的可能休市），暂停概率"
+    assert card.odds(T0 + 7_000) == "指数在最近的交易时段里没有变动，暂停概率"
     card.sigma = sigma
 
     # --- what holds the card back: Predict's target price, the time range its question names --------------------------------
@@ -154,8 +181,8 @@ async def run():
     pay = bot.updown_payload(card, now)
     assert (pay["name"], pay["group"], pay["source"], pay["ref"], pay["effective"]) == ("宇树 15分涨跌 11:00–11:15", "contract", "币安合约指数价",
                                                                                      "90.0000", "90.3000"), pay
-    assert pay["close_label"].startswith("22:15 ET（北京 11:15）的币安合约 UNITREEUSDT 指数价（Chainlink 结算源）") and pay["close_ms"] == T1
-    assert pay["ref_note"] == "币安合约 UNITREEUSDT 指数价，22:00 ET（北京 11:00）" and pay["predict"]["bids"][0] == [0.4, 300.0], pay
+    assert pay["close_label"].startswith("11:15 的币安合约 UNITREEUSDT 指数价（Chainlink 结算源）") and pay["close_ms"] == T1
+    assert pay["ref_note"] == "币安合约 UNITREEUSDT 指数价，11:00" and pay["predict"]["bids"][0] == [0.4, 300.0], pay
     items = [i for i in bot.odds_payload()["items"] if i.get("symbol") == "UNITREE-15M"]
     assert len(items) == 1 and items[0]["group"] == "contract"
     json.dumps(pay)
@@ -194,7 +221,7 @@ async def run():
     assert long_quiet.sim_quiet(mk.settle, T1 - 9 * 60_000) == ""  # SIM_QUIET_MINUTES would take most of the window: not applied here
     assert abs(long_quiet.sim_edge_bar(mk) - 0.06) < 1e-12 and long_quiet.sim_edge_bar(dataclasses_replace(mk, settle={"end": 1})) == long_quiet.config.sim_edge
     text = bot.sim_text()
-    assert "15 分钟涨跌（宇树，内测）：每次最多买 10 份，每个市场每边持仓加挂单最多 100 份，每个窗口最后 90 秒不下单、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
+    assert "15 分钟涨跌（宇树、SK 海力士，内测）：每次最多买 10 份，每个市场每边持仓加挂单最多 100 份，每个窗口最后 90 秒不下单、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
     # no Telegram alert: a quarter-hour window is over before an alert confirmed over a minute is acted on by hand
     seen = []
     bot.edge_observe = lambda state, market, mk_, *a, **k: seen.append(market)
@@ -214,7 +241,15 @@ async def run():
     card.times["candle"] = -1e9
     await bot.refresh_updown(T1 + 2_000)
     nxt = W.current(T1)
-    assert card.spec == nxt and card.close_of("start") == D("90.2000"), (card.spec, card.close_of("start"))  # the same candle starts the next window
+    assert card.spec == nxt and nxt.slug == "unitree-updown-15m-1793768400" and card.close_of("start") is None, card.spec  # 13:00: after the break
+    # the feed follows the next window from a quarter hour before it, not through the lunch break
+    assert "UNITREE-15M" not in bot.predict_targets(T1 + 2_000) and "UNITREE-15M" in bot.predict_targets(nxt.start_ms + 60_000 - 15 * 60_000)
+    # consecutive windows: the candle that settled one is the next one's line, kept at the roll (10:45–11:00 → 11:00–11:15)
+    c3 = m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(T0 - 30_000), None)
+    assert c3.updowns["UNITREE-15M"].spec == W.before(spec)
+    c3.market.index[T0 - 60_000], c3.market.now = "89.9500", T0 + 2_000
+    await c3.refresh_updown(T0 + 2_000)
+    assert c3.updowns["UNITREE-15M"].spec == spec and c3.updowns["UNITREE-15M"].close_of("start") == D("89.9500")
     assert nxt.slug in bot.predict.want_info
     assert store.get(f"updown:{ancient.slug}:end") is None and store.get(f"updown:{recent.slug}:end") == {"open": recent.end_ms, "close": "81"}
     assert store.get(f"updown:{spec.slug}:end") == {"open": spec.end_ms, "close": "90.2000", "read_ms": T1 + 2_000} and bot.updown_prune(W, T1 + 2_000) == 0
@@ -224,12 +259,12 @@ async def run():
     result = bot.sim_result(trade, T1 + 2_000)
     assert result is not None and result[0] == 1.0 and "终点 90.2" in result[1], result  # 90.20 over 90.00: 涨
     # an end within 0.05% of the start: Chainlink's report may differ from the index candle — Predict's result decides
-    fm.index[T1 + 14 * 60_000] = "90.2300"
-    later = W.current(T1 + 15 * 60_000 + 1)
+    fm.index[nxt.start_ms], fm.index[nxt.end_ms] = "90.2000", "90.2300"
     tie = {**trade, "market": nxt.slug, "slug": nxt.slug, "settle": {"end": nxt.end_ms, "start": nxt.start_ms, "window": "15m"}}
-    await bot.updown_of(tie).refresh(later.start_ms + 60_000 + 2_000)
-    assert bot.updown_of(tie).odds(later.start_ms + 60_000 + 2_000).startswith("终点指数 90.2300 与起点 90.2000 相差不到 0.05%")
-    assert bot.sim_result(tie, later.start_ms + 60_000 + 2_000) is None
+    at_end = nxt.end_ms + 60_000 + 2_000
+    await bot.updown_of(tie).refresh(at_end)
+    assert bot.updown_of(tie).odds(at_end).startswith("终点指数 90.2300 与起点 90.2000 相差不到 0.05%")
+    assert bot.sim_result(tie, at_end) is None
     # a restart within a minute of a window's end: the card starts on that window while its end is not read
     fresh = m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(T1 + 30_000), None)
     assert fresh.updowns["UNITREE-15M"].spec == spec

@@ -936,7 +936,7 @@ async def november():
         market = FakeMarket()
         bot = m.Bot(cfg, m.Store(":memory:"), market, None)
         assert list(bot.ranges) == [s.key for s in LIVE] + ["STRC-100"] and list(bot.touches) == ["SOL", "ETH"]  # 1.101.1: BNB 先触 decided, taken off
-        assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY", "UNITREE-15M"] and not bot.flips and not bot.caps  # 1.97.0: the daily up/down cards; 1.102.0: 宇树 15 分钟
+        assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY", "UNITREE-15M", "SKHYNIX-15M"] and not bot.flips and not bot.caps  # 1.97.0: the daily up/down cards; 1.102.0 / 1.103.0: the 15-minute ones
         targets = bot.predict_targets(MID)
         assert all(targets[s.key] == s.slug and s.key in bot.predict.ladder_keys for s in NOV) and not any(k.endswith("-HIT-10") for k in targets)
         # BNB 先触 700/900 (BNB fell to $700 first; Predict's book was gone, the card showed its HTTP 400): no book asked for, no
@@ -960,7 +960,7 @@ async def november():
                          ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格"), ("levels", "STRC 触及 $100")], items
         # the price streams follow: HYPEUSDT on futures for its ladder; no HYPE / SOL on Hyperliquid (the flip is gone)
         assert bot.binance_streams["spot"].symbols() == ["SOLUSDT", "ETHUSDT", "BTCUSDT", "BNBUSDT", "ZECUSDT"]  # BNBUSDT for BNB's daily card
-        assert bot.binance_streams["futures"].symbols() == ["UNITREEUSDT", "HYPEUSDT"] and not {"HYPE", "SOL"} & set(bot.hl_stream.coins())
+        assert bot.binance_streams["futures"].symbols() == ["UNITREEUSDT", "SKHYNIXUSDT", "HYPEUSDT"] and not {"HYPE", "SOL"} & set(bot.hl_stream.coins())
         assert [rm.spec.key for rm in bot.pair_markets[("futures", "HYPEUSDT")]] == ["HYPE-HIT-11"]
         assert [rm.spec.key for rm in bot.pair_markets[("spot", "BTCUSDT")]] == ["BTC-DAY", "BTC-HIT-11", "BTC-HIT-2027"]
     print("NOVEMBER_OK")

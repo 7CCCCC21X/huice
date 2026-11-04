@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.102.2"
+VERSION = "1.103.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -508,7 +508,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_CRYPTO_DAY_MAX_SHARES", "加密日涨跌每个市场每边最多持有多少份（内测）", "0～10000000：每日涨跌市场的涨、跌两边各自的持仓加挂单（含发送中、撤单待确认、低价挂单）不超过这个数，两边各算各的、不互相抵；超出的部分不买、只买剩下的额度；0 = 不另设"),
     ("SIM_CRYPTO_DAY_EDGE_CENTS", "加密日涨跌触发买入的净优势（¢/份，内测）", "0～50：每日涨跌市场单独的买入门槛，吃单、挂单都按它（模型误差更大时按模型误差），挂单撤单线随之不高于它减 0.5¢；0 = 同“触发买入的净优势”。怎么定：看 /calib 里的“加密日涨跌吃单门槛回测”"),
     ("SIM_CRYPTO_DAY_QUIET_MINUTES", "加密日涨跌结束前多少分钟不买（内测）", "0～1440：每日涨跌市场在结算那根 1 分钟 K（12:00 ET）之前这么多分钟起不开新单，未成交的挂单撤掉；和“结束前多少分钟不交易”取较长的；0 = 只按那一项"),
-    ("SIM_CRYPTO_15M_SHARES", "15 分钟涨跌每次最多买多少份（内测）", "0～1000000：宇树 15 分钟涨跌市场（每 15 分钟一个，按币安合约指数价结算）的吃单、挂单每次最多这么多份，上面的份数设置更小时按更小的；0 = 不另设"),
+    ("SIM_CRYPTO_15M_SHARES", "15 分钟涨跌每次最多买多少份（内测）", "0～1000000：宇树、SK 海力士 15 分钟涨跌市场（交易时段里每 15 分钟一个，按币安合约指数价结算）的吃单、挂单每次最多这么多份，上面的份数设置更小时按更小的；0 = 不另设"),
     ("SIM_CRYPTO_15M_MAX_SHARES", "15 分钟涨跌每个市场每边最多持有多少份（内测）", "0～10000000：每个 15 分钟市场的涨、跌两边各自的持仓加挂单（含发送中、撤单待确认、低价挂单）不超过这个数，两边各算各的；超出的部分不买、只买剩下的额度；0 = 不另设"),
     ("SIM_CRYPTO_15M_EDGE_CENTS", "15 分钟涨跌触发买入的净优势（¢/份，内测）", "0～50：15 分钟涨跌市场单独的买入门槛，吃单、挂单都按它（模型误差更大时按模型误差），挂单撤单线随之不高于它减 0.5¢；0 = 同“触发买入的净优势”"),
     ("SIM_CRYPTO_15M_QUIET_SECONDS", "15 分钟涨跌结束前多少秒不下单（内测）", "0～600：每个 15 分钟窗口结束前这么多秒起不下任何订单（吃单、挂单都不下，真实订单在这之前决定、发出时已进入这段时间的也不发），未成交的挂单撤掉；默认 90；最后一分钟（结算价那根 1 分钟 K）本来就不交易；只管 15 分钟涨跌，“结束前多少分钟不交易”不管这类市场"),
@@ -4884,6 +4884,31 @@ def session_state(market: str, now_ms: int, holidays: frozenset = frozenset()) -
     return "已收盘"
 
 
+def session_segments(market: str, day: dt.date, holidays: frozenset = frozenset()) -> list[tuple[int, int]]:
+    """The continuous-trading segments of ``market`` on its local ``day``, as [open, close) in epoch ms — a half day's
+    one, a KRX late day's (CALENDAR) — none on a weekend, on a holiday, or for a market the bot has no sessions for."""
+    info = STOCK_MARKETS.get(market)
+    if info is None or market not in SESSIONS or day.weekday() >= 5 or day in holidays:
+        return []
+    tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+    return [(int(dt.datetime.combine(day, a, tz).timestamp() * 1000), int(dt.datetime.combine(day, b, tz).timestamp() * 1000))
+            for a, b in CALENDAR.sessions(market, day)]
+
+
+def session_minute_fn(market: str, holidays: frozenset = frozenset()) -> Any:
+    """open_ms -> whether the minute opening then is inside one of ``market``'s trading segments (a day's segments
+    computed once): the 1-minute candles a 15-minute card's σ counts (IndexUpDownMarket)."""
+    tz = dt.timezone(dt.timedelta(hours=STOCK_MARKETS[market].utc_offset))
+    cache: dict[dt.date, list[tuple[int, int]]] = {}
+
+    def inside(open_ms: int) -> bool:
+        day = dt.datetime.fromtimestamp(open_ms / 1000, tz).date()
+        if day not in cache:
+            cache[day] = session_segments(market, day, holidays)
+        return any(a <= open_ms < b for a, b in cache[day])
+    return inside
+
+
 def ref_relative(ref_day: str, target: dt.date, now_ms: int) -> str:
     """'09-28' -> 昨收 (a close before today, Beijing) / 今收 (today's own close, after the session) / 参考."""
     if not ref_day:
@@ -6493,17 +6518,19 @@ def first_touch(spot: float, low: float, high: float, sigma: float, mu: float, y
 
 
 def realized_vol(rows: list, now_ms: int, count: int = 720, per_year: float = 365 * 24, at_least: int | None = None,
-                 what: str = "30 日小时 K 线") -> float:
+                 what: str = "30 日小时 K 线", keep: Any = None, step_ms: int | None = None) -> float:
     """Annualised σ of a price's finished candles (Binance klines: open time, O, H, L, C, …, close time): the sample σ of
     the log returns over the last ``count`` closes (the last 720 hourly ones, 30 days, by default), ``per_year`` candles
-    to a year. Fewer than ``at_least`` (``count``) finished candles is an error, as is a close that is not a positive number."""
-    done = [r for r in rows if isinstance(r, list) and len(r) > 6 and int(r[6]) < now_ms][-(count + 1):]
-    if len(done) < (count if at_least is None else at_least) + 1:
-        raise ValueError(f"{what}不足")
+    to a year. ``keep`` (open_ms -> bool) picks the candles that count (a session's minutes); with ``step_ms`` only
+    returns between candles that many ms apart count (not the jump over a break). Fewer than ``at_least`` (``count``)
+    returns is an error, as is a close that is not a positive number."""
+    done = [r for r in rows if isinstance(r, list) and len(r) > 6 and int(r[6]) < now_ms and (keep is None or keep(int(r[0])))][-(count + 1):]
     closes = [float(r[4]) for r in done]
-    if min(closes) <= 0:
+    if closes and min(closes) <= 0:
         raise ValueError(f"{what}价格无效")
-    rets = [math.log(b / a) for a, b in zip(closes, closes[1:])]
+    rets = [math.log(float(b[4]) / float(a[4])) for a, b in zip(done, done[1:]) if step_ms is None or int(b[0]) - int(a[0]) == step_ms]
+    if len(rets) < (count if at_least is None else at_least):
+        raise ValueError(f"{what}不足")
     mean = sum(rets) / len(rets)
     var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
     return math.sqrt(var * per_year)
@@ -6793,9 +6820,9 @@ class DailyUpDownSpec:
         return UpDownSpec(self.key, predict_slug(self.stem, day), self.symbol, f"{self.coin} {day:%m-%d} 涨跌",
                           et_wall_ms(day - dt.timedelta(days=1), self.hour, self.minute), et_wall_ms(day, self.hour, self.minute))
 
-    def current(self, now_ms: int) -> UpDownSpec:
+    def current(self, now_ms: int, holidays: frozenset = frozenset()) -> UpDownSpec:
         """The market whose final candle has not closed yet: the one named for today's ET date until hour:minute + 1 ET,
-        then tomorrow's (whose first candle is the one that just closed)."""
+        then tomorrow's (whose first candle is the one that just closed). Every day has one: no calendar."""
         day = et_date(now_ms)
         spec = self.day_spec(day)
         return spec if now_ms < spec.end_ms + 60_000 else self.day_spec(day + dt.timedelta(days=1))
@@ -6805,7 +6832,7 @@ class DailyUpDownSpec:
         """The date a day's market is named for: its final candle's ET date."""
         return et_date(spec.end_ms)
 
-    def before(self, spec: UpDownSpec) -> UpDownSpec:
+    def before(self, spec: UpDownSpec, holidays: frozenset = frozenset()) -> UpDownSpec:
         """The market before ``spec``: the day before's (a restart just after noon ET still settles it, Bot.updown_start)."""
         return self.day_spec(self.day_of(spec) - dt.timedelta(days=1))
 
@@ -6833,15 +6860,20 @@ class WindowUpDownSpec:
     1-minute candle that ends there — the last index before it, as a report at that moment carries. One card follows
     the windows under one key, as a daily card follows the days (Bot.updown_roll). The slug's time is taken for the
     window's start (the convention of these markets); Predict's target price and the time range in the market's question,
-    when it shows them, must agree, or nothing is suggested (Bot.updown_hold). In beta: the trader buys at most
+    when it shows them, must agree, or nothing is suggested (Bot.updown_hold). The windows of a stock's market follow its
+    exchange's session (``exchange``: current / before): inside a continuous-trading segment, ending before the segment's
+    close — the last quarter hour before a close has no market (宇树, 11-04: the listed windows end 09:45 … 11:15 and
+    13:15 … 14:45; none at 11:30 or 15:00) — on no weekend or holiday. In beta: the trader buys at most
     SIM_CRYPTO_15M_SHARES at a time, holds at most SIM_CRYPTO_15M_MAX_SHARES on each side of one window and buys nothing
     in its last SIM_CRYPTO_15M_QUIET_SECONDS (90: no order of any kind, resting ones withdrawn)."""
     key: str          # card / book key, the same for every window: the favourite, the /edge bar and SIM_SKIP stay with it
     stem: str         # the slug's head: unitree -> unitree-updown-15m-1793761200
     symbol: str       # the Binance USDⓈ-M futures pair whose index price settles the market
     coin: str         # the card's name for it: "宇树" -> "宇树 15分涨跌 11:00–11:15"
+    exchange: str = ""  # the stock exchange (STOCK_MARKETS: sh / kr) whose session the windows follow; "" = round the clock
     minutes: int = 15
     ROLL_WAIT_MS = 60_000  # the card waits this long past a window's end for the end's index, then moves on regardless
+    SCHEDULE_DAYS = 40     # how far current / before look for a trading day (the longest closure, Lunar New Year, is nine days)
 
     @property
     def window_ms(self) -> int:
@@ -6856,13 +6888,43 @@ class WindowUpDownSpec:
         return UpDownSpec(self.key, f"{self.stem}-updown-{self.minutes}m-{start_ms // 1000}", self.symbol,
                           f"{self.coin} {self.minutes}分涨跌 {hm(start_ms)}–{hm(end_ms)}", start_ms - 60_000, end_ms - 60_000)
 
-    def current(self, now_ms: int) -> UpDownSpec:
-        """The window ``now_ms`` falls in (windows start on the quarter hour)."""
-        return self.window_spec(now_ms - now_ms % self.window_ms)
+    def current(self, now_ms: int, holidays: frozenset = frozenset()) -> UpDownSpec:
+        """The window ``now_ms`` falls in when its market exists, else the next one that does: every quarter hour without
+        an exchange; with one, the quarter hours inside its trading segments whose end is before the segment's close
+        (weekends and ``holidays`` skipped) — over the lunch break and the night, the next segment's first."""
+        w = self.window_ms
+        start = now_ms - now_ms % w
+        if not self.exchange:
+            return self.window_spec(start)
+        tz = dt.timezone(dt.timedelta(hours=STOCK_MARKETS[self.exchange].utc_offset))
+        day = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
+        for offset in range(self.SCHEDULE_DAYS):
+            for seg_open, seg_close in session_segments(self.exchange, day + dt.timedelta(days=offset), holidays):
+                first = max(start, seg_open)
+                first += -first % w  # up to the quarter hour
+                if first + w < seg_close:
+                    return self.window_spec(first)
+        raise ValueError(f"{self.exchange} 在 {self.SCHEDULE_DAYS} 天内没有交易时段")
 
-    def before(self, spec: UpDownSpec) -> UpDownSpec:
-        """The window before ``spec``'s."""
-        return self.window_spec(spec.start_ms + 60_000 - self.window_ms)
+    def before(self, spec: UpDownSpec, holidays: frozenset = frozenset()) -> UpDownSpec:
+        """The last window before ``spec``'s whose market exists (as current counts them)."""
+        w = self.window_ms
+        last = spec.start_ms + 60_000 - w
+        if not self.exchange:
+            return self.window_spec(last)
+        tz = dt.timezone(dt.timedelta(hours=STOCK_MARKETS[self.exchange].utc_offset))
+        day = dt.datetime.fromtimestamp(last / 1000, tz).date()
+        for offset in range(self.SCHEDULE_DAYS):
+            for seg_open, seg_close in reversed(session_segments(self.exchange, day - dt.timedelta(days=offset), holidays)):
+                latest = min(last, seg_close - w - 1)
+                latest -= latest % w  # down to the quarter hour
+                if latest >= seg_open:
+                    return self.window_spec(latest)
+        raise ValueError(f"{self.exchange} 在 {self.SCHEDULE_DAYS} 天内没有交易时段")
+
+    def exists(self, start_ms: int, holidays: frozenset = frozenset()) -> bool:
+        """Whether the window starting at ``start_ms`` (a quarter hour) has a market."""
+        return self.current(start_ms, holidays).start_ms == start_ms - 60_000
 
     def tag(self, spec: UpDownSpec) -> dict:
         """What a position's record carries to mark its market for the beta limits (sim_beta): the window's length."""
@@ -6874,8 +6936,11 @@ WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
     # if the UNITREE/USDT price at the end of the time range specified in the title is greater than the price at the
     # beginning of that range", Down if lower, 50-50 if equal; "the primary resolution source … is Chainlink, specifically
     # the UNITREE/USDT data stream", which "uses the index price (field i) from Binance's USDS-Margined Futures Mark Price
-    # Stream for All Markets (!markPrice@arr)"
-    WindowUpDownSpec("UNITREE-15M", "unitree", "UNITREEUSDT", "宇树"),
+    # Stream for All Markets (!markPrice@arr)"; the windows follow the Shanghai session (宇树 688836.SS)
+    WindowUpDownSpec("UNITREE-15M", "unitree", "UNITREEUSDT", "宇树", "sh"),
+    # "SK海力士 (SKHYNIX) 涨或跌 15分" (skhynix-updown-15m-1793763900: 11-04 11:45–12:00 Beijing, 12:45–13:00 KST) on the same
+    # rules, Chainlink's SKHYNIX/USDT stream; the windows follow the KRX session (09:00–15:30 KST, no lunch break)
+    WindowUpDownSpec("SKHYNIX-15M", "skhynix", "SKHYNIXUSDT", "SK 海力士", "kr"),
 )
 
 
@@ -7042,12 +7107,13 @@ class UpDownMarket:
         return ""
 
 
-def minute_vol(rows: list, now_ms: int, minutes: int = 240) -> float:
-    """Annualised σ of a price's finished 1-minute closes (realized_vol): over the last ``minutes`` (an hour of them at
-    least), or over the last hour when that is higher (a quiet morning does not hide an afternoon that moves). 0 when
-    the price has not moved at all."""
-    vol = lambda count, at_least=None: realized_vol(rows, now_ms, count, 365 * 24 * 60, at_least, "指数 1 分钟 K 线")
-    return max(vol(minutes, 60), vol(60))
+def minute_vol(rows: list, now_ms: int, minutes: int = 240, keep: Any = None) -> float:
+    """Annualised σ of a price's finished 1-minute closes (realized_vol): over the last ``minutes`` (half an hour of them
+    at least), or over the last hour when that is higher (a quiet morning does not hide an afternoon that moves). With
+    ``keep`` (open_ms -> bool: a session's minutes) only those candles count, and only the returns between neighbouring
+    minutes — not the jump over a lunch break or a night. 0 when the price has not moved at all."""
+    vol = lambda count: realized_vol(rows, now_ms, count, 365 * 24 * 60, 30, "指数 1 分钟 K 线", keep, 60_000)
+    return max(vol(minutes), vol(60))
 
 
 class IndexUpDownMarket(UpDownMarket):
@@ -7064,16 +7130,20 @@ class IndexUpDownMarket(UpDownMarket):
     SIGMA_MINUTES = 240          # σ: the last four hours of 1-minute index candles (or the last hour, when higher)
     TIE = D("0.0005")            # an end this close to the start (relative) is left to Predict: Chainlink's report may differ
 
-    def __init__(self, store: "Store", spec: UpDownSpec, futures: Any = None):
+    SIGMA_ROWS = 1500            # candles read for σ when the trading minutes are a subset (the previous session's reach back a day)
+
+    def __init__(self, store: "Store", spec: UpDownSpec, futures: Any = None, exchange: str = "", trading: Any = None):
         super().__init__(store, spec)
         self.futures = futures or binance_futures  # the bot passes its own futures feed (base URL, rate-limit cooldown)
+        self.exchange = exchange  # the stock exchange whose session the windows follow ("" = round the clock)
+        self.trading = trading    # open_ms -> whether that minute is in the exchange's session (session_minute_fn): σ counts those alone
         self.index_ms = 0  # the newest index's own time (the push's event time, the read's)
 
     async def get(self, path: str, **params: Any) -> Any:
         return await self.futures(path, **params)
 
     def at(self, spec: UpDownSpec) -> "IndexUpDownMarket":
-        return IndexUpDownMarket(self.store, spec, self.futures)
+        return IndexUpDownMarket(self.store, spec, self.futures, self.exchange, self.trading)
 
     def push_price(self, price: D, now_ms: int) -> None:
         return None  # a trade is not the index: only push_index prices it
@@ -7089,10 +7159,18 @@ class IndexUpDownMarket(UpDownMarket):
         return moved
 
     def point(self, open_ms: int) -> str:
-        """The boundary the 1-minute candle opening at ``open_ms`` ends at: '22:15 ET（北京 11:15）'."""
+        """The boundary the 1-minute candle opening at ``open_ms`` ends at, as the card names its windows: Beijing time —
+        '11:15' for a Shanghai stock's, '11:15（韩国时间 12:15）' for a KRX one's — or, without an exchange, '22:15 ET（北京 11:15）'."""
         at = open_ms + 60_000
-        et = dt.datetime.fromtimestamp(at / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(at))))
-        return f"{et:%H:%M} ET（北京 {dt.datetime.fromtimestamp(at / 1000, BEIJING):%H:%M}）"
+        bj = f"{dt.datetime.fromtimestamp(at / 1000, BEIJING):%H:%M}"
+        if not self.exchange:
+            et = dt.datetime.fromtimestamp(at / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(at))))
+            return f"{et:%H:%M} ET（北京 {bj}）"
+        info = STOCK_MARKETS[self.exchange]
+        if info.utc_offset == 8:
+            return bj
+        local = dt.datetime.fromtimestamp(at / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset)))
+        return f"{bj}（{info.tz_name} {local:%H:%M}）"
 
     async def read_candle(self, open_ms: int) -> D:
         """The close of exactly the index's 1-minute candle that opens at open_ms (a neighbouring minute is never taken)."""
@@ -7114,8 +7192,11 @@ class IndexUpDownMarket(UpDownMarket):
                 self.index_ms, self.price, self.priced_ms = at, number(data["indexPrice"], f"{self.spec.symbol} 指数价"), now_ms
         if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
             self.times["vol"] = mono
-            rows = await self.get("indexPriceKlines", pair=self.spec.symbol, interval="1m", limit=self.SIGMA_MINUTES + 2)
-            self.sigma, self.sigma_ms = minute_vol(rows, now_ms, self.SIGMA_MINUTES), now_ms
+            # the session's minutes alone when the windows follow one (the index stands still outside it: a σ over the night
+            # or the lunch break would call the open near certain); enough candles to reach the previous session
+            rows = await self.get("indexPriceKlines", pair=self.spec.symbol, interval="1m",
+                                  limit=self.SIGMA_ROWS if self.trading else self.SIGMA_MINUTES + 2)
+            self.sigma, self.sigma_ms = minute_vol(rows, now_ms, self.SIGMA_MINUTES, self.trading), now_ms
 
     def odds(self, now_ms: int) -> UpDownOdds | str:
         spec = self.spec
@@ -7129,17 +7210,17 @@ class IndexUpDownMarket(UpDownMarket):
         why = f"（{brief_error(self.error, 60)}）" if self.error else ""
         if line is None:
             if now_ms < spec.start_ms + 60_000:
-                return f"窗口 {self.point(spec.start_ms)}开始，起点是那一刻的指数价"
-            return f"等待币安 {spec.symbol} {self.point(spec.start_ms)}的指数价（起点）{why}"
+                return f"窗口 {self.point(spec.start_ms)} 开始，起点是那一刻的指数价"
+            return f"等待币安 {spec.symbol} {self.point(spec.start_ms)} 的指数价（起点）{why}"
         if now_ms >= spec.end_ms + 60_000:
-            return f"窗口已在 {self.point(spec.end_ms)}结束，等待那一刻的指数价（终点）{why}"
+            return f"窗口已在 {self.point(spec.end_ms)} 结束，等待那一刻的指数价（终点）{why}"
         if self.price is None or self.sigma is None:
             return f"等待币安 {spec.symbol} 指数价{why}"
         if now_ms - self.priced_ms > self.PRICE_STALE_MS:
             return (f"指数价停在 {stamp(self.priced_ms)}（{(now_ms - self.priced_ms) // 1000} 秒未更新"
                     f"{'：' + brief_error(self.error, 60) if self.error else ''}），暂停概率")
         if not self.sigma > 0:
-            return "指数近 4 小时没有变动（标的可能休市），暂停概率"
+            return "指数在最近的交易时段里没有变动，暂停概率"
         years = (spec.end_ms + 60_000 - now_ms) / YEAR_MS
         up, flat, down, z = updown_odds(float(self.price), float(line), self.sigma, years)
         return UpDownOdds(up, flat, down, z, line, self.price, years)
@@ -12401,7 +12482,8 @@ class Bot:
         self.updown_rolling = {**self.updown_daily, **self.updown_windows}  # the cards that move on to the next market
         started = market.now_ms() if market is not None else int(time.time() * 1000)
         self.updowns.update({key: UpDownMarket(store, self.updown_start(daily, started)) for key, daily in self.updown_daily.items()})
-        self.updowns.update({key: IndexUpDownMarket(store, self.updown_start(spec, started), self.binance_futures)
+        self.updowns.update({key: IndexUpDownMarket(store, self.updown_start(spec, started), self.binance_futures, spec.exchange,
+                                                    session_minute_fn(spec.exchange, self.updown_holidays(spec)) if spec.exchange else None)
                              for key, spec in self.updown_windows.items()})
         self.flips = {spec.key: FlipMarket(store, spec) for spec in FLIP_MARKETS}
         self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
@@ -14233,7 +14315,7 @@ class Bot:
         the 合约标的 section beside the pair's own card."""
         spec = mkt.spec
         base = {"name": spec.name, "symbol": spec.key, "group": "contract", "close_ms": spec.end_ms + 60_000,
-                "close_label": (f"{mkt.point(spec.end_ms)}的币安合约 {spec.symbol} 指数价（Chainlink 结算源）；高于起点为涨、"
+                "close_label": (f"{mkt.point(spec.end_ms)} 的币安合约 {spec.symbol} 指数价（Chainlink 结算源）；高于起点为涨、"
                                 "低于为跌、相同按 50/50 结算")}
         odds = mkt.odds(now_ms)
         hold, agree = self.updown_hold(mkt, odds, now_ms) if isinstance(odds, UpDownOdds) else ("", "")
@@ -17467,8 +17549,15 @@ class Bot:
         if self.config.touch:
             targets.update({spec.key: spec.slug for spec in (*TOUCH_MARKETS, *FLIP_MARKETS, *CAP_MARKETS, *RANGE_MARKETS,
                                                               *STOCK_HIT_MARKETS)})
-            targets.update({key: mkt.spec.slug for key, mkt in self.updowns.items()})  # a daily card: the day it is on
+            targets.update({key: mkt.spec.slug for key, mkt in self.updowns.items() if self.updown_wanted(mkt, now_ms)})  # a daily card: the day it is on; a 15-minute card: its window, from a quarter hour before
         return targets
+
+    WINDOW_LEAD_MS = 15 * 60_000  # a 15-minute card's market is followed (its book, its outcome names) from this long before its window
+
+    def updown_wanted(self, mkt: UpDownMarket, now_ms: int) -> bool:
+        """Whether the Predict feed follows this card's market now: a daily card's always; a 15-minute card's from
+        WINDOW_LEAD_MS before its window — not through a lunch break or a night for a window hours away."""
+        return not isinstance(mkt, IndexUpDownMarket) or now_ms >= mkt.spec.start_ms + 60_000 - self.WINDOW_LEAD_MS
 
     def edge_costs(self) -> EdgeCosts:
         return EdgeCosts(self.config.predict_fee_bps, self.config.predict_trade_usd)
@@ -18792,12 +18881,18 @@ class Bot:
 
     UPDOWN_KEEP_MS = 8 * DAY_MS  # a window's kept closes outlive the settlement of its trades (SIM_GIVE_UP_MS, 7 days) by a day
 
+    def updown_holidays(self, rolling: "DailyUpDownSpec | WindowUpDownSpec") -> frozenset:
+        """The closures of the exchange a rolling card's windows follow (HOLIDAYS_CN / HOLIDAYS_KR); none for a daily card."""
+        exchange = getattr(rolling, "exchange", "")
+        return self.config.holidays.get(exchange, frozenset()) if exchange else frozenset()
+
     def updown_start(self, daily: "DailyUpDownSpec | WindowUpDownSpec", now_ms: int) -> UpDownSpec:
         """The market a rolling card starts on: the one whose final candle has not closed (current) — or, within the
         card's ROLL_WAIT_MS of the previous one's final minute, that one while its final close is not kept yet (a
         restart at 12:03 ET still reads it, and settles its paper trades on the bot's own data)."""
-        spec = daily.current(now_ms)
-        last = daily.before(spec)
+        holidays = self.updown_holidays(daily)
+        spec = daily.current(now_ms, holidays)
+        last = daily.before(spec, holidays)
         if now_ms < last.end_ms + 60_000 + daily.ROLL_WAIT_MS and UpDownMarket(self.store, last).close_of("end") is None:
             return last
         return spec
@@ -18811,7 +18906,7 @@ class Bot:
             mkt = self.updowns.get(key)
             if mkt is None:
                 continue
-            spec = daily.current(now_ms)
+            spec = daily.current(now_ms, self.updown_holidays(daily))  # a 15-minute card over a break: the next segment's first window
             if spec.end_ms <= mkt.spec.end_ms:
                 continue
             if now_ms < mkt.spec.end_ms + 60_000 + daily.ROLL_WAIT_MS and mkt.close_of("end") is None:
