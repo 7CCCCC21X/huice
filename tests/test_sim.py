@@ -2041,3 +2041,51 @@ async def retired_records():
 
 
 asyncio.run(retired_records())
+
+
+async def two_sided_maker():
+    """1.99.0: a resting order on the other side when the side with the most edge is refused at the caps. The 11-04 SK 海力士
+    card: 涨 17.7¢ fair, 买1 5¢×312.1, 卖1 35¢×127.1 — 挂跌 at 65¢ (+17.3¢) and 挂涨 at 5¢ (+12.7¢) both clear the 10¢ bar.
+    With a 跌 position past the group cap every look chose 挂跌, the cap refused it, and the 挂涨 that would have lowered the
+    risk was never placed: no 涨 order, no 涨 position."""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_WAYS": "both",
+           "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off"}
+    bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    slug = "sk-hynix-inc-up-or-down-on-october-5-2026"
+    bk = book([("0.05", "312.1"), ("0.01", "1000")], [("0.35", "127.1"), ("0.43", "175"), ("0.44", "178"), ("0.45", "112.1"), ("0.80", "100")],
+              slug=slug, key="SKHYNIXUSDT", mid="201")
+    mk = m.SimMarket(slug, "SK 海力士", "close", "SKHYNIXUSDT", 0.177, bk, 0.04, "", ("涨", "跌"),
+                     {"key": "SKHYNIXUSDT", "target": "2026-10-05", "line": 1398000.0, "close_ms": CLOSE}, {}, in_session=True)
+    bot.sim_markets = lambda now, only=None: [mk]
+    # nothing held: 挂跌 first (the most edge), 挂涨 at the next look (it clears the bar on its own)
+    trades, changed = m.TradeMap(), []
+    bot.sim_quote(mk, trades, NOW, changed)
+    bot.sim_quote(mk, trades, NOW, changed)
+    assert [(t["label"], t["price"], t["order"]) for _, t in changed] == [("挂跌", 0.65, 100.0), ("挂涨", 0.05, 100.0)], changed
+    # a 跌 position past the group cap ($310.20 at risk against $300): 挂跌 refused, 挂涨 placed in the same look
+    driver = m.market_driver("close", "SKHYNIXUSDT", mk.settle, "SK 海力士")
+    held = {"v": 2, "market": slug, "slug": slug, "market_id": "201", "item": "SK 海力士", "kind": "close", "key": "SKHYNIXUSDT",
+            "side": "down", "label": "挂跌", "maker": True, "status": "filled", "shares": 470.0, "order": 470.0, "price": 0.66,
+            "fills": [], "revisions": [], "settle": mk.settle, "driver": driver[0], "driver_name": driver[1], "opened": NOW - 3_600_000}
+    trades, changed = m.TradeMap({f"{slug}|down|挂#1": held}), []
+    bot.sim_save(trades.items())
+    check = next(r for r in bot.sim_checks(NOW) if r["market"] == slug)  # the control page's order check says the same
+    assert check["maker_why"] == "" and check["maker"].startswith("挂涨 5.0¢×100 份（净优势 12.7¢，排在 312.1 份之后）"), check
+    assert "；挂跌 65.0¢ 被拦（" in check["maker"] and "超过组上限 $300" in check["maker"] and check["maker"].endswith("），所以挂这一边"), check["maker"]
+    bot.sim_quote(mk, trades, NOW, changed)
+    assert [(tid, t["label"], t["price"], t["order"]) for tid, t in changed] == [(f"{slug}|up|挂", "挂涨", 0.05, 100.0)], changed
+    refused = [b for b in bot.sim_blocks() if b["label"] == "挂跌"]
+    assert len(refused) == 1 and "收涨时这组仓位合计将亏 $375.20，超过组上限 $300" in refused[0]["why"], refused
+    # the next look: 挂跌 still refused, 挂涨 already resting — nothing more, and the reason names the order that stands
+    changed = []
+    bot.sim_quote(mk, trades, NOW, changed)
+    assert changed == [] and bot.sim_maker_reason(mk, trades, NOW, {"down"}) == (None, "挂跌被拦下；另一边已有挂单中：5.0¢×100 份")
+    # both sides refused (the last minutes before the close): nothing placed
+    quiet = m.Bot(m.Config.from_env({**env, "SIM_QUIET_MINUTES": "30"}), m.Store(":memory:"), FM(NOW), None)
+    changed = []
+    quiet.sim_quote(mk, m.TradeMap(), CLOSE - 10 * 60_000, changed)
+    assert changed == []
+    print("TWO_SIDED_MAKER_OK")
+
+
+asyncio.run(two_sided_maker())

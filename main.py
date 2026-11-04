@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.98.0"
+VERSION = "1.99.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -14385,11 +14385,12 @@ class Bot:
                 out.append({**row, "skipped": str(row["key"]).upper() in self.config.sim_skip})
         return out
 
-    def sim_maker_reason(self, mk: SimMarket, trades: dict[str, dict], now_ms: int) -> tuple[BookEdge | None, str]:
+    def sim_maker_reason(self, mk: SimMarket, trades: dict[str, dict], now_ms: int, skip: Iterable[str] = ()) -> tuple[BookEdge | None, str]:
         """The resting order the paper trader places on this market now (the side, the valid 买1 it joins — maker_level:
         the first level holding SIM_MAKER_MIN_BID shares besides ours — and the edge), or why none, in the order check's
         words: scope, SIM_WAYS, the card, the book, the session, the points, the depth, the bar, the slot. The quiet
-        window, the group cap and the real-trading checks come after (sim_quiet, sim_group_room)."""
+        window, the group cap and the real-trading checks come after (sim_quiet, sim_group_room); a side they refused this
+        look is passed over (``skip``: "up" / "down"), for the other side if it clears the bar on its own."""
         c = self.config
         if mk.kind not in c.sim_markets:
             return None, "不在 SIM_MARKETS 范围"
@@ -14464,13 +14465,21 @@ class Bot:
                 + (f"；{cents(dear)} 的价位高于盘后上限 {cents(limit)}" if dear is not None else "") + cut_note
         # the side with the most edge first; when its order is already resting, the other side, if it clears the bar on its
         # own (both sides cheap enough is a pair: whichever fills has the edge it was judged on)
+        resting = None  # the other side's order already resting, when the best side was passed over
         for cand in cands:
             if cand.edge <= mk.need or cand.edge < bar - 1e-9:
                 break
-            held = trades.get(f"{mk.market}|{'up' if cand.side == '涨' else 'down'}|挂")
+            side = "up" if cand.side == "涨" else "down"
+            if side in skip:
+                continue  # refused at the caps this look: the other side, if it clears the bar on its own
+            held = trades.get(f"{mk.market}|{side}|挂")
             if held is None or sim_position(held):  # a position from an earlier order does not hold the slot
                 return cand, ""
+            resting = resting or held
         held = trades.get(f"{mk.market}|{'up' if best.side == '涨' else 'down'}|挂")
+        if held is None or sim_position(held):  # the best side refused (skip): nothing else to place
+            return None, (f"挂{best.side}被拦下；另一边已有{sim_status(resting)}：{cents(float(resting.get('price') or 0))}×"
+                          f"{float(resting.get('order') or 0):g} 份" if resting is not None else f"挂{best.side}被拦下，另一边净优势不够门槛")
         return None, f"已有{sim_status(held)}：{cents(float(held.get('price') or 0))}×{float(held.get('order') or 0):g} 份"
 
     def sim_maker_candidate(self, mk: SimMarket, trades: dict[str, dict], now_ms: int | None = None) -> BookEdge | None:
@@ -14487,17 +14496,26 @@ class Bot:
             points = (self.points_status(mk.book.market_id, mk.book, now_ms, PREDICT_POINTS_STALE_SECONDS) if mk.book.market_id
                       else {"points_active": None, "points_note": "积分状态暂缺"})
             maker, maker_why = self.sim_maker_reason(mk, trades, now_ms)
-            maker_text = ""
+            maker_text = refused_text = ""
             if maker is not None:
                 side = "up" if maker.side == "涨" else "down"
-                ahead = sum(q for p, q in own_levels(mk.book, side) if p > maker.price + 1e-9) if maker.sweep else 0.0
                 count, maker_why = self.sim_maker_pick(mk, trades, side, maker, now_ms)  # SIM_SHARES, or the most the caps take
+                if maker_why:  # refused at the caps: the other side, if it clears the bar on its own (sim_quote, 1.99.0)
+                    other = self.sim_maker_reason(mk, trades, now_ms, {side})[0]
+                    if other is not None:
+                        other_side = "up" if other.side == "涨" else "down"
+                        other_count, other_why = self.sim_maker_pick(mk, trades, other_side, other, now_ms)
+                        if not other_why:
+                            refused_text = f"；挂{maker.side} {cents(maker.price)} 被拦（{maker_why}），所以挂这一边"
+                            maker, side, count, maker_why = other, other_side, other_count, ""
+                ahead = sum(q for p, q in own_levels(mk.book, side) if p > maker.price + 1e-9) if maker.sweep else 0.0
                 maker_text = (f"挂{mk.sides[0 if side == 'up' else 1]} {cents(maker.price)}×{count:g} 份（净优势 {cents(maker.edge)}，"
                               + (f"击穿单，前面 {ahead:g} 份）" if maker.sweep else ("买1 之上 1¢，" if maker.front else "")
                                  + (f"排在 {maker.size:g} 份之后）" if maker.size > 0 else "排在最前）")))
                 held = trades.get(f"{mk.market}|{side}|挂")
                 if held is not None and sim_position(held):
                     maker_text += f"；已有持仓 {float(held.get('shares') or 0):g} 份，再挂一笔"
+                maker_text += refused_text
             taker_text = taker_why = ""
             if mk.kind not in c.sim_markets:
                 taker_why = "不在 SIM_MARKETS 范围"
@@ -15441,27 +15459,34 @@ class Bot:
         """The maker decision on one market (the step's and the express lane's): the side and the valid 买1 it joins,
         past every gate (sim_maker_reason), opened under its slot (a position there moves to tid#n); ``trades`` and
         ``changed`` are updated in place. The express lane leaves a slot it withdrew within SIM_EXPRESS_COOLDOWN_SECONDS
-        alone (a fair price flickering about the bar would otherwise place and withdraw several times a second)."""
-        maker = self.sim_maker_reason(mk, trades, now_ms)[0]  # the side and the valid 买1 it joins, past every gate (session, points, depth, bar, slot)
-        if maker is None:
+        alone (a fair price flickering about the bar would otherwise place and withdraw several times a second). A side the
+        caps refuse (sim_maker_pick: the group's worst move, a side's share cap, the real-trading limits) leaves the other
+        side its turn when that one clears the bar on its own (1.99.0: a 跌 position past the group cap kept every look on
+        挂跌, refused, and the 挂涨 that would have lowered the risk was never placed)."""
+        refused: set[str] = set()
+        for _ in range(2):
+            maker = self.sim_maker_reason(mk, trades, now_ms, refused)[0]  # the side and the valid 买1 it joins, past every gate (session, points, depth, bar, slot)
+            if maker is None:
+                return
+            side = "up" if maker.side == "涨" else "down"
+            tid = f"{mk.market}|{side}|挂"
+            if express and time.monotonic() - self.sim_express_withdrawn.get(tid, -1e9) < self.SIM_EXPRESS_COOLDOWN_SECONDS:
+                return
+            held = trades.get(tid)  # one order per market, side and way at a time; a position from a filled one lets the next in
+            if held is not None and not sim_position(held):
+                return
+            count, why = self.sim_maker_pick(mk, trades, side, maker, now_ms)  # SIM_SHARES, or the most the caps take
+            if why:
+                self.sim_note_block(tid, mk, "挂" + mk.sides[0 if side == "up" else 1], maker.price, why, now_ms)
+                refused.add(side)
+                continue  # a cap on this side is no reason to leave the other side unquoted
+            if held is not None:  # the position moves to tid#n (it settles there); the slot takes the fresh order
+                new_tid = self.sim_rekey(tid, held)
+                trades[new_tid] = trades.pop(tid)
+                changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]
+            trades[tid] = self.sim_open(mk, side, now_ms, maker=maker, shares=count)
+            changed.append((tid, trades[tid]))
             return
-        side = "up" if maker.side == "涨" else "down"
-        tid = f"{mk.market}|{side}|挂"
-        if express and time.monotonic() - self.sim_express_withdrawn.get(tid, -1e9) < self.SIM_EXPRESS_COOLDOWN_SECONDS:
-            return
-        held = trades.get(tid)  # one order per market, side and way at a time; a position from a filled one lets the next in
-        if held is not None and not sim_position(held):
-            return
-        count, why = self.sim_maker_pick(mk, trades, side, maker, now_ms)  # SIM_SHARES, or the most the caps take
-        if why:
-            self.sim_note_block(tid, mk, "挂" + mk.sides[0 if side == "up" else 1], maker.price, why, now_ms)
-            return
-        if held is not None:  # the position moves to tid#n (it settles there); the slot takes the fresh order
-            new_tid = self.sim_rekey(tid, held)
-            trades[new_tid] = trades.pop(tid)
-            changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]
-        trades[tid] = self.sim_open(mk, side, now_ms, maker=maker, shares=count)
-        changed.append((tid, trades[tid]))
 
     @staticmethod
     def requote_urgent(why: str) -> bool:
