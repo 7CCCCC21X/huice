@@ -10,6 +10,8 @@ import argparse
 import asyncio
 import contextlib
 import contextvars
+import io
+import csv
 import copy
 import datetime as dt
 import functools
@@ -47,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.103.0"
+VERSION = "1.104.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -1343,6 +1345,28 @@ async def http_json(url: str, payload: dict | None = None, timeout: int = 15) ->
 
 async def http_get(url: str, timeout: int = 15, headers: dict[str, str] | None = None) -> bytes:
     return await _blocking(_http_get, url, None, timeout, headers)
+
+
+def _http_multipart(url: str, fields: dict[str, str], files: dict[str, tuple[str, bytes, str]], timeout: int = 60) -> Any:
+    """POST a multipart/form-data body — ``fields`` and ``files`` (name -> (filename, bytes, media type)): a file upload
+    such as Telegram's sendDocument — and return the JSON answer."""
+    boundary = "----CloseAlert" + os.urandom(16).hex()
+    body = bytearray()
+    for name, value in fields.items():
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode("utf-8")
+    for name, (filename, data, mime) in files.items():
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n"
+                 f"Content-Type: {mime}\r\n\r\n").encode("utf-8") + bytes(data) + b"\r\n"
+    body += f"--{boundary}--\r\n".encode("utf-8")
+    hdrs = {"User-Agent": f"CloseAlert/{VERSION}", "Accept": "application/json", "Content-Type": f"multipart/form-data; boundary={boundary}"}
+    try:
+        return json.loads(_http_urllib(url, bytes(body), hdrs, timeout, urllib.parse.urlsplit(url).hostname or ""))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise RemoteError("接口未返回有效 JSON") from None
+
+
+async def http_multipart(url: str, fields: dict[str, str], files: dict[str, tuple[str, bytes, str]], timeout: int = 60) -> Any:
+    return await _blocking(_http_multipart, url, fields, files, timeout)
 
 
 SOURCE_TIMEOUT = 8  # seconds per quote-feed request: working feeds answer in < 1 s, a dead one must not cost 15
@@ -4250,6 +4274,10 @@ PRED_KEEP_DAYS = 400          # snapshots older than this are pruned (a year of 
 MARK_EVERY_MS = 2 * 3_600_000  # one saved snapshot of every priced Predict market (ladder levels included) per 2 hours
 MARK_KEEP_DAYS = 120           # ...kept this long: scored by /calib against the market's own middle once it has a result
 SHADOW_EVERY_MS = 5 * 60_000   # the daily crypto markets' taker chances, sampled this often for the threshold backtest (/calib)
+WSAMPLE_HORIZONS = {"window": (14 * 60, 10 * 60, 5 * 60, 2 * 60), "day": (12 * 3600, 6 * 3600, 2 * 3600, 30 * 60)}  # seconds left in a
+# rolling card's market when it is sampled (Bot.window_sample): a 15-minute window a minute in, then at 10, 5 and 2 minutes left
+WSAMPLE_LATE_MS = 60_000       # a sample due longer ago than this (a restart) is not taken: it would be of another moment
+WSAMPLE_KEEP_DAYS = 60         # the samples are kept this long
 SHADOW_FLOOR = 0.02            # ...a side is kept when buying its ask then would have had at least this much net edge
 SHADOW_KEEP_DAYS = 60          # ...for this long
 SHADOW_BARS = (0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20)  # the entry bars /calib scores them at
@@ -10929,7 +10957,7 @@ dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
-<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
+<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
 <div class="tiles" id="tiles"></div>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
 <div class="body" id="sumbody"><div class="tbl" id="summary"></div><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
@@ -11689,6 +11717,8 @@ class WebServer:
                 return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
             if parts[2] == "summary.csv":
                 return 200, "text/csv; charset=utf-8", self.bot.journal_summary_csv().encode("utf-8")
+            if parts[2] == "samples.csv":  # the model samples (window_sample): the model's own figures, nothing of an account
+                return 200, "text/csv; charset=utf-8", self.bot.window_csv().encode("utf-8")
             if parts[2] == "why.json":  # the cards' "为什么挂 / 不挂单": an account's orders, keyed as the review data is (handle)
                 return 200, "application/json; charset=utf-8", self.cached(
                     "why.json", lambda: json.dumps(self.bot.why_payload(), ensure_ascii=False, default=str).encode("utf-8"))
@@ -12133,6 +12163,15 @@ class Telegram:
             await self.paced("sendMessage", payload)
             SEND_CHECK.set(None)  # once the first part is out, the rest of the message follows it
 
+    async def send_document(self, chat: int, thread: int, doc: "Document") -> None:
+        """A file to a chat (sendDocument, multipart): the model samples' CSV (/samples)."""
+        fields = {"chat_id": str(chat), **({"message_thread_id": str(thread)} if thread else {}),
+                  **({"caption": doc.caption[:1024]} if doc.caption else {})}
+        data = await http_multipart(self.root + "sendDocument", fields, {"document": (doc.filename, doc.data, doc.mime)}, 60)
+        if not isinstance(data, dict) or not data.get("ok"):
+            msg = data.get("description", "未知错误") if isinstance(data, dict) else "响应格式异常"
+            raise RemoteError(f"Telegram: {clean_error(msg)}")
+
     async def edit(self, chat: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
         """Rewrite a card in place after a button press so it reflects the new selection."""
         payload: dict[str, Any] = {"chat_id": chat, "message_id": message_id, "text": split_text(text)[0],
@@ -12253,6 +12292,7 @@ COMMANDS: tuple[Command, ...] = (
             "不带参数查看；/edge 6 改默认；/edge 价格阶梯 6、/edge 恒指 4、/edge BTC 2027前 150k 3；末尾 off 取消；/edge 清空"),
     Command("web", "获取概率网页链接（自动刷新）"),
     Command("calib", "用已保存的预测快照和实际收盘给概率模型打分（Brier/校准/逐日向前拟合）"),
+    Command("samples", "导出模型样本 CSV：15 分钟 / 加密日涨跌每个市场在固定剩余时间记的公平价、盘口、σ 和结果"),
     Command("sim", "模拟交易：净优势 ≥10¢ 时买 100 份，看长期是赚还是亏（只记账，不下单）"),
     Command("live", "真实交易（LIVE=on）：钱包、余额、真实订单、持仓与风控；暂停/恢复/撤单/领取", "pause|resume|cancel all|redeem|check",
             "LIVE=on 时模拟交易的每个决定都会在 Predict 真实下单；/live pause 停止开新仓，/live resume 恢复"),
@@ -12329,6 +12369,15 @@ class Reply:
     text: str
     markup: dict | None = None
     html: bool = False
+
+
+@dataclass
+class Document:
+    """A command reply that is a file, sent with sendDocument: the model samples' CSV (/samples)."""
+    filename: str
+    data: bytes
+    caption: str = ""
+    mime: str = "text/csv"
 
 
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -12558,6 +12607,8 @@ class Bot:
         self.mark_last = -10**15  # ms of the last all-market snapshot (record_marks)
         self.mark_pruned = 0.0
         self.shadow_last = -10**15  # ms of the last sample of the daily crypto markets' taker chances (shadow_sample)
+        self.wsample_done: set[str] = set()  # the samples taken or passed over since the start (window_sample)
+        self.wsample_pruned = -1e9           # monotonic: when the old samples were last dropped
         self.shadow_pruned = 0.0
         self.beta_cache: dict[str, tuple[float, float, str]] = {}  # index -> (fitted at, β, how it was obtained)
         self.vol_errors: dict[str, str] = {}  # symbol -> why its exchange daily bars could not be read (σ is the prior)
@@ -12572,7 +12623,7 @@ class Bot:
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
-            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib,
+            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib, "/samples": self.cmd_samples,
             "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live,
         }
 
@@ -12840,6 +12891,9 @@ class Bot:
             LOG.exception("命令 %s 处理失败", req.command)
             reply = (f"❌ 命令执行失败：{clean_error(error) or type(error).__name__}\n"
                      "已写入日志；可发 /diag 检查数据源，或稍后重试。")
+        if isinstance(reply, Document):  # a file (the samples' CSV): sent as a document, queued like a text reply
+            await self.background("reply", functools.partial(self.telegram.send_document, req.chat, req.thread, reply))
+            return
         await self.reply(req, reply, markup, html_mode)
 
     async def reply(self, req: Request, text: str, markup: dict | None = None, html_mode: bool = False) -> None:
@@ -13249,6 +13303,7 @@ class Bot:
         the markets have results: the model against the market it was trading against, which the index snapshots
         (pred:, every 30 minutes, with the proxy fit's inputs) cannot say for the crypto and ladder cards."""
         self.shadow_sample(now_ms)  # every SHADOW_EVERY_MS, apart from the two-hourly snapshots
+        self.window_sample(now_ms)  # the rolling cards at fixed times before their markets end
         if now_ms - self.mark_last < MARK_EVERY_MS:
             return False
         self.mark_last = now_ms
@@ -13300,6 +13355,198 @@ class Bot:
             old = [k for k in self.store.keys("shadow:") if k.rsplit("|", 1)[-1].isdigit() and int(k.rsplit("|", 1)[-1]) < cutoff]
             if old:
                 self.store.delete_keys(old)
+
+    def window_kind(self, mkt: UpDownMarket) -> str:
+        """'window' for a 15-minute card, 'day' for a daily one, '' for a card that does not roll (not sampled)."""
+        rolling = self.updown_rolling.get(mkt.spec.key)
+        return "" if rolling is None else "window" if isinstance(rolling, WindowUpDownSpec) else "day"
+
+    def window_sample(self, now_ms: int) -> int:
+        """What the model and the market say at fixed times before each rolling card's market ends (WSAMPLE_HORIZONS: a
+        15-minute window at 14 / 10 / 5 / 2 minutes left, a daily market at 12 / 6 / 2 hours and 30 minutes), kept as a
+        record (wsample:<slug>:<seconds left>): the fair price, σ and τ, the index, the book's middle and touch, the card's
+        error and what held it back; scored once the market has its result (window_resolve; /calib, /samples). A sample
+        due longer than WSAMPLE_LATE_MS ago (a restart) is passed over. The number taken now."""
+        taken = 0
+        for mkt in self.updowns.values():
+            kind = self.window_kind(mkt)
+            if not kind:
+                continue
+            spec = mkt.spec
+            for left in WSAMPLE_HORIZONS[kind]:
+                due = spec.end_ms + 60_000 - left * 1000
+                key = f"wsample:{spec.slug}:{left}"
+                if now_ms < due or key in self.wsample_done:
+                    continue
+                self.wsample_done.add(key)
+                if now_ms - due > WSAMPLE_LATE_MS or self.store.get(key) is not None:
+                    continue  # another moment than the one meant, or taken before a restart
+                self.store.put(key, self.window_snapshot(mkt, kind, left, now_ms))
+                taken += 1
+        if time.monotonic() - self.wsample_pruned >= 86_400:
+            self.wsample_pruned = time.monotonic()
+            if pruned := self.window_prune(now_ms):
+                LOG.info("模型样本整理：清掉 %d 条 %d 天前的", pruned, WSAMPLE_KEEP_DAYS)
+        return taken
+
+    def window_snapshot(self, mkt: UpDownMarket, kind: str, left: int, now_ms: int) -> dict:
+        """One sample (window_sample): the card's model and its Predict book now, ``left`` seconds before the market ends."""
+        spec, rolling = mkt.spec, self.updown_rolling[mkt.spec.key]
+        odds = mkt.odds(now_ms)
+        book, _ = self.updown_book(spec)
+        row: dict[str, Any] = {"t": now_ms, "slug": spec.slug, "key": spec.key, "item": spec.name, "kind": kind,
+                               "card": f"{rolling.coin} {rolling.minutes}分涨跌" if kind == "window" else f"{rolling.coin} 日涨跌",
+                               "start": spec.start_ms + 60_000, "end": spec.end_ms + 60_000, "left": left,
+                               "mkt": None if book is None or book.stale(now_ms) or side_mid(book, "up") is None else round(side_mid(book, "up"), 6),
+                               "bid": float(book.bid[0]) if book is not None and book.bid else None,
+                               "ask": float(book.ask[0]) if book is not None and book.ask else None,
+                               "book_age": round((now_ms - book.fetched_ms) / 1000, 1) if book is not None else None}
+        if isinstance(odds, UpDownOdds):
+            row.update(up=odds.fair_up, sigma=mkt.sigma, tau=odds.years, z=odds.z, price=float(odds.price), line=float(odds.line),
+                       need=self.edge_need(mkt.model_swing(odds)), hold=self.updown_hold(mkt, odds, now_ms)[0], settled=odds.settled)
+        else:
+            line = mkt.close_of("start")
+            row.update(note=odds, line=float(line) if line is not None else None)
+        return row
+
+    @staticmethod
+    def window_settle_row(row: dict, final: float) -> bool:
+        """A sample gets its market's result: the final price, the move from the line (ln), and 涨's payout — 1 / 0 / ½, or
+        none on an index window whose end is within the tie band (IndexUpDownMarket.TIE: Predict's call, unknown here).
+        False when the row has no line to measure from."""
+        line = float(row.get("line") or 0)
+        if line <= 0 or final <= 0:
+            return False
+        tie = row.get("kind") == "window" and abs(final - line) <= line * float(IndexUpDownMarket.TIE)
+        row.update(final=final, move=math.log(final / line), result=None if tie else 1.0 if final > line else 0.0 if final < line else 0.5)
+        return True
+
+    def window_resolve(self, mkt: UpDownMarket, spec: UpDownSpec, final: D) -> None:
+        """The samples of a market just ended (updown_roll) get its result."""
+        kind = self.window_kind(mkt)
+        for left in WSAMPLE_HORIZONS.get(kind, ()):
+            key = f"wsample:{spec.slug}:{left}"
+            row = self.store.get(key)
+            if not isinstance(row, dict) or row.get("final") is not None:
+                continue
+            if not row.get("line"):  # sampled before the line was known: the kept start
+                start = self.store.get(f"updown:{spec.slug}:start")
+                row["line"] = float(start.get("close") or 0) if isinstance(start, dict) else 0.0
+            if self.window_settle_row(row, float(final)):
+                self.store.put(key, row)
+
+    def window_rows(self) -> list[dict]:
+        """Every sample, oldest first; one whose market ended while the bot was down is settled here on the kept end."""
+        rows = []
+        for key, row in self.store.items("wsample:"):
+            if not isinstance(row, dict):
+                continue
+            if row.get("final") is None:
+                end = self.store.get(f"updown:{row.get('slug')}:end")
+                if isinstance(end, dict) and end.get("close"):
+                    if not row.get("line"):
+                        start = self.store.get(f"updown:{row.get('slug')}:start")
+                        row["line"] = float(start.get("close") or 0) if isinstance(start, dict) else 0.0
+                    with contextlib.suppress(ValueError, TypeError, decimal.InvalidOperation):
+                        if self.window_settle_row(row, float(end["close"])):
+                            self.store.put(key, row)
+            rows.append(row)
+        rows.sort(key=lambda r: (int(r.get("t") or 0), str(r.get("slug") or "")))
+        return rows
+
+    def window_prune(self, now_ms: int) -> int:
+        """Samples older than WSAMPLE_KEEP_DAYS are dropped. The number dropped."""
+        old = [key for key, row in self.store.items("wsample:")
+               if isinstance(row, dict) and int(row.get("t") or 0) < now_ms - WSAMPLE_KEEP_DAYS * DAY_MS]
+        self.store.delete_keys(old)
+        return len(old)
+
+    @staticmethod
+    def left_text(left: int) -> str:
+        return f"{left // 3600} 小时" if left >= 3600 else f"{left // 60} 分"
+
+    def window_report(self) -> list[str]:
+        """The samples scored (/calib), per card: at each time left, the model's Brier against the market middle's and a
+        coin's; the reliability of the model's figures; σ against the move each market then made (the RMS of the
+        standardised moves — 1 when σ is right — and the share beyond 2σ), by the hour the market started."""
+        rows = [r for r in self.window_rows() if r.get("up") is not None]
+        if not rows:
+            return []
+        lines = [f"🧭 定时样本回测（15 分钟涨跌每个窗口在剩 14 / 10 / 5 / 2 分钟时各记一条，加密日涨跌在剩 12 / 6 / 2 小时和 30 分钟时：模型公平价、"
+                 f"盘口中间价、σ、指数，出结果后评分；保留 {WSAMPLE_KEEP_DAYS} 天；/samples 导出 CSV）："]
+        by_card: dict[str, list[dict]] = {}
+        for r in rows:
+            by_card.setdefault(str(r.get("card") or r.get("key")), []).append(r)
+        for card, items in sorted(by_card.items()):
+            done = [r for r in items if r.get("result") is not None]
+            ties = len({r["slug"] for r in items if r.get("final") is not None and r.get("result") is None})
+            lines.append(f"  {card}：{len({r['slug'] for r in items})} 个市场、{len(items)} 条样本，已有结果 {len({r['slug'] for r in done})} 个市场 / {len(done)} 条"
+                         + (f"（另 {ties} 个市场终点贴着起点，结果以 Predict 为准、不评分）" if ties else ""))
+            for left in sorted({int(r["left"]) for r in done}, reverse=True):
+                sel = [r for r in done if int(r["left"]) == left]
+                brier, _ = brier_scores([r["up"] for r in sel], [r["result"] for r in sel])
+                with_mkt = [r for r in sel if r.get("mkt") is not None]
+                against = ""
+                if with_mkt:
+                    mb, _ = brier_scores([r["mkt"] for r in with_mkt], [r["result"] for r in with_mkt])
+                    closer = sum(abs(r["up"] - r["result"]) < abs(r["mkt"] - r["result"]) for r in with_mkt) / len(with_mkt)
+                    against = f"，盘口中间价 {mb:.3f}（{len(with_mkt)} 条有盘口，模型更准的占 {closer:.0%}）"
+                lines.append(f"    剩 {self.left_text(left)}：{len(sel)} 条｜模型 Brier {brier:.3f}{against}，抛硬币 0.250")
+            bins = []
+            for lo in (0.0, 0.2, 0.4, 0.6, 0.8):
+                sel = [r for r in done if lo <= r["up"] < lo + 0.2 or (lo == 0.8 and r["up"] == 1.0)]
+                if sel:
+                    bins.append(f"模型 {lo * 100:.0f}–{(lo + 0.2) * 100:.0f}¢ 的 {len(sel)} 条实际涨 {sum(r['result'] for r in sel) / len(sel):.0%}")
+            if bins:
+                lines.append("    校准：" + "；".join(bins))
+            firsts: dict[str, dict] = {}  # each market's earliest sample with a move: the σ it was priced with at the start
+            for r in items:
+                if r.get("move") is not None and r.get("sigma") and r.get("tau") and (r["slug"] not in firsts or r["left"] > firsts[r["slug"]]["left"]):
+                    firsts[r["slug"]] = r
+            zs = [(r, r["move"] / (r["sigma"] * math.sqrt(r["tau"]))) for r in firsts.values() if r["sigma"] * math.sqrt(r["tau"]) > 0]
+            if zs:
+                rms = math.sqrt(sum(z * z for _, z in zs) / len(zs))
+                lines.append(f"    波动：{len(zs)} 个市场，实际 / 预测（RMS z）{rms:.2f}（σ 刚好是 1.00，大于 1 是 σ 偏小），"
+                             f"|z|>2 的占 {sum(abs(z) > 2 for _, z in zs) / len(zs):.0%}（正态 4.6%）")
+                by_hour: dict[str, list[float]] = {}
+                for r, z in zs:
+                    by_hour.setdefault(dt.datetime.fromtimestamp(r["start"] / 1000, BEIJING).strftime("%H 时"), []).append(z)
+                if len(by_hour) > 1:
+                    lines.append("      按开始时间：" + "、".join(f"{h} {math.sqrt(sum(z * z for z in v) / len(v)):.2f}（{len(v)}）" for h, v in sorted(by_hour.items())))
+        lines.append("    （市场不到 30 个时差别多半是运气；RMS z 稳定偏离 1 再调 σ 的分钟数或系数）")
+        return lines
+
+    WSAMPLE_COLUMNS = ("time", "card", "kind", "market", "window_start", "window_end", "left_s", "fair_up", "market_mid", "bid", "ask", "book_age_s",
+                       "sigma_annual", "tau_years", "sigma_sqrt_tau", "z_model", "price", "line", "need", "hold", "note",
+                       "result_up", "final", "move_ln", "realized_z")
+
+    def window_csv(self) -> str:
+        """Every sample as a CSV (a BOM for Excel; /samples, samples.csv): one row a sample, the result columns empty while
+        the market has none."""
+        out = io.StringIO()
+        out.write("\ufeff")
+        writer = csv.writer(out)
+        writer.writerow(self.WSAMPLE_COLUMNS)
+        when = lambda ms: dt.datetime.fromtimestamp(int(ms) / 1000, BEIJING).strftime("%Y-%m-%d %H:%M:%S") if ms else ""
+        num = lambda v: "" if v is None else f"{v:.6g}" if isinstance(v, float) else v
+        for r in self.window_rows():
+            st = float(r.get("sigma") or 0) * math.sqrt(float(r.get("tau") or 0))
+            writer.writerow([when(r.get("t")), r.get("card", ""), r.get("kind", ""), r.get("slug", ""), when(r.get("start")), when(r.get("end")),
+                             r.get("left", ""), num(r.get("up")), num(r.get("mkt")), num(r.get("bid")), num(r.get("ask")), num(r.get("book_age")),
+                             num(r.get("sigma")), num(r.get("tau")), num(st) if st else "", num(r.get("z")), num(r.get("price")), num(r.get("line")),
+                             num(r.get("need")), r.get("hold", ""), r.get("note", ""), num(r.get("result")), num(r.get("final")), num(r.get("move")),
+                             num(r["move"] / st) if r.get("move") is not None and st > 0 else ""])
+        return out.getvalue()
+
+    async def cmd_samples(self, req: Request) -> Any:
+        """/samples: the samples' CSV as a Telegram document."""
+        rows = self.window_rows()
+        if not rows:
+            return "还没有样本：15 分钟涨跌 / 加密日涨跌的市场定价后，每个市场在固定的剩余时间各记一条（/calib 里有说明）。"
+        day = dt.datetime.fromtimestamp(self.market.now_ms() / 1000, BEIJING).strftime("%Y%m%d")
+        done = sum(r.get("result") is not None for r in rows)
+        return Document(f"model-samples-{day}.csv", self.window_csv().encode("utf-8"),
+                        f"模型样本 {len(rows)} 条（已有结果 {done} 条），{len({r.get('slug') for r in rows})} 个市场；列的含义见 README")
 
     def shadow_report(self) -> list[str]:
         """The daily crypto markets' threshold backtest (shadow_sample), scored once their markets have results: for each
@@ -13440,7 +13687,7 @@ class Bot:
         preds = [v for v in saved if self.PRED_FIELDS <= v.keys()]  # snapshots from before 1.14 lack the fit's inputs
         outcomes = {k.removeprefix("outcome:"): float(v) for k, v in self.store.items("outcome:")}
         skipped = f"（忽略 {len(saved) - len(preds)} 条旧格式快照）" if len(saved) > len(preds) else ""
-        return "\n".join([f"📐 概率模型回测（只评估，不会自动改参数）{skipped}"] + calibration_report(preds, outcomes) + self.mark_report() + self.shadow_report())
+        return "\n".join([f"📐 概率模型回测（只评估，不会自动改参数）{skipped}"] + calibration_report(preds, outcomes) + self.mark_report() + self.shadow_report() + self.window_report())
 
     async def cmd_calib(self, req: Request) -> str:
         return self.calibration_text()
@@ -18913,6 +19160,8 @@ class Bot:
                 continue  # the day (the window) just over: its final close first
             LOG.info("%s：%s 结束，换到 %s", key, mkt.spec.slug, spec.slug)
             old, final = mkt.spec, mkt.close_of("end")
+            if final is not None:
+                self.window_resolve(mkt, old, final)  # the samples of the market just over get its result
             mkt.spec = spec
             mkt.times["candle"] = -1e9
             if final is not None and spec.start_ms == old.end_ms and mkt.close_of("start") is None:

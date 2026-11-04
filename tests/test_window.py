@@ -4,7 +4,7 @@ Chainlink's UNITREE/USDT data stream settles it, which "uses the index price (fi
 Mark Price Stream": the card reads that index (pushed every second, read when the push is late) and each boundary's value as
 the close of the index's 1-minute candle ending there. In beta: at most 10 shares a buy, 100 on each side of one window,
 no order of any kind in a window's last 90 seconds (1.102.1; 120 in 1.102.0), resting ones withdrawn."""
-import asyncio, json, math, sys, datetime as dt
+import asyncio, csv, io, json, math, sys, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -278,3 +278,102 @@ def dataclasses_replace(mk, **kw):
 
 
 asyncio.run(run())
+
+
+class FakeTg:
+    def __init__(self): self.sent, self.docs = [], []
+    async def call(self, *a, **k): return True
+    async def send(self, chat, thread, text, reply_markup=None, parse_mode=None): self.sent.append((chat, text)); return True
+    async def send_document(self, chat, thread, doc): self.docs.append((chat, thread, doc)); return True
+
+
+async def samples():
+    """1.104.0: the model samples. Each rolling card's market is sampled at fixed times before it ends — a 15-minute window
+    at 14 / 10 / 5 / 2 minutes left — with the model's fair price, σ and τ, the index, the book's middle and touch; the
+    market's result settles them at the roll (or later, on the kept end); /calib scores them and /samples sends them as a
+    CSV through Telegram (the review page serves samples.csv)."""
+    fm, store, tg = FM(T0 + 5_000), m.Store(":memory:"), FakeTg()
+    prev = W.before(spec)
+    store.put(f"updown:{prev.slug}:end", {"open": prev.end_ms, "close": "89.9500", "read_ms": T0 + 2_000})
+    bot = m.Bot(m.Config.from_env({**ENV, "ADMIN_USER_ID": "42"}), store, fm, tg)
+    card = bot.updowns["UNITREE-15M"]
+    fm.index[T0 - 60_000], fm.premium = "90.0000", ("90.1200", T0 + 4_500)
+    await card.refresh(T0 + 5_000)
+    bot.predict.books["UNITREE-15M"] = book("0.40", "0.45", T0 + 5_000, spec.slug)
+    bot.predict.info[spec.slug] = {"outcomes": ["Up", "Down"], "created_ms": 0, "question": ""}
+    assert m.WSAMPLE_HORIZONS == {"window": (840, 600, 300, 120), "day": (43200, 21600, 7200, 1800)}
+    # nothing before a minute in; then the 14-minutes-left sample, once (SK 海力士's 10:45 window is past its moments: passed over)
+    assert bot.window_sample(T0 + 30_000) == 0 and not store.keys("wsample:")
+    assert bot.window_sample(T0 + 61_000) == 1 and bot.window_sample(T0 + 62_000) == 0
+    row = store.get(f"wsample:{spec.slug}:840")
+    assert {k: row[k] for k in ("left", "kind", "card", "key", "start", "end", "mkt", "bid", "ask", "line", "price", "hold")} == {
+        "left": 840, "kind": "window", "card": "宇树 15分涨跌", "key": "UNITREE-15M", "start": T0, "end": T1, "mkt": 0.425, "bid": 0.4, "ask": 0.45,
+        "line": 90.0, "price": 90.12, "hold": ""}, row
+    assert 0.5 < row["up"] < 1 and row["sigma"] == card.sigma and abs(row["tau"] - (T1 - T0 - 61_000) / m.YEAR_MS) < 1e-15 and row["need"] >= 0.02
+    assert store.keys("wsample:") == [f"wsample:{spec.slug}:840"]
+    # a sample due more than a minute ago (a restart) is not taken; the next moments are
+    assert bot.window_sample(T0 + 5 * 60_000 + 70_000) == 0 and store.get(f"wsample:{spec.slug}:600") is None
+    fm.premium = ("90.2500", T0 + 10 * 60_000 - 500)  # the index kept fresh (a stale one leaves a sample without a fair price)
+    card.times["price"] = -1e9
+    await card.refresh(T0 + 10 * 60_000)
+    assert bot.window_sample(T0 + 10 * 60_000 + 1_000) == 1 and store.get(f"wsample:{spec.slug}:300")["left"] == 300
+    fm.premium = ("90.3000", T0 + 13 * 60_000 - 500)
+    card.times["price"] = -1e9
+    await card.refresh(T0 + 13 * 60_000)
+    assert bot.window_sample(T0 + 13 * 60_000 + 500) == 1 and store.get(f"wsample:{spec.slug}:120")["price"] == 90.3
+    report = "\n".join(bot.window_report())
+    assert "宇树 15分涨跌：1 个市场、3 条样本，已有结果 0 个市场 / 0 条" in report and "剩 14 分" not in report, report
+    # the window ends: its samples get the result at the roll — 90.20 over 90.00, 涨
+    fm.index[T1 - 60_000] = "90.2000"
+    fm.now = bot.market.now = T1 + 2_000
+    card.times["candle"] = -1e9
+    await bot.refresh_updown(T1 + 2_000)
+    rows = [r for r in bot.window_rows() if r["slug"] == spec.slug]
+    assert [r["result"] for r in rows] == [1.0, 1.0, 1.0] and all(abs(r["move"] - math.log(90.2 / 90.0)) < 1e-12 and r["final"] == 90.2 for r in rows)
+    report = "\n".join(bot.window_report())
+    first = store.get(f"wsample:{spec.slug}:840")
+    assert "宇树 15分涨跌：1 个市场、3 条样本，已有结果 1 个市场 / 3 条" in report, report
+    assert f"剩 14 分：1 条｜模型 Brier {(1 - first['up']) ** 2:.3f}，盘口中间价 0.331（1 条有盘口，模型更准的占 100%），抛硬币 0.250" in report, report
+    assert "剩 2 分：1 条" in report and "校准：模型 80–100¢ 的" in report and "波动：1 个市场，实际 / 预测（RMS z）" in report, report
+    # a window that ended while the bot was down is settled on its kept end when the samples are read; an end within the tie
+    # band keeps no result (Predict's call), the move all the same
+    for slug, close in (("x-updown-15m-1", "101"), ("y-updown-15m-2", "100.02")):
+        store.put(f"wsample:{slug}:840", {"t": T0 - 3_600_000, "slug": slug, "key": "X", "item": slug, "kind": "window", "card": "测试 15分涨跌",
+                                          "start": T0 - 3_600_000, "end": T0 - 2_700_000, "left": 840, "up": 0.6, "sigma": 0.5, "tau": 2.7e-5, "line": 100.0})
+        store.put(f"updown:{slug}:end", {"open": T0 - 2_760_000, "close": close})
+    by = {r["slug"]: r for r in bot.window_rows()}
+    assert by["x-updown-15m-1"]["result"] == 1.0 and by["x-updown-15m-1"]["final"] == 101.0
+    assert by["y-updown-15m-2"]["result"] is None and abs(by["y-updown-15m-2"]["move"] - math.log(1.0002)) < 1e-12
+    assert "测试 15分涨跌：2 个市场、2 条样本，已有结果 1 个市场 / 1 条（另 1 个市场终点贴着起点，结果以 Predict 为准、不评分）" in "\n".join(bot.window_report())
+    # the CSV: a row a sample, the result columns filled where there is one
+    text = bot.window_csv()
+    assert text.startswith("\ufeff")
+    table = list(csv.reader(io.StringIO(text.lstrip("\ufeff"))))
+    assert table[0] == list(m.Bot.WSAMPLE_COLUMNS) and len(table) == 6
+    line = next(r for r in table[1:] if r[3] == spec.slug and r[6] == "840")
+    assert line[:6] == [m.dt.datetime.fromtimestamp((T0 + 61_000) / 1000, m.BEIJING).strftime("%Y-%m-%d %H:%M:%S"), "宇树 15分涨跌", "window", spec.slug,
+                        "2026-11-04 11:00:00", "2026-11-04 11:15:00"] and line[8:11] == ["0.425", "0.4", "0.45"] and line[21:23] == ["1", "90.2"]
+    assert float(line[7]) == float(f"{first['up']:.6g}") and float(line[23]) == float(f"{math.log(90.2 / 90.0):.6g}") and line[24] and line[19] == ""
+    # /samples sends it as a document; the review page serves it
+    await bot.process_message({"text": "/samples", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})
+    assert len(tg.docs) == 1 and tg.docs[0][0] == 1 and tg.docs[0][2].filename == "model-samples-20261104.csv" and tg.docs[0][2].data == text.encode("utf-8")
+    assert tg.docs[0][2].caption == "模型样本 5 条（已有结果 4 条），3 个市场；列的含义见 README" and tg.docs[0][2].mime == "text/csv", tg.docs[0][2].caption
+    empty = m.Bot(m.Config.from_env({**ENV, "ADMIN_USER_ID": "42"}), m.Store(":memory:"), FM(T0), FakeTg())
+    assert (await empty.cmd_samples(m.Request("/samples", [], 1, 0, 42))).startswith("还没有样本")
+    web = m.WebServer(bot, 0, "t" * 20)
+    port = await web.start()
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(f"GET /p/{'t' * 20}/samples.csv HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+    await writer.drain()
+    raw = await reader.read()
+    writer.close()
+    await web.stop()
+    assert raw.startswith(b"HTTP/1.1 200") and b"text/csv" in raw and raw.endswith(text.encode("utf-8")), raw[:200]
+    # old samples go after 60 days
+    store.put("wsample:z-updown-15m-3:840", {"t": T0 - 61 * m.DAY_MS, "slug": "z-updown-15m-3", "kind": "window", "left": 840})
+    assert bot.window_prune(T0) == 1 and store.get("wsample:z-updown-15m-3:840") is None and bot.window_prune(T0) == 0
+    assert "/samples" in bot.cmd_help(None) and any(c.name == "samples" for c in m.COMMANDS)
+    print("SAMPLES_OK")
+
+
+asyncio.run(samples())
