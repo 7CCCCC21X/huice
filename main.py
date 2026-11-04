@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.104.6"
+VERSION = "1.104.7"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5927,7 +5927,8 @@ class PredictStream:
         self.replaced += 1
         if old is not None and (old.bid != new.bid or old.ask != new.ask):
             self.mismatch += 1
-            top = lambda b: f"买1 {cents(float(b.bid[0])) if b.bid else '—'} 卖1 {cents(float(b.ask[0])) if b.ask else '—'}"
+            level = lambda row: f"{cents(float(row[0]))}×{float(row[1]):g}" if row else "—"  # the size too: the tops often differ in size alone
+            top = lambda b: f"买1 {level(b.bid)} 卖1 {level(b.ask)}"
             self.last_mismatch = f"{key}：推送 {top(old)}，REST {top(new)}"
 
     def line(self) -> str:
@@ -12677,6 +12678,7 @@ class Bot:
         self.sim_express_count = 0          # decisions made by the express lane (for /diag)
         self.sim_express_withdrawn: dict[str, tuple[float, float]] = {}  # slot -> (monotonic time, price) of the order the express lane withdrew (sim_express_cooling)
         self.sim_requote_count = 0          # orders placed in the very look that withdrew the slot's last one, or right after its confirmed cancel (for /diag)
+        self.sim_requote_live = 0           # ...of which real orders (LiveBot.live_requote_freed)
         self.sim_follow_since: dict[str, tuple[float, int]] = {}  # market|side -> (the place a resting order would move to, since when it has been that: sim_follow_settled)
         self.sim_taker_seen: dict[str, int] = {}  # taker slot -> when (ms) its side was first buyable in the run of looks that still finds it so (SIM_TAKER_HOLD_SECONDS)
         self.sim_unpriced_since: dict[str, int] = {}  # market -> when (ms) a step first found it unpriced with an order resting (sim_unpriced_reason)
@@ -16556,15 +16558,24 @@ class Bot:
     @staticmethod
     def requote_urgent(why: str) -> bool:
         """Whether a re-quote reason (sim_requote_reason) is about the order's edge — gone under the exit line, under the
-        mode's line, under a changed bar — which the express lane acts on at once; the rest (the 买1 to follow, the
-        session, the points, a setting) waits for the step: following a moving bid every few hundred milliseconds would
-        lose the queue each time."""
+        mode's line, under a changed bar — which the express lane acts on at once whatever the settings; the rest (the
+        买1 to follow, the session, the points, a setting) is the step's unless the follow settle is on (sim_express_acts)."""
         return "净优势" in why
+
+    def sim_express_acts(self, why: str) -> bool:
+        """Whether the express lane withdraws a resting order for this re-quote reason now (""/falsy: nothing to do):
+        the edge gone, always; every other reason once SIM_MAKER_FOLLOW_SETTLE_SECONDS is on (1.104.7) — the 买1 a resting
+        order follows is then one that has held its new place that long (sim_follow_settled), so the lane follows it at
+        the first push after that instead of the step one to five seconds later, and a market maker re-posting every
+        half second is still not chased. With the settle at 0 the follow stays the step's: following every push would
+        lose the queue each time (1.88.0)."""
+        return bool(why) and (self.requote_urgent(why) or self.config.sim_maker_follow_settle > 0)
 
     def sim_express_rest(self, mk: SimMarket, trades: dict[str, dict], now_ms: int, changed: list) -> None:
         """The express lane's look at a market's resting orders: the fills this book shows, then the withdrawal of an
-        order the market's end or scope no longer allows (sim_withdraw_reason) or whose edge is gone (requote_urgent);
-        a withdrawn order with nothing filled frees its slot (tid#n), to be quoted again after the cooldown."""
+        order the market's end or scope no longer allows (sim_withdraw_reason), whose edge is gone, or — with the follow
+        settle on — that is to be placed afresh for any reason (sim_express_acts); a withdrawn order with nothing filled
+        frees its slot (tid#n), to be quoted again at once at another price (sim_express_cooling)."""
         rekeys = []
         for tid in list(trade_ids_of_market(trades, mk.market)):
             trade = trades.get(tid)
@@ -16574,7 +16585,7 @@ class Bot:
             self.sim_fill(trade, mk, now_ms)
             if trade["status"] == "resting":
                 why = self.sim_withdraw_reason(trade, mk, now_ms)
-                if not why and self.requote_urgent(reason := self.sim_requote_reason(trade, mk, now_ms)):
+                if not why and self.sim_express_acts(reason := self.sim_requote_reason(trade, mk, now_ms)):
                     why = reason
                 if why:
                     self.sim_withdraw(trade, why, now_ms)
@@ -18974,13 +18985,15 @@ class Bot:
                 if name == "模拟交易" and self.sim_express_count:
                     detail += f"｜快车道决定 {self.sim_express_count} 次"
                 if name == "模拟交易" and self.sim_requote_count:
-                    detail += f"｜撤单后随即重挂 {self.sim_requote_count} 单"
+                    detail += f"｜撤单后随即重挂 {self.sim_requote_count} 单" + (f"（真实 {self.sim_requote_live} 单）" if self.sim_requote_live else "")
                 latency = getattr(self, "live_latency", None)
                 if name == "模拟交易" and latency and (lat := latency()):
                     span = lambda s: f"中位 {s['median']:.1f}s / 最长 {s['max']:.1f}s" if s else "—"
                     detail += (f"｜下单链路（最近 {lat['n']} 笔真实订单）：盘口→决策 {span(lat['book'])}、决策→发出 {span(lat['send'])}、"
                                f"发出→订单号 {span(lat['answer'])}"
-                               + (f"、撤单→重挂发出 {span(lat['requote'])}（{lat['requotes']} 笔）" if lat.get("requote") else ""))
+                               + (f"、撤单→重挂发出 {span(lat['requote'])}（{lat['requotes']} 笔"
+                                  + (f"；中位分段：决定→撤单发出 {p[0]:.1f}s、→Predict 确认 {p[1]:.1f}s、→补挂发出 {p[2]:.1f}s" if (p := lat.get("parts")) else "")
+                                  + "）" if lat.get("requote") else ""))
                 if name == "Predict 盘口" and self.predict.round_info:
                     r = self.predict.round_info
                     detail += (f"｜上轮 {r['keys']} 个市场" + (f"（阶梯 {r['rows']} 档）" if r.get("rows") else "")

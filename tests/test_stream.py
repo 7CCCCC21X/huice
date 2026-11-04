@@ -126,7 +126,7 @@ async def run():
     assert feed.ladder_rows["BTC-HIT-10"]["41"].book.bids == ((D("0.12"), D("30")),), "a push for a market let go is not applied"
     # a REST read replacing a pushed book is compared (/diag); one replacing a REST book is not
     stream.note_rest("HSI", feed.books["HSI"], m.dataclasses.replace(feed.books["HSI"], asks=((D("0.86"), D("1")),)))
-    assert stream.replaced == 1 and stream.mismatch == 1 and stream.last_mismatch == "HSI：推送 买1 50.0¢ 卖1 84.0¢，REST 买1 50.0¢ 卖1 86.0¢", stream.last_mismatch
+    assert stream.replaced == 1 and stream.mismatch == 1 and stream.last_mismatch == "HSI：推送 买1 50.0¢×1 卖1 84.0¢×20，REST 买1 50.0¢×1 卖1 86.0¢×1", stream.last_mismatch  # the sizes too (1.104.7)
     stream.note_rest("HSI", feed.books["HSI"], feed.books["HSI"])
     assert stream.replaced == 1 and "HSI" not in stream.pushed
     line = stream.line()

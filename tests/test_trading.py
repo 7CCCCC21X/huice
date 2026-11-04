@@ -1959,7 +1959,8 @@ async def requote_after_cancel():
     assert lat["requotes"] == 1 and lat["requote"] == {"median": 0.0, "max": 0.0}, lat
     bot.reference_state["模拟交易"] = {"ok_at": time.time() - 2, "error": "", "error_at": 0, "ms": 900, "runs": 50}
     diag = "\n".join(bot.diag_state(NOW))
-    assert "撤单后随即重挂 1 单" in diag and "撤单→重挂发出 中位 0.0s / 最长 0.0s（1 笔）" in diag, diag
+    assert "撤单后随即重挂 1 单（真实 1 单）" in diag and "撤单→重挂发出 中位 0.0s / 最长 0.0s（1 笔；中位分段：决定→撤单发出 0.0s、→Predict 确认 0.0s、→补挂发出 0.0s）" in diag, diag
+    assert new["live"]["requote_cancel_sent_at"] == NOW and new["live"]["requote_cancel_done_at"] == NOW and lat["parts"] == (0.0, 0.0, 0.0), (new["live"], lat)
     # the step: the others left 50¢ (the 100 there are ours), the valid 买1 is at 48¢ — withdrawn to follow it, the cancel confirmed
     # in the step's sync, the 48¢ order out in the same step; its own ghost at 50¢, still on the book read before the cancel, is
     # not the 买1 it joins (sim_own_resting)
@@ -1983,6 +1984,25 @@ async def requote_after_cancel():
     t = bot.sim_trades()
     assert sorted(t) == [tid + "#1", tid + "#2", tid + "#3"] and t[f"{tid}#3"]["live"]["state"] == "cancelling" and bot.sim_requote_count == 2, sorted(t)
     bot.live.api.remove_orders = keep
+    # 1.104.7: with the follow settle on (the default 2 s; this suite's make_bot turns it off), the express lane follows a 买1
+    # that has held its new place: withdrawn, cancelled and placed again at the new level in one express pass
+    fbot = make_bot(SIM_WAYS="maker", SIM_MAKER_MIN_BID="100", SIM_MAKER_FOLLOW_SETTLE_SECONDS="2")
+    await fbot.live_prepare()
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    await fbot.live_prefetch(NOW)
+    await fbot.sim_express("HSI")
+    assert sorted(fbot.sim_trades()) == [tid] and fbot.sim_trades()[tid]["price"] == 0.55 and fbot.sim_trades()[tid]["live"]["state"] == "open"
+    world["markets"] = [hsi(0.70, [("0.53", "300")], [("0.58", "400")], NOW)]
+    await fbot.sim_express("HSI")  # just moved: the settle clock starts, nothing goes out
+    assert sorted(fbot.sim_trades()) == [tid] and fbot.sim_trades()[tid]["live"]["state"] == "open" and not [c for c in fbot.live.api.calls if c[0] == "remove"]
+    fbot.market.now = NOW + 2_500
+    world["markets"] = [hsi(0.70, [("0.53", "300")], [("0.58", "400")], NOW + 2_500)]
+    n = len(fbot.live.api.calls)
+    await fbot.sim_express("HSI")
+    t = fbot.sim_trades()
+    assert sorted(t) == [tid, f"{tid}#1"] and t[f"{tid}#1"]["withdrawn"]["why"] == "买1 移到 53.0¢，改跟" and t[f"{tid}#1"]["live"]["state"] == "done", sorted(t)
+    assert t[tid]["price"] == 0.53 and t[tid]["live"]["state"] == "open" and t[tid]["live"]["requote_of"] == f"{tid}#1" and t[tid]["live"]["withdrawn_at"] == NOW + 2_500
+    assert [c[0] for c in fbot.live.api.calls[n:]] == ["remove", "create"] and fbot.sim_requote_live == 1, fbot.live.api.calls[n:]
     print("REQUOTE_AFTER_CANCEL_OK")
 
 

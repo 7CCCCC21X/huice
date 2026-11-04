@@ -1515,6 +1515,26 @@ async def faster():
         and t[tid]["status"] == "resting" and fbot2.sim_requote_count == 1, t
     await step(fbot2, NOW + 10_000)
     assert sorted(fbot2.sim_trades()) == [tid, f"{tid}#1"] and fbot2.sim_trades()[tid]["price"] == 0.57 and fbot2.sim_requote_count == 1
+    # 1.104.7: with the follow settle on (the default), the lane follows a 买1 that has held its new place — withdrawn and
+    # placed again at the new level in one pass; a 买1 just moved is left alone (the settle), as the step would
+    fbot3 = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                     "SIM_WAYS": "maker", "SIM_MARKETS": "all", **LEGACY, "SIM_MAKER_MIN_BID": "100", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "2"}),
+                 m.Store(":memory:"), FM(NOW), None)
+    fbot3.sim_markets = lambda now: world["markets"]
+    assert fbot3.sim_express_acts("买1 移到 57.0¢，改跟") and fbot3.sim_express_acts("每次份数已改为 50 份，按新份数重挂") and not fbot3.sim_express_acts("") \
+        and not fbot2.sim_express_acts("买1 移到 57.0¢，改跟") and fbot2.sim_express_acts("净优势降到 3.0¢，低于撤单线 5.0¢")
+    world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW)]
+    await fbot3.sim_express("HSI")
+    assert sorted(fbot3.sim_trades()) == [tid] and fbot3.sim_trades()[tid]["price"] == 0.55
+    world["markets"] = [hsi(0.70, [(0.57, 100)], [(0.60, 100)], NOW)]
+    await fbot3.sim_express("HSI")  # the first look at the move: the settle clock starts, the order stays
+    assert sorted(fbot3.sim_trades()) == [tid] and fbot3.sim_trades()[tid]["price"] == 0.55 and fbot3.sim_trades()[tid]["status"] == "resting"
+    fbot3.market.now = NOW + 2_500
+    world["markets"] = [hsi(0.70, [(0.57, 100)], [(0.60, 100)], NOW + 2_500)]
+    await fbot3.sim_express("HSI")
+    t = fbot3.sim_trades()
+    assert sorted(t) == [tid, f"{tid}#1"] and t[f"{tid}#1"]["withdrawn"]["why"] == "买1 移到 57.0¢，改跟" and t[f"{tid}#1"]["withdrawn"]["rule"] is True \
+        and t[tid]["price"] == 0.57 and t[tid]["status"] == "resting" and fbot3.sim_express_count == 3, t
     print("FASTER_OK")
 
 

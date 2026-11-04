@@ -1551,10 +1551,13 @@ class LiveBot(core.Bot):
                     if (old is not None and isinstance(st, dict) and st.get("state") == "pending" and t.get("maker")
                             and not st.get("requote_of")):
                         st["requote_of"], st["withdrawn_at"] = old[0], int((old[1].get("withdrawn") or {}).get("at") or 0)
+                        st["requote_cancel_sent_at"] = int(old[1]["live"].get("cancel_sent_at") or 0)  # the chain's points (live_latency)
+                        st["requote_cancel_done_at"] = int(old[1]["live"].get("cancel_done_at") or 0)
                         st["events"].append({"at": at_ms, "what": f"上一张单（{core.cents(float(old[1].get('price') or 0))}）的撤单已获确认，随即重挂"})
                         fresh.append((tid, t))
                 if fresh:
                     self.sim_requote_count += len(fresh)
+                    self.sim_requote_live += len(fresh)
                     self.sim_save(fresh)
                 if changed:
                     await self.live_place_pending(at_ms)
@@ -1712,7 +1715,8 @@ class LiveBot(core.Bot):
         """The order path of the last ``last`` real orders sent, in seconds (median and longest): 盘口→决策 (the book's
         read to the decision), 决策→发出 (to the request), 发出→订单号 (Predict's answer); 撤单→重挂发出 for the orders
         that took a cancelled one's place (live_requote_freed: from that one's withdrawal to this one's request, the
-        cancel's round trip included). None before any was sent."""
+        cancel's round trip included), with its parts' medians (``parts``: the withdrawal decision to the cancel request,
+        the request to Predict's confirmation, the confirmation to the new order's request). None before any was sent."""
         rows = []
         for t in self.sim_trades().values():
             st = t.get("live")
@@ -1720,7 +1724,7 @@ class LiveBot(core.Bot):
                 continue
             want = st.get("want") or {}
             rows.append((int(t.get("opened") or 0), int(want.get("book_ms") or 0), int(st["sent_at"]), int(st["answered_at"]),
-                         int(st.get("withdrawn_at") or 0)))
+                         int(st.get("withdrawn_at") or 0), int(st.get("requote_cancel_sent_at") or 0), int(st.get("requote_cancel_done_at") or 0)))
         rows = sorted(rows, key=lambda r: r[2])[-last:]
         if not rows:
             return None
@@ -1728,9 +1732,14 @@ class LiveBot(core.Bot):
         def span(values: list) -> dict | None:
             values = sorted(v for v in values if v is not None and v >= 0)
             return {"median": core.median(values) / 1000, "max": values[-1] / 1000} if values else None
-        return {"n": len(rows), "book": span([o - b for o, b, s, a, w in rows if b and o]), "send": span([s - o for o, b, s, a, w in rows if o]),
-                "answer": span([a - s for o, b, s, a, w in rows]), "requote": span([s - w for o, b, s, a, w in rows if w]),
-                "requotes": sum(1 for r in rows if r[4])}
+        chain = [(w, cs, cd, s) for o, b, s, a, w, cs, cd in rows if w and cs and cd and w <= cs <= cd <= s]
+        parts = None
+        if chain:
+            mid = lambda values: core.median(sorted(values)) / 1000
+            parts = (mid([cs - w for w, cs, cd, s in chain]), mid([cd - cs for w, cs, cd, s in chain]), mid([s - cd for w, cs, cd, s in chain]))
+        return {"n": len(rows), "book": span([r[0] - r[1] for r in rows if r[1] and r[0]]), "send": span([r[2] - r[0] for r in rows if r[0]]),
+                "answer": span([r[3] - r[2] for r in rows]), "requote": span([r[2] - r[4] for r in rows if r[4]]),
+                "requotes": sum(1 for r in rows if r[4]), "parts": parts}
 
     async def live_redeem_round(self, now_ms: int) -> None:
         try:
@@ -1920,11 +1929,13 @@ class LiveBot(core.Bot):
             # fills the list showed were lost with their reservation (1.83.0)
             self.live_apply(tid, trade, listed, mk, now_ms)
         if not st.get("cancel_sent"):
+            st.setdefault("cancel_sent_at", self.market.now_ms())  # the first request's time, off the clock (live_latency: 决定→撤单发出)
             result = await self.live.api.remove_orders([st["order_id"]])
             gone_now = st["order_id"] in result["removed"]
             st["cancel_sent"], st["cancel_confirmed"] = now_ms, bool(gone_now)
             if gone_now:
                 st["cancel_done_ms"] = int(time.time() * 1000)  # off the book since (the books' clock): one read before may still show it (sim_own_resting)
+                st["cancel_done_at"] = self.market.now_ms()
             st["events"].append({"at": now_ms, "what": f"撤单请求已发送（{'Predict 确认已撤' if gone_now else 'Predict 称无需撤/已不在盘口'}）"})
         if listed is not None and not st.get("cancel_confirmed"):
             self.live_cancel_again(st, now_ms, "撤单请求发出后仍在盘口，再发一次")  # still listed: its fills count while it rests
@@ -1942,6 +1953,7 @@ class LiveBot(core.Bot):
         if final is not None and not order_final(final, order):
             final = {**final, "status": "CANCELLED"}  # removed on Predict's word; its record still lags
         st.setdefault("cancel_done_ms", int(time.time() * 1000))
+        st.setdefault("cancel_done_at", self.market.now_ms())
         self.live_finish(tid, trade, final or {"status": "CANCELLED"}, mk, now_ms)
 
     def live_cancel_again(self, st: dict, now_ms: int, what: str) -> None:
