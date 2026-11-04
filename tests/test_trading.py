@@ -1636,15 +1636,24 @@ async def unknown_release():
             await step(bot, NOW + 215_000, mkt(NOW + 215_000))
             assert bot.sim_trades()[tid]["live"]["unknown_misses"] == 2
             fake.orders_complete = True
-        # the third complete list, three minutes on: the positions decide
-        await step(bot, NOW + 245_000, mkt(NOW + 245_000))
+        if case == "none":  # 1.104.10: an order on the account this bot has no record of may be this one — nothing is released over it
+            async def ghost_list(status="OPEN", **params): return [{"id": "777", "status": "OPEN", "amount": "1", "amountFilled": "0", "order": {"hash": "0xabc"}}]
+            fake.orders = ghost_list
+            await step(bot, NOW + 245_000, mkt(NOW + 245_000))
+            t = bot.sim_trades()[tid]
+            assert t["live"]["state"] == "unknown" and t["live"]["unknown_misses"] == 3 and "没有记录的挂单（#777）" in t["live"]["last_error"], t["live"]
+            assert [u["id"] for u in bot.live_unknown_open] == ["777"]
+            fake.orders = _empty
+        # the third complete list (the fourth here), three minutes on: the positions decide
+        at = NOW + (250_000 if case == "none" else 245_000)
+        await step(bot, at, mkt(at))
         trades = bot.sim_trades()
         if case == "none":
             t = trades[tid]
-            assert t["live"]["state"] == "done" and t["status"] == "cancelled" and bot.live_reserved(t) == 0 and t["live"]["unknown_misses"] == 3, (t["live"], t["status"])
-            assert any("连续 3 次完整的开放订单列表里没有它" in e["what"] and "按未成交结束，这一边可以再挂" in e["what"] for e in t["live"]["events"]), t["live"]["events"]
-            assert "对账中" not in bot.live_room(trades, mkt(NOW + 245_000), "up", 0.55, 100)
-            await step(bot, NOW + 250_000, mkt(NOW + 250_000))  # the slot free: the next look places the side's order again
+            assert t["live"]["state"] == "done" and t["status"] == "cancelled" and bot.live_reserved(t) == 0 and t["live"]["unknown_misses"] == 4, (t["live"], t["status"])
+            assert any("连续 4 次完整的开放订单列表里没有它" in e["what"] and "按未成交结束，这一边可以再挂" in e["what"] for e in t["live"]["events"]), t["live"]["events"]
+            assert "对账中" not in bot.live_room(trades, mkt(NOW + 250_000), "up", 0.55, 100)
+            await step(bot, NOW + 255_000, mkt(NOW + 255_000))  # the slot free: the next look places the side's order again
             trades = bot.sim_trades()
             assert trades[f"{tid}#1"]["status"] == "cancelled" and trades[tid]["live"]["state"] == "open" and trades[tid]["price"] == 0.55 \
                 and trades[tid]["live"]["order_id"] != oid, (sorted(trades), trades[tid]["live"])
@@ -1662,6 +1671,57 @@ async def unknown_release():
 
 
 asyncio.run(unknown_release())
+
+
+async def drain():
+    """1.104.10: at shutdown the real trader waits for the placements and cancels on their way (its own in-flight set and
+    the API's count of writes) up to LIVE_DRAIN_SECONDS, and sends nothing new once stopping (11-04 16:46: a redeploy cut
+    five placements off mid-request, each left "placing" with a hash Predict never answered to)."""
+    tid = f"{HSI_SLUG}|up|挂"
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare(); fake = bot.live.api
+    await bot.live_prefetch(NOW)
+    real_create = fake.create_order
+    async def slow(body):
+        await asyncio.sleep(0.3)
+        return await real_create(body)
+    fake.create_order = slow
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    bot.market.now, bot.sim_ran = NOW, -1e9
+    stepping = asyncio.create_task(bot.sim_step(NOW))
+    await asyncio.sleep(0.05)
+    assert tid in bot.live_placing and bot.sim_trades()[tid]["live"]["state"] == "placing", bot.sim_trades()[tid]["live"]
+    bot.stopping.set()
+    started = time.monotonic()
+    await bot.drain_orders()  # returns once the placement has its answer, not at once
+    assert time.monotonic() - started >= 0.2 and not bot.live_placing and bot.sim_trades()[tid]["live"]["state"] == "open", (time.monotonic() - started, bot.sim_trades()[tid]["live"])
+    await stepping
+    # the API's own count of writes holds the drain too; and the cap: LIVE_DRAIN_SECONDS, then a warning
+    fake.writes_inflight = 1
+    async def done_soon():
+        await asyncio.sleep(0.2)
+        fake.writes_inflight = 0
+    asyncio.create_task(done_soon())
+    started = time.monotonic()
+    await bot.drain_orders()
+    assert 0.15 <= time.monotonic() - started < 2
+    bot.LIVE_DRAIN_SECONDS = 0.2
+    fake.writes_inflight = 1
+    started = time.monotonic()
+    await bot.drain_orders()
+    assert 0.15 <= time.monotonic() - started < 1
+    fake.writes_inflight = 0
+    # stopping: a pending record is not sent
+    bot.market.now = NOW + 5_000
+    t = bot.sim_open(hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000), "down", NOW + 5_000, maker=m.BookEdge("跌", True, 0.42, 0.12, 300.0, 0.12), shares=100)
+    bot.sim_save([(f"{HSI_SLUG}|down|挂", t)])
+    n = len(fake.calls)
+    await bot.live_place_pending(NOW + 5_000)
+    assert bot.sim_trades()[f"{HSI_SLUG}|down|挂"]["live"]["state"] == "pending" and len(fake.calls) == n
+    print("DRAIN_OK")
+
+
+asyncio.run(drain())
 
 
 async def latency():

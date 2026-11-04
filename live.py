@@ -292,6 +292,7 @@ class PredictApi:
         self.auth_error = ""
         self.gate = asyncio.Semaphore(self.PARALLEL)
         self.read_gate = asyncio.Semaphore(max(1, self.PARALLEL - 1))  # the reads leave a slot: an order or a cancel never queues behind them
+        self.writes_inflight = 0  # orders and cancels on their way (call: priority): the shutdown drain waits for their answers
         self.blocked_until = 0.0
         self.calls = 0
         self.orders_complete = self.positions_complete = True  # the last list read came whole (every page)
@@ -314,8 +315,12 @@ class PredictApi:
             payload = {}
         self.calls += 1
         if priority:
-            async with self.gate:
-                raw = await self.send(method, path, payload, timeout)
+            self.writes_inflight += 1
+            try:
+                async with self.gate:
+                    raw = await self.send(method, path, payload, timeout)
+            finally:
+                self.writes_inflight -= 1
         else:
             async with self.read_gate, self.gate:
                 raw = await self.send(method, path, payload, timeout)
@@ -939,6 +944,7 @@ class LiveBot(core.Bot):
     LIVE_UNKNOWN_SETTLE_MS = 3 * 60_000   # ...and this long unknown, once the account's positions show nothing it could have filled
     LIVE_UNEXPLAINED_EVERY_MS = 60_000    # the positions are read for an unknown record this often at most
     LIVE_SYNC_STALE_MS = 150_000    # no new order while the account's open orders were not read successfully for this long
+    LIVE_DRAIN_SECONDS = 15         # at shutdown, how long the orders and cancels on their way may take to be answered (drain_orders)
 
     def __init__(self, config: core.Config, store: core.Store, market: Any, telegram: Any):
         super().__init__(config, store, market, telegram)
@@ -1367,6 +1373,8 @@ class LiveBot(core.Bot):
             self.live_notify("✅ Predict 登录成功，真实交易就绪。", key="signin")
 
     async def live_place_pending(self, now_ms: int) -> None:
+        if self.stopping.is_set():
+            return  # stopping: nothing new goes out (a request cut off by the exit would leave a record Predict may or may not know)
         trades = self.sim_trades()
         sending = []
         for tid, trade in trades.items():
@@ -1498,6 +1506,21 @@ class LiveBot(core.Bot):
             await self.live_place_order(tid, trade, now_ms)
         finally:
             self.live_placing.discard(tid)
+
+    async def drain_orders(self) -> None:
+        """At shutdown (a redeploy): the placements and cancels in flight are given LIVE_DRAIN_SECONDS to be answered
+        before their tasks are cancelled, and nothing new goes out meanwhile (live_place_pending). 1.104.10: the 16:46
+        redeploy on 11-04 cut five placements off mid-request; each record was left "placing" with a hash Predict never
+        answered to, unknown after the grace, its side held until the evidence or an operator freed it."""
+        api = getattr(self.live, "api", None)
+        inflight = lambda: len(self.live_placing) + int(getattr(api, "writes_inflight", 0) or 0)
+        started = time.monotonic()
+        while inflight() and time.monotonic() - started < self.LIVE_DRAIN_SECONDS:
+            await asyncio.sleep(0.05)
+        if inflight():
+            LOG.warning("停止时仍有 %d 个下单/撤单请求等了 %d 秒没有应答：重启后按哈希找回", inflight(), self.LIVE_DRAIN_SECONDS)
+        elif time.monotonic() - started >= 0.05:
+            LOG.info("停止前等在途的下单/撤单请求应答：%.1f 秒", time.monotonic() - started)
 
     def live_cancels_unsent(self, skip: Any = ()) -> dict[str, dict]:
         """The records whose cancel is decided but not sent yet (state cancelling, an order id known), by tid."""
@@ -2045,6 +2068,12 @@ class LiveBot(core.Bot):
         unknown_ms = now_ms - int(st.get("unknown_since") or now_ms)
         settled = (not expired and int(st.get("unknown_misses") or 0) >= self.LIVE_UNKNOWN_LOOKS and unknown_ms >= self.LIVE_UNKNOWN_SETTLE_MS)
         if not expired and not settled:
+            return
+        if not expired and self.live_unknown_open:
+            # an order on the account this bot has no record of may be this very one under a hash it did not expect: an
+            # operator looks first (/live release, or /live cancel account), nothing is released on top of it
+            st["last_error"] = (f"连续 {st['unknown_misses']} 次完整列表没有它，但账户上还有 {len(self.live_unknown_open)} 张本机器人没有记录的挂单"
+                                f"（#{'、#'.join(u['id'] for u in self.live_unknown_open[:3])}）：可能就是这张，先核对；核对后 /live release 或 /live cancel account")
             return
         if not expired and now_ms - int(st.get("unexplained_at") or 0) < self.LIVE_UNEXPLAINED_EVERY_MS:
             return  # the positions are read for it once a minute at most

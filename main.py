@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.104.9"
+VERSION = "1.104.10"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -12911,6 +12911,11 @@ class Bot:
         self.deliveries[key] = asyncio.create_task(guarded(), name=f"deliver:{key}")
         return True
 
+    async def drain_orders(self) -> None:
+        """At shutdown, after the deliveries: the real trader waits for the orders and cancels on their way
+        (LiveBot.drain_orders); nothing to wait for on paper."""
+        return None
+
     async def drain_deliveries(self) -> None:
         """Wait for every delivery in flight (one-off runs and tests have no background to leave them to)."""
         while pending := [t for t in self.deliveries.values() if not t.done()]:
@@ -19663,6 +19668,8 @@ class Bot:
             pending = [task for task in self.deliveries.values() if not task.done()]
             if pending:
                 await asyncio.wait(pending, timeout=SHUTDOWN_GRACE_SECONDS)
+            with contextlib.suppress(Exception):
+                await self.drain_orders()  # the orders and cancels on their way are answered before their tasks are cancelled (1.104.10)
             for task in [*tasks, *pending]:
                 task.cancel()
             await asyncio.gather(*tasks, *pending, stopper, return_exceptions=True)
