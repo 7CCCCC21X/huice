@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.104.5"
+VERSION = "1.104.6"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -12675,7 +12675,8 @@ class Bot:
         self.fair_sig_at = -1e9
         self.sim_lock = asyncio.Lock()      # the step's decisions and the express lane never run side by side
         self.sim_express_count = 0          # decisions made by the express lane (for /diag)
-        self.sim_express_withdrawn: dict[str, float] = {}  # slot -> monotonic time the express lane withdrew its order (sim_quote's cooldown)
+        self.sim_express_withdrawn: dict[str, tuple[float, float]] = {}  # slot -> (monotonic time, price) of the order the express lane withdrew (sim_express_cooling)
+        self.sim_requote_count = 0          # orders placed in the very look that withdrew the slot's last one, or right after its confirmed cancel (for /diag)
         self.sim_follow_since: dict[str, tuple[float, int]] = {}  # market|side -> (the place a resting order would move to, since when it has been that: sim_follow_settled)
         self.sim_taker_seen: dict[str, int] = {}  # taker slot -> when (ms) its side was first buyable in the run of looks that still finds it so (SIM_TAKER_HOLD_SECONDS)
         self.sim_unpriced_since: dict[str, int] = {}  # market -> when (ms) a step first found it unpriced with an order resting (sim_unpriced_reason)
@@ -15224,13 +15225,23 @@ class Bot:
         return ""
 
     @staticmethod
-    def sim_own_resting(trades: dict[str, dict], market: str, side: str) -> tuple[float, float | None]:
-        """Our own resting real order on a market's side (a real book shows it among the bids): its unfilled shares and
-        its price; (0, None) when there is none."""
+    def sim_own_resting(trades: dict[str, dict], market: str, side: str, book: PredictBook | None = None) -> tuple[float, float | None]:
+        """Our own real order among a market's side's bids (a real book shows it): its unfilled shares and its price —
+        the resting one, else the latest whose cancel Predict confirmed after ``book`` was read (live_cancel's
+        cancel_done_ms: the book may show the order until the next push, and the order that takes a cancelled one's
+        place is decided on that very book — it must not join its own ghost as the valid 买1; 1.104.6). (0, None) when
+        there is none."""
+        ghost = None
         for t in trades_of_market(trades, market):
-            if t.get("side") == side and t.get("maker") and t.get("status") == "resting" and isinstance(t.get("live"), dict):
-                return max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0), float(t.get("price") or 0)
-        return 0.0, None
+            if t.get("side") != side or not t.get("maker") or not isinstance(t.get("live"), dict):
+                continue
+            own = max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0)
+            if t.get("status") == "resting":
+                return own, float(t.get("price") or 0)
+            done = int(t["live"].get("cancel_done_ms") or 0)
+            if book is not None and done and book.fetched_ms <= done and own > 1e-9 and (ghost is None or done > ghost[0]):
+                ghost = (done, own, float(t.get("price") or 0))
+        return (ghost[1], ghost[2]) if ghost else (0.0, None)
 
     def sim_in_scope(self, mk: SimMarket) -> bool:
         """Whether the paper trader trades this market: its kind is on (SIM_MARKETS) and it is not left out by name (SIM_SKIP)."""
@@ -15308,7 +15319,7 @@ class Bot:
             fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: a near-certain side is judged at the limit, no higher
             if cut > 0:
                 capped.append(f"{name}的公平价 {cents(fair + cut)} 按上限 {cents(fair)} 计")
-            own, own_price = self.sim_own_resting(trades, mk.market, side)
+            own, own_price = self.sim_own_resting(trades, mk.market, side, mk.book)
             level = maker_level(mk.book, side, c.sim_maker_min_bid, own, own_price)
             if level is None:
                 sides_seen[side] = {"why": (f"没有不少于 {c.sim_maker_min_bid:g} 份的买价档位可跟（SIM_MAKER_MIN_BID）" if c.sim_maker_min_bid > 0
@@ -16416,6 +16427,7 @@ class Bot:
         self.sim_taker_seen = {tid: at for tid, at in self.sim_taker_seen.items() if tid.rsplit("|", 2)[0] in markets}  # gone markets forgotten
         t2 = time.monotonic()
         opened, rekeys, unpriced = {tid for tid, _ in changed}, [], set()
+        freed: dict[str, dict] = {}  # market -> a record withdrawn below by a rule: its slot is quoted again in this look (sim_requote_freed)
         for mk in markets.values():
             if not mk.hold:
                 self.sim_unpriced_since.pop(mk.market, None)  # priced now: the clock of sim_unpriced_reason is cleared
@@ -16438,6 +16450,8 @@ class Bot:
                        or self.sim_unpriced_reason(trade, mk, now_ms))
                 if why:
                     self.sim_withdraw(trade, why, now_ms)
+                    trade["withdrawn"]["rule"] = True  # the strategy's own withdrawal: its slot is quoted again at once (an operator's is not)
+                    freed.setdefault(trade["market"], trade)
                     if float(trade.get("shares") or 0) <= 1e-9:
                         # nothing filled: the slot is free for a fresh order, the record keeps the attempt — whatever the
                         # reason: withdrawn for a setting that is later flipped back (SIM_WAYS, SIM_MARKETS, SIM_SKIP), the
@@ -16464,6 +16478,8 @@ class Bot:
             new_tid = self.sim_rekey(tid, trades[tid])
             trades[new_tid] = trades.pop(tid)
             changed = [(new_tid if k == tid else k, t) for k, t in changed]
+        if freed:
+            self.sim_requote_freed(markets, freed, trades, now_ms, changed)
         if changed:
             self.sim_save(changed)
         self.sim_step_ms = {"盘口": int((t1 - t0) * 1000), "判断": int((t2 - t1) * 1000), "结算": int((t3 - t2) * 1000),
@@ -16471,13 +16487,34 @@ class Bot:
         self.sim_step_info = {"markets": len(markets), "records": len(trades)}
         return confirm
 
-    SIM_EXPRESS_COOLDOWN_SECONDS = 3.0  # a slot the express lane withdrew is not quoted again by it for this long (the step may)
+    def sim_requote_freed(self, markets: dict[str, SimMarket], freed: dict[str, dict], trades: dict[str, dict], now_ms: int,
+                          changed: list) -> None:
+        """The markets whose resting order this look withdrew by a rule (``freed``: market -> that record; what it had
+        filled stays a position, under tid#n once the fresh order takes the slot) are quoted again in the same look — a
+        买1 that moved is followed now, an edge gone from the 买1 is placed at the level that has it, a changed count is
+        placed at the new count — not at the next step (1.104.6: the step quoted before
+        it judged the resting orders, so every withdrawal left the slot empty until the next look, one to five seconds
+        later, while the market maker on the same book re-posts within half a second). The fresh order faces every gate
+        a first one does (sim_quote); the real trader's slot is free only once Predict confirms the cancel, and is quoted
+        again then (LiveBot.live_requote_freed)."""
+        if self.config.sim_ways == "taker":
+            return
+        for market in freed:
+            mk = markets.get(market)
+            if mk is None or mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
+                continue
+            before = len(changed)
+            self.sim_quote(mk, trades, now_ms, changed)
+            self.sim_requote_count += len(changed) - before
+
+    SIM_EXPRESS_COOLDOWN_SECONDS = 3.0  # a slot the express lane withdrew is not quoted again by it at that price for this long (the step may)
 
     def sim_quote(self, mk: SimMarket, trades: dict[str, dict], now_ms: int, changed: list, express: bool = False) -> None:
         """The maker decision on one market (the step's and the express lane's): the side and the valid 买1 it joins,
         past every gate (sim_maker_reason), opened under its slot (a position there moves to tid#n); ``trades`` and
         ``changed`` are updated in place. The express lane leaves a slot it withdrew within SIM_EXPRESS_COOLDOWN_SECONDS
-        alone (a fair price flickering about the bar would otherwise place and withdraw several times a second). A side the
+        alone at the price it withdrew (sim_express_cooling: a fair price flickering about the bar would otherwise place
+        and withdraw the same order several times a second; a different price is quoted at once). A side the
         caps refuse (sim_maker_pick: the group's worst move, a side's share cap, the real-trading limits) leaves the other
         side its turn when that one clears the bar on its own (1.99.0: a 跌 position past the group cap kept every look on
         挂跌, refused, and the 挂涨 that would have lowered the risk was never placed)."""
@@ -16488,7 +16525,7 @@ class Bot:
                 return
             side = "up" if maker.side == "涨" else "down"
             tid = f"{mk.market}|{side}|挂"
-            if express and time.monotonic() - self.sim_express_withdrawn.get(tid, -1e9) < self.SIM_EXPRESS_COOLDOWN_SECONDS:
+            if express and self.sim_express_cooling(tid, float(maker.price)):
                 return
             held = trades.get(tid)  # one order per market, side and way at a time; a position from a filled one lets the next in
             if held is not None and not sim_position(held) and not sim_spent(held):  # (an order over unfilled: sim_spent)
@@ -16505,6 +16542,16 @@ class Bot:
             trades[tid] = self.sim_open(mk, side, now_ms, maker=maker, shares=count)
             changed.append((tid, trades[tid]))
             return
+
+    def sim_express_cooling(self, tid: str, price: float) -> bool:
+        """Whether the express lane leaves this slot alone: it withdrew the slot's order within SIM_EXPRESS_COOLDOWN_SECONDS
+        and the order it would place now is at the same price — a fair price flickering about the bar, the same order
+        placed and withdrawn several times a second. A different price is a move the market made (the 买1 gone, the edge
+        now at a deeper level): quoted at once (1.104.6; the cooldown used to hold every re-quote of the slot for the
+        three seconds)."""
+        held = self.sim_express_withdrawn.get(tid)
+        return (held is not None and time.monotonic() - held[0] < self.SIM_EXPRESS_COOLDOWN_SECONDS
+                and abs(price - held[1]) < SIM_MAKER_FOLLOW - 1e-9)
 
     @staticmethod
     def requote_urgent(why: str) -> bool:
@@ -16531,7 +16578,8 @@ class Bot:
                     why = reason
                 if why:
                     self.sim_withdraw(trade, why, now_ms)
-                    self.sim_express_withdrawn[tid] = time.monotonic()
+                    trade["withdrawn"]["rule"] = True
+                    self.sim_express_withdrawn[tid] = (time.monotonic(), float(trade.get("price") or 0))
                     if float(trade.get("shares") or 0) <= 1e-9:
                         rekeys.append(tid)
             if json.dumps(trade, sort_keys=True, default=str) != before:
@@ -16750,11 +16798,18 @@ class Bot:
         markets are judged now, under the step's lock but without the step (its settlements, markouts and every other
         market) — a resting order's presumed fills and its withdrawal when its edge is gone or the market's end is near
         (sim_express_rest), then a fresh resting order where a slot is free and the chance there (sim_quote), then the
-        taker (sim_take); in real trading the orders and the cancels go out at once (sim_express_after). Before 1.88.0
-        the lane decided takers alone; makers waited for the step, up to five seconds."""
+        taker (sim_take); in real trading the orders and the cancels go out at once, and the slot a confirmed cancel
+        frees is quoted again right then (sim_express_after). Before 1.88.0 the lane decided takers alone; makers waited
+        for the step, up to five seconds."""
         if not (self.config.sim and self.config.predict):
             return
         now_ms = self.market.now_ms()
+        if await self.sim_express_look(key, now_ms):
+            await self.sim_express_after(now_ms)
+
+    async def sim_express_look(self, key: str, now_ms: int) -> list[tuple[str, dict]]:
+        """One express look at a key's markets (sim_express), under the step's lock: the records it changed, saved —
+        [] when it changed nothing."""
         changed: list[tuple[str, dict]] = []
         async with self.sim_lock:
             trades = self.sim_trades()
@@ -16769,8 +16824,7 @@ class Bot:
             if changed:
                 self.sim_save(changed)
                 self.sim_express_count += 1
-        if changed:
-            await self.sim_express_after(now_ms)
+        return changed
 
     async def sim_express_after(self, now_ms: int) -> None:
         """What follows an express decision: nothing on paper (the fill is immediate); the real trader sends the order."""
@@ -18919,11 +18973,14 @@ class Bot:
                                + (f"；{size['markets']} 个市场、{size['records']} 条记录" if size else "") + "）")
                 if name == "模拟交易" and self.sim_express_count:
                     detail += f"｜快车道决定 {self.sim_express_count} 次"
+                if name == "模拟交易" and self.sim_requote_count:
+                    detail += f"｜撤单后随即重挂 {self.sim_requote_count} 单"
                 latency = getattr(self, "live_latency", None)
                 if name == "模拟交易" and latency and (lat := latency()):
                     span = lambda s: f"中位 {s['median']:.1f}s / 最长 {s['max']:.1f}s" if s else "—"
                     detail += (f"｜下单链路（最近 {lat['n']} 笔真实订单）：盘口→决策 {span(lat['book'])}、决策→发出 {span(lat['send'])}、"
-                               f"发出→订单号 {span(lat['answer'])}")
+                               f"发出→订单号 {span(lat['answer'])}"
+                               + (f"、撤单→重挂发出 {span(lat['requote'])}（{lat['requotes']} 笔）" if lat.get("requote") else ""))
                 if name == "Predict 盘口" and self.predict.round_info:
                     r = self.predict.round_info
                     detail += (f"｜上轮 {r['keys']} 个市场" + (f"（阶梯 {r['rows']} 档）" if r.get("rows") else "")

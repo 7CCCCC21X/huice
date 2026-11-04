@@ -558,7 +558,7 @@ async def run():
     assert k["hsi-w|up|挂"]["status"] == "resting" and "withdrawn" not in k["hsi-w|up|挂"]
     t = dbot.sim_trades()["sol#11|down|挂#1"]
     assert t["status"] == "cancelled" and t["note"] == "撤单：模拟交易已改为只吃单，一份都没成交", t
-    assert t["withdrawn"] == {"at": NOW + 60_000, "why": "模拟交易已改为只吃单", "unfilled": 100.0} and t["unfilled"] == 100
+    assert t["withdrawn"] == {"at": NOW + 60_000, "why": "模拟交易已改为只吃单", "unfilled": 100.0, "rule": True} and t["unfilled"] == 100
     assert m.sim_status(t) == "已撤单" and m.sim_state(t) == "" and not dbot.sim_due(t, BJ(12, 1, 0, 0))  # nothing to confirm, ever
     t = dbot.sim_trades()["sol#12|down|挂"]  # what had filled stays a position, the rest lapses now
     assert t["status"] == "filled" and t["shares"] == 30 and t["unfilled"] == 70 and m.sim_status(t) == "持仓"
@@ -653,15 +653,17 @@ async def maker_rules():
     assert sorted(trades) == [f"{tid}#1"] and trades[f"{tid}#1"]["status"] == "cancelled" and trades[f"{tid}#1"]["note"] == "撤单：买1 不足 100 份，不跟，一份都没成交"
     await step(bot, NOW + 20_000, hsi(0.70, [("0.56", "5"), ("0.55", "30")], [("0.58", "400")], NOW + 20_000))
     assert sorted(bot.sim_trades()) == [f"{tid}#1"]  # still nothing to join
-    # the 买1 is back, deep enough: a fresh order; then it moves up two cents → withdrawn, re-placed at the new level next step
+    # the 买1 is back, deep enough: a fresh order; then it moves up two cents → withdrawn, re-placed at the new level in the
+    # same look (1.104.6; the next step's before)
     await step(bot, NOW + 30_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 30_000))
     assert sorted(bot.sim_trades()) == [tid, f"{tid}#1"] and bot.sim_trades()[tid]["price"] == 0.55
     await step(bot, NOW + 40_000, hsi(0.70, [("0.57", "150"), ("0.55", "300")], [("0.58", "400")], NOW + 40_000))
     trades = bot.sim_trades()
-    assert sorted(trades) == [f"{tid}#1", f"{tid}#2"] and trades[f"{tid}#2"]["note"] == "撤单：买1 移到 57.0¢，改跟，一份都没成交" and trades[f"{tid}#2"]["price"] == 0.55
+    assert sorted(trades) == [tid, f"{tid}#1", f"{tid}#2"] and trades[f"{tid}#2"]["note"] == "撤单：买1 移到 57.0¢，改跟，一份都没成交" and trades[f"{tid}#2"]["price"] == 0.55
+    assert trades[tid]["price"] == 0.57 and trades[tid]["queue_ahead"] == 150 and abs(trades[tid]["edge"] - 0.13) < 1e-9 and bot.sim_requote_count == 1  # re-placed at the new 买1
     await step(bot, NOW + 50_000, hsi(0.70, [("0.57", "150"), ("0.55", "300")], [("0.58", "400")], NOW + 50_000))
     trades = bot.sim_trades()
-    assert trades[tid]["price"] == 0.57 and trades[tid]["queue_ahead"] == 150 and abs(trades[tid]["edge"] - 0.13) < 1e-9  # re-placed at the new 买1
+    assert sorted(trades) == [tid, f"{tid}#1", f"{tid}#2"] and trades[tid]["price"] == 0.57 and trades[tid]["status"] == "resting" and bot.sim_requote_count == 1
     # a half-cent move is not followed
     await step(bot, NOW + 60_000, hsi(0.70, [("0.575", "150"), ("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert bot.sim_trades()[tid]["price"] == 0.57 and bot.sim_trades()[tid]["status"] == "resting"
@@ -779,12 +781,13 @@ async def maker_rules():
     t = dbot.sim_trades()[tid]
     assert t["price"] == 0.06 and t["queue_ahead"] == 0 and t["deep"] is True and abs(t["edge"] - 0.32) < 1e-9 and t["version"]["sim_maker_deep"] == 0.25, t
     # sub-share dust over the order is ignored; a 20-share bid at its price (a paper order is not in the book, so all of
-    # it is someone else's) has pushed it off the front: re-quoted a cent over, on the next step
+    # it is someone else's) has pushed it off the front: re-quoted a cent over, in the same look (1.104.6; the next step's before)
     await step(dbot, NOW + 5_000, wide(0.38, NOW + 5_000, bids=(("0.09", "0.5"), ("0.05", "300"), ("0.01", "1000"))))
     assert dbot.sim_trades()[tid]["status"] == "resting" and dbot.sim_trades()[tid]["price"] == 0.06
     await step(dbot, NOW + 6_000, wide(0.38, NOW + 6_000, bids=(("0.06", "20"), ("0.05", "300"), ("0.01", "1000"))))
     trades = dbot.sim_trades()
-    assert tid not in trades and trades[f"{tid}#1"]["note"] == "撤单：买1 被顶到 6.0¢，改挂 7.0¢，一份都没成交", trades[f"{tid}#1"]["note"]
+    assert trades[f"{tid}#1"]["note"] == "撤单：买1 被顶到 6.0¢，改挂 7.0¢，一份都没成交" and trades[f"{tid}#1"]["withdrawn"]["rule"] is True, trades[f"{tid}#1"]["note"]
+    assert trades[tid]["price"] == 0.07 and trades[tid]["queue_ahead"] == 0 and trades[tid]["deep"] is True, trades[tid]
     await step(dbot, NOW + 7_000, wide(0.38, NOW + 7_000, bids=(("0.06", "20"), ("0.05", "300"), ("0.01", "1000"))))
     assert dbot.sim_trades()[tid]["price"] == 0.07 and dbot.sim_trades()[tid]["queue_ahead"] == 0 and dbot.sim_trades()[tid]["deep"] is True
     await step(dbot, NOW + 10_000, wide(0.315, NOW + 10_000, bids=(("0.06", "20"), ("0.05", "300"), ("0.01", "1000"))))  # 24.5¢ at 7¢: within the slack
@@ -792,17 +795,17 @@ async def maker_rules():
     # pushed again, but a cent over the new bid would leave under 25¢: it stays where it is rather than chase
     await step(dbot, NOW + 12_000, wide(0.38, NOW + 12_000, bids=(("0.13", "40"), ("0.06", "20"), ("0.05", "300"))))
     assert dbot.sim_trades()[tid]["status"] == "resting" and dbot.sim_trades()[tid]["price"] == 0.07
-    # 300 shares land at its price: pushed, re-placed a cent over them on the next step
+    # 300 shares land at its price: pushed, re-placed a cent over them in the same look
     await step(dbot, NOW + 15_000, wide(0.38, NOW + 15_000, bids=(("0.07", "300"), ("0.01", "1000"))))
     trades = dbot.sim_trades()
-    assert tid not in trades and trades[f"{tid}#2"]["note"] == "撤单：买1 被顶到 7.0¢，改挂 8.0¢，一份都没成交", trades[f"{tid}#2"]["note"]
+    assert trades[tid]["price"] == 0.08 and trades[f"{tid}#2"]["note"] == "撤单：买1 被顶到 7.0¢，改挂 8.0¢，一份都没成交", trades[f"{tid}#2"]["note"]
     await step(dbot, NOW + 16_000, wide(0.38, NOW + 16_000, bids=(("0.07", "300"), ("0.01", "1000"))))
     trades = dbot.sim_trades()
     assert trades[tid]["price"] == 0.08 and trades[tid]["queue_ahead"] == 0 and abs(trades[tid]["edge"] - 0.30) < 1e-9 and trades[tid]["deep"] is True
     # the bids under it fall away: down to a cent over what is left
     await step(dbot, NOW + 17_000, wide(0.38, NOW + 17_000, bids=(("0.05", "300"), ("0.01", "1000"))))
     trades = dbot.sim_trades()
-    assert tid not in trades and trades[f"{tid}#3"]["note"] == "撤单：买1 移到 5.0¢，改挂 6.0¢，一份都没成交", trades[f"{tid}#3"]["note"]
+    assert trades[tid]["price"] == 0.06 and trades[f"{tid}#3"]["note"] == "撤单：买1 移到 5.0¢，改挂 6.0¢，一份都没成交", trades[f"{tid}#3"]["note"]
     await step(dbot, NOW + 18_000, wide(0.38, NOW + 18_000))
     assert dbot.sim_trades()[tid]["price"] == 0.06
     await step(dbot, NOW + 20_000, wide(0.29, NOW + 20_000))  # 23¢ at 6¢: under the deep-bid line
@@ -886,15 +889,18 @@ async def maker_rules():
     await step(obot2, NOW, tight(0.70, NOW, asks=(("0.60", "400"),)))  # an ordinary joining order first…
     assert obot2.sim_trades()[tid]["price"] == 0.57 and "deep" not in obot2.sim_trades()[tid]
     obot2.config = m.dataclasses.replace(obot2.config, sim_maker_deep_only=True)
-    await step(obot2, NOW + 10_000, tight(0.70, NOW + 10_000, asks=(("0.60", "400"),)))  # …withdrawn once only the deep-bid ones are wanted
+    # …withdrawn once only the deep-bid ones are wanted, and the sweep order the mode wants placed in the same look (1.104.6)
+    await step(obot2, NOW + 10_000, tight(0.70, NOW + 10_000, asks=(("0.60", "400"),)))
     trades = obot2.sim_trades()
-    assert tid not in trades and trades[f"{tid}#1"]["note"] == "撤单：已改为只挂低价挂单，平时的挂单撤掉，一份都没成交", trades[f"{tid}#1"]["note"]
-    await step(obot2, NOW + 20_000, tight(0.90, NOW + 20_000, asks=(("0.60", "400"),)))  # 33¢ at 57¢: a cent in front at 58¢
+    assert trades[f"{tid}#1"]["note"] == "撤单：已改为只挂低价挂单，平时的挂单撤掉，一份都没成交" and trades[tid]["sweep"] is True and trades[tid]["price"] == 0.01, \
+        {k: (v["price"], v["status"], v.get("sweep"), v.get("note")) for k, v in trades.items()}
+    await step(obot2, NOW + 20_000, tight(0.90, NOW + 20_000, asks=(("0.60", "400"),)))  # 33¢ at 57¢: the sweep order moves a cent in front, to 58¢, in the same look
     t = obot2.sim_trades()[tid]
-    assert t["price"] == 0.58 and t["deep"] is True and abs(t["edge"] - 0.32) < 1e-9, t
-    await step(obot2, NOW + 30_000, tight(0.81, NOW + 30_000, asks=(("0.60", "400"),)))  # 23¢: under the line, on a book the ordinary rule accepts
+    assert t["price"] == 0.58 and t["deep"] is True and abs(t["edge"] - 0.32) < 1e-9 and obot2.sim_trades()[f"{tid}#2"]["note"].startswith("撤单：盘口离公平价远了，击穿单改挂到买1 之上 1¢（58.0¢）"), t
+    await step(obot2, NOW + 30_000, tight(0.81, NOW + 30_000, asks=(("0.60", "400"),)))  # 23¢: under the line, on a book the ordinary rule accepts — a sweep order again
     trades = obot2.sim_trades()
-    assert tid not in trades and trades[f"{tid}#2"]["note"] == "撤单：低价挂单只挂净优势 ≥ 25.0¢ 的，现 23.0¢ 低于低价挂单撤单线 24.0¢，一份都没成交", trades[f"{tid}#2"]["note"]
+    assert trades[f"{tid}#3"]["note"] == "撤单：低价挂单只挂净优势 ≥ 25.0¢ 的，现 23.0¢ 低于低价挂单撤单线 24.0¢，一份都没成交" and trades[tid]["sweep"] is True, \
+        {k: (v["price"], v["status"], v.get("sweep"), v.get("note")) for k, v in trades.items()}
     # --- the after-hours taker mode and the after-hours price limit (10-08): outside the session a daily card is taken only
     # with SIM_TAKER_AFTER_HOURS_CENTS of edge, and nothing, taker or maker, is bought over SIM_AFTER_HOURS_MAX_PRICE_CENTS
     hbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0", "WEB_PORT": "8080",
@@ -957,7 +963,7 @@ async def maker_rules():
     assert t["price"] == 0.02 and t["sweep"] is True and t["deep"] is True and t["queue_ahead"] == 0 and abs(t["edge"] - 0.48) < 1e-9, t
     await step(wbot, NOW + 10_000, hynix(0.50, NOW + 10_000, bids=(("0.48", "3430"),)))  # the 1¢ bid gone: down to 1¢
     trades = wbot.sim_trades()
-    assert tid not in trades and trades[f"{tid}#1"]["note"] == "撤单：下面的买单变了，击穿单改挂 1.0¢，一份都没成交", trades[f"{tid}#1"]["note"]
+    assert trades[tid]["price"] == 0.01 and trades[f"{tid}#1"]["note"] == "撤单：下面的买单变了，击穿单改挂 1.0¢，一份都没成交", trades[f"{tid}#1"]["note"]
     await step(wbot, NOW + 11_000, hynix(0.50, NOW + 11_000, bids=(("0.48", "3430"),)))
     assert wbot.sim_trades()[tid]["price"] == 0.01 and wbot.sim_trades()[tid]["sweep"] is True
     await step(wbot, NOW + 20_000, hynix(0.50, NOW + 20_000, bids=(("0.48", "3430"), ("0.10", "200"))))  # a 10¢ bid: a cent over it
@@ -989,14 +995,15 @@ async def maker_rules():
     sbot2.predict.market_meta["101"] = (active, time.monotonic())
     assert sbot2.sim_maker_reason(five, {}, NOW) == (None, "买卖价差 90.0¢ 超过 10.0¢") and sbot2.sim_version()["sim_maker_spread"] == 0.10
     assert "挂单只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后" in sbot2.sim_text()
-    # a part fill, then the 买1 moves: the filled shares stay a position under the slot, the rest lapses, no fresh order
+    # a part fill, then the 买1 moves: the filled shares stay a position (under #5 once the fresh order takes the slot), the
+    # rest lapses, and the fresh order joins the new 买1 in the same look (1.104.6; the next step's before)
     await step(bot, NOW + 130_000, hsi(0.70, [("0.565", "150")], [("0.57", "40"), ("0.58", "400")], NOW + 130_000))  # a seller at 57¢: 40 presumed
     assert bot.sim_trades()[tid]["shares"] == 40 and bot.sim_trades()[tid]["status"] == "resting"
     await step(bot, NOW + 140_000, hsi(0.70, [("0.59", "200"), ("0.565", "150")], [("0.60", "400")], NOW + 140_000))
-    t = bot.sim_trades()[tid]
-    assert t["status"] == "filled" and t["shares"] == 40 and t["unfilled"] == 60 and "买1 移到 59.0¢，改跟" in t["note"] and f"{tid}#5" not in bot.sim_trades()
+    t = bot.sim_trades()[f"{tid}#5"]
+    assert t["status"] == "filled" and t["shares"] == 40 and t["unfilled"] == 60 and "买1 移到 59.0¢，改跟" in t["note"] and t["withdrawn"]["rule"] is True
     await step(bot, NOW + 150_000, hsi(0.70, [("0.59", "200"), ("0.565", "150")], [("0.60", "400")], NOW + 150_000))
-    trades = bot.sim_trades()  # the position no longer holds the slot (10-08): it moves to #5, a fresh order joins the new 买1
+    trades = bot.sim_trades()  # the position no longer holds the slot (10-08): it moved to #5, the fresh order joined the new 买1
     assert trades[f"{tid}#5"]["shares"] == 40 and trades[f"{tid}#5"]["status"] == "filled" and m.sim_position(trades[f"{tid}#5"])
     assert trades[tid]["status"] == "resting" and trades[tid]["price"] == 0.59 and trades[tid]["queue_ahead"] == 200 and len([k for k in trades if k.startswith(tid)]) == 6
     world["markets"] = [hsi(0.70, [("0.59", "200"), ("0.565", "150")], [("0.60", "400")], NOW + 150_000)]
@@ -1039,7 +1046,7 @@ async def maker_rules():
     assert bot.sim_trades()["pts|up|挂"]["order"] == 100
     bot.apply_config(m.dataclasses.replace(bot.config, sim_shares=50.0))
     await step(bot, NOW + 210_000, pts(NOW + 210_000))
-    assert bot.sim_trades()["pts|up|挂#2"]["note"] == "撤单：每次份数已改为 50 份，按新份数重挂，一份都没成交" and "pts|up|挂" not in bot.sim_trades()
+    assert bot.sim_trades()["pts|up|挂#2"]["note"] == "撤单：每次份数已改为 50 份，按新份数重挂，一份都没成交" and bot.sim_trades()["pts|up|挂"]["order"] == 50
     await step(bot, NOW + 220_000, pts(NOW + 220_000))
     assert bot.sim_trades()["pts|up|挂"]["order"] == 50
     bot.apply_config(m.dataclasses.replace(bot.config, sim_edge=0.20))
@@ -1477,9 +1484,19 @@ async def faster():
     world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW)]  # the edge is back within the cooldown: the lane leaves the slot alone
     await ebot.sim_express("HSI")
     assert sorted(ebot.sim_trades()) == [f"{tid}#1"] and ebot.sim_express_count == 2, "within the cooldown"
-    ebot.sim_express_withdrawn[tid] = -1e9
+    ebot.sim_express_withdrawn[tid] = (-1e9, 0.55)
     await ebot.sim_express("HSI")
-    assert sorted(ebot.sim_trades()) == [tid, f"{tid}#1"] and ebot.sim_trades()[tid]["status"] == "resting"
+    assert sorted(ebot.sim_trades()) == [tid, f"{tid}#1"] and ebot.sim_trades()[tid]["status"] == "resting" and ebot.sim_express_count == 3
+    # 1.104.6: the cooldown holds the slot at the withdrawn price alone — withdrawn again at 55¢, the 买1 moved to 53¢ (with
+    # the edge there) is a move the market made: quoted at once, not after the three seconds
+    world["markets"] = [hsi(0.58, [(0.55, 100)], [(0.60, 100)], NOW)]
+    await ebot.sim_express("HSI")
+    assert sorted(ebot.sim_trades()) == [f"{tid}#1", f"{tid}#2"] and ebot.sim_express_withdrawn[tid][1] == 0.55 and ebot.sim_express_count == 4
+    assert ebot.sim_express_cooling(tid, 0.55) and not ebot.sim_express_cooling(tid, 0.54) and not ebot.sim_express_cooling(f"{HSI_SLUG}|down|挂", 0.55)
+    world["markets"] = [hsi(0.70, [(0.53, 100)], [(0.58, 100)], NOW)]
+    await ebot.sim_express("HSI")
+    t = ebot.sim_trades()
+    assert sorted(t) == [tid, f"{tid}#1", f"{tid}#2"] and t[tid]["status"] == "resting" and t[tid]["price"] == 0.53 and ebot.sim_express_count == 5, t
     assert m.Bot.requote_urgent("净优势降到 3.0¢，低于撤单线 5.0¢") and m.Bot.requote_urgent("盘后只挂净优势 ≥ 15.0¢ 的，现 9.0¢ 低于撤单线 14.0¢") \
         and m.Bot.requote_urgent("触发门槛已改为 12.0¢，现净优势 11.0¢ 不达标") and not m.Bot.requote_urgent("买1 移到 57.0¢，改跟") \
         and not m.Bot.requote_urgent("每次份数已改为 50 份，按新份数重挂") and not m.Bot.requote_urgent("积分已停止发放，不挂")
@@ -1492,10 +1509,12 @@ async def faster():
     world["markets"] = [hsi(0.70, [(0.57, 100)], [(0.60, 100)], NOW)]
     await fbot2.sim_express("HSI")
     assert fbot2.sim_trades()[tid]["status"] == "resting" and fbot2.sim_trades()[tid]["price"] == 0.55, "the 买1 moved: the step's business"
-    await step(fbot2, NOW + 5_000)
-    assert sorted(fbot2.sim_trades()) == [f"{tid}#1"] and fbot2.sim_trades()[f"{tid}#1"]["withdrawn"]["why"] == "买1 移到 57.0¢，改跟"
+    await step(fbot2, NOW + 5_000)  # 1.104.6: withdrawn and placed again at 57¢ in the same look, not the next step's
+    t = fbot2.sim_trades()
+    assert sorted(t) == [tid, f"{tid}#1"] and t[f"{tid}#1"]["withdrawn"]["why"] == "买1 移到 57.0¢，改跟" and t[tid]["price"] == 0.57 \
+        and t[tid]["status"] == "resting" and fbot2.sim_requote_count == 1, t
     await step(fbot2, NOW + 10_000)
-    assert sorted(fbot2.sim_trades()) == [tid, f"{tid}#1"] and fbot2.sim_trades()[tid]["price"] == 0.57
+    assert sorted(fbot2.sim_trades()) == [tid, f"{tid}#1"] and fbot2.sim_trades()[tid]["price"] == 0.57 and fbot2.sim_requote_count == 1
     print("FASTER_OK")
 
 

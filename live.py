@@ -1498,7 +1498,8 @@ class LiveBot(core.Bot):
 
     async def sim_express_after(self, now_ms: int) -> None:
         """An express decision in real trading: its orders go out now, and the cancels of the orders it withdrew (the
-        step's own placements and its sync skip what is done)."""
+        step's own placements and its sync skip what is done); a slot whose cancel Predict confirms is quoted again at
+        once and that order sent too (live_requote_freed)."""
         if self.config.live_mode != "off":
             try:
                 await self.live_place_pending(now_ms)
@@ -1511,6 +1512,54 @@ class LiveBot(core.Bot):
                 await self.live_cancel_blind(cancelling, now_ms)
             except Exception as error:
                 self.live_note_error(f"快车道撤单失败：{core.clean_error(error) or type(error).__name__}")
+            await self.live_requote_freed(list(cancelling), now_ms)
+
+    def sim_requote_freed(self, markets: dict, freed: dict[str, dict], trades: dict[str, dict], now_ms: int, changed: list) -> None:
+        if self.config.live_mode != "off":
+            return  # the real order's cancel goes out after the step's decisions, and its slot is busy until Predict confirms it (live_room): quoted again then (live_requote_freed)
+        super().sim_requote_freed(markets, freed, trades, now_ms, changed)
+
+    async def live_requote_freed(self, tids: list[str], now_ms: int) -> None:
+        """The slots whose real orders Predict has just confirmed cancelled (``tids``: the records whose cancels went
+        out; what filled stays a position) are quoted again now — one express look at each of their markets, the orders sent —
+        rather than at the next push or step (1.104.6: the cancel went out at once, but the order that took its place
+        waited for the next look, one to five seconds, while the market maker on the same book re-posts within half a
+        second). Only the strategy's own withdrawals (withdrawn.rule: the edge gone, a 买1 moved, a setting changed); an
+        operator's cancel, the emergency stop, LIVE=off and the loss stop are not followed by a fresh order here. The
+        fresh order faces every gate a first one does; at the withdrawn price within the lane's cooldown it is not
+        placed (sim_express_cooling). It names the record it follows (requote_of) and that one's withdrawal
+        (withdrawn_at): the 撤单→重挂 span of live_latency."""
+        if self.config.live_mode == "off" or self.config.sim_ways == "taker" or not tids:
+            return
+        trades = self.sim_trades()
+        freed: dict[tuple[str, str], tuple[str, dict]] = {}
+        for tid in tids:
+            t = trades.get(tid)
+            st = t.get("live") if isinstance(t, dict) else None
+            if isinstance(st, dict) and st.get("state") == "done" and (t.get("withdrawn") or {}).get("rule") and t.get("maker") and t.get("key"):
+                freed[(str(t["market"]), str(t.get("side") or ""))] = (tid, t)
+        if not freed:
+            return
+        at_ms = self.market.now_ms()
+        try:
+            for key in sorted({str(t["key"]) for _, t in freed.values()}):
+                changed = await self.sim_express_look(key, at_ms)
+                fresh = []
+                for tid, t in changed:
+                    st = t.get("live")
+                    old = freed.get((str(t.get("market")), str(t.get("side") or "")))
+                    if (old is not None and isinstance(st, dict) and st.get("state") == "pending" and t.get("maker")
+                            and not st.get("requote_of")):
+                        st["requote_of"], st["withdrawn_at"] = old[0], int((old[1].get("withdrawn") or {}).get("at") or 0)
+                        st["events"].append({"at": at_ms, "what": f"上一张单（{core.cents(float(old[1].get('price') or 0))}）的撤单已获确认，随即重挂"})
+                        fresh.append((tid, t))
+                if fresh:
+                    self.sim_requote_count += len(fresh)
+                    self.sim_save(fresh)
+                if changed:
+                    await self.live_place_pending(at_ms)
+        except Exception as error:
+            self.live_note_error(f"撤单后重挂失败：{core.clean_error(error) or type(error).__name__}")
 
     async def live_place_order(self, tid: str, trade: dict, now_ms: int) -> None:
         """Build, sign and send the order of a pending record. The hash is saved (state "placing") before the request
@@ -1634,7 +1683,9 @@ class LiveBot(core.Bot):
             return
         await self.live_renew_auth()
         if active or now_ms - self.live_list_at_ms >= self.LIVE_IDLE_LIST_MS:
+            cancelling = [tid for tid, t in active.items() if t["live"].get("state") == "cancelling"]
             await self.live_sync_orders(active, now_ms)  # with nothing in flight the list is still read now and then: orders this bot did not place
+            await self.live_requote_freed(cancelling, now_ms)  # the slots the confirmed cancels freed: quoted again now, not next step
         if (self.config.live_auto_redeem and time.monotonic() - self.live_last_redeem >= self.LIVE_REDEEM_SECONDS
                 and (self.live_redeem_task is None or self.live_redeem_task.done())):
             self.live_last_redeem = time.monotonic()
@@ -1659,14 +1710,17 @@ class LiveBot(core.Bot):
 
     def live_latency(self, last: int = 30) -> dict | None:
         """The order path of the last ``last`` real orders sent, in seconds (median and longest): 盘口→决策 (the book's
-        read to the decision), 决策→发出 (to the request), 发出→订单号 (Predict's answer). None before any was sent."""
+        read to the decision), 决策→发出 (to the request), 发出→订单号 (Predict's answer); 撤单→重挂发出 for the orders
+        that took a cancelled one's place (live_requote_freed: from that one's withdrawal to this one's request, the
+        cancel's round trip included). None before any was sent."""
         rows = []
         for t in self.sim_trades().values():
             st = t.get("live")
             if not isinstance(st, dict) or not st.get("sent_at") or not st.get("answered_at"):
                 continue
             want = st.get("want") or {}
-            rows.append((int(t.get("opened") or 0), int(want.get("book_ms") or 0), int(st["sent_at"]), int(st["answered_at"])))
+            rows.append((int(t.get("opened") or 0), int(want.get("book_ms") or 0), int(st["sent_at"]), int(st["answered_at"]),
+                         int(st.get("withdrawn_at") or 0)))
         rows = sorted(rows, key=lambda r: r[2])[-last:]
         if not rows:
             return None
@@ -1674,8 +1728,9 @@ class LiveBot(core.Bot):
         def span(values: list) -> dict | None:
             values = sorted(v for v in values if v is not None and v >= 0)
             return {"median": core.median(values) / 1000, "max": values[-1] / 1000} if values else None
-        return {"n": len(rows), "book": span([o - b for o, b, s, a in rows if b and o]), "send": span([s - o for o, b, s, a in rows if o]),
-                "answer": span([a - s for o, b, s, a in rows])}
+        return {"n": len(rows), "book": span([o - b for o, b, s, a, w in rows if b and o]), "send": span([s - o for o, b, s, a, w in rows if o]),
+                "answer": span([a - s for o, b, s, a, w in rows]), "requote": span([s - w for o, b, s, a, w in rows if w]),
+                "requotes": sum(1 for r in rows if r[4])}
 
     async def live_redeem_round(self, now_ms: int) -> None:
         try:
@@ -1868,6 +1923,8 @@ class LiveBot(core.Bot):
             result = await self.live.api.remove_orders([st["order_id"]])
             gone_now = st["order_id"] in result["removed"]
             st["cancel_sent"], st["cancel_confirmed"] = now_ms, bool(gone_now)
+            if gone_now:
+                st["cancel_done_ms"] = int(time.time() * 1000)  # off the book since (the books' clock): one read before may still show it (sim_own_resting)
             st["events"].append({"at": now_ms, "what": f"撤单请求已发送（{'Predict 确认已撤' if gone_now else 'Predict 称无需撤/已不在盘口'}）"})
         if listed is not None and not st.get("cancel_confirmed"):
             self.live_cancel_again(st, now_ms, "撤单请求发出后仍在盘口，再发一次")  # still listed: its fills count while it rests
@@ -1884,6 +1941,7 @@ class LiveBot(core.Bot):
             return self.live_unknown(tid, trade, "撤单请求未获 Predict 确认，订单也查不到", now_ms)  # neither gone for sure nor found
         if final is not None and not order_final(final, order):
             final = {**final, "status": "CANCELLED"}  # removed on Predict's word; its record still lags
+        st.setdefault("cancel_done_ms", int(time.time() * 1000))
         self.live_finish(tid, trade, final or {"status": "CANCELLED"}, mk, now_ms)
 
     def live_cancel_again(self, st: dict, now_ms: int, what: str) -> None:

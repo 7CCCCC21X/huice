@@ -905,15 +905,19 @@ async def run():
     # the real book now shows our 100 among the 55¢ bids: 400 there, 300 of them others → still the valid 买1
     await step(mbot, NOW + 10_000, hsi(0.70, [("0.55", "400")], [("0.58", "400")], NOW + 10_000))
     assert mbot.sim_trades()[mtid]["status"] == "resting"
-    # the others leave: 55¢ holds only our 100, the valid 买1 is the 200 at 53¢ → cancelled on Predict, re-placed there next step
+    # the others leave: 55¢ holds only our 100, the valid 买1 is the 200 at 53¢ → cancelled on Predict and, once the cancel is
+    # confirmed in the step's sync, re-placed there in the same step (1.104.6; the next step's before) — not at its own ghost
+    # at 55¢, which the book read before the cancel still shows (sim_own_resting: cancel_done_ms)
     await step(mbot, NOW + 20_000, hsi(0.70, [("0.55", "100"), ("0.53", "200")], [("0.58", "400")], NOW + 20_000))
     trades = mbot.sim_trades()
     old = trades[f"{mtid}#1"]
-    assert mtid not in trades and old["status"] == "cancelled" and old["live"]["final"] == "cancelled" and ("remove", ["101"]) in mfake.calls
+    assert old["status"] == "cancelled" and old["live"]["final"] == "cancelled" and ("remove", ["101"]) in mfake.calls and old["live"]["cancel_done_ms"] > 0
     assert old["live"]["cancel_why"] == "买1 移到 53.0¢，改跟" and old["live"]["rekeyed"] == f"{mtid}#1"
+    new = trades[mtid]
+    assert new["price"] == 0.53 and new["live"]["order_id"] == "102" and new["live"]["want"]["price"] == 0.53 and new["live"]["requote_of"] == f"{mtid}#1", new["live"]
     await step(mbot, NOW + 30_000, hsi(0.70, [("0.53", "200")], [("0.58", "400")], NOW + 30_000))  # our cancelled 100 are gone from the book
     new = mbot.sim_trades()[mtid]
-    assert new["price"] == 0.53 and new["live"]["order_id"] == "102" and new["live"]["want"]["price"] == 0.53
+    assert new["price"] == 0.53 and new["live"]["order_id"] == "102" and new["live"]["state"] == "open"
     # the order list cannot be read: the cancel still goes out, by order id (1.77.0: live_cancel_blind — a list that cannot be
     # read must not keep an order resting), and Predict's confirmation ends the record; the failure itself is noted
     mfake.fail_open = "HTTP 500: boom"
@@ -1921,3 +1925,65 @@ async def quiet_send():
 
 
 asyncio.run(quiet_send())
+
+
+async def requote_after_cancel():
+    """1.104.6: the slot a confirmed cancel frees is quoted again at once. The express lane: the index moved, the 买1 with it,
+    the resting 55¢ bid's edge fell under the exit line — withdrawn, its cancel sent and confirmed, and the order that takes
+    its place (the 买1 now at 50¢) sent in the same express pass, naming the one it follows (撤单→重挂发出 in /diag). The
+    step: the same after its sync's cancels (a 买1 that moved, followed in the step that withdrew the order), not the next
+    step's. Before, the cancel went out at once but the replacement waited for the next look, one to five seconds."""
+    bot = make_bot(SIM_WAYS="maker", SIM_MAKER_EXIT_CENTS="6", SIM_MAKER_MIN_BID="100")
+    await bot.live_prepare()
+    tid = f"{HSI_SLUG}|up|挂"
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    await bot.live_prefetch(NOW)
+    await bot.sim_express("HSI")
+    t = bot.sim_trades()
+    assert sorted(t) == [tid] and t[tid]["price"] == 0.55 and t[tid]["live"]["state"] == "open", t
+    first = t[tid]["live"]["order_id"]
+    n = len(bot.live.api.calls)
+    # the market moved: 5¢ left under the 6¢ line, the 买1 at 50¢ now — one express pass: withdrawn, cancelled, placed again
+    world["markets"] = [hsi(0.60, [("0.50", "300")], [("0.53", "400")], NOW)]
+    await bot.sim_express("HSI")
+    t = bot.sim_trades()
+    assert sorted(t) == [tid, f"{tid}#1"], sorted(t)
+    old, new = t[f"{tid}#1"], t[tid]
+    assert old["status"] == "cancelled" and old["withdrawn"]["why"] == "净优势降到 5.0¢，低于撤单线 6.0¢" and old["live"]["state"] == "done" \
+        and old["live"]["cancel_confirmed"], old
+    assert new["price"] == 0.50 and new["live"]["state"] == "open" and new["live"]["requote_of"] == f"{tid}#1" and new["live"]["withdrawn_at"] == NOW \
+        and any("撤单已获确认，随即重挂" in e["what"] for e in new["live"]["events"]), new
+    assert [c[0] for c in bot.live.api.calls[n:]] == ["remove", "create"] and bot.live.api.calls[n][1] == [first], bot.live.api.calls[n:]
+    assert bot.sim_requote_count == 1 and bot.sim_express_count == 3, (bot.sim_requote_count, bot.sim_express_count)
+    lat = bot.live_latency()
+    assert lat["requotes"] == 1 and lat["requote"] == {"median": 0.0, "max": 0.0}, lat
+    bot.reference_state["模拟交易"] = {"ok_at": time.time() - 2, "error": "", "error_at": 0, "ms": 900, "runs": 50}
+    diag = "\n".join(bot.diag_state(NOW))
+    assert "撤单后随即重挂 1 单" in diag and "撤单→重挂发出 中位 0.0s / 最长 0.0s（1 笔）" in diag, diag
+    # the step: the others left 50¢ (the 100 there are ours), the valid 买1 is at 48¢ — withdrawn to follow it, the cancel confirmed
+    # in the step's sync, the 48¢ order out in the same step; its own ghost at 50¢, still on the book read before the cancel, is
+    # not the 买1 it joins (sim_own_resting)
+    second = new["live"]["order_id"]
+    n = len(bot.live.api.calls)
+    await step(bot, NOW + 5_000, hsi(0.60, [("0.50", "100"), ("0.48", "300")], [("0.53", "400")], NOW + 5_000))
+    t = bot.sim_trades()
+    assert sorted(t) == [tid, f"{tid}#1", f"{tid}#2"] and t[f"{tid}#2"]["withdrawn"]["why"] == "买1 移到 48.0¢，改跟" and t[f"{tid}#2"]["live"]["state"] == "done", sorted(t)
+    assert t[tid]["price"] == 0.48 and t[tid]["live"]["state"] == "open" and t[tid]["live"]["requote_of"] == f"{tid}#2" \
+        and t[tid]["live"]["withdrawn_at"] == NOW + 5_000, t[tid]["live"]
+    assert [c[0] for c in bot.live.api.calls[n:] if c[0] in {"remove", "create"}] == ["remove", "create"] and bot.sim_requote_count == 2, bot.live.api.calls[n:]
+    assert second not in bot.live.api.open and t[tid]["live"]["order_id"] in bot.live.api.open
+    # nothing more to do next step: the order rests
+    n = len(bot.live.api.calls)
+    await step(bot, NOW + 10_000, hsi(0.60, [("0.48", "300")], [("0.53", "400")], NOW + 10_000))
+    assert sorted(bot.sim_trades()) == [tid, f"{tid}#1", f"{tid}#2"] and not [c for c in bot.live.api.calls[n:] if c[0] in {"remove", "create"}]
+    # a cancel Predict does not confirm leaves the slot busy: nothing is placed until it does (live_room)
+    bot.live.api.remove_orders, keep = (lambda ids: asyncio.sleep(0, {"removed": [], "noop": list(ids)})), bot.live.api.remove_orders
+    n = len(bot.live.api.calls)
+    await step(bot, NOW + 15_000, hsi(0.60, [("0.46", "300")], [("0.53", "400")], NOW + 15_000))
+    t = bot.sim_trades()
+    assert sorted(t) == [tid + "#1", tid + "#2", tid + "#3"] and t[f"{tid}#3"]["live"]["state"] == "cancelling" and bot.sim_requote_count == 2, sorted(t)
+    bot.live.api.remove_orders = keep
+    print("REQUOTE_AFTER_CANCEL_OK")
+
+
+asyncio.run(requote_after_cancel())
