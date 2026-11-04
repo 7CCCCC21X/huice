@@ -179,7 +179,7 @@ async def run():
                                           "outcomes": [{"name": "$900", "indexSet": 2}, {"name": "$700", "indexSet": 1}]}}
     bot.predict.fetch = fetch
     await bot.predict.market_info(BNB.slug, "1")
-    assert bot.predict.info[BNB.slug] == {"outcomes": ["$700", "$900"],
+    assert bot.predict.info[BNB.slug] == {"outcomes": ["$700", "$900"], "question": "",  # (1.102.0: the question, a 15-minute market's range)
                                              "created_ms": int(dt.datetime(2026, 9, 20, 8, tzinfo=dt.timezone.utc).timestamp() * 1000)}
     btc = bot.touch_payload(bot.touches["BTC"], NOW)
     assert btc["name"] == "BTC 先触 70k/90k" and btc["labels"] == ["$90k", "$70k"] and btc["close_ms"] == BTC.deadline_ms, btc

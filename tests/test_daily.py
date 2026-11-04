@@ -8,6 +8,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
+m.WINDOW_UPDOWN_MARKETS = ()  # the 15-minute cards (1.102.0) have their own suite, tests/test_window.py
 H, MIN = 3_600_000, 60_000
 utc = lambda *a: int(dt.datetime(*a, tzinfo=dt.timezone.utc).timestamp() * 1000)
 et = m.et_ms

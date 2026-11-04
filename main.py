@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.101.2"
+VERSION = "1.102.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -508,6 +508,10 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_CRYPTO_DAY_MAX_SHARES", "加密日涨跌每个市场每边最多持有多少份（内测）", "0～10000000：每日涨跌市场的涨、跌两边各自的持仓加挂单（含发送中、撤单待确认、低价挂单）不超过这个数，两边各算各的、不互相抵；超出的部分不买、只买剩下的额度；0 = 不另设"),
     ("SIM_CRYPTO_DAY_EDGE_CENTS", "加密日涨跌触发买入的净优势（¢/份，内测）", "0～50：每日涨跌市场单独的买入门槛，吃单、挂单都按它（模型误差更大时按模型误差），挂单撤单线随之不高于它减 0.5¢；0 = 同“触发买入的净优势”。怎么定：看 /calib 里的“加密日涨跌吃单门槛回测”"),
     ("SIM_CRYPTO_DAY_QUIET_MINUTES", "加密日涨跌结束前多少分钟不买（内测）", "0～1440：每日涨跌市场在结算那根 1 分钟 K（12:00 ET）之前这么多分钟起不开新单，未成交的挂单撤掉；和“结束前多少分钟不交易”取较长的；0 = 只按那一项"),
+    ("SIM_CRYPTO_15M_SHARES", "15 分钟涨跌每次最多买多少份（内测）", "0～1000000：宇树 15 分钟涨跌市场（每 15 分钟一个，按币安合约指数价结算）的吃单、挂单每次最多这么多份，上面的份数设置更小时按更小的；0 = 不另设"),
+    ("SIM_CRYPTO_15M_MAX_SHARES", "15 分钟涨跌每个市场每边最多持有多少份（内测）", "0～10000000：每个 15 分钟市场的涨、跌两边各自的持仓加挂单（含发送中、撤单待确认、低价挂单）不超过这个数，两边各算各的；超出的部分不买、只买剩下的额度；0 = 不另设"),
+    ("SIM_CRYPTO_15M_EDGE_CENTS", "15 分钟涨跌触发买入的净优势（¢/份，内测）", "0～50：15 分钟涨跌市场单独的买入门槛，吃单、挂单都按它（模型误差更大时按模型误差），挂单撤单线随之不高于它减 0.5¢；0 = 同“触发买入的净优势”"),
+    ("SIM_CRYPTO_15M_QUIET_SECONDS", "15 分钟涨跌结束前多少秒不买（内测）", "0～600：每个 15 分钟窗口结束前这么多秒起不开新单，未成交的挂单撤掉；最后一分钟（结算价那根 1 分钟 K）本来就不交易；“结束前多少分钟不交易”不管这类市场"),
     ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
     ("SIM_MAKER_DEEPER", "买1 不够门槛时跟更深的买价", "开 = 跟买1 的净优势不够门槛（或不超过模型误差）时，挂到下面第一个够门槛的买价档位（买2、买3…，同样要有“买1 至少多少份”那么多别人的单），等有人砸穿买1 时接；涨、跌两边各按各的；关 = 只跟买1，不够就不挂"),
     ("SIM_MAKER_EXIT_CENTS", "挂单撤单线（¢/份）", "0～50：挂着的单净优势降到这个数以下就撤掉（不会高于触发门槛）；0 = 不撤"),
@@ -646,6 +650,10 @@ class Config:
     # candle (12:00 ET), resting orders withdrawn; the longer of this and SIM_QUIET_MINUTES; 0 = SIM_QUIET_MINUTES alone
     sim_crypto_day_edge: float = 0.0         # SIM_CRYPTO_DAY_EDGE_CENTS / 100: ...the net edge a buy on one needs, taker and maker (the
     # withdrawal line kept half a cent under it); 0 = SIM_EDGE_CENTS
+    sim_crypto_15m_shares: float = 10.0       # SIM_CRYPTO_15M_SHARES: on a 15-minute up/down market (UNITREE, in beta) one buy asks for at most this
+    sim_crypto_15m_max_shares: float = 100.0  # SIM_CRYPTO_15M_MAX_SHARES: ...each side of one window holds at most this many shares (not netted)
+    sim_crypto_15m_quiet: int = 120           # SIM_CRYPTO_15M_QUIET_SECONDS: ...nothing bought in a window's last seconds (SIM_QUIET_MINUTES not applied)
+    sim_crypto_15m_edge: float = 0.0          # SIM_CRYPTO_15M_EDGE_CENTS / 100: ...its own entry bar; 0 = SIM_EDGE_CENTS
     sim_maker_min_bid: float = 100.0  # SIM_MAKER_MIN_BID: a resting order joins the first bid level holding this many shares besides ours and follows
     # it (withdrawn and re-placed when the valid 买1 moves a cent); 0 = the top level whatever its size, and no following
     sim_maker_exit: float = 0.05      # SIM_MAKER_EXIT_CENTS / 100: a resting order is withdrawn when its edge falls under this; 0 = never
@@ -828,6 +836,10 @@ class Config:
             sim_crypto_day_max_shares=parse_bounded(e, "SIM_CRYPTO_DAY_MAX_SHARES", "100", 0, 10_000_000),
             sim_crypto_day_quiet=bounded_int(e, "SIM_CRYPTO_DAY_QUIET_MINUTES", 30, 0, 1440),
             sim_crypto_day_edge=parse_bounded(e, "SIM_CRYPTO_DAY_EDGE_CENTS", "0", 0, 50) / 100,
+            sim_crypto_15m_shares=parse_bounded(e, "SIM_CRYPTO_15M_SHARES", "10", 0, 1_000_000),
+            sim_crypto_15m_max_shares=parse_bounded(e, "SIM_CRYPTO_15M_MAX_SHARES", "100", 0, 10_000_000),
+            sim_crypto_15m_quiet=bounded_int(e, "SIM_CRYPTO_15M_QUIET_SECONDS", 120, 0, 600),
+            sim_crypto_15m_edge=parse_bounded(e, "SIM_CRYPTO_15M_EDGE_CENTS", "0", 0, 50) / 100,
             sim_maker_min_bid=parse_bounded(e, "SIM_MAKER_MIN_BID", "100", 0, 10_000_000),
             sim_maker_exit=parse_bounded(e, "SIM_MAKER_EXIT_CENTS", "5", 0, 50) / 100,
             sim_maker_session=not off(e.get("SIM_MAKER_SESSION", "on")),
@@ -5161,7 +5173,7 @@ class PredictFeed:
 
     async def market_info(self, slug: str, market_id: str) -> None:
         details = await self.market_details(market_id)
-        self.info[slug] = {"outcomes": details["outcomes"], "created_ms": details["created_ms"]}
+        self.info[slug] = {"outcomes": details["outcomes"], "created_ms": details["created_ms"], "question": details.get("question", "")}
 
     CLOSED_WORDS = re.compile(r"\b(RESOLV\w*|SETTL\w*|FINAL\w*|CLOSED|ENDED|EXPIR\w*|CANCEL\w*)\b")
 
@@ -6048,6 +6060,8 @@ class BinanceStream(PushStream):
         if c.touch:
             if self.venue == "spot":
                 out += [spec.symbol for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *DAILY_UPDOWN_MARKETS)]
+            else:  # a 15-minute card's pair: its mark price stream carries the index that settles it (field i)
+                out += [spec.symbol for spec in WINDOW_UPDOWN_MARKETS]
             out += [spec.symbol for spec in RANGE_MARKETS if spec.venue == self.venue]
         return list(dict.fromkeys(out))
 
@@ -6169,8 +6183,8 @@ class BinanceStream(PushStream):
         if not self.first_logged:
             self.first_logged = True
             LOG.info("%s：连接后 %.1f 秒收到第一个价格（%s %s）", self.NAME, time.monotonic() - self.connected_at, symbol, kind)
-        if kind == "aggTrade" or symbol in self.bot.config.symbols:  # a mark price matters to a contract's quote alone
-            self.bot.price_pushed(self.venue, symbol, row)
+        if kind == "aggTrade" or symbol in self.bot.config.symbols or symbol in getattr(self.bot, "index_markets", {}):
+            self.bot.price_pushed(self.venue, symbol, row)  # a mark price matters to a contract's quote and a 15-minute card's index
 
     def line(self) -> str:
         """The connection's line, then what the server registered and each pair's last push (/diag)."""
@@ -6765,6 +6779,7 @@ class DailyUpDownSpec:
     coin: str         # the card's name for the coin: "BTC" -> "BTC 11-04 涨跌"
     hour: int = 12    # the two candles' wall time, ET
     minute: int = 0
+    ROLL_WAIT_MS = 10 * 60_000  # the card waits this long past a day's final minute for its close, then moves on regardless
 
     def day_spec(self, day: dt.date) -> UpDownSpec:
         """The market "on <day>": the candle of the day before at hour:minute ET against the one of <day>, each at its
@@ -6784,6 +6799,14 @@ class DailyUpDownSpec:
         """The date a day's market is named for: its final candle's ET date."""
         return et_date(spec.end_ms)
 
+    def before(self, spec: UpDownSpec) -> UpDownSpec:
+        """The market before ``spec``: the day before's (a restart just after noon ET still settles it, Bot.updown_start)."""
+        return self.day_spec(self.day_of(spec) - dt.timedelta(days=1))
+
+    def tag(self, spec: UpDownSpec) -> dict:
+        """What a position's record carries to mark its market for the beta limits (sim_beta): the day."""
+        return {"day": self.day_of(spec).isoformat()}
+
 
 DAILY_UPDOWN_MARKETS: tuple[DailyUpDownSpec, ...] = (
     # "the Binance 1 minute candle for BTC/USDT Nov 3 '26 12:00 in the ET timezone (noon)" against the one of "Nov 4 '26
@@ -6792,6 +6815,61 @@ DAILY_UPDOWN_MARKETS: tuple[DailyUpDownSpec, ...] = (
     DailyUpDownSpec("BTC-DAY", "bitcoin", "BTCUSDT", "BTC"),
     DailyUpDownSpec("ETH-DAY", "ethereum", "ETHUSDT", "ETH"),
     DailyUpDownSpec("BNB-DAY", "bnb", "BNBUSDT", "BNB"),
+)
+
+
+@dataclass(frozen=True)
+class WindowUpDownSpec:
+    """A "<coin> Up or Down 15m" market, a new one every 15 minutes (unitree-updown-15m-<window start, Unix seconds>):
+    Up when the price at the end of the window is above the one at its start, Down when below, 50-50 when the two are
+    equal. The price is Chainlink's data stream of the index price (field i) of Binance's USDⓈ-M futures mark price
+    stream; the bot reads that index itself (IndexUpDownMarket), and each boundary's value as the close of the index's
+    1-minute candle that ends there — the last index before it, as a report at that moment carries. One card follows
+    the windows under one key, as a daily card follows the days (Bot.updown_roll). The slug's time is taken for the
+    window's start (the convention of these markets); Predict's target price and the time range in the market's question,
+    when it shows them, must agree, or nothing is suggested (Bot.updown_hold). In beta: the trader buys at most
+    SIM_CRYPTO_15M_SHARES at a time, holds at most SIM_CRYPTO_15M_MAX_SHARES on each side of one window and buys nothing
+    in its last SIM_CRYPTO_15M_QUIET_SECONDS."""
+    key: str          # card / book key, the same for every window: the favourite, the /edge bar and SIM_SKIP stay with it
+    stem: str         # the slug's head: unitree -> unitree-updown-15m-1793761200
+    symbol: str       # the Binance USDⓈ-M futures pair whose index price settles the market
+    coin: str         # the card's name for it: "宇树" -> "宇树 15分涨跌 11:00–11:15"
+    minutes: int = 15
+    ROLL_WAIT_MS = 60_000  # the card waits this long past a window's end for the end's index, then moves on regardless
+
+    @property
+    def window_ms(self) -> int:
+        return self.minutes * 60_000
+
+    def window_spec(self, start_ms: int) -> UpDownSpec:
+        """The market of the window that starts at ``start_ms``: the slug names the start in Unix seconds; the two prices
+        are the closes of the index's 1-minute candles that end at the window's start and end (an UpDownSpec names its
+        candles by their open, a minute earlier)."""
+        end_ms = start_ms + self.window_ms
+        hm = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING).strftime("%H:%M")
+        return UpDownSpec(self.key, f"{self.stem}-updown-{self.minutes}m-{start_ms // 1000}", self.symbol,
+                          f"{self.coin} {self.minutes}分涨跌 {hm(start_ms)}–{hm(end_ms)}", start_ms - 60_000, end_ms - 60_000)
+
+    def current(self, now_ms: int) -> UpDownSpec:
+        """The window ``now_ms`` falls in (windows start on the quarter hour)."""
+        return self.window_spec(now_ms - now_ms % self.window_ms)
+
+    def before(self, spec: UpDownSpec) -> UpDownSpec:
+        """The window before ``spec``'s."""
+        return self.window_spec(spec.start_ms + 60_000 - self.window_ms)
+
+    def tag(self, spec: UpDownSpec) -> dict:
+        """What a position's record carries to mark its market for the beta limits (sim_beta): the window's length."""
+        return {"window": f"{self.minutes}m"}
+
+
+WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
+    # "宇树科技 (UNITREE) 涨或跌 15分" (unitree-updown-15m-1793761200: 11-04 11:00–11:15 Beijing, 11-03 22:00–22:15 ET): "Up
+    # if the UNITREE/USDT price at the end of the time range specified in the title is greater than the price at the
+    # beginning of that range", Down if lower, 50-50 if equal; "the primary resolution source … is Chainlink, specifically
+    # the UNITREE/USDT data stream", which "uses the index price (field i) from Binance's USDS-Margined Futures Mark Price
+    # Stream for All Markets (!markPrice@arr)"
+    WindowUpDownSpec("UNITREE-15M", "unitree", "UNITREEUSDT", "宇树"),
 )
 
 
@@ -6854,6 +6932,10 @@ class UpDownMarket:
     def push_price(self, price: D, now_ms: int) -> None:
         """A trade pushed in (BinanceStream): the price as the 30-second read would set it, that read deferred by as long."""
         self.price, self.priced_ms, self.times["price"] = price, now_ms, time.monotonic()
+
+    def at(self, spec: UpDownSpec) -> "UpDownMarket":
+        """A market of the same kind on another period (a past day or window a position settles on: Bot.updown_of)."""
+        return UpDownMarket(self.store, spec)
 
     def close_of(self, which: str) -> D | None:
         """The kept close of the "start" or "end" candle, None until it has been read."""
@@ -6943,6 +7025,129 @@ class UpDownMarket:
         if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
             return "波动率超过一天未更新；暂不给建议"
         return ""
+
+
+def minute_vol(rows: list, now_ms: int, minutes: int = 240) -> float:
+    """Annualised σ of a price's finished 1-minute closes: over the last ``minutes``, or over the last hour when that is
+    higher (a quiet morning does not hide an afternoon that moves). 0 when the price has not moved at all."""
+    done = [r for r in rows if isinstance(r, list) and len(r) > 6 and int(r[6]) < now_ms][-(minutes + 1):]
+    if len(done) < 61:
+        raise ValueError("指数 1 分钟 K 线不足一小时")
+    closes = [float(r[4]) for r in done]
+    if min(closes) <= 0:
+        raise ValueError("指数 1 分钟 K 线价格无效")
+    rets = [math.log(b / a) for a, b in zip(closes, closes[1:])]
+
+    def sd(xs: list[float]) -> float:
+        mean = sum(xs) / len(xs)
+        return math.sqrt(sum((x - mean) ** 2 for x in xs) / (len(xs) - 1))
+    return max(sd(rets), sd(rets[-60:])) * math.sqrt(365 * 24 * 60)
+
+
+class IndexUpDownMarket(UpDownMarket):
+    """A short window settled on a Binance USDⓈ-M futures pair's index price (WindowUpDownSpec): the index pushed every
+    second (markPrice@1s, field i: push_index) or read (premiumIndex) when the push is late, σ from its last hours of
+    1-minute candles (minute_vol), and the two boundary values — each the close of the index's 1-minute candle ending at
+    it (indexPriceKlines) — kept as UpDownMarket keeps its candle closes. Trades never price it."""
+    PRICE_SECONDS = 5            # the index is read this often while no push brings it
+    VOL_SECONDS = 60
+    CANDLE_SECONDS = 5           # a boundary value still missing is asked for again this often
+    CANDLE_GRACE_MS = 1_500      # and only this long after its minute ended
+    PRICE_STALE_MS = 60_000      # an index older than this prices nothing
+    SIGMA_STALE_MS = 30 * 60_000
+    SIGMA_MINUTES = 240          # σ: the last four hours of 1-minute index candles (or the last hour, when higher)
+    TIE = D("0.0005")            # an end this close to the start (relative) is left to Predict: Chainlink's report may differ
+
+    def __init__(self, store: "Store", spec: UpDownSpec, futures: Any = None):
+        super().__init__(store, spec)
+        self.futures = futures or binance_futures  # the bot passes its own futures feed (base URL, rate-limit cooldown)
+        self.index_ms = 0  # the newest index's own time (the push's event time, the read's)
+
+    async def get(self, path: str, **params: Any) -> Any:
+        return await self.futures(path, **params)
+
+    def at(self, spec: UpDownSpec) -> "IndexUpDownMarket":
+        return IndexUpDownMarket(self.store, spec, self.futures)
+
+    def push_price(self, price: D, now_ms: int) -> None:
+        return None  # a trade is not the index: only push_index prices it
+
+    def push_index(self, price: D, at_ms: int, now_ms: int) -> bool:
+        """An index pushed in (BinanceStream's markPriceUpdate, field i at event time E): taken when newer than the one
+        held, the REST read deferred by PRICE_SECONDS. True when taken."""
+        if at_ms <= self.index_ms or not price > 0:
+            return False
+        self.index_ms, self.price, self.priced_ms, self.times["price"] = at_ms, price, now_ms, time.monotonic()
+        return True
+
+    def point(self, open_ms: int) -> str:
+        """The boundary the 1-minute candle opening at ``open_ms`` ends at: '22:15 ET（北京 11:15）'."""
+        at = open_ms + 60_000
+        et = dt.datetime.fromtimestamp(at / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(at))))
+        return f"{et:%H:%M} ET（北京 {dt.datetime.fromtimestamp(at / 1000, BEIJING):%H:%M}）"
+
+    async def read_candle(self, open_ms: int) -> D:
+        """The close of exactly the index's 1-minute candle that opens at open_ms (a neighbouring minute is never taken)."""
+        rows = await self.get("indexPriceKlines", pair=self.spec.symbol, interval="1m", startTime=open_ms,
+                              endTime=open_ms + 59_999, limit=1)
+        row = next((r for r in rows or [] if isinstance(r, list) and len(r) > 6 and int(r[0]) == open_ms), None)
+        if row is None or int(row[6]) != open_ms + 59_999:
+            raise ValueError(f"币安没有返回 {self.point(open_ms)}的指数 1 分钟 K 线")
+        return number(row[4], f"{self.spec.symbol} 指数价")
+
+    async def refresh(self, now_ms: int) -> None:
+        mono, errors = time.monotonic(), []
+        if mono - self.times["candle"] >= self.CANDLE_SECONDS:
+            self.times["candle"] = mono
+            for which, open_ms in (("start", self.spec.start_ms), ("end", self.spec.end_ms)):
+                if self.close_of(which) is None and now_ms >= open_ms + 60_000 + self.CANDLE_GRACE_MS:
+                    try:
+                        close = await self.read_candle(open_ms)
+                        self.store.put(f"updown:{self.spec.slug}:{which}", {"open": open_ms, "close": str(close), "read_ms": now_ms})
+                    except Exception as error:
+                        errors.append(clean_error(error) or type(error).__name__)
+        if self.close_of("end") is None:  # settled: nothing is left to price
+            try:
+                if mono - self.times["price"] >= self.PRICE_SECONDS:
+                    self.times["price"] = mono
+                    data = await self.get("premiumIndex", symbol=self.spec.symbol)
+                    at = int((data or {}).get("time") or now_ms)
+                    if at > self.index_ms:
+                        self.index_ms, self.price, self.priced_ms = at, number(data["indexPrice"], f"{self.spec.symbol} 指数价"), now_ms
+                if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
+                    self.times["vol"] = mono
+                    rows = await self.get("indexPriceKlines", pair=self.spec.symbol, interval="1m", limit=self.SIGMA_MINUTES + 2)
+                    self.sigma, self.sigma_ms = minute_vol(rows, now_ms, self.SIGMA_MINUTES), now_ms
+            except Exception as error:
+                errors.append(clean_error(error) or type(error).__name__)
+        self.error = "；".join(errors)
+
+    def odds(self, now_ms: int) -> UpDownOdds | str:
+        spec = self.spec
+        line, final = self.close_of("start"), self.close_of("end")
+        if line is not None and final is not None:
+            if abs(final - line) <= line * self.TIE:
+                return (f"终点指数 {final:,.4f} 与起点 {line:,.4f} 相差不到 {float(self.TIE) * 100:g}%，"
+                        "Chainlink 的报价可能不同：以 Predict 的结算为准")
+            up, down = float(final > line), float(final < line)
+            return UpDownOdds(up, 0.0, down, 0.0, line, final, 0.0, True)
+        why = f"（{brief_error(self.error, 60)}）" if self.error else ""
+        if line is None:
+            if now_ms < spec.start_ms + 60_000:
+                return f"窗口 {self.point(spec.start_ms)}开始，起点是那一刻的指数价"
+            return f"等待币安 {spec.symbol} {self.point(spec.start_ms)}的指数价（起点）{why}"
+        if now_ms >= spec.end_ms + 60_000:
+            return f"窗口已在 {self.point(spec.end_ms)}结束，等待那一刻的指数价（终点）{why}"
+        if self.price is None or self.sigma is None:
+            return f"等待币安 {spec.symbol} 指数价{why}"
+        if now_ms - self.priced_ms > self.PRICE_STALE_MS:
+            return (f"指数价停在 {stamp(self.priced_ms)}（{(now_ms - self.priced_ms) // 1000} 秒未更新"
+                    f"{'：' + brief_error(self.error, 60) if self.error else ''}），暂停概率")
+        if not self.sigma > 0:
+            return "指数近 4 小时没有变动（标的可能休市），暂停概率"
+        years = (spec.end_ms + 60_000 - now_ms) / YEAR_MS
+        up, flat, down, z = updown_odds(float(self.price), float(line), self.sigma, years)
+        return UpDownOdds(up, flat, down, z, line, self.price, years)
 
 
 # --- flip market (does one coin trade above another on Hyperliquid within the window?) -------------------------------
@@ -8722,6 +8927,10 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_CRYPTO_DAY_MAX_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "50", "100", "200", "300", "500"], "unit": "份", "zero": "不另设"},
     "SIM_CRYPTO_DAY_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "5", "6", "8", "10", "15"], "unit": "¢", "zero": "同触发门槛"},
     "SIM_CRYPTO_DAY_QUIET_MINUTES": {"kind": "number", "group": "策略", "presets": ["0", "10", "15", "30", "60", "120"], "unit": "分钟", "zero": "同结束前不交易"},
+    "SIM_CRYPTO_15M_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "5", "10", "20", "50", "100"], "unit": "份", "zero": "不另设"},
+    "SIM_CRYPTO_15M_MAX_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "50", "100", "200", "300", "500"], "unit": "份", "zero": "不另设"},
+    "SIM_CRYPTO_15M_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "5", "6", "8", "10", "15"], "unit": "¢", "zero": "同触发门槛"},
+    "SIM_CRYPTO_15M_QUIET_SECONDS": {"kind": "number", "group": "策略", "presets": ["0", "60", "120", "180", "300", "600"], "unit": "秒", "zero": "只停最后一分钟"},
     "SIM_MAKER_MIN_BID": {"kind": "number", "group": "策略", "presets": ["0", "20", "50", "100", "200", "500"], "unit": "份", "zero": "不限、不改跟"},
     "SIM_MAKER_EXIT_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "2", "3", "5", "8"], "unit": "¢", "zero": "不撤"},
     "SIM_MAKER_SESSION": {"kind": "choice", "group": "策略", "options": [["off", "盘前盘后也挂"], ["on", "只在开盘时段挂"]]},
@@ -12176,8 +12385,13 @@ class Bot:
         self.updowns = {spec.key: UpDownMarket(store, spec) for spec in UPDOWN_MARKETS}
         # the daily up/down cards (1.97.0): one market object per coin, aimed at the next day's market as each day ends
         self.updown_daily = {spec.key: spec for spec in DAILY_UPDOWN_MARKETS}
+        # the 15-minute up/down cards (1.102.0): settled on a futures pair's index, a new market every quarter hour
+        self.updown_windows = {spec.key: spec for spec in WINDOW_UPDOWN_MARKETS}
+        self.updown_rolling = {**self.updown_daily, **self.updown_windows}  # the cards that move on to the next market
         started = market.now_ms() if market is not None else int(time.time() * 1000)
         self.updowns.update({key: UpDownMarket(store, self.updown_start(daily, started)) for key, daily in self.updown_daily.items()})
+        self.updowns.update({key: IndexUpDownMarket(store, self.updown_start(spec, started), self.binance_futures)
+                             for key, spec in self.updown_windows.items()})
         self.flips = {spec.key: FlipMarket(store, spec) for spec in FLIP_MARKETS}
         self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
         self.ranges = {spec.key: range_market(store, spec, self.binance_futures, config) for spec in (*RANGE_MARKETS, *STOCK_HIT_MARKETS)}
@@ -12188,7 +12402,11 @@ class Bot:
         self.predict.reward_keys.update(self.ranges)
         # the price streams (1.87.0): the crypto cards by the pair that prices them, the Binance venues, Hyperliquid
         self.pair_markets: dict[tuple[str, str], list] = {}  # (venue, pair) -> the cards priced from it (BinanceStream)
+        self.index_markets: dict[str, list] = {}  # futures pair -> the 15-minute cards its index prices (markPrice field i)
         for card in (*self.touches.values(), *self.updowns.values()):
+            if isinstance(card, IndexUpDownMarket):
+                self.index_markets.setdefault(card.spec.symbol, []).append(card)
+                continue
             self.pair_markets.setdefault(("spot", card.spec.symbol), []).append(card)
         for rm in self.ranges.values():
             if rm.spec.venue in ("spot", "futures"):
@@ -13747,7 +13965,8 @@ class Bot:
         if self.config.touch:  # one broken card must not take the whole page down with it
             items.extend(self.safe_card(f"{t.spec.symbol.removesuffix('USDT')} 先触", t.spec.key, "crypto", self.touch_payload, t, now_ms)
                          for t in self.touches.values())
-            items.extend(self.safe_card(u.spec.name, u.spec.key, "crypto", self.updown_payload, u, now_ms) for u in self.updowns.values())
+            items.extend(self.safe_card(u.spec.name, u.spec.key, "contract" if isinstance(u, IndexUpDownMarket) else "crypto",
+                                        self.updown_payload, u, now_ms) for u in self.updowns.values())
             items.extend(self.safe_card(f.spec.name, f.spec.key, "crypto", self.flip_payload, f, now_ms) for f in self.flips.values())
             items.extend(self.safe_card(r.spec.name, r.spec.key, "crypto", self.range_payload, r, now_ms) for r in self.ranges.values())
             items.extend(self.safe_card(c.spec.name, c.spec.key, "crypto", self.cap_payload, c, now_ms) for c in self.caps.values())
@@ -13924,16 +14143,41 @@ class Bot:
         """(why no trade is suggested, a note on the line): the market's own reasons, and Predict's target price (when its
         category shows one) must be the same opening close we read from Binance."""
         hold = mkt.advice_problem(odds, now_ms)
+        index = isinstance(mkt, IndexUpDownMarket)
+        if index and not hold:
+            hold = self.window_title_problem(mkt.spec)  # the window Predict names must be the one the slug was read as
         strike = (self.predict.strikes.get(mkt.spec.slug) or (None,))[0]
         if strike is None:
             return hold, ""
-        if abs(percent(strike, odds.line)) > D("0.005"):
-            return hold or f"Predict 目标价 {strike:,.2f} 与币安起点 {odds.line:,.2f} 不一致，请核实；暂不给建议", ""
+        # (percent: in %) the daily close is the very number Predict shows; an index window's start is Chainlink's report at
+        # that second against the index candle closing then — within 0.1%, or the window was read a quarter hour off
+        if abs(percent(strike, odds.line)) > (D("0.1") if index else D("0.005")):
+            shown = (lambda x: f"{x:,.4f}") if index else (lambda x: f"{x:,.2f}")
+            return hold or f"Predict 目标价 {shown(strike)} 与{'起点指数' if index else '币安起点'} {shown(odds.line)} 不一致，请核实；暂不给建议", ""
         return hold, "；与 Predict 目标价一致"
 
+    def window_title_problem(self, spec: UpDownSpec) -> str:
+        """A 15-minute market's question names its time range ("… 10:00PM-10:15PM ET"): when it does, it must start where
+        the slug's time was read as the start (WindowUpDownSpec), or nothing is suggested. "" when it agrees or says no time."""
+        question = str((self.predict.info.get(spec.slug) or {}).get("question") or "")
+        found = re.search(r"(\d{1,2}):(\d{2})\s*([AP]M)?\s*[-–—~至到]\s*(\d{1,2}):(\d{2})\s*([AP]M)?\s*(?:ET|EST|EDT)\b", question, re.I)
+        if not found:
+            return ""
+        hour, minute, half = int(found.group(1)), int(found.group(2)), (found.group(3) or "").upper()
+        if half:
+            hour = hour % 12 + (12 if half == "PM" else 0)
+        start = spec.start_ms + 60_000
+        et = dt.datetime.fromtimestamp(start / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(start))))
+        if (hour, minute) == (et.hour, et.minute):
+            return ""
+        return (f"Predict 市场写的时间段（{found.group(0)}）和按链接推算的窗口（{et:%H:%M} ET 起）对不上，请核实；暂不给建议")
+
     def updown_payload(self, mkt: "UpDownMarket", now_ms: int) -> dict:
-        """Web card for a period up/down market: the usual 涨/跌 card, measured from the starting candle's close."""
+        """Web card for a period up/down market: the usual 涨/跌 card, measured from the starting candle's close (a
+        15-minute card from the index at its window's start)."""
         spec = mkt.spec
+        if isinstance(mkt, IndexUpDownMarket):
+            return self.window_payload(mkt, now_ms)
         base = {"name": spec.name, "symbol": spec.key, "group": "crypto", "close_ms": spec.end_ms + 60_000,
                 "close_label": f"{spec.label(spec.end_ms)}这根 1 分钟 K 的收盘价；高于起点为涨、低于为跌、相同按 50/50 结算"}
         odds = mkt.odds(now_ms)
@@ -13963,6 +14207,44 @@ class Bot:
                 "sigma": sigma * math.sqrt(odds.years),
                 "sigma_note": (f"币安 {spec.symbol} 30 日小时收盘年化 {sigma * 100:.1f}%；价格零漂移，中位数比现价低 σ²τ/2"
                                if not odds.settled else "已结算"),
+                "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
+                "fair_up": odds.fair_up, "fair_down": odds.fair_down}
+
+    def window_payload(self, mkt: "IndexUpDownMarket", now_ms: int) -> dict:
+        """Web card for a 15-minute market: the 涨/跌 card of its window, measured from the index at the window's start, in
+        the 合约标的 section beside the pair's own card."""
+        spec = mkt.spec
+        base = {"name": spec.name, "symbol": spec.key, "group": "contract", "close_ms": spec.end_ms + 60_000,
+                "close_label": (f"{mkt.point(spec.end_ms)}的币安合约 {spec.symbol} 指数价（Chainlink 结算源）；高于起点为涨、"
+                                "低于为跌、相同按 50/50 结算")}
+        odds = mkt.odds(now_ms)
+        hold, agree = self.updown_hold(mkt, odds, now_ms) if isinstance(odds, UpDownOdds) else ("", "")
+        out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
+        book, why = self.updown_book(spec)
+        if book is not None:
+            ok = isinstance(odds, UpDownOdds)
+            swing = mkt.model_swing(odds) if ok else 0.0
+            self.book_block(out, book, odds.fair_up if ok else None, self.edge_need(swing), swing, hold, ("涨", "跌"), now_ms)
+        elif why and spec.key in self.predict.books:
+            out["error"] = why
+        if self.config.predict:
+            base["predict"] = out
+        if isinstance(odds, str):
+            return {**base, "missing": odds}
+        sigma = mkt.sigma or 0.0
+        verdict = "涨" if odds.up else "跌"
+        minutes = max(odds.years * YEAR_MS / 60_000, 0.0)
+        return {**base, "quote_ms": 0 if odds.settled else mkt.priced_ms, "source": "已结算" if odds.settled else "币安合约指数价",
+                "ref": f"{odds.line:,.4f}", "ref_rel": "起点", "unit": "USDT",
+                "ref_note": f"币安合约 {spec.symbol} 指数价，{mkt.point(spec.start_ms)}{agree}",
+                "eff_label": "终点" if odds.settled else "现价", "effective": f"{odds.price:,.4f}",
+                "move": float(percent(odds.price, odds.line)),
+                "proxy_note": (f"已结算：终点 {odds.price:,.4f}（{mkt.point(spec.end_ms)}）对起点 {odds.line:,.4f} → {verdict}"
+                               if odds.settled else "不用代理：结算源 Chainlink 的价格就是币安合约的指数价（markPrice 推送的 i）"),
+                "warn": hold, "sigma_daily": sigma / math.sqrt(365), "remaining": odds.years * 365,
+                "sigma": sigma * math.sqrt(odds.years),
+                "sigma_note": (f"币安合约 {spec.symbol} 指数近 4 小时（或近 1 小时，取大）1 分钟 K 年化 {sigma * 100:.1f}%；"
+                               f"剩 {minutes:.1f} 分钟；价格零漂移" if not odds.settled else "已结算"),
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down}
 
@@ -14112,6 +14394,16 @@ class Bot:
                               "path": touch.status(), "start_ms": touch.start_ms},
                     "sources": [price_evidence("现货", "币安现货", spec.symbol, "最新价", touch.price, touch.priced_ms,
                                                touch.priced_ms)], "proxy": None}
+        if kind == "updown" and isinstance(parts["mkt"], IndexUpDownMarket):
+            mkt = parts["mkt"]
+            odds = parts["odds"]
+            spec = mkt.spec
+            return {"basis": {"line": float(odds.line), "price": float(odds.price), "sigma": mkt.sigma, "years": odds.years,
+                              "settled": odds.settled, "start": mkt.point(spec.start_ms), "end": mkt.point(spec.end_ms),
+                              "window": spec.slug},
+                    "sources": [price_evidence("指数", "币安合约指数价", spec.symbol, "指数价 i", mkt.price, mkt.priced_ms, mkt.priced_ms),
+                                price_evidence("起点", "币安合约指数 1 分钟 K", spec.symbol, "收盘", odds.line, spec.start_ms)],
+                    "proxy": None}
         if kind == "updown":
             mkt: UpDownMarket = parts["mkt"]
             odds: UpDownOdds = parts["odds"]
@@ -14387,6 +14679,11 @@ class Bot:
             return ""
         if now_ms >= end:
             return "已到结束时间，等结果出来：不开新单，挂单撤掉"
+        if (settle or {}).get("window"):  # a 15-minute up/down market (in beta): its own seconds; SIM_QUIET_MINUTES would take most of it
+            secs = self.config.sim_crypto_15m_quiet
+            if secs and now_ms >= end + 60_000 - secs * 1000:  # (end: the final minute's open; the window ends a minute later)
+                return f"15 分钟涨跌结束前 {secs} 秒不买（内测，SIM_CRYPTO_15M_QUIET_SECONDS）"
+            return ""
         minutes = self.config.sim_quiet_minutes
         day = self.config.sim_crypto_day_quiet if (settle or {}).get("day") else 0  # a daily crypto up/down market, in beta
         if day > minutes and now_ms >= end - day * 60_000:
@@ -14398,16 +14695,20 @@ class Bot:
     def sim_order_cap(self, mk: SimMarket) -> float:
         """The most shares one buy on this market may ask for beyond the general counts: SIM_CRYPTO_DAY_SHARES on a daily
         crypto up/down market (in beta), else no limit of its own."""
-        cap = self.config.sim_crypto_day_shares
-        return cap if cap > 0 and mk.kind == "updown" and mk.settle.get("day") else math.inf
+        if mk.kind != "updown":
+            return math.inf
+        cap = (self.config.sim_crypto_15m_shares if mk.settle.get("window") else  # SIM_CRYPTO_15M_SHARES on a 15-minute one
+               self.config.sim_crypto_day_shares if mk.settle.get("day") else 0)
+        return cap if cap > 0 else math.inf
 
     def sim_market_room(self, trades: dict[str, dict], mk: SimMarket, side: str) -> tuple[float, str]:
         """How many more shares one side of a daily crypto up/down market (in beta) may take under SIM_CRYPTO_DAY_MAX_SHARES:
         the cap less what that side holds — its positions and its orders resting or in flight at their whole count,
         deep-bid ones too; each side has its own cap, the other side's shares neither count nor offset (1.98.0: "每边各
         100 份") — and why none when no share is left. (inf, "") on any other market or with the cap off."""
-        cap = self.config.sim_crypto_day_max_shares
-        if cap <= 0 or mk.kind != "updown" or not mk.settle.get("day"):
+        window = mk.kind == "updown" and bool(mk.settle.get("window"))  # a 15-minute market: SIM_CRYPTO_15M_MAX_SHARES, the same way
+        cap = self.config.sim_crypto_15m_max_shares if window else self.config.sim_crypto_day_max_shares
+        if cap <= 0 or mk.kind != "updown" or not (window or mk.settle.get("day")):
             return math.inf, ""
         held = side_held(trades, mk.market, side)
         used = held["total"] + held["deep"]
@@ -14415,13 +14716,17 @@ class Bot:
         if room >= SIM_MIN_SHARES - 1e-9:
             return room, ""
         return 0.0, (f"{mk.sides[0 if side == 'up' else 1]}这一边持仓加挂单已有 {used:g} 份，" + ("达到" if used >= cap - 1e-9 else "离")
-                     + f"加密日涨跌每边上限 {cap:g} 份" + ("" if used >= cap - 1e-9 else "不足 1 份") + "（内测，SIM_CRYPTO_DAY_MAX_SHARES）")
+                     + f"{'15 分钟涨跌' if window else '加密日涨跌'}每边上限 {cap:g} 份" + ("" if used >= cap - 1e-9 else "不足 1 份")
+                     + f"（内测，{'SIM_CRYPTO_15M_MAX_SHARES' if window else 'SIM_CRYPTO_DAY_MAX_SHARES'}）")
 
     def sim_crypto_day_version(self, mk: SimMarket) -> dict:
         """The beta limits a daily crypto up/down trade was made under (beside sim_version's settings, on that market only)."""
+        c = self.config
+        if mk.kind == "updown" and mk.settle.get("window"):  # a 15-minute market's own
+            return {"sim_crypto_15m_shares": c.sim_crypto_15m_shares, "sim_crypto_15m_max_shares": c.sim_crypto_15m_max_shares,
+                    "sim_crypto_15m_quiet": c.sim_crypto_15m_quiet, "sim_crypto_15m_edge": c.sim_crypto_15m_edge}
         if mk.kind != "updown" or not mk.settle.get("day"):
             return {}
-        c = self.config
         return {"sim_crypto_day_shares": c.sim_crypto_day_shares, "sim_crypto_day_max_shares": c.sim_crypto_day_max_shares,
                 "sim_crypto_day_quiet": c.sim_crypto_day_quiet, "sim_crypto_day_edge": c.sim_crypto_day_edge}
 
@@ -15024,6 +15329,8 @@ class Bot:
     def sim_edge_bar(self, mk: SimMarket | None) -> float:
         """The entry bar on this market: SIM_CRYPTO_DAY_EDGE_CENTS on a daily crypto up/down market when it is set, else
         SIM_EDGE_CENTS (the modes and the card's own error may raise it, never lower it)."""
+        if mk is not None and mk.kind == "updown" and mk.settle.get("window") and self.config.sim_crypto_15m_edge > 0:
+            return self.config.sim_crypto_15m_edge  # SIM_CRYPTO_15M_EDGE_CENTS on a 15-minute market
         day = self.config.sim_crypto_day_edge
         return day if mk is not None and day > 0 and mk.kind == "updown" and mk.settle.get("day") else self.config.sim_edge
 
@@ -15215,7 +15522,7 @@ class Bot:
         if mode and edge < self.sim_maker_line(mk, deep) - 1e-9:  # the close re-judges every order by the after-hours bar too
             return f"{mode}只挂净优势 ≥ {cents(bar)} 的，现 {cents(edge)} 低于{line_name} {cents(self.sim_maker_line(mk, deep))}"
         version, now_bar = trade.get("version") or {}, self.sim_edge_bar(mk)  # a daily crypto market's own bar, when set
-        placed_bar = float(version.get("sim_crypto_day_edge") or version.get("sim_edge") or now_bar)
+        placed_bar = float(version.get("sim_crypto_15m_edge") or version.get("sim_crypto_day_edge") or version.get("sim_edge") or now_bar)
         if abs(placed_bar - now_bar) > 1e-12 and edge < now_bar - 1e-9:
             return f"触发门槛已改为 {cents(now_bar)}，现净优势 {cents(edge)} 不达标"  # a changed setting re-judges the order by the entry bar
         deep_order = bool(trade.get("deep"))
@@ -16134,6 +16441,12 @@ class Bot:
                                   if max(c.sim_crypto_day_quiet, c.sim_quiet_minutes) else "") if part]
         if beta and self.updown_daily and "updown" in c.sim_markets:
             how.append("加密日涨跌（BTC / ETH / BNB，内测）：" + "，".join(beta) + "（SIM_CRYPTO_DAY_*）")
+        beta = [part for part in (f"净优势 ≥ {cents(c.sim_crypto_15m_edge)} 才买" if c.sim_crypto_15m_edge > 0 else "",
+                                  f"每次最多买 {c.sim_crypto_15m_shares:g} 份" if c.sim_crypto_15m_shares > 0 else "",
+                                  f"每个市场每边持仓加挂单最多 {c.sim_crypto_15m_max_shares:g} 份" if c.sim_crypto_15m_max_shares > 0 else "",
+                                  f"每个窗口最后 {max(c.sim_crypto_15m_quiet, 60)} 秒不买、撤掉挂单") if part]
+        if self.updown_windows and "updown" in c.sim_markets:
+            how.append("15 分钟涨跌（" + "、".join(w.coin for w in self.updown_windows.values()) + "，内测）：" + "，".join(beta) + "（SIM_CRYPTO_15M_*）")
         if r["ways"] != "只吃单":
             spread = self.config.sim_maker_spread
             how.append((f"挂单{'平时' if self.config.sim_maker_deep > 0 else ''}只挂在双边都有报价、价差不超过 {spread * 100:g}¢ 的盘口" if spread > 0
@@ -16674,6 +16987,8 @@ class Bot:
         bars, _ = self.edge_bars()  # read once a round, not once a market
         observed_makers = set()
         for mk in self.sim_markets(now_ms):
+            if mk.kind == "updown" and mk.settle.get("window"):
+                continue  # a 15-minute market: over before a confirmed alert could be acted on by hand (the trader trades it itself)
             bar = self.edge_bar(mk, bars)  # the level's, market's or section's own bar (/edge), else EDGE_ALERT_CENTS
             self.edge_observe(state, mk.market, mk, costs, bar, now_ms)
             if mk.kind == "range":
@@ -17444,6 +17759,8 @@ class Bot:
                   "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes), "SIM_MAKER_MIN_BID": plain(c.sim_maker_min_bid),
                   "SIM_CRYPTO_DAY_SHARES": plain(c.sim_crypto_day_shares), "SIM_CRYPTO_DAY_MAX_SHARES": plain(c.sim_crypto_day_max_shares),
                   "SIM_CRYPTO_DAY_QUIET_MINUTES": str(c.sim_crypto_day_quiet), "SIM_CRYPTO_DAY_EDGE_CENTS": f"{c.sim_crypto_day_edge * 100:g}",
+                  "SIM_CRYPTO_15M_SHARES": plain(c.sim_crypto_15m_shares), "SIM_CRYPTO_15M_MAX_SHARES": plain(c.sim_crypto_15m_max_shares),
+                  "SIM_CRYPTO_15M_QUIET_SECONDS": str(c.sim_crypto_15m_quiet), "SIM_CRYPTO_15M_EDGE_CENTS": f"{c.sim_crypto_15m_edge * 100:g}",
                   "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points), "SIM_MAKER_DEEPER": flag(c.sim_maker_deeper),
                   "SIM_SHARES_NET": flag(c.sim_shares_net),
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
@@ -18335,6 +18652,11 @@ class Bot:
                     snapshot["quote"] = quote
                     if quote.price != old.price or quote.source != old.source:
                         keys.append(symbol)
+        if venue == "futures" and row.get("indexPrice") is not None and row.get("markTime") is not None:
+            for card in self.index_markets.get(symbol, ()):
+                with contextlib.suppress(ValueError, TypeError):
+                    if card.push_index(number(row["indexPrice"], symbol), int(row["markTime"]), now_ms):
+                        keys.append(card.spec.key)
         cards = self.pair_markets.get((venue, symbol), ())
         if cards and row.get("price") is not None:
             try:
@@ -18449,13 +18771,13 @@ class Bot:
 
     UPDOWN_ROLL_WAIT_MS = 10 * 60_000  # a daily card waits this long past its final minute for that candle's close, then moves on regardless
 
-    def updown_start(self, daily: DailyUpDownSpec, now_ms: int) -> UpDownSpec:
-        """The day a daily card starts on: the market whose final candle has not closed (DailyUpDownSpec.current) — or,
-        within UPDOWN_ROLL_WAIT_MS of the previous one's final minute, that one while its final close is not kept yet (a
+    def updown_start(self, daily: "DailyUpDownSpec | WindowUpDownSpec", now_ms: int) -> UpDownSpec:
+        """The market a rolling card starts on: the one whose final candle has not closed (current) — or, within the
+        card's ROLL_WAIT_MS of the previous one's final minute, that one while its final close is not kept yet (a
         restart at 12:03 ET still reads it, and settles its paper trades on the bot's own data)."""
         spec = daily.current(now_ms)
-        last = daily.day_spec(daily.day_of(spec) - dt.timedelta(days=1))
-        if now_ms < last.end_ms + 60_000 + self.UPDOWN_ROLL_WAIT_MS and UpDownMarket(self.store, last).close_of("end") is None:
+        last = daily.before(spec)
+        if now_ms < last.end_ms + 60_000 + daily.ROLL_WAIT_MS and UpDownMarket(self.store, last).close_of("end") is None:
             return last
         return spec
 
@@ -18464,34 +18786,39 @@ class Bot:
         paper trades on it settle on that) or UPDOWN_ROLL_WAIT_MS past it. The same market object goes on — the live
         price and σ are the pair's, the candle closes are kept per slug — with the new day's slug, name and candles; the
         new day's first candle (the final one just read) is read at once, the new market's outcome names are asked for."""
-        for key, daily in self.updown_daily.items():
+        for key, daily in self.updown_rolling.items():
             mkt = self.updowns.get(key)
             if mkt is None:
                 continue
             spec = daily.current(now_ms)
             if spec.end_ms <= mkt.spec.end_ms:
                 continue
-            if now_ms < mkt.spec.end_ms + 60_000 + self.UPDOWN_ROLL_WAIT_MS and mkt.close_of("end") is None:
-                continue  # the day just over: its final close first
+            if now_ms < mkt.spec.end_ms + 60_000 + daily.ROLL_WAIT_MS and mkt.close_of("end") is None:
+                continue  # the day (the window) just over: its final close first
             LOG.info("%s：%s 结束，换到 %s", key, mkt.spec.slug, spec.slug)
+            old, final = mkt.spec, mkt.close_of("end")
             mkt.spec = spec
             mkt.times["candle"] = -1e9
+            if final is not None and spec.start_ms == old.end_ms and mkt.close_of("start") is None:
+                # the new market's line is the very candle that just settled the old one: kept at once, not read again
+                self.store.put(f"updown:{spec.slug}:start", {"open": spec.start_ms, "close": str(final), "read_ms": now_ms, "from": old.slug})
             self.predict.want_info.add(spec.slug)
 
     def updown_settle(self, spec: UpDownSpec) -> dict:
         """What settling an up/down position needs: its final candle's open time; for a daily card's market its first
         candle and its date too — the card moves on, the position settles on its own day's closes (updown_of), and the
         day marks the market for the beta limits (sim_order_cap, sim_market_room, sim_quiet)."""
-        if spec.key not in self.updown_daily:
+        rolling = self.updown_rolling.get(spec.key)
+        if rolling is None:
             return {"end": spec.end_ms}
-        return {"end": spec.end_ms, "start": spec.start_ms, "day": DailyUpDownSpec.day_of(spec).isoformat()}
+        return {"end": spec.end_ms, "start": spec.start_ms, **rolling.tag(spec)}  # the day, or the window's length
 
     def updown_of(self, trade: dict) -> "UpDownMarket | None":
         """The up/down market a paper trade settles on: the card's, while it is on the trade's market; for a daily card
         that has moved on, the trade's own day read from its kept candle closes (its slug and window from the record).
         None when there is neither."""
         mkt = self.updowns.get(str(trade.get("key") or ""))
-        if mkt is None or mkt.spec.key not in self.updown_daily:
+        if mkt is None or mkt.spec.key not in self.updown_rolling:
             return mkt  # a card that stays on its one market (a monthly one)
         slug = str(trade.get("slug") or trade.get("market") or "").partition("#")[0]
         if mkt.spec.slug == slug:
@@ -18499,8 +18826,8 @@ class Bot:
         s = trade.get("settle") or {}
         if not (slug and s.get("start") and s.get("end")):
             return None  # another day than the card's and no window to read it by
-        return UpDownMarket(self.store, dataclasses.replace(mkt.spec, slug=slug, start_ms=int(s["start"]), end_ms=int(s["end"]),
-                                                            name=str(trade.get("item") or mkt.spec.name)))
+        return mkt.at(dataclasses.replace(mkt.spec, slug=slug, start_ms=int(s["start"]), end_ms=int(s["end"]),
+                                          name=str(trade.get("item") or mkt.spec.name)))  # the card's own kind (an index window too)
 
     async def refresh_touch(self, now_ms: int) -> Refreshed:
         for touch in self.touches.values():

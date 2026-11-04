@@ -936,7 +936,7 @@ async def november():
         market = FakeMarket()
         bot = m.Bot(cfg, m.Store(":memory:"), market, None)
         assert list(bot.ranges) == [s.key for s in LIVE] + ["STRC-100"] and list(bot.touches) == ["SOL", "ETH"]  # 1.101.1: BNB 先触 decided, taken off
-        assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY"] and not bot.flips and not bot.caps  # 1.97.0: the daily up/down cards
+        assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY", "UNITREE-15M"] and not bot.flips and not bot.caps  # 1.97.0: the daily up/down cards; 1.102.0: 宇树 15 分钟
         targets = bot.predict_targets(MID)
         assert all(targets[s.key] == s.slug and s.key in bot.predict.ladder_keys for s in NOV) and not any(k.endswith("-HIT-10") for k in targets)
         # BNB 先触 700/900 (BNB fell to $700 first; Predict's book was gone, the card showed its HTTP 400): no book asked for, no
