@@ -1592,6 +1592,78 @@ async def expiry_positions():
 asyncio.run(expiry_positions())
 
 
+async def unknown_release():
+    """1.104.9: an order of unknown state no longer blocks its side until its expiry. Three complete open lists without it,
+    the hash read answering 404 and three minutes unknown, the account's positions decide: nothing beyond the records and
+    it ends unfilled, the slot free for the next order (11-04: 长鑫 跌's 19¢ sweep order unknown from 16:46, its expiry two
+    hours after the next day's close, the side unquoted all day); a surplus is what it filled; unreadable positions keep
+    it unknown. A cut open list does not count as a look."""
+    async def _none(*a, **k): return None
+    async def _empty(*a, **k): return []
+    async def _noop(ids): return {"removed": [], "noop": list(ids)}
+    tid = f"{HSI_SLUG}|up|挂"
+    mkt = lambda at: hsi(0.70, [("0.55", "300")], [("0.58", "400")], at)
+    for case in ("none", "filled", "unreadable", "cut"):
+        bot = make_bot(SIM_WAYS="maker")
+        await bot.live_prepare(); fake = bot.live.api
+        await bot.live_prefetch(NOW)
+        await step(bot, NOW, mkt(NOW))
+        oid = bot.sim_trades()[tid]["live"]["order_id"]
+        fake.orders, fake.order, fake.remove_orders = _empty, _none, _noop
+        for at in (NOW + 10_000, NOW + 20_000, NOW + 30_000, NOW + 65_000):
+            await step(bot, at, mkt(at))
+        t = bot.sim_trades()[tid]
+        assert t["live"]["state"] == "unknown" and t["live"]["unknown_since"] == NOW + 65_000 and t["live"]["unknown_misses"] == 0, (case, t["live"])
+        if case == "filled":
+            want = t["live"]["want"]
+            fake.positions_rows = [{"id": "p9", "market": {"id": 101, "title": "恒生指数"}, "outcome": {"name": want["outcome"], "indexSet": want["index_set"]},
+                                    "amount": str(100 * WEI)}]
+        elif case == "unreadable":
+            async def broken(): raise m.RemoteError("HTTP 503")
+            fake.positions = broken
+        elif case == "cut":
+            async def cut():
+                fake.positions_complete = False
+                return [{"id": "p1", "market": {"id": 999}, "outcome": {"indexSet": 1}, "amount": str(5 * WEI)}]
+            fake.positions = cut
+        # two complete lists without it, 2 minutes unknown: still unknown, the side still held
+        for at in (NOW + 125_000, NOW + 185_000):
+            await step(bot, at, mkt(at))
+        t = bot.sim_trades()[tid]
+        assert t["live"]["state"] == "unknown" and t["live"]["unknown_misses"] == 2 and "对账中" in bot.live_room(bot.sim_trades(), mkt(NOW + 185_000), "up", 0.55, 100), (case, t["live"])
+        if case == "none":  # a cut list in between says nothing: not a look
+            fake.orders_complete = False
+            await step(bot, NOW + 215_000, mkt(NOW + 215_000))
+            assert bot.sim_trades()[tid]["live"]["unknown_misses"] == 2
+            fake.orders_complete = True
+        # the third complete list, three minutes on: the positions decide
+        await step(bot, NOW + 245_000, mkt(NOW + 245_000))
+        trades = bot.sim_trades()
+        if case == "none":
+            t = trades[tid]
+            assert t["live"]["state"] == "done" and t["status"] == "cancelled" and bot.live_reserved(t) == 0 and t["live"]["unknown_misses"] == 3, (t["live"], t["status"])
+            assert any("连续 3 次完整的开放订单列表里没有它" in e["what"] and "按未成交结束，这一边可以再挂" in e["what"] for e in t["live"]["events"]), t["live"]["events"]
+            assert "对账中" not in bot.live_room(trades, mkt(NOW + 245_000), "up", 0.55, 100)
+            await step(bot, NOW + 250_000, mkt(NOW + 250_000))  # the slot free: the next look places the side's order again
+            trades = bot.sim_trades()
+            assert trades[f"{tid}#1"]["status"] == "cancelled" and trades[tid]["live"]["state"] == "open" and trades[tid]["price"] == 0.55 \
+                and trades[tid]["live"]["order_id"] != oid, (sorted(trades), trades[tid]["live"])
+        elif case == "filled":
+            t = trades[tid]
+            assert t["live"]["state"] == "done" and t["status"] == "filled" and abs(t["shares"] - 100) < 1e-9, t
+            assert any("持仓比记录多 100 份" in e["what"] for e in t["live"]["events"]), t["live"]["events"]
+        elif case == "unreadable":
+            t = trades[tid]
+            assert t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0 and "持仓读取失败" in t["live"].get("last_error", ""), t["live"]
+        else:
+            t = trades[tid]
+            assert t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0 and "持仓列表没读全" in t["live"].get("last_error", ""), t["live"]
+    print("UNKNOWN_RELEASE_OK")
+
+
+asyncio.run(unknown_release())
+
+
 async def latency():
     """1.79.0: the order path's timing points — the book's read, the decision, the request sent, Predict's answer — kept
     on each real order and summarised for /diag; orders go out before the step waits for its settlement lookups; the

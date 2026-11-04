@@ -935,6 +935,9 @@ class LiveBot(core.Bot):
     LIVE_CANCEL_RETRY_MS = 30_000   # a cancel Predict did not confirm, the order still listed (or open by its own record): asked again after this long
     LIVE_MARKET_RETRY_SECONDS = 60  # a market whose details could not be read is asked for again after this long, not every step
     LIVE_UNKNOWN_MARGIN_MS = 10 * 60_000  # an order of unknown state is given up (nothing can fill) this long after its expiry
+    LIVE_UNKNOWN_LOOKS = 3                # ...or sooner (1.104.9): after this many complete open-order lists without it (the hash read 404ing too)...
+    LIVE_UNKNOWN_SETTLE_MS = 3 * 60_000   # ...and this long unknown, once the account's positions show nothing it could have filled
+    LIVE_UNEXPLAINED_EVERY_MS = 60_000    # the positions are read for an unknown record this often at most
     LIVE_SYNC_STALE_MS = 150_000    # no new order while the account's open orders were not read successfully for this long
 
     def __init__(self, config: core.Config, store: core.Store, market: Any, telegram: Any):
@@ -1980,12 +1983,15 @@ class LiveBot(core.Bot):
     def live_unknown(self, tid: str, trade: dict, why: str, now_ms: int) -> None:
         """Predict neither shows the order nor confirms its removal: the record is not finished (a "no such order"
         answer is not a cancellation — the order may still be live and fill). It keeps its reservation and its slot,
-        is asked for again every step, and ends only on Predict's final word, when its expiry has passed (nothing can
-        fill), or when an operator releases it (/live release)."""
+        is asked for again every step (live_recheck), and ends on Predict's final word, when the evidence has settled
+        that it is gone (LIVE_UNKNOWN_LOOKS complete open lists without it, LIVE_UNKNOWN_SETTLE_MS unknown, the account's
+        positions showing nothing it filled — 1.104.9), when its expiry has passed (nothing can fill), or when an
+        operator releases it (/live release)."""
         st = trade["live"]
         deadline = self.live_order_deadline(trade)
-        st.update(state="unknown", unknown_since=st.get("unknown_since") or now_ms, unknown_why=why)
-        st["events"].append({"at": now_ms, "what": f"状态未知：{why}。额度照旧占用、这一边不开新单，直到 Predict 给出终态、订单有效期过去"
+        st.update(state="unknown", unknown_since=st.get("unknown_since") or now_ms, unknown_why=why, unknown_misses=0)
+        st["events"].append({"at": now_ms, "what": f"状态未知：{why}。额度照旧占用、这一边不开新单，直到 Predict 给出终态、连续 {self.LIVE_UNKNOWN_LOOKS} 次完整的"
+                                                   f"开放订单列表都没有它且 {self.LIVE_UNKNOWN_SETTLE_MS // 60_000} 分钟后账户持仓也没有多出的份数、订单有效期过去"
                                                    + (f"（{core.stamp(deadline, seconds=False)} 之后）" if deadline else "（无到期时间：需人工确认）") + "或 /live release 人工释放"})
         self.live_misses.pop(tid, None)
         self.live_note_error(f"{trade['item']} {trade['label']} 订单状态未知：{why}")
@@ -2007,7 +2013,12 @@ class LiveBot(core.Bot):
 
     async def live_recheck(self, tid: str, trade: dict, by_id: dict, by_hash: dict, mk: Any, now_ms: int) -> None:
         """An unknown record, every step: found on the list or by its hash, it is tracked again (or finished on a final
-        word); past its expiry plus a margin, it is finished as unfilled — nothing can fill it any more."""
+        word). Missing from LIVE_UNKNOWN_LOOKS complete open lists, unknown to the hash read and unknown for
+        LIVE_UNKNOWN_SETTLE_MS, the account's positions decide (1.104.9): nothing beyond what the other records explain
+        and it ends unfilled, its slot and reservation freed; a surplus is what it filled. Before, only its expiry plus a
+        margin ended it — a daily market's maker order expires two hours after the close, so the 11-04 长鑫 跌 side sat
+        blocked from 16:46 for a day ("状态未知、对账中"). The expiry path stays for a record the positions cannot
+        settle (unreadable, or the list cut)."""
         st = trade["live"]
         order = float(trade.get("order") or 0)
         row = by_id.get(str(st.get("order_id") or "-")) or by_hash.get(str(st.get("hash") or "-").lower())
@@ -2027,26 +2038,41 @@ class LiveBot(core.Bot):
             st["cancel_sent"] = 0
             self.live_apply(tid, trade, row, mk, now_ms)
             return
+        if getattr(self.live.api, "orders_complete", True):
+            st["unknown_misses"] = int(st.get("unknown_misses") or 0) + 1  # one more complete open list without it (a cut list says nothing)
         deadline = self.live_order_deadline(trade)
-        if deadline and now_ms >= deadline + self.LIVE_UNKNOWN_MARGIN_MS:
-            # nothing can fill it any more — but it may have filled before the expiry while it could not be found (Predict's
-            # hash of it differing from the one computed here, its answer lost): the account's position on that outcome beyond
-            # what the other records explain is what it filled; the absence of a record never is
-            extra = await self.live_unexplained(trade)
-            if extra is None:
-                st["last_error"] = ("有效期已过，但持仓列表没读全（超过分页上限）：下次再核对（额度照旧占用）"
-                                    if self.live_positions_cut else "有效期已过，但持仓读取失败：下次再核对（额度照旧占用）")
-                return
-            if extra > 1e-9:
-                filled = min(extra, order)
-                st["events"].append({"at": now_ms, "what": f"订单的有效期已过（{core.stamp(deadline, seconds=False)}），查不到订单，但账户在这一边的"
-                                                           f"持仓比记录多 {extra:g} 份：按成交 {filled:g} 份记（成本按限价，待对账）"})
-                self.live_finish(tid, trade, {"status": "EXPIRED", "amount": str(to_wei(order)), "amountFilled": str(to_wei(filled))}, mk, now_ms)
-                self.live_notify(f"❓→✅ {trade['item']} {trade['label']}：查不到的订单有效期已过，但账户持仓多出 {extra:g} 份，按成交 {filled:g} 份记入"
-                                 f"（成本按限价 {core.cents(float(trade['price']))} 记，请在 Predict 核对）。", key=f"unknown-filled:{tid}")
-                return
-            st["events"].append({"at": now_ms, "what": f"订单的有效期已过（{core.stamp(deadline, seconds=False)}），之后不可能再成交，账户持仓也没有多出的份数：按未成交结束，释放额度"})
-            self.live_finish(tid, trade, {"status": "EXPIRED"}, mk, now_ms)
+        expired = bool(deadline) and now_ms >= deadline + self.LIVE_UNKNOWN_MARGIN_MS
+        unknown_ms = now_ms - int(st.get("unknown_since") or now_ms)
+        settled = (not expired and int(st.get("unknown_misses") or 0) >= self.LIVE_UNKNOWN_LOOKS and unknown_ms >= self.LIVE_UNKNOWN_SETTLE_MS)
+        if not expired and not settled:
+            return
+        if not expired and now_ms - int(st.get("unexplained_at") or 0) < self.LIVE_UNEXPLAINED_EVERY_MS:
+            return  # the positions are read for it once a minute at most
+        st["unexplained_at"] = now_ms
+        # nothing can fill it any more (expired), or nothing says it exists (settled) — but it may have filled while it could
+        # not be found (Predict's hash of it differing from the one computed here, its answer lost): the account's position on
+        # that outcome beyond what the other records explain is what it filled; the absence of a record never is
+        extra = await self.live_unexplained(trade)
+        head = (f"订单的有效期已过（{core.stamp(deadline, seconds=False)}）" if expired
+                else f"连续 {st['unknown_misses']} 次完整的开放订单列表里没有它、按哈希也查不到，状态未知已 {unknown_ms // 60_000} 分钟")
+        if extra is None:
+            st["last_error"] = head + ("，但持仓列表没读全（超过分页上限）：下次再核对（额度照旧占用）" if self.live_positions_cut
+                                       else "，但持仓读取失败：下次再核对（额度照旧占用）")
+            return
+        if extra > 1e-9:
+            filled = min(extra, order)
+            st["events"].append({"at": now_ms, "what": f"{head}，查不到订单，但账户在这一边的持仓比记录多 {extra:g} 份：按成交 {filled:g} 份记（成本按限价，待对账）"})
+            status = "EXPIRED" if expired else ("FILLED" if filled >= order - 1e-9 else "CANCELLED")
+            self.live_finish(tid, trade, {"status": status, "amount": str(to_wei(order)), "amountFilled": str(to_wei(filled))}, mk, now_ms)
+            self.live_notify(f"❓→✅ {trade['item']} {trade['label']}：查不到的订单{'有效期已过' if expired else '已不在 Predict'}，但账户持仓多出 {extra:g} 份，"
+                             f"按成交 {filled:g} 份记入（成本按限价 {core.cents(float(trade['price']))} 记，请在 Predict 核对）。", key=f"unknown-filled:{tid}")
+            return
+        st["events"].append({"at": now_ms, "what": f"{head}，{'之后不可能再成交，' if expired else ''}账户持仓也没有多出的份数：按未成交结束"
+                                                   + ("，释放额度" if expired else "，这一边可以再挂")})
+        self.live_finish(tid, trade, {"status": "EXPIRED" if expired else "CANCELLED"}, mk, now_ms)
+        if not expired:
+            self.live_notify(f"❓→✅ {trade['item']} {trade['label']}（订单 #{st.get('order_id') or '?'}）：{head}，账户持仓也没有多出的份数，按未成交结束、额度已释放，"
+                             f"这一边恢复挂单。若 Predict 网站上它还挂着，请手动撤掉（同步时也会当作账户无记录的挂单报出来）。", key=f"unknown-released:{tid}")
 
     async def live_unexplained(self, trade: dict) -> float | None:
         """The shares the account holds on this record's outcome beyond what the other records explain (their filled
