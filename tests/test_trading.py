@@ -110,7 +110,7 @@ assert L.outcome_for_side("flip", "down", [{"name": "Yes", "index_set": 1, "toke
 odd = [{"name": "A", "index_set": 1, "token": "3"}, {"name": "B", "index_set": 2, "token": "4"}]
 assert L.outcome_for_side("close", "down", odd) == (odd[1], "按结果顺序推定（结果名称：a、b）") and L.outcome_for_side("ladder", "up", odd)[0] is None
 assert L.outcome_for_side("close", "up", outs[:1])[0] is None and L.outcome_for_side("close", "up", [{**outs[0], "token": ""}, outs[1]])[0] is None
-bnb = next(s for s in m.TOUCH_MARKETS if s.key == "BNB")
+bnb = m.touch_spec("BNB")  # (taken off in 1.101.1: its lines are kept in TOUCH_SETTLED)
 touch_outs = [{"name": "$700", "index_set": 1, "token": "70"}, {"name": "$900", "index_set": 2, "token": "90"}]
 assert L.outcome_for_side("touch", "up", touch_outs, bnb)[0]["token"] == "90" and L.outcome_for_side("touch", "down", touch_outs, bnb)[0]["token"] == "70"
 info = L.parse_market({"id": 101, "status": "REGISTERED", "isNegRisk": True, "isYieldBearing": False, "feeRateBps": "150", "conditionId": "0xab",

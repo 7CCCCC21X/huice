@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.101.0"
+VERSION = "1.101.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -665,7 +665,7 @@ class Config:
     sim_maker_deeper: bool = True     # SIM_MAKER_DEEPER: when the valid 买1 leaves less edge than the bar, an ordinary resting order waits at the
     # first deeper bid level (买2, 买3…, holding SIM_MAKER_MIN_BID shares besides ours) that clears it, for a seller who sells through 买1;
     # each side on its own; off = 买1 or nothing
-    touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
+    touch: bool = True       # BNB_TOUCH (the name kept from the first card): the 加密 cards — first-touch, up/down, flip, ladders
     auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
     edge_alert: bool = True  # Telegram: a suggestion reaching edge_alert_edge; later, that suggestion going away or turning
     edge_alert_edge: float = 0.10  # net edge (per $1 share) a suggestion needs before it is announced
@@ -6292,7 +6292,7 @@ class HyperliquidStream(PushStream):
         self.bot.hl_pushed(coin, quote)
 
 
-# --- first-touch market (which barrier does BNB hit first?) ------------------------------------------
+# --- first-touch market (which barrier does SOL / ETH hit first?) ------------------------------------
 def et_ms(year: int, month: int, day: int, hour: int, minute: int, utc_offset: int) -> int:
     """US Eastern wall time -> epoch ms; utc_offset is -4 (EDT, Mar-Nov) or -5 (EST)."""
     return int(dt.datetime(year, month, day, hour, minute, tzinfo=dt.timezone(dt.timedelta(hours=utc_offset))).timestamp() * 1000)
@@ -6325,13 +6325,27 @@ class TouchSpec:
 
 
 TOUCH_MARKETS = (
-    TouchSpec("BNB", "will-bnb-hit-700-or-900", "BNBUSDT", D("700"), D("900")),
     TouchSpec("SOL", "will-solana-hit-60-or-140-first", "SOLUSDT", D("60"), D("140"),
               int(dt.datetime(2026, 3, 12, 13, 27, 8, 415000, tzinfo=dt.timezone.utc).timestamp() * 1000)),
     # window opens at the market's creation (from Predict; the rules give no date)
     TouchSpec("ETH", "will-ethereum-hit-1k-or-3k-first", "ETHUSDT", D("1000"), D("3000")),
-    # (BTC 先触 70k / 90k, a window the rules date, ended 10-25 23:59 ET; tests/retired.py keeps its line)
 )
+# Touch markets no longer listed: no card, no book, no trading. Kept only so that a trade bought on one is still settled
+# on Predict's result, whose outcome names ("$700" / "$900") are read against the market's two lines (touch_spec).
+TOUCH_SETTLED = (
+    # BNB fell to $700 before reaching $900 (11-04: 689.86); Predict's book was gone and the card showed its error.
+    # Taken off in 1.101.1, its 12-31 deadline still ahead
+    TouchSpec("BNB", "will-bnb-hit-700-or-900", "BNBUSDT", D("700"), D("900")),
+    # "between August 25th, 2026 at 10:00 AM ET and October 25th, 2026 at 11:59 PM ET" (both EDT): over, taken off in 1.95.0
+    TouchSpec("BTC", "will-btc-hit-70000-or-90000-first", "BTCUSDT", D("70000"), D("90000"),
+              et_ms(2026, 8, 25, 10, 0, -4), et_ms(2026, 10, 25, 23, 59, -4), -4, fixed_start=True),
+)
+
+
+def touch_spec(key: str) -> TouchSpec | None:
+    """A touch market's lines by its key: a listed market's (TOUCH_MARKETS), else one taken off the page (TOUCH_SETTLED)."""
+    return next((spec for spec in (*TOUCH_MARKETS, *TOUCH_SETTLED) if spec.key == key), None)
+
 TOUCH_SPOT = ("https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com")
 YEAR_MS = 365 * 24 * 3600 * 1000
 
@@ -6529,7 +6543,7 @@ class TouchMarket:
             if mono - self.times["price"] >= self.PRICE_SECONDS:
                 self.times["price"] = mono
                 data = await self.get("ticker/price", symbol=self.spec.symbol)
-                self.price, self.priced_ms = number(data["price"], "BNB"), now_ms
+                self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
                 if (self.price <= self.spec.low or self.price >= self.spec.high) and self.history.get("kind") in {None, "clear"}:
                     self.times["scan"] = -1e9  # the price is at a line right now: check the path at once, not in 5 minutes
             if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
@@ -8860,7 +8874,8 @@ def market_driver(kind: str, key: str, settle: dict | None = None, item: str = "
     if kind == "ladder":
         spec = next((s for s in CAP_MARKETS if s.key == key), None)
         return key, spec.name if spec else (item.rsplit(" ", 1)[0] if item else key)
-    specs = {"touch": TOUCH_MARKETS, "updown": (*UPDOWN_MARKETS, *DAILY_UPDOWN_MARKETS), "range": (*RANGE_MARKETS, *STOCK_HIT_MARKETS)}.get(kind, ())
+    specs = {"touch": (*TOUCH_MARKETS, *TOUCH_SETTLED), "updown": (*UPDOWN_MARKETS, *DAILY_UPDOWN_MARKETS),
+             "range": (*RANGE_MARKETS, *STOCK_HIT_MARKETS)}.get(kind, ())
     spec = next((s for s in specs if s.key == key), None)
     symbol = spec.symbol if spec else key
     return symbol, symbol.removesuffix("USDT")
@@ -15312,6 +15327,8 @@ class Bot:
             return f"窗口已结束（{at(end)}），本地数据还定不了结果，等 Predict 结算{tail}"
         if kind == "close":
             return f"等 {str(s.get('target') or '')[5:]} 收盘（{at(end)}）后 1 小时（{at(settle_at)}），按官方收盘预结算，再等 Predict 确认"
+        if kind == "touch" and trade.get("key") not in self.touches:
+            return "这个先触市场已有结果、不再列出，等 Predict 结算（每 10 分钟核对一次）"
         if kind == "touch":
             return f"先碰到哪条线就按那条线结算；都没碰到的话等截止 {at(end)} 后按 50/50（{at(settle_at)} 起核验）"
         if kind == "updown":
@@ -15436,6 +15453,8 @@ class Bot:
             return False  # Predict never gave a readable result for this market: the local settlement stands
         if trade.get("local"):
             return True
+        if trade.get("kind") == "touch" and trade.get("key") not in self.touches:
+            return True  # a touch market taken off once it was decided (TOUCH_SETTLED): Predict's result, not the deadline
         s = trade.get("settle") or {}
         end = int(s.get("close_ms") or s.get("deadline") or s.get("end") or 0)
         return bool(end) and now_ms > end + self.SIM_SETTLE_MS
@@ -15447,7 +15466,8 @@ class Bot:
         name = str(resolved.get("name") or "").strip()
         if trade["kind"] == "touch":
             touch = self.touches.get(trade["key"])
-            side = touch_outcome(name, touch.spec) if touch else ""
+            spec = touch.spec if touch else touch_spec(str(trade.get("key") or ""))  # a market taken off: its lines are kept
+            side = touch_outcome(name, spec) if spec else ""
             return 1.0 if side == "high" else 0.0 if side == "low" else None
         word = name.lower()
         if word in {"yes", "up", "涨", "higher", "above"}:

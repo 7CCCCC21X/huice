@@ -6,7 +6,8 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
-BNB = m.TOUCH_MARKETS[0]
+BNB = m.touch_spec("BNB")
+m.TOUCH_MARKETS = (BNB, *m.TOUCH_MARKETS)  # BNB 先触 700/900 (decided, taken off in 1.101.1) listed again: this suite's touch market
 H = 3_600_000
 NOW = int(dt.datetime(2026, 9, 29, 12, 30, tzinfo=m.BEIJING).timestamp() * 1000)
 HOUR = NOW - NOW % H  # the hour still running at NOW

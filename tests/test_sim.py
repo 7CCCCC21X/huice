@@ -2257,3 +2257,50 @@ async def why_rows():
 
 
 asyncio.run(why_rows())
+
+
+async def settled_touch():
+    """1.101.1: BNB 先触 700/900 taken off the page once BNB fell to $700 first (11-04: 689.86; Predict's book was gone and
+    the card showed "HTTP 400: failed to parse path `param0`"), its 12-31 deadline still ahead. A trade bought on it is
+    still settled: asked of Predict at once (not after the deadline), Predict's outcome name read against the market's
+    two lines (TOUCH_SETTLED), its risk group BNB's."""
+    now = m.et_ms(2026, 11, 4, 12, 0, -5)
+    with retired.live():
+        rbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                        "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}), m.Store(":memory:"), FM(now), None)
+        assert "BNB" not in rbot.touches and list(rbot.touches) == ["SOL", "ETH"]
+        spec = m.touch_spec("BNB")
+        assert (spec.slug, spec.low, spec.high, spec.deadline_ms) == ("will-bnb-hit-700-or-900", D("700"), D("900"), m.TOUCH_DEADLINE_MS)
+        base = {"v": 2, "fills": [], "revisions": [], "order": 100.0, "maker": False, "fair": 0.6, "edge": 0.12, "price": 0.48,
+                "status": "filled", "shares": 100.0, "opened": now - 3 * m.DAY_MS, "filled": now - 3 * m.DAY_MS,
+                "market": "will-bnb-hit-700-or-900", "slug": "will-bnb-hit-700-or-900", "market_id": "88", "item": "BNB 先触 700/900",
+                "kind": "touch", "key": "BNB", "settle": {"deadline": m.TOUCH_DEADLINE_MS}}
+        low = {**base, "side": "down", "label": "吃700"}  # $700 first
+        high = {**base, "side": "up", "label": "吃900"}   # $900 first
+        old = {k: v for k, v in high.items() if k not in {"market_id"}}  # an old record: no driver kept, no market id
+        rbot.sim_save([("bnb|down|吃", low), ("bnb|up|吃", high)])
+        trades = rbot.sim_trades()
+        assert [rbot.sim_result(trades[t], now) for t in ("bnb|down|吃", "bnb|up|吃")] == [None, None]  # no card to decide on
+        assert rbot.sim_due(trades["bnb|down|吃"], now)  # at once, not after 12-31
+        assert rbot.sim_wait(trades["bnb|down|吃"], None, now) == "这个先触市场已有结果、不再列出，等 Predict 结算（每 10 分钟核对一次）"
+        assert m.trade_driver(old) == ("BNBUSDT", "BNB")  # grouped with BNB's daily card, as before
+        # a listed touch market still waits for its own lines or its deadline
+        sol = {**base, "market": "will-solana-hit-60-or-140-first", "slug": "will-solana-hit-60-or-140-first", "market_id": "89", "key": "SOL",
+               "item": "SOL 先触 60/140", "side": "up", "label": "吃140"}
+        assert not rbot.sim_due(sol, now)
+        asked = []
+
+        async def details(mid):
+            asked.append(mid)
+            return {"outcomes": ["$700", "$900"], "status": "RESOLVED", "resolved": {"name": "$700", "index": 0, "how": "outcomes.status"}}
+        rbot.predict.market_details = details
+        await rbot.sim_confirm(rbot.sim_trades(), now)
+        done = rbot.sim_trades()
+        assert asked == ["88"], asked
+        assert (done["bnb|down|吃"]["status"], done["bnb|down|吃"]["payout"], done["bnb|down|吃"]["confirm"]) == ("settled", 1.0, "confirmed"), done["bnb|down|吃"]
+        assert (done["bnb|up|吃"]["status"], done["bnb|up|吃"]["payout"]) == ("settled", 0.0)
+        assert all(not rbot.sim_due(done[t], now + m.DAY_MS) for t in done)  # final: never asked again
+    print("SETTLED_TOUCH_OK")
+
+
+asyncio.run(settled_touch())

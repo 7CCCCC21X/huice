@@ -935,10 +935,15 @@ async def november():
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
         market = FakeMarket()
         bot = m.Bot(cfg, m.Store(":memory:"), market, None)
-        assert list(bot.ranges) == [s.key for s in LIVE] + ["STRC-100"] and list(bot.touches) == ["BNB", "SOL", "ETH"]
+        assert list(bot.ranges) == [s.key for s in LIVE] + ["STRC-100"] and list(bot.touches) == ["SOL", "ETH"]  # 1.101.1: BNB 先触 decided, taken off
         assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY"] and not bot.flips and not bot.caps  # 1.97.0: the daily up/down cards
         targets = bot.predict_targets(MID)
         assert all(targets[s.key] == s.slug and s.key in bot.predict.ladder_keys for s in NOV) and not any(k.endswith("-HIT-10") for k in targets)
+        # BNB 先触 700/900 (BNB fell to $700 first; Predict's book was gone, the card showed its HTTP 400): no book asked for, no
+        # market details; its lines are kept only to read Predict's result of a trade bought on it (TOUCH_SETTLED)
+        assert "BNB" not in targets and "will-bnb-hit-700-or-900" not in targets.values() and "will-bnb-hit-700-or-900" not in bot.predict.want_info
+        assert m.touch_spec("BNB") in m.TOUCH_SETTLED and m.touch_spec("SOL") in m.TOUCH_MARKETS and m.touch_spec("XRP") is None
+        assert targets["BNB-DAY"].startswith("bnb-up-or-down-on-") and "BNB" not in {r["key"] for r in bot.sim_catalog(MID) if r["kind"] == "touch"}
         card = bot.range_payload(bot.ranges["ETH-HIT-11"], MID)
         assert (card["name"], card["group"], card["close_ms"]) == ("ETH 11月价格", "levels", ETH11.end_ms), card
         assert card["close_label"] == "11-30 23:59 ET（北京 12-01 12:59）这根 1 分钟 K 为止" and card["source"] == "币安现货", card
@@ -949,12 +954,12 @@ async def november():
         assert (await bot.ranges["HYPE-HIT-11"].get("ticker/price", symbol="HYPEUSDT"))["price"] == "45.12"
         assert market.paths == [("/fapi/v1/ticker/price", {"symbol": "HYPEUSDT"})]  # the bot's own futures feed (BINANCE_BASE_URL)
         items = [(i["group"], i["name"]) for i in bot.odds_payload()["items"] if i["group"] in {"crypto", "levels", "ladder"}]
-        assert items == [("crypto", "BNB 先触 700/900"), ("crypto", "SOL 先触 60/140"), ("crypto", "ETH 先触 1k/3k"),
+        assert items == [("crypto", "SOL 先触 60/140"), ("crypto", "ETH 先触 1k/3k"),
                          ("crypto", "BTC 11-05 涨跌"), ("crypto", "ETH 11-05 涨跌"), ("crypto", "BNB 11-05 涨跌"),
                          ("levels", "BTC 11月价格"), ("levels", "ETH 11月价格"), ("levels", "SOL 11月价格"), ("levels", "HYPE 11月价格"),
                          ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格"), ("levels", "STRC 触及 $100")], items
         # the price streams follow: HYPEUSDT on futures for its ladder; no HYPE / SOL on Hyperliquid (the flip is gone)
-        assert bot.binance_streams["spot"].symbols() == ["BNBUSDT", "SOLUSDT", "ETHUSDT", "BTCUSDT", "ZECUSDT"]
+        assert bot.binance_streams["spot"].symbols() == ["SOLUSDT", "ETHUSDT", "BTCUSDT", "BNBUSDT", "ZECUSDT"]  # BNBUSDT for BNB's daily card
         assert bot.binance_streams["futures"].symbols() == ["UNITREEUSDT", "HYPEUSDT"] and not {"HYPE", "SOL"} & set(bot.hl_stream.coins())
         assert [rm.spec.key for rm in bot.pair_markets[("futures", "HYPEUSDT")]] == ["HYPE-HIT-11"]
         assert [rm.spec.key for rm in bot.pair_markets[("spot", "BTCUSDT")]] == ["BTC-DAY", "BTC-HIT-11", "BTC-HIT-2027"]

@@ -1,9 +1,11 @@
-"""Markets main.py no longer lists because their windows are over (taken out in 1.95.0), kept as they were listed.
+"""Markets main.py no longer lists because their windows are over (taken out in 1.95.0) or they were decided early (BNB
+先触 700 / 900, 1.101.1), kept as they were listed.
 
 They are the suites' fixtures: the market-cap ladders, the flip and the monthly up/down have no market open now, and the
 suites test those kinds of cards (and a 先触 window the rules date, and the October price ladders) through these lines.
 ``install()`` puts main's tables back as they stood in 1.94.1; ``LIVE`` keeps the tables main itself lists, for the
-checks on what the bot runs with. Each line is also an example of its kind for the next market to add."""
+checks on what the bot runs with. Each line is also an example of its kind for the next market to add. The two touch
+markets are main's own lines in TOUCH_SETTLED (kept there to read Predict's results of the trades bought on them)."""
 import contextlib
 
 import main as m
@@ -13,9 +15,10 @@ D, et_ms = m.D, m.et_ms
 LIVE = {name: getattr(m, name) for name in ("TOUCH_MARKETS", "UPDOWN_MARKETS", "DAILY_UPDOWN_MARKETS", "FLIP_MARKETS", "CAP_MARKETS",
                                             "RANGE_MARKETS")}
 
-# "between August 25th, 2026 at 10:00 AM ET and October 25th, 2026 at 11:59 PM ET" (both EDT)
-BTC_TOUCH = m.TouchSpec("BTC", "will-btc-hit-70000-or-90000-first", "BTCUSDT", D("70000"), D("90000"),
-                        et_ms(2026, 8, 25, 10, 0, -4), et_ms(2026, 10, 25, 23, 59, -4), -4, fixed_start=True)
+# "between August 25th, 2026 at 10:00 AM ET and October 25th, 2026 at 11:59 PM ET" (both EDT); and BNB, which fell to $700
+# first (11-04), its 12-31 deadline still ahead
+BTC_TOUCH, BNB_TOUCH = m.touch_spec("BTC"), m.touch_spec("BNB")
+assert BTC_TOUCH in m.TOUCH_SETTLED and BNB_TOUCH in m.TOUCH_SETTLED and BTC_TOUCH.fixed_start
 
 UPDOWN_MARKETS = (
     # "the Binance 1 minute candle for BTC/USDT Sep 30 '26 11:59 PM in the ET timezone" against the one for
@@ -101,7 +104,7 @@ def install() -> None:
     so are the daily up/down cards (1.97.0; tests/test_daily.py tests them)."""
     touch = {s.key: s for s in LIVE["TOUCH_MARKETS"]}
     ranges = {s.key: s for s in LIVE["RANGE_MARKETS"]}
-    m.TOUCH_MARKETS = (touch["BNB"], touch["SOL"], BTC_TOUCH, touch["ETH"])
+    m.TOUCH_MARKETS = (BNB_TOUCH, touch["SOL"], BTC_TOUCH, touch["ETH"])
     m.UPDOWN_MARKETS = UPDOWN_MARKETS
     m.DAILY_UPDOWN_MARKETS = ()
     m.FLIP_MARKETS = FLIP_MARKETS
