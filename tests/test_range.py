@@ -870,7 +870,7 @@ async def november():
     read from its first hour through its last, October's last hour and December's first never count, and once it is
     read to its end the levels it never reached are worth 0 (ETH's, read here). The bot built from main's own tables
     shows the cards BTC / ETH / SOL / HYPE 11月价格 (HYPE through the bot's Binance futures feed), beside the three 先触
-    cards, the two "before 2027" ladders and STRC: no 涨跌, 反超 or 市值阶梯 card."""
+    cards, the three daily 涨跌 cards (1.97.0), the two "before 2027" ladders and STRC: no 反超 or 市值阶梯 card."""
     S, E = ETH11.start_ms, ETH11.end_ms + 60_000  # E: 12-01 05:00 UTC, the end of the window's last hour
     hours = []
     for t in range(S - 800 * H, E + 3 * H, H):
@@ -924,7 +924,7 @@ async def november():
         market = FakeMarket()
         bot = m.Bot(cfg, m.Store(":memory:"), market, None)
         assert list(bot.ranges) == [s.key for s in LIVE] + ["STRC-100"] and list(bot.touches) == ["BNB", "SOL", "ETH"]
-        assert not bot.updowns and not bot.flips and not bot.caps
+        assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY"] and not bot.flips and not bot.caps  # 1.97.0: the daily up/down cards
         targets = bot.predict_targets(MID)
         assert all(targets[s.key] == s.slug and s.key in bot.predict.ladder_keys for s in NOV) and not any(k.endswith("-HIT-10") for k in targets)
         card = bot.range_payload(bot.ranges["ETH-HIT-11"], MID)
@@ -938,13 +938,14 @@ async def november():
         assert market.paths == [("/fapi/v1/ticker/price", {"symbol": "HYPEUSDT"})]  # the bot's own futures feed (BINANCE_BASE_URL)
         items = [(i["group"], i["name"]) for i in bot.odds_payload()["items"] if i["group"] in {"crypto", "levels", "ladder"}]
         assert items == [("crypto", "BNB 先触 700/900"), ("crypto", "SOL 先触 60/140"), ("crypto", "ETH 先触 1k/3k"),
+                         ("crypto", "BTC 11-05 涨跌"), ("crypto", "ETH 11-05 涨跌"), ("crypto", "BNB 11-05 涨跌"),
                          ("levels", "BTC 11月价格"), ("levels", "ETH 11月价格"), ("levels", "SOL 11月价格"), ("levels", "HYPE 11月价格"),
                          ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格"), ("levels", "STRC 触及 $100")], items
         # the price streams follow: HYPEUSDT on futures for its ladder; no HYPE / SOL on Hyperliquid (the flip is gone)
         assert bot.binance_streams["spot"].symbols() == ["BNBUSDT", "SOLUSDT", "ETHUSDT", "BTCUSDT", "ZECUSDT"]
         assert bot.binance_streams["futures"].symbols() == ["UNITREEUSDT", "HYPEUSDT"] and not {"HYPE", "SOL"} & set(bot.hl_stream.coins())
         assert [rm.spec.key for rm in bot.pair_markets[("futures", "HYPEUSDT")]] == ["HYPE-HIT-11"]
-        assert [rm.spec.key for rm in bot.pair_markets[("spot", "BTCUSDT")]] == ["BTC-HIT-11", "BTC-HIT-2027"]
+        assert [rm.spec.key for rm in bot.pair_markets[("spot", "BTCUSDT")]] == ["BTC-DAY", "BTC-HIT-11", "BTC-HIT-2027"]
     print("NOVEMBER_OK")
 
 

@@ -10,7 +10,8 @@ import main as m
 
 D, et_ms = m.D, m.et_ms
 
-LIVE = {name: getattr(m, name) for name in ("TOUCH_MARKETS", "UPDOWN_MARKETS", "FLIP_MARKETS", "CAP_MARKETS", "RANGE_MARKETS")}
+LIVE = {name: getattr(m, name) for name in ("TOUCH_MARKETS", "UPDOWN_MARKETS", "DAILY_UPDOWN_MARKETS", "FLIP_MARKETS", "CAP_MARKETS",
+                                            "RANGE_MARKETS")}
 
 # "between August 25th, 2026 at 10:00 AM ET and October 25th, 2026 at 11:59 PM ET" (both EDT)
 BTC_TOUCH = m.TouchSpec("BTC", "will-btc-hit-70000-or-90000-first", "BTCUSDT", D("70000"), D("90000"),
@@ -96,11 +97,13 @@ RANGE_OCTOBER = (
 
 def install() -> None:
     """main's tables as they stood in 1.94.1, in the same order: the markets still listed plus the retired ones (the
-    suites unpack them by position). The November ladders are left out, as the October ones stand in their place."""
+    suites unpack them by position). The November ladders are left out, as the October ones stand in their place, and
+    so are the daily up/down cards (1.97.0; tests/test_daily.py tests them)."""
     touch = {s.key: s for s in LIVE["TOUCH_MARKETS"]}
     ranges = {s.key: s for s in LIVE["RANGE_MARKETS"]}
     m.TOUCH_MARKETS = (touch["BNB"], touch["SOL"], BTC_TOUCH, touch["ETH"])
     m.UPDOWN_MARKETS = UPDOWN_MARKETS
+    m.DAILY_UPDOWN_MARKETS = ()
     m.FLIP_MARKETS = FLIP_MARKETS
     m.CAP_MARKETS = CAP_MARKETS
     m.RANGE_MARKETS = (*RANGE_OCTOBER, ranges["BTC-HIT-2027"], ranges["ZEC-HIT-2027"])
