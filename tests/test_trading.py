@@ -1180,7 +1180,10 @@ async def run():
     t2 = obot.sim_trades()["rest2|up|挂"]
     assert t2["status"] == "cancelled" and t2["live"]["state"] == "cancelling" and "切换到 LIVE=off" in t2["note"]  # withdrawn at once
     await step(obot, NOW + 40_000)  # the next step sends the cancel and follows the taker to its end, LIVE=off or not
-    assert ("remove", [t2["live"]["order_id"]]) in fake2.calls and obot.sim_trades()["rest2|up|挂"]["live"]["state"] == "done"
+    ot = obot.sim_trades()
+    assert ("remove", [t2["live"]["order_id"]]) in fake2.calls and ot["rest2|up|挂#1"]["live"]["state"] == "done"
+    # 1.101.2: the withdrawn order no longer holds the slot (sim_spent): on paper now, the side is quoted again, on paper
+    assert ot["rest2|up|挂"]["status"] == "resting" and "live" not in ot["rest2|up|挂"], ot["rest2|up|挂"]
     # the saved mode outlives a restart (the variable is only the initial value)
     obot2 = L.LiveBot(m.Config.from_env({**base, "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "LIVE": "on",
                                          "PREDICT_PRIVATE_KEY": KEY}), obot.store, FM(NOW), None)
@@ -1835,3 +1838,71 @@ async def cancel_reads():
 
 
 asyncio.run(cancel_reads())
+
+
+async def spent_slots():
+    """1.101.2: an order over with nothing filled frees its slot (sim_spent), whoever ended it. Only the trader's own
+    withdrawals used to: a real order Predict ended (CANCELLED, EXPIRED, gone from the book), one withdrawn from the
+    control page (撤单, 紧急停止), by LIVE=off or by the daily loss stop kept the slot — "one order per market, side and way"
+    — and that side was never quoted again that day, while the odds page said 可挂 … 下一轮挂出 (11-04: 恒指 both sides,
+    KOSPI 跌, SK 海力士 跌, 宇树 涨). A new order still waits for an old one's cancel to be confirmed, and says which."""
+    tid = f"{HSI_SLUG}|up|挂"
+    mkt = lambda at: hsi(0.70, [("0.55", "300")], [("0.58", "400")], at)
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare(); fake = bot.live.api
+    await bot.live_prefetch(NOW)
+    await step(bot, NOW, mkt(NOW))
+    first = bot.sim_trades()[tid]["live"]["order_id"]
+    assert first in fake.open
+    # --- Predict ends it (CANCELLED), nothing filled ---------------------------------------------------------------------
+    row = fake.open.pop(first); row["status"] = "CANCELLED"; fake.closed[first] = row
+    at = NOW
+    for _ in range(6):  # the sync finds it gone and reads its end
+        at += 10_000
+        await step(bot, at, mkt(at))
+        if bot.sim_trades().get(tid, {}).get("live", {}).get("order_id") != first:
+            break
+    trades = bot.sim_trades()
+    gone = next(t for k, t in trades.items() if k.startswith(tid + "#") and t["live"]["order_id"] == first)
+    assert gone["status"] == "cancelled" and gone["note"] == "挂单结束（CANCELLED），一份都没成交", gone["note"]
+    again = trades[tid]
+    assert again["status"] == "resting" and again["live"]["order_id"] not in ("", first) and again["live"]["order_id"] in fake.open, again["live"]
+    # the page said so while the slot waited: an order over unfilled no longer holds it
+    spent = {**gone, "status": "cancelled"}
+    assert m.sim_spent(spent) and not m.sim_spent({**spent, "shares": 5.0}) and not m.sim_spent({**spent, "status": "resting"})
+    probe = make_bot(SIM_WAYS="maker")
+    await probe.live_prepare()
+    await probe.live_prefetch(NOW)
+    probe.sim_save([(tid, gone)])
+    probe.sim_markets = lambda now, only=None: [mkt(now)]
+    side = probe.why_payload()["markets"]["101"]["maker"]["sides"][0]
+    assert (side["state"], side["text"]) == ("ready", "可挂 55.0¢×100 份（跟买1，排在 300 份之后，净优势 15.0¢），下一轮挂出"), side
+    assert probe.sim_maker_reason(mkt(NOW), probe.sim_trades(), NOW)[0] is not None
+    # --- the control page's 撤掉本策略全部挂单, the cancel confirmed at once: quoted again at the next look ----------------
+    second = again["live"]["order_id"]
+    assert "策略挂单 1 笔：Predict 确认撤掉 1 笔" in await bot.live_action("cancel", ["all"], at)
+    assert bot.sim_trades()[tid]["status"] == "cancelled" and "管理员撤单" in bot.sim_trades()[tid]["note"]
+    at += 10_000
+    await step(bot, at, mkt(at))
+    trades = bot.sim_trades()
+    third = trades[tid]["live"]["order_id"]
+    assert trades[tid]["status"] == "resting" and third not in ("", first, second), trades[tid]["live"]
+    assert sorted(t["live"]["order_id"] for k, t in trades.items() if k.startswith(tid + "#")) == sorted([first, second])
+    # --- a cancel not yet confirmed: the slot is free, the new order waits for it, and the page names it ---------------------
+    fake.remove_orders, fake.orders = _noop_remove(fake), _none_list
+    text = await bot.live_action("cancel", ["all"], at)
+    assert "1 笔撤单请求已发送、待确认" in text, text
+    at += 10_000
+    await step(bot, at, mkt(at))
+    trades = bot.sim_trades()
+    assert tid not in trades or trades[tid]["live"]["order_id"] == third, sorted(trades)
+    why = bot.live_room(trades, mkt(at), "up", 0.55, 100)
+    assert why.startswith(f"这个市场这一边还有同类订单在发送中、撤单中或对账中，等它结束（#{third} 55.0¢×100 份，撤单待 Predict 确认，自 ") \
+        and why.endswith("；撤单原因：管理员撤单）"), why
+    bot.sim_markets = lambda now, only=None: [mkt(now)]
+    side = bot.why_payload()["markets"]["101"]["maker"]["sides"][0]
+    assert side["state"] == "blocked" and "撤单待 Predict 确认" in side["text"] and "管理员撤单" in side["text"], side
+    print("SPENT_SLOTS_OK")
+
+
+asyncio.run(spent_slots())

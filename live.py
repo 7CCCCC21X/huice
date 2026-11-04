@@ -1051,9 +1051,16 @@ class LiveBot(core.Bot):
         held = self.live_backoff.get((mk.market, side))
         if held and time.monotonic() < held[0]:
             return f"{held[1]}，{int(held[0] - time.monotonic()) + 1} 秒后再试"
-        if any(t.get("side") == side and bool(t.get("maker")) == (taker is None) and isinstance(t.get("live"), dict)
-               and t["live"].get("state") in {"pending", "placing", "cancelling", "unknown"} for t in core.trades_of_market(trades, mk.market)):
-            return "这个市场这一边还有同类订单在发送中、撤单中或对账中，等它结束"  # a re-placed resting order waits for the old one's cancel
+        busy = next((t for t in core.trades_of_market(trades, mk.market) if t.get("side") == side and bool(t.get("maker")) == (taker is None)
+                     and isinstance(t.get("live"), dict) and t["live"].get("state") in {"pending", "placing", "cancelling", "unknown"}), None)
+        if busy is not None:  # a re-placed resting order waits for the old one's cancel; named, so the page says which (1.101.2)
+            st = busy["live"]
+            word = {"pending": "等待发送", "placing": "发送中", "cancelling": "撤单待 Predict 确认", "unknown": "状态未知、对账中"}[st["state"]]
+            since = int((st.get("events") or [{}])[-1].get("at") or 0)
+            return ("这个市场这一边还有同类订单在发送中、撤单中或对账中，等它结束（"
+                    + (f"#{st['order_id']} " if st.get("order_id") else "") + f"{core.cents(float(busy.get('price') or 0))}×{float(busy.get('order') or 0):g} 份，"
+                    + word + (f"，自 {core.stamp(since, seconds=False)}" if since else "")
+                    + (f"；撤单原因：{st['cancel_why']}" if st.get("state") == "cancelling" and st.get("cancel_why") else "") + "）")
         if hold := self.live_send_hold(self.market.now_ms()):
             return hold  # no new risk on an account whose orders were not read lately
         if taker and taker.get("cap"):
@@ -2022,6 +2029,10 @@ class LiveBot(core.Bot):
             self.live_finish(tid, t, {"status": "RELEASED"}, None, now_ms)
             t["note"] = "管理员确认订单不存在，已释放额度"
             self.sim_save([(t["live"].get("rekeyed") or tid, t)])  # a taker's record moved to #n (live_fail): saved there
+            # its slot is free now (sim_spent), but no new order on that side for LIVE_RETRY_SECONDS: should the order show up
+            # on the account's list after all (the next idle read, within a minute), it is tracked again in its own slot —
+            # rather than resting beside a fresh one, two orders where one was meant (1.101.2)
+            self.live_backoff[(t["market"], t["side"])] = (time.monotonic() + self.config.live_retry, "刚手动释放了这一边一张状态未知的订单")
         return f"已释放 {len(hits)} 张状态未知的订单的额度；它若再出现在 Predict 的开放订单里会自动恢复跟踪。"
 
     def live_unknown_rows(self, live: list[tuple[str, dict]], now_ms: int) -> list[dict]:

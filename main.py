@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.101.1"
+VERSION = "1.101.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -8789,6 +8789,16 @@ def sim_position(trade: Mapping) -> bool:
     return bool(trade.get("maker")) and trade.get("status") == "filled" and float(trade.get("shares") or 0) > 1e-9 and not trade.get("final")
 
 
+def sim_spent(trade: Mapping) -> bool:
+    """A resting order that ended with nothing filled — withdrawn, cancelled or expired, whoever ended it — holds nothing:
+    its slot is free for the next order, which moves it to tid#n. Before 1.101.2 only the trader's own withdrawals freed
+    the slot (sim_decide); a real order Predict ended (CANCELLED / EXPIRED / gone from the book), one withdrawn from the
+    control page (撤单 / 紧急停止), by LIVE=off or by the daily loss stop kept it, and that side of the market was never
+    quoted again that day while the page said 可挂 (11-04: 恒指 both sides, KOSPI 跌, SK 海力士 跌, 宇树 涨). An order whose
+    cancel is not confirmed yet may still fill: the real trader holds a new one back until it is (live_room)."""
+    return trade.get("status") in {"cancelled", "expired"} and float(trade.get("shares") or 0) <= 1e-9
+
+
 def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
     """Why no resting paper order is placed on this book (one-sided, crossed, or a spread wider than ``spread``); ""
     when it may be. ``spread`` 0 (SIM_MAKER_SPREAD_CENTS=0, the default) limits nothing: a one-sided book or any gap is
@@ -14583,11 +14593,11 @@ class Bot:
             if side in skip:
                 continue  # refused at the caps this look: the other side, if it clears the bar on its own
             held = trades.get(f"{mk.market}|{side}|挂")
-            if held is None or sim_position(held):  # a position from an earlier order does not hold the slot
+            if held is None or sim_position(held) or sim_spent(held):  # a position, or an order over unfilled, does not hold the slot
                 return cand, ""
             resting = resting or held
         held = trades.get(f"{mk.market}|{'up' if best.side == '涨' else 'down'}|挂")
-        if held is None or sim_position(held):  # the best side refused (skip): nothing else to place
+        if held is None or sim_position(held) or sim_spent(held):  # the best side refused (skip): nothing else to place
             return None, (f"挂{best.side}被拦下；另一边已有{sim_status(resting)}：{cents(float(resting.get('price') or 0))}×"
                           f"{float(resting.get('order') or 0):g} 份" if resting is not None else f"挂{best.side}被拦下，另一边净优势不够门槛")
         return None, f"已有{sim_status(held)}：{cents(float(held.get('price') or 0))}×{float(held.get('order') or 0):g} 份"
@@ -14767,13 +14777,21 @@ class Bot:
             own = f"持仓 {held:g} 份；" if held > 1e-9 else ""
             rest = trades.get(f"{mk.market}|{side}|挂")
             if rest is not None and rest.get("status") == "resting":
-                place = ("击穿单" if rest.get("sweep") else "买1 之上 1¢" if rest.get("deep")
+                price = float(rest.get("price") or 0)
+                own_left = max(float(rest.get("order") or 0) - float(rest.get("shares") or 0), 0.0) if isinstance(rest.get("live"), dict) else 0.0
+                top = maker_level(mk.book, side, SIM_MAKER_FRONT_MIN, own_left, price)  # the best bid of anyone else
+                place = ("击穿单" if rest.get("sweep") else
+                         (f"低价单，买1 已到 {cents(top[0])}" if top is not None and top[0] > price + 1e-9 else "买1 之上 1¢") if rest.get("deep")
                          else f"跟买{rest['join_level']}" if rest.get("join_level") else "跟买1")
                 filled = float(rest.get("shares") or 0)
                 leave = (self.sim_withdraw_reason(rest, mk, now_ms) or self.sim_requote_reason(rest, mk, now_ms)).removesuffix("，撤单")
-                rows.append({"side": side, "label": label, "state": "resting", "short": f"{label} 挂单中 {cents(float(rest.get('price') or 0))}",
-                             "text": own + f"挂单中：{cents(float(rest.get('price') or 0))}×{float(rest.get('order') or 0):g} 份（{place}"
+                rows.append({"side": side, "label": label, "state": "resting", "short": f"{label} 挂单中 {cents(price)}",
+                             "text": own + f"挂单中：{cents(price)}×{float(rest.get('order') or 0):g} 份（{place}"
                                      + (f"，已成交 {filled:g} 份" if filled > 1e-9 else "") + "）" + (f"；下一轮撤掉：{leave}" if leave else "")})
+                continue
+            if rest is not None and not sim_position(rest) and not sim_spent(rest):  # the slot taken (sim_quote leaves the side alone)
+                rows.append({"side": side, "label": label, "state": "wait", "short": f"{label} 不挂",
+                             "text": own + f"已有{sim_status(rest)}：{cents(float(rest.get('price') or 0))}×{float(rest.get('order') or 0):g} 份，这一边不再挂"})
                 continue
             if gate:
                 rows.append({"side": side, "label": label, "state": "off", "short": f"{label} 不挂", "text": own + gate})
@@ -15673,14 +15691,14 @@ class Bot:
             if express and time.monotonic() - self.sim_express_withdrawn.get(tid, -1e9) < self.SIM_EXPRESS_COOLDOWN_SECONDS:
                 return
             held = trades.get(tid)  # one order per market, side and way at a time; a position from a filled one lets the next in
-            if held is not None and not sim_position(held):
+            if held is not None and not sim_position(held) and not sim_spent(held):  # (an order over unfilled: sim_spent)
                 return
             count, why = self.sim_maker_pick(mk, trades, side, maker, now_ms)  # SIM_SHARES, or the most the caps take
             if why:
                 self.sim_note_block(tid, mk, "挂" + mk.sides[0 if side == "up" else 1], maker.price, why, now_ms)
                 refused.add(side)
                 continue  # a cap on this side is no reason to leave the other side unquoted
-            if held is not None:  # the position moves to tid#n (it settles there); the slot takes the fresh order
+            if held is not None:  # the position (or the order over unfilled) moves to tid#n; the slot takes the fresh order
                 new_tid = self.sim_rekey(tid, held)
                 trades[new_tid] = trades.pop(tid)
                 changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]

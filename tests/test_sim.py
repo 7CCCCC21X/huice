@@ -2304,3 +2304,38 @@ async def settled_touch():
 
 
 asyncio.run(settled_touch())
+
+
+async def why_slots():
+    """1.101.2: the 为什么挂 / 不挂单 row sees the slot as the trader does. An order over with nothing filled (sim_spent) no
+    longer holds it — 可挂 is true, and the next look places the order, the old record moving to #n; a record that does hold
+    it is named. A low-price order pushed under the 买1 says so instead of "买1 之上 1¢" (11-04 SHEIN: 70¢, 买1 90¢)."""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_WAYS": "both",
+           "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_ONLY": "on", "SIM_MAKER_MIN_BID": "10"}
+    slug = "shein-up-or-down-on-october-5-2026"
+    settle = {"key": "SHEIN", "target": "2026-10-05", "line": 36.26, "close_ms": CLOSE}
+    card = lambda: m.SimMarket(slug, "SHEIN 希音", "close", "SHEIN", 0.954, book([("0.90", "620")], [("0.96", "420")], slug=slug, key="SHEIN", mid="301"),
+                               0.04, "", ("涨", "跌"), settle, {}, in_session=True)
+    bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    bot.sim_markets = lambda now, only=None: [card()]
+    tid = f"{slug}|up|挂"
+    order = bot.sim_open(card(), "up", NOW - 600_000, maker=m.BookEdge("涨", True, 0.70, 0.25, 0.0, 0.25, front=True), shares=142)
+    assert order["deep"] and order["status"] == "resting"
+    bot.sim_save([(tid, order)])
+    up = lambda: bot.why_payload()["markets"]["301"]["maker"]["sides"][0]
+    assert (up()["state"], up()["text"]) == ("resting", "挂单中：70.0¢×142 份（低价单，买1 已到 90.0¢）"), up()
+    # ended with nothing filled (on Predict's side, by the control page…): the slot is free, and the next look quotes it
+    bot.sim_save([(tid, {**order, "status": "cancelled", "unfilled": 142.0, "note": "挂单结束（CANCELLED），一份都没成交"})])
+    assert (up()["state"], up()["text"]) == ("ready", "可挂 1.0¢×100 份（击穿单，净优势 94.0¢），下一轮挂出"), up()
+    trades, changed = bot.sim_trades(), []
+    bot.sim_quote(card(), trades, NOW, changed)
+    assert [(k, t["price"], t.get("sweep")) for k, t in changed] == [(tid, 0.01, True)], changed
+    assert trades[f"{tid}#1"]["note"] == "挂单结束（CANCELLED），一份都没成交" and trades[tid]["status"] == "resting"
+    # a record that does hold the slot is named: the trader leaves that side alone
+    bot.sim_save([(tid, {**order, "status": "settled", "shares": 142.0, "payout": 1.0, "final": {"up": 1.0}})])
+    assert up()["state"] == "wait" and up()["text"].startswith("已有赢 +$") and up()["text"].endswith("：70.0¢×142 份，这一边不再挂"), up()
+    assert bot.sim_maker_reason(card(), bot.sim_trades(), NOW)[0] is None
+    print("WHY_SLOTS_OK")
+
+
+asyncio.run(why_slots())
