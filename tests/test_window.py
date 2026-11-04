@@ -34,7 +34,7 @@ assert m.minute_vol(rows(["90"] * 241, T0), T0) == 0.0  # not moved at all: the 
 try:
     m.minute_vol(rows(["90"] * 30, T0), T0); assert False
 except ValueError as error:
-    assert "不足一小时" in str(error)
+    assert str(error) == "指数 1 分钟 K 线不足"
 
 
 class FM:
@@ -106,6 +106,10 @@ async def run():
     await futures.frame(None, json.dumps({"e": "markPriceUpdate", "s": "UNITREEUSDT", "p": "90.40", "i": "89.0000", "E": T0 + 5_500}))
     await futures.frame(None, json.dumps({"e": "aggTrade", "s": "UNITREEUSDT", "p": "95.00", "T": T0 + 7_000}))
     assert card.price == D("90.3000")
+    # the same index a second later (a flat market): the card is kept fresh, nothing is woken for it
+    bot.price_dirty.clear()
+    await futures.frame(None, json.dumps({"e": "markPriceUpdate", "s": "UNITREEUSDT", "p": "90.40", "i": "90.3000", "E": T0 + 6_900}))
+    assert card.index_ms == T0 + 6_900 and card.price == D("90.3000") and not bot.price_dirty
     # the premium index read: only when the push is late, and never older than what the push gave
     fm.premium = ("90.2500", T0 + 5_800)
     card.times["price"] = -1e9
@@ -132,6 +136,16 @@ async def run():
                                                            "请核实；暂不给建议")
     bot.predict.info[spec.slug]["question"] = "宇树科技 (UNITREE) 涨或跌 15分"  # no time named: nothing to check
     assert bot.updown_hold(card, odds, T0 + 7_000) == ("", "")
+    # the half of the day written once, at the end ("10:00-10:15PM"), names the start's too; over noon or midnight the start
+    # is in the other half ("11:45-12:00PM": an hour before noon; "11:45-12:00AM": before midnight); a 24-hour range as is
+    for question, ok in (("10:00-10:15PM ET", True), ("10:00-10:15AM ET", False), ("22:00-22:15 ET", True), ("22:00 - 22:15 EST", True)):
+        bot.predict.info[spec.slug]["question"] = f"UNITREE Up or Down - November 3, {question}"
+        assert (bot.window_title_problem(spec) == "") is ok, (question, bot.window_title_problem(spec))
+    midnight, noon = W.window_spec(T0 + 105 * 60_000), W.window_spec(T0 - 615 * 60_000)  # 11:45PM–12:00AM ET; 11:45AM–12:00PM ET
+    for window, question, ok in ((midnight, "11:45-12:00AM ET", True), (midnight, "11:45PM-12:00AM ET", True), (midnight, "11:45-12:00PM ET", False),
+                                 (noon, "11:45-12:00PM ET", True), (noon, "11:45AM-12:00PM ET", True), (noon, "11:45-12:00AM ET", False)):
+        bot.predict.info[window.slug] = {"outcomes": ["Up", "Down"], "created_ms": 0, "question": f"UNITREE Up or Down - {question}"}
+        assert (bot.window_title_problem(window) == "") is ok, (window.slug, question, bot.window_title_problem(window))
 
     # --- the card on the page: in 合约标的, beside the pair's own card ----------------------------------------------------------
     now = T0 + 7_000
@@ -150,7 +164,7 @@ async def run():
     mk = next(x for x in bot.sim_markets(now) if x.key == "UNITREE-15M")
     assert (mk.kind, mk.market, mk.settle) == ("updown", spec.slug, {"end": T1 - 60_000, "start": T0 - 60_000, "window": "15m"})
     assert bot.sim_order_cap(mk) == 10 and bot.sim_taker_shares(mk) == 10 and bot.sim_market_room({}, mk, "up") == (100, "")
-    assert bot.sim_edge_bar(mk) == bot.config.sim_edge and bot.sim_crypto_day_version(mk) == {
+    assert bot.sim_edge_bar(mk) == bot.config.sim_edge and bot.sim_beta_version(mk) == {
         "sim_crypto_15m_shares": 10, "sim_crypto_15m_max_shares": 100, "sim_crypto_15m_quiet": 90, "sim_crypto_15m_edge": 0}
     trades, changed = m.TradeMap(), []
     bot.sim_take(mk, trades, now, changed)
@@ -190,6 +204,11 @@ async def run():
 
     # --- the window ends: the end's index read, the card moves on, the trade settles on its own window -----------------------
     bot.sim_save([(f"{spec.slug}|up|吃", {**taken[0], "status": "filled"})])
+    # the kept closes of windows older than 8 days go at the roll (two rows a window, 192 a day); a 7-day-old window's stay
+    ancient, recent = W.window_spec(T0 - 9 * m.DAY_MS), W.window_spec(T0 - 7 * m.DAY_MS)
+    for old_spec in (ancient, recent):
+        store.put(f"updown:{old_spec.slug}:start", {"open": old_spec.start_ms, "close": "80"})
+        store.put(f"updown:{old_spec.slug}:end", {"open": old_spec.end_ms, "close": "81"})
     fm.index[T1 - 60_000] = "90.2000"
     fm.now = bot.market.now = T1 + 2_000
     card.times["candle"] = -1e9
@@ -197,6 +216,8 @@ async def run():
     nxt = W.current(T1)
     assert card.spec == nxt and card.close_of("start") == D("90.2000"), (card.spec, card.close_of("start"))  # the same candle starts the next window
     assert nxt.slug in bot.predict.want_info
+    assert store.get(f"updown:{ancient.slug}:end") is None and store.get(f"updown:{recent.slug}:end") == {"open": recent.end_ms, "close": "81"}
+    assert store.get(f"updown:{spec.slug}:end") == {"open": spec.end_ms, "close": "90.2000", "read_ms": T1 + 2_000} and bot.updown_prune(W, T1 + 2_000) == 0
     trade = bot.sim_trades()[f"{spec.slug}|up|吃"]
     past = bot.updown_of(trade)
     assert isinstance(past, m.IndexUpDownMarket) and past.spec.slug == spec.slug and past.futures == card.futures

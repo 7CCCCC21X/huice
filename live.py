@@ -1067,7 +1067,8 @@ class LiveBot(core.Bot):
             price, shares = self.sim_taker_limit(taker), float(taker.get("want") or self.sim_taker_shares(mk))  # the LIMIT order asks for the count at its limit: the most it can cost
         notional = float(price) * float(shares)
         if notional < MIN_ORDER_USD - 1e-9:
-            more = "SIM_CRYPTO_DAY_SHARES" if float(shares) >= self.sim_order_cap(mk) - 1e-9 else "SIM_SHARES"  # the count that binds
+            beta = self.sim_beta(mk.settle)  # the count that binds: a market in beta's own, else SIM_SHARES
+            more = f"{beta.env}_SHARES" if beta is not None and float(shares) >= self.sim_order_cap(mk) - 1e-9 else "SIM_SHARES"
             return f"本单 ${notional:,.2f} 低于 Predict 最低订单金额 ${MIN_ORDER_USD:g}（提高 {more}）"
         if notional > c.live_max_order_usd + 1e-9:
             return f"单笔 ${notional:,.2f} 超过 LIVE_MAX_ORDER_USD ${c.live_max_order_usd:g}"

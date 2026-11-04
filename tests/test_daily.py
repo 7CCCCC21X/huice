@@ -125,7 +125,7 @@ async def run():
     NONE = m.TradeMap()
     assert bot.sim_order_cap(mk) == 10 and bot.sim_market_room(NONE, mk, "up") == (100, "")
     other = m.dataclasses.replace(mk, kind="updown", settle={"end": SPEC.end_ms})  # a monthly up/down market: none of it
-    assert bot.sim_order_cap(other) == math.inf and bot.sim_market_room(NONE, other, "up") == (math.inf, "") and bot.sim_crypto_day_version(other) == {}
+    assert bot.sim_order_cap(other) == math.inf and bot.sim_market_room(NONE, other, "up") == (math.inf, "") and bot.sim_beta_version(other) == {}
     # a taker sweeps every ask under its cap (SIM_TAKER_SWEEP_SHARES 300) — here no more than a buy: 10 shares
     cap = bot.sim_taker_cap(mk, "up", 200)
     assert cap >= 0.45 and bot.sim_taker_shares(mk) == 10 and bot.sim_taker_want(mk, "up", cap) == 10
@@ -227,7 +227,7 @@ async def run():
     clock[0] = SPEC.end_ms + 150_000
     await bot.refresh_updown(clock[0])  # the new day's first candle is the one just read
     assert btc.close_of("start") == D("69000") and btc.spec.name == "BTC 11-05 涨跌"
-    clock[0] = SPEC.end_ms + MIN + bot.UPDOWN_ROLL_WAIT_MS
+    clock[0] = SPEC.end_ms + MIN + m.DailyUpDownSpec.ROLL_WAIT_MS
     await bot.refresh_updown(clock[0])  # ten minutes on, still nothing from Binance: ETH moves on regardless
     assert eth.spec == ETH.day_spec(NOV5)
     # the 11-04 taker settles on its own day's closes (69,000 under 70,000: Down), not on the card's new day
@@ -245,7 +245,7 @@ async def run():
     assert m.Bot(m.Config.from_env(ENV), s2, FM(at), None).updowns["BTC-DAY"].spec == NEXT
     s2.put(f"updown:{NEXT.slug}:end", {"open": NEXT.end_ms, "close": "71000", "read_ms": at})
     assert m.Bot(m.Config.from_env(ENV), s2, FM(at), None).updowns["BTC-DAY"].spec == BTC.day_spec(dt.date(2026, 11, 6))
-    later = m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(NEXT.end_ms + MIN + bot.UPDOWN_ROLL_WAIT_MS), None)
+    later = m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(NEXT.end_ms + MIN + m.DailyUpDownSpec.ROLL_WAIT_MS), None)
     assert later.updowns["BTC-DAY"].spec.slug == "bitcoin-up-or-down-on-november-6-2026"
     print("DAILY_OK")
 
