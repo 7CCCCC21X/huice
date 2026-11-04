@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.99.0"
+VERSION = "1.100.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -509,6 +509,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_CRYPTO_DAY_EDGE_CENTS", "加密日涨跌触发买入的净优势（¢/份，内测）", "0～50：每日涨跌市场单独的买入门槛，吃单、挂单都按它（模型误差更大时按模型误差），挂单撤单线随之不高于它减 0.5¢；0 = 同“触发买入的净优势”。怎么定：看 /calib 里的“加密日涨跌吃单门槛回测”"),
     ("SIM_CRYPTO_DAY_QUIET_MINUTES", "加密日涨跌结束前多少分钟不买（内测）", "0～1440：每日涨跌市场在结算那根 1 分钟 K（12:00 ET）之前这么多分钟起不开新单，未成交的挂单撤掉；和“结束前多少分钟不交易”取较长的；0 = 只按那一项"),
     ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
+    ("SIM_MAKER_DEEPER", "买1 不够门槛时跟更深的买价", "开 = 跟买1 的净优势不够门槛（或不超过模型误差）时，挂到下面第一个够门槛的买价档位（买2、买3…，同样要有“买1 至少多少份”那么多别人的单），等有人砸穿买1 时接；涨、跌两边各按各的；关 = 只跟买1，不够就不挂"),
     ("SIM_MAKER_EXIT_CENTS", "挂单撤单线（¢/份）", "0～50：挂着的单净优势降到这个数以下就撤掉（不会高于触发门槛）；0 = 不撤"),
     ("SIM_MAKER_SESSION", "只在标的开盘时段挂单", "开 = 指数/个股日涨跌的挂单只在标的开盘时段挂着，开盘前、收盘后全部撤掉；加密市场不受影响"),
     ("SIM_MAKER_SPREAD_CENTS", "挂单价差上限（¢）", "0～99：平时只在买卖价差不超过这个数的双边盘口挂单；0 = 不限，价差再宽、只有单边的盘口也跟有效买1 挂（门槛不变）"),
@@ -661,6 +662,9 @@ class Config:
     sim_maker_deep_markets: frozenset = frozenset()         # SIM_MAKER_DEEP_MARKETS: the deep-bid mode only on these markets; empty = every market in scope
     sim_maker_deep_only_markets: frozenset = frozenset()    # SIM_MAKER_DEEP_ONLY_MARKETS: deep-only on these markets only; empty = wherever the deep-bid mode is on
     sim_maker_points: bool = True     # SIM_MAKER_POINTS: resting orders only on markets whose Predict points pay now (rewards.current); withdrawn when they stop
+    sim_maker_deeper: bool = True     # SIM_MAKER_DEEPER: when the valid 买1 leaves less edge than the bar, an ordinary resting order waits at the
+    # first deeper bid level (买2, 买3…, holding SIM_MAKER_MIN_BID shares besides ours) that clears it, for a seller who sells through 买1;
+    # each side on its own; off = 买1 or nothing
     touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
     auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
     edge_alert: bool = True  # Telegram: a suggestion reaching edge_alert_edge; later, that suggestion going away or turning
@@ -827,6 +831,7 @@ class Config:
             sim_maker_min_bid=parse_bounded(e, "SIM_MAKER_MIN_BID", "100", 0, 10_000_000),
             sim_maker_exit=parse_bounded(e, "SIM_MAKER_EXIT_CENTS", "5", 0, 50) / 100,
             sim_maker_session=not off(e.get("SIM_MAKER_SESSION", "on")),
+            sim_maker_deeper=not off(e.get("SIM_MAKER_DEEPER", "on")),
             sim_maker_after_hours=parse_bounded(e, "SIM_MAKER_AFTER_HOURS_CENTS", "0", 0, 50) / 100,
             sim_maker_deep=parse_bounded(e, "SIM_MAKER_DEEP_CENTS", "0", 0, 90) / 100,
             sim_maker_spread=parse_bounded(e, "SIM_MAKER_SPREAD_CENTS", "0", 0, 99) / 100,
@@ -4690,6 +4695,7 @@ class BookEdge:
     short: bool = False  # taker: the visible book cannot fill the whole trade size
     front: bool = False  # maker: placed a cent in front of the valid 买1 (the deep-bid mode), not behind its queue
     sweep: bool = False  # maker: a sweep order — deep under the book's front (SIM_MAKER_DEEP_ONLY), filled only when a seller sweeps through
+    level: int = 1       # maker: the bid level it joins, counted from the top (1 = 买1; 2 = 买2 when 买1 leaves too little edge: SIM_MAKER_DEEPER)
 
     @property
     def label(self) -> str:
@@ -8705,6 +8711,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_MAKER_MIN_BID": {"kind": "number", "group": "策略", "presets": ["0", "20", "50", "100", "200", "500"], "unit": "份", "zero": "不限、不改跟"},
     "SIM_MAKER_EXIT_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "2", "3", "5", "8"], "unit": "¢", "zero": "不撤"},
     "SIM_MAKER_SESSION": {"kind": "choice", "group": "策略", "options": [["off", "盘前盘后也挂"], ["on", "只在开盘时段挂"]]},
+    "SIM_MAKER_DEEPER": {"kind": "choice", "group": "策略", "options": [["on", "不够就跟买2、买3"], ["off", "只跟买1"]]},
     "SIM_MAKER_AFTER_HOURS_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "5", "8", "10", "15", "20"], "unit": "¢", "zero": "关"},
     "SIM_MAKER_SPREAD_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "5", "10", "20", "30"], "unit": "¢", "zero": "不限"},
     "SIM_MAKER_DEEP_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "15", "20", "25", "30", "40"], "unit": "¢", "zero": "关"},
@@ -8797,6 +8804,20 @@ def maker_level(book: PredictBook, side: str, min_size: float, own: float = 0.0,
         others = size - (own if own_price is not None and abs(price - own_price) < 1e-9 else 0.0)
         if others > 1e-9 and others >= min_size - 1e-9:
             return price, others
+    return None
+
+
+def maker_level_under(book: PredictBook, side: str, min_size: float, top: float, own: float = 0.0,
+                      own_price: float | None = None) -> tuple[float, float, int] | None:
+    """The first bid level of ``side`` at or under ``top`` holding at least ``min_size`` shares besides ``own`` (as
+    maker_level), with its place from the top of the book (2 = 买2): where a resting buy waits when the valid 买1 leaves
+    too little edge (SIM_MAKER_DEEPER), for a seller who sells through the levels above it. None when none is there."""
+    for rank, (price, size) in enumerate(own_levels(book, side), 1):
+        if price > top + 1e-9:
+            continue
+        others = size - (own if own_price is not None and abs(price - own_price) < 1e-9 else 0.0)
+        if others > 1e-9 and others >= min_size - 1e-9:
+            return price, others, rank
     return None
 
 
@@ -10587,7 +10608,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_crypto_day_shares:"加密日涨跌每笔份数",sim_crypto_day_max_shares:"加密日涨跌每边上限",sim_crypto_day_edge:"加密日涨跌买入门槛",sim_crypto_day_quiet:"加密日涨跌结束前不买（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_crypto_day_shares:"加密日涨跌每笔份数",sim_crypto_day_max_shares:"加密日涨跌每边上限",sim_crypto_day_edge:"加密日涨跌买入门槛",sim_crypto_day_quiet:"加密日涨跌结束前不买（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_deeper:"买1 不够跟买2",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
   sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_taker_hold:"吃单前优势保持（秒）",sim_taker_hold_range:"价格阶梯吃单前优势保持（秒）",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",sim_no_odds_withdraw:"概率暂缺撤单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
   min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",big_move:"大波动日放宽 σ（倍日 σ）",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
@@ -14088,6 +14109,7 @@ class Bot:
                 **({"sim_maker_min_bid": c.sim_maker_min_bid} if c.sim_maker_min_bid > 0 else {}),
                 **({"sim_maker_exit": self.sim_maker_exit()} if self.sim_maker_exit() > 0 else {}),
                 **({"sim_maker_session": True} if c.sim_maker_session else {}),
+                **({"sim_maker_deeper": True} if c.sim_maker_deeper else {}),
                 **({"sim_maker_after_hours": c.sim_maker_after_hours} if c.sim_maker_after_hours > 0 else {}),
                 **({"sim_taker_after_hours": c.sim_taker_after_hours} if c.sim_taker_after_hours > 0 else {}),
                 **({"sim_after_hours_max_price": c.sim_after_hours_max_price} if c.sim_after_hours_max_price > 0 else {}),
@@ -14261,7 +14283,8 @@ class Bot:
         if maker is not None:
             queue = next((q for p, q in own_levels(mk.book, side) if abs(p - maker.price) < 1e-9), 0.0)
             trade.update(price=maker.price, signal=maker.edge, shares=0.0, status="resting", filled=None,
-                         queue_ahead=queue, queue_min=queue, **({"deep": True} if maker.front else {}), **({"sweep": True} if maker.sweep else {}))
+                         queue_ahead=queue, queue_min=queue, **({"deep": True} if maker.front else {}), **({"sweep": True} if maker.sweep else {}),
+                         **({"join_level": maker.level} if maker.level > 1 else {}))  # SIM_MAKER_DEEPER: it waits at 买2, 买3…
         else:
             trade.update(price=taker["cost"], avg=taker["avg"], fee=taker["fee"], best=taker["best"],
                          slip=taker["avg"] - taker["best"], signal=fair - taker["cost"], shares=taker["got"], status="filled", cap=taker.get("cap"),
@@ -14419,6 +14442,7 @@ class Bot:
         only = front_ok and c.sim_maker_deep_only and self.sim_mode_market(mk, c.sim_maker_deep_only_markets)  # SIM_MAKER_DEEP_ONLY (on its markets): the joining orders are not placed at all
         deep_bar = self.sim_maker_mode(mk, True)[0] if front_ok or wide else c.sim_maker_deep  # the deep-bid orders' bar here: SIM_MAKER_DEEP_CENTS, or the after-hours bar when higher
         limit = self.sim_after_hours_price(mk)  # after hours only at or under SIM_AFTER_HOURS_MAX_PRICE_CENTS
+        maker_bar = self.sim_maker_mode(mk)[0]  # an ordinary order's bar here (SIM_MAKER_DEEPER looks under 买1 for it)
         cands, joined, dear, capped = [], None, None, []  # joined / dear / capped: what was passed over or cut, for the reason when nothing is left
         for side, name in (("up", "涨"), ("down", "跌")):
             fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: a near-certain side is judged at the limit, no higher
@@ -14442,11 +14466,19 @@ class Bot:
                     joined = max(joined if joined is not None else -1.0, fair - level[0])
                     continue
             price, queued = (sweep[0], sweep[1]) if sweep else front if use_front else level
+            rank = 1
+            if (c.sim_maker_deeper and not use_front and sweep is None and not wide
+                    and (fair - price < maker_bar - 1e-9 or fair - price <= mk.need)):
+                # 买1 leaves too little edge: the first deeper level that clears the bar (and the card's error), waiting
+                # there for a seller who sells through 买1 (1.100.0: 涨 17.7¢ fair, 买1 10¢ worth 7.7¢, 买2 5¢ worth 12.7¢)
+                lower = maker_level_under(mk.book, side, c.sim_maker_min_bid, fair - max(maker_bar, mk.need), own, own_price)
+                if lower is not None and fair - lower[0] > mk.need + 1e-9:
+                    price, queued, rank = lower
             if limit is not None and price > limit + 1e-9:
                 dear = max(dear if dear is not None else -1.0, price)
                 continue
             edge = fair - price
-            cands.append(BookEdge(name, True, price, edge, queued, edge, front=use_front or sweep is not None, sweep=sweep is not None))
+            cands.append(BookEdge(name, True, price, edge, queued, edge, front=use_front or sweep is not None, sweep=sweep is not None, level=rank))
         cands.sort(key=lambda b: b.edge, reverse=True)
         cut_note = f"；{'；'.join(capped)}" if capped else ""
         best = cands[0] if cands else None
@@ -14510,7 +14542,8 @@ class Bot:
                             maker, side, count, maker_why = other, other_side, other_count, ""
                 ahead = sum(q for p, q in own_levels(mk.book, side) if p > maker.price + 1e-9) if maker.sweep else 0.0
                 maker_text = (f"挂{mk.sides[0 if side == 'up' else 1]} {cents(maker.price)}×{count:g} 份（净优势 {cents(maker.edge)}，"
-                              + (f"击穿单，前面 {ahead:g} 份）" if maker.sweep else ("买1 之上 1¢，" if maker.front else "")
+                              + (f"击穿单，前面 {ahead:g} 份）" if maker.sweep else ("买1 之上 1¢，" if maker.front else
+                                                                             f"买1 不够门槛，跟买{maker.level}，" if maker.level > 1 else "")
                                  + (f"排在 {maker.size:g} 份之后）" if maker.size > 0 else "排在最前）")))
                 held = trades.get(f"{mk.market}|{side}|挂")
                 if held is not None and sim_position(held):
@@ -17226,7 +17259,7 @@ class Bot:
                   "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes), "SIM_MAKER_MIN_BID": plain(c.sim_maker_min_bid),
                   "SIM_CRYPTO_DAY_SHARES": plain(c.sim_crypto_day_shares), "SIM_CRYPTO_DAY_MAX_SHARES": plain(c.sim_crypto_day_max_shares),
                   "SIM_CRYPTO_DAY_QUIET_MINUTES": str(c.sim_crypto_day_quiet), "SIM_CRYPTO_DAY_EDGE_CENTS": f"{c.sim_crypto_day_edge * 100:g}",
-                  "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points),
+                  "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points), "SIM_MAKER_DEEPER": flag(c.sim_maker_deeper),
                   "SIM_SHARES_NET": flag(c.sim_shares_net),
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
                   "SIM_MAKER_SPREAD_CENTS": f"{c.sim_maker_spread * 100:g}", "SIM_MAKER_DEEP_ONLY": flag(c.sim_maker_deep_only),

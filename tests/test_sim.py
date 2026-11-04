@@ -21,7 +21,7 @@ HSI_SLUG = "hang-seng-index-up-or-down-on-october-5-2026"
 KOSPI_SLUG = "kospi-composite-index-up-or-down-on-october-5-2026"
 CLOSE = BJ(10, 5, 16, 10)
 LEGACY = {"SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off",
-          "SIM_MAKER_SPREAD_CENTS": "10", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0"}  # the resting-order rules off and the old 10¢ spread rule on: orders rest as placed
+          "SIM_MAKER_SPREAD_CENTS": "10", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0", "SIM_MAKER_DEEPER": "off"}  # the resting-order rules off and the old 10¢ spread rule on: orders rest as placed
 FEE = 0.02  # Predict: 2% × min(p, 1 − p) when the market states no rate
 
 # --- settings ----------------------------------------------------------------------------------------------------------
@@ -619,12 +619,15 @@ async def browser_check(bot):
 
 
 async def maker_rules():
-    """The resting-order rules on by default: the valid 买1, following it, the exit line, the session, the freed slot."""
+    """The resting-order rules on by default: the valid 买1, following it, the exit line, the session, the freed slot. (The
+    deeper levels a 买1 short of the bar sends an order to, SIM_MAKER_DEEPER, are off here: deeper_levels tests them.)"""
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
-                             "WEB_PORT": "8080", "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_MAKER_SPREAD_CENTS": "10"})  # the 10¢ spread rule on
+                             "WEB_PORT": "8080", "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_MAKER_SPREAD_CENTS": "10",  # the 10¢ spread rule on
+                             "SIM_MAKER_DEEPER": "off"})
     assert cfg.sim_maker_min_bid == 100 and cfg.sim_maker_exit == 0.05 and cfg.sim_maker_session and cfg.sim_maker_spread == 0.10
+    assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).sim_maker_deeper and not cfg.sim_maker_deeper  # on by default (1.100.0)
     for bad in ({"SIM_MAKER_MIN_BID": "-1"}, {"SIM_MAKER_EXIT_CENTS": "51"}, {"SIM_MAKER_EXIT_CENTS": "x"}):
-        try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
+        try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", **bad}); assert False, bad
         except ValueError: pass
     bot = m.Bot(cfg, m.Store(":memory:"), FM(NOW), None)
     bot.sim_markets = lambda now: world["markets"]
@@ -683,9 +686,9 @@ async def maker_rules():
     # a few tenths; the close re-judges every resting order, the open brings back the ordinary bar and exit line
     assert cfg.sim_maker_after_hours == 0 and bot.control_value("SIM_MAKER_AFTER_HOURS_CENTS") == "0" and "sim_maker_after_hours" not in bot.sim_version()
     for bad in ({"SIM_MAKER_AFTER_HOURS_CENTS": "51"}, {"SIM_MAKER_AFTER_HOURS_CENTS": "-1"}, {"SIM_MAKER_AFTER_HOURS_CENTS": "x"}):
-        try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
+        try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", **bad}); assert False, bad
         except ValueError: pass
-    abot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+    abot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
                                     "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_EDGE_CENTS": "5", "SIM_MAKER_EXIT_CENTS": "2",
                                     "SIM_MAKER_AFTER_HOURS_CENTS": "10"}), m.Store(":memory:"), FM(NOW), None)
     abot.sim_markets = lambda now: world["markets"]
@@ -724,12 +727,12 @@ async def maker_rules():
     assert abot.sim_trades()[tid]["status"] == "resting" and len([k for k in abot.sim_trades() if k.startswith(tid)]) == 3
     # the mode applies whatever SIM_MAKER_SESSION says (盘前盘后也挂 still needs the after-hours edge after hours), and an
     # after-hours bar under the ordinary one never loosens it
-    obot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+    obot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
                                     "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_EDGE_CENTS": "5", "SIM_MAKER_SESSION": "off",
                                     "SIM_MAKER_AFTER_HOURS_CENTS": "10"}), m.Store(":memory:"), FM(NOW), None)
     obot.predict.market_meta["101"] = (active, time.monotonic())
     assert obot.sim_maker_reason(after(0.64, NOW), {}, NOW) == (None, "盘后只挂净优势 ≥ 10.0¢ 的，现 7.0¢") and obot.sim_maker_reason(after(0.70, NOW), {}, NOW)[0] is not None
-    lbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_EDGE_CENTS": "10", "SIM_MAKER_AFTER_HOURS_CENTS": "5"}),
+    lbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SIM_WAYS": "maker", "SIM_EDGE_CENTS": "10", "SIM_MAKER_AFTER_HOURS_CENTS": "5"}),
                  m.Store(":memory:"), FM(NOW), None)
     lbot.predict.market_meta["101"] = (active, time.monotonic())
     assert lbot.sim_maker_bar(after(0.70, NOW)) == 0.10 and abs(lbot.sim_maker_line(after(0.70, NOW)) - 0.09) < 1e-12
@@ -738,13 +741,13 @@ async def maker_rules():
     # on at the valid 买1 when the edge is that large — the 10-08 book: fair 38¢, bids 5¢×300 / 1¢×1000, asks 38¢×1 / 40¢×100 …
     assert cfg.sim_maker_deep == 0 and bot.control_value("SIM_MAKER_DEEP_CENTS") == "0" and "sim_maker_deep" not in bot.sim_version()
     for bad in ({"SIM_MAKER_DEEP_CENTS": "91"}, {"SIM_MAKER_DEEP_CENTS": "-1"}):
-        try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
+        try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", **bad}); assert False, bad
         except ValueError: pass
     wide = lambda fair, at, bids=(("0.05", "300"), ("0.01", "1000")), asks=(("0.38", "1"), ("0.40", "100"), ("0.98", "500"), ("0.99", "1200")): \
         m.dataclasses.replace(hsi(fair, list(bids), list(asks), at), in_session=True)
     tight = lambda fair, at, asks=(("0.58", "400"),): hsi(fair, [("0.57", "150"), ("0.55", "300")], list(asks), at)
     assert bot.sim_maker_reason(wide(0.38, NOW), {}, NOW) == (None, "买卖价差 33.0¢ 超过 10.0¢")  # the ordinary rule: nobody sells into it
-    dbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+    dbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
                                     "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_SPREAD_CENTS": "10"}),
                  m.Store(":memory:"), FM(NOW), None)
     dbot.sim_markets = lambda now: world["markets"]
@@ -813,7 +816,7 @@ async def maker_rules():
     await step(dbot, NOW + 50_000, tight(0.61, NOW + 50_000, asks=(("0.90", "400"),)))  # 4¢: the ordinary exit line
     assert tid not in dbot.sim_trades() and dbot.sim_trades()[f"{tid}#5"]["note"].startswith("撤单：净优势降到 4.0¢，低于撤单线 5.0¢")
     # after hours with both modes the higher bar wins (the after-hours 30¢ here) and the order check names both
-    bbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_AFTER_HOURS_CENTS": "30",
+    bbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_AFTER_HOURS_CENTS": "30",
                                     "SIM_MAKER_SPREAD_CENTS": "10"}), m.Store(":memory:"), FM(NOW), None)
     bbot.predict.market_meta["101"] = (active, time.monotonic())
     closed_wide = m.dataclasses.replace(wide(0.33, NOW), in_session=False)
@@ -822,7 +825,7 @@ async def maker_rules():
     assert why[0] is None and why[1].startswith("盘后、价差 33.0¢ 的盘口只挂净优势 ≥ 30.0¢ 的，现 27.0¢；") and why[1].endswith("的价位高于盘后上限 60.0¢"), why
     assert bbot.sim_maker_reason(m.dataclasses.replace(closed_wide, fair_up=0.36), {}, NOW)[0] is not None  # 30¢ clears both
     # each mode can be limited to chosen markets (the detail chips under its card): elsewhere it is as if the mode were off
-    nbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_MARKETS": "kospi",
+    nbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SIM_WAYS": "maker", "SIM_MAKER_DEEP_CENTS": "25", "SIM_MAKER_DEEP_MARKETS": "kospi",
                                     "SIM_MAKER_AFTER_HOURS_CENTS": "10", "SIM_MAKER_AFTER_HOURS_MARKETS": "KOSPI,SSE", "SIM_MAKER_SPREAD_CENTS": "10"}),
                  m.Store(":memory:"), FM(NOW), None)
     nbot.predict.market_meta["101"] = (active, time.monotonic())
@@ -836,7 +839,7 @@ async def maker_rules():
     assert nbot.sim_after_hours(kospi_after) and nbot.sim_maker_reason(kospi_after, {}, NOW)[0] is not None
     assert "sim_maker_deep_markets" not in dbot.sim_version() and dbot.sim_maker_reason(wide(0.38, NOW), {}, NOW)[0] is not None  # no list: every market
     # a maker mode set while SIM_WAYS=taker (the 10-08 case: 低价挂单 25¢ on, 挂单 off) places nothing: the order check and /sim say so
-    tbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEP_CENTS": "25"}), m.Store(":memory:"), FM(NOW), None)
+    tbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SIM_MAKER_DEEP_CENTS": "25"}), m.Store(":memory:"), FM(NOW), None)
     assert tbot.sim_maker_reason(wide(0.38, NOW), {}, NOW) == (None, "SIM_WAYS=taker：只吃单（盘后挂单 / 低价挂单模式要先打开挂单）")
     assert "低价挂单模式已设置，但现在只吃单，不会挂单" in tbot.sim_text()
     plain = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}), m.Store(":memory:"), FM(NOW), None)
@@ -844,7 +847,7 @@ async def maker_rules():
     # --- no spread limit by default (SIM_MAKER_SPREAD_CENTS=0): the 10-08 ask "价差大也挂，比如两边都是 5，公平价 40" — bids 5¢ on
     # both sides (涨 5¢×300; 跌 5¢ = a 95¢ ask ×200), fair 40¢: the 跌 bid is joined at 5¢ with 55¢ of edge; the deep-bid mode
     # then puts it a cent in front, on this and any book, when the edge there clears its bar
-    both5 = lambda **env: m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", **env}), m.Store(":memory:"), FM(NOW), None)
+    both5 = lambda **env: m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SIM_WAYS": "maker", **env}), m.Store(":memory:"), FM(NOW), None)
     ubot = both5()
     ubot.predict.market_meta["101"] = (active, time.monotonic())
     five = m.dataclasses.replace(hsi(0.40, [("0.05", "300")], [("0.95", "200")], NOW), in_session=True)
@@ -893,7 +896,7 @@ async def maker_rules():
     assert tid not in trades and trades[f"{tid}#2"]["note"] == "撤单：低价挂单只挂净优势 ≥ 25.0¢ 的，现 23.0¢ 低于低价挂单撤单线 24.0¢，一份都没成交", trades[f"{tid}#2"]["note"]
     # --- the after-hours taker mode and the after-hours price limit (10-08): outside the session a daily card is taken only
     # with SIM_TAKER_AFTER_HOURS_CENTS of edge, and nothing, taker or maker, is bought over SIM_AFTER_HOURS_MAX_PRICE_CENTS
-    hbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+    hbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
                                     "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_TAKER_SESSION": "on", "SIM_TAKER_AFTER_HOURS_CENTS": "15",
                                     "SIM_MAKER_SESSION": "off"}), m.Store(":memory:"), FM(NOW), None)
     hbot.sim_markets = lambda now: world["markets"]
@@ -1007,7 +1010,7 @@ async def maker_rules():
     assert trades[f"{tid}#6"]["shares"] == 100 and trades[f"{tid}#6"]["status"] == "filled" and trades[tid]["status"] == "resting" and trades[tid]["price"] == 0.59
     assert len([k for k in trades if k.startswith(tid)]) == 7 and not m.sim_position(trades[tid]) and not m.sim_position(trades[f"{tid}#4"])
     # the exit line never sits above the bar: SIM_EDGE_CENTS=3 with the 5¢ default → 2.5¢
-    low = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_EDGE_CENTS": "3"}), m.Store(":memory:"), FM(NOW), None)
+    low = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SIM_EDGE_CENTS": "3"}), m.Store(":memory:"), FM(NOW), None)
     why = low.sim_requote_reason({"maker": True, "side": "up", "price": 0.69, "order": 100, "shares": 0}, hsi(0.70, [("0.69", "300")], [("0.72", "400")], NOW), NOW)
     assert abs(low.sim_maker_exit() - 0.025) < 1e-12 and why == "净优势降到 1.0¢，低于撤单线 2.5¢", why
     assert "只跟不少于 100 份的买1" in bot.sim_text() and "降到 5.0¢ 以下撤掉" in bot.sim_text() and "开盘前、收盘后撤掉" in bot.sim_text() and "只挂积分已激活的市场" in bot.sim_text()
@@ -2089,3 +2092,50 @@ async def two_sided_maker():
 
 
 asyncio.run(two_sided_maker())
+
+
+async def deeper_levels():
+    """1.100.0: SIM_MAKER_DEEPER (on by default). The 11-04 SK 海力士 card: 涨 17.7¢ fair, bids 10¢×212 / 5¢×312.1 / 1¢×1000.
+    Joining 买1 at 10¢ leaves 7.7¢, under the 10¢ bar, so the 涨 order waits at 买2, 5¢ (12.7¢), for a seller who sells
+    through 10¢, while 跌 rests at 65¢ (17.3¢) on its own: both sides. A deeper level needs SIM_MAKER_MIN_BID shares besides
+    ours; the order stays while 买1 is short of the bar and moves up to 买1 once 买1 clears it."""
+    env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_WAYS": "both",
+           "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off"}
+    slug = "sk-hynix-inc-up-or-down-on-october-5-2026"
+    settle = {"key": "SKHYNIXUSDT", "target": "2026-10-05", "line": 1398000.0, "close_ms": CLOSE}
+    asks = [("0.35", "127.1"), ("0.43", "175"), ("0.44", "178"), ("0.45", "112.1"), ("0.80", "100")]
+    card = lambda fair, bids, a=asks: m.SimMarket(slug, "SK 海力士", "close", "SKHYNIXUSDT", fair,
+                                                 book(bids, a, slug=slug, key="SKHYNIXUSDT", mid="201"), 0.04, "", ("涨", "跌"), settle, {}, in_session=True)
+    ladder = [("0.10", "212"), ("0.05", "312.1"), ("0.01", "1000")]
+    bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(NOW), None)
+    mk = card(0.177, ladder)
+    trades, changed = m.TradeMap(), []
+    bot.sim_quote(mk, trades, NOW, changed)
+    bot.sim_quote(mk, trades, NOW, changed)
+    assert [(t["label"], t["price"], t["order"], t.get("join_level")) for _, t in changed] == [("挂跌", 0.65, 100.0, None), ("挂涨", 0.05, 100.0, 2)], changed
+    up = trades[f"{slug}|up|挂"]
+    assert up["queue_ahead"] == 312.1 and abs(up["edge"] - 0.127) < 1e-9 and up["version"]["sim_maker_deeper"] is True
+    # it stays at 5¢ while 买1 (10¢) is short of the bar; the fair price rising to 25¢ makes 10¢ worth 15¢: it follows 买1 up
+    assert bot.sim_requote_reason(up, mk, NOW) == ""
+    assert bot.sim_requote_reason(up, card(0.25, ladder), NOW) == "买1 移到 10.0¢，改跟"
+    # 跌 kept out of the way (asks at 20¢: 跌's 买1 80¢ worth 2.3¢), the 涨 side alone
+    only_up = lambda bids: card(0.177, bids, [("0.20", "500")])
+    cand, why = bot.sim_maker_reason(only_up(ladder), m.TradeMap(), NOW)
+    assert (cand.side, cand.price, cand.level, cand.size, why) == ("涨", 0.05, 2, 312.1, ""), (cand, why)
+    # SIM_MAKER_MIN_BID: a thin level under 买1 is passed over (6¢×20, under 100 shares): 5¢ is 买3
+    cand, _ = bot.sim_maker_reason(only_up([("0.10", "212"), ("0.06", "20"), ("0.05", "312.1")]), m.TradeMap(), NOW)
+    assert (cand.price, cand.level) == (0.05, 3)
+    # no level under 买1 clears the bar: nothing, as before
+    assert bot.sim_maker_reason(only_up([("0.10", "212"), ("0.09", "500")]), m.TradeMap(), NOW) == (None, "净优势 7.7¢ 低于触发门槛 10.0¢")
+    # the switch off: 买1 or nothing
+    off = m.Bot(m.Config.from_env({**env, "SIM_MAKER_DEEPER": "off"}), m.Store(":memory:"), FM(NOW), None)
+    assert off.sim_maker_reason(only_up(ladder), m.TradeMap(), NOW) == (None, "净优势 7.7¢ 低于触发门槛 10.0¢")
+    assert off.control_value("SIM_MAKER_DEEPER") == "off" and bot.control_value("SIM_MAKER_DEEPER") == "on"
+    # the control page's order check says where it waits
+    bot.sim_markets = lambda now, only=None: [only_up(ladder)]
+    row = next(r for r in bot.sim_checks(NOW) if r["market"] == slug)
+    assert row["maker"].startswith("挂涨 5.0¢×100 份（净优势 12.7¢，买1 不够门槛，跟买2，排在 312.1 份之后）") and row["maker_why"] == "", row
+    print("DEEPER_LEVELS_OK")
+
+
+asyncio.run(deeper_levels())
