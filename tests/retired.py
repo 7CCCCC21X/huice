@@ -96,7 +96,7 @@ RANGE_OCTOBER = (
 
 def install() -> None:
     """main's tables as they stood in 1.94.1, in the same order: the markets still listed plus the retired ones (the
-    suites unpack them by position). The November ETH ladder is left out, as the October one stands in its place."""
+    suites unpack them by position). The November ladders are left out, as the October ones stand in their place."""
     touch = {s.key: s for s in LIVE["TOUCH_MARKETS"]}
     ranges = {s.key: s for s in LIVE["RANGE_MARKETS"]}
     m.TOUCH_MARKETS = (touch["BNB"], touch["SOL"], BTC_TOUCH, touch["ETH"])

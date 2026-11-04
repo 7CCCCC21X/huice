@@ -4,21 +4,25 @@ import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 import retired  # 1.95.0: the October ladders left main's table when their window ended; they stay this suite's examples
 D = m.D
-LIVE = retired.LIVE["RANGE_MARKETS"]  # what main lists: November's ETH ladder and the two "before 2027"
+LIVE = retired.LIVE["RANGE_MARKETS"]  # what main lists: the four November ladders and the two "before 2027"
 retired.install()
 BTC, ETH, SOL, HYPE, BTC27, ZEC27 = m.RANGE_MARKETS
 H = 3_600_000
 utc = lambda *a: int(dt.datetime(*a, tzinfo=dt.timezone.utc).timestamp() * 1000)
 
-# --- 1.95.0: the table main runs with. ETH's November ladder replaced its October one; the BTC, SOL and HYPE October
-# ladders ended 10-31 23:59 ET and were taken out, as every market whose window is over ----------------------------
-ETH11 = LIVE[0]
-assert [s.key for s in LIVE] == ["ETH-HIT-11", "BTC-HIT-2027", "ZEC-HIT-2027"] and LIVE[1:] == (BTC27, ZEC27)
-assert (ETH11.slug, ETH11.symbol, ETH11.venue, ETH11.name, ETH11.default_dir) == (
-    "what-price-will-ethereum-hit-in-november-2026", "ETHUSDT", "spot", "ETH 11月价格", "up")
+# --- the table main runs with. 1.95.0: the October ladders ended 10-31 23:59 ET and were taken out, as every market whose
+# window is over, ETH's November ladder taking its October one's place; 1.96.0: BTC's, SOL's and HYPE's November ones too
+NOV = LIVE[:4]
+BTC11, ETH11, SOL11, HYPE11 = NOV
+assert [s.key for s in LIVE] == ["BTC-HIT-11", "ETH-HIT-11", "SOL-HIT-11", "HYPE-HIT-11", "BTC-HIT-2027", "ZEC-HIT-2027"] and LIVE[4:] == (BTC27, ZEC27)
+assert [s.slug for s in NOV] == [f"what-price-will-{c}-hit-in-november-2026" for c in ("bitcoin", "ethereum", "solana", "hyperliquid")]
+assert [(s.symbol, s.venue) for s in NOV] == [("BTCUSDT", "spot"), ("ETHUSDT", "spot"), ("SOLUSDT", "spot"), ("HYPEUSDT", "futures")]
+assert [s.name for s in NOV] == ["BTC 11月价格", "ETH 11月价格", "SOL 11月价格", "HYPE 11月价格"]
+assert [s.default_dir for s in NOV] == ["down", "up", "up", "up"]  # as each coin's October rules came (each level's own rules decide)
 # "from 00:00 AM ET on the first day to 11:59 PM ET on the last": 11-01 00:00 is still daylight time (it ends at 02:00
 # that Sunday), 11-30 23:59 is standard time; whole hours either way, so the hourly candles cover the window exactly
 assert ETH11.start_ms == utc(2026, 11, 1, 4, 0) and ETH11.end_ms == utc(2026, 12, 1, 4, 59) and ETH11.start_ms % H == 0
+assert all((s.start_ms, s.end_ms) == (ETH11.start_ms, ETH11.end_ms) for s in NOV)
 assert ETH11.label(ETH11.start_ms) == "11-01 00:00 ET（北京 11-01 12:00）" and ETH11.label(ETH11.end_ms) == "11-30 23:59 ET（北京 12-01 12:59）"
 assert all(s.end_ms > utc(2026, 11, 4) for s in LIVE)  # nothing listed had ended when the ended ones were taken out
 
@@ -861,11 +865,12 @@ async def creation_window():
 
 
 async def november():
-    """1.95.0: ETH's November ladder, the one main lists. Its window opens in daylight time and closes in standard time
+    """1.95.0 / 1.96.0: the November ladders main lists. Their window opens in daylight time and closes in standard time
     (11-01 00:00 EDT = 04:00 UTC to the 1-minute candle of 11-30 23:59 EST = 12-01 04:59 UTC): the hourly candles are
     read from its first hour through its last, October's last hour and December's first never count, and once it is
-    read to its end the levels it never reached are worth 0. The bot built from main's own tables shows it as the card
-    ETH 11月价格, beside the three 先触 cards, the two "before 2027" ladders and STRC: no 涨跌, 反超 or 市值阶梯 card."""
+    read to its end the levels it never reached are worth 0 (ETH's, read here). The bot built from main's own tables
+    shows the cards BTC / ETH / SOL / HYPE 11月价格 (HYPE through the bot's Binance futures feed), beside the three 先触
+    cards, the two "before 2027" ladders and STRC: no 涨跌, 反超 or 市值阶梯 card."""
     S, E = ETH11.start_ms, ETH11.end_ms + 60_000  # E: 12-01 05:00 UTC, the end of the window's last hour
     hours = []
     for t in range(S - 800 * H, E + 3 * H, H):
@@ -908,29 +913,38 @@ async def november():
     assert rm.advice_problem(AFTER) == "窗口已结束，等待结算"
 
     class FakeMarket:
-        def __init__(self): self.config = None
+        def __init__(self): self.config, self.paths = None, []
         def now_ms(self): return MID
-        async def get(self, path, **params): return {"symbol": params.get("symbol"), "price": "45.12"}
+        async def get(self, path, **params):
+            self.paths.append((path, params))
+            return {"symbol": params.get("symbol"), "price": "45.12"}
 
     with retired.live():
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
-        bot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(), None)
-        assert list(bot.ranges) == ["ETH-HIT-11", "BTC-HIT-2027", "ZEC-HIT-2027", "STRC-100"] and list(bot.touches) == ["BNB", "SOL", "ETH"]
+        market = FakeMarket()
+        bot = m.Bot(cfg, m.Store(":memory:"), market, None)
+        assert list(bot.ranges) == [s.key for s in LIVE] + ["STRC-100"] and list(bot.touches) == ["BNB", "SOL", "ETH"]
         assert not bot.updowns and not bot.flips and not bot.caps
         targets = bot.predict_targets(MID)
-        assert targets["ETH-HIT-11"] == ETH11.slug and "ETH-HIT-11" in bot.predict.ladder_keys and "ETH-HIT-10" not in targets
+        assert all(targets[s.key] == s.slug and s.key in bot.predict.ladder_keys for s in NOV) and not any(k.endswith("-HIT-10") for k in targets)
         card = bot.range_payload(bot.ranges["ETH-HIT-11"], MID)
         assert (card["name"], card["group"], card["close_ms"]) == ("ETH 11月价格", "levels", ETH11.end_ms), card
         assert card["close_label"] == "11-30 23:59 ET（北京 12-01 12:59）这根 1 分钟 K 为止" and card["source"] == "币安现货", card
         assert card["predict"]["url"].startswith("https://predict.fun/zh-cn/market/what-price-will-ethereum-hit-in-november-2026")
         assert (card["ladder"]["window"], card["ladder"]["window_word"]) == ("11-01 00:00 ET（北京 11-01 12:00）起", "本月"), card["ladder"]
+        hype = bot.range_payload(bot.ranges["HYPE-HIT-11"], MID)
+        assert (hype["name"], hype["source"], hype["ladder"]["window_word"]) == ("HYPE 11月价格", "币安合约", "本月") and hype["close_ms"] == ETH11.end_ms
+        assert (await bot.ranges["HYPE-HIT-11"].get("ticker/price", symbol="HYPEUSDT"))["price"] == "45.12"
+        assert market.paths == [("/fapi/v1/ticker/price", {"symbol": "HYPEUSDT"})]  # the bot's own futures feed (BINANCE_BASE_URL)
         items = [(i["group"], i["name"]) for i in bot.odds_payload()["items"] if i["group"] in {"crypto", "levels", "ladder"}]
         assert items == [("crypto", "BNB 先触 700/900"), ("crypto", "SOL 先触 60/140"), ("crypto", "ETH 先触 1k/3k"),
-                         ("levels", "ETH 11月价格"), ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格"),
-                         ("levels", "STRC 触及 $100")], items
-        # the price streams follow: no HYPEUSDT on futures, no HYPE / SOL on Hyperliquid (the flip is gone)
+                         ("levels", "BTC 11月价格"), ("levels", "ETH 11月价格"), ("levels", "SOL 11月价格"), ("levels", "HYPE 11月价格"),
+                         ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格"), ("levels", "STRC 触及 $100")], items
+        # the price streams follow: HYPEUSDT on futures for its ladder; no HYPE / SOL on Hyperliquid (the flip is gone)
         assert bot.binance_streams["spot"].symbols() == ["BNBUSDT", "SOLUSDT", "ETHUSDT", "BTCUSDT", "ZECUSDT"]
-        assert bot.binance_streams["futures"].symbols() == ["UNITREEUSDT"] and not {"HYPE", "SOL"} & set(bot.hl_stream.coins())
+        assert bot.binance_streams["futures"].symbols() == ["UNITREEUSDT", "HYPEUSDT"] and not {"HYPE", "SOL"} & set(bot.hl_stream.coins())
+        assert [rm.spec.key for rm in bot.pair_markets[("futures", "HYPEUSDT")]] == ["HYPE-HIT-11"]
+        assert [rm.spec.key for rm in bot.pair_markets[("spot", "BTCUSDT")]] == ["BTC-HIT-11", "BTC-HIT-2027"]
     print("NOVEMBER_OK")
 
 

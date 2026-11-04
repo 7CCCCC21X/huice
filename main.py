@@ -47,7 +47,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.95.0"
+VERSION = "1.96.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7695,10 +7695,19 @@ class RangeSpec:
 
 
 RANGE_MARKETS = (
-    # "from 00:00 AM ET on the first day to 11:59 PM ET on the last", Binance 1m candles of ETH/USDT spot. November opens
-    # in daylight time (it ends at 02:00 on Sunday 11-01) and closes in standard time: 11-01 04:00 UTC to 12-01 04:59 UTC.
-    # (The October ladders of BTC, ETH, SOL and HYPE ended 10-31 23:59 ET; tests/retired.py keeps their lines.)
+    # "from 00:00 AM ET on the first day to 11:59 PM ET on the last", Binance 1m candles. November opens in daylight time
+    # (it ends at 02:00 on Sunday 11-01) and closes in standard time: 11-01 04:00 UTC to 12-01 04:59 UTC. The October
+    # ladders of the same four coins ended 10-31 23:59 ET (tests/retired.py keeps their lines); each coin keeps October's
+    # source and default direction (BTC's rules came with "final Low ≤", the others' with "final High ≥": each level's
+    # own rules still decide)
+    RangeSpec("BTC-HIT-11", "what-price-will-bitcoin-hit-in-november-2026", "BTCUSDT", "spot", "BTC 11月价格",
+              et_ms(2026, 11, 1, 0, 0, -4), et_ms(2026, 11, 30, 23, 59, -5), "down"),
     RangeSpec("ETH-HIT-11", "what-price-will-ethereum-hit-in-november-2026", "ETHUSDT", "spot", "ETH 11月价格",
+              et_ms(2026, 11, 1, 0, 0, -4), et_ms(2026, 11, 30, 23, 59, -5)),
+    RangeSpec("SOL-HIT-11", "what-price-will-solana-hit-in-november-2026", "SOLUSDT", "spot", "SOL 11月价格",
+              et_ms(2026, 11, 1, 0, 0, -4), et_ms(2026, 11, 30, 23, 59, -5)),
+    # HYPEUSDT on Binance futures (October's rules linked binance.com/en/futures/HYPEUSDT)
+    RangeSpec("HYPE-HIT-11", "what-price-will-hyperliquid-hit-in-november-2026", "HYPEUSDT", "futures", "HYPE 11月价格",
               et_ms(2026, 11, 1, 0, 0, -4), et_ms(2026, 11, 30, 23, 59, -5)),
     # "between November 24, 2025, 14:00 and December 31, 2026, 23:59 in the ET timezone" (EST at both ends), a High at or
     # over the level: the whole of 2026 on one card

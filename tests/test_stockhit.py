@@ -305,9 +305,9 @@ async def run():
     evidence = mk.evidence
     assert evidence["basis"]["close_ms"] == dec31 + 60_000 and evidence["basis"]["years"] == L["years"]
     assert [s["what"] for s in evidence["sources"]] == ["现价", "窗口内最高", "窗口内最低"] and [s["source"] for s in evidence["sources"]] == ["Yahoo 行情（NASDAQ:STRC）", "Yahoo 日 K（常规时段）", "Yahoo 日 K（常规时段）"]
-    # the page: the card sits in 价格阶梯 after the Binance ladders (1.95.0: November's ETH ladder and the two "before 2027")
+    # the page: the card sits in 价格阶梯 after the Binance ladders (1.96.0: the four November ones and the two "before 2027")
     names = [i["name"] for i in bot.odds_payload()["items"] if i["group"] == "levels"]
-    assert names == ["ETH 11月价格", "BTC 2027前价格", "ZEC 2027前价格", "STRC 触及 $100"], names
+    assert names == ["BTC 11月价格", "ETH 11月价格", "SOL 11月价格", "HYPE 11月价格", "BTC 2027前价格", "ZEC 2027前价格", "STRC 触及 $100"], names
     m.json.dumps(bot.odds_payload())
     print("STOCKHIT_OK")
 asyncio.run(run())
