@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.104.1"
+VERSION = "1.104.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -6328,7 +6328,7 @@ class BinanceStream(PushStream):
         mute = ((self.connected and self.pushed == 0 and now - self.connected_at >= 30)
                 or (not self.connected and self.connects > 0 and self.last_session[2] == 0 and self.last_session[0] >= 30))
         if mute and self.venue == "futures":  # (1.104.1: a Railway host connected, subscribed and heard nothing, five times over)
-            text += "；连上了却没有行情：币安合约推送可能不对这个部署地区开放（REST 正常）——合约报价照旧按 REST 采样，15 分钟指数价窗口前后每 2 秒读一次"
+            text += "；连上了却没有行情：币安合约推送可能不对这个部署地区开放（REST 正常）——合约报价照旧按 REST 采样，15 分钟指数价窗口前后每秒读一次"
         return text
 
     def rows(self, symbols: Any) -> dict[str, dict] | None:
@@ -7221,7 +7221,7 @@ class IndexUpDownMarket(UpDownMarket):
     second (markPrice@1s, field i: push_index) or read (premiumIndex) when the push is late, σ from its last hours of
     1-minute candles (minute_vol), and the two boundary values — each the close of the index's 1-minute candle ending at
     it (indexPriceKlines) — kept as UpDownMarket keeps its candle closes. Trades never price it."""
-    PRICE_SECONDS = 2            # the index is read this often while no push brings it, from WINDOW_LEAD_MS before the window to its end
+    PRICE_SECONDS = 1            # the index is read this often while no push brings it, from WINDOW_LEAD_MS before the window to its end
     PRICE_IDLE_SECONDS = 30      # ...and this often the rest of the time (a window hours away, the night)
     VOL_SECONDS = 60             # σ, likewise
     VOL_IDLE_SECONDS = 600
@@ -7286,7 +7286,8 @@ class IndexUpDownMarket(UpDownMarket):
     def cadence(self, now_ms: int) -> tuple[int, int]:
         """(seconds between index reads, between σ reads): the near ones from WINDOW_LEAD_MS before the window, the idle ones
         otherwise. A push every second (markPrice@1s) defers the index read; where the futures stream is mute (a region
-        Binance does not serve it in: it connects and sends nothing) the read is what prices the card."""
+        Binance does not serve it in: it connects and sends nothing) the read is what prices the card — and, like a push,
+        wakes the express lane when it moves the index (Bot.refresh_updown)."""
         near = now_ms >= self.spec.start_ms + 60_000 - WINDOW_LEAD_MS
         return (self.PRICE_SECONDS, self.VOL_SECONDS) if near else (self.PRICE_IDLE_SECONDS, self.VOL_IDLE_SECONDS)
 
@@ -19213,8 +19214,17 @@ class Bot:
         return refreshed(failed, len(self.flips) - len(failed))
 
     async def refresh_updown(self, now_ms: int) -> Refreshed:
-        for mkt in self.updowns.values():
+        moved = []
+        for key, mkt in self.updowns.items():
+            before = mkt.price if isinstance(mkt, IndexUpDownMarket) else None
             await mkt.refresh(now_ms)
+            if before is not None and mkt.price != before:
+                moved.append(key)
+        if moved:
+            # an index read by REST that moved a 15-minute card (the futures stream mute: 1.104.2) wakes the express lane as
+            # a push would, rather than waiting for the step: the taker on a book not yet repriced, the resting order
+            # whose edge just went
+            self.priced(moved)
         self.updown_roll(now_ms)  # a daily card whose day is over (its final close read just now) moves on to the next day
         failed = [f"{key}：{mkt.error}" for key, mkt in self.updowns.items() if mkt.error]
         return refreshed(failed, len(self.updowns) - len(failed))

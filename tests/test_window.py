@@ -122,7 +122,7 @@ async def run():
     assert card.odds(T0 + 5_000) == "等待币安 UNITREEUSDT 11:00 的指数价（起点）" and card.exchange == "sh" and card.trading(T0)
     # the index is read every 2 s from a quarter hour before the window to its end, every 30 s otherwise (σ: 60 s / 600 s)
     far = card.at(W.window_spec(T0 + 7_200_000))
-    assert card.cadence(T0 + 5_000) == (2, 60) and far.cadence(T0 + 5_000) == (30, 600) and far.cadence(T0 + 7_200_000 - 15 * 60_000) == (2, 60)
+    assert card.cadence(T0 + 5_000) == (1, 60) and far.cadence(T0 + 5_000) == (30, 600) and far.cadence(T0 + 7_200_000 - 15 * 60_000) == (1, 60)
     fm.index[T0 - 60_000], fm.premium = "90.0000", ("90.1200", T0 + 4_500)
     await card.refresh(T0 + 5_000)
     assert card.close_of("start") == D("90.0000") and card.price == D("90.1200") and card.sigma > 0 and card.error == "", card.error
@@ -145,8 +145,18 @@ async def run():
     card.times["price"] = -1e9
     await card.refresh(T0 + 7_000)
     assert card.price == D("90.3000")  # the read's index is older than the pushed one
+    # an index read by REST that moves the card wakes the express lane as a push would (1.104.2: the futures stream mute here)
+    bot.price_dirty.clear()
+    fm.premium = ("90.3300", T0 + 8_000)
+    card.times["price"] = -1e9
+    await bot.refresh_updown(T0 + 8_000)
+    assert card.price == D("90.3300") and bot.price_dirty == {"UNITREE-15M"}
+    bot.price_dirty.clear()
+    card.times["price"] = -1e9
+    await bot.refresh_updown(T0 + 9_000)  # the same index again: nothing moved, nothing to look at
+    assert card.price == D("90.3300") and not bot.price_dirty
     # paused: an index a minute old; an index that has not moved for hours
-    assert card.odds(T0 + 6_000 + 61_000).startswith("指数价停在 ") and "暂停概率" in card.odds(T0 + 67_000)
+    assert card.odds(T0 + 8_000 + 61_000).startswith("指数价停在 ") and "暂停概率" in card.odds(T0 + 70_000)
     sigma, card.sigma = card.sigma, 0.0
     assert card.odds(T0 + 7_000) == "指数在最近的交易时段里没有变动，暂停概率"
     card.sigma = sigma
@@ -183,7 +193,7 @@ async def run():
     bot.predict.books["UNITREE-15M"] = book("0.40", "0.45", now, spec.slug)
     pay = bot.updown_payload(card, now)
     assert (pay["name"], pay["group"], pay["source"], pay["ref"], pay["effective"]) == ("宇树 15分涨跌 11:00–11:15", "contract", "币安合约指数价",
-                                                                                     "90.0000", "90.3000"), pay
+                                                                                     "90.0000", "90.3300"), pay
     assert pay["close_label"].startswith("11:15 的币安合约 UNITREEUSDT 指数价（Chainlink 结算源）") and pay["close_ms"] == T1
     assert pay["ref_note"] == "币安合约 UNITREEUSDT 指数价，11:00" and pay["predict"]["bids"][0] == [0.4, 300.0], pay
     items = [i for i in bot.odds_payload()["items"] if i.get("symbol") == "UNITREE-15M"]
