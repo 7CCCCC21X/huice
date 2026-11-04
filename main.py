@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.104.4"
+VERSION = "1.104.5"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -12696,6 +12696,7 @@ class Bot:
         self.pred_last: dict[str, int] = {}  # index -> ms of the last saved prediction snapshot
         self.a50_anchor_note = "15:00"
         self.a50_anchor_error = ""  # why the last anchor lookup failed (shown in /diag and the odds row)
+        self.a50_bar_checked = 0    # the close (ms) whose five-minute-bar anchor was checked against the final bar (once per close)
         self.hsi_cfd_error = ""     # why the Sina CFD's 16:10 bar could not be read (when it was needed)
         self.hsi_used: FuturesQuote | None = None  # the futures quote the HSI after-hours odds were last mapped from
         self.a50_anchor_source = "东方财富"
@@ -13354,14 +13355,20 @@ class Bot:
                     self.anchors["A50"] = (close_ms, price)
                     self.a50_anchor_note, self.a50_anchor_source = "15:00", "东方财富"
                     self.store.put("anchor:A50", [close_ms, str(price), "15:00", "东方财富"])
-            elif (not wrong and live == "新浪CFD" and self.a50_anchor_note.endswith("分钟首笔近似") and settled
+            elif (not wrong and live == "新浪CFD" and settled and self.a50_bar_checked != close_ms
+                  and (self.a50_anchor_note.endswith("分钟首笔近似") or self.a50_anchor_note == "15:00 五分钟K近似")
                   and self.retry_ok("A50-bar", every=600)):
-                # a print minutes after the close stood in: the 15:00 five-minute bar, once final, is the closer figure
+                # a print minutes after the close stood in: the 15:00 five-minute bar, once final, is the closer figure; a bar
+                # anchor is checked once against the final bar too — one read before the bar was final (a version before
+                # 1.104.1: 11-03 12,800.88 against 12,806.19), or Sina revising a bar, would stand all day otherwise
                 with contextlib.suppress(Exception):
                     price = await self.cn.a50_sina_five_minute_at(day)
-                    self.anchors["A50"] = (close_ms, price)
-                    self.a50_anchor_note, self.a50_anchor_source = "15:00 五分钟K近似", "新浪CFD"
-                    self.store.put("anchor:A50", [close_ms, str(price), "15:00 五分钟K近似", "新浪CFD"])
+                    self.a50_bar_checked = close_ms
+                    if price != self.anchors["A50"][1] or self.a50_anchor_note != "15:00 五分钟K近似":
+                        LOG.info("A50 锚点改为收完的 15:00 五分钟 K：%s → %s（原 %s）", self.anchors["A50"][1], price, self.a50_anchor_note)
+                        self.anchors["A50"] = (close_ms, price)
+                        self.a50_anchor_note, self.a50_anchor_source = "15:00 五分钟K近似", "新浪CFD"
+                        self.store.put("anchor:A50", [close_ms, str(price), "15:00 五分钟K近似", "新浪CFD"])
         if self.vols.due("SSE") and len(self.cn.bars) > 2:  # the dated bars CnIndex already read
             self.vols.refreshed["SSE"] = time.monotonic()
             done = finished_bars(self.cn.bars, "sh", now_ms)

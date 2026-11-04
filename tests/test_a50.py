@@ -259,6 +259,25 @@ async def bar_gate():
     bot3.cn.a50 = m.IndexQuote("A50期货", D("14270"), D("14181"), None, None, None, close + 10 * 60_000, "新浪CFD")
     await bot3.refresh_odds_inputs(close + 10 * 60_000)
     assert bot3.anchors["A50"] == (close, D("14255")) and bot3.a50_anchor_note == "15:00 五分钟K近似", (bot3.anchors, bot3.a50_anchor_note)
+    # a bar anchor on record (read before the bar was final by an older version, or Sina revised the bar) is checked once
+    # against the final bar and replaced when it differs; not read again for that close
+    bot4 = make_bot()
+    bot4.cn.close = day_close
+    bot4.cn.a50 = m.IndexQuote("A50期货", D("14270"), D("14181"), None, None, None, close + 10 * 60_000, "新浪CFD")
+    bot4.store.put("anchor:A50", [close, "14249", "15:00 五分钟K近似", "新浪CFD"])
+    calls = []
+
+    async def counting(url, timeout=15, headers=None):
+        calls.append(url)
+        return await get(url, timeout, headers)
+    m.http_get = counting
+    await bot4.refresh_odds_inputs(close + 10 * 60_000)
+    assert bot4.anchors["A50"] == (close, D("14255")) and bot4.a50_anchor_note == "15:00 五分钟K近似" and bot4.store.get("anchor:A50")[1] == "14255"
+    bars = len([u for u in calls if "getMink" in u])
+    assert bars == 1 and bot4.a50_bar_checked == close
+    bot4.anchor_tries.clear()
+    await bot4.refresh_odds_inputs(close + 30 * 60_000)
+    assert len([u for u in calls if "getMink" in u]) == bars and bot4.anchors["A50"] == (close, D("14255"))
     print("A50_BAR_GATE_OK")
 
 
