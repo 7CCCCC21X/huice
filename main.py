@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.104.3"
+VERSION = "1.104.4"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -530,7 +530,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREDICT_MIN_EDGE_CENTS", "卡片建议至少要有的净优势（¢）", "0～50，模型误差之上"),
     ("PREDICT_TRADE_USD", "卡片吃单按多少美元走盘口", "1～1000000"),
     ("SIM_SECONDS", "检查订单的频率（秒）", "3～60：每隔这么多秒看一轮盘口——决定挂单 / 吃单 / 撤单，并读回真实订单的状态（成交、撤单）；越小反应越快、请求越多"),
-    ("PREDICT_POLL_SECONDS", "盘口刷新间隔（秒）", "3～3600：每隔这么多秒读一遍 Predict 的订单簿；设得比检查频率还短没有意义，太短会被 Predict 限流（429，之后 20 秒内不再请求）"),
+    ("PREDICT_POLL_SECONDS", "盘口 REST 补读间隔（秒）", "1～3600：每隔这么多秒用 REST 读一遍热门市场的订单簿（盘口推送正常时它只是兜底和核对，推送到的变化立刻生效）；太短会被 Predict 限流（429，之后 20 秒内不再请求任何盘口），不建议低于 2"),
     ("PREDICT_COLD_POLL_SECONDS", "冷门盘口刷新间隔（秒）", "3～80：指数/个股日涨跌、有单的市场、距吃单 5¢ 以内或够挂单门槛的市场每轮都刷；其余（几十个阶梯档位）每隔这么多秒才刷一次，省下的请求让关键市场更快"),
     ("LIVE_MAX_ORDER_USD", "真实交易单笔上限（$）", "1～1000000：吃单按封顶价 × 份数算；容不下想买的份数时只买上限之内的份数"),
     ("LIVE_MAX_OPEN_USD", "持仓 + 挂单上限（$）", "1～100000000：容不下想买的份数时只买剩余额度之内的份数"),
@@ -806,7 +806,7 @@ class Config:
             predict=e.get("PREDICT", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
-            predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 10, 3, 3600),
+            predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 10, 1, 3600),
             predict_ws=e.get("PREDICT_WS", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict_cold_poll=bounded_int(e, "PREDICT_COLD_POLL_SECONDS", 30, 3, 80),
             predict_ref=parse_ref_code(e.get("PREDICT_REF_CODE", "B00EA")),
@@ -5656,7 +5656,8 @@ class PredictStream:
         self.heartbeats = 0
         self.books = 0                # pushed books applied
         self.dropped = 0              # pushes dropped: unreadable, an older version, a market with no book of its own to put them in
-        self.repeated = 0             # the same book (version) pushed again — the server does so every second or so: its age restarts
+        self.repeated = 0             # the same levels pushed again — the server does so every second or so: the book's age restarts
+        self.lag: list[int] = []      # ms from the server's stamp on a pushed book (updateTimestampMs) to its arrival, the last 300
         self.replaced = 0             # pushed books a later REST read replaced...
         self.mismatch = 0             # ...of which with another top of book
         self.last_mismatch = ""
@@ -5845,10 +5846,6 @@ class PredictStream:
             if version < self.versions.get(mid, -1):
                 self.dropped += 1  # out of order
                 return
-            if version == self.versions.get(mid, -1):
-                self.repeated += 1  # sent again (1.104.1: 7427 of them in six minutes once read as dropped): the book is as current as it was
-                self.refresh_age(key, level, mid)
-                return
             self.versions[mid] = int(version)
         bids = predict_levels(data.get("bids"), True) if isinstance(data.get("bids"), list) else None
         asks = predict_levels(data.get("asks"), False) if isinstance(data.get("asks"), list) else None
@@ -5861,6 +5858,17 @@ class PredictStream:
         if old is None or str(old.market_id) != str(mid):
             self.dropped += 1  # no book of this market to put the levels in: the REST read comes first, or the key moved on
             return
+        if (bids is None or bids == old.bids) and (asks is None or asks == old.asks):
+            # the same levels again (the server re-sends every second or so): the book is as current as it was. The levels
+            # decide, not the version (1.104.4): with the version deciding, 7,427 pushes in six minutes were read as repeats
+            # while the REST read found the book changed under them — the version does not count every change
+            self.repeated += 1
+            self.refresh_age(key, level, mid)
+            return
+        stamp = data.get("updateTimestampMs")
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and 0 < stamp <= now_ms + 60_000:
+            self.lag.append(now_ms - int(stamp))
+            del self.lag[:-300]
         book = dataclasses.replace(old, bids=old.bids if bids is None else bids, asks=old.asks if asks is None else asks, fetched_ms=now_ms)
         if level:
             feed.ladder_rows[key][mid] = dataclasses.replace(row, book=book, error="")
@@ -5874,6 +5882,13 @@ class PredictStream:
         self.live.add(mid)
         self.books += 1
         feed.updated(key)
+
+    def lag_text(self) -> str:
+        """The push's lag — the server's stamp on a book to its arrival — over the last pushes applied, for /diag."""
+        if not self.lag:
+            return ""
+        ordered = sorted(self.lag)
+        return f"，推送延迟中位 {ordered[len(ordered) // 2]} ms、最大 {ordered[-1]} ms（最近 {len(ordered)} 次更新）"
 
     def refresh_age(self, key: str, level: bool, mid: str) -> None:
         """A market's stored book is as current as it was (its book pushed again unchanged): its age restarts."""
@@ -5921,7 +5936,8 @@ class PredictStream:
             return "关（PREDICT_WS=off）" if self.feed.config.predict else "关"
         if self.connected:
             text = (f"已连接 {int(time.monotonic() - self.connected_at)} 秒（第 {self.connects} 次），订阅 {len(self.subscribed)} 个市场、"
-                    f"在推 {len(self.live)} 个，收到盘口 {self.books} 次、心跳 {self.heartbeats} 次，最近一帧 {time.monotonic() - self.last_frame:.0f} 秒前")
+                    f"在推 {len(self.live)} 个，收到盘口 {self.books} 次、心跳 {self.heartbeats} 次，最近一帧 {time.monotonic() - self.last_frame:.0f} 秒前"
+                    + self.lag_text())
         elif self.connects:
             text = f"未连接（上次断开：{brief_error(self.closed_why, 60)}；{self.backoff:.0f} 秒后重连）"
         else:
@@ -5930,7 +5946,7 @@ class PredictStream:
             mid, (why, _) = next(iter(self.refused.items()))
             text += f"；被拒绝 {len(self.refused)} 个主题（{mid}：{brief_error(why, 40)}）"
         if self.repeated:
-            text += f"；重复 {self.repeated} 帧（同一版本的盘口再推一次，只当作还活着）"
+            text += f"；重复 {self.repeated} 帧（档位没变的盘口再推一次，只当作还活着）"
         if self.dropped:
             text += f"；丢弃 {self.dropped} 帧"
         if self.replaced:
@@ -9143,7 +9159,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREDICT_MIN_EDGE_CENTS": {"kind": "number", "group": "高级", "presets": ["0", "1", "2", "3", "5"], "unit": "¢"},
     "PREDICT_TRADE_USD": {"kind": "number", "group": "高级", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
     "SIM_SECONDS": {"kind": "number", "group": "高级", "presets": ["3", "5", "10", "15"], "unit": "秒"},
-    "PREDICT_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["3", "5", "10", "15", "30"], "unit": "秒"},
+    "PREDICT_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["1", "2", "3", "5", "10", "30"], "unit": "秒"},
     "PREDICT_COLD_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["10", "15", "30", "60", "80"], "unit": "秒"},
     "LIVE_TAKER_WAIT_SECONDS": {"kind": "number", "group": "高级", "presets": ["15", "30", "60", "120"], "unit": "秒"},
     "LIVE_TAKER_PRICE": {"kind": "choice", "group": "高级", "options": [["book", "盘口价"], ["cap", "封顶价"]]},

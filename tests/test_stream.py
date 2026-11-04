@@ -81,19 +81,21 @@ async def run():
     assert book.bids == ((D("0.81"), D("110.5")), (D("0.80"), D("400"))) and book.asks == ((D("0.85"), D("12")),), book
     assert book.fetched_ms >= NOW and book.slug == HSI_SLUG and book.fee_bps == 200 and book.market_id == "7" and book.title == "HSI up?"
     assert seen == ["HSI"] and stream.books == 1 and stream.live == {"7"} and feed.book_asked["HSI"] > 0 and stream.versions["7"] == 5 and "HSI" in stream.pushed
-    # an older or repeated version is dropped; a one-sided message replaces that side only; object levels are read too
+    # an older version is dropped; the same version with other levels is an update all the same (1.104.4: the version does
+    # not count every change); a one-sided message replaces that side only; object levels are read too
     ws.push({"type": "M", "topic": "predictOrderbook/7", "data": {"version": 4, "bids": [["0.5", "1"]], "asks": [["0.6", "1"]]}})
     ws.push({"type": "M", "topic": "predictOrderbook/7", "data": {"version": 5, "bids": [["0.5", "1"]], "asks": [["0.6", "1"]]}})
-    ws.push({"type": "M", "topic": "predictOrderbook/7", "data": {"version": 6, "asks": [{"price": "0.84", "size": "20"}]}})
+    ws.push({"type": "M", "topic": "predictOrderbook/7", "data": {"version": 6, "asks": [{"price": "0.84", "size": "20"}], "updateTimestampMs": NOW - 120}})
     await asyncio.sleep(0.05)
     book = feed.books["HSI"]
-    assert stream.dropped == 1 and stream.repeated == 1 and book.bids[0] == (D("0.81"), D("110.5")) and book.asks == ((D("0.84"), D("20")),) and stream.books == 2, (stream.dropped, book)
-    # the repeat (1.104.1: the server re-sends an unchanged book every second or so) restarts the book's age, nothing else
+    assert stream.dropped == 1 and stream.repeated == 0 and book.bids[0] == (D("0.5"), D("1")) and book.asks == ((D("0.84"), D("20")),) and stream.books == 3, (stream.dropped, book)
+    assert len(stream.lag) == 2 and all(0 <= x < 5_000 for x in stream.lag) and "推送延迟中位" in stream.line() and "（最近 2 次更新）" in stream.line(), (stream.lag, stream.line())
+    # the same levels again (1.104.1: the server re-sends an unchanged book every second or so) restart the book's age, nothing else
     feed.books["HSI"] = m.dataclasses.replace(feed.books["HSI"], fetched_ms=NOW - 100_000)
-    ws.push({"type": "M", "topic": "predictOrderbook/7", "data": {"version": 6, "bids": [["0.5", "1"]], "asks": [["0.6", "1"]]}})
+    ws.push({"type": "M", "topic": "predictOrderbook/7", "data": {"version": 6, "bids": [["0.5", "1"]], "asks": [["0.84", "20"]]}})
     await asyncio.sleep(0.05)
-    assert stream.repeated == 2 and feed.books["HSI"].fetched_ms >= NOW and feed.books["HSI"].asks == ((D("0.84"), D("20")),) and stream.books == 2
-    assert "重复 2 帧" in stream.line() and "丢弃 1 帧" in stream.line()
+    assert stream.repeated == 1 and feed.books["HSI"].fetched_ms >= NOW and feed.books["HSI"].asks == ((D("0.84"), D("20")),) and stream.books == 3
+    assert "重复 1 帧" in stream.line() and "丢弃 1 帧" in stream.line() and len(stream.lag) == 2  # a repeat is not an update: no lag of its own
     # a ladder level: its row's book, the ladder republished, the express lane told
     ws.push({"type": "M", "topic": "predictOrderbook/41", "data": {"version": 1, "bids": [["0.12", "30"]], "asks": [["0.19", "40"]]}})
     await asyncio.sleep(0.05)
@@ -105,7 +107,7 @@ async def run():
     ws.push({"type": "M", "topic": "predictOrderbook/99", "data": {"bids": [], "asks": []}})
     ws.push("not json")
     await asyncio.sleep(0.05)
-    assert stream.books == 3 and stream.dropped == 3 and seen == ["HSI", "HSI", "BTC-HIT-10"], (stream.books, stream.dropped, seen)
+    assert stream.books == 4 and stream.dropped == 3 and seen == ["HSI", "HSI", "HSI", "BTC-HIT-10"], (stream.books, stream.dropped, seen)
     # the heartbeat: echoed with the server's own data; the pushed books' age restarts, a market never pushed is left alone
     feed.books["HSI"] = m.dataclasses.replace(feed.books["HSI"], fetched_ms=NOW - 100_000)
     feed.ladder_rows["BTC-HIT-10"]["41"] = m.dataclasses.replace(row, book=m.dataclasses.replace(row.book, fetched_ms=NOW - 100_000))
@@ -124,11 +126,11 @@ async def run():
     assert feed.ladder_rows["BTC-HIT-10"]["41"].book.bids == ((D("0.12"), D("30")),), "a push for a market let go is not applied"
     # a REST read replacing a pushed book is compared (/diag); one replacing a REST book is not
     stream.note_rest("HSI", feed.books["HSI"], m.dataclasses.replace(feed.books["HSI"], asks=((D("0.86"), D("1")),)))
-    assert stream.replaced == 1 and stream.mismatch == 1 and stream.last_mismatch == "HSI：推送 买1 81.0¢ 卖1 84.0¢，REST 买1 81.0¢ 卖1 86.0¢", stream.last_mismatch
+    assert stream.replaced == 1 and stream.mismatch == 1 and stream.last_mismatch == "HSI：推送 买1 50.0¢ 卖1 84.0¢，REST 买1 50.0¢ 卖1 86.0¢", stream.last_mismatch
     stream.note_rest("HSI", feed.books["HSI"], feed.books["HSI"])
     assert stream.replaced == 1 and "HSI" not in stream.pushed
     line = stream.line()
-    assert "订阅 1 个市场、在推 1 个" in line and "收到盘口 3 次、心跳 1 次" in line and "被拒绝 1 个主题（8：invalid_topic" in line and "重复 2 帧" in line and "丢弃 4 帧" in line \
+    assert "订阅 1 个市场、在推 1 个" in line and "收到盘口 4 次、心跳 1 次" in line and "被拒绝 1 个主题（8：invalid_topic" in line and "重复 1 帧" in line and "丢弃 4 帧" in line \
         and "REST 覆盖推送 1 次，其中盘口不同 1 次" in line, line
     # the connection drops: made anew after the backoff, the subscriptions sent afresh, the versions and the live set forgotten
     stream.refused.clear()
