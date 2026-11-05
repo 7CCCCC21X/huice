@@ -100,6 +100,11 @@ async def run():
     assert trades[f"{KOSPI_SLUG}|down|挂#1"]["status"] == "cancelled" and trades[f"{KOSPI_SLUG}|down|挂#1"]["withdrawn"]["why"] == "已到结束时间，等结果出来：不开新单，挂单撤掉"
     # the list rows are light (1.59.1): the whole record comes when a trade is opened (?id=) and for the exports (?full=1)
     assert all("entry" not in t and "fills" not in t for t in data["trades"]) and data["more"] == 0 and data["mode"] == "paper" and data["history"] == 300
+    # 1.117.1: when a record last changed state — a settled one at its settlement, a resting one with no fill at its order
+    by_id = {t["id"]: t for t in data["trades"]}
+    assert all(t["updated"] == t["settled"] >= t["opened"] for t in data["trades"] if t["status"] == "settled" and t["settled"]), by_id
+    assert by_id["hype-flip#1|up|挂"]["updated"] == by_id["hype-flip#1|up|挂"]["opened"]
+    assert m.trade_updated({"opened": 5, "fills": [{"at": 9}], "live": {"events": [{"at": 7}], "cancel_done_ms": 8}}) == 9 and m.trade_updated({}) == 0
     assert [r["name"] for r in data["recent"]] == ["今天", "近 7 天"] and data["recent"][0]["settled"] == data["total"]["settled"] > 0
     # 1.80.0: the daily summary — per day the records were opened on, by kind and way under each, and 累计
     s = data["summary"]
@@ -428,8 +433,10 @@ async def browser_check(bot, data):
         assert await page.locator("#list .tr").count() == 1  # the KOSPI maker: no seller ever reached it
         await page.click("#filters [data-f=rest]")
         assert await page.locator("#list .tr").count() == 1 and "⏳ 挂 20.0¢，最低卖价 30.0¢（高出 10.0¢）" in await page.inner_text("#list .tr .t3")
-        assert await page.locator("#filters [data-f=open]").count() == (1 if any(t["status"] == "filled" for t in data["trades"]) else 0)
+        assert await page.locator("#filters [data-f=open]").count() == (1 if any(t["status"] == "filled" or (t["status"] == "resting" and t["shares"] > 0) for t in data["trades"]) else 0)
         await page.click("#filters [data-f=all]")
+        # 1.117.1: a row says when the record last changed (the settlement here), after its order time
+        assert "更新 " in await page.locator("#list .tr:has-text('恒生指数 挂涨') .t2").inner_text()
         await page.click("#filters [data-f=taker]")
         assert await page.locator("#list .tr").count() == 2
         await page.click("#filters [data-f=taker]")  # the same chip again: off

@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.117.0"
+VERSION = "1.117.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -9771,6 +9771,17 @@ def market_driver(kind: str, key: str, settle: dict | None = None, item: str = "
     return symbol, symbol.removesuffix("USDT")
 
 
+def trade_updated(trade: Mapping) -> int:
+    """When a record last changed state (ms): the latest of its order, its fills, its real order's events (a cancel,
+    an answer) and its settlement. The review page's rows say it (1.117.1), as Predict's positions page sorts by it."""
+    ats = [int(trade.get(k) or 0) for k in ("opened", "filled", "settled")]
+    ats += [int(f.get("at") or 0) for f in (trade.get("fills") or ()) if isinstance(f, Mapping)]
+    st = trade.get("live") if isinstance(trade.get("live"), Mapping) else {}
+    ats += [int(e.get("at") or 0) for e in (st.get("events") or ()) if isinstance(e, Mapping)]
+    ats.append(int(st.get("cancel_done_ms") or 0))
+    return max(ats)
+
+
 def trade_driver(trade: dict) -> tuple[str, str]:
     """A paper trade's driver: as saved at the order, else derived (records from before it was kept)."""
     if trade.get("driver"):
@@ -11820,7 +11831,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
 const CENT_KEYS=new Set(["fair_up"]);
-const STATES=[["all","全部",t=>true],["open","持仓",t=>t.status==="filled"],["rest","挂单中",t=>t.status==="resting"],["done","已结算",t=>t.status==="settled"],
+const STATES=[["all","全部",t=>true],["open","持仓",t=>t.status==="filled"||(t.status==="resting"&&t.shares>0)],["rest","挂单中",t=>t.status==="resting"],["done","已结算",t=>t.status==="settled"],  // 持仓: a partly filled resting order holds a position too (1.117.1)
   ["bad","结果不一致",t=>t.confirm==="mismatch"],["exp","未成交/撤单",t=>t.status==="expired"||t.status==="cancelled"]];
 const PAGE=50;  // rows shown at a time; the rest on request
 let ana=null,verAll=false;  // ana: the summary and analysis over the filter (journal.json?analysis=1&…), when one is on
@@ -11917,6 +11928,7 @@ function row(t){
   if(data.live&&!t.real)t1.append(" ",$("span","tag","模拟"));if(t.deep)t1.append(" ",$("span","tag","低价挂单"));
   l.append(t1);
   const bits=[hm(t.opened),t.maker?"挂单":"吃单","优势 "+sg(t.edge)];
+  if(t.updated&&t.updated-t.opened>60000)bits.splice(1,0,"更新 "+(dayKey(t.updated)===dayKey(t.opened)?hm(t.updated):mdhm(t.updated)));  // 1.117.1: the last fill, cancel or settlement
   if(t.maker&&t.shares>0)bits.push("成交时 "+sg(perShare(t)));
   if(t.order_id)bits.push("#"+t.order_id);if(t.cost_confirmed===false&&t.shares>0)bits.push("成本待对账");
   l.append($("div","t2",bits.join(" · ")));
@@ -18422,14 +18434,15 @@ class Bot:
     JOURNAL_HISTORY = 300  # finished trades the review page lists at first; the older ones come on request (journal.json?all=1)
     JOURNAL_LIGHT = ("id", "market", "slug", "item", "kind", "key", "card", "side", "label", "maker", "deep", "sweep", "floor", "price", "shares", "order",
                      "unfilled", "opened", "filled", "settled", "status", "confirm", "payout", "edge", "fair", "note", "driver_name",
-                     "text", "state", "pnl", "expected_fill", "url", "wait", "legacy", "cost_confirmed", "withdrawn", "real", "limit", "mark", "unrealized")
+                     "text", "state", "pnl", "expected_fill", "url", "wait", "legacy", "cost_confirmed", "withdrawn", "real", "limit", "mark", "unrealized",
+                     "updated")
 
     def journal_row(self, tid: str, t: dict, mk: "SimMarket | None", now_ms: int, full: bool) -> dict:
         """One trade for the review page: a list row (JOURNAL_LIGHT — what a line and the filters need, a few hundred
         bytes) or, when ``full``, the whole record (entry and fill snapshots, sources, settlement evidence, the real
         order's events, version), fetched when the trade is opened and for the exports."""
         st = t.get("live") if isinstance(t.get("live"), dict) else {}
-        row = {**t, "id": tid, "driver_name": trade_driver(t)[1], "card": card_of(t), "text": sim_status(t), "state": sim_state(t),
+        row = {**t, "id": tid, "driver_name": trade_driver(t)[1], "card": card_of(t), "text": sim_status(t), "state": sim_state(t), "updated": trade_updated(t),
                "pnl": (t["payout"] - t["price"]) * t["shares"] if t["status"] == "settled" else None,
                "expected_fill": sim_fill_expectation(t) if float(t.get("shares") or 0) else 0.0, "url": self.sim_url(t),
                "wait": self.sim_wait(t, mk, now_ms), "real": bool(st),
