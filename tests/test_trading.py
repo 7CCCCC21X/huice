@@ -976,6 +976,37 @@ async def run():
     assert dust["status"] == "filled" and abs(dust["unfilled"] - 0.01) < 1e-6 and ("remove", ["101"]) in dfake.calls, dust
     assert dust["live"]["cancel_why"] == "剩 0.01 份不到 1 份的零头，撤掉不再等（已成交 99.99 份照常持有）" and "零头" in dust["note"], (dust["live"]["cancel_why"], dust["note"])
 
+    # --- 1.119.0: fills that landed as an order was ending, read later: the orders that ended with shares unfilled are set against the
+    # account's positions once a minute (not within 15 s of their end) — the order's own record first, else the position's excess is
+    # taken as filled on the newest such order
+    async def late_case(by_record: bool):
+        lbot = make_bot(SIM_MAKER_MIN_BID="100", SIM_MAKER_EXIT_CENTS="5", SIM_MAKER_SESSION="on", SIM_WAYS="maker")
+        await lbot.live_prepare(); lfake = lbot.live.api
+        await lbot.live_prefetch(NOW)
+        await step(lbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+        assert lbot.sim_trades()[mtid]["live"]["order_id"] == "101"
+        assert "Predict 确认撤掉 1 笔" in await lbot.cmd_live(req("cancel", "all"))  # the cancel's read showed nothing filled
+        gone = next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")
+        assert gone["status"] == "cancelled" and gone["shares"] == 0 and gone["live"]["state"] == "done", gone
+        want = gone["live"]["want"]
+        lfake.positions_rows = [{"id": "p1", "market": {"id": 101, "title": "恒生指数"}, "outcome": {"name": want["outcome"], "indexSet": want["index_set"], "onChainId": want["token"]},
+                                 "amount": str(10 * WEI)}]
+        if by_record:
+            lfake.closed["101"]["amountFilled"] = str(10 * WEI)  # the order's record shows the fill when read again
+        await step(lbot, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000))  # within the grace and the minute: not yet
+        assert next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] == 0
+        await step(lbot, NOW + 70_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 70_000))
+        late = next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")
+        assert late["status"] == "filled" and abs(late["shares"] - 10) < 1e-9 and abs(late["unfilled"] - 90) < 1e-9 and "订单结束后补记" in late["note"], late
+        how = next(e["what"] for e in late["live"]["events"] if e["what"].startswith("结束后核对持仓："))
+        assert how == ("结束后核对持仓：结束后再读订单记录，读到成交 10 份（累计 10/100）" if by_record
+                       else "结束后核对持仓：账户在这一边的持仓比记录多 10 份、订单记录没显示：按成交 10 份补记（累计 10/100）"), how
+        assert len(late["fills"]) == 1 and late["fills"][0]["shares"] == 10 and abs(lbot.live_reserved(late) - 10 * late["price"]) < 1e-9
+        await step(lbot, NOW + 140_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 140_000))  # explained now: nothing more is adopted
+        assert abs(next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] - 10) < 1e-9
+    await late_case(False)
+    await late_case(True)
+
     # --- execution safety: reserved until Predict's final word, cancels confirmed, unknown results reconciled, the pre-send check
     sbot = make_bot(SIM_WAYS="both")
     await sbot.live_prepare()

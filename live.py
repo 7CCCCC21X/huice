@@ -970,6 +970,7 @@ class LiveBot(core.Bot):
         self.live_last_signin = -1e9
         self.live_positions: tuple[list[dict], float] = ([], 0.0)
         self.live_positions_cut = False  # the last positions read for a reconciliation came cut at the page cap
+        self.live_late_checked = -1e9    # when the ended orders were last set against the account's positions (live_late_fills)
         self.live_errors: list[str] = []  # the latest failures, newest last, for /live
         self.live_wanted: set[str] = set()  # market ids a decision waited for (details read next step, whatever the edge)
         self.live_market_retry: dict[str, float] = {}  # market id -> monotonic time its details are asked for again after a failure
@@ -1742,6 +1743,10 @@ class LiveBot(core.Bot):
             cancelling = [tid for tid, t in active.items() if t["live"].get("state") == "cancelling"]
             await self.live_sync_orders(active, now_ms)  # with nothing in flight the list is still read now and then: orders this bot did not place
             await self.live_requote_freed(cancelling, now_ms)  # the slots the confirmed cancels freed: quoted again now, not next step
+        try:
+            await self.live_late_fills(now_ms)  # 1.119.0: an order that ended with shares unfilled, against the account's positions
+        except Exception as error:
+            self.live_note_error(f"结束订单核对持仓失败：{core.clean_error(error) or type(error).__name__}")
         if (self.config.live_auto_redeem and time.monotonic() - self.live_last_redeem >= self.LIVE_REDEEM_SECONDS
                 and (self.live_redeem_task is None or self.live_redeem_task.done())):
             self.live_last_redeem = time.monotonic()
@@ -1896,6 +1901,68 @@ class LiveBot(core.Bot):
                          note=f"真实成交 {after:g}/{order:g} 份（撤单确认后读到），其余 {max(order - after, 0.0):g} 份{st.get('cancel_why') or '已撤'}")
             st["events"].append({"at": now_ms, "what": f"撤单确认后读到成交 {after - before:g} 份（累计 {after:g}/{order:g}）"})
         self.sim_save([(tid, trade)])
+
+    LIVE_LATE_FILLS_MS = 60_000               # live_late_fills runs at most this often
+    LIVE_LATE_FILLS_WINDOW_MS = 2 * 3_600_000  # ...over the orders that ended within this long
+    LIVE_LATE_FILLS_GRACE_MS = 15_000          # ...and not before this long after their end: the positions list follows the matching a little late
+
+    async def live_late_fills(self, now_ms: int) -> None:
+        """Fills that landed as an order was ending and were not read then (1.119.0: a 300-share KOSPI order withdrawn
+        with 0 filled as far as the cancel's read said, while the account held 299.99 shares of it). The records whose
+        real order ended (withdrawn, or kept its position with some shares unfilled) within LIVE_LATE_FILLS_WINDOW_MS
+        are set against the account's positions: shares the account holds on an outcome beyond what its records
+        explain (live_unexplained) are read from the order's own record first, and what that still does not show is
+        taken as filled on the newest such order, at most its unfilled count — costed as a fill of that order (a
+        maker's price; a taker's limit, 待对账), noted on the record and announced. Once a minute; the newest order on
+        an outcome takes the excess, an older one is looked at the next pass."""
+        if now_ms - self.live_late_checked < self.LIVE_LATE_FILLS_MS:
+            return
+        self.live_late_checked = now_ms
+        trades = self.sim_trades()
+        ended = [(tid, t) for tid, t in trades.items()
+                 if isinstance(t.get("live"), dict) and t["live"].get("state") == "done" and t["live"].get("order_id")
+                 and t.get("status") in {"cancelled", "filled"} and not t.get("final")
+                 and float(t.get("order") or 0) - float(t.get("shares") or 0) > 1e-9
+                 and self.LIVE_LATE_FILLS_GRACE_MS <= now_ms - core.trade_updated(t) <= self.LIVE_LATE_FILLS_WINDOW_MS]
+        ended.sort(key=lambda kv: core.trade_updated(kv[1]), reverse=True)
+        seen: set[tuple[str, int]] = set()
+        for tid, t in ended:
+            st = t["live"]
+            want = st.get("want") or {}
+            key = (str(want.get("market_id") or t.get("market_id") or ""), int(want.get("index_set") or 0))
+            if not key[0] or not key[1] or key in seen:
+                continue
+            seen.add(key)
+            extra = await self.live_unexplained(t)  # the account's shares on the outcome beyond the other records' (this one's own included)
+            if extra is None:
+                return  # the positions could not be read, or came cut: nothing is adopted on a guess
+            before, order = float(t.get("shares") or 0), float(t.get("order") or 0)
+            excess = extra - before
+            if excess <= 0.01:
+                continue
+            row = None
+            with contextlib.suppress(Exception):
+                row = await self.live.api.order(str(st["order_id"]), str(st.get("hash") or ""))
+            if isinstance(row, dict):
+                self.live_apply(tid, t, row, None, now_ms)
+            after = float(t.get("shares") or 0)
+            if after > before + 1e-9:
+                how = f"结束后再读订单记录，读到成交 {after - before:g} 份（累计 {after:g}/{order:g}）"
+            else:
+                adopt = min(excess, order - after)
+                if adopt <= 0.01:
+                    continue
+                self.live_apply(tid, t, {"status": str(st.get("final") or "closed").upper(), "amount": str(to_wei(order)),
+                                         "amountFilled": str(to_wei(after + adopt))}, None, now_ms)
+                after = float(t.get("shares") or 0)
+                how = f"账户在这一边的持仓比记录多 {excess:g} 份、订单记录没显示：按成交 {adopt:g} 份补记（累计 {after:g}/{order:g}）"
+            if t["status"] not in {"settled", "expired"} and after > 1e-9:
+                t.update(status="filled", unfilled=max(order - after, 0.0),
+                         note=f"真实成交 {after:g}/{order:g} 份（订单结束后补记），其余 {max(order - after, 0.0):g} 份{st.get('cancel_why') or '已结束'}")
+            st["events"].append({"at": now_ms, "what": "结束后核对持仓：" + how})
+            self.live_notify(f"📌 补记成交：{t['item']} {t['label']} {core.cents(float(t['price']))}：{how}（订单 #{st['order_id']}，请在 Predict 核对）",
+                             key=f"latefill:{st['order_id']}")
+            self.sim_save([(tid, t)])
 
     async def live_fills_wait(self) -> None:
         """Every fills read in flight (live_fills_later), waited for: the step's sync and the tests."""

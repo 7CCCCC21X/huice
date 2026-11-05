@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.118.2"
+VERSION = "1.119.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -9779,8 +9779,7 @@ def trade_updated(trade: Mapping) -> int:
     ats = [int(trade.get(k) or 0) for k in ("opened", "filled", "settled")]
     ats += [int(f.get("at") or 0) for f in (trade.get("fills") or ()) if isinstance(f, Mapping)]
     st = trade.get("live") if isinstance(trade.get("live"), Mapping) else {}
-    ats += [int(e.get("at") or 0) for e in (st.get("events") or ()) if isinstance(e, Mapping)]
-    ats.append(int(st.get("cancel_done_ms") or 0))
+    ats += [int(e.get("at") or 0) for e in (st.get("events") or ()) if isinstance(e, Mapping)]  # (cancel_done_ms is on the wall clock: not mixed in)
     return max(ats)
 
 
