@@ -662,6 +662,20 @@ async def samples():
     assert by["x-updown-15m-1"]["result"] == 1.0 and by["x-updown-15m-1"]["final"] == 101.0
     assert by["y-updown-15m-2"]["result"] is None and abs(by["y-updown-15m-2"]["move"] - math.log(1.0002)) < 1e-12
     assert "测试 15分涨跌：2 个市场、2 条样本，已有结果 1 个市场 / 1 条（另 1 个市场终点贴着起点，结果以 Predict 为准、不评分）" in "\n".join(bot.window_report())
+    # 1.115.1: a sample is judged with its own card's tie band — the BTC spot window's is 0.01%, so an end 0.02% up is 涨 there
+    # (a tie on an index window); one judged a tie with the index band before gets its result when the samples are read
+    assert bot.updowns["BTC-15M"].TIE == D("0.0001") and bot.window_tie({"key": "BTC-15M"}) == 0.0001 and bot.window_tie({"key": "X"}) == 0.0005
+    store.put("wsample:btc-updown-15m-9:840", {"t": T0 - 3_600_000, "slug": "btc-updown-15m-9", "key": "BTC-15M", "item": "b9", "kind": "window", "card": "现货测试 15分涨跌",
+                                               "start": T0 - 3_600_000, "end": T0 - 2_700_000, "left": 840, "up": 0.6, "sigma": 0.5, "tau": 2.7e-5, "line": 100.0})
+    store.put("updown:btc-updown-15m-9:end", {"open": T0 - 2_760_000, "close": "100.02"})
+    store.put("wsample:btc-updown-15m-8:840", {"t": T0 - 7_200_000, "slug": "btc-updown-15m-8", "key": "BTC-15M", "item": "b8", "kind": "window", "card": "现货测试 15分涨跌",
+                                               "start": T0 - 7_200_000, "end": T0 - 6_300_000, "left": 840, "up": 0.4, "sigma": 0.5, "tau": 2.7e-5, "line": 100.0,
+                                               "final": 99.97, "move": math.log(0.9997), "result": None})
+    by = {r["slug"]: r for r in bot.window_rows()}
+    assert by["btc-updown-15m-9"]["result"] == 1.0 and by["btc-updown-15m-8"]["result"] == 0.0 and store.get("wsample:btc-updown-15m-8:840")["result"] == 0.0
+    assert by["y-updown-15m-2"]["result"] is None  # the index window's tie stays Predict's call
+    assert "现货测试 15分涨跌：2 个市场、2 条样本，已有结果 2 个市场 / 2 条\n" in "\n".join(bot.window_report()) + "\n"
+    store.delete_keys(["wsample:btc-updown-15m-9:840", "wsample:btc-updown-15m-8:840", "updown:btc-updown-15m-9:end"])
     # the CSV: a row a sample, the result columns filled where there is one
     text = bot.window_csv()
     assert text.startswith("\ufeff")

@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.115.0"
+VERSION = "1.115.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -14385,16 +14385,20 @@ class Bot:
         return row
 
     @staticmethod
-    def window_settle_row(row: dict, final: float) -> bool:
+    def window_settle_row(row: dict, final: float, tie: float = float(IndexUpDownMarket.TIE)) -> bool:
         """A sample gets its market's result: the final price, the move from the line (ln), and 涨's payout — 1 / 0 / ½, or
-        none on an index window whose end is within the tie band (IndexUpDownMarket.TIE: Predict's call, unknown here).
-        False when the row has no line to measure from."""
+        none on a window whose end is within its card's tie band (``tie``, the card's TIE: Predict's call, unknown here;
+        1.115.1: a spot window's 0.01%, the index windows' 0.05% before). False when the row has no line to measure from."""
         line = float(row.get("line") or 0)
         if line <= 0 or final <= 0:
             return False
-        tie = row.get("kind") == "window" and abs(final - line) <= line * float(IndexUpDownMarket.TIE)
-        row.update(final=final, move=math.log(final / line), result=None if tie else 1.0 if final > line else 0.0 if final < line else 0.5)
+        near = row.get("kind") == "window" and abs(final - line) <= line * tie
+        row.update(final=final, move=math.log(final / line), result=None if near else 1.0 if final > line else 0.0 if final < line else 0.5)
         return True
+
+    def window_tie(self, row: Mapping) -> float:
+        """The tie band a sample is judged with: its card's TIE (by the sample's key), the index windows' when the card is not listed."""
+        return float(getattr(self.updowns.get(str(row.get("key") or "")), "TIE", IndexUpDownMarket.TIE))
 
     def window_resolve(self, mkt: UpDownMarket, spec: UpDownSpec, final: D) -> None:
         """The samples of a market just ended (updown_roll) get its result."""
@@ -14407,7 +14411,7 @@ class Bot:
             if not row.get("line"):  # sampled before the line was known: the kept start
                 start = self.store.get(f"updown:{spec.slug}:start")
                 row["line"] = float(start.get("close") or 0) if isinstance(start, dict) else 0.0
-            if self.window_settle_row(row, float(final)):
+            if self.window_settle_row(row, float(final), float(getattr(mkt, "TIE", IndexUpDownMarket.TIE))):
                 self.store.put(key, row)
         self.sigma_calib_cache.pop(spec.key, None)  # the card's factor is measured again on the next refresh (sigma_calib)
         self.sigma_calib_cache.pop(CRYPTO_DAY_CALIB, None)
@@ -14454,8 +14458,13 @@ class Bot:
                         start = self.store.get(f"updown:{row.get('slug')}:start")
                         row["line"] = float(start.get("close") or 0) if isinstance(start, dict) else 0.0
                     with contextlib.suppress(ValueError, TypeError, decimal.InvalidOperation):
-                        if self.window_settle_row(row, float(end["close"])):
+                        if self.window_settle_row(row, float(end["close"]), self.window_tie(row)):
                             self.store.put(key, row)
+            elif row.get("result") is None and row.get("kind") == "window" and float(row.get("final") or 0) > 0:
+                # judged a tie with the index windows' band before 1.115.1: a spot window's own band is narrower, so its result may be known
+                with contextlib.suppress(ValueError, TypeError):
+                    if self.window_settle_row(row, float(row["final"]), self.window_tie(row)) and row.get("result") is not None:
+                        self.store.put(key, row)
             rows.append(row)
         rows.sort(key=lambda r: (int(r.get("t") or 0), str(r.get("slug") or "")))
         return rows
