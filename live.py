@@ -962,6 +962,7 @@ class LiveBot(core.Bot):
         self.live_redeem_failed: dict[str, float] = {}      # position key -> monotonic time its redeem failed
         self.live_gas_noted = -1e9
         self.live_step_ms: dict[str, int] = {}  # the last step's phases (预取 / 决策 / 下单 / 同步), for /diag
+        self.live_fill_tasks: set = set()   # the fills reads of orders confirmed removed, beside the lane (live_fills_later)
         self.live_placing: set[str] = set()     # records whose order is being sent right now: the step and the express lane never both
         self.live_last_signin = -1e9
         self.live_positions: tuple[list[dict], float] = ([], 0.0)
@@ -1829,15 +1830,18 @@ class LiveBot(core.Bot):
                 self.sim_save([(tid, trade)])
 
     async def live_cancel_blind(self, active: dict[str, dict], now_ms: int) -> None:
-        """The open list could not be read: the withdrawn records whose order id is known still get their cancel sent now
-        (remove_orders needs no list). Each is saved as it changes; a failure is noted on the record, never raised."""
-        markets = {}
-        with contextlib.suppress(Exception):
-            markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
-        for tid, trade in active.items():
+        """The open list could not be read (or the express lane cannot wait for one): the withdrawn records whose order id
+        is known get their cancels sent now, side by side (remove_orders needs no list; the API gate bounds them). Each
+        is saved as it changes; a failure is noted on the record, never raised."""
+        markets: dict[str, core.SimMarket] = {}
+        with contextlib.suppress(Exception):  # the cancels' own cards alone (1.111.0: every card used to be priced for this)
+            for key in sorted({str(t.get("key") or "") for t in active.values() if t.get("key")}):
+                markets.update({mk.market: mk for mk in self.sim_markets_for(key, now_ms)})
+
+        async def one(tid: str, trade: dict) -> None:
             st = trade["live"]
             if st.get("state") != "cancelling" or not st.get("order_id"):
-                continue
+                return
             before = json.dumps(trade, sort_keys=True, default=str)
             try:
                 await self.live_cancel(tid, trade, {}, markets.get(trade["market"]), now_ms)
@@ -1845,6 +1849,45 @@ class LiveBot(core.Bot):
                 st["last_error"] = core.clean_error(error) or type(error).__name__
             if json.dumps(trade, sort_keys=True, default=str) != before:
                 self.sim_save([(tid, trade)])
+        await asyncio.gather(*(one(tid, trade) for tid, trade in active.items()))
+
+    def live_fills_later(self, tid: str, trade: dict, mk: Any) -> None:
+        """The fills of an order Predict just confirmed removed, read in a task beside the lane (live_cancel_fills)."""
+        task = asyncio.create_task(self.live_cancel_fills(tid, trade, mk), name=f"cancel-fills:{tid}")
+        self.live_fill_tasks.add(task)
+        task.add_done_callback(self.live_fill_tasks.discard)
+
+    async def live_cancel_fills(self, tid: str, trade: dict, mk: Any) -> None:
+        """What a removed order filled before its cancel (GET by its hash), onto its record — found by the order id, under
+        whatever tid it has by now (the slot's fresh order may have moved it to tid#n); a position's status follows."""
+        st = trade["live"]
+        order_id, hash_ = str(st.get("order_id") or ""), str(st.get("hash") or "")
+        try:
+            final = await self.live.api.order(order_id, hash_)
+        except Exception as error:
+            self.live_note_error(f"撤单后读成交失败（#{order_id}）：{core.clean_error(error) or type(error).__name__}")
+            return
+        if not isinstance(final, dict):
+            return
+        trades = self.sim_trades()
+        cur = next(((k, t) for k, t in trades.items() if isinstance(t.get("live"), dict) and str(t["live"].get("order_id") or "") == order_id), None)
+        if cur is None:
+            return
+        tid, trade = cur
+        st, now_ms = trade["live"], self.market.now_ms()
+        before = float(trade.get("shares") or 0)
+        self.live_apply(tid, trade, final, mk, now_ms)
+        after, order = float(trade.get("shares") or 0), float(trade.get("order") or 0)
+        if after > before + 1e-9 and trade["status"] not in {"settled", "expired"}:
+            trade.update(status="filled", unfilled=max(order - after, 0.0),
+                         note=f"真实成交 {after:g}/{order:g} 份（撤单确认后读到），其余 {max(order - after, 0.0):g} 份{st.get('cancel_why') or '已撤'}")
+            st["events"].append({"at": now_ms, "what": f"撤单确认后读到成交 {after - before:g} 份（累计 {after:g}/{order:g}）"})
+        self.sim_save([(tid, trade)])
+
+    async def live_fills_wait(self) -> None:
+        """Every fills read in flight (live_fills_later), waited for: the step's sync and the tests."""
+        if self.live_fill_tasks:
+            await asyncio.gather(*list(self.live_fill_tasks), return_exceptions=True)
 
     def live_note_unknown(self, open_rows: list[dict], now_ms: int) -> None:
         """Open orders on the account that no record here placed (a manual order, a lost record, another bot): kept
@@ -1983,6 +2026,14 @@ class LiveBot(core.Bot):
                 st["cancel_done_ms"] = int(time.time() * 1000)  # off the book since (the books' clock): one read before may still show it (sim_own_resting)
                 st["cancel_done_at"] = self.market.now_ms()
             st["events"].append({"at": now_ms, "what": f"撤单请求已发送（{'Predict 确认已撤' if gone_now else 'Predict 称无需撤/已不在盘口'}）"})
+            if gone_now and trade.get("maker"):
+                # 1.111.0: Predict confirmed the removal, so the order is off the book and its slot is free now: the record ends
+                # on what the open list showed (nothing, in the express lane) and the fills it took before the cancel are
+                # read right after (live_cancel_fills), not before the slot is quoted again — one round trip less in the
+                # 撤单→重挂 chain (the "撤单确认 0.3 s" of the 1.7 measured on 11-05)
+                self.live_finish(tid, trade, {**(listed or {}), "status": "CANCELLED"}, mk, now_ms)
+                self.live_fills_later(tid, trade, mk)
+                return
         if listed is not None and not st.get("cancel_confirmed"):
             self.live_cancel_again(st, now_ms, "撤单请求发出后仍在盘口，再发一次")  # still listed: its fills count while it rests
             return

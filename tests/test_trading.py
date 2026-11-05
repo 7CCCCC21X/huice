@@ -263,6 +263,7 @@ class FakeApi:
         self.jwt, self.jwt_exp, self.auth_error, self.lookup = "t", 0, "", ""
         self.markets, self.open, self.closed, self.calls, self.positions_rows = {}, {}, {}, [], []
         self.next_id, self.fail_create, self.fail_open = 100, None, None
+        self.fill_on_cancel: dict = {}  # order id -> amountFilled its record shows once removed (shares matched as the cancel landed)
 
     async def ensure_auth(self): pass
 
@@ -286,6 +287,8 @@ class FakeApi:
             row = self.open.pop(i, None)
             if row:
                 row["status"] = "CANCELLED"
+                if i in self.fill_on_cancel:  # the removal answer says removed; the order's own record shows what matched meanwhile
+                    row["amountFilled"] = str(self.fill_on_cancel.pop(i))
                 self.closed[i] = row
                 removed.append(i)
         return {"removed": removed, "noop": [i for i in ids if i not in removed]}
@@ -293,11 +296,13 @@ class FakeApi:
     async def orders(self, status="OPEN", **params):
         if self.fail_open:
             raise m.RemoteError(self.fail_open)
-        return list(self.open.values()) if status == "OPEN" else [r for r in self.closed.values() if r["status"] == status]
+        rows = list(self.open.values()) if status == "OPEN" else [r for r in self.closed.values() if r["status"] == status]
+        return [dict(r) for r in rows]  # snapshots, as the API answers: a row read before a removal does not change with it
 
     async def order(self, oid, hash_=""):
         rows = [*self.open.values(), *self.closed.values()]
-        return self.open.get(oid) or self.closed.get(oid) or next((r for r in rows if hash_ and r["order"]["hash"] == hash_), None)
+        row = self.open.get(oid) or self.closed.get(oid) or next((r for r in rows if hash_ and r["order"]["hash"] == hash_), None)
+        return dict(row) if row is not None else None
 
     async def positions(self): return self.positions_rows
 
@@ -927,6 +932,27 @@ async def run():
     assert trades[f"{mtid}#2"]["live"]["cancel_confirmed"] and mbot.live_reserved(trades[f"{mtid}#2"]) == 0 and any("同步真实订单失败" in e for e in mbot.live_errors), mbot.live_errors[-2:]
     mfake.fail_open = None
     await step(mbot, NOW + 50_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 50_000))
+
+    # --- 1.111.0: the slot is free the moment Predict confirms the removal; what the order filled as the cancel landed is read
+    # right after, onto the record under its new tid — the re-placement no longer waits for that read
+    fbot = make_bot(SIM_MAKER_MIN_BID="100", SIM_MAKER_EXIT_CENTS="5", SIM_MAKER_SESSION="on", SIM_WAYS="maker")
+    await fbot.live_prepare()
+    ffake = fbot.live.api
+    await fbot.live_prefetch(NOW)
+    await step(fbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    assert fbot.sim_trades()[mtid]["live"]["order_id"] == "101"
+    ffake.fill_on_cancel["101"] = L.to_wei(10)
+    await step(fbot, NOW + 20_000, hsi(0.70, [("0.55", "100"), ("0.53", "200")], [("0.58", "400")], NOW + 20_000))
+    trades = fbot.sim_trades()
+    new, old = trades[mtid], trades[f"{mtid}#1"]
+    assert new["price"] == 0.53 and new["live"]["order_id"] == "102" and new["live"]["requote_of"] == f"{mtid}#1", new["live"]
+    events = [e["what"] for e in old["live"]["events"]]
+    assert "撤单请求已发送（Predict 确认已撤）" in events and any(e.startswith("订单结束：CANCELLED，成交 0/100 份") for e in events), events
+    await fbot.live_fills_wait()
+    old = fbot.sim_trades()[f"{mtid}#1"]
+    assert old["status"] == "filled" and old["shares"] == 10 and old["unfilled"] == 90 and "（撤单确认后读到）" in old["note"] and old["live"]["state"] == "done", old
+    assert any("撤单确认后读到成交 10 份（累计 10/100）" in e["what"] for e in old["live"]["events"]) and len(old["fills"]) == 1 and old["fills"][0]["shares"] == 10, old["live"]["events"]
+    assert fbot.sim_trades()[mtid]["live"]["state"] == "open" and not fbot.live_fill_tasks
     assert mbot.sim_trades()[mtid]["price"] == 0.57 and mbot.sim_trades()[mtid]["live"]["order_id"] == "103"
 
     # --- execution safety: reserved until Predict's final word, cancels confirmed, unknown results reconciled, the pre-send check

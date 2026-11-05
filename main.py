@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.110.2"
+VERSION = "1.111.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -934,7 +934,10 @@ class Store:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=FULL")
+        # 1.111.0: NORMAL, not FULL — with WAL a committed transaction survives a process crash either way; FULL also fsyncs the
+        # WAL on every commit, which an order waits for (Store.flush before the request goes out). What NORMAL risks is the
+        # last transactions on a power loss of the machine, not on a crash of the bot
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("CREATE TABLE IF NOT EXISTS records (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         self.conn.commit()
         self.touched: dict[str, int] = {}  # key family ("sim", "notice"...) -> how many writes it has seen: in-memory views check this
@@ -949,7 +952,7 @@ class Store:
         self.writer_conn: sqlite3.Connection | None = None
         if path != ":memory:":
             self.writer_conn = sqlite3.connect(path, check_same_thread=False)
-            self.writer_conn.execute("PRAGMA synchronous=FULL")
+            self.writer_conn.execute("PRAGMA synchronous=NORMAL")
             self.writer = threading.Thread(target=self.write_loop, name="store-writer", daemon=True)
             self.writer.start()
 
@@ -7281,19 +7284,43 @@ class UpDownMarket:
                 except Exception as error:
                     errors.append(clean_error(error) or type(error).__name__)
 
+    def cadence(self, now_ms: int) -> tuple[int, int]:
+        """(seconds between price reads, between σ reads)."""
+        return self.PRICE_SECONDS, self.VOL_SECONDS
+
     async def read_quote(self, now_ms: int, mono: float) -> None:
-        """The live price every PRICE_SECONDS (unless pushed meanwhile), σ every VOL_SECONDS."""
-        if mono - self.times["price"] >= self.PRICE_SECONDS:
+        """The live price (read_price) at the price cadence unless pushed meanwhile, σ (read_vol) at the σ cadence — the two
+        side by side when both are due (1.111.0: a σ read of hundreds of candles no longer holds the price read up); a
+        failure of either is raised once both are done."""
+        price_every, vol_every = self.cadence(now_ms)
+        jobs = []
+        if mono - self.times["price"] >= price_every:
             self.times["price"] = mono
-            data = await self.get("ticker/price", symbol=self.spec.symbol)
-            self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
-        if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
+            jobs.append(self.read_price(now_ms))
+        if mono - self.times["vol"] >= vol_every or self.sigma is None:
             self.times["vol"] = mono
-            # the last 30 days' hourly returns, the last five days weighing about half (a month-old calm does not price a
-            # week that moves: the 11-04 crypto windows moved 1.8–3.5 σ√τ)
-            self.sigma = realized_vol(await self.get("klines", symbol=self.spec.symbol, interval="1h", limit=722), now_ms,
-                                      half_life=self.SIGMA_HALF_LIFE)
-            self.sigma_ms = now_ms
+            jobs.append(self.read_vol(now_ms))
+        if not jobs:
+            return
+        results = await asyncio.gather(*jobs, return_exceptions=True)
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+        errors = [r for r in results if isinstance(r, Exception)]
+        if errors:
+            raise RemoteError("；".join(clean_error(e) or type(e).__name__ for e in errors))
+
+    async def read_price(self, now_ms: int) -> None:
+        """The pair's last trade (ticker/price)."""
+        data = await self.get("ticker/price", symbol=self.spec.symbol)
+        self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
+
+    async def read_vol(self, now_ms: int) -> None:
+        """σ: the last 30 days' hourly returns, the last five days weighing about half (a month-old calm does not price a
+        week that moves: the 11-04 crypto windows moved 1.8–3.5 σ√τ)."""
+        self.sigma = realized_vol(await self.get("klines", symbol=self.spec.symbol, interval="1h", limit=722), now_ms,
+                                  half_life=self.SIGMA_HALF_LIFE)
+        self.sigma_ms = now_ms
 
     def odds(self, now_ms: int) -> UpDownOdds | str:
         spec = self.spec
@@ -7560,23 +7587,20 @@ class IndexUpDownMarket(UpDownMarket):
         near = now_ms >= self.spec.start_ms + 60_000 - WINDOW_LEAD_MS
         return (self.PRICE_SECONDS, self.VOL_SECONDS) if near else (self.PRICE_IDLE_SECONDS, self.VOL_IDLE_SECONDS)
 
-    async def read_quote(self, now_ms: int, mono: float) -> None:
-        """The index (premiumIndex) unless the push brought a newer one, σ from the 1-minute index candles, at the cadence
-        of the moment (cadence)."""
-        price_every, vol_every = self.cadence(now_ms)
-        if mono - self.times["price"] >= price_every:
-            self.times["price"] = mono
-            data = await self.get("premiumIndex", symbol=self.spec.symbol)
-            at = int((data or {}).get("time") or now_ms)
-            if at > self.index_ms:
-                self.index_ms, self.price, self.priced_ms = at, number(data["indexPrice"], f"{self.spec.symbol} 指数价"), now_ms
-        if mono - self.times["vol"] >= vol_every or self.sigma is None:
-            self.times["vol"] = mono
-            # the session's minutes alone when the windows follow one (the index stands still outside it: a σ over the night
-            # or the lunch break would call the open near certain); enough candles to reach the previous session
-            rows = await self.get("indexPriceKlines", pair=self.spec.symbol, interval="1m",
-                                  limit=self.SIGMA_ROWS if self.trading else self.SIGMA_MINUTES + 2)
-            self.sigma, self.sigma_ms = minute_vol(rows, now_ms, self.SIGMA_MINUTES, self.trading), now_ms
+    async def read_price(self, now_ms: int) -> None:
+        """The index (premiumIndex) unless the push brought a newer one."""
+        data = await self.get("premiumIndex", symbol=self.spec.symbol)
+        at = int((data or {}).get("time") or now_ms)
+        if at > self.index_ms:
+            self.index_ms, self.price, self.priced_ms = at, number(data["indexPrice"], f"{self.spec.symbol} 指数价"), now_ms
+
+    async def read_vol(self, now_ms: int) -> None:
+        """σ from the 1-minute index candles: the session's minutes alone when the windows follow one (the index stands still
+        outside it: a σ over the night or the lunch break would call the open near certain); enough candles to reach the
+        previous session."""
+        rows = await self.get("indexPriceKlines", pair=self.spec.symbol, interval="1m",
+                              limit=self.SIGMA_ROWS if self.trading else self.SIGMA_MINUTES + 2)
+        self.sigma, self.sigma_ms = minute_vol(rows, now_ms, self.SIGMA_MINUTES, self.trading), now_ms
 
     def odds(self, now_ms: int) -> UpDownOdds | str:
         spec = self.spec
@@ -7639,19 +7663,16 @@ class SpotWindowMarket(IndexUpDownMarket):
         """A trade pushed in without its own time: taken as newer than whatever the card holds (trades come in order)."""
         self.push_index(price, max(now_ms, self.index_ms + 1), now_ms)
 
-    async def read_quote(self, now_ms: int, mono: float) -> None:
-        """The last trade (ticker/price) unless a push brought a newer one, σ from the pair's 1-minute candles, at the
-        cadence of the moment (cadence)."""
-        price_every, vol_every = self.cadence(now_ms)
-        if mono - self.times["price"] >= price_every:
-            self.times["price"] = mono
-            data = await self.get("ticker/price", symbol=self.spec.symbol)
-            if now_ms > self.index_ms:
-                self.index_ms, self.price, self.priced_ms = now_ms, number(data["price"], f"{self.spec.symbol} 现货价"), now_ms
-        if mono - self.times["vol"] >= vol_every or self.sigma is None:
-            self.times["vol"] = mono
-            rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", limit=self.SIGMA_MINUTES + 2)
-            self.sigma, self.sigma_ms = minute_vol(rows, now_ms, self.SIGMA_MINUTES), now_ms
+    async def read_price(self, now_ms: int) -> None:
+        """The last trade (ticker/price) unless a push brought a newer one."""
+        data = await self.get("ticker/price", symbol=self.spec.symbol)
+        if now_ms > self.index_ms:
+            self.index_ms, self.price, self.priced_ms = now_ms, number(data["price"], f"{self.spec.symbol} 现货价"), now_ms
+
+    async def read_vol(self, now_ms: int) -> None:
+        """σ from the pair's 1-minute candles (minute_vol)."""
+        rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", limit=self.SIGMA_MINUTES + 2)
+        self.sigma, self.sigma_ms = minute_vol(rows, now_ms, self.SIGMA_MINUTES), now_ms
 
     async def read_candle(self, open_ms: int) -> D:
         """The close of exactly the pair's 1-minute candle that opens at open_ms (a neighbouring minute is never taken)."""
@@ -20316,7 +20337,7 @@ class Bot:
         if sig != self.fair_sig:
             self.fair_sig, self.sim_wake = sig, True
 
-    PRICE_LOOK_DELAY = 0.2  # pushes gathered this long before the keys they move are looked at (a busy pair ticks many times a second)
+    PRICE_LOOK_DELAY = 0.1  # pushes gathered this long before the keys they move are looked at (a busy pair ticks many times a second; 1.111.0: 0.1, was 0.2)
 
     def price_pushed(self, venue: str, symbol: str, row: dict) -> None:
         """A Binance price pushed in (BinanceStream): a contract's quote between sampling cycles (the baseline kept; a
@@ -20449,8 +20470,9 @@ class Bot:
         return refreshed(failed, len(self.flips) - len(failed))
 
     async def refresh_updown(self, now_ms: int) -> Refreshed:
-        moved = []
-        for key, mkt in self.updowns.items():
+        moved: list[str] = []
+
+        async def one(key: str, mkt: UpDownMarket) -> None:
             index = isinstance(mkt, IndexUpDownMarket)
             if index:
                 await self.updown_strike(mkt, now_ms)  # Predict's start price: the line when it agrees (line_used); asked for eagerly after a start
@@ -20464,6 +20486,12 @@ class Bot:
             await mkt.refresh(now_ms)
             if before is not None and mkt.effective(now_ms)[0] != before:
                 moved.append(key)
+
+        # 1.111.0: the cards side by side — one card's reads (a KRX card's σ is 1,500 candles) no longer hold the others' prices
+        results = await asyncio.gather(*(one(key, mkt) for key, mkt in self.updowns.items()), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
         if moved:
             # an index read by REST that moved a 15-minute card (the futures stream mute: 1.104.2) wakes the express lane as
             # a push would, rather than waiting for the step: the taker on a book not yet repriced, the resting order
