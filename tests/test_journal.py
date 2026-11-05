@@ -111,10 +111,11 @@ async def run():
     assert s[-1]["day"] == "" and s[-1]["records"] == 6 and abs(s[-1]["pnl"] - data["total"]["pnl"]) < 1e-9 and s[-1]["settled"] == data["total"]["settled"]
     assert m.sim_summary([]) == [] and 'id="summary"' in web.route("GET", f"/p/{TOKEN}/journal")[2].decode() and "jrnsum" in m.JOURNAL_PAGE
     # 1.113.0: a day is one line until it is clicked (sumDays); 今日按市场 has a refresh button and the time of the data
-    assert "sumDays" in m.JOURNAL_PAGE and 'id="scref"' in m.JOURNAL_PAGE and 'id="scat"' in m.JOURNAL_PAGE and "function clock(" in m.JOURNAL_PAGE
+    assert "dayOpen" in m.JOURNAL_PAGE and 'id="scref"' in m.JOURNAL_PAGE and 'id="scat"' in m.JOURNAL_PAGE and "function clock(" in m.JOURNAL_PAGE
     assert 'id="anaref"' in m.JOURNAL_PAGE and 'id="anaat"' in m.JOURNAL_PAGE  # 1.113.1: the 复盘分析 header's refresh button and the time of its data
     assert 'id="s-detail"' in m.JOURNAL_PAGE and "rows=1" in m.JOURNAL_PAGE and "function cardDetail(" in m.JOURNAL_PAGE  # 1.114.0: a card's records under the table
     assert "function recTable(" in m.JOURNAL_PAGE  # 1.114.1: as one compact table (by market, a subtotal each, a total), a row opening the record
+    assert 'id="d-detail"' in m.JOURNAL_PAGE and "function dayDetail(" in m.JOURNAL_PAGE and "lean=1" in m.JOURNAL_PAGE  # 1.115.0: a day's records under the summary
     # 1.81.0: the analysis tables (per underlying, per edge / fair bucket, per session part, the makers, the refused buys), the
     # marks, the summary CSV and the daily report
     hsi_mk = m.SimMarket(HSI_SLUG, "恒生指数", "close", "HSI", 0.70, book([("0.55", "300")], [("0.58", "400")], NOW, HSI_SLUG, "HSI", "101"),
@@ -190,6 +191,8 @@ async def run():
     assert abs(sum(t["pnl"] or 0 for t in hs_rows["trades"]) - hs_line["pnl"]) < 1e-9 and hs_rows["total"]["settled"] == sum(t["status"] == "settled" for t in hs_rows["trades"])
     assert fj("rows=1&day=2026-10-04&card=" + urllib.parse.quote("恒生指数"))["trades"] == [] and fj("rows=1&day=2026-10-04")["total"]["records"] == 1  # the 上证 record, opened the day before
     assert fj("rows=1&day=nope")["total"]["records"] == 6 and fj("rows=1")["day"] == "" and fj("rows=1&day=today&way=maker")["total"]["records"] == 3
+    lean = fj("rows=1&day=today&lean=1")  # 1.115.0: only the settled, open and resting records sent (the KOSPI maker was withdrawn), the total over every one
+    assert lean["total"]["records"] == 5 and len(lean["trades"]) == 4 and {t["status"] for t in lean["trades"]} == {"settled", "resting"}, [t["status"] for t in lean["trades"]]
     status, _, body = web.route("GET", f"/p/{TOKEN}/summary.csv", "card=" + urllib.parse.quote("恒生指数"))
     frows = list(csv.reader(io.StringIO(body.decode("utf-8")[1:])))
     assert status == 200 and frows[1][:3] == ["筛选", "恒生指数", "2"] and next(r for r in frows if r[1] == "累计")[2] == "2", frows[:3]
@@ -360,10 +363,18 @@ async def browser_check(bot, data):
         # click folds them); 今日按市场 has a refresh button and says when the data was read
         days = page.locator("#summary tr.dayrow")
         assert await days.count() >= 1 and await page.locator("#summary tr.sub").count() == 0 and (await days.first.inner_text()).startswith("▸ ")
+        assert await page.is_hidden("#d-detail")
         await days.first.click()
         assert await page.locator("#summary tr.sub").count() >= 2 and (await days.first.inner_text()).startswith("▾ ")
+        # 1.115.0: the open day's records show under the summary, by card with each card's figures first, a total at the end
+        await page.wait_for_selector("#d-detail table tr.rec")
+        assert "10-05 周一 · 这一天的每一笔" in await page.inner_text("#d-detail h3") and "5 笔" in await page.inner_text("#d-detail .day")
+        assert {x for x in await page.locator("#d-detail tr.grp td:first-child").all_inner_texts()} == {"恒生指数", "KOSPI", "HYPE"}
+        assert await page.locator("#d-detail tr.rec").count() == 4 and "另有 1 笔未成交 / 撤单的没有列出" in await page.inner_text("#d-detail p.small")
+        day_total = await page.locator("#d-detail tr.all td").all_inner_texts()
+        assert day_total[0] == "合计" and day_total[1] == "4 笔" and day_total[6] == "赢 3 输 0" and day_total[7] == "+$178.77", day_total
         await days.first.click()
-        assert await page.locator("#summary tr.sub").count() == 0
+        assert await page.locator("#summary tr.sub").count() == 0 and await page.is_hidden("#d-detail")
         assert (await page.inner_text("#scat")).startswith("已刷新 ") and await page.inner_text("#scref") == "刷新"
         read_at = await page.evaluate("okAt")  # when the data was last read
         await page.click("#scref")  # disabled and "刷新中…" while the page re-reads, then back
@@ -393,7 +404,7 @@ async def browser_check(bot, data):
         assert heads == ["市场", "时间", "方向", "价格", "份数", "成本", "结果", "盈亏", "状态", "订单号"], heads
         recs = [await r.locator("td").all_inner_texts() for r in await page.locator("#s-detail tr.rec").all()]
         assert [r[0] for r in recs] == ["恒生指数"] * 2 and {r[2] for r in recs} == {"挂涨", "吃涨"} and all(r[6] == "赢" and r[8] == "已确认" for r in recs), recs  # the item is the card's name here
-        assert await page.locator("#s-detail tr.sub").count() == 0 and await page.locator("#s-detail tr.all").count() == 1
+        assert await page.locator("#s-detail tr.grp").count() == 0 and await page.locator("#s-detail tr.all").count() == 1
         total = await page.locator("#s-detail tr.all td").all_inner_texts()
         assert total[0] == "合计" and total[1] == "2 笔" and total[4] == "400" and total[5] == "$231.52" and total[6] == "赢 2 输 0" and total[7] == "+$168.48", total
         await page.locator("#s-detail tr.rec").first.locator("td").first.click()

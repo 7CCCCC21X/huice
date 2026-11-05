@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.114.1"
+VERSION = "1.115.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -11711,7 +11711,7 @@ a{color:var(--best)}.mut{color:var(--muted)}.small{font-size:12.5px}.warn{color:
 .box p{margin:4px 0}
 .tbl{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
 table{border-collapse:collapse;font-size:12.5px;width:100%;font-variant-numeric:tabular-nums}
-.tbl tr.sub td{color:var(--muted)}.tbl tr.sub td:first-child{padding-left:22px}.tbl tr.all td{font-weight:700;border-top:2px solid var(--line)}.tbl tr.dayrow td{cursor:pointer}.tbl tr.dayrow td:first-child{font-weight:600}.tbl tr.dayrow.open td{background:var(--chip)}#s-detail{margin-top:10px}#s-detail .day{margin:6px 2px}.tbl tr.rec td{cursor:pointer}.tbl tr.rec.open td{background:var(--chip)}.tbl tr.det>td{white-space:normal;padding:0;background:var(--chip)}.tbl tr.det:hover td{background:var(--chip)}#scat{font-weight:400;margin-left:4px}
+.tbl tr.sub td{color:var(--muted)}.tbl tr.sub td:first-child{padding-left:22px}.tbl tr.all td{font-weight:700;border-top:2px solid var(--line)}.tbl tr.dayrow td{cursor:pointer}.tbl tr.dayrow td:first-child{font-weight:600}.tbl tr.dayrow.open td{background:var(--chip)}#s-detail,#d-detail{margin-top:10px}#s-detail .day,#d-detail .day{margin:6px 2px}.tbl tr.grp td{font-weight:650;border-top:2px solid var(--line);background:var(--chip)}.tbl tr.rec td{cursor:pointer}.tbl tr.rec.open td{background:var(--chip)}.tbl tr.det>td{white-space:normal;padding:0;background:var(--chip)}.tbl tr.det:hover td{background:var(--chip)}#scat{font-weight:400;margin-left:4px}
 td,th{border-bottom:1px solid var(--line2);padding:6px 10px;text-align:left;vertical-align:top;white-space:nowrap}
 th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;background:var(--chip)}tr:last-child td{border-bottom:0}tr:hover td{background:var(--chip)}td.wrap{white-space:normal;min-width:160px}
 .filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:12px 0 8px}
@@ -11744,7 +11744,7 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
 <div class="tiles" id="tiles"></div>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
-<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><h3>今日按市场 <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。</p><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
+<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>今日按市场 <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。</p><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="anaref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
 <div class="note fline" id="anafilt" hidden></div><div class="small mut" id="anaat"></div>
@@ -11926,57 +11926,70 @@ function src(){  // what the summary and the analysis show: every record, or the
 function filterLine(el,S){el.hidden=!S.label;if(!S.label)return;
   const b=$("button","lnk","清除筛选");b.type="button";b.addEventListener("click",e=>{e.stopPropagation();cardF=kindF=wayF="all";shown=PAGE;render()});
   el.replaceChildren("按筛选：",$("b","",S.label),"（下面列表的市场、类型、挂/吃筛选；状态筛选只管列表） ",b)}
-const sumDays=new Set();  // the days whose kind / way lines are shown (1.113.0: a day is one line until it is clicked; the set outlives the refreshes)
 function summary(){  // per day the records were opened on: records, markets, what filled, what settled and its P&L, what is open — by kind and way under each
   const S=src(),rows=S.s,el=document.getElementById("summary"),head=document.getElementById("sumsum");el.replaceChildren();
   filterLine(document.getElementById("sumfilt"),S);const fk=filterKey();document.getElementById("scsv").href=base+"/summary.csv"+(fk?"?"+fk:"");document.getElementById("csv").href=base+"/journal.csv"+(fk?"?"+fk:"");
   const cel=document.getElementById("s-cards");document.getElementById("scat").textContent=okAt?"已刷新 "+clock(okAt):"";
-  if(rows===null){el.append($("p","small mut",S.err?"按筛选读取失败："+S.err:"按筛选读取中…"));cel.replaceChildren();cardDetail([]);head.textContent=S.label;
+  if(rows===null){el.append($("p","small mut",S.err?"按筛选读取失败："+S.err:"按筛选读取中…"));cel.replaceChildren();cardDetail([]);dayDetail(null);head.textContent=S.label;
     document.getElementById("sumbody").hidden=!sumOpen;return}
-  if(!rows.length){el.append($("p","small mut",S.label?"这个筛选下没有交易":"还没有交易"));cel.replaceChildren();cardDetail([]);head.textContent=S.label;document.getElementById("sumbody").hidden=!sumOpen;return}
+  if(!rows.length){el.append($("p","small mut",S.label?"这个筛选下没有交易":"还没有交易"));cel.replaceChildren();cardDetail([]);dayDetail(null);head.textContent=S.label;document.getElementById("sumbody").hidden=!sumOpen;return}
   const t=$("table"),h=$("tr");["日期 / 类别","记录","市场","成交份数","成交额","已结算","盈亏","持仓中","浮动盈亏"].forEach(x=>h.append($("th","",x)));t.append(h);
   const cell=(v,cls)=>{const c=$("td","",v);if(cls)c.className=cls;return c};
   const wl=r=>r.settled+"（赢 "+r.wins+" 输 "+r.losses+(r.ties?" 平 "+r.ties:"")+"）";
   const line=(r,name,cls)=>{const tr=$("tr",cls);tr.append(cell(name),cell(r.records),cell(r.markets),cell(num(r.filled)),cell(usd(r.volume)),cell(r.settled?wl(r):"—"),
     cell(r.settled?money(r.pnl):"—",r.settled?(r.pnl>=0?"ok":"bad"):""),cell((r.open?r.open+"（"+usd(r.open_cost)+"）":"")+(r.resting?(r.open?" · ":"")+"挂单 "+r.resting:"")||"—"),
     cell(r.marked?money(r.unrealized)+(r.marked<r.open?"（"+r.marked+"/"+r.open+" 笔有报价）":""):"—",r.marked?(r.unrealized>=0?"ok":"bad"):""));return tr};
+  if(dayOpen&&!rows.some(r=>r.day===dayOpen))dayOpen="";  // 1.113.0: a day is one line until it is clicked; 1.115.0: the open day's records show under the table (dayDetail)
   rows.forEach(r=>{if(!r.day){t.append(line(r,r.label,"all"));return}  // 累计: one line
-    const open=sumDays.has(r.day),tr=line(r,(open?"▾ ":"▸ ")+r.label,"dayrow");tr.title=open?"收起这一天的明细":"点开看这一天按类型和挂单 / 吃单的明细";
-    tr.addEventListener("click",()=>{if(open)sumDays.delete(r.day);else sumDays.add(r.day);summary()});t.append(tr);
+    const open=r.day===dayOpen,tr=line(r,(open?"▾ ":"▸ ")+r.label,"dayrow"+(open?" open":""));tr.title=open?"收起这一天的明细":"点开看这一天按类型和挂单 / 吃单的明细，和这一天的每一笔";
+    tr.addEventListener("click",()=>{dayOpen=open?"":r.day;summary()});t.append(tr);
     if(open)(r.parts||[]).forEach(p=>t.append(line(p,p.name,"sub")))});
-  el.append(t);
+  el.append(t);dayDetail(rows);
   const d=rows[0];head.replaceChildren((S.label?S.label+"｜":"")+d.label+"：记录 "+d.records+" · 成交 "+usd(d.volume)+(d.settled?" · 盈亏 ":""));
   if(d.settled){const b=$("b","",money(d.pnl));b.className=d.pnl>=0?"ok":"bad";head.append(b)}
   const ct=(S.a||{}).cards_today||[];cel.replaceChildren(ct.length?cardsTable(ct):$("p","small mut","今天还没有记录"));cardDetail(ct);
   document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"}
 function pn(x){const b=$("b","",money(x));b.className=x>=0?"ok":"bad";return b}
-let cardOpen="";const cardRows={};  // 今日按市场 (1.114.0): the card whose records of the day are shown under the table; the rows read per card and filter
+let cardOpen="",dayOpen="";const rowsCache={},rowsBusy=new Set();  // the card of 今日按市场 (1.114.0) and the day of the summary (1.115.0) whose records are shown under their tables; the records read for a panel, by query (journal.json?rows=1&…), again after each refresh
 function cardsTable(ct){  // 今日按市场: anaTable's lines, each opening the card's records of the day under the table (cardDetail) when clicked
   if(cardOpen&&!ct.some(r=>r.name===cardOpen))cardOpen="";
   const w=anaTable(ct);[...w.querySelectorAll("tr")].slice(1).forEach((tr,i)=>{const r=ct[i],open=r.name===cardOpen;
     tr.className="dayrow"+(open?" open":"");tr.title=open?"收起这个市场今天的记录":"点开看这个市场今天的每一笔：已结算的盈亏和确认状态、持仓、挂单";
     tr.firstChild.textContent=(open?"▾ ":"▸ ")+r.name;tr.addEventListener("click",()=>{cardOpen=open?"":r.name;summary()})});
   return w}
-function cardKey(name){return name+"|"+kindF+"|"+wayF}
-function cardDetail(ct){  // under 今日按市场: the opened card's records of the day, read from the server (journal.json?rows=1&day=today&card=…: the list below holds only the latest records), again with each refresh
+const itemLess=(it,name)=>{it=it||"";const s=name&&it.startsWith(name)?it.slice(name.length).replace(/^[\s｜|·]+/,""):it;return s||it||"—"};  // an item less its card's name (a window, a day); the whole item when nothing is left
+function panelQuery(parts){const q=["rows=1","lean=1",...parts];if(kindF!=="all")q.push("kind="+encodeURIComponent(kindF));if(wayF!=="all")q.push("way="+encodeURIComponent(wayF));return q.join("&")}
+function panel(el,title,buttons,q,note,grp,empty){  // one records panel (a card's today, a day's): the heading with its buttons, the line over every record (listed or not), the note, the table of the settled / open / resting ones — read from the server by q, again after each refresh
+  const c=rowsCache[q];el.hidden=false;if(!c||c.at!==okAt)loadRows(q);
+  const h=$("h3","",title);h.append(...buttons);const kids=[h];
+  if(!c||!c.rows)kids.push($("p","small mut",c&&c.error?"读取失败："+c.error:"读取中…"));
+  else{const ts=c.rows.trades||[],total=c.rows.total||{},rest=(total.records||0)-ts.length;
+    const line=$("div","day");line.append(totalLine(total));kids.push(line);
+    if(c.error)kids.push($("p","small bad","刷新失败："+c.error+"，下面是上一次读到的"));
+    kids.push($("p","small mut",note+(rest>0?"另有 "+rest+" 笔未成交 / 撤单的没有列出。":"")));
+    kids.push(ts.length?recTable(ts,grp):$("p","small mut",empty))}
+  el.replaceChildren(...kids)}
+function cardDetail(ct){  // under 今日按市场: the opened card's records of today (journal.json?rows=1&day=today&card=…: the list below holds only the latest records), by market (a 15-minute card's windows)
   const el=document.getElementById("s-detail");if(!cardOpen||!ct.some(r=>r.name===cardOpen)){el.replaceChildren();el.hidden=true;return}
-  const name=cardOpen,c=cardRows[cardKey(name)];el.hidden=false;
-  if(!c||c.at!==okAt)loadCardRows(name);
-  const h=$("h3","",name+" · 今天的每一笔"),fold=$("button","lnk","收起"),flt=$("button","lnk","在下面列表里筛选这个市场");fold.type=flt.type="button";
+  const name=cardOpen,fold=$("button","lnk","收起"),flt=$("button","lnk","在下面列表里筛选这个市场");fold.type=flt.type="button";
   fold.addEventListener("click",()=>{cardOpen="";summary()});
   flt.addEventListener("click",()=>{cardF=name;stateF="all";shown=PAGE;render();document.getElementById("filters").scrollIntoView({block:"start"})});
-  h.append(fold,flt);const kids=[h];
-  if(!c||!c.rows)kids.push($("p","small mut",c&&c.error?"读取失败："+c.error:"读取中…"));
-  else{const ts=c.rows.trades||[],show=ts.filter(t=>t.status==="settled"||t.status==="filled"||t.status==="resting"),rest=ts.length-show.length;
-    const line=$("div","day");line.append(dayLine(ts));kids.push(line);
-    if(c.error)kids.push($("p","small bad","刷新失败："+c.error+"，下面是上一次读到的"));
-    kids.push($("p","small mut","盈亏 = (结算价 − 买价) × 份数，合计就是上表这一行的盈亏；状态是结果的确认情况（预结算 / 已确认 / 结果不一致）。点一行看完整记录。"
-      +(rest?"另有 "+rest+" 笔未成交 / 撤单的没有列出（点“在下面列表里筛选这个市场”看）。":"")));
-    kids.push(show.length?recTable(name,show):$("p","small mut","今天还没有成交、持仓或挂单"))}
-  el.replaceChildren(...kids)}
-function recTable(name,ts){  // the card's records as one compact table (1.114.1): by market (a 15-minute card's windows, the newest first), a subtotal per market when there are several, a total at the end; a row opens the record
-  const sub=t=>{const it=t.item||"",s=it.startsWith(name)?it.slice(name.length).replace(/^[\s｜|·]+/,""):it;return s||it||"—"};  // the item less the card's name (a window, a day); the whole item when nothing is left
-  const groups=[],by=new Map();ts.forEach(t=>{const k=t.item||"";if(!by.has(k)){by.set(k,[]);groups.push(k)}by.get(k).push(t)});
+  panel(el,name+" · 今天的每一笔",[fold,flt],panelQuery(["day=today","card="+encodeURIComponent(name)]),
+    "盈亏 = (结算价 − 买价) × 份数，合计就是上表这一行的盈亏；状态是结果的确认情况（预结算 / 已确认 / 结果不一致）。点一行看完整记录。",
+    {key:t=>t.item||"",label:k=>itemLess(k,name),sub:t=>itemLess(t.item,name)},"今天还没有成交、持仓或挂单")}
+function dayDetail(rows){  // under the daily summary (1.115.0): the opened day's records (the filter's; journal.json?rows=1&day=…), by card with each card's figures first
+  const el=document.getElementById("d-detail"),r=dayOpen&&rows?rows.find(x=>x.day===dayOpen):null;if(!r){el.replaceChildren();el.hidden=true;return}
+  const fold=$("button","lnk","收起");fold.type="button";fold.addEventListener("click",()=>{dayOpen="";summary()});
+  panel(el,r.label+" · 这一天的每一笔",[fold],panelQuery(["day="+r.day,...(cardF!=="all"?["card="+encodeURIComponent(cardF)]:[])]),
+    "按市场分组，每组第一行是这个市场这一天的合计；盈亏 = (结算价 − 买价) × 份数；状态是结果的确认情况（预结算 / 已确认 / 结果不一致）。点一行看完整记录。",
+    {key:t=>t.card||"",label:k=>k||"—",sub:t=>itemLess(t.item,t.card)},"这一天没有成交、持仓或挂单")}
+function totalLine(s){  // the line over a panel's records, from the server's summary_of every one of them (dayLine's figures, listed or not)
+  const el=$("span","",s.records+" 笔"+(s.filled?" · 成交 "+num(s.filled)+" 份 "+usd(s.volume):"")+(s.settled?" · 已结算 "+s.settled+" 笔（赢 "+s.wins+" 输 "+s.losses+(s.ties?" 平 "+s.ties:"")+"）":""));
+  if(s.settled)el.append(pn(s.pnl));
+  if(s.open){el.append(" · 持仓 "+s.open+" 笔");if(s.marked)el.append("（浮动 ",pn(s.unrealized),"）")}
+  if(s.resting)el.append(" · 挂单中 "+s.resting+" 笔");return el}
+function recTable(ts,g){  // one compact table of records (1.114.1): in groups by g.key (a line with the group's figures first, when there are several), the newest first, a total at the end; a row opens the record in place
+  const groups=[],by=new Map();ts.forEach(t=>{const k=g.key(t);if(!by.has(k)){by.set(k,[]);groups.push(k)}by.get(k).push(t)});
   const w=$("div","tbl"),tb=$("table"),h=$("tr");["市场","时间","方向","价格","份数","成本","结果","盈亏","状态","订单号"].forEach(x=>h.append($("th","",x)));tb.append(h);
   const cell=(v,cls)=>{const c=$("td",cls||"");c.append(...(Array.isArray(v)?v:[v instanceof Node?v:String(v??"—")]));return c};
   const res=t=>t.status==="settled"?(t.payout===1?"赢":t.payout===0?"输":"平 "+t.payout):t.status==="filled"?"持仓"+(t.mark!=null?" @ "+cent(t.mark):""):"挂单中";
@@ -11987,19 +12000,19 @@ function recTable(name,ts){  // the card's records as one compact table (1.114.1
       wins:done.filter(t=>t.payout===1).length,losses:done.filter(t=>t.payout===0).length,marked,unr:marked.reduce((a,t)=>a+t.unrealized,0)}};
   const sumRow=(label,s,cls)=>{const tr=$("tr",cls);tr.append(cell(label),cell(s.n+" 笔"),cell(""),cell(""),cell(s.shares?num(s.shares):"—"),cell(s.cost?usd(s.cost):"—"),
     cell(s.done.length?"赢 "+s.wins+" 输 "+s.losses:"—"),cell(s.done.length?pn(s.pnl):"—"),cell(s.marked.length?["浮动 ",pn(s.unr)]:""),cell(""));return tr};
-  groups.forEach(k=>{const rows=by.get(k);rows.forEach(t=>{const open=openId===t.id,tr=$("tr","rec"+(open?" open":""));tr.title=[t.text,t.wait].filter(Boolean).join("；");
-      tr.append(cell(sub(t)),cell(hm(t.opened)),cell(t.label+(t.deep?" · 低价挂单":"")+(data.live&&!t.real?" · 模拟":"")),cell(cent(t.price)),
+  const several=groups.length>1;
+  groups.forEach(k=>{const rows=by.get(k),label=g.label(k,rows[0]);if(several)tb.append(sumRow(label,stat(rows),"grp"));
+    rows.forEach(t=>{const open=openId===t.id,tr=$("tr","rec"+(open?" open":"")),m=g.sub(t);tr.title=[t.text,t.wait].filter(Boolean).join("；");
+      tr.append(cell(several&&m===label?"":m),cell(hm(t.opened)),cell(t.label+(t.deep?" · 低价挂单":"")+(data.live&&!t.real?" · 模拟":"")),cell(cent(t.price)),
         cell(num(t.shares)+(t.maker&&t.shares<t.order?"/"+num(t.order):"")),cell(t.shares>0?usd(t.shares*t.price):"—"),cell(res(t)),cell(pl(t)),cell(st(t)),cell(t.order_id?"#"+t.order_id:"—"));
       tr.addEventListener("click",()=>{openId=open?"":t.id;history.replaceState(null,"",openId?"#"+encodeURIComponent(openId):location.pathname);render()});tb.append(tr);
-      if(open){const d=$("tr","det"),td=$("td","wrap");td.colSpan=10;td.append(detailBox(t));d.append(td);tb.append(d)}});
-    if(groups.length>1)tb.append(sumRow("小计",stat(rows),"sub"))});
+      if(open){const d=$("tr","det"),td=$("td","wrap");td.colSpan=10;td.append(detailBox(t));d.append(td);tb.append(d)}})});
   tb.append(sumRow("合计",stat(ts),"all"));w.append(tb);return w}
-async function loadCardRows(name){const key=cardKey(name),at=okAt;if(loadCardRows.busy===key)return;loadCardRows.busy=key;
-  const q=["rows=1","day=today","card="+encodeURIComponent(name)];if(kindF!=="all")q.push("kind="+encodeURIComponent(kindF));if(wayF!=="all")q.push("way="+encodeURIComponent(wayF));
-  try{const k=ctlKey();const r=await fetch(base+"/journal.json?"+q.join("&"),{cache:"no-store",headers:k?{"X-Control-Key":k}:{}});if(!r.ok)throw new Error("HTTP "+r.status);cardRows[key]={at,rows:await r.json()}}
-  catch(e){cardRows[key]={at,error:e.message||"读取失败",rows:(cardRows[key]||{}).rows}}  // a failed re-read keeps what was shown
-  finally{if(loadCardRows.busy===key)loadCardRows.busy=null}
-  if(cardOpen===name)summary()}
+async function loadRows(q){const at=okAt;if(rowsBusy.has(q))return;rowsBusy.add(q);  // a panel's records, as the page stood (at): read again once it refreshes
+  try{const k=ctlKey();const r=await fetch(base+"/journal.json?"+q,{cache:"no-store",headers:k?{"X-Control-Key":k}:{}});if(!r.ok)throw new Error("HTTP "+r.status);rowsCache[q]={at,rows:await r.json()}}
+  catch(e){rowsCache[q]={at,error:e.message||"读取失败",rows:(rowsCache[q]||{}).rows}}  // a failed re-read keeps what was shown
+  finally{rowsBusy.delete(q)}
+  summary()}
 function anaTable(rows,extra){  // one summary table: records, fills, the settled P&L against the model's expectation, the hit rate against the mean fair price, open, unrealized — plus a table's own columns
   const head=["分组","记录","市场","成交份数","成交额","已结算","盈亏","下单时预期","胜率 / 平均公平价","持仓中","浮动盈亏"].concat(extra?extra.head:[]);
   const wl=r=>r.settled+"（赢 "+r.wins+" 输 "+r.losses+(r.ties?" 平 "+r.ties:"")+"）";
@@ -12631,7 +12644,8 @@ class WebServer:
     def journal_json(self, query: str) -> tuple[int, str, bytes]:
         """journal.json: the review page's list (light rows: the open trades and the last JOURNAL_HISTORY finished
         ones); ?all=1 every trade; ?full=1 every trade's whole record (the JSON export); ?id=<trade> one whole record;
-        ?rows=1&day=today&card=… the records of a card (the filter) opened on a day (journal_rows, 1.114.0).
+        ?rows=1&day=today&card=… the records of a card (the filter) opened on a day (journal_rows, 1.114.0; &lean=1 lists
+        only the settled, open and resting ones, the total still over every one).
         The list variants are built once per cache interval; a single record is cheap and built on demand."""
         params = urllib.parse.parse_qs(query, keep_blank_values=True)
         flag = lambda key: (params.get(key) or [""])[0].strip().lower() not in {"", "0", "false", "off", "no"}
@@ -12647,9 +12661,9 @@ class WebServer:
             name = "journal.json?analysis" + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
             return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_analysis(flt), ensure_ascii=False, default=str).encode("utf-8"))
         if flag("rows"):  # the records of a card (the filter) opened on a day, as list rows: under a line of 今日按市场 (1.114.0)
-            flt, day = journal_filter_of(params), (params.get("day") or [""])[0].strip()[:10]
-            name = "journal.json?rows&day=" + day + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
-            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_rows(flt, day), ensure_ascii=False, default=str).encode("utf-8"))
+            flt, day, lean = journal_filter_of(params), (params.get("day") or [""])[0].strip()[:10], flag("lean")
+            name = "journal.json?rows&day=" + day + ("&lean=1" if lean else "") + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
+            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_rows(flt, day, lean), ensure_ascii=False, default=str).encode("utf-8"))
         full, everything = flag("full"), flag("all")
         name = "journal.json" + ("?full" if full else "?all" if everything else "")
         return 200, ctype, self.cached(name, lambda: json.dumps(
@@ -18472,11 +18486,13 @@ class Bot:
                 "filter_text": journal_filter_text(flt), "records": len(values),
                 "summary": sim_summary(values, marks=marks), "analysis": self.sim_analysis(values, marks, flt)}
 
-    def journal_rows(self, flt: Mapping | None = None, day: str = "") -> dict:
+    def journal_rows(self, flt: Mapping | None = None, day: str = "", lean: bool = False) -> dict:
         """The records in ``flt`` (journal_filter_of) opened on ``day`` — a Beijing date, "today" for the bot's, "" (or
         one that does not read) for any day — as list rows (journal_row), newest first, with summary_of them: what
-        the review page shows under a line of 今日按市场 (journal.json?rows=1&day=today&card=…, 1.114.0). The list
-        payload holds only the latest records; this reads every one of the card's day."""
+        the review page shows under a line of 今日按市场 (journal.json?rows=1&day=today&card=…, 1.114.0) and under a
+        day of the summary (1.115.0). The list payload holds only the latest records; this reads every one of the
+        day. ``lean`` lists only the settled, open and resting ones (the total is still over every one): a day's
+        thousands of unfilled orders are counted, not sent."""
         flt = dict(flt or {})
         now_ms = self.market.now_ms()
         wanted: dt.date | None = None
@@ -18499,7 +18515,8 @@ class Bot:
         return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）", "filter": flt,
                 "filter_text": journal_filter_text(flt), "day": wanted.isoformat() if wanted else "",
                 "total": {**summary_of(values, marks), **settled_extras(values)},
-                "trades": [self.journal_row(tid, t, markets.get(t["market"]), now_ms, False) for tid, t in trades]}
+                "trades": [self.journal_row(tid, t, markets.get(t["market"]), now_ms, False) for tid, t in trades
+                           if not lean or t["status"] in {"settled", "filled", "resting"}]}
 
     def journal_trade(self, tid: str) -> dict | None:
         """One trade's whole record (None when there is no such trade): what the review page fetches when a trade is opened."""
