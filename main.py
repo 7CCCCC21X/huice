@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.105.1"
+VERSION = "1.105.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -6993,9 +6993,9 @@ class WindowUpDownSpec:
     the windows under one key, as a daily card follows the days (Bot.updown_roll). The slug's time is taken for the
     window's start (the convention of these markets); Predict's target price and the time range in the market's question,
     when it shows them, must agree, or nothing is suggested (Bot.updown_hold). The windows of a stock's market follow its
-    exchange's session (``exchange``: current / before): inside a continuous-trading segment, ending before the segment's
-    close — the last quarter hour before a close has no market (宇树, 11-04: the listed windows end 09:45 … 11:15 and
-    13:15 … 14:45; none at 11:30 or 15:00) — on no weekend or holiday. In beta: the trader buys at most
+    exchange's session (``exchange``: current / before): inside a continuous-trading segment, ending at or before the
+    segment's close (1.105.2: 宇树 has an 11:15–11:30 window; 1.103.0 had read the Predict page's list as ending at 11:15
+    and left out the quarter hour before each close) — on no weekend or holiday. In beta: the trader buys at most
     SIM_CRYPTO_15M_SHARES at a time, holds at most SIM_CRYPTO_15M_MAX_SHARES on each side of one window and buys nothing
     in its last SIM_CRYPTO_15M_QUIET_SECONDS (90: no order of any kind, resting ones withdrawn)."""
     key: str          # card / book key, the same for every window: the favourite, the /edge bar and SIM_SKIP stay with it
@@ -7022,8 +7022,8 @@ class WindowUpDownSpec:
 
     def current(self, now_ms: int, holidays: frozenset = frozenset()) -> UpDownSpec:
         """The window ``now_ms`` falls in when its market exists, else the next one that does: every quarter hour without
-        an exchange; with one, the quarter hours inside its trading segments whose end is before the segment's close
-        (weekends and ``holidays`` skipped) — over the lunch break and the night, the next segment's first."""
+        an exchange; with one, the quarter hours inside its trading segments whose end is at or before the segment's
+        close (weekends and ``holidays`` skipped) — over the lunch break and the night, the next segment's first."""
         w = self.window_ms
         start = now_ms - now_ms % w
         if not self.exchange:
@@ -7034,7 +7034,7 @@ class WindowUpDownSpec:
             for seg_open, seg_close in session_segments(self.exchange, day + dt.timedelta(days=offset), holidays):
                 first = max(start, seg_open)
                 first += -first % w  # up to the quarter hour
-                if first + w < seg_close:
+                if first + w <= seg_close:  # ending at the close is a market too (11:15–11:30, 14:45–15:00)
                     return self.window_spec(first)
         raise ValueError(f"{self.exchange} 在 {self.SCHEDULE_DAYS} 天内没有交易时段")
 
@@ -7048,7 +7048,7 @@ class WindowUpDownSpec:
         day = dt.datetime.fromtimestamp(last / 1000, tz).date()
         for offset in range(self.SCHEDULE_DAYS):
             for seg_open, seg_close in reversed(session_segments(self.exchange, day - dt.timedelta(days=offset), holidays)):
-                latest = min(last, seg_close - w - 1)
+                latest = min(last, seg_close - w)
                 latest -= latest % w  # down to the quarter hour
                 if latest >= seg_open:
                     return self.window_spec(latest)

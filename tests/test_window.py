@@ -19,25 +19,25 @@ assert (W.key, W.stem, W.symbol, W.coin, W.minutes) == ("UNITREE-15M", "unitree"
 spec = W.current(BJ(11, 5, 30))
 assert spec.slug == "unitree-updown-15m-1793761200" and T0 // 1000 == 1793761200 and spec.name == "宇树 15分涨跌 11:00–11:15", spec
 assert (spec.start_ms, spec.end_ms) == (T0 - 60_000, T1 - 60_000)  # the index candles that end at 11:00 and at 11:15
-assert W.current(T0) == spec and W.current(T1 - 1) == spec and W.current(T1).slug == "unitree-updown-15m-1793768400"  # 13:00: no 11:15 window
+assert W.current(T0) == spec and W.current(T1 - 1) == spec and W.current(T1).slug == "unitree-updown-15m-1793762100"  # 11:15–11:30 (1.105.2: it exists)
 assert W.before(spec) == W.current(T0 - 1) and W.before(spec).slug == "unitree-updown-15m-1793760300" and W.tag(spec) == {"window": "15m"}
-# the schedule (1.103.0): 宇树's windows follow the Shanghai session (09:30–11:30, 13:00–15:00), the quarter hour before each close
-# without a market (the Predict page lists windows ending 09:45 … 11:15 and 13:15 … 14:45); weekends and holidays skipped
+# the schedule (1.103.0; 1.105.2): 宇树's windows follow the Shanghai session (09:30–11:30, 13:00–15:00), a window ending at a
+# close included (宇树 has an 11:15–11:30 market; 1.103.0 had left the quarter hour before each close out); weekends and holidays skipped
 at = lambda h, mi, d=4: int(dt.datetime(2026, 11, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
 first = lambda ms, hol=frozenset(): m.stamp(W.current(ms, hol).start_ms + 60_000, seconds=False)
 assert W.exchange == "sh" and [first(at(h, mi)) for h, mi in ((9, 0), (9, 30), (11, 14), (11, 15), (12, 59), (13, 0), (14, 30), (14, 45), (15, 10))] == [
-    "11-04 09:30", "11-04 09:30", "11-04 11:00", "11-04 13:00", "11-04 13:00", "11-04 13:00", "11-04 14:30", "11-05 09:30", "11-05 09:30"]
+    "11-04 09:30", "11-04 09:30", "11-04 11:00", "11-04 11:15", "11-04 13:00", "11-04 13:00", "11-04 14:30", "11-04 14:45", "11-05 09:30"]
 assert first(at(15, 10, 6)) == "11-09 09:30" and first(at(15, 10, 6), frozenset({dt.date(2026, 11, 9)})) == "11-10 09:30"
-assert [W.exists(at(h, mi)) for h, mi in ((9, 15), (9, 30), (11, 0), (11, 15), (13, 0), (14, 30), (14, 45))] == [False, True, True, False, True, True, False]
+assert [W.exists(at(h, mi)) for h, mi in ((9, 15), (9, 30), (11, 0), (11, 15), (11, 30), (13, 0), (14, 30), (14, 45), (15, 0))] == [False, True, True, True, False, True, True, True, False]
 last = lambda ms, hol=frozenset(): m.stamp(W.before(W.current(ms, hol), hol).start_ms + 60_000, seconds=False)
-assert last(at(13, 0)) == "11-04 11:00" and last(at(9, 30)) == "11-03 14:30" and last(at(9, 30, 9)) == "11-06 14:30"
-assert last(at(9, 30, 10), frozenset({dt.date(2026, 11, 9)})) == "11-06 14:30"
+assert last(at(13, 0)) == "11-04 11:15" and last(at(9, 30)) == "11-03 14:45" and last(at(9, 30, 9)) == "11-06 14:45"
+assert last(at(9, 30, 10), frozenset({dt.date(2026, 11, 9)})) == "11-06 14:45"
 # SK 海力士: the KRX session (09:00–15:30 KST = 08:00–14:30 Beijing), the user's link the 11:45 Beijing (12:45 KST) window
 K = m.WINDOW_UPDOWN_MARKETS[1]
 assert (K.key, K.stem, K.symbol, K.coin, K.exchange, K.minutes) == ("SKHYNIX-15M", "skhynix", "SKHYNIXUSDT", "SK 海力士", "kr", 15)
-assert m.stamp(K.current(at(7, 50)).start_ms + 60_000, seconds=False) == "11-04 08:00" and K.exists(at(14, 0)) and not K.exists(at(14, 15))
+assert m.stamp(K.current(at(7, 50)).start_ms + 60_000, seconds=False) == "11-04 08:00" and K.exists(at(14, 15)) and not K.exists(at(14, 30))
 assert K.current(at(11, 50)).slug == "skhynix-updown-15m-1793763900" and K.current(at(11, 50)).name == "SK 海力士 15分涨跌 11:45–12:00"
-assert m.stamp(K.before(K.current(at(8, 0))).start_ms + 60_000, seconds=False) == "11-03 14:00"
+assert m.stamp(K.before(K.current(at(8, 0))).start_ms + 60_000, seconds=False) == "11-03 14:15"
 assert W.ROLL_WAIT_MS == 60_000 and m.DailyUpDownSpec.ROLL_WAIT_MS == 10 * 60_000
 
 # --- σ from the index's 1-minute candles: the last four hours, or the last hour when it moves more ---------------------------
@@ -253,10 +253,18 @@ async def run():
     fm.now = bot.market.now = T1 + 2_000
     card.times["candle"] = -1e9
     await bot.refresh_updown(T1 + 2_000)
-    nxt = W.current(T1)
+    nxt = W.current(T1)  # 1.105.2: the 11:15–11:30 window exists — consecutive, the settling candle is its line
+    assert card.spec == nxt and nxt.slug == "unitree-updown-15m-1793762100" and card.close_of("start") == D("90.2000"), (card.spec, card.close_of("start"))
+    assert "UNITREE-15M" in bot.predict_targets(T1 + 2_000)
+    # the 11:15 window ends at the break: the card moves on to 13:00, and the feed follows it from a quarter hour before, not through the break
+    T2 = T1 + 15 * 60_000
+    fm.index[T2 - 60_000] = "90.5000"
+    fm.now = bot.market.now = T2 + 2_000
+    card.times["candle"] = -1e9
+    await bot.refresh_updown(T2 + 2_000)
+    nxt = W.current(T2)
     assert card.spec == nxt and nxt.slug == "unitree-updown-15m-1793768400" and card.close_of("start") is None, card.spec  # 13:00: after the break
-    # the feed follows the next window from a quarter hour before it, not through the lunch break
-    assert "UNITREE-15M" not in bot.predict_targets(T1 + 2_000) and "UNITREE-15M" in bot.predict_targets(nxt.start_ms + 60_000 - 15 * 60_000)
+    assert "UNITREE-15M" not in bot.predict_targets(T2 + 2_000) and "UNITREE-15M" in bot.predict_targets(nxt.start_ms + 60_000 - 15 * 60_000)
     # consecutive windows: the candle that settled one is the next one's line, kept at the roll (10:45–11:00 → 11:00–11:15)
     c3 = m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(T0 - 30_000), None)
     assert c3.updowns["UNITREE-15M"].spec == W.before(spec)
@@ -281,7 +289,8 @@ async def run():
     # a restart within a minute of a window's end: the card starts on that window while its end is not read
     fresh = m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(T1 + 30_000), None)
     assert fresh.updowns["UNITREE-15M"].spec == spec
-    assert m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(T1 + 61_000), None).updowns["UNITREE-15M"].spec == nxt
+    assert m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(T1 + 61_000), None).updowns["UNITREE-15M"].spec == W.window_spec(T1)  # 11:15–11:30
+    assert m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(T2 + 61_000), None).updowns["UNITREE-15M"].spec == nxt  # 13:00, over the break
     print("WINDOW_OK")
 
 
