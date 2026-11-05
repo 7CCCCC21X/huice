@@ -283,7 +283,8 @@ class PredictApi:
     """Signed-in requests to Predict's REST API. The API key goes in x-api-key on every request; the JWT from the
     sign-in flow (GET /v1/auth/message → sign → POST /v1/auth) in Authorization, renewed before it expires or after a
     401. A 429 pauses every request for its retry-after."""
-    PARALLEL = 3
+    PARALLEL = 4           # requests in flight at most (1.112.1: 4, was 3 — a cancel and its re-quote go side by side)
+    READ_PARALLEL = 2      # ...of which the reads may hold this many: two slots always stay free for an order or a cancel
     BACKOFF_SECONDS = 20
 
     def __init__(self, base: str, api_key: str, wallet: Wallet | None):
@@ -291,7 +292,7 @@ class PredictApi:
         self.jwt, self.jwt_exp, self.jwt_at = "", 0, 0.0
         self.auth_error = ""
         self.gate = asyncio.Semaphore(self.PARALLEL)
-        self.read_gate = asyncio.Semaphore(max(1, self.PARALLEL - 1))  # the reads leave a slot: an order or a cancel never queues behind them
+        self.read_gate = asyncio.Semaphore(max(1, min(self.READ_PARALLEL, self.PARALLEL - 1)))  # the reads leave slots: an order or a cancel never queues behind them
         self.writes_inflight = 0  # orders and cancels on their way (call: priority): the shutdown drain waits for their answers
         self.blocked_until = 0.0
         self.calls = 0
@@ -306,8 +307,9 @@ class PredictApi:
         return out
 
     async def call(self, method: str, path: str, payload: dict | None = None, timeout: int = API_TIMEOUT, priority: bool = False) -> Any:
-        """One request under the gate (PARALLEL in flight at most). A read takes a slot of the reads' own gate first, so
-        one slot is always free for a ``priority`` request — an order, a cancel — which never waits behind the reads."""
+        """One request under the gate (PARALLEL in flight at most). A read takes a slot of the reads' own gate first
+        (READ_PARALLEL), so slots are always free for a ``priority`` request — an order, a cancel — which never waits
+        behind the reads."""
         left = self.blocked_until - time.monotonic()
         if left > 0:
             raise core.RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
@@ -739,6 +741,7 @@ class LiveTrader:
         self.config = config
         self.wallet = Wallet(config.live_key, config.live_chain, config.live_account)
         self.api = PredictApi(API_BASES[config.live_chain], config.predict_api_key, self.wallet)
+        self.api.ORDERS_PAGE = config.live_orders_page  # LIVE_ORDERS_PAGE: fewer pages (a round trip each) when the account rests many orders
         self.chain = Chain(config.live_rpc or RPC_URLS[config.live_chain], self.wallet)
         self.ready_error = "尚未登录 Predict"
         self.ready_at = 0.0
@@ -1811,10 +1814,12 @@ class LiveBot(core.Bot):
         self.live_readopt(open_rows, by_id, by_hash, now_ms)
         self.live_note_unknown(open_rows, now_ms)
         self.live_synced_at = self.live_list_at_ms = now_ms
-        markets = {}
-        with contextlib.suppress(Exception):
-            markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
-        for tid, trade in active.items():
+        markets: dict[str, core.SimMarket] = {}
+        with contextlib.suppress(Exception):  # the records' own cards alone (1.112.1: every card used to be priced for this, each step)
+            for key in sorted({str(t.get("key") or "") for t in active.values() if t.get("key")}):
+                markets.update({mk.market: mk for mk in self.sim_markets_for(key, now_ms)})
+
+        async def one(tid: str, trade: dict) -> None:
             st = trade["live"]
             before = json.dumps(trade, sort_keys=True, default=str)
             try:
@@ -1830,9 +1835,12 @@ class LiveBot(core.Bot):
                 st["last_error"] = core.clean_error(error) or type(error).__name__
                 self.live_note_error(f"{trade['item']} {trade['label']} 订单同步失败：{st['last_error']}")
             if st.get("rekeyed") and st["rekeyed"] != tid:
-                continue  # moved to an attempt record (live_fail): saved there, never again under the old key
+                return  # moved to an attempt record (live_fail): saved there, never again under the old key
             if json.dumps(trade, sort_keys=True, default=str) != before:
                 self.sim_save([(tid, trade)])
+        # side by side (1.112.1: one after another, each record's reads and cancels added up to the step's 同步 seconds); the
+        # API gate bounds them, and a record's own failure is noted on it alone
+        await asyncio.gather(*(one(tid, trade) for tid, trade in list(active.items())))
 
     async def live_cancel_blind(self, active: dict[str, dict], now_ms: int) -> None:
         """The open list could not be read (or the express lane cannot wait for one): the withdrawn records whose order id

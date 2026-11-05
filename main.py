@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.112.0"
+VERSION = "1.112.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -721,6 +721,7 @@ class Config:
     live_retry: int = 300              # LIVE_RETRY_SECONDS: a market and side whose order Predict refused (or whose send broke) waits this long
     live_taker_retry: int = 30         # LIVE_TAKER_RETRY_SECONDS: ...whose taker filled nothing (the timer, the bot's own re-judgement) or was dropped at the re-check
     live_max_order_usd: float = 100.0  # LIVE_MAX_ORDER_USD: the most one order may cost
+    live_orders_page: int = 50         # LIVE_ORDERS_PAGE: orders per page when the account's open list is read (a page is a round trip; 1.112.1)
     live_max_open_usd: float = 500.0   # LIVE_MAX_OPEN_USD: filled positions plus resting orders, at cost
     live_max_daily_loss_usd: float = 200.0  # LIVE_MAX_DAILY_LOSS_USD: realised loss per Beijing day that stops new orders; 0 = no limit
     live_auto_redeem: bool = True      # LIVE_AUTO_REDEEM: redeem resolved positions for USDT on-chain
@@ -911,6 +912,7 @@ class Config:
             live_retry=bounded_int(e, "LIVE_RETRY_SECONDS", 300, 10, 86400),
             live_taker_retry=bounded_int(e, "LIVE_TAKER_RETRY_SECONDS", 30, 1, 3600),
             live_max_order_usd=parse_bounded(e, "LIVE_MAX_ORDER_USD", "100", 1, 1_000_000),
+            live_orders_page=bounded_int(e, "LIVE_ORDERS_PAGE", 50, 10, 500),
             live_max_open_usd=parse_bounded(e, "LIVE_MAX_OPEN_USD", "500", 1, 100_000_000),
             live_max_daily_loss_usd=parse_bounded(e, "LIVE_MAX_DAILY_LOSS_USD", "200", 0, 100_000_000),
             live_auto_redeem=not off(e.get("LIVE_AUTO_REDEEM", "on")),
