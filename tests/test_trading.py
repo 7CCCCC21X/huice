@@ -955,6 +955,21 @@ async def run():
     assert fbot.sim_trades()[mtid]["live"]["state"] == "open" and not fbot.live_fill_tasks
     assert mbot.sim_trades()[mtid]["price"] == 0.57 and mbot.sim_trades()[mtid]["live"]["order_id"] == "103"
 
+    # --- 1.118.0: a resting order filled to within a share of its count is withdrawn and its fills kept as the position: the last
+    # fraction of a share never fills, and the order would hold its slot (and sit under 挂单中) all day
+    dbot = make_bot(SIM_MAKER_MIN_BID="100", SIM_MAKER_EXIT_CENTS="5", SIM_MAKER_SESSION="on", SIM_WAYS="maker")
+    await dbot.live_prepare(); dfake = dbot.live.api
+    await dbot.live_prefetch(NOW)
+    await step(dbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    assert dbot.sim_trades()[mtid]["live"]["order_id"] == "101" and dbot.sim_trades()[mtid]["order"] == 100
+    dfake.fill("101", 99.99)
+    for at in (NOW + 20_000, NOW + 40_000):
+        await step(dbot, at, hsi(0.70, [("0.55", "300")], [("0.58", "400")], at))
+    await dbot.live_fills_wait()
+    dust = next(t for k, t in dbot.sim_trades().items() if k.startswith(mtid) and abs(float(t.get("shares") or 0) - 99.99) < 1e-9)
+    assert dust["status"] == "filled" and abs(dust["unfilled"] - 0.01) < 1e-6 and ("remove", ["101"]) in dfake.calls, dust
+    assert dust["live"]["cancel_why"] == "剩 0.01 份不到 1 份的零头，撤掉不再等（已成交 99.99 份照常持有）" and "零头" in dust["note"], (dust["live"]["cancel_why"], dust["note"])
+
     # --- execution safety: reserved until Predict's final word, cancels confirmed, unknown results reconciled, the pre-send check
     sbot = make_bot(SIM_WAYS="both")
     await sbot.live_prepare()

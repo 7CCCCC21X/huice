@@ -341,6 +341,11 @@ async def run():
     got = []
     bot.sim_take(late(T1 - 179_000), m.TradeMap(), T1 - 179_000, got)
     assert [(t["label"], t["order"]) for _, t in got] == [("吃涨", 10.0)] and bot.sim_withdraw_reason(resting, late(T1 - 179_000), T1 - 179_000) == ""
+    # 1.118.0: a resting order filled to within a share of its count is withdrawn, its fills the position (the last fraction never fills)
+    at = T1 - 300_000
+    assert bot.sim_withdraw_reason({**resting, "shares": 9.5, "order": 10.0}, late(at), at) == "剩 0.5 份不到 1 份的零头，撤掉不再等（已成交 9.5 份照常持有）"
+    assert bot.sim_withdraw_reason({**resting, "shares": 9.0, "order": 10.0}, late(at), at) == "" and bot.sim_withdraw_reason({**resting, "shares": 0.0, "order": 10.0}, late(at), at) == ""
+    assert bot.sim_withdraw_reason({**resting, "shares": 10.0, "order": 10.0}, late(at), at) == ""  # nothing left: filled, not this
     hush_off = m.Bot(m.Config.from_env({**ENV, "SIM_CRYPTO_15M_MAKER_QUIET_SECONDS": "0"}), m.Store(":memory:"), FM(now), None)
     assert hush_off.sim_maker_quiet(mk.settle, T1 - 100_000) == "" and hush_off.sim_maker_pick(mk, m.TradeMap(), "up", edge, T1 - 100_000) == (10.0, "")
     long_quiet = m.Bot(m.Config.from_env({**ENV, "SIM_QUIET_MINUTES": "10", "SIM_CRYPTO_15M_QUIET_SECONDS": "0", "SIM_CRYPTO_15M_EDGE_CENTS": "6"}),

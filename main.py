@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.117.1"
+VERSION = "1.118.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -9680,6 +9680,8 @@ SIM_MAKER_MODE_SLACK = 0.01  # under the after-hours / deep-bid modes a resting 
 SIM_MAKER_DEEP_STEP = 0.01  # a deep-bid order goes this far above the best bid: at the front of the book, filled before the queue there
 SIM_MAKER_FRONT_MIN = 1.0  # a bid of at least this many shares by others, at or over a deep-bid order, is in front of it: re-quoted over; smaller dust is ignored
 SIM_STALE_WITHDRAW_MS = 5 * 60_000  # a resting order whose book has not refreshed this long is withdrawn: no pricing basis is left
+SIM_MAKER_DUST_SHARES = 1.0  # a resting order with less than this many shares still unfilled is withdrawn, its fills kept as the position
+#                              (1.118.0: a 300-share KOSPI order filled to 299.99 sat on the book all evening, its slot taken, shown as 挂单中)
 SIM_WINDOW_STALE_WITHDRAW_MS = 90_000  # ...on a 15-minute window as soon as the book is stale (PREDICT_STALE_MS): a quarter hour has no five minutes to spare (1.110.0)
 
 
@@ -16453,12 +16455,17 @@ class Bot:
 
     def sim_withdraw_reason(self, trade: dict, mk: SimMarket | None, now_ms: int | None = None) -> str:
         """Why a resting paper order is withdrawn now rather than left to the result: the trader no longer places such
-        orders (SIM_WAYS, SIM_MARKETS, a kind that is taker-only such as the price ladders), or the market is in its
-        last minutes (SIM_QUIET_MINUTES). "" while it stands."""
+        orders (SIM_WAYS, SIM_MARKETS, a kind that is taker-only such as the price ladders), the market is in its
+        last minutes (SIM_QUIET_MINUTES), or what is left of the order is a fraction of a share that never fills
+        (SIM_MAKER_DUST_SHARES, 1.118.0). "" while it stands."""
         kind = str(trade.get("kind") or "")
         quiet = self.sim_quiet(trade.get("settle") or (mk.settle if mk is not None else None), self.market.now_ms() if now_ms is None else now_ms)
         if quiet:
             return quiet
+        if trade.get("maker") and trade.get("status") == "resting" and float(trade.get("shares") or 0) > 1e-9:
+            left = float(trade.get("order") or 0) - float(trade.get("shares") or 0)
+            if 1e-9 < left < SIM_MAKER_DUST_SHARES:  # the last fraction of a share: never filled, the slot taken meanwhile
+                return f"剩 {left:g} 份不到 {SIM_MAKER_DUST_SHARES:g} 份的零头，撤掉不再等（已成交 {float(trade['shares']):g} 份照常持有）"
         if self.config.sim_ways == "taker":
             return "模拟交易已改为只吃单"
         if kind not in self.config.sim_markets:
