@@ -113,6 +113,7 @@ async def run():
     # 1.113.0: a day is one line until it is clicked (sumDays); 今日按市场 has a refresh button and the time of the data
     assert "sumDays" in m.JOURNAL_PAGE and 'id="scref"' in m.JOURNAL_PAGE and 'id="scat"' in m.JOURNAL_PAGE and "function clock(" in m.JOURNAL_PAGE
     assert 'id="anaref"' in m.JOURNAL_PAGE and 'id="anaat"' in m.JOURNAL_PAGE  # 1.113.1: the 复盘分析 header's refresh button and the time of its data
+    assert 'id="s-detail"' in m.JOURNAL_PAGE and "rows=1" in m.JOURNAL_PAGE and "function cardDetail(" in m.JOURNAL_PAGE  # 1.114.0: a card's records under the table
     # 1.81.0: the analysis tables (per underlying, per edge / fair bucket, per session part, the makers, the refused buys), the
     # marks, the summary CSV and the daily report
     hsi_mk = m.SimMarket(HSI_SLUG, "恒生指数", "close", "HSI", 0.70, book([("0.55", "300")], [("0.58", "400")], NOW, HSI_SLUG, "HSI", "101"),
@@ -177,6 +178,17 @@ async def run():
     junk = fj("analysis=1&kind=nope&way=sideways&card=")
     assert junk["filter"] == {} and junk["records"] == 6 and junk["filter_text"] == ""
     assert m.block_matches({"label": "吃跌", "market": "x"}, {"card": "恒生指数"}, {"x"}) and not m.block_matches({"label": "吃跌", "market": "y"}, {"card": "恒生指数"}, {"x"})  # an older block: by market
+    # --- 1.114.0: a card's records of a day as list rows (what opens under a line of 今日按市场): every one of them, newest first,
+    # the settled ones' P&L adding up to the card's line; "today" is the bot's Beijing day, a day nothing was opened on is empty,
+    # a day that does not read means every day
+    hs_rows = fj("rows=1&day=today&card=" + urllib.parse.quote("恒生指数"))
+    assert hs_rows["filter"] == {"card": "恒生指数"} and hs_rows["day"] == "2026-10-05" and [t["card"] for t in hs_rows["trades"]] == ["恒生指数"] * 2, hs_rows["day"]
+    assert hs_rows["trades"][0]["opened"] >= hs_rows["trades"][1]["opened"] and set(hs_rows["trades"][0]) <= set(m.Bot.JOURNAL_LIGHT) | {"live_state", "order_id"}
+    hs_line = next(r for r in data["analysis"]["cards_today"] if r["name"] == "恒生指数")
+    assert hs_rows["total"]["records"] == hs_line["records"] == 2 and abs(hs_rows["total"]["pnl"] - hs_line["pnl"]) < 1e-9
+    assert abs(sum(t["pnl"] or 0 for t in hs_rows["trades"]) - hs_line["pnl"]) < 1e-9 and hs_rows["total"]["settled"] == sum(t["status"] == "settled" for t in hs_rows["trades"])
+    assert fj("rows=1&day=2026-10-04&card=" + urllib.parse.quote("恒生指数"))["trades"] == [] and fj("rows=1&day=2026-10-04")["total"]["records"] == 1  # the 上证 record, opened the day before
+    assert fj("rows=1&day=nope")["total"]["records"] == 6 and fj("rows=1")["day"] == "" and fj("rows=1&day=today&way=maker")["total"]["records"] == 3
     status, _, body = web.route("GET", f"/p/{TOKEN}/summary.csv", "card=" + urllib.parse.quote("恒生指数"))
     frows = list(csv.reader(io.StringIO(body.decode("utf-8")[1:])))
     assert status == 200 and frows[1][:3] == ["筛选", "恒生指数", "2"] and next(r for r in frows if r[1] == "累计")[2] == "2", frows[:3]
@@ -366,6 +378,16 @@ async def browser_check(bot, data):
         assert await page.is_visible("#anabody") and (await page.inner_text("#anaat")).startswith("已刷新 ")
         await page.click("#anahd")
         assert await page.is_hidden("#anabody")
+        # 1.114.0: a line of 今日按市场 opens the card's records of the day under the table (read from the server), a second click folds them
+        assert await page.is_hidden("#s-detail")
+        hs_line = page.locator("#s-cards tr.dayrow", has_text="恒生指数")
+        assert await hs_line.count() == 1 and (await hs_line.inner_text()).startswith("▸ 恒生指数")
+        await hs_line.locator("td").first.click()
+        await page.wait_for_selector("#s-detail .list .tr")
+        assert (await hs_line.inner_text()).startswith("▾ 恒生指数") and "恒生指数 · 今天的每一笔" in await page.inner_text("#s-detail h3")
+        assert await page.locator("#s-detail .list .tr").count() == 2 and "2 笔" in await page.inner_text("#s-detail .day") and "已结算" in await page.inner_text("#s-detail .day")
+        await page.click("#s-detail button:has-text('收起')")
+        assert await page.is_hidden("#s-detail") and (await hs_line.inner_text()).startswith("▸ 恒生指数")
         assert not errors, errors
         # three rows at first (the resting order and the last two finished ones), every one on request, by day
         assert await page.locator("#list .tr").count() == 3 and "更早的 3 笔可载入" in await page.inner_text("#meta")
