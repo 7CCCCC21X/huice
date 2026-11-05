@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.112.1"
+VERSION = "1.112.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7738,9 +7738,10 @@ class SpotWindowMarket(IndexUpDownMarket):
     PROXY_NOTE = "不用代理：结算源 Chainlink 取币安现货买卖一的中间价，卡片按最新成交价，两者相差不到一个最小价位"
     GROUP = "crypto"
     TIE = D("0.0001")
-    STRIKE_WAIT_MS = 20_000  # the line is Chainlink's figure, which Predict relays as the window's start price: waited for (updown_hold).
-    #                          1.110.2: 20 s, not 60 — the candle's close has matched Predict's figure to the cent (BTC's spread is a
-    #                          tick), and the eager asking (Bot.updown_strike) gets the figure within seconds when the API has it
+    STRIKE_WAIT_MS = 0  # the line is Chainlink's figure, which Predict relays as the window's start price (line_used, read from the
+    #                     REST category within seconds of the start): 1.112.2 waits for it no longer — the candle's close has matched
+    #                     it to half a tick (80,486.99 against 80,486.985 on 11-05), and the figure replaces the line the moment it
+    #                     comes; the wait (updown_hold) stays for a kind of market whose candle is further off
 
     async def get(self, path: str, **params: Any) -> Any:
         return await binance_spot(path, **params)

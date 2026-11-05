@@ -481,13 +481,15 @@ async def run():
     assert {"kind": "updown", "key": "BTC-15M", "name": bspec.name, "skipped": False} in bbot.sim_catalog(T0 + 6_000)
     # 1.110.0: the line is Chainlink's figure as Predict relays it (the window's start price) once it agrees with the candle; a
     # spot window waits up to 60 s for it before suggesting anything, and a figure 0.1% off holds the card instead
-    # 1.111.1 / 1.112.0: the figure is waited for only where one can come — REST gave one for this card's kind lately, or
-    # GraphQL (retired) knows the category type; neither: the candle is the line at once
+    # 1.112.2: no card waits for the figure by default (the candle has matched it to half a tick; the figure replaces the line the
+    # moment it comes, line_used); the wait itself stays (STRIKE_WAIT_MS) and applies only where a figure can come — REST gave
+    # one for this card's kind lately, or GraphQL (retired) knows the category type
+    assert card.STRIKE_WAIT_MS == 0 and btc.STRIKE_WAIT_MS == 0 and m.SpotWindowMarket.STRIKE_WAIT_MS == 0
     assert bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("", "") and not bbot.predict.strike_possible(bspec.slug)
     bbot.predict.strike_seen["btc-updown-15m"] = time.monotonic()
-    assert bbot.predict.strike_possible(bspec.slug)
+    assert bbot.predict.strike_possible(bspec.slug) and bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("", "")  # possible, not waited for
+    btc.STRIKE_WAIT_MS = 20_000  # the wait, where wanted
     assert bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("等 Predict 公布这个窗口的起点价（最多 20 秒）", "") and bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 21_000) == ("", "")
-    assert card.STRIKE_WAIT_MS == 0 and btc.STRIKE_WAIT_MS == 20_000
     bbot.predict.strike_seen["btc-updown-15m"] = time.monotonic() - 90_000  # a day without one: not expected any more
     assert bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("", "") and not bbot.predict.strike_possible(bspec.slug)
     bbot.predict.types[bspec.slug] = "CryptoUpDownCategory"  # GraphQL would know the type (where it still answers)
@@ -495,6 +497,7 @@ async def run():
     bbot.predict.graphql_until = time.monotonic() + 600  # paused after a 403: no wait either
     assert bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("", "") and not bbot.predict.strike_possible(bspec.slug)
     bbot.predict.graphql_until = 0.0
+    btc.STRIKE_WAIT_MS = 0
     bbot.predict.strikes[bspec.slug] = (D("100000.50"), 0.0)
     btc.times["price"] = -1e9
     await bbot.refresh_updown(T0 + 6_500)
