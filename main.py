@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.112.3"
+VERSION = "1.113.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -11711,7 +11711,7 @@ a{color:var(--best)}.mut{color:var(--muted)}.small{font-size:12.5px}.warn{color:
 .box p{margin:4px 0}
 .tbl{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
 table{border-collapse:collapse;font-size:12.5px;width:100%;font-variant-numeric:tabular-nums}
-.tbl tr.sub td{color:var(--muted)}.tbl tr.sub td:first-child{padding-left:22px}.tbl tr.all td{font-weight:700;border-top:2px solid var(--line)}
+.tbl tr.sub td{color:var(--muted)}.tbl tr.sub td:first-child{padding-left:22px}.tbl tr.all td{font-weight:700;border-top:2px solid var(--line)}.tbl tr.dayrow td{cursor:pointer}.tbl tr.dayrow td:first-child{font-weight:600}#scat{font-weight:400;margin-left:4px}
 td,th{border-bottom:1px solid var(--line2);padding:6px 10px;text-align:left;vertical-align:top;white-space:nowrap}
 th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;background:var(--chip)}tr:last-child td{border-bottom:0}tr:hover td{background:var(--chip)}td.wrap{white-space:normal;min-width:160px}
 .filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:12px 0 8px}
@@ -11744,7 +11744,7 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
 <div class="tiles" id="tiles"></div>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
-<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><h3>今日按市场</h3><div class="tbl" id="s-cards"></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。</p><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
+<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><h3>今日按市场 <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbl" id="s-cards"></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。</p><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
 <div class="note fline" id="anafilt" hidden></div>
@@ -11926,10 +11926,11 @@ function src(){  // what the summary and the analysis show: every record, or the
 function filterLine(el,S){el.hidden=!S.label;if(!S.label)return;
   const b=$("button","lnk","清除筛选");b.type="button";b.addEventListener("click",e=>{e.stopPropagation();cardF=kindF=wayF="all";shown=PAGE;render()});
   el.replaceChildren("按筛选：",$("b","",S.label),"（下面列表的市场、类型、挂/吃筛选；状态筛选只管列表） ",b)}
+const sumDays=new Set();  // the days whose kind / way lines are shown (1.113.0: a day is one line until it is clicked; the set outlives the refreshes)
 function summary(){  // per day the records were opened on: records, markets, what filled, what settled and its P&L, what is open — by kind and way under each
   const S=src(),rows=S.s,el=document.getElementById("summary"),head=document.getElementById("sumsum");el.replaceChildren();
   filterLine(document.getElementById("sumfilt"),S);const fk=filterKey();document.getElementById("scsv").href=base+"/summary.csv"+(fk?"?"+fk:"");document.getElementById("csv").href=base+"/journal.csv"+(fk?"?"+fk:"");
-  const cel=document.getElementById("s-cards");
+  const cel=document.getElementById("s-cards");document.getElementById("scat").textContent=okAt?"已刷新 "+clock(okAt):"";
   if(rows===null){el.append($("p","small mut",S.err?"按筛选读取失败："+S.err:"按筛选读取中…"));cel.replaceChildren();head.textContent=S.label;
     document.getElementById("sumbody").hidden=!sumOpen;return}
   if(!rows.length){el.append($("p","small mut",S.label?"这个筛选下没有交易":"还没有交易"));cel.replaceChildren();head.textContent=S.label;document.getElementById("sumbody").hidden=!sumOpen;return}
@@ -11939,7 +11940,10 @@ function summary(){  // per day the records were opened on: records, markets, wh
   const line=(r,name,cls)=>{const tr=$("tr",cls);tr.append(cell(name),cell(r.records),cell(r.markets),cell(num(r.filled)),cell(usd(r.volume)),cell(r.settled?wl(r):"—"),
     cell(r.settled?money(r.pnl):"—",r.settled?(r.pnl>=0?"ok":"bad"):""),cell((r.open?r.open+"（"+usd(r.open_cost)+"）":"")+(r.resting?(r.open?" · ":"")+"挂单 "+r.resting:"")||"—"),
     cell(r.marked?money(r.unrealized)+(r.marked<r.open?"（"+r.marked+"/"+r.open+" 笔有报价）":""):"—",r.marked?(r.unrealized>=0?"ok":"bad"):""));return tr};
-  rows.forEach(r=>{t.append(line(r,r.label,r.day?"":"all"));if(r.day)(r.parts||[]).forEach(p=>t.append(line(p,p.name,"sub")))});
+  rows.forEach(r=>{if(!r.day){t.append(line(r,r.label,"all"));return}  // 累计: one line
+    const open=sumDays.has(r.day),tr=line(r,(open?"▾ ":"▸ ")+r.label,"dayrow");tr.title=open?"收起这一天的明细":"点开看这一天按类型和挂单 / 吃单的明细";
+    tr.addEventListener("click",()=>{if(open)sumDays.delete(r.day);else sumDays.add(r.day);summary()});t.append(tr);
+    if(open)(r.parts||[]).forEach(p=>t.append(line(p,p.name,"sub")))});
   el.append(t);
   const d=rows[0];head.replaceChildren((S.label?S.label+"｜":"")+d.label+"：记录 "+d.records+" · 成交 "+usd(d.volume)+(d.settled?" · 盈亏 ":""));
   if(d.settled){const b=$("b","",money(d.pnl));b.className=d.pnl>=0?"ok":"bad";head.append(b)}
@@ -12069,6 +12073,7 @@ function render(){
   more(all.length)}
 let okAt=0,dead=false;
 function two(n){return String(n).padStart(2,"0")}
+function clock(ms){const d=new Date(ms);return two(d.getHours())+":"+two(d.getMinutes())+":"+two(d.getSeconds())}
 function ctlKey(){try{return sessionStorage.getItem("ctlkey")||""}catch(e){return ""}}
 function askKey(msg){const k=prompt(msg+"\n这是实盘账户的交易记录，需要控制口令（环境变量 WEB_CONTROL_KEY）：","");if(k===null||!k.trim()){load.keyBad=true;return false}
   try{sessionStorage.setItem("ctlkey",k.trim())}catch(e){}load.keyBad=false;return true}
@@ -12083,7 +12088,7 @@ async function load(){  // the list: light rows, the open trades and the last fe
       document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"+(data.more>0?"（更早的 "+data.more+" 笔可载入）":"")));
       render();if(openId&&details[openId])loadDetail(openId);
       const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}}
-  catch(e){const at=okAt?new Date(okAt):null,hms=at?two(at.getHours())+":"+two(at.getMinutes())+":"+two(at.getSeconds()):"";
+  catch(e){const hms=okAt?clock(okAt):"";
     if(e.message==="HTTP 404")dead=true;
     document.getElementById("meta").replaceChildren($("span","bad","⚠️ 读取失败："+(dead?"链接已失效，请在 Telegram 重新发送 /web；本页不再自动刷新":e.name==="AbortError"?"20 秒没有回应":e.message)+
       (okAt?"；下面显示的是 "+hms+" 的旧数据":"")))}
@@ -12097,6 +12102,8 @@ document.getElementById("statshd").addEventListener("click",()=>{statsOpen=!stat
   document.getElementById("statsbody").hidden=!statsOpen;document.getElementById("foldstats").textContent=statsOpen?"收起":"展开"});
 document.getElementById("sumhd").addEventListener("click",()=>{sumOpen=!sumOpen;try{localStorage.setItem("jrnsum",sumOpen?"1":"0")}catch(e){}
   document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"});
+document.getElementById("scref").addEventListener("click",async e=>{e.stopPropagation();const b=e.currentTarget;if(b.disabled)return;b.disabled=true;b.textContent="刷新中…";  // 1.113.0
+  try{if(load.busy)load.again=true;else await load()}finally{b.disabled=false;b.textContent="刷新"}});
 document.getElementById("anahd").addEventListener("click",()=>{anaOpen=!anaOpen;try{localStorage.setItem("jrnana",anaOpen?"1":"0")}catch(e){}
   document.getElementById("anabody").hidden=!anaOpen;document.getElementById("foldana").textContent=anaOpen?"收起":"展开"});
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once

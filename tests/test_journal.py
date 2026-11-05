@@ -110,6 +110,8 @@ async def run():
     assert s[1]["records"] == 1 and s[1]["losses"] == 1 and abs(s[1]["pnl"] + 50) < 1e-9 and s[1]["parts"][0]["name"] == "指数/个股日涨跌"
     assert s[-1]["day"] == "" and s[-1]["records"] == 6 and abs(s[-1]["pnl"] - data["total"]["pnl"]) < 1e-9 and s[-1]["settled"] == data["total"]["settled"]
     assert m.sim_summary([]) == [] and 'id="summary"' in web.route("GET", f"/p/{TOKEN}/journal")[2].decode() and "jrnsum" in m.JOURNAL_PAGE
+    # 1.113.0: a day is one line until it is clicked (sumDays); 今日按市场 has a refresh button and the time of the data
+    assert "sumDays" in m.JOURNAL_PAGE and 'id="scref"' in m.JOURNAL_PAGE and 'id="scat"' in m.JOURNAL_PAGE and "function clock(" in m.JOURNAL_PAGE
     # 1.81.0: the analysis tables (per underlying, per edge / fair bucket, per session part, the makers, the refused buys), the
     # marks, the summary CSV and the daily report
     hsi_mk = m.SimMarket(HSI_SLUG, "恒生指数", "close", "HSI", 0.70, book([("0.55", "300")], [("0.58", "400")], NOW, HSI_SLUG, "HSI", "101"),
@@ -340,6 +342,20 @@ async def browser_check(bot, data):
         assert await page.is_visible("#statsbody") and "模型预期（下单时）" in await page.inner_text("#statsbody") and await page.is_visible("#groups")
         await page.click("#statshd")
         assert await page.is_hidden("#statsbody")
+        # 1.113.0: the daily summary is one line per day until that line is clicked (its kind / way lines then show; a second
+        # click folds them); 今日按市场 has a refresh button and says when the data was read
+        days = page.locator("#summary tr.dayrow")
+        assert await days.count() >= 1 and await page.locator("#summary tr.sub").count() == 0 and (await days.first.inner_text()).startswith("▸ ")
+        await days.first.click()
+        assert await page.locator("#summary tr.sub").count() >= 2 and (await days.first.inner_text()).startswith("▾ ")
+        await days.first.click()
+        assert await page.locator("#summary tr.sub").count() == 0
+        assert (await page.inner_text("#scat")).startswith("已刷新 ") and await page.inner_text("#scref") == "刷新"
+        read_at = await page.evaluate("okAt")  # when the data was last read
+        await page.click("#scref")  # disabled and "刷新中…" while the page re-reads, then back
+        await page.wait_for_selector("#scref:not([disabled])")
+        assert await page.inner_text("#scref") == "刷新" and await page.evaluate("okAt") > read_at and await page.locator("#list .tr").count() == 3
+        assert not errors, errors
         # three rows at first (the resting order and the last two finished ones), every one on request, by day
         assert await page.locator("#list .tr").count() == 3 and "更早的 3 笔可载入" in await page.inner_text("#meta")
         await page.click("#more button:has-text('载入更早的 3 笔')")
