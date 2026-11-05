@@ -205,6 +205,14 @@ async def run():
     assert "📈 成交后市场走向（盘口中间价 − 成交价，每份）：1 分钟 -9.0¢（3 笔）｜5 分钟 -18.0¢（3 笔）｜30 分钟 +3.0¢（3 笔）；持续为负" in text, text
     rows = list(csv.reader(io.StringIO(bot.journal_csv()[1:])))
     assert rows[1][-3:] == ["-0.09", "-0.18", "0.03"], rows[1][-3:]
+    # 1.107.3: the summary CSV carries every horizon's market and fair-price moves and the counts; /markout says them in text
+    srows = list(csv.reader(io.StringIO(bot.journal_summary_csv()[1:])))
+    scol = dict(zip(srows[0], next(r for r in srows if r[0] == "按时段")))  # the tables with markouts: by session, by window (the daily summary has none)
+    assert (scol["成交后1分钟市价变动"], scol["成交后5分钟市价变动"], scol["成交后30分钟市价变动"], scol["走向标记笔数（1/5/30 分钟）"]) == ("-0.09", "-0.18", "0.03", "3/3/3"), scol
+    assert scol["成交后1分钟公平价变动"] != "" and "成交后1分钟公平价变动" in m.Bot.SUMMARY_COLUMNS
+    said = await bot.cmd_markout(m.Request("/markout", [], 1, 0, 42))
+    assert said.startswith("📈 成交后市场走向（记录 ") and "全部：1 分钟 -9.0¢ / " in said and "（3 笔）｜5 分钟 -18.0¢ / " in said and "15 分钟市场" not in said, said
+    assert (await bot.cmd_markout(m.Request("/markout", ["没有这个"], 1, 0, 42))).startswith("没有名字含“没有这个”的市场")
     card = next(i for i in bot.odds_payload()["items"] if i["name"] == "模拟交易")["sim"]
     assert card["groups"][0]["name"] == "$PONS FDV" and card["total"]["markout"]["1m"]["n"] == 3 and card["blocks"][0]["label"] == "吃No"
 

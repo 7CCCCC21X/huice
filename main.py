@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.107.2"
+VERSION = "1.107.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -12832,6 +12832,8 @@ COMMANDS: tuple[Command, ...] = (
             "不带筛选是全部记录；/journal 海力士 吃 = SK 海力士 15 分钟的吃单"),
     Command("summary", "导出复盘汇总 CSV（每日汇总、今日按市场、按净优势 / 公平价 / 时段、按设置版本、15 分钟表、撤单原因、被拦下的机会）", "海力士",
             "筛选词和 /journal 一样"),
+    Command("markout", "成交后市场走向（文字）：全部 / 挂单 / 吃单，15 分钟市场再按下单时离结束的分钟数和窗口开始的整点分组", "海力士 挂",
+            "筛选词和 /journal 一样；1 / 5 / 30 分钟后盘口中间价 − 成交价、模型公平价的变化，持续为负 = 挂单被信息领先的对手吃掉"),
     Command("sim", "模拟交易：净优势 ≥10¢ 时买 100 份，看长期是赚还是亏（只记账，不下单）"),
     Command("live", "真实交易（LIVE=on）：钱包、余额、真实订单、持仓与风控；暂停/恢复/撤单/领取", "pause|resume|cancel all|redeem|check",
             "LIVE=on 时模拟交易的每个决定都会在 Predict 真实下单；/live pause 停止开新仓，/live resume 恢复"),
@@ -13172,7 +13174,7 @@ class Bot:
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
             "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib, "/samples": self.cmd_samples,
-            "/journal": self.cmd_journal, "/summary": self.cmd_summary,
+            "/journal": self.cmd_journal, "/summary": self.cmd_summary, "/markout": self.cmd_markout,
             "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live,
         }
 
@@ -14219,6 +14221,43 @@ class Bot:
         return Document(self.export_name("summary", flt), self.journal_summary_csv(flt).encode("utf-8"),
                         f"复盘汇总（{scope}）：每日汇总、今日按市场、按标的 / 净优势 / 公平价 / 时段、按设置版本、15 分钟表、"
                         "挂单效率与撤单原因、被拦下的机会；第一列是表名")
+
+    async def cmd_markout(self, req: Request) -> Any:
+        """/markout [筛选词]: the fills' markouts (markout_stats) over the filter's records — all of them, the makers' and
+        the takers' — and, for 15-minute windows, by the minutes left at the order and by the window's start hour
+        (sim_by_window): the review page's 15-minute tables as text (1.107.3)."""
+        flt, problem = self.journal_filter_words(req.args)
+        if problem:
+            return problem
+        values = [t for t in self.sim_trades().values() if journal_match(t, flt)]
+        if not values:
+            return f"没有符合的记录（筛选：{journal_filter_text(flt)}）" if flt else "还没有交易记录"
+
+        def text(mo: Mapping) -> str:
+            parts = [f"{label[:-1]} 分钟 {cents(mo[label]['avg'], True)} / {cents(mo[label]['fair'], True)}（{mo[label]['n']} 笔）"
+                     for _, label in MARKOUT_HORIZONS if label in mo]
+            return "｜".join(parts) if parts else "还没有标记"
+
+        def row(r: Mapping) -> str:
+            tail = f"；已结算 {r['settled']} 笔，盈亏 ${float(r.get('pnl') or 0):+.2f}" if r.get("settled") else ""
+            return f"  {r['name']}：{text(r.get('markout') or {})}{tail}"
+
+        lines = ["📈 成交后市场走向" + (f"｜{journal_filter_text(flt)}" if flt else "") + f"（记录 {len(values)} 笔）",
+                 "每份平均：盘口中间价 − 成交价 / 模型公平价 − 成交时公平价；持续为负 = 卖给你的人知道得更多（挂单被信息领先的对手吃掉）",
+                 "全部：" + text(markout_stats(values))]
+        if not flt.get("way"):
+            for name, maker in (("挂单", True), ("吃单", False)):
+                part = [t for t in values if bool(t.get("maker")) == maker]
+                if part:
+                    lines.append(f"{name}：" + text(markout_stats(part)))
+        windows = self.journal_analysis(flt)["analysis"].get("windows") or {}
+        if windows.get("left"):
+            lines.append("15 分钟市场，按下单时离窗口结束：")
+            lines += [row(r) for r in windows["left"]]
+        if windows.get("hours"):
+            lines.append("15 分钟市场，按窗口开始（北京时间）：")
+            lines += [row(r) for r in windows["hours"]]
+        return "\n".join(lines)
 
     def shadow_report(self) -> list[str]:
         """The daily crypto markets' threshold backtest (shadow_sample), scored once their markets have results: for each
@@ -17940,7 +17979,10 @@ class Bot:
         return "\ufeff" + out.getvalue()
 
     SUMMARY_COLUMNS = ("表", "行", "记录", "市场", "成交份数", "成交额", "已结算", "赢", "输", "平", "盈亏", "持仓中", "持仓成本", "挂单中",
-                       "浮动盈亏", "有报价的持仓", "下单时预期", "平均公平价", "胜率", "成交后5分钟市价变动", "成交后30分钟市价变动")
+                       "浮动盈亏", "有报价的持仓", "下单时预期", "平均公平价", "胜率",
+                       # 1.107.3: every horizon, the market's middle and the model's fair price, and how many fills carry the mark
+                       "成交后1分钟市价变动", "成交后5分钟市价变动", "成交后30分钟市价变动",
+                       "成交后1分钟公平价变动", "成交后5分钟公平价变动", "成交后30分钟公平价变动", "走向标记笔数（1/5/30 分钟）")
 
     def journal_summary_csv(self, flt: Mapping | None = None) -> str:
         """The review page's summary and analysis tables as one CSV (UTF-8 with BOM), the table's name in the first
@@ -17970,7 +18012,9 @@ class Bot:
                               "盈亏": r4(r.get("pnl")), "持仓中": r.get("open", ""), "持仓成本": r4(r.get("open_cost")), "挂单中": r.get("resting", ""),
                               "浮动盈亏": r4(r.get("unrealized")), "有报价的持仓": r.get("marked", ""), "下单时预期": r4(r.get("expected")),
                               "平均公平价": r4(r.get("avg_fair")), "胜率": r4(r.get("hit")),
-                              "成交后5分钟市价变动": r4((mo.get("5m") or {}).get("avg")), "成交后30分钟市价变动": r4((mo.get("30m") or {}).get("avg"))})
+                              **{f"成交后{label[:-1]}分钟市价变动": r4((mo.get(label) or {}).get("avg")) for _, label in MARKOUT_HORIZONS},
+                              **{f"成交后{label[:-1]}分钟公平价变动": r4((mo.get(label) or {}).get("fair")) for _, label in MARKOUT_HORIZONS},
+                              "走向标记笔数（1/5/30 分钟）": "/".join(str((mo.get(label) or {}).get("n", 0)) for _, label in MARKOUT_HORIZONS) if mo else ""})
         if payload["filter"]:
             put("筛选", payload["filter_text"], {"记录": payload["records"]})
         for r in payload["summary"]:

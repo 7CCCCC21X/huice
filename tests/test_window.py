@@ -312,7 +312,11 @@ async def run():
     srows = list(csv.reader(io.StringIO(sdoc.data.decode("utf-8").lstrip("\ufeff"))))
     assert sdoc.filename == "summary-20261104-宇树_15分涨跌_加密涨跌.csv" and srows[0] == list(m.Bot.SUMMARY_COLUMNS) and srows[1][:3] == ["筛选", "宇树 15分涨跌 · 加密涨跌", str(sum(m.card_of(t) == "宇树 15分涨跌" for t in bot.sim_trades().values()))], srows[:2]
     assert sdoc.caption.startswith("复盘汇总（筛选：宇树 15分涨跌 · 加密涨跌）：每日汇总、今日按市场") and "15 分钟涨跌｜按下单时距结束" in {r[0] for r in srows}
-    assert all(f"/{name}" in bot.cmd_help(None) and any(c.name == name for c in m.COMMANDS) for name in ("journal", "summary"))
+    assert all(f"/{name}" in bot.cmd_help(None) and any(c.name == name for c in m.COMMANDS) for name in ("journal", "summary", "markout"))
+    # 1.107.3: /markout: the 15-minute tables as text — a row per minutes-left bucket and per start hour, settled count and P&L
+    said = await bot.cmd_markout(m.Request("/markout", ["宇树"], 1, 0, 42))
+    assert said.startswith("📈 成交后市场走向｜宇树 15分涨跌（记录 ") and "15 分钟市场，按下单时离窗口结束：\n  剩 " in said and "15 分钟市场，按窗口开始（北京时间）：\n  11 时开始：" in said, said
+    assert "吃单：" in said and ("已结算 1 笔，盈亏 $" in said or "还没有标记" in said), said
     # an end within 0.05% of the start: Chainlink's report may differ from the index candle — Predict's result decides
     fm.index[nxt.start_ms], fm.index[nxt.end_ms] = "90.2000", "90.2300"
     tie = {**trade, "market": nxt.slug, "slug": nxt.slug, "settle": {"end": nxt.end_ms, "start": nxt.start_ms, "window": "15m"}}
