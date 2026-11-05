@@ -1480,14 +1480,20 @@ class LiveBot(core.Bot):
         1.83.0 failed it then, and its side sat out LIVE_RETRY_SECONDS for a book a second past PREDICT_STALE_MS.
         ("", False) to send; a decision of this very second (the step's own, the express lane's) is sent as made."""
         age = now_ms - self.live_decided(trade, now_ms)
-        if trade.get("maker") or age <= self.LIVE_TAKER_RECHECK_MS:
+        if age <= self.LIVE_TAKER_RECHECK_MS:
             return "", False
+        word = "挂单" if trade.get("maker") else "吃单"
         try:
             mk = next((x for x in self.sim_markets_for(str(trade.get("key") or ""), now_ms) if x.market == trade.get("market")), None)
         except Exception as error:  # the order waits; a pricing failure is no ground to send it, nor to fail it
-            return f"复核吃单决定时定价出错（{core.clean_error(error) or type(error).__name__}），等下一轮", True  # one note per cause (live_defer)
+            return f"复核{word}决定时定价出错（{core.clean_error(error) or type(error).__name__}），等下一轮", True  # one note per cause (live_defer)
         if mk is None or mk.book.stale(now_ms) or core.book_crossed(mk.book):
-            return "吃单决定之后还没有新鲜盘口可复核，等新盘口", True
+            return f"{word}决定之后还没有新鲜盘口可复核，等新盘口", True
+        if trade.get("maker"):
+            # 1.110.0: a resting order decided a while ago (held by a cooldown, a sign-in) is judged on the book now, as a
+            # taker is — the rules that would withdraw or re-quote it resting apply before it goes out
+            why = self.sim_withdraw_reason(trade, mk, now_ms) or self.sim_requote_reason(trade, mk, now_ms)
+            return (f"盘口变了：{why}，{age // 1000} 秒前的挂单决定作废", False) if why else ("", False)
         if mk.hold:
             return f"卡片暂不建议（{mk.hold}），{age // 1000} 秒前的吃单决定作废", False
         bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps

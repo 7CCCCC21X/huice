@@ -279,7 +279,7 @@ async def run():
     assert (mk.kind, mk.market, mk.settle) == ("updown", spec.slug, {"end": T1 - 60_000, "start": T0 - 60_000, "window": "15m"})
     assert bot.sim_order_cap(mk) == 10 and bot.sim_taker_shares(mk) == 10 and bot.sim_market_room({}, mk, "up") == (100, "")
     assert bot.sim_edge_bar(mk) == bot.config.sim_edge and bot.sim_beta_version(mk) == {
-        "sim_crypto_15m_shares": 10, "sim_crypto_15m_max_shares": 100, "sim_crypto_15m_quiet": 90, "sim_crypto_15m_edge": 0}
+        "sim_crypto_15m_shares": 10, "sim_crypto_15m_max_shares": 100, "sim_crypto_15m_quiet": 90, "sim_crypto_15m_edge": 0, "sim_crypto_15m_open_usd": 100}
     trades, changed = m.TradeMap(), []
     bot.sim_take(mk, trades, now, changed)
     taken = [t for _, t in changed if not t["maker"]]
@@ -290,7 +290,30 @@ async def run():
             "label": "吃涨", "maker": False, "status": "filled", "shares": 100.0, "order": 100.0, "price": 0.45, "fills": [], "revisions": [],
             "settle": mk.settle, "opened": now}
     room, why = bot.sim_market_room(m.TradeMap({f"{spec.slug}|up|吃": held}), mk, "up")
-    assert room == 0 and why == "涨这一边持仓加挂单已有 100 份，达到15 分钟涨跌每边上限 100 份（内测，SIM_CRYPTO_15M_MAX_SHARES）", why
+    assert room == 0 and why == "这个窗口两边持仓加挂单合计已有 100 份（涨 100、跌 0），达到15 分钟涨跌每个窗口合计上限 100 份（内测，SIM_CRYPTO_15M_MAX_SHARES）", why
+    # 1.110.0: the window's cap is on both sides together, gross — 60 涨 filled and 50 跌 filled leave no room on either side;
+    # a resting order counts at its whole count; nothing is netted
+    both = m.TradeMap({f"{spec.slug}|up|吃": {**held, "shares": 60.0, "order": 60.0},
+                       f"{spec.slug}|down|吃": {**held, "side": "down", "label": "吃跌", "shares": 50.0, "order": 50.0}})
+    assert bot.sim_market_room(both, mk, "up") == (0.0, "这个窗口两边持仓加挂单合计已有 110 份（涨 60、跌 50），达到15 分钟涨跌每个窗口合计上限 100 份（内测，SIM_CRYPTO_15M_MAX_SHARES）")
+    assert bot.sim_market_room(both, mk, "down")[0] == 0.0
+    some = m.TradeMap({f"{spec.slug}|up|吃": {**held, "shares": 60.0, "order": 60.0},
+                       f"{spec.slug}|down|挂": {**held, "side": "down", "label": "挂跌", "maker": True, "status": "resting", "shares": 0.0, "order": 10.0, "price": 0.3}})
+    assert bot.sim_market_room(some, mk, "down") == (30.0, "") and bot.sim_market_room(some, mk, "up") == (30.0, "")
+    # a floor order on a market in beta: its count (100 shares at 1¢, Predict's minimum order) is over the 10 a buy — none
+    assert bot.sim_maker_pick(mk, m.TradeMap(), "up", m.BookEdge("涨", True, 0.01, 0.2, 0, floor=True), now) == (
+        100.0, "托底单要 100 份（1.0¢×100 份 = Predict 最低订单金额 $1），超过15 分钟涨跌每单 10 份（内测，SIM_CRYPTO_15M_SHARES），不挂")
+    # the unsettled windows' money (SIM_CRYPTO_15M_OPEN_USD): every window of the card, positions at cost, orders at their price
+    tight = m.Bot(m.Config.from_env({**ENV, "SIM_CRYPTO_15M_OPEN_USD": "20"}), m.Store(":memory:"), FM(now), None)
+    older = {**held, "market": W.before(spec).slug, "slug": W.before(spec).slug, "shares": 30.0, "order": 30.0, "price": 0.5}  # $15 on the window before, unsettled
+    rest = {**held, "maker": True, "status": "resting", "shares": 0.0, "order": 10.0, "price": 0.3}  # $3 resting on this window
+    tmap = m.TradeMap({f"{older['market']}|up|吃": older, f"{spec.slug}|up|挂": rest})
+    assert tight.sim_window_open_usd(tmap, "UNITREE-15M") == 18.0 and tight.sim_window_usd_room(tmap, mk, 0.5) == (4.0, "") and bot.sim_window_usd_room(tmap, mk, 0.5) == (164.0, "")
+    assert tight.sim_maker_pick(mk, tmap, "down", m.BookEdge("跌", True, 0.5, 0.2, 500), now) == (4.0, "")  # cut to the $2 left
+    full_map = m.TradeMap({f"{older['market']}|up|吃": {**older, "shares": 40.0, "order": 40.0}})  # $20: nothing left
+    assert tight.sim_window_usd_room(full_map, mk, 0.5) == (0.0, "这张卡未结算的窗口持仓加挂单已有 $20.00，达到15 分钟涨跌未结算窗口总资金上限 $20（内测，SIM_CRYPTO_15M_OPEN_USD）")
+    assert tight.sim_window_usd_room(m.TradeMap({f"{older['market']}|up|吃": {**older, "shares": 39.0, "order": 39.0}}), mk, 0.5)[1].endswith("只剩 $0.50，不够一单（内测，SIM_CRYPTO_15M_OPEN_USD）")
+    assert "SIM_CRYPTO_15M_OPEN_USD" in m.CONTROL_KEY_SET and bot.control_value("SIM_CRYPTO_15M_OPEN_USD") == "100"
     assert bot.sim_quiet(mk.settle, T1 - 91_000) == "" and bot.sim_quiet(mk.settle, T1 - 89_000) == "15 分钟涨跌结束前 90 秒不下单（内测，SIM_CRYPTO_15M_QUIET_SECONDS）"
     # the last 90 seconds: no order of any kind — a taker the book would fill is not bought, a resting order is withdrawn
     late = lambda at: dataclasses_replace(mk, book=book("0.40", "0.45", at, spec.slug))
@@ -308,7 +331,7 @@ async def run():
     assert long_quiet.sim_quiet(mk.settle, T1 - 9 * 60_000) == ""  # SIM_QUIET_MINUTES would take most of the window: not applied here
     assert abs(long_quiet.sim_edge_bar(mk) - 0.06) < 1e-12 and long_quiet.sim_edge_bar(dataclasses_replace(mk, settle={"end": 1})) == long_quiet.config.sim_edge
     text = bot.sim_text()
-    assert "15 分钟涨跌（宇树、SK 海力士、BTC，内测）：每次最多买 10 份，每个市场每边持仓加挂单最多 100 份，每个窗口最后 90 秒不下单、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
+    assert "15 分钟涨跌（宇树、SK 海力士、BTC，内测）：每次最多买 10 份（托底单也不例外），每个窗口两边持仓加挂单合计最多 100 份（不抵扣），每张卡未结算窗口的持仓加挂单合计不超过 $100，每个窗口最后 90 秒不下单、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
     # no Telegram alert: a quarter-hour window is over before an alert confirmed over a minute is acted on by hand
     seen = []
     bot.edge_observe = lambda state, market, mk_, *a, **k: seen.append(market)
@@ -377,6 +400,7 @@ async def run():
     # 1.107.3: /markout: the 15-minute tables as text — a row per minutes-left bucket and per start hour, settled count and P&L
     said = await bot.cmd_markout(m.Request("/markout", ["宇树"], 1, 0, 42))
     assert said.startswith("📈 成交后市场走向｜宇树 15分涨跌（记录 ") and "15 分钟市场，按下单时离窗口结束：\n  剩 " in said and "15 分钟市场，按窗口开始（北京时间）：\n  11 时开始：" in said, said
+    assert "15 分钟市场，按方向：\n  涨：" in said, said  # 1.110.0: each side on its own
     assert "吃单：" in said and ("已结算 1 笔，盈亏 $" in said or "还没有标记" in said), said
     # 1.107.4: the words match a card's name with spaces and case aside; a name shared by two cards says which to type
     base = {"v": 2, "fills": [], "revisions": [], "order": 10.0, "maker": False, "fair": 0.6, "edge": 0.1, "price": 0.5, "status": "filled",
@@ -455,6 +479,20 @@ async def run():
     assert mk.settle == {"end": T1 - 60_000, "start": T0 - 60_000, "window": "15m"} and bbot.sim_order_cap(mk) == 10 and bbot.sim_market_room({}, mk, "up") == (100, "")
     assert m.card_of({"item": bspec.name, "kind": "updown", "settle": mk.settle}) == "BTC 15分涨跌" and bbot.window_kind(btc) == "window"
     assert {"kind": "updown", "key": "BTC-15M", "name": bspec.name, "skipped": False} in bbot.sim_catalog(T0 + 6_000)
+    # 1.110.0: the line is Chainlink's figure as Predict relays it (the window's start price) once it agrees with the candle; a
+    # spot window waits up to 60 s for it before suggesting anything, and a figure 0.1% off holds the card instead
+    assert bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("等 Predict 公布这个窗口的起点价（最多 60 秒）", "") and bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 61_000) == ("", "")
+    assert card.STRIKE_WAIT_MS == 0 and btc.STRIKE_WAIT_MS == 60_000
+    bbot.predict.strikes[bspec.slug] = (D("100000.50"), 0.0)
+    btc.times["price"] = -1e9
+    await bbot.refresh_updown(T0 + 6_500)
+    assert btc.strike == D("100000.50") and btc.odds(T0 + 6_500).line == D("100000.50") and btc.close_of("start") == D("100000.00")
+    assert bbot.updown_hold(btc, btc.odds(T0 + 6_500), T0 + 6_500) == ("", "；与 Predict 目标价一致")
+    assert bbot.market_evidence("updown", T0 + 6_500, mkt=btc, odds=btc.odds(T0 + 6_500))["basis"]["line_source"] == "Predict 目标价（结算源的起点）"
+    bbot.predict.strikes[bspec.slug] = (D("100200.00"), 0.0)  # 0.2% off: another window's figure — the candle stays the line, nothing is suggested
+    await bbot.refresh_updown(T0 + 6_600)
+    assert btc.odds(T0 + 6_600).line == D("100000.00") and bbot.updown_hold(btc, btc.odds(T0 + 6_600), T0 + 6_600)[0] == "Predict 目标价 100,200.0000 与起点现货 100,000.0000 不一致，请核实；暂不给建议"
+    bbot.predict.strikes.pop(bspec.slug)
     # settled on the pair's 1-minute closes: the end 0.011% over the start is 涨; one within 0.01% is left to Predict
     closes[bspec.end_ms] = "100011.00"
     btc.times["candle"] = -1e9  # the candles are asked for every 5 s (monotonic): due now

@@ -229,7 +229,7 @@ async def run():
     assert [(r["name"], r["records"]) for r in w["hours"]] == [("SK 海力士 15分涨跌 08 时开始", 1), ("宇树 15分涨跌 09 时开始", 2), ("宇树 15分涨跌 13 时开始", 1)], w["hours"]
     assert [(r["name"], r["records"]) for r in w["left"]] == [("剩 ≥12 分", 1), ("剩 9–12 分", 1), ("剩 3–6 分", 1), ("剩 <3 分", 1)], w["left"]
     assert w["hours"][1]["losses"] == 1 and "markout" in w["left"][0] and [r["name"] for r in m.sim_by_window(wins[:3])["hours"]] == ["09 时开始", "13 时开始"]
-    assert m.sim_by_window([]) == {"hours": [], "left": []} and data["analysis"]["windows"] == {"hours": [], "left": []}
+    assert m.sim_by_window([]) == {"hours": [], "left": [], "sides": []} and data["analysis"]["windows"] == {"hours": [], "left": [], "sides": []}
     page = m.JOURNAL_PAGE
     for want in ('id="a-versions"', 'id="a-windows"', 'id="sumfilt"', 'id="anafilt"', "journal.json?analysis=1&", "清除筛选", "按设置版本"):
         assert want in page, want

@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.109.0"
+VERSION = "1.110.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -523,6 +523,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_CRYPTO_15M_SHARES", "15 分钟涨跌每次最多买多少份（内测）", "0～1000000：宇树、SK 海力士 15 分钟涨跌市场（交易时段里每 15 分钟一个，按币安合约指数价结算）的吃单、挂单每次最多这么多份，上面的份数设置更小时按更小的；0 = 不另设"),
     ("SIM_CRYPTO_15M_MAX_SHARES", "15 分钟涨跌每个市场每边最多持有多少份（内测）", "0～10000000：每个 15 分钟市场的涨、跌两边各自的持仓加挂单（含发送中、撤单待确认、低价挂单）不超过这个数，两边各算各的，SIM_SHARES_NET=on 时按净头寸、另一边已成交的持仓抵掉；超出的部分不买、只买剩下的额度；0 = 不另设"),
     ("SIM_CRYPTO_15M_EDGE_CENTS", "15 分钟涨跌触发买入的净优势（¢/份，内测）", "0～50：15 分钟涨跌市场单独的买入门槛，吃单、挂单都按它（模型误差更大时按模型误差），挂单撤单线随之不高于它减 0.5¢；0 = 同“触发买入的净优势”"),
+    ("SIM_CRYPTO_15M_OPEN_USD", "15 分钟涨跌未结算窗口总资金上限（$，内测）", "0～1000000：同一张卡所有还没结算的窗口，持仓按成本、未成交挂单（含撤单待确认的）按挂价，合计不超过这么多美元，超过就不开新单；0 = 不限"),
     ("SIM_CRYPTO_15M_QUIET_SECONDS", "15 分钟涨跌结束前多少秒不下单（内测）", "0～600：每个 15 分钟窗口结束前这么多秒起不下任何订单（吃单、挂单都不下，真实订单在这之前决定、发出时已进入这段时间的也不发），未成交的挂单撤掉；默认 90；最后一分钟（结算价那根 1 分钟 K）本来就不交易；只管 15 分钟涨跌，“结束前多少分钟不交易”不管这类市场"),
     ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
     ("SIM_MAKER_FLOOR_SHARES", "托底单份数", "这一边没有可跟的买价（盘口空着、买单都不够“买1 至少多少份”）时，按“托底单价格”挂这么多份守在最底下，等有人砸盘；至少挂到 Predict 最低订单金额 $1（1¢ 就是 100 份）；有了可跟的买1 就改跟；挂着时不占每边份数上限；0 = 不挂"),
@@ -672,6 +673,7 @@ class Config:
     sim_crypto_15m_max_shares: float = 100.0  # SIM_CRYPTO_15M_MAX_SHARES: ...each side of one window holds at most this many shares (not netted)
     sim_crypto_15m_quiet: int = 90            # SIM_CRYPTO_15M_QUIET_SECONDS: ...no order at all in a window's last seconds (SIM_QUIET_MINUTES not applied)
     sim_crypto_15m_edge: float = 0.0          # SIM_CRYPTO_15M_EDGE_CENTS / 100: ...its own entry bar; 0 = SIM_EDGE_CENTS
+    sim_crypto_15m_open_usd: float = 100.0    # SIM_CRYPTO_15M_OPEN_USD: ...a card's unsettled windows hold at most this much, positions at cost and orders at their price (1.110.0); 0 = no cap
     sim_maker_min_bid: float = 100.0  # SIM_MAKER_MIN_BID: a resting order joins the first bid level holding this many shares besides ours and follows
     # it (withdrawn and re-placed when the valid 买1 moves a cent); 0 = the top level whatever its size, and no following
     sim_maker_floor_shares: float = 100.0  # SIM_MAKER_FLOOR_SHARES: on a side with no bid to follow, a floor order of this many shares (at least
@@ -865,6 +867,7 @@ class Config:
             sim_crypto_15m_max_shares=parse_bounded(e, "SIM_CRYPTO_15M_MAX_SHARES", "100", 0, 10_000_000),
             sim_crypto_15m_quiet=bounded_int(e, "SIM_CRYPTO_15M_QUIET_SECONDS", 90, 0, 600),
             sim_crypto_15m_edge=parse_bounded(e, "SIM_CRYPTO_15M_EDGE_CENTS", "0", 0, 50) / 100,
+            sim_crypto_15m_open_usd=parse_bounded(e, "SIM_CRYPTO_15M_OPEN_USD", "100", 0, 1_000_000),
             sim_maker_min_bid=parse_bounded(e, "SIM_MAKER_MIN_BID", "100", 0, 10_000_000),
             sim_maker_floor_shares=parse_bounded(e, "SIM_MAKER_FLOOR_SHARES", "100", 0, 10_000_000),
             sim_maker_floor=parse_bounded(e, "SIM_MAKER_FLOOR_CENTS", "1", 1, 50) / 100,
@@ -7398,6 +7401,8 @@ class IndexUpDownMarket(UpDownMarket):
 
     # LEAD_QUOTE (1.108.0): the stock's own exchange quote (StockMarket.live_quote, read every second while it trades) leads the
     # index — the price the odds are taken at is the index at the window's start times the quote's ratio to its own start
+    STRIKE_TOLERANCE = D("0.001")     # Predict's start price is the line when within this (0.1%) of the candle; further off it is another window's (updown_hold)
+    STRIKE_WAIT_MS = 0                # a card waits this long after a window's start for Predict's start price before suggesting (a spot window: 60 s)
     LEAD_STALE_MS = 15_000            # a quote fetched longer ago than this leads nothing (the poll failed): the index alone
     LEAD_START_TOLERANCE_MS = 20_000  # the quote taken for the window's start must be from within this of the start moment
     LEAD_MAX_GAP = 0.01               # an exchange price this far (ln) from the index is another instrument, a currency move: not used
@@ -7409,8 +7414,18 @@ class IndexUpDownMarket(UpDownMarket):
         self.trading = trading    # open_ms -> whether that minute is in the exchange's session (session_minute_fn): σ counts those alone
         self.index_ms = 0  # the newest index's own time (the push's event time, the read's)
         self.lead: IndexQuote | None = None  # the exchange's realtime quote now (Bot.refresh_updown: note_lead), None when it has none
+        self.strike: D | None = None  # the start price Predict shows for the window (Bot.refresh_updown): the line when it agrees with the candle (line_used)
         self.lead_mode = "off"               # LEAD_QUOTE: on / shadow / off (the bot sets it; a past window's market stays off)
         self.lead_code = ""                  # the stock's code at its exchange (000660), for the evidence
+
+    def line_used(self) -> D | None:
+        """The line the odds are priced against: the start candle's close — or, when Predict shows the window's start price
+        (its target: the settlement source's own report at the start moment, 1.110.0) and it agrees with the candle within
+        STRIKE_TOLERANCE, that price. None until the candle is read; a settled window is judged candle against candle."""
+        candle = self.close_of("start")
+        if candle is None or self.strike is None or not self.strike > 0:
+            return candle
+        return self.strike if abs(self.strike - candle) <= candle * self.STRIKE_TOLERANCE else candle
 
     def lead_start(self) -> tuple[D, int] | None:
         """The exchange price in force at the window's start moment and its time, kept per window (updown:<slug>:lead);
@@ -7443,7 +7458,7 @@ class IndexUpDownMarket(UpDownMarket):
         """(the index the exchange quote implies now, its ln gap from the index, why not): the index at the window's start
         times the quote's ratio to the exchange price at the start — when the quote is fresh (fetched within LEAD_STALE_MS),
         the start price is kept, and the two agree within LEAD_MAX_GAP. (None, the gap, why) otherwise."""
-        q, line = self.lead, self.close_of("start")
+        q, line = self.lead, self.line_used()
         if self.lead_mode == "off":
             return None, 0.0, ""
         if q is None:
@@ -7577,6 +7592,7 @@ class IndexUpDownMarket(UpDownMarket):
             return f"{self.WORD}在最近的交易时段里没有变动，暂停概率"
         years = (spec.end_ms + 60_000 - now_ms) / YEAR_MS
         price, _ = self.effective(now_ms)  # the exchange-led price under LEAD_QUOTE=on, else the index
+        line = self.line_used()  # Predict's start price when it shows one that agrees with the candle (1.110.0)
         up, flat, down, z = updown_odds(float(price), float(line), self.sigma_used, years)
         return UpDownOdds(up, flat, down, z, line, price, years)
 
@@ -7598,6 +7614,7 @@ class SpotWindowMarket(IndexUpDownMarket):
     PROXY_NOTE = "不用代理：结算源 Chainlink 取币安现货买卖一的中间价，卡片按最新成交价，两者相差不到一个最小价位"
     GROUP = "crypto"
     TIE = D("0.0001")
+    STRIKE_WAIT_MS = 60_000  # the line is Chainlink's figure, which Predict relays as the window's start price: waited for (updown_hold)
 
     async def get(self, path: str, **params: Any) -> Any:
         return await binance_spot(path, **params)
@@ -9412,6 +9429,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_CRYPTO_15M_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "5", "10", "20", "50", "100"], "unit": "份", "zero": "不另设"},
     "SIM_CRYPTO_15M_MAX_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "50", "100", "200", "300", "500"], "unit": "份", "zero": "不另设"},
     "SIM_CRYPTO_15M_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "5", "6", "8", "10", "15"], "unit": "¢", "zero": "同触发门槛"},
+    "SIM_CRYPTO_15M_OPEN_USD": {"kind": "number", "group": "策略", "presets": ["0", "50", "100", "200", "500"], "unit": "$", "zero": "不限"},
     "SIM_CRYPTO_15M_QUIET_SECONDS": {"kind": "number", "group": "策略", "presets": ["0", "60", "90", "120", "180", "300"], "unit": "秒", "zero": "只停最后一分钟"},
     "SIM_MAKER_MIN_BID": {"kind": "number", "group": "策略", "presets": ["0", "20", "50", "100", "200", "500"], "unit": "份", "zero": "不限、不改跟"},
     "SIM_MAKER_FLOOR_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "100", "200", "500", "1000"], "unit": "份", "zero": "不挂"},
@@ -9516,6 +9534,7 @@ SIM_MAKER_MODE_SLACK = 0.01  # under the after-hours / deep-bid modes a resting 
 SIM_MAKER_DEEP_STEP = 0.01  # a deep-bid order goes this far above the best bid: at the front of the book, filled before the queue there
 SIM_MAKER_FRONT_MIN = 1.0  # a bid of at least this many shares by others, at or over a deep-bid order, is in front of it: re-quoted over; smaller dust is ignored
 SIM_STALE_WITHDRAW_MS = 5 * 60_000  # a resting order whose book has not refreshed this long is withdrawn: no pricing basis is left
+SIM_WINDOW_STALE_WITHDRAW_MS = 90_000  # ...on a 15-minute window as soon as the book is stale (PREDICT_STALE_MS): a quarter hour has no five minutes to spare (1.110.0)
 
 
 def maker_level(book: PredictBook, side: str, min_size: float, own: float = 0.0, own_price: float | None = None) -> tuple[float, float] | None:
@@ -9557,6 +9576,7 @@ class BetaLimits:
     quiet_text: str      # the quiet rule in words
     general_quiet: bool  # whether SIM_QUIET_MINUTES applies too (the longer of the two)
     version: dict        # what a trade's record keeps of these
+    open_usd: float = 0.0  # a card's unsettled markets of this kind hold at most this much together, positions at cost and orders at their price (0 = no cap)
 
 
 def sim_end_ms(settle: Mapping | None) -> int | None:
@@ -10055,6 +10075,7 @@ VERSION_KNOBS: dict[str, tuple[str, str, Any]] = {
     "sim_crypto_15m_max_shares": ("SIM_CRYPTO_15M_MAX_SHARES", "", VERSION_UNRECORDED),
     "sim_crypto_15m_quiet": ("SIM_CRYPTO_15M_QUIET_SECONDS", "", VERSION_UNRECORDED),
     "sim_crypto_15m_edge": ("SIM_CRYPTO_15M_EDGE_CENTS", "¢", VERSION_UNRECORDED),
+    "sim_crypto_15m_open_usd": ("SIM_CRYPTO_15M_OPEN_USD", "$", VERSION_UNRECORDED),
 }
 CONTROL_LABELS = {key: label for key, label, _ in CONTROL_KEYS}
 VERSION_LABELS = {"code": "代码版本", "PREDICT_FEE_BPS": "默认费率（基点）", "A50_BETA": "A50 β", "KOSPI_BETA": "KOSPI β",
@@ -10174,8 +10195,10 @@ def sim_by_window(trades: list[dict], marks: Mapping | None = None) -> dict:
         minutes = (int(s["end"]) + 60_000 - int(t.get("opened") or 0)) / 60_000
         left.setdefault(next(name for low, name in WINDOW_LEFT_BUCKETS if minutes >= low), []).append(t)
     row = lambda name, rows: {"name": name, **summary_of(rows, marks), **settled_extras(rows), "markout": markout_stats(rows)}
+    sides = [(name, [t for t in wins if t.get("side") == side]) for side, name in (("up", "涨"), ("down", "跌"))]
     return {"hours": [row(f"{card} {hour:02d} 时开始".strip(), hours[(card, hour)]) for card, hour in sorted(hours)],
-            "left": [row(name, left[name]) for _, name in WINDOW_LEFT_BUCKETS if name in left]}
+            "left": [row(name, left[name]) for _, name in WINDOW_LEFT_BUCKETS if name in left],
+            "sides": [row(name, rows) for name, rows in sides if rows]}  # 1.110.0: each side on its own (a window's 涨 and 跌 are two bets)
 
 
 # --- the review page's filter (1.107.0): the daily summary and the analysis over a card, a kind, a way of trading ----------------
@@ -11640,7 +11663,7 @@ const KINDS={close:"指数/个股日涨跌",touch:"先触价",updown:"加密涨�
 const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参考说明",effective:"有效价",sigma_daily:"σ（日）",sigma_note:"σ 来源",
   remaining:"剩余方差占比",sigma:"σ（剩余）",z:"z",beta:"β",mode:"口径",direct:"直接用现货",proxy_note:"代理换算",target:"目标日",warn:"提示",
   close_ms:"收盘/截止",price:"现价",low:"低线",high:"高线",sigma_ms:"σ 计算时间",deadline_ms:"截止",years:"剩余年数",path:"路径核验",start_ms:"窗口开始",
-  line:"起点",settled:"已结算",start:"起点 K 线",end:"终点 K 线",index:"币安指数价",lead_price:"交易所现价",lead_source:"交易所行情来源",lead_quoted:"交易所报价时间",lead_start:"交易所起点价",lead_gap:"先行幅度（对指数）",lead_used:"按交易所现价定价",lead_note:"先行说明",a:"A 价格",b:"B 价格",ratio:"A/B",window:"窗口",cap:"市值",
+  line:"起点",line_source:"起点来源",settled:"已结算",start:"起点 K 线",end:"终点 K 线",index:"币安指数价",lead_price:"交易所现价",lead_source:"交易所行情来源",lead_quoted:"交易所报价时间",lead_start:"交易所起点价",lead_gap:"先行幅度（对指数）",lead_used:"按交易所现价定价",lead_note:"先行说明",a:"A 价格",b:"B 价格",ratio:"A/B",window:"窗口",cap:"市值",
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
@@ -11825,7 +11848,7 @@ function analysis(){  // per setting, per underlying, per net edge and fair pric
   put("a-sessions",a.sessions,{head:["成交后 5 分钟","成交后 30 分钟"],cells:r=>[mo(r,"5m"),mo(r,"30m")]});
   const w=a.windows||{},wins=(w.hours||[]).length>0;["h-windows","a-windows","p-windows"].forEach(id=>{document.getElementById(id).hidden=!wins});
   if(wins){const ex={head:["成交后 1 分钟","成交后 5 分钟"],cells:r=>[mo(r,"1m"),mo(r,"5m")]};
-    document.getElementById("a-windows").replaceChildren($("div","sub","按窗口开始（北京时间）"),anaTable(w.hours,ex),$("div","sub","按下单时离窗口结束"),anaTable(w.left||[],ex))}
+    document.getElementById("a-windows").replaceChildren($("div","sub","按窗口开始（北京时间）"),anaTable(w.hours,ex),$("div","sub","按下单时离窗口结束"),anaTable(w.left||[],ex),$("div","sub","按方向（涨 / 跌各算）"),anaTable(w.sides||[],ex))}
   const mk=a.makers||{},mb=document.getElementById("a-makers");mb.replaceChildren();
   if(!mk.placed)mb.append($("p","small mut","还没有挂单"));
   else{const d=$("dl"),p=(k,v)=>d.append($("dt","",k),$("dd","",v));
@@ -14444,6 +14467,9 @@ class Bot:
         if windows.get("hours"):
             lines.append("15 分钟市场，按窗口开始（北京时间）：")
             lines += [row(r) for r in windows["hours"]]
+        if windows.get("sides"):
+            lines.append("15 分钟市场，按方向：")
+            lines += [row(r) for r in windows["sides"]]
         return "\n".join(lines)
 
     def shadow_report(self) -> list[str]:
@@ -15400,12 +15426,17 @@ class Bot:
             hold = self.window_title_problem(mkt.spec)  # the window Predict names must be the one the slug was read as
         strike = (self.predict.strikes.get(mkt.spec.slug) or (None,))[0]
         if strike is None:
+            if index and not hold and not odds.settled and mkt.STRIKE_WAIT_MS and now_ms < mkt.spec.start_ms + 60_000 + mkt.STRIKE_WAIT_MS:
+                # 1.110.0: a spot window's line is the settlement source's own figure, which Predict relays: waited for a while
+                return f"等 Predict 公布这个窗口的起点价（最多 {mkt.STRIKE_WAIT_MS // 1000} 秒）", ""
             return hold, ""
         # (percent: in %) the daily close is the very number Predict shows; an index window's start is Chainlink's report at
-        # that second against the index candle closing then — within 0.1%, or the window was read a quarter hour off
-        if abs(percent(strike, odds.line)) > (D("0.1") if index else D("0.005")):
+        # that second against the index candle closing then — within 0.1%, or the window was read a quarter hour off. An
+        # index card prices on the shown figure once it agrees (line_used): judged against the candle, not against itself
+        against = (mkt.close_of("start") if index else None) or odds.line
+        if abs(percent(strike, against)) > (D("0.1") if index else D("0.005")):
             shown = (lambda x: f"{x:,.4f}") if index else (lambda x: f"{x:,.2f}")
-            return hold or f"Predict 目标价 {shown(strike)} 与{'起点指数' if index else '币安起点'} {shown(odds.line)} 不一致，请核实；暂不给建议", ""
+            return hold or f"Predict 目标价 {shown(strike)} 与{'起点' + mkt.WORD if index else '币安起点'} {shown(against)} 不一致，请核实；暂不给建议", ""
         return hold, "；与 Predict 目标价一致"
 
     def window_title_problem(self, spec: UpDownSpec) -> str:
@@ -15677,7 +15708,8 @@ class Bot:
             return {"basis": {"line": float(odds.line), "price": float(odds.price), "sigma": mkt.sigma_used, "years": odds.years,
                               **({"sigma_raw": mkt.sigma, "sigma_factor": mkt.calib[0]} if mkt.calib[1] else {}),  # SIGMA_CALIB's factor in that σ
                               "settled": odds.settled, "start": mkt.point(spec.start_ms), "end": mkt.point(spec.end_ms),
-                              "window": spec.slug, **lead},
+                              "window": spec.slug, **lead,
+                              "line_source": "Predict 目标价（结算源的起点）" if not odds.settled and mkt.strike is not None and odds.line == mkt.strike else mkt.SOURCE_LINE},
                     "sources": sources, "proxy": None}
         if kind == "updown":
             mkt: UpDownMarket = parts["mkt"]
@@ -15960,7 +15992,8 @@ class Bot:
                               max(secs * 1000 - 60_000, 0),  # from the final minute's open; the window ends a minute later
                               f"15 分钟涨跌结束前 {secs} 秒不下单（内测，SIM_CRYPTO_15M_QUIET_SECONDS）", False,
                               {"sim_crypto_15m_shares": c.sim_crypto_15m_shares, "sim_crypto_15m_max_shares": c.sim_crypto_15m_max_shares,
-                               "sim_crypto_15m_quiet": c.sim_crypto_15m_quiet, "sim_crypto_15m_edge": c.sim_crypto_15m_edge})
+                               "sim_crypto_15m_quiet": c.sim_crypto_15m_quiet, "sim_crypto_15m_edge": c.sim_crypto_15m_edge,
+                               "sim_crypto_15m_open_usd": c.sim_crypto_15m_open_usd}, c.sim_crypto_15m_open_usd)
         if s.get("day"):
             return BetaLimits("加密日涨跌", "SIM_CRYPTO_DAY", c.sim_crypto_day_shares, c.sim_crypto_day_max_shares, c.sim_crypto_day_edge,
                               c.sim_crypto_day_quiet * 60_000,
@@ -16012,6 +16045,19 @@ class Bot:
             return math.inf, ""
         cap = beta.max_shares
         held = side_held(trades, mk.market, side)
+        if (mk.settle or {}).get("window"):
+            # 1.110.0: a 15-minute window's cap is on both sides together, gross — positions, orders resting or in flight (a
+            # cancel not yet confirmed too), deep and floor orders — nothing netted: a 涨 fill makes no room for 跌, and the
+            # two sides of one window cannot add up past the cap (100 涨 against 100 跌 was "net 0" under SIM_SHARES_NET)
+            theirs = side_held(trades, mk.market, "down" if side == "up" else "up")
+            mine_gross, theirs_gross = held["total"] + held["deep"] + held["floor"], theirs["total"] + theirs["deep"] + theirs["floor"]
+            used = mine_gross + theirs_gross
+            room = cap - used
+            if room >= SIM_MIN_SHARES - 1e-9:
+                return room, ""
+            up, down = (mine_gross, theirs_gross) if side == "up" else (theirs_gross, mine_gross)
+            return 0.0, (f"这个窗口两边持仓加挂单合计已有 {used:g} 份（{mk.sides[0]} {up:g}、{mk.sides[1]} {down:g}），" + ("达到" if used >= cap - 1e-9 else "离")
+                         + f"{beta.name}每个窗口合计上限 {cap:g} 份" + ("" if used >= cap - 1e-9 else "不足 1 份") + f"（内测，{beta.env}_MAX_SHARES）")
         gross = held["total"] + held["deep"]
         other = self.sim_other_held(trades, mk, side)  # SIM_SHARES_NET: the other side's fills offset
         used = gross - other
@@ -16021,6 +16067,37 @@ class Bot:
         offset = f"、另一边持仓 {other:g} 份抵掉、净 {used:g} 份" if other > 1e-9 else ""
         return 0.0, (f"{mk.sides[0 if side == 'up' else 1]}这一边持仓加挂单已有 {gross:g} 份{offset}，" + ("达到" if used >= cap - 1e-9 else "离")
                      + f"{beta.name}每边上限 {cap:g} 份" + ("" if used >= cap - 1e-9 else "不足 1 份") + f"（内测，{beta.env}_MAX_SHARES）")
+
+    def sim_window_open_usd(self, trades: Mapping, key: str) -> float:
+        """What one card's 15-minute windows hold unsettled, in dollars (SIM_CRYPTO_15M_OPEN_USD): every window's positions
+        at cost and its orders resting or in flight — a cancel not yet confirmed too (sim_open_order) — at their price."""
+        total = 0.0
+        for t in trades.values():
+            if t.get("key") != key or not (t.get("settle") or {}).get("window"):
+                continue
+            unfilled = sim_open_order(t)
+            if t.get("status") not in {"filled", "resting"} and not unfilled:
+                continue
+            price = float(t.get("price") or 0)
+            total += price * float(t.get("shares") or 0)
+            if unfilled:
+                total += price * max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0)
+        return total
+
+    def sim_window_usd_room(self, trades: Mapping, mk: SimMarket, price: float) -> tuple[float, str]:
+        """How many shares at ``price`` the card's unsettled windows still take under SIM_CRYPTO_15M_OPEN_USD (1.110.0: the
+        money across the windows, where the share cap is one window's): (shares, "") — or (0, why) when not even a
+        share, or less than Predict's minimum order, is left. (inf, "") off a 15-minute window or with the cap off."""
+        beta = self.sim_beta(mk.settle)
+        if beta is None or beta.open_usd <= 0 or not (mk.settle or {}).get("window") or price <= 0:
+            return math.inf, ""
+        held = self.sim_window_open_usd(trades, mk.key)
+        left = beta.open_usd - held
+        shares = math.floor(left / price + 1e-9)
+        if shares >= SIM_MIN_SHARES - 1e-9 and left >= FLOOR_MIN_USD - 1e-9:
+            return float(shares), ""
+        return 0.0, (f"这张卡未结算的窗口持仓加挂单已有 ${held:,.2f}，" + (f"达到{beta.name}未结算窗口总资金上限 ${beta.open_usd:g}" if left <= 1e-9
+                     else f"离{beta.name}未结算窗口总资金上限 ${beta.open_usd:g} 只剩 ${left:,.2f}，不够一单") + f"（内测，{beta.env}_OPEN_USD）")
 
     def sim_beta_version(self, mk: SimMarket) -> dict:
         """The beta limits a trade on a market in beta was made under (beside sim_version's settings, on that market only)."""
@@ -16814,8 +16891,9 @@ class Bot:
             return f"每次份数已改为 {c.sim_shares:g} 份，按新份数重挂"
         if c.sim_maker_points and mk.book.market_id and self.points_status(mk.book.market_id, mk.book, now_ms, PREDICT_POINTS_STALE_SECONDS)["points_active"] is False:
             return "积分已停止发放，不挂"
-        if mk.book.stale(now_ms) and now_ms - mk.book.fetched_ms > SIM_STALE_WITHDRAW_MS:
-            return f"盘口断流超过 {SIM_STALE_WITHDRAW_MS // 60_000} 分钟，撤单"  # no pricing basis: not left for someone with one to fill
+        stale_ms = SIM_WINDOW_STALE_WITHDRAW_MS if (trade.get("settle") or {}).get("window") else SIM_STALE_WITHDRAW_MS
+        if mk.book.stale(now_ms) and now_ms - mk.book.fetched_ms > stale_ms:  # no pricing basis: not left for someone with one to fill
+            return f"盘口断流超过 {stale_ms // 1000} 秒，撤单" if stale_ms < 120_000 else f"盘口断流超过 {stale_ms // 60_000} 分钟，撤单"
         if mk.hold or mk.book.stale(now_ms) or book_crossed(mk.book):
             return ""  # no fresh view of the market: the order stands
         side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)
@@ -17564,11 +17642,15 @@ class Bot:
         mroom, full = self.sim_market_room(trades, mk, side)  # SIM_CRYPTO_DAY_MAX_SHARES: what a daily crypto market's side may still hold
         if full:
             return q, full
-        if q["want"] > min(room, mroom) + 1e-9:
-            left = min(room, mroom)
+        uroom, full = self.sim_window_usd_room(trades, mk, self.sim_taker_limit(q))  # SIM_CRYPTO_15M_OPEN_USD: at the most a share can cost
+        if full:
+            return q, full
+        if q["want"] > min(room, mroom, uroom) + 1e-9:
+            left = min(room, mroom, uroom)
             smaller = taker_quote(mk.book, side, float(math.floor(left + 1e-9)), bps, q["cap"])
             if not smaller or smaller["got"] < SIM_MIN_SHARES - 1e-9:
-                return q, (f"这一边只剩 {left:g} 份额度（加密日涨跌每边上限），封顶价之下买不到一份" if mroom < room
+                return q, (f"这张卡未结算窗口的资金只剩 {left:g} 份的额度，封顶价之下买不到一份" if uroom < min(room, mroom)
+                           else f"这一边只剩 {left:g} 份额度（加密日涨跌每边上限），封顶价之下买不到一份" if mroom < room
                            else f"盘后这一边只剩 {room:g} 份额度，封顶价之下买不到一份")
             q = smaller
         why = self.sim_group_room(trades, mk, side, q["cost"], q["got"], taker=q)
@@ -17616,6 +17698,10 @@ class Bot:
         want = float(min(self.config.sim_shares, self.sim_order_cap(mk)))  # SIM_CRYPTO_DAY_SHARES on a daily crypto market
         if maker.floor:
             want = self.sim_floor_shares(maker.price)  # a floor order: its own count, never cut (under Predict's minimum it could not go out)
+            beta = self.sim_beta(mk.settle)
+            if beta is not None and beta.shares > 0 and want > beta.shares + 1e-9:  # 1.110.0: a market in beta keeps its count a buy, floor orders too
+                return want, (f"托底单要 {want:g} 份（{cents(maker.price)}×{want:g} 份 = Predict 最低订单金额 $1），超过{beta.name}每单 {beta.shares:g} 份"
+                              f"（内测，{beta.env}_SHARES），不挂")
         quiet = self.sim_quiet(mk.settle, now_ms) or self.sim_open_quiet(mk, now_ms)
         if quiet:
             return want, quiet
@@ -17625,6 +17711,13 @@ class Bot:
         if room < want - 1e-9:
             if maker.floor:
                 return want, f"这一边只剩 {room:g} 份额度，托底单要 {want:g} 份（{cents(maker.price)}×{want:g} 份 = Predict 最低订单金额）才挂得上"
+            want = float(math.floor(room + 1e-9))
+        room, full = self.sim_window_usd_room(trades, mk, maker.price)  # SIM_CRYPTO_15M_OPEN_USD: the card's unsettled windows' money
+        if full:
+            return want, full
+        if room < want - 1e-9:
+            if maker.floor:
+                return want, f"这张卡未结算窗口的资金只剩 {room:g} 份的额度，托底单要 {want:g} 份才挂得上"
             want = float(math.floor(room + 1e-9))
         if not maker.front:  # SIM_AFTER_HOURS_MAX_SHARES: what the side may still hold after hours (a deep-bid order: outside it)
             room, full = self.sim_side_room(trades, mk, side)
@@ -17877,8 +17970,9 @@ class Bot:
         if beta and self.updown_daily and "updown" in c.sim_markets:
             how.append("加密日涨跌（BTC / ETH / BNB，内测）：" + "，".join(beta) + "（SIM_CRYPTO_DAY_*）")
         beta = [part for part in (f"净优势 ≥ {cents(c.sim_crypto_15m_edge)} 才买" if c.sim_crypto_15m_edge > 0 else "",
-                                  f"每次最多买 {c.sim_crypto_15m_shares:g} 份" if c.sim_crypto_15m_shares > 0 else "",
-                                  f"每个市场每边持仓加挂单最多 {c.sim_crypto_15m_max_shares:g} 份" if c.sim_crypto_15m_max_shares > 0 else "",
+                                  f"每次最多买 {c.sim_crypto_15m_shares:g} 份（托底单也不例外）" if c.sim_crypto_15m_shares > 0 else "",
+                                  f"每个窗口两边持仓加挂单合计最多 {c.sim_crypto_15m_max_shares:g} 份（不抵扣）" if c.sim_crypto_15m_max_shares > 0 else "",
+                                  f"每张卡未结算窗口的持仓加挂单合计不超过 ${c.sim_crypto_15m_open_usd:g}" if c.sim_crypto_15m_open_usd > 0 else "",
                                   f"每个窗口最后 {max(c.sim_crypto_15m_quiet, 60)} 秒不下单、撤掉挂单") if part]
         if self.updown_windows and "updown" in c.sim_markets:
             how.append("15 分钟涨跌（" + "、".join(w.coin for w in self.updown_windows.values()) + "，内测）：" + "，".join(beta) + "（SIM_CRYPTO_15M_*）")
@@ -18225,7 +18319,7 @@ class Bot:
         for k in analysis["versions"]:
             for r in k["rows"]:
                 line(f"按设置版本｜{k['label']}" + (f"（{k['env']}）" if k["env"] else ""), f"{r['name']}（{when(r['first'])} – {when(r['last'])}）", r)
-        for table, key in (("15 分钟涨跌｜按窗口开始", "hours"), ("15 分钟涨跌｜按下单时距结束", "left")):
+        for table, key in (("15 分钟涨跌｜按窗口开始", "hours"), ("15 分钟涨跌｜按下单时距结束", "left"), ("15 分钟涨跌｜按方向", "sides")):
             for r in analysis["windows"][key]:
                 line(table, r["name"], r)
         mk = analysis["makers"]
@@ -19255,6 +19349,7 @@ class Bot:
                   "SIM_CRYPTO_DAY_QUIET_MINUTES": str(c.sim_crypto_day_quiet), "SIM_CRYPTO_DAY_EDGE_CENTS": f"{c.sim_crypto_day_edge * 100:g}",
                   "SIM_CRYPTO_15M_SHARES": plain(c.sim_crypto_15m_shares), "SIM_CRYPTO_15M_MAX_SHARES": plain(c.sim_crypto_15m_max_shares),
                   "SIM_CRYPTO_15M_QUIET_SECONDS": str(c.sim_crypto_15m_quiet), "SIM_CRYPTO_15M_EDGE_CENTS": f"{c.sim_crypto_15m_edge * 100:g}",
+                  "SIM_CRYPTO_15M_OPEN_USD": plain(c.sim_crypto_15m_open_usd),
                   "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": plain(c.sim_maker_follow_settle), "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points), "SIM_MAKER_DEEPER": flag(c.sim_maker_deeper),
                   "SIM_SHARES_NET": flag(c.sim_shares_net), "SIGMA_CALIB": flag(c.sigma_calib),
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
@@ -20271,6 +20366,8 @@ class Bot:
         moved = []
         for key, mkt in self.updowns.items():
             index = isinstance(mkt, IndexUpDownMarket)
+            if index:
+                mkt.strike = (self.predict.strikes.get(mkt.spec.slug) or (None,))[0]  # Predict's start price: the line when it agrees (line_used)
             before = mkt.effective(now_ms)[0] if index else None
             if index and mkt.lead_code:
                 # LEAD_QUOTE: the stock's exchange quote of the moment (fresh, in its session; None otherwise) leads the index
