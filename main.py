@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.108.0"
+VERSION = "1.109.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -6276,8 +6276,9 @@ class BinanceStream(PushStream):
         if c.touch:
             if self.venue == "spot":
                 out += [spec.symbol for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *DAILY_UPDOWN_MARKETS)]
+                out += [spec.symbol for spec in WINDOW_UPDOWN_MARKETS if spec.venue == "spot"]  # BTC 15分涨跌: the pair's trades
             else:  # a 15-minute card's pair: its mark price stream carries the index that settles it (field i)
-                out += [spec.symbol for spec in WINDOW_UPDOWN_MARKETS]
+                out += [spec.symbol for spec in WINDOW_UPDOWN_MARKETS if spec.venue == "futures"]
             out += [spec.symbol for spec in RANGE_MARKETS if spec.venue == self.venue]
         return list(dict.fromkeys(out))
 
@@ -7070,6 +7071,7 @@ class WindowUpDownSpec:
     coin: str         # the card's name for it: "宇树" -> "宇树 15分涨跌 11:00–11:15"
     exchange: str = ""  # the stock exchange (STOCK_MARKETS: sh / kr) whose session the windows follow; "" = round the clock
     minutes: int = 15
+    venue: str = "futures"  # the Binance venue the price comes from: a contract's index (IndexUpDownMarket) or a spot pair's trades (SpotWindowMarket, 1.109.0)
     ROLL_WAIT_MS = 60_000  # the card waits this long past a window's end for the end's index, then moves on regardless
     SCHEDULE_DAYS = 40     # how far current / before look for a trading day (the longest closure, Lunar New Year, is nine days)
 
@@ -7139,6 +7141,12 @@ WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
     # "SK海力士 (SKHYNIX) 涨或跌 15分" (skhynix-updown-15m-1793763900: 11-04 11:45–12:00 Beijing, 12:45–13:00 KST) on the same
     # rules, Chainlink's SKHYNIX/USDT stream; the windows follow the KRX session (09:00–15:30 KST, no lunch break)
     WindowUpDownSpec("SKHYNIX-15M", "skhynix", "SKHYNIXUSDT", "SK 海力士", "kr"),
+    # "BTC 涨或跌 15分" (btc-updown-15m-1793867400: 11-05 16:30–16:45 Beijing; 1.109.0): Up when the BTC/USDT price at the
+    # end of the window is above the one at its start, by Chainlink's BTC/USDT stream — the mid of Binance spot's top of
+    # book. Round the clock, a window every quarter hour. The card reads the pair's spot trades (within a tick of that
+    # mid) and settles on its 1-minute closes, an end within SpotWindowMarket.TIE of the start left to Predict. In beta
+    # like the other 15-minute cards (SIM_CRYPTO_15M_*: 10 shares a buy, 100 a side).
+    WindowUpDownSpec("BTC-15M", "btc", "BTCUSDT", "BTC", venue="spot"),
 )
 
 
@@ -7378,6 +7386,16 @@ class IndexUpDownMarket(UpDownMarket):
 
     SIGMA_ROWS = 1500            # candles read for σ when the trading minutes are a subset (the previous session's reach back a day)
 
+    VENUE = "futures"            # the Binance venue the price comes from (Bot: the mark price stream's index / the spot trades)
+    WORD = "指数"                 # the price, as the card's messages name it (指数价 / 现货价)
+    SOURCE = "币安合约指数价"      # the price's source, as the card and the evidence name it
+    PRICE_KIND = "指数价 i"       # the kind of price (price_evidence)
+    SOURCE_LINE = "币安合约指数 1 分钟 K"  # the candles the boundaries are read from
+    PRICE_TEXT = "币安合约 {symbol} 指数价"  # the card's reference line
+    SIGMA_TEXT = "币安合约 {symbol} 指数近 4 小时 1 分钟 K（近 1 小时权重过半，开盘首小时按开盘后的）"
+    PROXY_NOTE = "不用代理：结算源 Chainlink 的价格就是币安合约的指数价（markPrice 推送的 i）"
+    GROUP = "contract"           # the page's section
+
     # LEAD_QUOTE (1.108.0): the stock's own exchange quote (StockMarket.live_quote, read every second while it trades) leads the
     # index — the price the odds are taken at is the index at the window's start times the quote's ratio to its own start
     LEAD_STALE_MS = 15_000            # a quote fetched longer ago than this leads nothing (the poll failed): the index alone
@@ -7505,8 +7523,8 @@ class IndexUpDownMarket(UpDownMarket):
                               endTime=open_ms + 59_999, limit=1)
         row = next((r for r in rows or [] if isinstance(r, list) and len(r) > 6 and int(r[0]) == open_ms), None)
         if row is None or int(row[6]) != open_ms + 59_999:
-            raise ValueError(f"币安没有返回 {self.point(open_ms)}的指数 1 分钟 K 线")
-        return number(row[4], f"{self.spec.symbol} 指数价")
+            raise ValueError(f"币安没有返回 {self.point(open_ms)}的{self.WORD} 1 分钟 K 线")
+        return number(row[4], f"{self.spec.symbol} {self.WORD}价")
 
     def cadence(self, now_ms: int) -> tuple[int, int]:
         """(seconds between index reads, between σ reads): the near ones from WINDOW_LEAD_MS before the window, the idle ones
@@ -7539,28 +7557,79 @@ class IndexUpDownMarket(UpDownMarket):
         line, final = self.close_of("start"), self.close_of("end")
         if line is not None and final is not None:
             if abs(final - line) <= line * self.TIE:
-                return (f"终点指数 {final:,.4f} 与起点 {line:,.4f} 相差不到 {float(self.TIE) * 100:g}%，"
+                return (f"终点{self.WORD} {final:,.4f} 与起点 {line:,.4f} 相差不到 {float(self.TIE) * 100:g}%，"
                         "Chainlink 的报价可能不同：以 Predict 的结算为准")
             up, down = float(final > line), float(final < line)
             return UpDownOdds(up, 0.0, down, 0.0, line, final, 0.0, True)
         why = f"（{brief_error(self.error, 60)}）" if self.error else ""
         if line is None:
             if now_ms < spec.start_ms + 60_000:
-                return f"窗口 {self.point(spec.start_ms)} 开始，起点是那一刻的指数价"
-            return f"等待币安 {spec.symbol} {self.point(spec.start_ms)} 的指数价（起点）{why}"
+                return f"窗口 {self.point(spec.start_ms)} 开始，起点是那一刻的{self.WORD}价"
+            return f"等待币安 {spec.symbol} {self.point(spec.start_ms)} 的{self.WORD}价（起点）{why}"
         if now_ms >= spec.end_ms + 60_000:
-            return f"窗口已在 {self.point(spec.end_ms)} 结束，等待那一刻的指数价（终点）{why}"
+            return f"窗口已在 {self.point(spec.end_ms)} 结束，等待那一刻的{self.WORD}价（终点）{why}"
         if self.price is None or self.sigma is None:
-            return f"等待币安 {spec.symbol} 指数价{why}"
+            return f"等待币安 {spec.symbol} {self.WORD}价{why}"
         if now_ms - self.priced_ms > self.PRICE_STALE_MS:
-            return (f"指数价停在 {stamp(self.priced_ms)}（{(now_ms - self.priced_ms) // 1000} 秒未更新"
+            return (f"{self.WORD}价停在 {stamp(self.priced_ms)}（{(now_ms - self.priced_ms) // 1000} 秒未更新"
                     f"{'：' + brief_error(self.error, 60) if self.error else ''}），暂停概率")
         if not self.sigma > 0:
-            return "指数在最近的交易时段里没有变动，暂停概率"
+            return f"{self.WORD}在最近的交易时段里没有变动，暂停概率"
         years = (spec.end_ms + 60_000 - now_ms) / YEAR_MS
         price, _ = self.effective(now_ms)  # the exchange-led price under LEAD_QUOTE=on, else the index
         up, flat, down, z = updown_odds(float(price), float(line), self.sigma_used, years)
         return UpDownOdds(up, flat, down, z, line, price, years)
+
+
+class SpotWindowMarket(IndexUpDownMarket):
+    """A short window settled on a spot pair's price (WindowUpDownSpec with venue "spot"; 1.109.0): Chainlink's BTC/USDT
+    stream is the mid of Binance spot's top of book, and the card reads the pair's trades — pushed (aggTrade: push_price)
+    or read (ticker/price) — which sit within a tick of that mid; σ from the pair's 1-minute candles (minute_vol), the
+    boundaries as the closes of the 1-minute candles ending there (UpDownMarket's own rule). An end within TIE of the
+    start — a hundredth of a percent: the mid and the last trade can differ by that — is left to Predict. Round the clock:
+    no exchange session, no lead quote."""
+    VENUE = "spot"
+    WORD = "现货"
+    SOURCE = "币安现货最新成交（Chainlink 取买卖一中间价）"
+    PRICE_KIND = "最新成交"
+    SOURCE_LINE = "币安现货 1 分钟 K"
+    PRICE_TEXT = "币安现货 {symbol} 价格"
+    SIGMA_TEXT = "币安现货 {symbol} 近 4 小时 1 分钟 K（近 1 小时权重过半）"
+    PROXY_NOTE = "不用代理：结算源 Chainlink 取币安现货买卖一的中间价，卡片按最新成交价，两者相差不到一个最小价位"
+    GROUP = "crypto"
+    TIE = D("0.0001")
+
+    async def get(self, path: str, **params: Any) -> Any:
+        return await binance_spot(path, **params)
+
+    def at(self, spec: UpDownSpec) -> "SpotWindowMarket":
+        return SpotWindowMarket(self.store, spec)
+
+    def push_price(self, price: D, now_ms: int) -> None:
+        """A trade pushed in without its own time: taken as newer than whatever the card holds (trades come in order)."""
+        self.push_index(price, max(now_ms, self.index_ms + 1), now_ms)
+
+    async def read_quote(self, now_ms: int, mono: float) -> None:
+        """The last trade (ticker/price) unless a push brought a newer one, σ from the pair's 1-minute candles, at the
+        cadence of the moment (cadence)."""
+        price_every, vol_every = self.cadence(now_ms)
+        if mono - self.times["price"] >= price_every:
+            self.times["price"] = mono
+            data = await self.get("ticker/price", symbol=self.spec.symbol)
+            if now_ms > self.index_ms:
+                self.index_ms, self.price, self.priced_ms = now_ms, number(data["price"], f"{self.spec.symbol} 现货价"), now_ms
+        if mono - self.times["vol"] >= vol_every or self.sigma is None:
+            self.times["vol"] = mono
+            rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", limit=self.SIGMA_MINUTES + 2)
+            self.sigma, self.sigma_ms = minute_vol(rows, now_ms, self.SIGMA_MINUTES), now_ms
+
+    async def read_candle(self, open_ms: int) -> D:
+        """The close of exactly the pair's 1-minute candle that opens at open_ms (a neighbouring minute is never taken)."""
+        rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=open_ms, endTime=open_ms + 59_999, limit=1)
+        row = next((r for r in rows or [] if isinstance(r, list) and len(r) > 6 and int(r[0]) == open_ms), None)
+        if row is None or int(row[6]) != open_ms + 59_999:
+            raise ValueError(f"币安没有返回 {self.point(open_ms)}的现货 1 分钟 K 线")
+        return number(row[4], f"{self.spec.symbol} 现货价")
 
 
 # --- flip market (does one coin trade above another on Hyperliquid within the window?) -------------------------------
@@ -13170,7 +13239,8 @@ class Bot:
         self.updown_rolling = {**self.updown_daily, **self.updown_windows}  # the cards that move on to the next market
         started = market.now_ms() if market is not None else int(time.time() * 1000)
         self.updowns.update({key: UpDownMarket(store, self.updown_start(daily, started)) for key, daily in self.updown_daily.items()})
-        self.updowns.update({key: IndexUpDownMarket(store, self.updown_start(spec, started), self.binance_futures, spec.exchange,
+        self.updowns.update({key: SpotWindowMarket(store, self.updown_start(spec, started)) if spec.venue == "spot" else
+                                  IndexUpDownMarket(store, self.updown_start(spec, started), self.binance_futures, spec.exchange,
                                                     session_minute_fn(spec.exchange, self.updown_holidays(spec)) if spec.exchange else None)
                              for key, spec in self.updown_windows.items()})
         self.flips = {spec.key: FlipMarket(store, spec) for spec in FLIP_MARKETS}
@@ -13185,7 +13255,7 @@ class Bot:
         self.pair_markets: dict[tuple[str, str], list] = {}  # (venue, pair) -> the cards priced from it (BinanceStream)
         self.index_markets: dict[str, list] = {}  # futures pair -> the 15-minute cards its index prices (markPrice field i)
         for card in (*self.touches.values(), *self.updowns.values()):
-            if isinstance(card, IndexUpDownMarket):
+            if isinstance(card, IndexUpDownMarket) and card.VENUE == "futures":  # a spot window (BTC 15分涨跌) is priced by its pair's trades
                 self.index_markets.setdefault(card.spec.symbol, []).append(card)
                 ticker = config.tickers.get(card.spec.symbol)  # LEAD_QUOTE: the stock's exchange quote (StockMarket.live_quote) leads the index
                 card.lead_code = ticker.code if ticker is not None else ""
@@ -15147,7 +15217,7 @@ class Bot:
         if self.config.touch:  # one broken card must not take the whole page down with it
             items.extend(self.safe_card(f"{t.spec.symbol.removesuffix('USDT')} 先触", t.spec.key, "crypto", self.touch_payload, t, now_ms)
                          for t in self.touches.values())
-            items.extend(self.safe_card(u.spec.name, u.spec.key, "contract" if isinstance(u, IndexUpDownMarket) else "crypto",
+            items.extend(self.safe_card(u.spec.name, u.spec.key, u.GROUP if isinstance(u, IndexUpDownMarket) else "crypto",
                                         self.updown_payload, u, now_ms) for u in self.updowns.values())
             items.extend(self.safe_card(f.spec.name, f.spec.key, "crypto", self.flip_payload, f, now_ms) for f in self.flips.values())
             items.extend(self.safe_card(r.spec.name, r.spec.key, "crypto", self.range_payload, r, now_ms) for r in self.ranges.values())
@@ -15405,8 +15475,8 @@ class Bot:
         """Web card for a 15-minute market: the 涨/跌 card of its window, measured from the index at the window's start, in
         the 合约标的 section beside the pair's own card."""
         spec = mkt.spec
-        base = {"name": spec.name, "symbol": spec.key, "group": "contract", "close_ms": spec.end_ms + 60_000,
-                "close_label": (f"{mkt.point(spec.end_ms)} 的币安合约 {spec.symbol} 指数价（Chainlink 结算源）；高于起点为涨、"
+        base = {"name": spec.name, "symbol": spec.key, "group": mkt.GROUP, "close_ms": spec.end_ms + 60_000,
+                "close_label": (f"{mkt.point(spec.end_ms)} 的{mkt.PRICE_TEXT.format(symbol=spec.symbol)}（Chainlink 结算源）；高于起点为涨、"
                                 "低于为跌、相同按 50/50 结算")}
         odds = mkt.odds(now_ms)
         hold, agree = self.updown_hold(mkt, odds, now_ms) if isinstance(odds, UpDownOdds) else ("", "")
@@ -15429,16 +15499,16 @@ class Bot:
         minutes = max(odds.years * YEAR_MS / 60_000, 0.0)
         lead_note = "" if odds.settled else mkt.lead_text(now_ms)  # LEAD_QUOTE: the exchange quote's part in the price
         led = bool(lead_note) and mkt.effective(now_ms)[1] != ""
-        return {**base, "quote_ms": 0 if odds.settled else mkt.priced_ms, "source": "已结算" if odds.settled else "交易所现价先行" if led else "币安合约指数价",
+        return {**base, "quote_ms": 0 if odds.settled else mkt.priced_ms, "source": "已结算" if odds.settled else "交易所现价先行" if led else mkt.SOURCE,
                 "ref": f"{odds.line:,.4f}", "ref_rel": "起点", "unit": "USDT",
-                "ref_note": f"币安合约 {spec.symbol} 指数价，{mkt.point(spec.start_ms)}{agree}",
+                "ref_note": f"{mkt.PRICE_TEXT.format(symbol=spec.symbol)}，{mkt.point(spec.start_ms)}{agree}",
                 "eff_label": "终点" if odds.settled else "现价", "effective": f"{odds.price:,.4f}",
                 "move": float(percent(odds.price, odds.line)),
                 "proxy_note": (f"已结算：终点 {odds.price:,.4f}（{mkt.point(spec.end_ms)}）对起点 {odds.line:,.4f} → {verdict}"
-                               if odds.settled else lead_note or "不用代理：结算源 Chainlink 的价格就是币安合约的指数价（markPrice 推送的 i）"),
+                               if odds.settled else lead_note or mkt.PROXY_NOTE),
                 "warn": hold, "sigma_daily": sigma / math.sqrt(365), "remaining": odds.years * 365,
                 "sigma": sigma * math.sqrt(odds.years),
-                "sigma_note": (f"币安合约 {spec.symbol} 指数近 4 小时 1 分钟 K（近 1 小时权重过半，开盘首小时按开盘后的）年化 {sigma * 100:.1f}%{calib_note}；"
+                "sigma_note": (f"{mkt.SIGMA_TEXT.format(symbol=spec.symbol)}年化 {sigma * 100:.1f}%{calib_note}；"
                                f"剩 {minutes:.1f} 分钟；价格零漂移" if not odds.settled else "已结算"),
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down}
@@ -15595,8 +15665,8 @@ class Bot:
             odds = parts["odds"]
             spec = mkt.spec
             lead: dict[str, Any] = {"index": float(mkt.price)} if mkt.price is not None else {}
-            sources = [price_evidence("指数", "币安合约指数价", spec.symbol, "指数价 i", mkt.price, mkt.priced_ms, mkt.priced_ms),
-                       price_evidence("起点", "币安合约指数 1 分钟 K", spec.symbol, "收盘", odds.line, spec.start_ms)]
+            sources = [price_evidence(mkt.WORD, mkt.SOURCE, spec.symbol, mkt.PRICE_KIND, mkt.price, mkt.priced_ms, mkt.priced_ms),
+                       price_evidence("起点", mkt.SOURCE_LINE, spec.symbol, "收盘", odds.line, spec.start_ms)]
             q = mkt.lead
             if q is not None and mkt.lead_mode != "off" and not odds.settled:  # LEAD_QUOTE: the exchange quote and its part in the price
                 led, gap, why = mkt.lead_price(now_ms)
@@ -20097,7 +20167,10 @@ class Bot:
                 price = None
             if price is not None:
                 for card in cards:
-                    card.push_price(price, now_ms)
+                    if isinstance(card, SpotWindowMarket) and row.get("time") is not None:
+                        card.push_index(price, int(row["time"]), now_ms)  # a 15-minute spot window: the trade's own time, as an index push
+                    else:
+                        card.push_price(price, now_ms)
                     keys.append(card.spec.key)
         if keys:
             self.priced(keys)

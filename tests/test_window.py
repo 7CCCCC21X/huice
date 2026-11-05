@@ -308,7 +308,7 @@ async def run():
     assert long_quiet.sim_quiet(mk.settle, T1 - 9 * 60_000) == ""  # SIM_QUIET_MINUTES would take most of the window: not applied here
     assert abs(long_quiet.sim_edge_bar(mk) - 0.06) < 1e-12 and long_quiet.sim_edge_bar(dataclasses_replace(mk, settle={"end": 1})) == long_quiet.config.sim_edge
     text = bot.sim_text()
-    assert "15 分钟涨跌（宇树、SK 海力士，内测）：每次最多买 10 份，每个市场每边持仓加挂单最多 100 份，每个窗口最后 90 秒不下单、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
+    assert "15 分钟涨跌（宇树、SK 海力士、BTC，内测）：每次最多买 10 份，每个市场每边持仓加挂单最多 100 份，每个窗口最后 90 秒不下单、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
     # no Telegram alert: a quarter-hour window is over before an alert confirmed over a minute is acted on by hand
     seen = []
     bot.edge_observe = lambda state, market, mk_, *a, **k: seen.append(market)
@@ -403,6 +403,68 @@ async def run():
     assert fresh.updowns["UNITREE-15M"].spec == spec
     assert m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(T1 + 61_000), None).updowns["UNITREE-15M"].spec == W.window_spec(T1)  # 11:15–11:30
     assert m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(T2 + 61_000), None).updowns["UNITREE-15M"].spec == nxt  # 13:00, over the break
+    # --- 1.109.0: BTC 15分涨跌 — a spot pair's windows round the clock, settled on Chainlink's BTC/USDT stream (the mid of Binance
+    # spot's top of book): the card reads the pair's trades and its 1-minute closes; in beta like the other 15-minute cards ------
+    B = next(s for s in m.WINDOW_UPDOWN_MARKETS if s.key == "BTC-15M")
+    assert (B.stem, B.symbol, B.coin, B.venue, B.exchange) == ("btc", "BTCUSDT", "BTC", "spot", "") and W.venue == "futures"
+    bspec = B.window_spec(T0)
+    assert bspec.slug == f"btc-updown-15m-{T0 // 1000}" and bspec.name == "BTC 15分涨跌 11:00–11:15" and B.current(T0 + 5_000) == bspec
+    assert B.current(T0 + 20 * 60_000).start_ms == T1 - 60_000 and B.before(bspec).start_ms == T0 - 16 * 60_000  # every quarter hour, no calendar
+    store2 = m.Store(":memory:")
+    store2.put(f"updown:{B.before(bspec).slug}:end", {"open": T0 - 60_000, "close": "100000.00", "read_ms": T0 + 2_000})
+    bbot = m.Bot(m.Config.from_env(ENV), store2, FM(T0 + 5_000), None)
+    btc = bbot.updowns["BTC-15M"]
+    assert isinstance(btc, m.SpotWindowMarket) and btc.spec == bspec and btc.lead_mode == "off" and btc.GROUP == "crypto" and btc.TIE == D("0.0001")
+    assert "BTCUSDT" not in bbot.index_markets and [c.spec.key for c in bbot.pair_markets[("spot", "BTCUSDT")]][:2] == ["BTC-DAY", "BTC-15M"]  # then the price ladders
+    assert "BTCUSDT" in bbot.binance_streams["spot"].symbols() and "btcusdt@aggTrade" in bbot.binance_streams["spot"].names()
+    assert "BTCUSDT" not in bbot.binance_streams["futures"].symbols() and set(bbot.index_markets) == {"UNITREEUSDT", "SKHYNIXUSDT"}
+    assert bbot.predict_targets(T0 + 5_000)["BTC-15M"] == bspec.slug and bspec.slug in bbot.predict.want_info
+    closes, tick = {bspec.start_ms: "100000.00"}, ["100050.00"]
+    calm_btc = [str(100000 * (1 + 0.0002 * (i % 2))) for i in range(241)]
+
+    async def spot(path, **params):
+        if path == "ticker/price":
+            assert params == {"symbol": "BTCUSDT"}, params
+            return {"symbol": "BTCUSDT", "price": tick[0]}
+        assert path == "klines" and params["symbol"] == "BTCUSDT" and params["interval"] == "1m", (path, params)
+        if "startTime" in params:
+            o, c = params["startTime"], closes.get(params["startTime"])
+            return [] if c is None else [[o, c, c, c, c, "0", o + 59_999, "0", 0, "0", "0", "0"]]
+        return [[T0 - (len(calm_btc) - i) * 60_000, c, c, c, c, "0", T0 - (len(calm_btc) - i) * 60_000 + 59_999, "0", 0, "0", "0", "0"]
+                for i, c in enumerate(calm_btc)]  # (the module's rows() is shadowed by a list above)
+    btc.get = spot
+    assert btc.odds(T0 + 1_000) == "等待币安 BTCUSDT 22:00 ET（北京 11:00） 的现货价（起点）", btc.odds(T0 + 1_000)
+    await bbot.refresh_updown(T0 + 5_000)
+    odds = btc.odds(T0 + 5_000)
+    assert isinstance(odds, m.UpDownOdds) and (odds.line, odds.price) == (D("100000.00"), D("100050.00")) and 0.6 < odds.fair_up < 0.9 and btc.sigma > 0, odds  # +0.05% on a calm σ: about 74%
+    # a trade pushed on the spot stream prices it and wakes the express lane, as a pushed index does for the other cards
+    bbot.price_dirty.clear()
+    await bbot.binance_streams["spot"].frame(None, json.dumps({"e": "aggTrade", "s": "BTCUSDT", "p": "99950.00", "T": T0 + 6_000}))
+    assert btc.price == D("99950.00") and "BTC-15M" in bbot.price_dirty and btc.odds(T0 + 6_000).fair_up < 0.5
+    bbot.predict.books["BTC-15M"] = m.PredictBook("BTC-15M", bspec.slug, "702", "t", ((D("0.40"), D("300")),), ((D("0.45"), D("300")),), T0 + 6_000, None)
+    bbot.predict.info[bspec.slug] = {"outcomes": ["Up", "Down"], "created_ms": 0, "question": "BTC Up or Down - November 3, 10:00PM-10:15PM ET"}  # which side is Up
+    pay = bbot.updown_payload(btc, T0 + 6_000)
+    assert (pay["group"], pay["source"], pay["ref"], pay["effective"]) == ("crypto", btc.SOURCE, "100,000.0000", "99,950.0000"), pay
+    assert pay["close_label"].startswith("22:15 ET（北京 11:15） 的币安现货 BTCUSDT 价格（Chainlink 结算源）") and pay["ref_note"] == "币安现货 BTCUSDT 价格，22:00 ET（北京 11:00）", pay
+    assert pay["proxy_note"] == btc.PROXY_NOTE and pay["sigma_note"].startswith("币安现货 BTCUSDT 近 4 小时 1 分钟 K（近 1 小时权重过半）年化 "), pay["sigma_note"]
+    assert [i["group"] for i in bbot.odds_payload()["items"] if i.get("symbol") == "BTC-15M"] == ["crypto"]
+    ev = bbot.market_evidence("updown", T0 + 6_000, mkt=btc, odds=btc.odds(T0 + 6_000))
+    assert (ev["sources"][0]["what"], ev["sources"][0]["source"], ev["sources"][0]["type"], ev["sources"][0]["price"]) == ("现货", btc.SOURCE, "最新成交", 99950.0), ev["sources"]
+    assert ev["sources"][1]["source"] == "币安现货 1 分钟 K" and ev["basis"]["window"] == bspec.slug and "lead_price" not in ev["basis"]
+    mk = next(x for x in bbot.sim_markets(T0 + 6_000) if x.key == "BTC-15M")
+    assert mk.settle == {"end": T1 - 60_000, "start": T0 - 60_000, "window": "15m"} and bbot.sim_order_cap(mk) == 10 and bbot.sim_market_room({}, mk, "up") == (100, "")
+    assert m.card_of({"item": bspec.name, "kind": "updown", "settle": mk.settle}) == "BTC 15分涨跌" and bbot.window_kind(btc) == "window"
+    assert {"kind": "updown", "key": "BTC-15M", "name": bspec.name, "skipped": False} in bbot.sim_catalog(T0 + 6_000)
+    # settled on the pair's 1-minute closes: the end 0.011% over the start is 涨; one within 0.01% is left to Predict
+    closes[bspec.end_ms] = "100011.00"
+    btc.times["candle"] = -1e9  # the candles are asked for every 5 s (monotonic): due now
+    await bbot.refresh_updown(T1 + 2_000)
+    assert store2.get(f"updown:{bspec.slug}:end")["close"] == "100011.00" and btc.spec.start_ms == T1 - 60_000  # read, and the card moved on
+    done = btc.at(bspec).odds(T1 + 2_000)
+    assert isinstance(done, m.UpDownOdds) and done.settled and (done.up, done.price, done.line) == (1.0, D("100011.00"), D("100000.00")), done
+    tie = btc.at(B.before(bspec))  # the window before: its end (100,000) against a start 0.004% under it
+    store2.put(f"updown:{tie.spec.slug}:start", {"open": tie.spec.start_ms, "close": "99996.00", "read_ms": T0})
+    assert tie.odds(T1).startswith("终点现货 100,000.0000 与起点 99,996.0000 相差不到 0.01%，Chainlink 的报价可能不同"), tie.odds(T1)
     print("WINDOW_OK")
 
 
