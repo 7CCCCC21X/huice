@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.115.1"
+VERSION = "1.116.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -525,6 +525,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_CRYPTO_15M_EDGE_CENTS", "15 分钟涨跌触发买入的净优势（¢/份，内测）", "0～50：15 分钟涨跌市场单独的买入门槛，吃单、挂单都按它（模型误差更大时按模型误差），挂单撤单线随之不高于它减 0.5¢；0 = 同“触发买入的净优势”"),
     ("SIM_CRYPTO_15M_OPEN_USD", "15 分钟涨跌未结算窗口总资金上限（$，内测）", "0～1000000：同一张卡所有还没结算的窗口，持仓按成本、未成交挂单（含撤单待确认的）按挂价，合计不超过这么多美元，超过就不开新单；0 = 不限"),
     ("SIM_CRYPTO_15M_QUIET_SECONDS", "15 分钟涨跌结束前多少秒不下单（内测）", "0～600：每个 15 分钟窗口结束前这么多秒起不下任何订单（吃单、挂单都不下，真实订单在这之前决定、发出时已进入这段时间的也不发），未成交的挂单撤掉；默认 90；最后一分钟（结算价那根 1 分钟 K）本来就不交易；只管 15 分钟涨跌，“结束前多少分钟不交易”不管这类市场"),
+    ("SIM_CRYPTO_15M_MAKER_QUIET_SECONDS", "15 分钟涨跌结束前多少秒不挂新单（内测）", "0～600：每个 15 分钟窗口结束前这么多秒起不再挂新的挂单（撤了重挂的也算新单，这段时间里只撤不挂）；已挂着的不动、吃单照常，直到“结束前多少秒不下单”那段才全部停下；默认 180（复盘里剩不到 3 分钟才挂的单成交后多半亏）；0 = 不另设"),
     ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
     ("SIM_MAKER_FLOOR_SHARES", "托底单份数", "这一边没有可跟的买价（盘口空着、买单都不够“买1 至少多少份”）时，按“托底单价格”挂这么多份守在最底下，等有人砸盘；至少挂到 Predict 最低订单金额 $1（1¢ 就是 100 份）；有了可跟的买1 就改跟；挂着时不占每边份数上限；0 = 不挂"),
     ("SIM_MAKER_FLOOR_CENTS", "托底单价格（¢）", "1～50：托底单挂的价格；两边各按各的公平价算净优势，不够触发门槛的那一边不挂"),
@@ -673,6 +674,7 @@ class Config:
     sim_crypto_15m_shares: float = 10.0       # SIM_CRYPTO_15M_SHARES: on a 15-minute up/down market (UNITREE, in beta) one buy asks for at most this
     sim_crypto_15m_max_shares: float = 100.0  # SIM_CRYPTO_15M_MAX_SHARES: ...each side of one window holds at most this many shares (not netted)
     sim_crypto_15m_quiet: int = 90            # SIM_CRYPTO_15M_QUIET_SECONDS: ...no order at all in a window's last seconds (SIM_QUIET_MINUTES not applied)
+    sim_crypto_15m_maker_quiet: int = 180     # SIM_CRYPTO_15M_MAKER_QUIET_SECONDS: ...no new resting order in a window's last seconds, takers and resting orders as they were (1.116.0)
     sim_crypto_15m_edge: float = 0.0          # SIM_CRYPTO_15M_EDGE_CENTS / 100: ...its own entry bar; 0 = SIM_EDGE_CENTS
     sim_crypto_15m_open_usd: float = 100.0    # SIM_CRYPTO_15M_OPEN_USD: ...a card's unsettled windows hold at most this much, positions at cost and orders at their price (1.110.0); 0 = no cap
     sim_maker_min_bid: float = 100.0  # SIM_MAKER_MIN_BID: a resting order joins the first bid level holding this many shares besides ours and follows
@@ -869,6 +871,7 @@ class Config:
             sim_crypto_15m_shares=parse_bounded(e, "SIM_CRYPTO_15M_SHARES", "10", 0, 1_000_000),
             sim_crypto_15m_max_shares=parse_bounded(e, "SIM_CRYPTO_15M_MAX_SHARES", "100", 0, 10_000_000),
             sim_crypto_15m_quiet=bounded_int(e, "SIM_CRYPTO_15M_QUIET_SECONDS", 90, 0, 600),
+            sim_crypto_15m_maker_quiet=bounded_int(e, "SIM_CRYPTO_15M_MAKER_QUIET_SECONDS", 180, 0, 600),
             sim_crypto_15m_edge=parse_bounded(e, "SIM_CRYPTO_15M_EDGE_CENTS", "0", 0, 50) / 100,
             sim_crypto_15m_open_usd=parse_bounded(e, "SIM_CRYPTO_15M_OPEN_USD", "100", 0, 1_000_000),
             sim_maker_min_bid=parse_bounded(e, "SIM_MAKER_MIN_BID", "100", 0, 10_000_000),
@@ -7170,7 +7173,8 @@ class WindowUpDownSpec:
     segment's close (1.105.2: 宇树 has an 11:15–11:30 window; 1.103.0 had read the Predict page's list as ending at 11:15
     and left out the quarter hour before each close) — on no weekend or holiday. In beta: the trader buys at most
     SIM_CRYPTO_15M_SHARES at a time, holds at most SIM_CRYPTO_15M_MAX_SHARES on each side of one window and buys nothing
-    in its last SIM_CRYPTO_15M_QUIET_SECONDS (90: no order of any kind, resting ones withdrawn)."""
+    in its last SIM_CRYPTO_15M_QUIET_SECONDS (90: no order of any kind, resting ones withdrawn); no new resting order goes
+    on in its last SIM_CRYPTO_15M_MAKER_QUIET_SECONDS (180, 1.116.0: takers and the orders already resting as they were)."""
     key: str          # card / book key, the same for every window: the favourite, the /edge bar and SIM_SKIP stay with it
     stem: str         # the slug's head: unitree -> unitree-updown-15m-1793761200
     symbol: str       # the Binance USDⓈ-M futures pair whose index price settles the market
@@ -9554,6 +9558,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_CRYPTO_15M_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "5", "6", "8", "10", "15"], "unit": "¢", "zero": "同触发门槛"},
     "SIM_CRYPTO_15M_OPEN_USD": {"kind": "number", "group": "策略", "presets": ["0", "50", "100", "200", "500"], "unit": "$", "zero": "不限"},
     "SIM_CRYPTO_15M_QUIET_SECONDS": {"kind": "number", "group": "策略", "presets": ["0", "60", "90", "120", "180", "300"], "unit": "秒", "zero": "只停最后一分钟"},
+    "SIM_CRYPTO_15M_MAKER_QUIET_SECONDS": {"kind": "number", "group": "策略", "presets": ["0", "120", "180", "240", "300"], "unit": "秒", "zero": "不另设"},
     "SIM_MAKER_MIN_BID": {"kind": "number", "group": "策略", "presets": ["0", "20", "50", "100", "200", "500"], "unit": "份", "zero": "不限、不改跟"},
     "SIM_MAKER_FLOOR_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "100", "200", "500", "1000"], "unit": "份", "zero": "不挂"},
     "SIM_MAKER_FLOOR_CENTS": {"kind": "number", "group": "策略", "presets": ["1", "2", "5", "10"], "unit": "¢"},
@@ -10197,6 +10202,7 @@ VERSION_KNOBS: dict[str, tuple[str, str, Any]] = {
     "sim_crypto_15m_shares": ("SIM_CRYPTO_15M_SHARES", "", VERSION_UNRECORDED),
     "sim_crypto_15m_max_shares": ("SIM_CRYPTO_15M_MAX_SHARES", "", VERSION_UNRECORDED),
     "sim_crypto_15m_quiet": ("SIM_CRYPTO_15M_QUIET_SECONDS", "", VERSION_UNRECORDED),
+    "sim_crypto_15m_maker_quiet": ("SIM_CRYPTO_15M_MAKER_QUIET_SECONDS", "", VERSION_UNRECORDED),
     "sim_crypto_15m_edge": ("SIM_CRYPTO_15M_EDGE_CENTS", "¢", VERSION_UNRECORDED),
     "sim_crypto_15m_open_usd": ("SIM_CRYPTO_15M_OPEN_USD", "$", VERSION_UNRECORDED),
 }
@@ -16288,7 +16294,8 @@ class Bot:
                               f"15 分钟涨跌结束前 {secs} 秒不下单（内测，SIM_CRYPTO_15M_QUIET_SECONDS）", False,
                               {"sim_crypto_15m_shares": c.sim_crypto_15m_shares, "sim_crypto_15m_max_shares": c.sim_crypto_15m_max_shares,
                                "sim_crypto_15m_quiet": c.sim_crypto_15m_quiet, "sim_crypto_15m_edge": c.sim_crypto_15m_edge,
-                               "sim_crypto_15m_open_usd": c.sim_crypto_15m_open_usd}, c.sim_crypto_15m_open_usd)
+                               "sim_crypto_15m_open_usd": c.sim_crypto_15m_open_usd, "sim_crypto_15m_maker_quiet": c.sim_crypto_15m_maker_quiet},
+                              c.sim_crypto_15m_open_usd)
         if s.get("day"):
             return BetaLimits("加密日涨跌", "SIM_CRYPTO_DAY", c.sim_crypto_day_shares, c.sim_crypto_day_max_shares, c.sim_crypto_day_edge,
                               c.sim_crypto_day_quiet * 60_000,
@@ -16313,6 +16320,17 @@ class Bot:
             return beta.quiet_text
         if minutes and now_ms >= end - minutes * 60_000:
             return f"结束前 {minutes} 分钟不交易"
+        return ""
+
+    def sim_maker_quiet(self, settle: Mapping | None, now_ms: int) -> str:
+        """Why no new resting order goes on a 15-minute window now, takers and the orders already resting as they were:
+        its last SIM_CRYPTO_15M_MAKER_QUIET_SECONDS (1.116.0: the resting orders placed with under three minutes left
+        lost — /markout's 剩 <3 分 — while the earlier ones paid). "" on any other market, or with the setting at 0."""
+        secs, end = self.config.sim_crypto_15m_maker_quiet, sim_end_ms(settle)
+        if not secs or end is None or not (settle or {}).get("window"):
+            return ""
+        if now_ms >= end - max(secs * 1000 - 60_000, 0):  # end: the final minute's open; the window ends a minute later
+            return f"15 分钟涨跌结束前 {secs} 秒不挂新单（内测，SIM_CRYPTO_15M_MAKER_QUIET_SECONDS）"
         return ""
 
     def sim_floor_shares(self, price: float) -> float:
@@ -17997,7 +18015,7 @@ class Bot:
             if beta is not None and beta.shares > 0 and want > beta.shares + 1e-9:  # 1.110.0: a market in beta keeps its count a buy, floor orders too
                 return want, (f"托底单要 {want:g} 份（{cents(maker.price)}×{want:g} 份 = Predict 最低订单金额 $1），超过{beta.name}每单 {beta.shares:g} 份"
                               f"（内测，{beta.env}_SHARES），不挂")
-        quiet = self.sim_quiet(mk.settle, now_ms) or self.sim_open_quiet(mk, now_ms)
+        quiet = self.sim_quiet(mk.settle, now_ms) or self.sim_open_quiet(mk, now_ms) or self.sim_maker_quiet(mk.settle, now_ms)  # 1.116.0: a window's last minutes take no new resting order
         if quiet:
             return want, quiet
         room, full = self.sim_market_room(trades, mk, side)  # SIM_CRYPTO_DAY_MAX_SHARES: every order on the side, a deep-bid one too
@@ -19676,7 +19694,7 @@ class Bot:
                   "SIM_CRYPTO_DAY_QUIET_MINUTES": str(c.sim_crypto_day_quiet), "SIM_CRYPTO_DAY_EDGE_CENTS": f"{c.sim_crypto_day_edge * 100:g}",
                   "SIM_CRYPTO_15M_SHARES": plain(c.sim_crypto_15m_shares), "SIM_CRYPTO_15M_MAX_SHARES": plain(c.sim_crypto_15m_max_shares),
                   "SIM_CRYPTO_15M_QUIET_SECONDS": str(c.sim_crypto_15m_quiet), "SIM_CRYPTO_15M_EDGE_CENTS": f"{c.sim_crypto_15m_edge * 100:g}",
-                  "SIM_CRYPTO_15M_OPEN_USD": plain(c.sim_crypto_15m_open_usd),
+                  "SIM_CRYPTO_15M_OPEN_USD": plain(c.sim_crypto_15m_open_usd), "SIM_CRYPTO_15M_MAKER_QUIET_SECONDS": str(c.sim_crypto_15m_maker_quiet),
                   "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": plain(c.sim_maker_follow_settle), "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points), "SIM_MAKER_DEEPER": flag(c.sim_maker_deeper),
                   "SIM_SHARES_NET": flag(c.sim_shares_net), "SIGMA_CALIB": flag(c.sigma_calib),
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",

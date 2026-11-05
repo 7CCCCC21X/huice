@@ -110,10 +110,11 @@ async def run():
     # --- the settings ------------------------------------------------------------------------------------------------------
     c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"})
     assert (c.sim_crypto_15m_shares, c.sim_crypto_15m_max_shares, c.sim_crypto_15m_quiet, c.sim_crypto_15m_edge) == (10, 100, 90, 0)
-    for bad in ({"SIM_CRYPTO_15M_QUIET_SECONDS": "601"}, {"SIM_CRYPTO_15M_EDGE_CENTS": "51"}, {"SIM_CRYPTO_15M_SHARES": "-1"}):
+    assert c.sim_crypto_15m_maker_quiet == 180  # 1.116.0: no new resting order in a window's last three minutes
+    for bad in ({"SIM_CRYPTO_15M_QUIET_SECONDS": "601"}, {"SIM_CRYPTO_15M_EDGE_CENTS": "51"}, {"SIM_CRYPTO_15M_SHARES": "-1"}, {"SIM_CRYPTO_15M_MAKER_QUIET_SECONDS": "601"}):
         try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
         except ValueError: pass
-    assert {"SIM_CRYPTO_15M_SHARES", "SIM_CRYPTO_15M_MAX_SHARES", "SIM_CRYPTO_15M_QUIET_SECONDS", "SIM_CRYPTO_15M_EDGE_CENTS"} <= m.CONTROL_KEY_SET
+    assert {"SIM_CRYPTO_15M_SHARES", "SIM_CRYPTO_15M_MAX_SHARES", "SIM_CRYPTO_15M_QUIET_SECONDS", "SIM_CRYPTO_15M_EDGE_CENTS", "SIM_CRYPTO_15M_MAKER_QUIET_SECONDS"} <= m.CONTROL_KEY_SET
 
     # --- the card: an index market, priced by the pair's mark price stream (field i), never by its trades ----------------------
     fm = FM(T0 + 5_000)
@@ -131,6 +132,7 @@ async def run():
     assert futures.symbols()[:2] == ["SKHYNIXUSDT", "UNITREEUSDT"] and "unitreeusdt@markPrice@1s" in futures.names()  # not in SYMBOLS: streamed all the same
     assert bot.predict_targets(T0 + 5_000)["UNITREE-15M"] == spec.slug and spec.slug in bot.predict.want_info
     assert bot.control_value("SIM_CRYPTO_15M_SHARES") == "10" and bot.control_value("SIM_CRYPTO_15M_QUIET_SECONDS") == "90"
+    assert bot.control_value("SIM_CRYPTO_15M_MAKER_QUIET_SECONDS") == "180"
     # before the start's candle is read
     assert card.odds(T0 + 5_000) == "等待币安 UNITREEUSDT 11:00 的指数价（起点）" and card.exchange == "sh" and card.trading(T0)
     # the index is read every 2 s from a quarter hour before the window to its end, every 30 s otherwise (σ: 60 s / 600 s)
@@ -279,7 +281,8 @@ async def run():
     assert (mk.kind, mk.market, mk.settle) == ("updown", spec.slug, {"end": T1 - 60_000, "start": T0 - 60_000, "window": "15m"})
     assert bot.sim_order_cap(mk) == 10 and bot.sim_taker_shares(mk) == 10 and bot.sim_market_room({}, mk, "up") == (100, "")
     assert bot.sim_edge_bar(mk) == bot.config.sim_edge and bot.sim_beta_version(mk) == {
-        "sim_crypto_15m_shares": 10, "sim_crypto_15m_max_shares": 100, "sim_crypto_15m_quiet": 90, "sim_crypto_15m_edge": 0, "sim_crypto_15m_open_usd": 100}
+        "sim_crypto_15m_shares": 10, "sim_crypto_15m_max_shares": 100, "sim_crypto_15m_quiet": 90, "sim_crypto_15m_edge": 0, "sim_crypto_15m_open_usd": 100,
+        "sim_crypto_15m_maker_quiet": 180}
     trades, changed = m.TradeMap(), []
     bot.sim_take(mk, trades, now, changed)
     taken = [t for _, t in changed if not t["maker"]]
@@ -326,6 +329,20 @@ async def run():
     assert bot.sim_withdraw_reason(resting, late(T1 - 89_000), T1 - 89_000) == "15 分钟涨跌结束前 90 秒不下单（内测，SIM_CRYPTO_15M_QUIET_SECONDS）"
     assert bot.sim_withdraw_reason(resting, late(T1 - 91_000), T1 - 91_000) == ""
     assert bot.sim_quiet(mk.settle, T1 - 59_000) == "已到结束时间，等结果出来：不开新单，挂单撤掉"  # the final minute: never
+    # 1.116.0: the last SIM_CRYPTO_15M_MAKER_QUIET_SECONDS (180) take no new resting order; a taker still goes and a resting order stays
+    hush = "15 分钟涨跌结束前 180 秒不挂新单（内测，SIM_CRYPTO_15M_MAKER_QUIET_SECONDS）"
+    assert bot.sim_maker_quiet(mk.settle, T1 - 181_000) == "" and bot.sim_maker_quiet(mk.settle, T1 - 179_000) == hush and bot.sim_maker_quiet({"end": T1}, T1 - 1) == ""
+    edge = m.BookEdge("涨", True, 0.3, 0.2, 500)
+    assert bot.sim_maker_pick(mk, m.TradeMap(), "up", edge, T1 - 181_000) == (10.0, "") and bot.sim_maker_pick(mk, m.TradeMap(), "up", edge, T1 - 179_000) == (10.0, hush)
+    for at, n in ((T1 - 181_000, 1), (T1 - 179_000, 0)):
+        got = []
+        bot.sim_quote(late(at), m.TradeMap(), at, got)
+        assert len([t for _, t in got if t["maker"]]) == n, (at, got)
+    got = []
+    bot.sim_take(late(T1 - 179_000), m.TradeMap(), T1 - 179_000, got)
+    assert [(t["label"], t["order"]) for _, t in got] == [("吃涨", 10.0)] and bot.sim_withdraw_reason(resting, late(T1 - 179_000), T1 - 179_000) == ""
+    hush_off = m.Bot(m.Config.from_env({**ENV, "SIM_CRYPTO_15M_MAKER_QUIET_SECONDS": "0"}), m.Store(":memory:"), FM(now), None)
+    assert hush_off.sim_maker_quiet(mk.settle, T1 - 100_000) == "" and hush_off.sim_maker_pick(mk, m.TradeMap(), "up", edge, T1 - 100_000) == (10.0, "")
     long_quiet = m.Bot(m.Config.from_env({**ENV, "SIM_QUIET_MINUTES": "10", "SIM_CRYPTO_15M_QUIET_SECONDS": "0", "SIM_CRYPTO_15M_EDGE_CENTS": "6"}),
                        m.Store(":memory:"), FM(now), None)
     assert long_quiet.sim_quiet(mk.settle, T1 - 9 * 60_000) == ""  # SIM_QUIET_MINUTES would take most of the window: not applied here
