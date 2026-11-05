@@ -3,6 +3,7 @@ import asyncio, sys, time, json, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+import retired  # the STRC stock card (over since 1.112.3): its Yahoo probe is still checked on the retired line
 D = m.D
 
 
@@ -61,15 +62,14 @@ async def run():
     results = await bot.diagnose()
     by = {(r.group, r.name.split(" ")[0]): r for r in results}
     groups = {r.group for r in results}
-    assert groups == {"币安", "币安推送", "交易所收盘·UNITREE", "上证实时", "上证日K", "A50实时", "A50锚点", "Hyperliquid", "汇率", "美股触及·STRC", "Predict"}, groups
+    assert groups == {"币安", "币安推送", "交易所收盘·UNITREE", "上证实时", "上证日K", "A50实时", "A50锚点", "Hyperliquid", "汇率", "Predict"}, groups  # 1.112.3: no 美股触及 group, no US stock card listed
     # the stream probes (1.89.2): the futures server in use, spot's main host, spot's data host; offline no connection is made
     streams = [r for r in results if r.group == "币安推送"]
     assert [r.name for r in streams] == ["合约 fstream.binance.com", "现货主站 stream.binance.com", "现货数据站 data-stream.binance.vision"], [r.name for r in streams]
     assert all(not r.ok and r.detail.startswith("请求失败：") for r in streams), streams
     gql = by[("Predict", "GraphQL")]  # Predict itself is probed (1.61.0): offline it fails like any other request; no book yet, so no orderbook probe
     assert not gql.ok and gql.detail.startswith("请求失败：") and ("Predict", "REST") not in by, gql
-    strc = by[("美股触及·STRC", "Yahoo")]  # the stock market's feed is probed too; offline it fails like any other request
-    assert strc.name == "Yahoo 1 分钟 K" and not strc.ok and strc.detail.startswith("请求失败："), strc
+    assert not [r for r in results if r.group.startswith("美股触及")], groups  # STRC 触及 $100 is over (1.112.3): nothing to probe
 
     assert by[("币安", "服务器时间")].ok and "+1.2 秒" in by[("币安", "服务器时间")].detail
     assert by[("币安", "合约最新价")].detail == "UNITREE 73.5"
@@ -92,7 +92,7 @@ async def run():
 
     # report: groups that lost every source are called out first
     text = m.Bot.diag_text(results, bot.diag_state(NOW), "T")
-    assert "🚨 整组全部失败（该数据当前拿不到）：币安推送、交易所收盘·UNITREE、美股触及·STRC、Hyperliquid、Predict、汇率" in text, text
+    assert "🚨 整组全部失败（该数据当前拿不到）：币安推送、交易所收盘·UNITREE、Hyperliquid、Predict、汇率" in text, text
     partial = [l for l in text.splitlines() if l.startswith("⚠️ 其余失败的源")][0]
     assert partial == ("⚠️ 其余失败的源（同组有别的源顶上）：上证实时·新浪、上证实时·东方财富、上证日K·东方财富日K、"
                        "上证日K·新浪日K、上证日K·Yahoo日K、"
@@ -160,6 +160,13 @@ async def run():
     # GBK answers (Sina/Tencent) are shown readably, not as mojibake
     assert "富时中国A50期货" in m.raw_snippet('var hq_str_hf_CHA50CFD="1,,2026-09-26,富时中国A50期货";'.encode("gbk"))
     assert m.raw_snippet("上证指数".encode("utf-8")) == "上证指数"
+    # a US stock card's feed is probed in its own group (none listed since 1.112.3; the retired STRC line stands in):
+    # offline it fails like any other request
+    m.STOCK_HIT_MARKETS = retired.STOCK_HIT_MARKETS
+    stock = m.Bot(cfg, m.Store(":memory:"), FM(cfg), TG())
+    probes = {(r.group, r.name): r for r in await stock.diagnose()}
+    strc = probes[("美股触及·STRC", "Yahoo 1 分钟 K")]
+    assert not strc.ok and strc.detail.startswith("请求失败："), strc
     print("DIAG_OK")
 
 

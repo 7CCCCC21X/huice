@@ -1,9 +1,12 @@
-"""STRC 触及 $100: a US stock's "hits $X by <date>" market (STOCK_HIT_MARKETS) priced from Yahoo's chart feed in trading time."""
+"""STRC 触及 $100: a US stock's "hits $X by <date>" market (STOCK_HIT_MARKETS) priced from Yahoo's chart feed in trading time.
+The market is over and main lists no US stock since 1.112.3: its line, kept in tests/retired.py, is this suite's fixture."""
 import asyncio, json, math, sys, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
+import retired  # the STRC line, as main listed it through 1.112.2
+m.STOCK_HIT_MARKETS = retired.STOCK_HIT_MARKETS
 STRC, = m.STOCK_HIT_MARKETS
 utc = lambda *a: int(dt.datetime(*a, tzinfo=dt.timezone.utc).timestamp() * 1000)
 et = lambda y, mo, d, h, mi, off=-4: m.et_ms(y, mo, d, h, mi, off)

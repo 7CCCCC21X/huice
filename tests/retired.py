@@ -1,5 +1,5 @@
-"""Markets main.py no longer lists because their windows are over (taken out in 1.95.0) or they were decided early (BNB
-先触 700 / 900, 1.101.1), kept as they were listed.
+"""Markets main.py no longer lists because their windows are over (taken out in 1.95.0; STRC 触及 $100 in 1.112.3) or
+they were decided early (BNB 先触 700 / 900, 1.101.1), kept as they were listed.
 
 They are the suites' fixtures: the market-cap ladders, the flip and the monthly up/down have no market open now, and the
 suites test those kinds of cards (and a 先触 window the rules date, and the October price ladders) through these lines.
@@ -13,7 +13,7 @@ import main as m
 D, et_ms = m.D, m.et_ms
 
 LIVE = {name: getattr(m, name) for name in ("TOUCH_MARKETS", "UPDOWN_MARKETS", "DAILY_UPDOWN_MARKETS", "WINDOW_UPDOWN_MARKETS",
-                                            "FLIP_MARKETS", "CAP_MARKETS", "RANGE_MARKETS")}
+                                            "FLIP_MARKETS", "CAP_MARKETS", "RANGE_MARKETS", "STOCK_HIT_MARKETS")}
 
 # "between August 25th, 2026 at 10:00 AM ET and October 25th, 2026 at 11:59 PM ET" (both EDT); and BNB, which fell to $700
 # first (11-04), its 12-31 deadline still ahead
@@ -97,12 +97,21 @@ RANGE_OCTOBER = (
                 et_ms(2026, 10, 1, 0, 0, -4), et_ms(2026, 10, 31, 23, 59, -4)),
 )
 
+STOCK_HIT_MARKETS = (
+    # "any TradingView 1 minute candle for STRC between market creation and the listed date, 11:59 PM ET, has a final
+    # High of at least $100" (NASDAQ:STRC); over, taken out of main in 1.112.3. The window is read from Predict: the
+    # market's createdAt and the date its title names (start_ms / end_ms = 0 here); LADDER_DEADLINES=STRC-100=2026-12-31
+    # pins the deadline by hand.
+    m.RangeSpec("STRC-100", "strc-hits-100-by-20260618001620693", "STRC", "nasdaq", "STRC 触及 $100", 0, 0),
+)
+
 
 def install() -> None:
     """main's tables as they stood in 1.94.1, in the same order: the markets still listed plus the retired ones (the
     suites unpack them by position). The November ladders are left out, as the October ones stand in their place, and
     so are the daily up/down cards (1.97.0; tests/test_daily.py tests them) and the 15-minute ones (1.102.0;
-    tests/test_window.py)."""
+    tests/test_window.py). The STRC stock card (over since 1.112.3) is put back: tests/test_stockhit.py, test_tuning
+    and test_risk read it."""
     touch = {s.key: s for s in LIVE["TOUCH_MARKETS"]}
     ranges = {s.key: s for s in LIVE["RANGE_MARKETS"]}
     m.TOUCH_MARKETS = (BNB_TOUCH, touch["SOL"], BTC_TOUCH, touch["ETH"])
@@ -112,6 +121,7 @@ def install() -> None:
     m.FLIP_MARKETS = FLIP_MARKETS
     m.CAP_MARKETS = CAP_MARKETS
     m.RANGE_MARKETS = (*RANGE_OCTOBER, ranges["BTC-HIT-2027"], ranges["ZEC-HIT-2027"])
+    m.STOCK_HIT_MARKETS = STOCK_HIT_MARKETS
 
 
 @contextlib.contextmanager

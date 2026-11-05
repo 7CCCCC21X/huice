@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.112.2"
+VERSION = "1.112.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -8634,12 +8634,11 @@ RANGE_MARKETS = (
 
 
 # --- a US stock's "hits $X by <date>" market: TradingView 1-minute candles of the regular session, read from Yahoo -----------
-STOCK_HIT_MARKETS = (
-    # "any TradingView 1 minute candle for STRC between market creation and the listed date, 11:59 PM ET, has a final
-    # High of at least $100" (NASDAQ:STRC). The window is read from Predict: the market's createdAt and the date its title
-    # names (start_ms / end_ms = 0 here); LADDER_DEADLINES=STRC-100=2026-12-31 pins the deadline by hand.
-    RangeSpec("STRC-100", "strc-hits-100-by-20260618001620693", "STRC", "nasdaq", "STRC 触及 $100", 0, 0),
-)
+# None listed: STRC 触及 $100 (strc-hits-100-by-20260618001620693) is over, taken out in 1.112.3; its line stays in
+# tests/retired.py as the example of its kind. The next one is a RangeSpec(key, slug, symbol, "nasdaq", name, 0, 0): the
+# window is read from Predict (the market's createdAt and the date its title names), LADDER_DEADLINES=<key>=<YYYY-MM-DD>
+# pins the deadline by hand.
+STOCK_HIT_MARKETS: tuple[RangeSpec, ...] = ()
 YAHOO_CHART = ("https://query1.finance.yahoo.com/v8/finance/chart/", "https://query2.finance.yahoo.com/v8/finance/chart/")
 # NYSE / Nasdaq closures and 13:00 ET early closes, 2026–2027 (weekends are never sessions)
 US_MARKET_HOLIDAYS = frozenset({

@@ -882,7 +882,8 @@ async def november():
     read from its first hour through its last, October's last hour and December's first never count, and once it is
     read to its end the levels it never reached are worth 0 (ETH's, read here). The bot built from main's own tables
     shows the cards BTC / ETH / SOL / HYPE 11月价格 (HYPE through the bot's Binance futures feed), beside the three 先触
-    cards, the three daily 涨跌 cards (1.97.0), the two "before 2027" ladders and STRC: no 反超 or 市值阶梯 card."""
+    cards, the three daily 涨跌 cards (1.97.0) and the two "before 2027" ladders: no 反超, 市值阶梯 or US stock card
+    (STRC 触及 $100 is over, 1.112.3)."""
     S, E = ETH11.start_ms, ETH11.end_ms + 60_000  # E: 12-01 05:00 UTC, the end of the window's last hour
     hours = []
     for t in range(S - 800 * H, E + 3 * H, H):
@@ -935,7 +936,7 @@ async def november():
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
         market = FakeMarket()
         bot = m.Bot(cfg, m.Store(":memory:"), market, None)
-        assert list(bot.ranges) == [s.key for s in LIVE] + ["STRC-100"] and list(bot.touches) == ["SOL", "ETH"]  # 1.101.1: BNB 先触 decided, taken off
+        assert list(bot.ranges) == [s.key for s in LIVE] and list(bot.touches) == ["SOL", "ETH"]  # 1.101.1: BNB 先触 decided, taken off; 1.112.3: STRC over
         assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY", "UNITREE-15M", "SKHYNIX-15M", "BTC-15M"] and not bot.flips and not bot.caps  # 1.97.0: the daily up/down cards; 1.102.0 / 1.103.0 / 1.109.0: the 15-minute ones
         targets = bot.predict_targets(MID)
         assert all(targets[s.key] == s.slug and s.key in bot.predict.ladder_keys for s in NOV) and not any(k.endswith("-HIT-10") for k in targets)
@@ -957,7 +958,7 @@ async def november():
         assert items == [("crypto", "SOL 先触 60/140"), ("crypto", "ETH 先触 1k/3k"),
                          ("crypto", "BTC 11-05 涨跌"), ("crypto", "ETH 11-05 涨跌"), ("crypto", "BNB 11-05 涨跌"), ("crypto", "BTC 15分涨跌 16:00–16:15"),  # 1.109.0: in 加密
                          ("levels", "BTC 11月价格"), ("levels", "ETH 11月价格"), ("levels", "SOL 11月价格"), ("levels", "HYPE 11月价格"),
-                         ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格"), ("levels", "STRC 触及 $100")], items
+                         ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格")], items
         # the price streams follow: HYPEUSDT on futures for its ladder; no HYPE / SOL on Hyperliquid (the flip is gone)
         assert bot.binance_streams["spot"].symbols() == ["SOLUSDT", "ETHUSDT", "BTCUSDT", "BNBUSDT", "ZECUSDT"]  # BNBUSDT for BNB's daily card
         assert bot.binance_streams["futures"].symbols() == ["UNITREEUSDT", "SKHYNIXUSDT", "HYPEUSDT"] and not {"HYPE", "SOL"} & set(bot.hl_stream.coins())
