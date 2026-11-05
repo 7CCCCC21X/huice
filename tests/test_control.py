@@ -174,7 +174,7 @@ async def run():
     withkey = {**base, "PREDICT_PRIVATE_KEY": "a" * 64}
     for key, form in m.CONTROL_FORMS.items():
         if form["kind"] == "detail":  # SIM_SKIP: drawn inside the SIM_MARKETS card from the catalog, no presets or options of its own
-            assert "presets" not in form and "options" not in form and key in {"SIM_SKIP", "SIM_MAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_DEEP_MARKETS", "SIM_MAKER_DEEP_ONLY_MARKETS", "SIM_TAKER_AFTER_HOURS_MARKETS"}, key
+            assert "presets" not in form and "options" not in form and key in {"SIM_SKIP", "SIM_MAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_DEEP_MARKETS", "SIM_MAKER_DEEP_ONLY_MARKETS", "SIM_TAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_FLOOR_MARKETS"}, key
             continue
         assert form["kind"] in {"choice", "multi", "number"} and (form["kind"] == "number") == ("presets" in form) and (form["kind"] != "number") == ("options" in form), key
         for value in (form.get("presets") or [o[0] for o in form.get("options", [])]):
@@ -441,7 +441,7 @@ async def run():
     estore = m.Store(":memory:")
     ebot = m.Bot(m.Config.from_env(env), estore, FM(NOW), None)
     assert ebot.config.sim_maker_deep_markets == {"HSI"} and ebot.config.sim_skip == {"BNB"} and ebot.config.sources_off == {"eastmoney"}
-    assert m.CONTROL_CLEARABLE == {"SIM_SKIP", "SOURCES_OFF", "SIM_TAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_DEEP_MARKETS", "SIM_MAKER_DEEP_ONLY_MARKETS"}
+    assert m.CONTROL_CLEARABLE == {"SIM_SKIP", "SOURCES_OFF", "SIM_TAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_DEEP_MARKETS", "SIM_MAKER_DEEP_ONLY_MARKETS", "SIM_MAKER_FLOOR_MARKETS"}
     assert ebot.control_set({"SIM_MAKER_DEEP_MARKETS": "sse"})["ok"] and ebot.config.sim_maker_deep_markets == {"SSE"}
     r = ebot.control_set({"SIM_MAKER_DEEP_MARKETS": "", "SIM_SKIP": "", "SOURCES_OFF": ""})
     assert r["ok"] and ebot.config.sim_maker_deep_markets == frozenset() and ebot.config.sim_skip == frozenset() and ebot.config.sources_off == frozenset(), r

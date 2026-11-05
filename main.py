@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.104.11"
+VERSION = "1.105.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -515,6 +515,9 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_CRYPTO_15M_EDGE_CENTS", "15 分钟涨跌触发买入的净优势（¢/份，内测）", "0～50：15 分钟涨跌市场单独的买入门槛，吃单、挂单都按它（模型误差更大时按模型误差），挂单撤单线随之不高于它减 0.5¢；0 = 同“触发买入的净优势”"),
     ("SIM_CRYPTO_15M_QUIET_SECONDS", "15 分钟涨跌结束前多少秒不下单（内测）", "0～600：每个 15 分钟窗口结束前这么多秒起不下任何订单（吃单、挂单都不下，真实订单在这之前决定、发出时已进入这段时间的也不发），未成交的挂单撤掉；默认 90；最后一分钟（结算价那根 1 分钟 K）本来就不交易；只管 15 分钟涨跌，“结束前多少分钟不交易”不管这类市场"),
     ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
+    ("SIM_MAKER_FLOOR_SHARES", "托底单份数", "这一边没有可跟的买价（盘口空着、买单都不够“买1 至少多少份”）时，按“托底单价格”挂这么多份守在最底下，等有人砸盘；至少挂到 Predict 最低订单金额 $1（1¢ 就是 100 份）；有了可跟的买1 就改跟；挂着时不占每边份数上限；0 = 不挂"),
+    ("SIM_MAKER_FLOOR_CENTS", "托底单价格（¢）", "1～50：托底单挂的价格；两边各按各的公平价算净优势，不够触发门槛的那一边不挂"),
+    ("SIM_MAKER_FLOOR_MARKETS", "托底单只做这些市场（详细选项）", "逗号分隔的市场代码；在“托底单份数”卡片展开详细选项点选，空 = 范围内的所有市场"),
     ("SIM_MAKER_DEEPER", "买1 不够门槛时跟更深的买价", "开 = 跟买1 的净优势不够门槛（或不超过模型误差）时，挂到下面第一个够门槛的买价档位（买2、买3…，同样要有“买1 至少多少份”那么多别人的单），等有人砸穿买1 时接；涨、跌两边各按各的；关 = 只跟买1，不够就不挂"),
     ("SIM_MAKER_EXIT_CENTS", "挂单撤单线（¢/份）", "0～50：挂着的单净优势降到这个数以下就撤掉（不会高于触发门槛）；0 = 不撤"),
     ("SIM_MAKER_FOLLOW_SETTLE_SECONDS", "买1 变了多久才改跟（秒）", "0～60：有效买1 移开、低价挂单被顶、击穿单下面的买单变了，新位置要连续保持这么多秒才撤了改挂；做市机器人每半秒撤了重挂一遍的盘口，不等一下就会跟着它反复撤挂、每次都排到队尾；0 = 一变就改。优势没了的撤单不受它影响"),
@@ -659,6 +662,9 @@ class Config:
     sim_crypto_15m_edge: float = 0.0          # SIM_CRYPTO_15M_EDGE_CENTS / 100: ...its own entry bar; 0 = SIM_EDGE_CENTS
     sim_maker_min_bid: float = 100.0  # SIM_MAKER_MIN_BID: a resting order joins the first bid level holding this many shares besides ours and follows
     # it (withdrawn and re-placed when the valid 买1 moves a cent); 0 = the top level whatever its size, and no following
+    sim_maker_floor_shares: float = 100.0  # SIM_MAKER_FLOOR_SHARES: on a side with no bid to follow, a floor order of this many shares (at least
+    # Predict's minimum order value: FLOOR_MIN_USD) rests at SIM_MAKER_FLOOR_CENTS, for a seller dumping into the empty side; 0 = none (1.105.0)
+    sim_maker_floor: float = 0.01     # SIM_MAKER_FLOOR_CENTS / 100: the floor order's price
     sim_maker_exit: float = 0.05      # SIM_MAKER_EXIT_CENTS / 100: a resting order is withdrawn when its edge falls under this; 0 = never
     sim_maker_follow_settle: float = 2.0  # SIM_MAKER_FOLLOW_SETTLE_SECONDS: a re-quote (the 买1 moved, a deep-bid order pushed off the front,
     # a sweep order's bids changed) waits until the new place has held this long; 0 = at once
@@ -674,6 +680,7 @@ class Config:
     # SIM_TAKER_SESSION says (the after-hours taker mode applies on them); empty = all
     sim_maker_deep_markets: frozenset = frozenset()         # SIM_MAKER_DEEP_MARKETS: the deep-bid mode only on these markets; empty = every market in scope
     sim_maker_deep_only_markets: frozenset = frozenset()    # SIM_MAKER_DEEP_ONLY_MARKETS: deep-only on these markets only; empty = wherever the deep-bid mode is on
+    sim_maker_floor_markets: frozenset = frozenset()        # SIM_MAKER_FLOOR_MARKETS: floor orders only on these markets; empty = every market in scope
     sim_maker_points: bool = True     # SIM_MAKER_POINTS: resting orders only on markets whose Predict points pay now (rewards.current); withdrawn when they stop
     sim_maker_deeper: bool = True     # SIM_MAKER_DEEPER: when the valid 买1 leaves less edge than the bar, an ordinary resting order waits at the
     # first deeper bid level (买2, 买3…, holding SIM_MAKER_MIN_BID shares besides ours) that clears it, for a seller who sells through 买1;
@@ -830,6 +837,7 @@ class Config:
             sim_no_odds_withdraw=bounded_int(e, "SIM_NO_ODDS_WITHDRAW_MINUTES", 30, 0, 1440),
             sim_ways=sim_ways, sim_markets=sim_markets, sim_skip=sim_skip, sources_off=sources_off,
             sim_maker_after_hours_markets=market_keys("SIM_MAKER_AFTER_HOURS_MARKETS"), sim_maker_deep_markets=market_keys("SIM_MAKER_DEEP_MARKETS"),
+            sim_maker_floor_markets=market_keys("SIM_MAKER_FLOOR_MARKETS"),
             sim_taker_after_hours_markets=market_keys("SIM_TAKER_AFTER_HOURS_MARKETS"),
             sim_maker_deep_only_markets=market_keys("SIM_MAKER_DEEP_ONLY_MARKETS"),
             sim_group_usd=parse_bounded(e, "SIM_GROUP_USD", "300", 0, 10_000_000),
@@ -846,6 +854,8 @@ class Config:
             sim_crypto_15m_quiet=bounded_int(e, "SIM_CRYPTO_15M_QUIET_SECONDS", 90, 0, 600),
             sim_crypto_15m_edge=parse_bounded(e, "SIM_CRYPTO_15M_EDGE_CENTS", "0", 0, 50) / 100,
             sim_maker_min_bid=parse_bounded(e, "SIM_MAKER_MIN_BID", "100", 0, 10_000_000),
+            sim_maker_floor_shares=parse_bounded(e, "SIM_MAKER_FLOOR_SHARES", "100", 0, 10_000_000),
+            sim_maker_floor=parse_bounded(e, "SIM_MAKER_FLOOR_CENTS", "1", 1, 50) / 100,
             sim_maker_exit=parse_bounded(e, "SIM_MAKER_EXIT_CENTS", "5", 0, 50) / 100,
             sim_maker_follow_settle=parse_bounded(e, "SIM_MAKER_FOLLOW_SETTLE_SECONDS", "2", 0, 60),
             sim_maker_session=not off(e.get("SIM_MAKER_SESSION", "on")),
@@ -4765,6 +4775,7 @@ class BookEdge:
     front: bool = False  # maker: placed a cent in front of the valid 买1 (the deep-bid mode), not behind its queue
     sweep: bool = False  # maker: a sweep order — deep under the book's front (SIM_MAKER_DEEP_ONLY), filled only when a seller sweeps through
     level: int = 1       # maker: the bid level it joins, counted from the top (1 = 买1; 2 = 买2 when 买1 leaves too little edge: SIM_MAKER_DEEPER)
+    floor: bool = False  # maker: a floor order — a small bid at the bottom of a side with no bid to follow (SIM_MAKER_FLOOR_SHARES, 1.105.0)
 
     @property
     def label(self) -> str:
@@ -9140,6 +9151,9 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_CRYPTO_15M_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "5", "6", "8", "10", "15"], "unit": "¢", "zero": "同触发门槛"},
     "SIM_CRYPTO_15M_QUIET_SECONDS": {"kind": "number", "group": "策略", "presets": ["0", "60", "90", "120", "180", "300"], "unit": "秒", "zero": "只停最后一分钟"},
     "SIM_MAKER_MIN_BID": {"kind": "number", "group": "策略", "presets": ["0", "20", "50", "100", "200", "500"], "unit": "份", "zero": "不限、不改跟"},
+    "SIM_MAKER_FLOOR_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "100", "200", "500", "1000"], "unit": "份", "zero": "不挂"},
+    "SIM_MAKER_FLOOR_CENTS": {"kind": "number", "group": "策略", "presets": ["1", "2", "5", "10"], "unit": "¢"},
+    "SIM_MAKER_FLOOR_MARKETS": {"kind": "detail", "group": "策略"},        # drawn inside the SIM_MAKER_FLOOR_SHARES card
     "SIM_MAKER_EXIT_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "2", "3", "5", "8"], "unit": "¢", "zero": "不撤"},
     "SIM_MAKER_FOLLOW_SETTLE_SECONDS": {"kind": "number", "group": "策略", "presets": ["0", "1", "2", "3", "5", "10"], "unit": "秒", "zero": "一变就改"},
     "SIM_MAKER_SESSION": {"kind": "choice", "group": "策略", "options": [["off", "盘前盘后也挂"], ["on", "只在开盘时段挂"]]},
@@ -9232,6 +9246,7 @@ def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
 
 
 SIM_MAKER_FOLLOW = 0.01  # a resting order follows the valid 买1 once it has moved this far (1¢) from the order's price
+FLOOR_MIN_USD = 1.0  # a floor order is at least this much (Predict's minimum order value, live.MIN_ORDER_USD): 100 shares at 1¢
 SIM_MAKER_MODE_SLACK = 0.01  # under the after-hours / deep-bid modes a resting order is kept while its edge is within a cent under the mode's bar
 SIM_MAKER_DEEP_STEP = 0.01  # a deep-bid order goes this far above the best bid: at the front of the book, filled before the queue there
 SIM_MAKER_FRONT_MIN = 1.0  # a bid of at least this many shares by others, at or over a deep-bid order, is in front of it: re-quoted over; smaller dust is ignored
@@ -9435,8 +9450,9 @@ def side_held(trades: Mapping, market: str, side: str) -> dict:
     orders too), which are outside the cap — placed whatever the side holds and not counted against it (what they
     fill is a position, counted). Expired and settled records hold nothing; a withdrawn one holds its fills, and while
     its real order's cancel is not confirmed (sim_open_order) its unfilled shares too — ``cancelling`` counts those
-    orders among ``orders``."""
-    positions = resting = deep = 0.0
+    orders among ``orders``. ``floor``, apart too: the unfilled shares of a floor order (SIM_MAKER_FLOOR_SHARES: a dollar's
+    worth at the bottom of an empty side), outside every cap while it rests; what it fills is a position, counted."""
+    positions = resting = deep = floor = 0.0
     orders = cancelling = 0
     for t in trades_of_market(trades, market):
         unfilled = sim_open_order(t)
@@ -9449,11 +9465,13 @@ def side_held(trades: Mapping, market: str, side: str) -> dict:
                 continue
             if t.get("deep"):
                 deep += left
+            elif t.get("floor"):
+                floor += left
             else:
                 resting += left
                 orders += 1
                 cancelling += t.get("status") != "resting"
-    return {"positions": positions, "resting": resting, "orders": orders, "cancelling": cancelling, "deep": deep, "total": positions + resting}
+    return {"positions": positions, "resting": resting, "orders": orders, "cancelling": cancelling, "deep": deep, "floor": floor, "total": positions + resting}
 
 
 def side_held_text(held: dict) -> str:
@@ -11106,7 +11124,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_crypto_day_shares:"加密日涨跌每笔份数",sim_crypto_day_max_shares:"加密日涨跌每边上限",sim_crypto_day_edge:"加密日涨跌买入门槛",sim_crypto_day_quiet:"加密日涨跌结束前不买（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_deeper:"买1 不够跟买2",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_crypto_day_shares:"加密日涨跌每笔份数",sim_crypto_day_max_shares:"加密日涨跌每边上限",sim_crypto_day_edge:"加密日涨跌买入门槛",sim_crypto_day_quiet:"加密日涨跌结束前不买（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_floor_shares:"托底单份数",sim_maker_floor:"托底单价格",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_deeper:"买1 不够跟买2",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
   sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_taker_hold:"吃单前优势保持（秒）",sim_taker_hold_range:"价格阶梯吃单前优势保持（秒）",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",sim_no_odds_withdraw:"概率暂缺撤单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
   min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",big_move:"大波动日放宽 σ（倍日 σ）",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
@@ -11473,7 +11491,7 @@ try{adv=localStorage.getItem("ctladv")==="1";folded=localStorage.getItem("ctlfol
 const drafts={};  // custom values typed but not saved yet, per setting: a re-render (the poll) must not wipe them
 const DETAIL={SIM_MARKETS:{key:"SIM_SKIP",mode:"exclude"},SIM_MAKER_AFTER_HOURS_CENTS:{key:"SIM_MAKER_AFTER_HOURS_MARKETS",mode:"include",kinds:["close"]},
   SIM_TAKER_AFTER_HOURS_CENTS:{key:"SIM_TAKER_AFTER_HOURS_MARKETS",mode:"include",kinds:["close"]},
-  SIM_MAKER_DEEP_CENTS:{key:"SIM_MAKER_DEEP_MARKETS",mode:"include"},SIM_MAKER_DEEP_ONLY:{key:"SIM_MAKER_DEEP_ONLY_MARKETS",mode:"include"}};
+  SIM_MAKER_DEEP_CENTS:{key:"SIM_MAKER_DEEP_MARKETS",mode:"include"},SIM_MAKER_DEEP_ONLY:{key:"SIM_MAKER_DEEP_ONLY_MARKETS",mode:"include"},SIM_MAKER_FLOOR_SHARES:{key:"SIM_MAKER_FLOOR_MARKETS",mode:"include"}};
 const MAKER_MODES=new Set(["SIM_MAKER_AFTER_HOURS_CENTS","SIM_MAKER_DEEP_CENTS"]);  // resting-order modes: nothing happens while 做哪种单 = 只吃单
 try{const k=sessionStorage.getItem("ctlkey");if(k){$("key").value=k;$("remember").checked=true}}catch(e){}
 function keep(){try{if($("remember").checked)sessionStorage.setItem("ctlkey",$("key").value);else sessionStorage.removeItem("ctlkey")}catch(e){}}
@@ -14945,6 +14963,7 @@ class Bot:
                 **({"sim_taker_session": True} if c.sim_taker_session else {}),
                 **({"sim_quiet_minutes": c.sim_quiet_minutes} if c.sim_quiet_minutes else {}),
                 **({"sim_maker_min_bid": c.sim_maker_min_bid} if c.sim_maker_min_bid > 0 else {}),
+                **({"sim_maker_floor_shares": c.sim_maker_floor_shares, "sim_maker_floor": c.sim_maker_floor} if c.sim_maker_floor_shares > 0 else {}),
                 **({"sim_maker_exit": self.sim_maker_exit()} if self.sim_maker_exit() > 0 else {}),
                 **({"sim_maker_session": True} if c.sim_maker_session else {}),
                 **({"sim_maker_deeper": True} if c.sim_maker_deeper else {}),
@@ -15122,6 +15141,7 @@ class Bot:
             queue = next((q for p, q in own_levels(mk.book, side) if abs(p - maker.price) < 1e-9), 0.0)
             trade.update(price=maker.price, signal=maker.edge, shares=0.0, status="resting", filled=None,
                          queue_ahead=queue, queue_min=queue, **({"deep": True} if maker.front else {}), **({"sweep": True} if maker.sweep else {}),
+                         **({"floor": True} if maker.floor else {}),
                          **({"join_level": maker.level} if maker.level > 1 else {}))  # SIM_MAKER_DEEPER: it waits at 买2, 买3…
         else:
             trade.update(price=taker["cost"], avg=taker["avg"], fee=taker["fee"], best=taker["best"],
@@ -15184,6 +15204,11 @@ class Bot:
         if minutes and now_ms >= end - minutes * 60_000:
             return f"结束前 {minutes} 分钟不交易"
         return ""
+
+    def sim_floor_shares(self, price: float) -> float:
+        """A floor order's count: SIM_MAKER_FLOOR_SHARES, and at least Predict's minimum order value at its price
+        (FLOOR_MIN_USD: 100 shares at 1¢ — 10 shares there would be a $0.10 order Predict refuses)."""
+        return float(max(self.config.sim_maker_floor_shares, math.ceil(FLOOR_MIN_USD / max(price, 0.0001) - 1e-9)))
 
     def sim_order_cap(self, mk: SimMarket) -> float:
         """The most shares one buy on this market may ask for beyond the general counts: a market in beta's own
@@ -15336,6 +15361,14 @@ class Bot:
             own, own_price = self.sim_own_resting(trades, mk.market, side, mk.book)
             level = maker_level(mk.book, side, c.sim_maker_min_bid, own, own_price)
             if level is None:
+                if c.sim_maker_floor_shares > 0 and self.sim_mode_market(mk, c.sim_maker_floor_markets):
+                    # nothing to follow on this side (an empty book, bids all under SIM_MAKER_MIN_BID): a floor order — a dollar's
+                    # worth at SIM_MAKER_FLOOR_CENTS, for a seller dumping into the empty side (1.105.0: the 11-05 宇树 10:45 window
+                    # showed "暂无挂单" and both sides with nothing to follow); it follows a 买1 that appears (sim_requote_reason)
+                    edge = fair - c.sim_maker_floor
+                    cands.append(BookEdge(name, True, c.sim_maker_floor, edge, 0.0, edge, floor=True))
+                    sides_seen[side] = {"cand": cands[-1]}
+                    continue
                 sides_seen[side] = {"why": (f"没有不少于 {c.sim_maker_min_bid:g} 份的买价档位可跟（SIM_MAKER_MIN_BID）" if c.sim_maker_min_bid > 0
                                             else "没有买价可跟")}
                 continue
@@ -15435,7 +15468,7 @@ class Bot:
                             maker, side, count, maker_why = other, other_side, other_count, ""
                 ahead = sum(q for p, q in own_levels(mk.book, side) if p > maker.price + 1e-9) if maker.sweep else 0.0
                 maker_text = (f"挂{mk.sides[0 if side == 'up' else 1]} {cents(maker.price)}×{count:g} 份（净优势 {cents(maker.edge)}，"
-                              + (f"击穿单，前面 {ahead:g} 份）" if maker.sweep else ("买1 之上 1¢，" if maker.front else
+                              + ("托底单，这一边没有可跟的买价）" if maker.floor else f"击穿单，前面 {ahead:g} 份）" if maker.sweep else ("买1 之上 1¢，" if maker.front else
                                                                              f"买1 不够门槛，跟买{maker.level}，" if maker.level > 1 else "")
                                  + (f"排在 {maker.size:g} 份之后）" if maker.size > 0 else "排在最前）")))
                 held = trades.get(f"{mk.market}|{side}|挂")
@@ -15562,6 +15595,8 @@ class Bot:
     @staticmethod
     def maker_place_text(b: BookEdge) -> str:
         """Where a resting order sits, in words: 跟买1 / 跟买2 (SIM_MAKER_DEEPER) / 买1 之上 1¢ (the deep-bid mode) / 击穿单."""
+        if b.floor:
+            return "托底单（这一边没有可跟的买价）"
         place = "击穿单" if b.sweep else "买1 之上 1¢" if b.front else f"跟买{b.level}"
         return place + (f"，排在 {b.size:g} 份之后" if b.size > 0 and not b.front else "")
 
@@ -15585,7 +15620,7 @@ class Bot:
                 price = float(rest.get("price") or 0)
                 own_left = max(float(rest.get("order") or 0) - float(rest.get("shares") or 0), 0.0) if isinstance(rest.get("live"), dict) else 0.0
                 top = maker_level(mk.book, side, SIM_MAKER_FRONT_MIN, own_left, price)  # the best bid of anyone else
-                place = ("击穿单" if rest.get("sweep") else
+                place = ("托底单" if rest.get("floor") else "击穿单" if rest.get("sweep") else
                          (f"低价单，买1 已到 {cents(top[0])}" if top is not None and top[0] > price + 1e-9 else "买1 之上 1¢") if rest.get("deep")
                          else f"跟买{rest['join_level']}" if rest.get("join_level") else "跟买1")
                 filled = float(rest.get("shares") or 0)
@@ -15990,7 +16025,7 @@ class Bot:
         if (limit := self.sim_after_hours_price(mk)) is not None and float(trade.get("price") or 0) > limit + 1e-9:
             return f"盘后只挂 {cents(limit)} 以下的，{cents(float(trade.get('price') or 0))} 的单撤掉"
         placed_shares = float((trade.get("version") or {}).get("sim_shares") or trade.get("order") or 0)
-        if abs(placed_shares - c.sim_shares) > 1e-9:
+        if abs(placed_shares - c.sim_shares) > 1e-9 and not trade.get("floor"):
             # the setting changed since the order was placed. Never the order's own count against the setting: an order the
             # caps cut short (1.69.0) would be withdrawn and placed again, cut again, every step (10-14: a 270-share order
             # under a $100 limit, placed and withdrawn every two seconds)
@@ -16009,7 +16044,7 @@ class Bot:
             return f"净优势降到 {cents(edge)}，低于撤单线 {cents(exit_edge)}"
         only = (c.sim_maker_deep > 0 and c.sim_maker_deep_only and self.sim_mode_market(mk, c.sim_maker_deep_markets)
                 and self.sim_mode_market(mk, c.sim_maker_deep_only_markets) and not book_crossed(mk.book))
-        if only and not trade.get("deep"):
+        if only and not trade.get("deep") and not trade.get("floor"):
             return "已改为只挂低价挂单，平时的挂单撤掉"
         if trade.get("sweep") and not only:
             # a sweep order exists only under SIM_MAKER_DEEP_ONLY: with it off here it would hold the side's slot (one order
@@ -16023,11 +16058,22 @@ class Bot:
         placed_bar = float(version.get("sim_crypto_15m_edge") or version.get("sim_crypto_day_edge") or version.get("sim_edge") or now_bar)
         if abs(placed_bar - now_bar) > 1e-12 and edge < now_bar - 1e-9:
             return f"触发门槛已改为 {cents(now_bar)}，现净优势 {cents(edge)} 不达标"  # a changed setting re-judges the order by the entry bar
-        deep_order = bool(trade.get("deep"))
-        if c.sim_maker_min_bid > 0 or deep_order:  # SIM_MAKER_MIN_BID=0: an ordinary order is not re-quoted; a deep-bid order keeps its place whatever the setting
+        deep_order, floor_order = bool(trade.get("deep")), bool(trade.get("floor"))
+        if floor_order:  # a floor order (1.105.0): gone with its setting, re-placed at a changed price or count, else it waits for a 买1 to follow
+            if c.sim_maker_floor_shares <= 0:
+                return "已关闭托底单，撤掉"
+            if not self.sim_mode_market(mk, c.sim_maker_floor_markets):
+                return "托底单已不做这个市场，撤掉"
+            if abs(price - c.sim_maker_floor) >= SIM_MAKER_FOLLOW - 1e-9:
+                return f"托底单价格已改为 {cents(c.sim_maker_floor)}，重挂"
+            if abs(float(trade.get("order") or 0) - self.sim_floor_shares(price)) > 1e-9:
+                return f"托底单份数已改为 {self.sim_floor_shares(price):g} 份，按新份数重挂"
+        if c.sim_maker_min_bid > 0 or deep_order or floor_order:  # SIM_MAKER_MIN_BID=0: an ordinary order is not re-quoted; a deep-bid order keeps its place whatever the setting
             own = max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0) if isinstance(trade.get("live"), dict) else 0.0
             level = maker_level(mk.book, side, max(c.sim_maker_min_bid, SIM_MAKER_FRONT_MIN) if deep_order else c.sim_maker_min_bid, own, price)
             if level is None:
+                if floor_order:
+                    return ""  # still nothing to follow: the floor order is what rests here
                 return f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟" if c.sim_maker_min_bid > 0 else ""  # nobody else bids: a deep-bid order stays
             move: tuple[float, str] | None = None  # (the place the order would move to, why), to go once that place has held (sim_follow_settled)
             if not deep_order:
@@ -16039,7 +16085,7 @@ class Bot:
                     fresh_bar = self.sim_maker_mode(mk)[0]
                     if not (level[0] > price and (fair - level[0] < fresh_bar - 1e-9 or fair - level[0] <= mk.need
                                                   or (limit is not None and level[0] > limit + 1e-9))):
-                        move = (level[0], f"买1 移到 {cents(level[0])}，改跟")
+                        move = (level[0], f"有了可跟的买1 {cents(level[0])}，托底单改跟" if floor_order else f"买1 移到 {cents(level[0])}，改跟")
             else:
                 # a deep-bid order keeps a cent over the best bid of anyone else: pushed off the front (a bid at or over its
                 # price, dust aside) it goes back over the pusher while the edge there still clears the mode's bar, otherwise it
@@ -16779,6 +16825,8 @@ class Bot:
         position (10-20); the cap counts the positions and the ordinary orders (side_held). The group cap and the
         real-trading limits hold for every order. (shares, "" | why none may be placed)."""
         want = float(min(self.config.sim_shares, self.sim_order_cap(mk)))  # SIM_CRYPTO_DAY_SHARES on a daily crypto market
+        if maker.floor:
+            want = self.sim_floor_shares(maker.price)  # a floor order: its own count, never cut (under Predict's minimum it could not go out)
         quiet = self.sim_quiet(mk.settle, now_ms) or self.sim_open_quiet(mk, now_ms)
         if quiet:
             return want, quiet
@@ -16786,12 +16834,16 @@ class Bot:
         if full:
             return want, full
         if room < want - 1e-9:
+            if maker.floor:
+                return want, f"这一边只剩 {room:g} 份额度，托底单要 {want:g} 份（{cents(maker.price)}×{want:g} 份 = Predict 最低订单金额）才挂得上"
             want = float(math.floor(room + 1e-9))
         if not maker.front:  # SIM_AFTER_HOURS_MAX_SHARES: what the side may still hold after hours (a deep-bid order: outside it)
             room, full = self.sim_side_room(trades, mk, side)
             if full:
                 return want, full
             if room < want - 1e-9:  # (never floor an unbounded room)
+                if maker.floor:
+                    return want, f"盘后这一边只剩 {room:g} 份额度，托底单要 {want:g} 份才挂得上"
                 want = float(math.floor(room + 1e-9))
         why = self.sim_group_room(trades, mk, side, maker.price, want)
         if not why:
@@ -17055,6 +17107,9 @@ class Bot:
                            + (f"，只做 {'、'.join(sorted(self.config.sim_maker_deep_markets))}" if self.config.sim_maker_deep_markets else ""))
             if self.config.sim_maker_min_bid > 0:
                 how.append(f"只跟不少于 {self.config.sim_maker_min_bid:g} 份的买1，买1 移动 1¢ 以上就撤了改跟")
+            if self.config.sim_maker_floor_shares > 0:
+                how.append(f"这一边没有可跟的买价时挂托底单 {cents(self.config.sim_maker_floor)}×{self.sim_floor_shares(self.config.sim_maker_floor):g} 份守在最底下"
+                           f"（Predict 最低订单金额 $1），有了可跟的买1 就改跟（SIM_MAKER_FLOOR_SHARES）")
             if self.sim_maker_exit() > 0:
                 how.append(f"挂着的单净优势降到 {cents(self.sim_maker_exit())} 以下撤掉")
             if self.config.sim_maker_after_hours > 0:
@@ -17146,7 +17201,7 @@ class Bot:
         return {label: sim_stats([t for t in trades if int(t["settled"]) >= since]) for label, since in windows.items()}
 
     JOURNAL_HISTORY = 300  # finished trades the review page lists at first; the older ones come on request (journal.json?all=1)
-    JOURNAL_LIGHT = ("id", "market", "slug", "item", "kind", "key", "side", "label", "maker", "deep", "sweep", "price", "shares", "order",
+    JOURNAL_LIGHT = ("id", "market", "slug", "item", "kind", "key", "side", "label", "maker", "deep", "sweep", "floor", "price", "shares", "order",
                      "unfilled", "opened", "filled", "settled", "status", "confirm", "payout", "edge", "fair", "note", "driver_name",
                      "text", "state", "pnl", "expected_fill", "url", "wait", "legacy", "cost_confirmed", "withdrawn", "real", "limit", "mark", "unrealized")
 
@@ -18355,6 +18410,7 @@ class Bot:
                   "SIM_GROUP_USD": plain(c.sim_group_usd), "SIM_TAKER_SESSION": flag(c.sim_taker_session),
                   "SIM_TAKER_AFTER_HOURS_CENTS": f"{c.sim_taker_after_hours * 100:g}", "SIM_AFTER_HOURS_MAX_PRICE_CENTS": f"{c.sim_after_hours_max_price * 100:g}", "SIM_SKIP": ",".join(sorted(c.sim_skip)),
                   "SIM_QUIET_MINUTES": str(c.sim_quiet_minutes), "SIM_MAKER_MIN_BID": plain(c.sim_maker_min_bid),
+                  "SIM_MAKER_FLOOR_SHARES": plain(c.sim_maker_floor_shares), "SIM_MAKER_FLOOR_CENTS": f"{c.sim_maker_floor * 100:g}",
                   "SIM_CRYPTO_DAY_SHARES": plain(c.sim_crypto_day_shares), "SIM_CRYPTO_DAY_MAX_SHARES": plain(c.sim_crypto_day_max_shares),
                   "SIM_CRYPTO_DAY_QUIET_MINUTES": str(c.sim_crypto_day_quiet), "SIM_CRYPTO_DAY_EDGE_CENTS": f"{c.sim_crypto_day_edge * 100:g}",
                   "SIM_CRYPTO_15M_SHARES": plain(c.sim_crypto_15m_shares), "SIM_CRYPTO_15M_MAX_SHARES": plain(c.sim_crypto_15m_max_shares),
@@ -18364,6 +18420,7 @@ class Bot:
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
                   "SIM_MAKER_SPREAD_CENTS": f"{c.sim_maker_spread * 100:g}", "SIM_MAKER_DEEP_ONLY": flag(c.sim_maker_deep_only),
                   "SIM_MAKER_AFTER_HOURS_MARKETS": ",".join(sorted(c.sim_maker_after_hours_markets)), "SIM_MAKER_DEEP_MARKETS": ",".join(sorted(c.sim_maker_deep_markets)),
+                  "SIM_MAKER_FLOOR_MARKETS": ",".join(sorted(c.sim_maker_floor_markets)),
                   "SIM_TAKER_AFTER_HOURS_MARKETS": ",".join(sorted(c.sim_taker_after_hours_markets)),
                   "SIM_MAKER_DEEP_ONLY_MARKETS": ",".join(sorted(c.sim_maker_deep_only_markets)),
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}", "SIM_SECONDS": str(c.sim_seconds), "PREDICT_POLL_SECONDS": str(c.predict_poll),
