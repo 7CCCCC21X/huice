@@ -971,6 +971,7 @@ class LiveBot(core.Bot):
         self.live_positions: tuple[list[dict], float] = ([], 0.0)
         self.live_positions_cut = False  # the last positions read for a reconciliation came cut at the page cap
         self.live_late_checked = -1e9    # when the ended orders were last set against the account's positions (live_late_fills)
+        self.live_trim_seen: dict[tuple[str, int], tuple[float, int]] = {}  # outcome -> (the holding's shortfall seen, when): trimmed once it stands a minute
         self.live_errors: list[str] = []  # the latest failures, newest last, for /live
         self.live_wanted: set[str] = set()  # market ids a decision waited for (details read next step, whatever the edge)
         self.live_market_retry: dict[str, float] = {}  # market id -> monotonic time its details are asked for again after a failure
@@ -1906,40 +1907,65 @@ class LiveBot(core.Bot):
     LIVE_LATE_FILLS_WINDOW_MS = 2 * 3_600_000  # ...over the orders that ended within this long
     LIVE_LATE_FILLS_GRACE_MS = 15_000          # ...and not before this long after their end: the positions list follows the matching a little late
 
+    LIVE_TRIM_MAX = 0.05                       # a holding short of the records by more than this share is not a fee: left as it is (noted on the page)
+
     async def live_late_fills(self, now_ms: int) -> None:
-        """Fills that landed as an order was ending and were not read then (1.119.0: a 300-share KOSPI order withdrawn
-        with 0 filled as far as the cancel's read said, while the account held 299.99 shares of it). The records whose
-        real order ended (withdrawn, or kept its position with some shares unfilled) within LIVE_LATE_FILLS_WINDOW_MS
-        are set against the account's positions: shares the account holds on an outcome beyond what its records
-        explain (live_unexplained) are read from the order's own record first, and what that still does not show is
-        taken as filled on the newest such order, at most its unfilled count — costed as a fill of that order (a
-        maker's price; a taker's limit, 待对账), noted on the record and announced. Once a minute; the newest order on
-        an outcome takes the excess, an older one is looked at the next pass."""
+        """The account's positions against the records, once a minute (1.119.0): one read of the positions, then
+        (a) fills that landed as an order was ending and were not read then (a 300-share KOSPI order withdrawn with 0
+        filled as far as the cancel's read said, while the account held 299.99 shares of it): the records whose real
+        order ended within LIVE_LATE_FILLS_WINDOW_MS with shares unfilled — shares the account holds on their outcome
+        beyond what its records explain are read from the order's own record first, and what that still does not show
+        is taken as filled on the newest such order, at most its unfilled count, costed as a fill of that order (a
+        maker's price; a taker's limit, 待对账), noted on the record and announced; not within LIVE_LATE_FILLS_GRACE_MS
+        of the end (the positions list follows the matching a little late);
+        (b) 1.119.1: an outcome the account holds a little less of than its open records say (Predict takes the taker
+        fee in shares: 97.74 bought, 96.30 held) — the records are trimmed to the holding, in proportion, when no order
+        with fills is still working there, the shortfall is within LIVE_TRIM_MAX and the same shortfall stands a minute
+        later (the positions list follows the matching a little late); a position's payout is then exactly the shares
+        held (the cost, price with the fee times the shares bought, stays right within a cent). A list that cannot be
+        read, or came cut at the page cap, changes nothing."""
         if now_ms - self.live_late_checked < self.LIVE_LATE_FILLS_MS:
             return
         self.live_late_checked = now_ms
         trades = self.sim_trades()
-        ended = [(tid, t) for tid, t in trades.items()
-                 if isinstance(t.get("live"), dict) and t["live"].get("state") == "done" and t["live"].get("order_id")
-                 and t.get("status") in {"cancelled", "filled"} and not t.get("final")
+        key_of = lambda t: (str((t["live"].get("want") or {}).get("market_id") or t.get("market_id") or ""), int((t["live"].get("want") or {}).get("index_set") or 0))
+        live = [(tid, t) for tid, t in trades.items() if isinstance(t.get("live"), dict)]
+        ended = [(tid, t) for tid, t in live
+                 if t["live"].get("state") == "done" and t["live"].get("order_id") and t.get("status") in {"cancelled", "filled"} and not t.get("final")
                  and float(t.get("order") or 0) - float(t.get("shares") or 0) > 1e-9
                  and self.LIVE_LATE_FILLS_GRACE_MS <= now_ms - core.trade_updated(t) <= self.LIVE_LATE_FILLS_WINDOW_MS]
+        open_recs = [(tid, t) for tid, t in live if t.get("status") in {"filled", "resting"} and float(t.get("shares") or 0) > 1e-9]
+        if not ended and not open_recs:
+            return
+        try:
+            rows = await self.live.api.positions()
+        except Exception:
+            return
+        self.live_positions = (rows, time.time())
+        if not getattr(self.live.api, "positions_complete", True):
+            return  # cut at the page cap: a position missing from it says nothing
+        held: dict[tuple[str, int], float] = {}
+        for row in rows:
+            market = row.get("market") if isinstance(row.get("market"), dict) else {}
+            outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
+            k = (str(market.get("id") or row.get("marketId") or ""), int(outcome.get("indexSet") or 0))
+            held[k] = held.get(k, 0.0) + self.position_shares(row)
+        recorded: dict[tuple[str, int], float] = {}
+        for tid, t in live:
+            k = key_of(t)
+            recorded[k] = recorded.get(k, 0.0) + float(t.get("shares") or 0)
+        # (a) the shares held beyond the records, onto the newest order that ended with shares unfilled
         ended.sort(key=lambda kv: core.trade_updated(kv[1]), reverse=True)
         seen: set[tuple[str, int]] = set()
         for tid, t in ended:
-            st = t["live"]
-            want = st.get("want") or {}
-            key = (str(want.get("market_id") or t.get("market_id") or ""), int(want.get("index_set") or 0))
-            if not key[0] or not key[1] or key in seen:
+            st, k = t["live"], key_of(t)
+            if not k[0] or not k[1] or k in seen:
                 continue
-            seen.add(key)
-            extra = await self.live_unexplained(t)  # the account's shares on the outcome beyond the other records' (this one's own included)
-            if extra is None:
-                return  # the positions could not be read, or came cut: nothing is adopted on a guess
-            before, order = float(t.get("shares") or 0), float(t.get("order") or 0)
-            excess = extra - before
+            excess = held.get(k, 0.0) - recorded.get(k, 0.0)
             if excess <= 0.01:
                 continue
+            seen.add(k)  # the newest order on the outcome takes the excess; the outcome is not trimmed in the same pass
+            before, order = float(t.get("shares") or 0), float(t.get("order") or 0)
             row = None
             with contextlib.suppress(Exception):
                 row = await self.live.api.order(str(st["order_id"]), str(st.get("hash") or ""))
@@ -1956,6 +1982,7 @@ class LiveBot(core.Bot):
                                          "amountFilled": str(to_wei(after + adopt))}, None, now_ms)
                 after = float(t.get("shares") or 0)
                 how = f"账户在这一边的持仓比记录多 {excess:g} 份、订单记录没显示：按成交 {adopt:g} 份补记（累计 {after:g}/{order:g}）"
+            recorded[k] = recorded.get(k, 0.0) + after - before
             if t["status"] not in {"settled", "expired"} and after > 1e-9:
                 t.update(status="filled", unfilled=max(order - after, 0.0),
                          note=f"真实成交 {after:g}/{order:g} 份（订单结束后补记），其余 {max(order - after, 0.0):g} 份{st.get('cancel_why') or '已结束'}")
@@ -1963,6 +1990,33 @@ class LiveBot(core.Bot):
             self.live_notify(f"📌 补记成交：{t['item']} {t['label']} {core.cents(float(t['price']))}：{how}（订单 #{st['order_id']}，请在 Predict 核对）",
                              key=f"latefill:{st['order_id']}")
             self.sim_save([(tid, t)])
+        # (b) a holding a little short of the open records: the fee taken in shares — the records trimmed to it, in proportion
+        groups: dict[tuple[str, int], list[tuple[str, dict]]] = {}
+        for tid, t in open_recs:
+            groups.setdefault(key_of(t), []).append((tid, t))
+        for k, recs in groups.items():
+            if not k[0] or not k[1] or k in seen or any(t["live"].get("state") != "done" and float(t.get("shares") or 0) > 1e-9 for _, t in recs):
+                continue  # a working order with fills there: its fills and the holding are not settled against each other yet
+            total, got = recorded.get(k, 0.0), held.get(k)
+            short = total - got if got is not None and total > 1e-9 else 0.0
+            if short <= 0.01 or short > self.LIVE_TRIM_MAX * total:
+                self.live_trim_seen.pop(k, None)
+                continue
+            earlier = self.live_trim_seen.get(k)
+            if earlier is None or abs(earlier[0] - short) > 0.01 or now_ms - earlier[1] < self.LIVE_LATE_FILLS_MS:
+                self.live_trim_seen[k] = (short, now_ms)  # the same shortfall has to stand a minute later
+                continue
+            self.live_trim_seen.pop(k, None)
+            scale = got / total
+            for tid, t in recs:
+                before = float(t["shares"])
+                after = round(before * scale, 6)
+                t["shares"] = after
+                t["fee_shares"] = round(float(t.get("fee_shares") or 0) + before - after, 6)
+                t["live"]["events"].append({"at": now_ms, "what": f"按 Predict 持仓校正份数：{before:g} → {after:g}（账户在这一边共持有 {got:g} 份，比记录的 {total:g} 份少 {short:g} 份：手续费以份额扣除）"})
+                self.sim_save([(tid, t)])
+            self.live_notify(f"📐 份数校正：{recs[0][1]['item']} {recs[0][1]['label']}：账户持有 {got:g} 份，记录 {total:g} 份，少的 {short:g} 份是手续费以份额扣除；"
+                             f"{len(recs)} 笔记录按比例改为持有的份数（成本不变）", key=f"trim:{k[0]}:{k[1]}")
 
     async def live_fills_wait(self) -> None:
         """Every fills read in flight (live_fills_later), waited for: the step's sync and the tests."""
@@ -2842,8 +2896,8 @@ class LiveBot(core.Bot):
                          + (f"，比记录多 {diff:g} 份" if diff > 0.01 else f"，比记录少 {-diff:g} 份" if diff < -0.01 else "，一致"))
             else:
                 ended = [(tid, t) for tid, t in mine if int(t.get("opened") or 0) >= now_ms - 2 * core.DAY_MS and float(t.get("shares") or 0) <= 1e-9]
-                line += "｜⚠️ 无记录" + (f"（这一边有 {len(ended)} 张没成交就结束的订单：{'、'.join(tag(tid, t) for tid, t in ended[:5])}，可能撤单前成交了没读到）"
-                                     if ended else "")
+                line += "｜⚠️ 无记录" + (f"（这一边有 {len(ended)} 张没成交就结束的订单：{'、'.join(tag(tid, t) for tid, t in ended[:5])}，可能撤单前成交了没读到，每分钟自动核对补记）"
+                                     if ended else "（本机器人近两天没有这一边的订单：手动买的或旧持仓，到期照常自动领取）")
             out.append(line)
         return out
 

@@ -632,7 +632,10 @@ async def run():
     # index set): the records holding it, or 无记录 with the orders there that ended without a fill (a fill during the cancel, unread)
     ptext = await bot.cmd_live(req("positions"))
     assert ptext.startswith("Predict 上的持仓 3 个：") and "恒生指数 10-05｜Down 100 份｜≈$100.00｜" in ptext, ptext
-    assert f"rest｜Up 5 份｜⚠️ 无记录（这一边有 1 张没成交就结束的订单：#{oid}，可能撤单前成交了没读到）" in ptext, ptext
+    assert f"rest｜Up 5 份｜⚠️ 无记录（这一边有 1 张没成交就结束的订单：#{oid}，可能撤单前成交了没读到，每分钟自动核对补记）" in ptext, ptext
+    fake.positions_rows.append({"id": "p5", "market": {"id": 555, "title": "someone else's"}, "outcome": {"name": "No", "indexSet": 2, "onChainId": "5552"}, "amount": str(3 * WEI)})
+    assert "someone else's｜No 3 份｜⚠️ 无记录（本机器人近两天没有这一边的订单：手动买的或旧持仓，到期照常自动领取）" in await bot.cmd_live(req("positions"))
+    fake.positions_rows.pop()
     assert bot.live_status(bot.market.now_ms())["positions"] == ptext.split("\n")[1:], ptext
     lines = await bot.live_redeem(CLOSE + 70 * 60_000)
     assert len(lines) == 1 and "已领取 恒生指数 10-05 Down 100 份：0xredeem" in lines[0], lines
@@ -1004,6 +1007,20 @@ async def run():
         assert len(late["fills"]) == 1 and late["fills"][0]["shares"] == 10 and abs(lbot.live_reserved(late) - 10 * late["price"]) < 1e-9
         await step(lbot, NOW + 140_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 140_000))  # explained now: nothing more is adopted
         assert abs(next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] - 10) < 1e-9
+        # 1.119.1: the account holds a little less than the records say (the taker fee taken in shares): the records are trimmed to
+        # the holding once the same shortfall has stood a minute (the second pass), no order with fills working there; a shortfall
+        # beyond 5% is not a fee and is left alone
+        lfake.positions_rows[0]["amount"] = str(int(9.8 * WEI))
+        await step(lbot, NOW + 210_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 210_000))  # seen once: not yet
+        assert abs(next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] - 10) < 1e-9
+        await step(lbot, NOW + 280_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 280_000))
+        trimmed = next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")
+        assert abs(trimmed["shares"] - 9.8) < 1e-9 and abs(trimmed["fee_shares"] - 0.2) < 1e-9 and trimmed["status"] == "filled", trimmed
+        assert any(e["what"].startswith("按 Predict 持仓校正份数：10 → 9.8（账户在这一边共持有 9.8 份，比记录的 10 份少 0.2 份") for e in trimmed["live"]["events"]), trimmed["live"]["events"]
+        lfake.positions_rows[0]["amount"] = str(5 * WEI)
+        for at in (NOW + 350_000, NOW + 420_000):
+            await step(lbot, at, hsi(0.70, [("0.55", "300")], [("0.58", "400")], at))
+        assert abs(next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] - 9.8) < 1e-9
     await late_case(False)
     await late_case(True)
 
