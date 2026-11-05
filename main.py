@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.107.1"
+VERSION = "1.107.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -11618,7 +11618,7 @@ function filterLine(el,S){el.hidden=!S.label;if(!S.label)return;
   el.replaceChildren("按筛选：",$("b","",S.label),"（下面列表的市场、类型、挂/吃筛选；状态筛选只管列表） ",b)}
 function summary(){  // per day the records were opened on: records, markets, what filled, what settled and its P&L, what is open — by kind and way under each
   const S=src(),rows=S.s,el=document.getElementById("summary"),head=document.getElementById("sumsum");el.replaceChildren();
-  filterLine(document.getElementById("sumfilt"),S);const fk=filterKey();document.getElementById("scsv").href=base+"/summary.csv"+(fk?"?"+fk:"");
+  filterLine(document.getElementById("sumfilt"),S);const fk=filterKey();document.getElementById("scsv").href=base+"/summary.csv"+(fk?"?"+fk:"");document.getElementById("csv").href=base+"/journal.csv"+(fk?"?"+fk:"");
   const cel=document.getElementById("s-cards");
   if(rows===null){el.append($("p","small mut",S.err?"按筛选读取失败："+S.err:"按筛选读取中…"));cel.replaceChildren();head.textContent=S.label;
     document.getElementById("sumbody").hidden=!sumOpen;return}
@@ -12242,8 +12242,9 @@ class WebServer:
                 return 200, "text/html; charset=utf-8", self.pages["journal"]
             if parts[2] == "journal.json":
                 return self.journal_json(query)
-            if parts[2] == "journal.csv":
-                return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
+            if parts[2] == "journal.csv":  # with the review page's filter, when it has one (1.107.2; summary.csv since 1.107.0)
+                flt = journal_filter_of(urllib.parse.parse_qs(query, keep_blank_values=True))
+                return 200, "text/csv; charset=utf-8", self.bot.journal_csv(flt).encode("utf-8")
             if parts[2] == "summary.csv":  # with the review page's filter, when it has one (1.107.0)
                 flt = journal_filter_of(urllib.parse.parse_qs(query, keep_blank_values=True))
                 return 200, "text/csv; charset=utf-8", self.bot.journal_summary_csv(flt).encode("utf-8")
@@ -12827,6 +12828,10 @@ COMMANDS: tuple[Command, ...] = (
     Command("web", "获取概率网页链接（自动刷新）"),
     Command("calib", "用已保存的预测快照和实际收盘给概率模型打分（Brier/校准/逐日向前拟合）"),
     Command("samples", "导出模型样本 CSV：15 分钟 / 加密日涨跌每个市场在固定剩余时间记的公平价、盘口、σ 和结果"),
+    Command("journal", "导出交易日记 CSV（一笔一行，和复盘页“导出 CSV”同一个文件）；可带筛选：市场名的一部分、挂 / 吃、类型名", "海力士 挂",
+            "不带筛选是全部记录；/journal 海力士 吃 = SK 海力士 15 分钟的吃单"),
+    Command("summary", "导出复盘汇总 CSV（每日汇总、今日按市场、按净优势 / 公平价 / 时段、按设置版本、15 分钟表、撤单原因、被拦下的机会）", "海力士",
+            "筛选词和 /journal 一样"),
     Command("sim", "模拟交易：净优势 ≥10¢ 时买 100 份，看长期是赚还是亏（只记账，不下单）"),
     Command("live", "真实交易（LIVE=on）：钱包、余额、真实订单、持仓与风控；暂停/恢复/撤单/领取", "pause|resume|cancel all|redeem|check",
             "LIVE=on 时模拟交易的每个决定都会在 Predict 真实下单；/live pause 停止开新仓，/live resume 恢复"),
@@ -13167,6 +13172,7 @@ class Bot:
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
             "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib, "/samples": self.cmd_samples,
+            "/journal": self.cmd_journal, "/summary": self.cmd_summary,
             "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live,
         }
 
@@ -14150,6 +14156,69 @@ class Bot:
         done = sum(r.get("result") is not None for r in rows)
         return Document(f"model-samples-{day}.csv", self.window_csv().encode("utf-8"),
                         f"模型样本 {len(rows)} 条（已有结果 {done} 条），{len({r.get('slug') for r in rows})} 个市场；列的含义见 README")
+
+    def journal_filter_words(self, words: list[str]) -> tuple[dict[str, str], str]:
+        """The review page's filter (journal_filter_of) from a command's words (/journal, /summary; 1.107.2): 挂 / 挂单 or
+        吃 / 吃单 the way, a kind's name or key (SIM_KINDS) the kind, the rest together part of one card's name (card_of,
+        among the records'), case aside. (the filter, "") — or ({}, why not) when no card, or more than one, has that
+        in its name."""
+        flt: dict[str, str] = {}
+        rest: list[str] = []
+        for word in (w.strip() for w in words):
+            if not word:
+                continue
+            if word in {"挂", "挂单"}:
+                flt["way"] = "maker"
+            elif word in {"吃", "吃单"}:
+                flt["way"] = "taker"
+            elif word in SIM_KINDS:
+                flt["kind"] = word
+            elif word in SIM_KINDS.values():
+                flt["kind"] = next(k for k, v in SIM_KINDS.items() if v == word)
+            else:
+                rest.append(word)
+        if rest:
+            text = " ".join(rest)
+            names = sorted({card_of(t) for t in self.sim_trades().values()})
+            hits = [n for n in names if n == text] or [n for n in names if text.casefold() in n.casefold()]
+            if not hits:
+                return {}, (f"没有名字含“{text}”的市场。有记录的市场：" + "、".join(names[:15]) + ("…" if len(names) > 15 else "")
+                            if names else "还没有交易记录")
+            if len(hits) > 1:
+                return {}, f"“{text}”匹配多个市场：" + "、".join(hits) + "。写具体些"
+            flt["card"] = hits[0]
+        return flt, ""
+
+    def export_name(self, stem: str, flt: Mapping) -> str:
+        """journal-20261105-宇树_15分涨跌_吃单.csv: the stem, the day, the filter's words."""
+        day = dt.datetime.fromtimestamp(self.market.now_ms() / 1000, BEIJING).strftime("%Y%m%d")
+        tag = re.sub(r"[^\w]+", "_", journal_filter_text(flt)).strip("_") if flt else ""
+        return f"{stem}-{day}" + (f"-{tag}" if tag else "") + ".csv"
+
+    async def cmd_journal(self, req: Request) -> Any:
+        """/journal [筛选词]: the journal's CSV (journal_csv — the review page's 导出 CSV) as a Telegram document."""
+        flt, problem = self.journal_filter_words(req.args)
+        if problem:
+            return problem
+        n = sum(not flt or journal_match(t, flt) for t in self.sim_trades().values())
+        if not n:
+            return f"没有符合的记录（筛选：{journal_filter_text(flt)}）" if flt else "还没有交易记录"
+        scope = f"筛选：{journal_filter_text(flt)}" if flt else "全部"
+        return Document(self.export_name("journal", flt), self.journal_csv(flt).encode("utf-8"),
+                        f"交易日记 {n} 笔（{scope}）；一笔一行，列的含义见 README")
+
+    async def cmd_summary(self, req: Request) -> Any:
+        """/summary [筛选词]: the review page's summary and analysis tables (journal_summary_csv — its 导出汇总 CSV) as a
+        Telegram document."""
+        flt, problem = self.journal_filter_words(req.args)
+        if problem:
+            return problem
+        if not self.sim_trades():
+            return "还没有交易记录"
+        scope = f"筛选：{journal_filter_text(flt)}" if flt else "全部记录"
+        return Document(self.export_name("summary", flt), self.journal_summary_csv(flt).encode("utf-8"),
+                        f"复盘汇总（{scope}）：每日汇总、今日按市场、按标的 / 净优势 / 公平价 / 时段、按设置版本、15 分钟表、"
+                        "挂单效率与撤单原因、被拦下的机会；第一列是表名")
 
     def shadow_report(self) -> list[str]:
         """The daily crypto markets' threshold backtest (shadow_sample), scored once their markets have results: for each
@@ -17818,18 +17887,24 @@ class Bot:
                        "最优价", "滑点", "下单时公平价", "下单时净优势", "下单时预期", "成交时预期", "状态", "确认", "本地结果",
                        "Predict 结果", "结果不一致", "回款/份", "盈亏", "结算时间", "说明", "修订", "参考线", "有效价", "σ（日）",
                        "剩余方差占比", "β", "口径", "下单距收盘（小时）", "最旧报价年龄（秒）", "行情来源", "代理与锚点", "版本", "市场链接",
+                       "起点", "下单时现价", "σ（年化）", "下单距结束（分钟）", "成交时公平价",  # 1.107.2: an up/down (15-minute, daily crypto) or touch record's basis
                        "共同风险组", "成交后1分钟市价变动", "成交后5分钟市价变动", "成交后30分钟市价变动")
 
-    def journal_csv(self) -> str:
-        """The journal as one row per trade (UTF-8 with BOM, so spreadsheet apps read the Chinese), for analysis."""
+    def journal_csv(self, flt: Mapping | None = None) -> str:
+        """The journal as one row per trade (UTF-8 with BOM, so spreadsheet apps read the Chinese), for analysis — the
+        records in ``flt`` (journal_filter_of: a card, a kind, a way; 1.107.2), every one without."""
         import csv
         import io
         when = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING).strftime("%Y-%m-%d %H:%M:%S") if ms else ""
         result = lambda r: "" if not r else {1.0: "涨/Yes", 0.0: "跌/No", 0.5: "50/50"}.get(float(r["up"]), str(r["up"]))
+        r6 = lambda v: round(float(v), 6) if isinstance(v, (int, float)) and not isinstance(v, bool) else ""
+        keep = {tid for tid, t in self.sim_trades().items() if journal_match(t, flt)} if flt else None
         out = io.StringIO()
         writer = csv.writer(out)
         writer.writerow(self.JOURNAL_COLUMNS)
         for t in self.journal_payload(full=True, history=0)["trades"]:
+            if keep is not None and t["id"] not in keep:
+                continue
             entry = t.get("entry") or {}
             sources = "；".join(f"{x.get('what', '')}={x.get('source', '')}"
                                + (f" {x['symbol']}" if x.get("symbol") else "")
@@ -17855,6 +17930,10 @@ class Bot:
                 basis.get("beta", ""), basis.get("mode", ""), round(left, 2) if left != "" else "", round(max(ages), 1) if ages else "",
                 sources or ("旧记录：无快照" if t.get("legacy") else ""), proxy_text,
                 (t.get("version") or {}).get("code", "") or ("旧版" if t.get("legacy") else ""), t["url"],
+                # an up/down or touch record's basis: the start, the price and σ (annual) at the order, the minutes to the
+                # end (its years, calendar), and the model's fair price at the fill (markout's reference)
+                r6(basis.get("line")), r6(basis.get("price")), r6(basis.get("sigma")),
+                round(float(basis["years"]) * 525_600, 2) if isinstance(basis.get("years"), (int, float)) else "", r6(t.get("fill_fair")),
                 trade_driver(t)[1], *(round(float(marks[label]["move"]), 6) if isinstance(marks.get(label), dict) else ""
                                      for marks in [t.get("markout") if isinstance(t.get("markout"), dict) else {}]
                                      for _, label in MARKOUT_HORIZONS)])

@@ -178,6 +178,12 @@ async def run():
     frows = list(csv.reader(io.StringIO(body.decode("utf-8")[1:])))
     assert status == 200 and frows[1][:3] == ["筛选", "恒生指数", "2"] and next(r for r in frows if r[1] == "累计")[2] == "2", frows[:3]
     assert "今日按市场" in {r[0] for r in frows}
+    # 1.107.2: the journal's CSV takes the filter too, and the page's 导出 CSV button carries it
+    status, _, body = web.route("GET", f"/p/{TOKEN}/journal.csv", "card=" + urllib.parse.quote("恒生指数"))
+    jrows = list(csv.reader(io.StringIO(body.decode("utf-8")[1:])))
+    assert status == 200 and jrows[0] == list(m.Bot.JOURNAL_COLUMNS) and {r[0] for r in jrows[1:]} == {tid for tid, t in bot.sim_trades().items() if m.card_of(t) == "恒生指数"} and len(jrows) == 3
+    assert len(list(csv.reader(io.StringIO(web.route("GET", f"/p/{TOKEN}/journal.csv")[2].decode("utf-8")[1:])))) == 7  # every record without one
+    assert 'document.getElementById("csv").href=base+"/journal.csv"+(fk?"?"+fk:"")' in m.JOURNAL_PAGE
     web.cache = {f"x{i}": (0.0, b"") for i in range(70)}  # the cache drops what expired once it holds many (the filtered analyses: one a filter)
     web.cached("journal.json?analysis&card=y", lambda: b"{}")
     assert len(web.cache) == 1

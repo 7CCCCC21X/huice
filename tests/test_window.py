@@ -292,6 +292,27 @@ async def run():
     assert isinstance(past, m.IndexUpDownMarket) and past.spec.slug == spec.slug and past.futures == card.futures
     result = bot.sim_result(trade, T1 + 2_000)
     assert result is not None and result[0] == 1.0 and "终点 90.2" in result[1], result  # 90.20 over 90.00: 涨
+    # 1.107.2: /journal sends the journal's CSV, the words its filter (part of a card's name, 挂 / 吃, a kind); the window's
+    # own columns (the start, the price and σ at the order, the minutes left, the fair price at the fill)
+    doc = await bot.cmd_journal(m.Request("/journal", ["宇树", "吃"], 1, 0, 42))
+    assert isinstance(doc, m.Document) and doc.filename == "journal-20261104-宇树_15分涨跌_吃单.csv" and doc.mime == "text/csv", doc.filename
+    rows = list(csv.reader(io.StringIO(doc.data.decode("utf-8").lstrip("\ufeff"))))
+    want = {tid for tid, t in bot.sim_trades().items() if not t.get("maker") and m.card_of(t) == "宇树 15分涨跌"}
+    assert rows[0] == list(m.Bot.JOURNAL_COLUMNS) and {r[0] for r in rows[1:]} == want and f"{spec.slug}|up|吃" in want, (want, [r[0] for r in rows[1:]])
+    assert doc.caption == f"交易日记 {len(want)} 笔（筛选：宇树 15分涨跌 · 吃单）；一笔一行，列的含义见 README", doc.caption
+    col = dict(zip(rows[0], next(r for r in rows if r[0] == f"{spec.slug}|up|吃")))
+    basis = trade["entry"]["basis"]
+    assert float(col["起点"]) == basis["line"] == 90.0 and float(col["下单时现价"]) == round(basis["price"], 6) > 90 and float(col["σ（年化）"]) == round(basis["sigma"], 6) > 0
+    assert float(col["下单距结束（分钟）"]) == round(basis["years"] * 525_600, 2) and 0 < float(col["下单距结束（分钟）"]) <= 15 and float(col["成交时公平价"]) == round(trade["fill_fair"], 6), col
+    assert (await bot.cmd_journal(m.Request("/journal", ["没有这个"], 1, 0, 42))).startswith("没有名字含“没有这个”的市场。有记录的市场：宇树 15分涨跌")
+    assert (await bot.cmd_journal(m.Request("/journal", ["宇树", "挂单"], 1, 0, 42))).startswith("没有符合的记录（筛选：宇树 15分涨跌 · 挂单）") or any(t.get("maker") for t in bot.sim_trades().values())
+    whole = await bot.cmd_journal(m.Request("/journal", [], 1, 0, 42))
+    assert whole.filename == "journal-20261104.csv" and whole.caption.startswith(f"交易日记 {len(bot.sim_trades())} 笔（全部）")
+    sdoc = await bot.cmd_summary(m.Request("/summary", ["加密涨跌", "宇树"], 1, 0, 42))
+    srows = list(csv.reader(io.StringIO(sdoc.data.decode("utf-8").lstrip("\ufeff"))))
+    assert sdoc.filename == "summary-20261104-宇树_15分涨跌_加密涨跌.csv" and srows[0] == list(m.Bot.SUMMARY_COLUMNS) and srows[1][:3] == ["筛选", "宇树 15分涨跌 · 加密涨跌", str(sum(m.card_of(t) == "宇树 15分涨跌" for t in bot.sim_trades().values()))], srows[:2]
+    assert sdoc.caption.startswith("复盘汇总（筛选：宇树 15分涨跌 · 加密涨跌）：每日汇总、今日按市场") and "15 分钟涨跌｜按下单时距结束" in {r[0] for r in srows}
+    assert all(f"/{name}" in bot.cmd_help(None) and any(c.name == name for c in m.COMMANDS) for name in ("journal", "summary"))
     # an end within 0.05% of the start: Chainlink's report may differ from the index candle — Predict's result decides
     fm.index[nxt.start_ms], fm.index[nxt.end_ms] = "90.2000", "90.2300"
     tie = {**trade, "market": nxt.slug, "slug": nxt.slug, "settle": {"end": nxt.end_ms, "start": nxt.start_ms, "window": "15m"}}
