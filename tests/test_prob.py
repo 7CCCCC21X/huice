@@ -173,9 +173,29 @@ async def run():
     tg.sent.clear(); await bot.process_message({"text": "/prob", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})
     pr = tg.sent[-1]
     assert "<b>📍 KOSPI</b>" in pr and "参考收盘 <b>7,080.92</b>（09-23 收盘）→ 目标 09-28 收盘" in pr and "σ 日 3.02%（PROB_VOL 手动设定）× √1.000 = 3.02%｜z -0.576" in pr, pr
-    assert "HL KR200 标记价 1,107.15 / 收盘时刻 1,126.6 → -1.726%（KOSPI200 代理）" in pr and "公平价 涨 <b>28.2¢</b> / 跌 <b>71.8¢</b>" in pr, pr
+    assert "HL KR200 标记价 1,107.15 / 收盘时刻 1,126.6 → -1.726% × β 1（暂定，未校准）·盘后样本 0 日，满 5 日起自动回归（KOSPI200 代理）" in pr and "公平价 涨 <b>28.2¢</b> / 跌 <b>71.8¢</b>" in pr, pr
     assert "<b>📍 SK 海力士｜SKHYNIXUSDT</b>" in pr and "参考收盘 <b>1,857,000 KRW</b>（09-23 14:30·Naver）" in pr and "Yahoo日K 30 日" in pr, pr
     assert "📍 恒生指数" not in pr  # HSI disabled
+    # 1.117.0: KOSPI's β is fitted from the bot's own after-hours record like the A50 one (proxy_beta: the slope over the closed target
+    # days, blended with KOSPI_BETA as 10 pseudo-days); KOSPI_BETA_DYNAMIC=off keeps the configured β
+    now_ms = bot.market.now_ms()
+    assert bot.proxy_beta("KOSPI", 1.0, now_ms) == (1.0, "β 1（暂定，未校准）·盘后样本 0 日，满 5 日起自动回归")
+    for i, mv in enumerate((0.004, -0.006, 0.01, 0.002, -0.011, 0.007)):  # 6 target days whose close moved 0.7 × the KR200 move
+        day = (dt.date(2026, 8, 4) + dt.timedelta(days=i)).isoformat()
+        store.put(f"pred:KOSPI:{now_ms - (20 - i) * 86_400_000}", {"key": "KOSPI", "target": day, "mode": "盘后", "ref_raw": 7000.0, "ref": 7000.0, "move": mv, "R": 1.0, "beta": 1.0})
+        store.put(f"outcome:KOSPI:{day}", 7000.0 * math.exp(0.7 * mv))
+    bot.beta_cache.clear()
+    beta, note = bot.proxy_beta("KOSPI", 1.0, now_ms)
+    assert abs(beta - (6 * 0.7 + 10 * 1.0) / 16) < 1e-9 and note == "β 0.89（近 6 日盘后回归 0.70，与先验 1 按 10 日权重合成）", (beta, note)
+    ko = bot.kospi_odds(now_ms)
+    assert isinstance(ko, m.CloseOdds) and ko.beta == beta and "→ -1.726% × β 0.89（近 6 日盘后回归 0.70，与先验 1 按 10 日权重合成）（KOSPI200 代理）" in ko.proxy_note, ko.proxy_note
+    assert abs(float(ko.effective) - 7080.92 * math.exp(beta * math.log(1107.15 / 1126.6))) < 1e-6, ko.effective
+    kept_cfg, bot.config = bot.config, dataclasses.replace(bot.config, kospi_beta_dynamic=False, kospi_beta=0.9)
+    fixed = bot.kospi_odds(now_ms)
+    assert fixed.beta == 0.9 and "× β 0.9（KOSPI_BETA 固定）（KOSPI200 代理）" in fixed.proxy_note, fixed.proxy_note
+    bot.config = kept_cfg
+    store.delete_keys([k for k, _ in store.items("pred:KOSPI:")] + [k for k, _ in store.items("outcome:KOSPI:")]); bot.beta_cache.clear()
+    assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "KOSPI_BETA_DYNAMIC": "off"}).kospi_beta_dynamic is False and bot.config.kospi_beta_dynamic is True
     # --- KR200 anchor: restart, 5-minute fallback, recorded mark, never the KOSPI200 cash level ---------
     k, hl = bot.kospi.quote, bot.hl.quotes["KR200"]
     async def no_candles(url, payload=None, timeout=15): raise m.RemoteError("HTTP 500: 接口请求失败")

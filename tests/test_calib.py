@@ -34,10 +34,12 @@ assert "95% 区间" in text and "区间按日数算" in text, text
 # with 20 days at 1 — the true residual 0.8%/day against a 2% σ: z's RMS about 0.47, the factor about 0.73
 done = [dict(p, y=math.log(outcomes[f"KOSPI:{p['target']}"] / p["ref"])) for p in preds if f"KOSPI:{p['target']}" in outcomes]
 f, n = m.residual_factor(done)
-assert n == 30 and 0.6 < f < 0.9 and m.residual_factor([]) == (1.0, 0), (f, n)
+assert n == 30 and 0.6 <= f < 0.9 and m.residual_factor([]) == (1.0, 0), (f, n)  # 1.117.0: the fixture's small residuals sit on the 0.6 floor
 assert m.residual_factor([dict(r, sigma=r["sigma"] * 0.5, sigma_raw=r["sigma"]) for r in done]) == (f, n), "a snapshot's own factor is taken off first"
-assert m.residual_factor([dict(r, y=r["y"] * 10) for r in done]) == (1.4, 30) and m.residual_factor([dict(r, y=r["beta"] * r["move"]) for r in done]) == (0.7, 30)  # no residual at all: √(20/50) = 0.63, floored at 0.7
-assert f"σ 校准系数：×{f:.2f}（按 30 日残差，先验 20 日按 1 计" in text and "逐日向前检验（σ 校准，80 条，同一公式）：不校准 Brier" in text, text
+assert m.residual_factor([dict(r, y=r["y"] * 10) for r in done]) == (2.0, 30) and m.residual_factor([dict(r, y=r["beta"] * r["move"]) for r in done]) == (0.6, 30)  # 1.117.0: no residual at all: √(10/40) = 0.5, floored at 0.6
+rms, rms_days = m.residual_rms(done)  # the factor is the day-weighted RMS pooled with the 10-day prior at 1
+assert rms_days == 30 and abs(f - min(2.0, max(0.6, math.sqrt((rms * rms * 30 + 10) / 40)))) < 1e-12 and m.residual_rms([]) == (0.0, 0), (f, rms)
+assert f"σ 校准系数：×{f:.2f}（按 30 日残差，先验 10 日按 1 计，限 0.6～2" in text and "逐日向前检验（σ 校准，80 条，同一公式）：不校准 Brier" in text, text
 # the volatility book applies the factor to the σ it hands out and says so; a mode without one is untouched
 vb = m.VolBook({}, None)
 plain, plain_in = vb.get("KOSPI", "KOSPI"), vb.get("KOSPI", "KOSPI", intraday=True)
@@ -120,22 +122,23 @@ async def run():
     report = kbot.calibration_text()
     assert "对比 Predict 盘口中间价（1 条/1 日）：模型 Brier 0.1" in report and "市场 0.176" in report, report
     # 1.106.1: the Bot measures each card and mode's factor from the snapshots on disk and hands it to the volatility book (an
-    # outcome coming in measures again; the setting off clears them). 25 days moving 2% against a 1% σ: z 2, capped at ×1.4
+    # outcome coming in measures again; the setting off clears them). 25 days moving 2% against a 1% σ: z 2 → about √((4·25 + 10) / 35) = ×1.77
+    # (1.117.0: within the 0.6–2.0 range, the 10-day prior at 1 pooled in; the cap at 1.4 used to hold it)
     for i in range(25):
         day = (dt.date(2026, 7, 1) + dt.timedelta(days=i)).isoformat()
         kbot.store.put(f"outcome:KOSPI:{day}", 3300.0 * math.exp(0.02 * (1 if i % 2 else -1)))
         kbot.store.put(f"pred:KOSPI:{9_000_000 + i}", {"key": "KOSPI", "t": 9_000_000 + i, "target": day, "mode": "盘中", "ref": 3300.0, "up": 0.5,
                                                        "move": 0.0, "beta": 1.0, "sigma": 0.01, "R": 1.0})
     calibs = kbot.index_sigma_calibs()
-    assert calibs[("KOSPI", "盘中")][0] == 1.4 and calibs[("KOSPI", "盘中")][1] >= 25, calibs
+    assert 1.74 < calibs[("KOSPI", "盘中")][0] < 1.76 and calibs[("KOSPI", "盘中")][1] == 26, calibs  # (the fixture's own earlier snapshot is the 26th day)
     kbot.vols.calib = calibs
-    assert "快照残差校准 ×1.40" in kbot.vols.get("KOSPI", "KOSPI", intraday=True)[1]
+    assert "快照残差校准 ×1.75" in kbot.vols.get("KOSPI", "KOSPI", intraday=True)[1]
     kbot.config = m.dataclasses.replace(kbot.config, sigma_calib=False)
     kbot.note_outcome("KOSPI", "2026-07-26", 3300.0, "test")
     assert kbot.vols.calib == {}
     kbot.config = m.dataclasses.replace(kbot.config, sigma_calib=True)
     kbot.note_outcome("KOSPI", "2026-07-27", 3300.0, "test")
-    assert kbot.vols.calib[("KOSPI", "盘中")][0] == 1.4
+    assert 1.7 < kbot.vols.calib[("KOSPI", "盘中")][0] < 1.8  # measured again on the outcome (1.117.0: no longer the 1.4 cap)
     kbot.pred_last.clear(); kbot.record_predictions(t0 + 180_000)
     last = max((v for _, v in kbot.store.items("pred:KOSPI")), key=lambda v: v["t"])  # the one just recorded (the made-up rows sort after it)
     assert last["calib"] == kbot.vols.calib.get(("KOSPI", last["mode"]), (1.0, 0))[0] and abs(last["sigma_raw"] * last["calib"] - last["sigma"]) < 1e-12, last

@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.116.0"
+VERSION = "1.117.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -496,7 +496,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_AFTER_HOURS_SHARES", "盘后吃单每次最多买多少份", "0～1000000：开盘前、收盘后的吃单单独按这个份数；0 = 同盘中吃单的份数"),
     ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
-    ("SIGMA_CALIB", "σ 自动校准", "开 = 卡片的 σ 乘以按实际结果算出的系数（限 0.7～1.4，和 20 个“刚好是 1”的先验一起平均）：15 分钟涨跌按每张卡的定时样本，加密日涨跌三张卡合并按定时样本，指数日涨跌按 /calib 的快照残差、盘中和盘后各算；关 = 只用估计值"),
+    ("SIGMA_CALIB", "σ 自动校准", "开 = 卡片的 σ 乘以按实际结果算出的系数（15 分钟和加密日涨跌限 0.7～1.4、和 20 个“刚好是 1”的先验一起平均；指数日涨跌限 0.6～2.0、和 10 日先验一起平均）：15 分钟涨跌按每张卡的定时样本，加密日涨跌三张卡合并按定时样本，指数日涨跌按 /calib 的快照残差、盘中和盘后各算；关 = 只用估计值"),
     ("LEAD_QUOTE", "交易所现价先行（15 分钟涨跌）", "on = 卡片的现价按标的交易所的实时成交价相对窗口起点的涨跌折算（币安指数比交易所慢几秒到一分钟：卖涨给你的人先看到了下跌），和指数差超过 1% 或行情 15 秒没读到时退回指数，起点、终点仍按币安指数结算；shadow = 两种定价都记进模型样本、按指数交易，/calib 比较谁更准；off = 只用币安指数"),
     ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限、盘后每边持仓上限、加密日涨跌和 15 分钟涨跌的每边上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
@@ -606,6 +606,7 @@ class Config:
     sse_index: bool = True  # Shanghai Composite with the FTSE China A50 futures as after-hours proxy.
     a50_beta: float = 0.8   # Composite move per unit of A50 move when mapping the proxy.
     kospi_beta: float = 1.0  # KOSPI move per unit of HL KR200 (KOSPI 200 perp) move.
+    kospi_beta_dynamic: bool = True  # fit the KR200 → KOSPI coefficient from the bot's own after-hours record (KOSPI_BETA is the prior; 1.117.0)
     holidays: dict[str, frozenset] = field(default_factory=dict)  # market -> non-trading weekdays
     hk_half_days: frozenset = frozenset()  # HKEX half days (close 12:10, futures 12:30, no night session)
     kr_late_days: frozenset = frozenset()  # KRX days that run one hour late (CSAT day: 10:00–16:30)
@@ -904,6 +905,7 @@ class Config:
             a50_beta=parse_beta(e.get("A50_BETA", "0.8")),
             a50_beta_dynamic=e.get("A50_BETA_DYNAMIC", "on").strip().lower() not in {"off", "0", "false", "no"},
             kospi_beta=parse_beta(e.get("KOSPI_BETA", "1"), "KOSPI_BETA"),
+            kospi_beta_dynamic=e.get("KOSPI_BETA_DYNAMIC", "on").strip().lower() not in {"off", "0", "false", "no"},
             holidays=holidays,
             hk_half_days=parse_dates(e.get("HK_HALF_DAYS", DEFAULT_SPECIAL_DAYS["HK_HALF"]), "HK_HALF_DAYS"),
             kr_late_days=parse_dates(e.get("KR_LATE_DAYS", DEFAULT_SPECIAL_DAYS["KR_LATE"]), "KR_LATE_DAYS"),
@@ -4411,7 +4413,14 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
         lines.append("  校准：" + "；".join(bins) + "；区间按日数算，窄到能分辨几个点的差别之前，别把小数点后的优势当真")
         lines.extend(residual_lines(done))
         factor, factor_days = residual_factor(done)
-        lines.append(f"  σ 校准系数：×{factor:.2f}（按 {factor_days} 日残差，先验 {RESIDUAL_PRIOR_DAYS} 日按 1 计，限 0.7～1.4；SIGMA_CALIB 开着时卡片按它定价）")
+        lines.append(f"  σ 校准系数：×{factor:.2f}（按 {factor_days} 日残差，先验 {RESIDUAL_PRIOR_DAYS} 日按 1 计，限 {RESIDUAL_RANGE[0]:g}～{RESIDUAL_RANGE[1]:g}；"
+                     "SIGMA_CALIB 开着时卡片按它定价）")
+        if mode == "盘中":  # 1.117.0: the σ the card priced with (the opening gap taken out, before any factor) against what the residuals ask for
+            raw_rows = [r for r in done if float(r.get("sigma_raw") or r.get("sigma") or 0) > 0 and r.get("R") and float(r["R"]) > 0]
+            rms, _ = residual_rms(done)
+            if raw_rows and rms > 0:
+                sigma_in = sum(float(r.get("sigma_raw") or r["sigma"]) for r in raw_rows) / len(raw_rows)
+                lines.append(f"  现用盘中 σ 均值 {sigma_in * 100:.2f}%/日（已扣开盘跳空，校准前），按残差均方根应为 {sigma_in * rms * 100:.2f}%")
         if len(days) >= CALIB_MIN_DAYS + 5:
             # the factor walked forward by target day, each day priced on the days before it, against the same formula unscaled
             base, scaled, hits = [], [], []
@@ -4460,19 +4469,18 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
 CALIB_BUCKETS = ((0.0, 0.25, "R<0.25"), (0.25, 0.5, "0.25–0.5"), (0.5, 1.0, "0.5–1"), (1.0, math.inf, "R≥1"))
 
 
-RESIDUAL_PRIOR_DAYS = 20       # residual_factor: days' worth of "σ is right" the measured residuals are averaged with
-RESIDUAL_RANGE = (0.7, 1.4)
+RESIDUAL_PRIOR_DAYS = 10       # residual_factor: days' worth of "σ is right" the measured residuals are averaged with (20 before 1.117.0)
+RESIDUAL_RANGE = (0.6, 2.0)    # ...and the factor's bounds (0.7–1.4 before 1.117.0: the SSE intraday residuals' 1.59 sat on the cap)
 
 
-def residual_factor(done: list[dict], prior_days: int = RESIDUAL_PRIOR_DAYS) -> tuple[float, int]:
-    """The factor an index card's σ should be scaled by on its scored snapshots (SIGMA_CALIB, 1.106.1), and the days it
-    rests on: the day-weighted RMS of the standardised residuals z = (y − β·move) / (raw σ·√R) — the raw σ, before any
-    factor the snapshot's σ already carried — pooled with ``prior_days`` days at 1, kept within RESIDUAL_RANGE. (1, 0)
-    without a scored snapshot."""
+def residual_rms(done: list[dict]) -> tuple[float, int]:
+    """The day-weighted root mean square of the standardised residuals z = (y − β·move) / (raw σ·√R) of scored snapshots
+    — the raw σ, before any factor the snapshot's σ already carried; each target day one unit of weight — and the days
+    behind it. (0, 0) without a scored snapshot."""
     rows = [r for r in done if r.get("y") is not None and r.get("R") and float(r["R"]) > 0
             and float(r.get("sigma_raw") or r.get("sigma") or 0) > 0]
     if not rows:
-        return 1.0, 0
+        return 0.0, 0
     per_day: dict[str, int] = {}
     for r in rows:
         per_day[r["target"]] = per_day.get(r["target"], 0) + 1
@@ -4482,7 +4490,17 @@ def residual_factor(done: list[dict], prior_days: int = RESIDUAL_PRIOR_DAYS) -> 
         z = (float(r["y"]) - float(r.get("beta") or 1.0) * float(r.get("move") or 0.0)) / (sigma * math.sqrt(float(r["R"])))
         total += z * z / per_day[r["target"]]
     days = len(per_day)
-    factor = math.sqrt((total + prior_days) / (days + prior_days))
+    return math.sqrt(total / days), days
+
+
+def residual_factor(done: list[dict], prior_days: int = RESIDUAL_PRIOR_DAYS) -> tuple[float, int]:
+    """The factor an index card's σ should be scaled by on its scored snapshots (SIGMA_CALIB, 1.106.1), and the days it
+    rests on: residual_rms pooled with ``prior_days`` days at 1, kept within RESIDUAL_RANGE. (1, 0) without a scored
+    snapshot."""
+    rms, days = residual_rms(done)
+    if not days:
+        return 1.0, 0
+    factor = math.sqrt((rms * rms * days + prior_days) / (days + prior_days))
     return min(max(factor, RESIDUAL_RANGE[0]), RESIDUAL_RANGE[1]), days
 
 
@@ -14993,7 +15011,8 @@ class Bot:
         return close.close_ms if close else 0
 
     def proxy_beta(self, key: str, prior: float, now_ms: int) -> tuple[float, str]:
-        """The after-hours proxy coefficient for ``key`` ("SSE": A50 → Composite) and how it was obtained.
+        """The after-hours proxy coefficient for ``key`` ("SSE": A50 → Composite; "KOSPI": HL KR200 → KOSPI, 1.117.0) and
+        how it was obtained.
 
         The slope b of ln(close / reference close) on the proxy's log move since that close, fitted (fit_proxy: every
         target day weighted once) on the bot's own after-hours snapshots of the last BETA_WINDOW_DAYS days whose close
@@ -15457,12 +15476,15 @@ class Bot:
             return f"缺少 HL KR200 在 {quoted_day.strftime('%m-%d')} 15:30 的同源锚点{why}；暂不输出概率"
         base, base_note = anchor[1], "收盘时刻" if self.kospi_anchor_note == "15:30 一分钟K" else self.kospi_anchor_note
         price, kind = kr200_price(hl)
-        beta = self.config.kospi_beta
+        if self.config.kospi_beta_dynamic:  # 1.117.0: the slope of the bot's own after-hours record, blended with KOSPI_BETA (as the A50 proxy's)
+            beta, beta_note = self.proxy_beta("KOSPI", self.config.kospi_beta, now_ms)
+        else:
+            beta, beta_note = self.config.kospi_beta, f"β {self.config.kospi_beta:g}（KOSPI_BETA 固定）"
         ref, ref_note = self.kospi_ref(quoted_day, k.last)
         effective = ref * D(str(math.exp(beta * math.log(float(price / base)))))
         return close_odds("KOSPI", ref, effective, sigma, remaining, target, D("0.01"), ref_note,
-                          f"HL KR200 {kind} {fmt(price)} / {base_note} {fmt(base)} → {percent(price, base):+.3f}%"
-                          + (f" × β {beta:g}" if beta != 1 else "") + "（KOSPI200 代理）", sigma_note, beta=beta, mode="盘后", sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
+                          f"HL KR200 {kind} {fmt(price)} / {base_note} {fmt(base)} → {percent(price, base):+.3f}% × {beta_note}（KOSPI200 代理）",
+                          sigma_note, beta=beta, mode="盘后", sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
 
     @staticmethod
     def odds_row(odds: CloseOdds | str | None, label: str = "") -> str:
