@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.114.0"
+VERSION = "1.114.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -11711,7 +11711,7 @@ a{color:var(--best)}.mut{color:var(--muted)}.small{font-size:12.5px}.warn{color:
 .box p{margin:4px 0}
 .tbl{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
 table{border-collapse:collapse;font-size:12.5px;width:100%;font-variant-numeric:tabular-nums}
-.tbl tr.sub td{color:var(--muted)}.tbl tr.sub td:first-child{padding-left:22px}.tbl tr.all td{font-weight:700;border-top:2px solid var(--line)}.tbl tr.dayrow td{cursor:pointer}.tbl tr.dayrow td:first-child{font-weight:600}.tbl tr.dayrow.open td{background:var(--chip)}#s-detail{margin-top:10px}#s-detail .day{margin:6px 2px}#scat{font-weight:400;margin-left:4px}
+.tbl tr.sub td{color:var(--muted)}.tbl tr.sub td:first-child{padding-left:22px}.tbl tr.all td{font-weight:700;border-top:2px solid var(--line)}.tbl tr.dayrow td{cursor:pointer}.tbl tr.dayrow td:first-child{font-weight:600}.tbl tr.dayrow.open td{background:var(--chip)}#s-detail{margin-top:10px}#s-detail .day{margin:6px 2px}.tbl tr.rec td{cursor:pointer}.tbl tr.rec.open td{background:var(--chip)}.tbl tr.det>td{white-space:normal;padding:0;background:var(--chip)}.tbl tr.det:hover td{background:var(--chip)}#scat{font-weight:400;margin-left:4px}
 td,th{border-bottom:1px solid var(--line2);padding:6px 10px;text-align:left;vertical-align:top;white-space:nowrap}
 th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;background:var(--chip)}tr:last-child td{border-bottom:0}tr:hover td{background:var(--chip)}td.wrap{white-space:normal;min-width:160px}
 .filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:12px 0 8px}
@@ -11970,10 +11970,30 @@ function cardDetail(ct){  // under 今日按市场: the opened card's records of
   else{const ts=c.rows.trades||[],show=ts.filter(t=>t.status==="settled"||t.status==="filled"||t.status==="resting"),rest=ts.length-show.length;
     const line=$("div","day");line.append(dayLine(ts));kids.push(line);
     if(c.error)kids.push($("p","small bad","刷新失败："+c.error+"，下面是上一次读到的"));
-    kids.push($("p","small mut","每笔的盈亏 = (结算价 − 买价) × 份数，合计就是上表这一行的盈亏；标记写结果的确认状态（预结算 / 已确认 / 结果不一致）。点一笔看完整记录。"
+    kids.push($("p","small mut","盈亏 = (结算价 − 买价) × 份数，合计就是上表这一行的盈亏；状态是结果的确认情况（预结算 / 已确认 / 结果不一致）。点一行看完整记录。"
       +(rest?"另有 "+rest+" 笔未成交 / 撤单的没有列出（点“在下面列表里筛选这个市场”看）。":"")));
-    const list=$("div","list");show.forEach(t=>list.append(row(t)));if(!show.length)list.append($("p","small mut","今天还没有成交、持仓或挂单"));kids.push(list)}
+    kids.push(show.length?recTable(name,show):$("p","small mut","今天还没有成交、持仓或挂单"))}
   el.replaceChildren(...kids)}
+function recTable(name,ts){  // the card's records as one compact table (1.114.1): by market (a 15-minute card's windows, the newest first), a subtotal per market when there are several, a total at the end; a row opens the record
+  const sub=t=>{const it=t.item||"",s=it.startsWith(name)?it.slice(name.length).replace(/^[\s｜|·]+/,""):it;return s||it||"—"};  // the item less the card's name (a window, a day); the whole item when nothing is left
+  const groups=[],by=new Map();ts.forEach(t=>{const k=t.item||"";if(!by.has(k)){by.set(k,[]);groups.push(k)}by.get(k).push(t)});
+  const w=$("div","tbl"),tb=$("table"),h=$("tr");["市场","时间","方向","价格","份数","成本","结果","盈亏","状态","订单号"].forEach(x=>h.append($("th","",x)));tb.append(h);
+  const cell=(v,cls)=>{const c=$("td",cls||"");c.append(...(Array.isArray(v)?v:[v instanceof Node?v:String(v??"—")]));return c};
+  const res=t=>t.status==="settled"?(t.payout===1?"赢":t.payout===0?"输":"平 "+t.payout):t.status==="filled"?"持仓"+(t.mark!=null?" @ "+cent(t.mark):""):"挂单中";
+  const pl=t=>t.pnl!=null?pn(t.pnl):t.unrealized!=null?["浮动 ",pn(t.unrealized)]:"—";
+  const st=t=>t.status==="settled"?badge(t):$("span","badge"+(t.status==="filled"?" pre":""),t.status==="filled"?"持仓":"挂单中");
+  const stat=rows=>{const done=rows.filter(t=>t.pnl!=null),filled=rows.filter(t=>t.shares>0),marked=rows.filter(t=>t.unrealized!=null);
+    return{n:rows.length,done,shares:filled.reduce((a,t)=>a+t.shares,0),cost:filled.reduce((a,t)=>a+t.shares*t.price,0),pnl:done.reduce((a,t)=>a+t.pnl,0),
+      wins:done.filter(t=>t.payout===1).length,losses:done.filter(t=>t.payout===0).length,marked,unr:marked.reduce((a,t)=>a+t.unrealized,0)}};
+  const sumRow=(label,s,cls)=>{const tr=$("tr",cls);tr.append(cell(label),cell(s.n+" 笔"),cell(""),cell(""),cell(s.shares?num(s.shares):"—"),cell(s.cost?usd(s.cost):"—"),
+    cell(s.done.length?"赢 "+s.wins+" 输 "+s.losses:"—"),cell(s.done.length?pn(s.pnl):"—"),cell(s.marked.length?["浮动 ",pn(s.unr)]:""),cell(""));return tr};
+  groups.forEach(k=>{const rows=by.get(k);rows.forEach(t=>{const open=openId===t.id,tr=$("tr","rec"+(open?" open":""));tr.title=[t.text,t.wait].filter(Boolean).join("；");
+      tr.append(cell(sub(t)),cell(hm(t.opened)),cell(t.label+(t.deep?" · 低价挂单":"")+(data.live&&!t.real?" · 模拟":"")),cell(cent(t.price)),
+        cell(num(t.shares)+(t.maker&&t.shares<t.order?"/"+num(t.order):"")),cell(t.shares>0?usd(t.shares*t.price):"—"),cell(res(t)),cell(pl(t)),cell(st(t)),cell(t.order_id?"#"+t.order_id:"—"));
+      tr.addEventListener("click",()=>{openId=open?"":t.id;history.replaceState(null,"",openId?"#"+encodeURIComponent(openId):location.pathname);render()});tb.append(tr);
+      if(open){const d=$("tr","det"),td=$("td","wrap");td.colSpan=10;td.append(detailBox(t));d.append(td);tb.append(d)}});
+    if(groups.length>1)tb.append(sumRow("小计",stat(rows),"sub"))});
+  tb.append(sumRow("合计",stat(ts),"all"));w.append(tb);return w}
 async function loadCardRows(name){const key=cardKey(name),at=okAt;if(loadCardRows.busy===key)return;loadCardRows.busy=key;
   const q=["rows=1","day=today","card="+encodeURIComponent(name)];if(kindF!=="all")q.push("kind="+encodeURIComponent(kindF));if(wayF!=="all")q.push("way="+encodeURIComponent(wayF));
   try{const k=ctlKey();const r=await fetch(base+"/journal.json?"+q.join("&"),{cache:"no-store",headers:k?{"X-Control-Key":k}:{}});if(!r.ok)throw new Error("HTTP "+r.status);cardRows[key]={at,rows:await r.json()}}

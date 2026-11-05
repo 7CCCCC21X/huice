@@ -114,6 +114,7 @@ async def run():
     assert "sumDays" in m.JOURNAL_PAGE and 'id="scref"' in m.JOURNAL_PAGE and 'id="scat"' in m.JOURNAL_PAGE and "function clock(" in m.JOURNAL_PAGE
     assert 'id="anaref"' in m.JOURNAL_PAGE and 'id="anaat"' in m.JOURNAL_PAGE  # 1.113.1: the 复盘分析 header's refresh button and the time of its data
     assert 'id="s-detail"' in m.JOURNAL_PAGE and "rows=1" in m.JOURNAL_PAGE and "function cardDetail(" in m.JOURNAL_PAGE  # 1.114.0: a card's records under the table
+    assert "function recTable(" in m.JOURNAL_PAGE  # 1.114.1: as one compact table (by market, a subtotal each, a total), a row opening the record
     # 1.81.0: the analysis tables (per underlying, per edge / fair bucket, per session part, the makers, the refused buys), the
     # marks, the summary CSV and the daily report
     hsi_mk = m.SimMarket(HSI_SLUG, "恒生指数", "close", "HSI", 0.70, book([("0.55", "300")], [("0.58", "400")], NOW, HSI_SLUG, "HSI", "101"),
@@ -383,9 +384,24 @@ async def browser_check(bot, data):
         hs_line = page.locator("#s-cards tr.dayrow", has_text="恒生指数")
         assert await hs_line.count() == 1 and (await hs_line.inner_text()).startswith("▸ 恒生指数")
         await hs_line.locator("td").first.click()
-        await page.wait_for_selector("#s-detail .list .tr")
+        await page.wait_for_selector("#s-detail table tr.rec")
         assert (await hs_line.inner_text()).startswith("▾ 恒生指数") and "恒生指数 · 今天的每一笔" in await page.inner_text("#s-detail h3")
-        assert await page.locator("#s-detail .list .tr").count() == 2 and "2 笔" in await page.inner_text("#s-detail .day") and "已结算" in await page.inner_text("#s-detail .day")
+        assert await page.locator("#s-detail tr.rec").count() == 2 and "2 笔" in await page.inner_text("#s-detail .day") and "已结算" in await page.inner_text("#s-detail .day")
+        # 1.114.1: one compact table — the record's market (the day), time, side, price, shares, cost, result, P&L, state, order id;
+        # one market today, so no subtotal; the total line adds the two up to the card's line; a row opens the whole record
+        heads = await page.locator("#s-detail table th").all_inner_texts()
+        assert heads == ["市场", "时间", "方向", "价格", "份数", "成本", "结果", "盈亏", "状态", "订单号"], heads
+        recs = [await r.locator("td").all_inner_texts() for r in await page.locator("#s-detail tr.rec").all()]
+        assert [r[0] for r in recs] == ["恒生指数"] * 2 and {r[2] for r in recs} == {"挂涨", "吃涨"} and all(r[6] == "赢" and r[8] == "已确认" for r in recs), recs  # the item is the card's name here
+        assert await page.locator("#s-detail tr.sub").count() == 0 and await page.locator("#s-detail tr.all").count() == 1
+        total = await page.locator("#s-detail tr.all td").all_inner_texts()
+        assert total[0] == "合计" and total[1] == "2 笔" and total[4] == "400" and total[5] == "$231.52" and total[6] == "赢 2 输 0" and total[7] == "+$168.48", total
+        await page.locator("#s-detail tr.rec").first.locator("td").first.click()
+        det = page.locator("#s-detail tr.det .det")
+        await det.locator("h3").first.wait_for()
+        assert await page.locator("#s-detail tr.det").count() == 1 and "判断依据（下单时）" in await det.locator("h3").first.inner_text()
+        await page.locator("#s-detail tr.rec.open").first.locator("td").first.click()  # the same row again: closed
+        assert await page.locator("#s-detail tr.det").count() == 0 and await page.locator("#list .tr.open").count() == 0
         await page.click("#s-detail button:has-text('收起')")
         assert await page.is_hidden("#s-detail") and (await hs_line.inner_text()).startswith("▸ 恒生指数")
         assert not errors, errors
