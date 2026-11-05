@@ -481,12 +481,17 @@ async def run():
     assert {"kind": "updown", "key": "BTC-15M", "name": bspec.name, "skipped": False} in bbot.sim_catalog(T0 + 6_000)
     # 1.110.0: the line is Chainlink's figure as Predict relays it (the window's start price) once it agrees with the candle; a
     # spot window waits up to 60 s for it before suggesting anything, and a figure 0.1% off holds the card instead
-    # 1.111.1: the category type unknown (GraphQL refused the lookup, as in a region it does not serve): no figure can come — no wait
+    # 1.111.1 / 1.112.0: the figure is waited for only where one can come — REST gave one for this card's kind lately, or
+    # GraphQL (retired) knows the category type; neither: the candle is the line at once
     assert bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("", "") and not bbot.predict.strike_possible(bspec.slug)
-    bbot.predict.types[bspec.slug] = "CryptoUpDownCategory"
+    bbot.predict.strike_seen["btc-updown-15m"] = time.monotonic()
     assert bbot.predict.strike_possible(bspec.slug)
     assert bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("等 Predict 公布这个窗口的起点价（最多 20 秒）", "") and bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 21_000) == ("", "")
     assert card.STRIKE_WAIT_MS == 0 and btc.STRIKE_WAIT_MS == 20_000
+    bbot.predict.strike_seen["btc-updown-15m"] = time.monotonic() - 90_000  # a day without one: not expected any more
+    assert bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("", "") and not bbot.predict.strike_possible(bspec.slug)
+    bbot.predict.types[bspec.slug] = "CryptoUpDownCategory"  # GraphQL would know the type (where it still answers)
+    assert bbot.predict.strike_possible(bspec.slug) and bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000)[0].startswith("等 Predict 公布")
     bbot.predict.graphql_until = time.monotonic() + 600  # paused after a 403: no wait either
     assert bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("", "") and not bbot.predict.strike_possible(bspec.slug)
     bbot.predict.graphql_until = 0.0
@@ -507,12 +512,15 @@ async def run():
     async def fake_details(mid): return {"outcomes": ["Up", "Down"], "created_ms": T0 - 900_000, "start_price": D("100000.50"), "status": "OPEN", "fee_bps": 200,
                                          "resolved": None, "price_fields": {"startPrice": "100000.5"}, "rules": "", "question": "", "trading_status": "TRADING"}
     async def fake_strike(slug, mid, eager=False): return D("100000.50")
-    bbot.predict.resolve, bbot.predict.market_details, bbot.predict.strike = fake_resolve, fake_details, fake_strike
+    async def fake_fetch(url, payload=None): return {"id": "c", "slug": bspec.slug, "markets": [{"id": "55", "marketData": {"marketId": "55", "startPrice": "100000.5"}}]}
+    bbot.predict.resolve, bbot.predict.market_details, bbot.predict.strike, bbot.predict.fetch = fake_resolve, fake_details, fake_strike, fake_fetch
     bbot.predict.types[bspec.slug] = "CryptoUpDownCategory"
     said = await bbot.cmd_market(m.Request("/market", ["btc15分涨跌"], 1, 0, 42))
     assert said.split("\n") == [f"🔎 {bspec.slug}（BTC-15M）", "市场 #55：BTC 涨或跌 15分；类别类型 CryptoUpDownCategory",
                                  f"结果名称 Up、Down；状态 OPEN / TRADING；创建 {m.stamp(T0 - 900_000, seconds=False)}；手续费 200 bps",
-                                 "详情里和价格有关的字段：startPrice=100000.5", "Predict 起点价（startPrice）：100,000.5000",
+                                 "详情里和价格有关的字段：startPrice=100000.5",
+                                 "类别 REST 里和价格有关的字段：markets[0].marketData.startPrice=100000.5", "GraphQL 可用",  # 1.112.0
+                                 "Predict 起点价（startPrice）：100,000.5000",
                                  "卡片：起点 K 线 100,000.0000；定价用的起点 100,000.5000（Predict 起点价）；两者差 +0.001%"], said
     assert (await bbot.cmd_market(m.Request("/market", [], 1, 0, 42))).startswith("用法：/market ") and "没有名字含" in await bbot.cmd_market(m.Request("/market", ["没有这个"], 1, 0, 42))
     btc.strike = None

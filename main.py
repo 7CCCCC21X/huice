@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.111.1"
+VERSION = "1.112.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -624,6 +624,7 @@ class Config:
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
+    predict_graphql: bool = True  # PREDICT_GRAPHQL: ask graphql.predict.fun at all (the category lookup, the start price); off = REST alone (1.112.0)
     predict_poll: int = 10   # seconds between orderbook refreshes (PREDICT_POLL_SECONDS)
     predict_ws: bool = True  # PREDICT_WS: Predict's WebSocket beside the REST rounds, the hot markets' books pushed as they change (PredictStream); off = REST only
     predict_cold_poll: int = 30  # ...for the markets nothing is near on (PREDICT_COLD_POLL_SECONDS; under PREDICT_STALE_MS; 1.94.1: 30, was 60)
@@ -827,6 +828,7 @@ class Config:
             predict=e.get("PREDICT", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
+            predict_graphql=not off(e.get("PREDICT_GRAPHQL", "on")),
             predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 10, 1, 3600),
             predict_ws=e.get("PREDICT_WS", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict_cold_poll=bounded_int(e, "PREDICT_COLD_POLL_SECONDS", 30, 3, 80),
@@ -4751,6 +4753,60 @@ def market_start_price(market: Any) -> D | None:
     return None
 
 
+PRICE_FIELDS = ("startPrice", "priceToBeat", "targetPrice", "strikePrice", "referencePrice")
+
+
+def json_start_price(data: Any, market_id: str) -> D | None:
+    """The start price a JSON answer (a REST category, 1.112.0) carries for market ``market_id``: a PRICE_FIELDS value in a
+    record naming that market (marketId, or the id of a market record it sits in), else the one such value when the
+    answer holds a single one; None otherwise (none, or several markets' figures without a name)."""
+    found: list[tuple[str, D]] = []
+
+    def walk(node: Any, depth: int, owner: str) -> None:
+        if depth > 8:
+            return
+        if isinstance(node, dict):
+            mine = str(node.get("marketId") or node.get("market_id") or node.get("id") or owner or "")
+            for key in PRICE_FIELDS:
+                value = node.get(key)
+                if value in (None, "", 0, False):
+                    continue
+                with contextlib.suppress(decimal.InvalidOperation, ValueError, TypeError):
+                    price = D(str(value))
+                    if price.is_finite() and price > 0:
+                        found.append((mine, price))
+            for value in node.values():
+                walk(value, depth + 1, mine)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, depth + 1, owner)
+    walk(data, 0, "")
+    for owner, price in found:
+        if owner == str(market_id):
+            return price
+    return found[0][1] if len({price for _, price in found}) == 1 else None
+
+
+def json_price_fields(data: Any, limit: int = 20) -> list[str]:
+    """The price-like scalars anywhere in a JSON answer, as "path.key=value" (/market: what a record carries, under whichever name)."""
+    out: list[str] = []
+
+    def walk(node: Any, path: str, depth: int) -> None:
+        if depth > 8 or len(out) >= limit:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, (int, float, str)) and not isinstance(value, bool) and re.search(r"price|start|strike|target|reference", str(key), re.I):
+                    out.append(f"{path + '.' if path else ''}{key}={value}")
+                else:
+                    walk(value, f"{path}.{key}" if path else str(key), depth + 1)
+        elif isinstance(node, list):
+            for index, value in enumerate(node[:10]):
+                walk(value, f"{path}[{index}]", depth + 1)
+    walk(data, "", 0)
+    return out
+
+
 def predict_markets(data: Any) -> list[dict]:
     """Market records ({id, conditionId, title}) anywhere in a GraphQL / REST answer."""
     found: list[dict] = []
@@ -5129,6 +5185,8 @@ class PredictFeed:
         self.types: dict[str, str] = {}                          # slug -> GraphQL category type
         self.strikes: dict[str, tuple[D | None, float]] = {}     # slug -> (target price shown on the site, when)
         self.no_strike: set[str] = set()                         # category types without marketData.startPrice
+        self.category_raw: dict[str, tuple[Any, float]] = {}    # slug -> (the REST category answer, when): the start price may sit in it (1.112.0)
+        self.strike_seen: dict[str, float] = {}                 # slug stem -> when REST last gave a start price for a market of the kind (strike_possible)
         self.graphql_until = 0.0                                 # monotonic: after a 403 from GraphQL, no GraphQL request before this
         self.graphql_error = ""                                  # the refusal
         self.info: dict[str, dict] = {}                          # slug -> {"outcomes": [...], "created_ms": int}
@@ -5184,6 +5242,8 @@ class PredictFeed:
         """A GraphQL query; refused outright (403: a region the endpoint does not serve, 1.104.1) it is not asked again for
         PREDICT_GRAPHQL_PAUSE_SECONDS — the market lists come from REST meanwhile, as they did after each refusal, without
         the refused request first."""
+        if not self.config.predict_graphql:
+            raise RemoteError("Predict GraphQL 已关闭（PREDICT_GRAPHQL=off）")
         left = self.graphql_until - time.monotonic()
         if left > 0:
             raise RemoteError(f"Predict GraphQL 已暂停（{self.graphql_error}；{int(left) + 1} 秒后再试）")
@@ -5202,10 +5262,13 @@ class PredictFeed:
         has the field, and GraphQL is not paused (1.111.1: in a region the endpoint refuses, the type is never learnt and
         the market's REST details carry no price — a card waiting for the figure would wait for nothing)."""
         kind = self.types.get(slug, "")
-        return bool(kind) and kind not in self.no_strike and self.graphql_until - time.monotonic() <= 0
+        via_graphql = self.config.predict_graphql and bool(kind) and kind not in self.no_strike and self.graphql_until - time.monotonic() <= 0
+        return via_graphql or time.monotonic() - self.strike_seen.get(slug.rsplit("-", 1)[0], -1e18) < 86_400  # REST gave one lately: it comes
 
     def graphql_note(self) -> str:
-        """The pause, for /diag: "" while GraphQL is asked."""
+        """The pause (or the switch), for /diag: "" while GraphQL is asked."""
+        if not self.config.predict_graphql:
+            return "GraphQL 已关闭（PREDICT_GRAPHQL=off）：市场列表和起点价都走 REST"
         left = self.graphql_until - time.monotonic()
         if left <= 0:
             return ""
@@ -5248,23 +5311,26 @@ class PredictFeed:
         [] = not listed; network trouble raises (and is not cached as "not listed")."""
         found: list[dict] = []
         errors = []  # only failures that leave the answer unknown; "no such category" is an answer
-        try:
-            data = await self.graphql("query($id: ID!) { category(id: $id) { id __typename } }", {"id": slug})
-            category = (data or {}).get("category") or {}
-            if re.fullmatch(r"[A-Za-z_]\w*", str(category.get("__typename") or "")):
-                self.types[slug] = category["__typename"]
-            if category.get("id") is not None:
-                data = await self.graphql(
-                    f"query($f: MarketFilterInput!) {{ markets(filter: $f, pagination: {{ first: {PREDICT_MARKETS_PAGE} }}) "
-                    "{ edges { node { id conditionId title question } } } }", {"f": {"categoryId": str(category["id"])}})
-                found = predict_markets(data)
-        except (RemoteError, TimeoutError, OSError) as error:
-            errors.append(clean_error(error))
+        if self.config.predict_graphql:  # (off: REST alone, 1.112.0 — Predict retired the endpoint for some regions, then for all)
+            try:
+                data = await self.graphql("query($id: ID!) { category(id: $id) { id __typename } }", {"id": slug})
+                category = (data or {}).get("category") or {}
+                if re.fullmatch(r"[A-Za-z_]\w*", str(category.get("__typename") or "")):
+                    self.types[slug] = category["__typename"]
+                if category.get("id") is not None:
+                    data = await self.graphql(
+                        f"query($f: MarketFilterInput!) {{ markets(filter: $f, pagination: {{ first: {PREDICT_MARKETS_PAGE} }}) "
+                        "{ edges { node { id conditionId title question } } } }", {"f": {"categoryId": str(category["id"])}})
+                    found = predict_markets(data)
+            except (RemoteError, TimeoutError, OSError) as error:
+                errors.append(clean_error(error))
         if not found or len(found) >= PREDICT_MARKETS_PAGE:
             # nothing from GraphQL — or a full page, which may be the first of several (1.83.0: a category's markets past
             # the twentieth were never seen): the REST category, its markets added to the page's
             try:
-                rest = predict_markets(await self.fetch(f"{PREDICT_REST}/categories/{urllib.parse.quote(slug)}"))
+                raw = await self.fetch(f"{PREDICT_REST}/categories/{urllib.parse.quote(slug)}")
+                self.category_raw[slug] = (raw, time.monotonic())  # kept: the start price may sit in it (strike)
+                rest = predict_markets(raw)
                 merged = {m["id"]: m for m in found}
                 for market in rest:
                     merged.setdefault(market["id"], market)
@@ -5325,6 +5391,19 @@ class PredictFeed:
                     self.no_strike.add(kind)  # schema answer: never ask this type again
             except (TimeoutError, OSError, ValueError, TypeError, decimal.InvalidOperation):
                 pass
+        via_graphql = self.config.predict_graphql and bool(kind) and kind not in self.no_strike and self.graphql_until - time.monotonic() <= 0
+        if value is None and not via_graphql:
+            # the category's REST record (1.112.0: GraphQL retired — the figure Predict's page shows must come from REST): kept
+            # from the lookup, read when missing, and read afresh every PREDICT_STRIKE_EAGER_SECONDS while asked eagerly.
+            # (Where GraphQL still answers for the type, it is the source: no REST read beside it.)
+            raw = self.category_raw.get(slug)
+            if raw is None or (eager and time.monotonic() - raw[1] >= PREDICT_STRIKE_EAGER_SECONDS):
+                with contextlib.suppress(Exception):  # best effort, as the details read below
+                    raw = self.category_raw[slug] = (await self.fetch(f"{PREDICT_REST}/categories/{urllib.parse.quote(slug)}"), time.monotonic())
+            if raw is not None:
+                value = json_start_price(raw[0], market_id)
+                if value is not None:
+                    self.strike_seen[slug.rsplit("-", 1)[0]] = time.monotonic()
         if value is None:  # the market's details (read for the fee every PREDICT_META_SECONDS) may carry it: no request of its own
             meta = self.market_meta.get(str(market_id))
             if eager and (not meta or time.monotonic() - meta[1] >= PREDICT_STRIKE_EAGER_SECONDS):
@@ -5333,6 +5412,7 @@ class PredictFeed:
                     meta = self.market_meta[str(market_id)] = (details, time.monotonic())
             if meta and isinstance(meta[0], dict) and meta[0].get("start_price"):
                 value = meta[0]["start_price"]
+                self.strike_seen[slug.rsplit("-", 1)[0]] = time.monotonic()
         self.strikes[slug] = (value, time.monotonic())
         return value
 
@@ -14529,6 +14609,14 @@ class Bot:
                          + (f"{details['fee_bps']} bps" if details['fee_bps'] is not None else "未写"))
             fields = details.get("price_fields") or {}
             lines.append("详情里和价格有关的字段：" + ("、".join(f"{k}={v}" for k, v in fields.items()) if fields else "没有"))
+        try:  # the category's REST record, afresh: where Predict's page reads the start price from (1.112.0)
+            raw = await self.predict.fetch(f"{PREDICT_REST}/categories/{urllib.parse.quote(slug)}")
+            self.predict.category_raw[slug] = (raw, time.monotonic())
+            found = json_price_fields(raw)
+            lines.append("类别 REST 里和价格有关的字段：" + ("、".join(found[:12]) + ("…" if len(found) > 12 else "") if found else "没有"))
+        except Exception as error:
+            lines.append(f"类别 REST 读取失败：{clean_error(error) or type(error).__name__}")
+        lines.append(self.predict.graphql_note() or "GraphQL 可用")
         self.predict.strikes.pop(slug, None)  # asked afresh
         try:
             strike = await self.predict.strike(slug, mid, eager=True)
@@ -20059,7 +20147,8 @@ class Bot:
                 if not isinstance(data, dict) or "data" not in data:
                     raise ValueError("GraphQL 格式异常")
                 return "GraphQL 正常"
-            probes.append(("Predict", "GraphQL", lambda: self.predict.fetch(PREDICT_GRAPHQL, {"query": "{ __typename }", "variables": {}}), check_gql))
+            if self.config.predict_graphql:  # (PREDICT_GRAPHQL=off: not asked, not probed)
+                probes.append(("Predict", "GraphQL", lambda: self.predict.fetch(PREDICT_GRAPHQL, {"query": "{ __typename }", "variables": {}}), check_gql))
 
         for name, url in FxRates.SOURCES:
             def check_fx(data: Any) -> str:

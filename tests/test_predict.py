@@ -172,12 +172,35 @@ async def run():
             return {"id": "5", "outcomes": [{"name": "Up", "indexSet": 1}, {"name": "Down", "indexSet": 2}], "status": "OPEN", "priceToBeat": shown[0]}
         return {"data": {"category": {"marketData": [{"marketId": "5", "startPrice": None}]}}}
     feed.fetch = late
-    assert await feed.strike(w, "5") is None and await feed.strike(w, "5") is None and hits == ["gql"]  # a miss, cached a minute
+    assert await feed.strike(w, "5") is None and await feed.strike(w, "5") is None and hits == ["gql"]  # a miss, cached a minute (GraphQL answers for the type: no REST category read beside it, 1.112.0)
     assert await feed.strike(w, "5", eager=True) is None and hits == ["gql"]  # within 5 s of the miss: not asked again
     feed.strikes[w] = (None, time.monotonic() - 6)
     assert await feed.strike(w, "5", eager=True) is None and hits[1:] == ["gql", f"{m.PREDICT_REST}/markets/5"]  # asked again, the details read too
     shown[0] = "80300.5"; feed.strikes[w] = (None, time.monotonic() - 6); feed.market_meta.pop("5", None)
     assert await feed.strike(w, "5", eager=True) == D("80300.5") and feed.market_meta["5"][0]["price_fields"] == {"priceToBeat": "80300.5"}
+    # 1.112.0: GraphQL retired (PREDICT_GRAPHQL=off): the markets and the start price come from the REST category alone
+    rcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "SYMBOLS": "UNITREEUSDT", "PREDICT_GRAPHQL": "off"})
+    rfeed = m.PredictFeed(rcfg)
+    rslug, rhits, rprice = "btc-updown-15m-1793873700", [], [None]
+    async def rest_only(url, payload=None):
+        rhits.append(url if payload is None else "gql")
+        assert payload is None, "GraphQL must not be asked"
+        if url.endswith(f"/categories/{rslug}"):
+            return {"id": "c7", "slug": rslug, "markets": [{"id": "7", "conditionId": "0xb", "title": "BTC Up or Down", "question": "Bitcoin Up or Down?",
+                                                             "marketData": {"marketId": "7", "startPrice": rprice[0]}}]}
+        if url.endswith("/markets/7"):
+            return {"id": "7", "outcomes": [{"name": "Up", "indexSet": 1}, {"name": "Down", "indexSet": 2}], "status": "OPEN", "boostStartsAt": "2026-11-05T10:15:00.000Z"}
+        raise AssertionError(url)
+    rfeed.fetch = rest_only
+    assert (await rfeed.resolve(rslug))["id"] == "7" and rhits == [f"{m.PREDICT_REST}/categories/{rslug}"] and rslug not in rfeed.types
+    assert await rfeed.strike(rslug, "7") is None and not rfeed.strike_possible(rslug)  # no figure yet (the window has not started)
+    rprice[0] = "80297.93"; rfeed.strikes[rslug] = (None, time.monotonic() - 6)
+    rfeed.category_raw[rslug] = (rfeed.category_raw[rslug][0], time.monotonic() - 6)  # the copy from the lookup is old: read afresh when asked eagerly
+    assert await rfeed.strike(rslug, "7", eager=True) == D("80297.93") and rfeed.strike_possible(rslug) and "btc-updown-15m" in rfeed.strike_seen
+    assert rfeed.graphql_note() == "GraphQL 已关闭（PREDICT_GRAPHQL=off）：市场列表和起点价都走 REST"
+    assert m.json_start_price({"marketData": [{"marketId": "5", "startPrice": 1}, {"marketId": "6", "startPrice": 2}]}, "6") == D("2")
+    assert m.json_start_price({"a": {"priceToBeat": "3"}}, "9") == D("3") and m.json_start_price({"a": {"priceToBeat": "3"}, "b": {"startPrice": 4}}, "9") is None
+    assert m.json_price_fields({"id": "c", "markets": [{"id": "7", "marketData": {"startPrice": 1, "volume": 2}}]}) == ["markets[0].marketData.startPrice=1"]
     # the odds are measured against it; a proxy-mapped estimate moves with it, a live print does not
     kcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT"})
     kbot = m.Bot(kcfg, m.Store(":memory:"), FakeMarket(), tg)
