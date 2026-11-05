@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.107.4"
+VERSION = "1.108.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -189,6 +189,14 @@ def parse_clock(env: dict[str, str], key: str, default: str) -> str:
     if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
         raise ValueError(f"{key} 应为 HH:MM（北京时间）或 off")
     return f"{int(match.group(1)):02d}:{match.group(2)}"
+
+
+def parse_choice(e: Mapping, key: str, default: str, allowed: tuple[str, ...]) -> str:
+    """A setting that is one of a few words, case aside; empty = the default."""
+    value = str(e.get(key, default) or default).strip().lower() or default
+    if value not in allowed:
+        raise ValueError(f"{key} 只能是 " + "、".join(allowed) + f"：{value}")
+    return value
 
 
 def parse_bounded(env: dict[str, str], key: str, default: str, low: float, high: float) -> float:
@@ -489,6 +497,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
     ("SIGMA_CALIB", "σ 自动校准", "开 = 卡片的 σ 乘以按实际结果算出的系数（限 0.7～1.4，和 20 个“刚好是 1”的先验一起平均）：15 分钟涨跌按每张卡的定时样本，加密日涨跌三张卡合并按定时样本，指数日涨跌按 /calib 的快照残差、盘中和盘后各算；关 = 只用估计值"),
+    ("LEAD_QUOTE", "交易所现价先行（15 分钟涨跌）", "on = 卡片的现价按标的交易所的实时成交价相对窗口起点的涨跌折算（币安指数比交易所慢几秒到一分钟：卖涨给你的人先看到了下跌），和指数差超过 1% 或行情 15 秒没读到时退回指数，起点、终点仍按币安指数结算；shadow = 两种定价都记进模型样本、按指数交易，/calib 比较谁更准；off = 只用币安指数"),
     ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限、盘后每边持仓上限、加密日涨跌和 15 分钟涨跌的每边上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
     ("SIM_NO_ODDS_WITHDRAW_MINUTES", "概率暂缺多久撤单（分钟）", "0～1440：卡片的概率暂缺（如上证卡周末 A50 休市、行情断流）或暂不建议持续这么多分钟后，这个市场挂着的单撤掉（低价挂单也撤），概率回来再按新公平价重挂；没有概率时本来就不开新单；0 = 不撤、挂着等"),
@@ -634,6 +643,7 @@ class Config:
     big_move_sigmas: float = 1.5               # PROB_BIG_MOVE_SIGMAS: a daily card's σ ahead is widened once the day's move passes this many daily σ (big_move_widen); 0 = never
     sim_after_hours_max_shares: float = 300.0  # SIM_AFTER_HOURS_MAX_SHARES: after hours a market's side holds at most this many shares (positions and orders); 0 = no limit
     sigma_calib: bool = True      # SIGMA_CALIB: a 15-minute card's σ times the factor its windows' moves imply (Bot.sigma_calib)
+    lead_quote: str = "on"        # LEAD_QUOTE: a 15-minute card priced on its stock's exchange quote (on), recorded only (shadow), or not (off): IndexUpDownMarket.effective
     sim_shares_net: bool = True   # SIM_SHARES_NET: the share caps count a side's net position — what it holds less the other side's fills; off = each side on its own
     sim_open_quiet_minutes: int = 3            # SIM_OPEN_QUIET_MINUTES: no new order on a daily card this long after its underlying opens; 0 = none
     sim_no_odds_withdraw: int = 30             # SIM_NO_ODDS_WITHDRAW_MINUTES: a resting order on a market the bot cannot price (odds missing, suggestion held) this long is withdrawn; 0 = never
@@ -869,6 +879,7 @@ class Config:
             sim_maker_points=not off(e.get("SIM_MAKER_POINTS", "on")),
             sim_shares_net=not off(e.get("SIM_SHARES_NET", "on")),
             sigma_calib=not off(e.get("SIGMA_CALIB", "on")),
+            lead_quote=parse_choice(e, "LEAD_QUOTE", "on", ("on", "shadow", "off")),
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -7367,12 +7378,93 @@ class IndexUpDownMarket(UpDownMarket):
 
     SIGMA_ROWS = 1500            # candles read for σ when the trading minutes are a subset (the previous session's reach back a day)
 
+    # LEAD_QUOTE (1.108.0): the stock's own exchange quote (StockMarket.live_quote, read every second while it trades) leads the
+    # index — the price the odds are taken at is the index at the window's start times the quote's ratio to its own start
+    LEAD_STALE_MS = 15_000            # a quote fetched longer ago than this leads nothing (the poll failed): the index alone
+    LEAD_START_TOLERANCE_MS = 20_000  # the quote taken for the window's start must be from within this of the start moment
+    LEAD_MAX_GAP = 0.01               # an exchange price this far (ln) from the index is another instrument, a currency move: not used
+
     def __init__(self, store: "Store", spec: UpDownSpec, futures: Any = None, exchange: str = "", trading: Any = None):
         super().__init__(store, spec)
         self.futures = futures or binance_futures  # the bot passes its own futures feed (base URL, rate-limit cooldown)
         self.exchange = exchange  # the stock exchange whose session the windows follow ("" = round the clock)
         self.trading = trading    # open_ms -> whether that minute is in the exchange's session (session_minute_fn): σ counts those alone
         self.index_ms = 0  # the newest index's own time (the push's event time, the read's)
+        self.lead: IndexQuote | None = None  # the exchange's realtime quote now (Bot.refresh_updown: note_lead), None when it has none
+        self.lead_mode = "off"               # LEAD_QUOTE: on / shadow / off (the bot sets it; a past window's market stays off)
+        self.lead_code = ""                  # the stock's code at its exchange (000660), for the evidence
+
+    def lead_start(self) -> tuple[D, int] | None:
+        """The exchange price in force at the window's start moment and its time, kept per window (updown:<slug>:lead);
+        None until kept, or when the bot came too late for it (note_lead)."""
+        saved = self.store.get(f"updown:{self.spec.slug}:lead")
+        with contextlib.suppress(TypeError, KeyError, ValueError, decimal.InvalidOperation):
+            if isinstance(saved, dict) and saved.get("price") is not None:
+                return D(str(saved["price"])), int(saved["at"])
+        return None
+
+    def note_lead(self, q: IndexQuote | None, now_ms: int) -> None:
+        """The exchange's quote now (None: the stock not trading, or no fresh quote), and — the first one fetched at or after
+        the window's start moment whose trade is at most LEAD_START_TOLERANCE_MS after it (the price in force then) — the
+        window's start price. A bot that gets its first quote later than that prices the window on the index alone."""
+        self.lead = q
+        if q is None or self.lead_mode == "off" or self.lead_start() is not None:
+            return
+        at = self.spec.start_ms + 60_000  # the start moment: the index candle ending there is the line
+        key = f"updown:{self.spec.slug}:lead"
+        if now_ms < at or self.store.get(key) is not None:
+            return
+        fetched = int(q.fetched_ms or now_ms)
+        quoted = int(q.quoted_ms or fetched)
+        if fetched >= at and quoted - at <= self.LEAD_START_TOLERANCE_MS:
+            self.store.put(key, {"price": str(q.last), "at": quoted, "read_ms": now_ms, "source": q.source})
+        elif now_ms - at > self.LEAD_START_TOLERANCE_MS:
+            self.store.put(key, {"missed": True, "read_ms": now_ms})
+
+    def lead_price(self, now_ms: int) -> tuple[D | None, float, str]:
+        """(the index the exchange quote implies now, its ln gap from the index, why not): the index at the window's start
+        times the quote's ratio to the exchange price at the start — when the quote is fresh (fetched within LEAD_STALE_MS),
+        the start price is kept, and the two agree within LEAD_MAX_GAP. (None, the gap, why) otherwise."""
+        q, line = self.lead, self.close_of("start")
+        if self.lead_mode == "off":
+            return None, 0.0, ""
+        if q is None:
+            return None, 0.0, "交易所没有实时行情"
+        start = self.lead_start()
+        if line is None or start is None:
+            return None, 0.0, "没有窗口起点的交易所价"
+        if now_ms - int(q.fetched_ms or 0) > self.LEAD_STALE_MS:
+            return None, 0.0, f"交易所行情 {(now_ms - int(q.fetched_ms or 0)) // 1000} 秒没读到"
+        if not (q.last > 0 and start[0] > 0 and self.price):
+            return None, 0.0, "交易所价或指数无效"
+        price = line * q.last / start[0]
+        gap = math.log(float(price) / float(self.price))
+        if abs(gap) > self.LEAD_MAX_GAP:
+            return None, gap, f"交易所价折算 {price:,.4f} 与指数 {self.price:,.4f} 差 {gap:+.2%}，不用"
+        return price, gap, ""
+
+    def effective(self, now_ms: int) -> tuple[D | None, str]:
+        """(the price the odds are taken at, a note): under LEAD_QUOTE=on the exchange-led one when it can be had, else the index."""
+        if self.lead_mode == "on":
+            price, gap, _ = self.lead_price(now_ms)
+            if price is not None:
+                return price, f"交易所现价先行 {gap:+.2%}"
+        return self.price, ""
+
+    def lead_text(self, now_ms: int) -> str:
+        """The exchange quote's part in the price now, for the card and the evidence; "" without one."""
+        q = self.lead
+        if q is None or self.lead_mode == "off":
+            return ""
+        price, gap, why = self.lead_price(now_ms)
+        head = f"{q.source} {self.lead_code} 最新价 {q.last:,.2f}（{stamp(q.quoted_ms)}）"
+        if price is None:
+            return f"交易所现价不先行：{head}，{why}"
+        start = self.lead_start()
+        rel = float(q.last / start[0]) - 1 if start and start[0] else 0.0
+        body = f"{head}，相对窗口起点 {start[0]:,.2f} 为 {rel:+.2%}，折算指数 {price:,.4f}，比币安指数 {self.price:,.4f} {gap:+.2%}"
+        return (f"交易所现价先行：{body}；结算仍按币安指数（Chainlink）" if self.lead_mode == "on"
+                else f"交易所现价只记录（LEAD_QUOTE=shadow）：{body}")
 
     async def get(self, path: str, **params: Any) -> Any:
         return await self.futures(path, **params)
@@ -7466,8 +7558,9 @@ class IndexUpDownMarket(UpDownMarket):
         if not self.sigma > 0:
             return "指数在最近的交易时段里没有变动，暂停概率"
         years = (spec.end_ms + 60_000 - now_ms) / YEAR_MS
-        up, flat, down, z = updown_odds(float(self.price), float(line), self.sigma_used, years)
-        return UpDownOdds(up, flat, down, z, line, self.price, years)
+        price, _ = self.effective(now_ms)  # the exchange-led price under LEAD_QUOTE=on, else the index
+        up, flat, down, z = updown_odds(float(price), float(line), self.sigma_used, years)
+        return UpDownOdds(up, flat, down, z, line, price, years)
 
 
 # --- flip market (does one coin trade above another on Hyperliquid within the window?) -------------------------------
@@ -9269,6 +9362,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_MAKER_POINTS": {"kind": "choice", "group": "策略", "options": [["off", "都挂"], ["on", "只挂积分已激活的"]]},
     "SIM_SHARES_NET": {"kind": "choice", "group": "策略", "options": [["on", "按净头寸"], ["off", "每边单独"]]},
     "SIGMA_CALIB": {"kind": "choice", "group": "策略", "options": [["on", "按样本校准"], ["off", "只用估计值"]]},
+    "LEAD_QUOTE": {"kind": "choice", "group": "策略", "options": [["on", "按交易所现价"], ["shadow", "只记录"], ["off", "只用指数"]]},
     "SIM_GROUP_USD": {"kind": "number", "group": "策略", "presets": ["0", "100", "300", "500", "1000"], "unit": "$", "zero": "不限"},
     "LIVE_MAX_ORDER_USD": {"kind": "number", "group": "风控", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
     "LIVE_MAX_OPEN_USD": {"kind": "number", "group": "风控", "presets": ["100", "300", "500", "1000", "3000"], "unit": "$"},
@@ -9860,6 +9954,7 @@ VERSION_KNOBS: dict[str, tuple[str, str, Any]] = {
     "beta_error": ("", "", VERSION_UNRECORDED),
     "big_move": ("PROB_BIG_MOVE_SIGMAS", "", VERSION_UNRECORDED),
     "sigma_calib": ("SIGMA_CALIB", "", VERSION_UNRECORDED),
+    "lead_quote": ("LEAD_QUOTE", "", VERSION_UNRECORDED),
     "sim_taker_session": ("SIM_TAKER_SESSION", "", False),
     "sim_quiet_minutes": ("SIM_QUIET_MINUTES", "", 0.0),
     "sim_maker_min_bid": ("SIM_MAKER_MIN_BID", "", 0.0),
@@ -11476,11 +11571,11 @@ const KINDS={close:"指数/个股日涨跌",touch:"先触价",updown:"加密涨�
 const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参考说明",effective:"有效价",sigma_daily:"σ（日）",sigma_note:"σ 来源",
   remaining:"剩余方差占比",sigma:"σ（剩余）",z:"z",beta:"β",mode:"口径",direct:"直接用现货",proxy_note:"代理换算",target:"目标日",warn:"提示",
   close_ms:"收盘/截止",price:"现价",low:"低线",high:"高线",sigma_ms:"σ 计算时间",deadline_ms:"截止",years:"剩余年数",path:"路径核验",start_ms:"窗口开始",
-  line:"起点",settled:"已结算",start:"起点 K 线",end:"终点 K 线",a:"A 价格",b:"B 价格",ratio:"A/B",window:"窗口",cap:"市值",
+  line:"起点",settled:"已结算",start:"起点 K 线",end:"终点 K 线",index:"币安指数价",lead_price:"交易所现价",lead_source:"交易所行情来源",lead_quoted:"交易所报价时间",lead_start:"交易所起点价",lead_gap:"先行幅度（对指数）",lead_used:"按交易所现价定价",lead_note:"先行说明",a:"A 价格",b:"B 价格",ratio:"A/B",window:"窗口",cap:"市值",
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_crypto_day_shares:"加密日涨跌每笔份数",sim_crypto_day_max_shares:"加密日涨跌每边上限",sim_crypto_day_edge:"加密日涨跌买入门槛",sim_crypto_day_quiet:"加密日涨跌结束前不买（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_floor_shares:"托底单份数",sim_maker_floor:"托底单价格",sim_maker_floor_markets:"托底单只做",sim_maker_follow_settle:"买1 变了多久才改跟（秒）",sigma_calib:"σ 自动校准",sigma_raw:"σ（校准前）",sigma_factor:"σ 校准系数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_deeper:"买1 不够跟买2",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_crypto_day_shares:"加密日涨跌每笔份数",sim_crypto_day_max_shares:"加密日涨跌每边上限",sim_crypto_day_edge:"加密日涨跌买入门槛",sim_crypto_day_quiet:"加密日涨跌结束前不买（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_floor_shares:"托底单份数",sim_maker_floor:"托底单价格",sim_maker_floor_markets:"托底单只做",sim_maker_follow_settle:"买1 变了多久才改跟（秒）",sigma_calib:"σ 自动校准",lead_quote:"交易所现价先行",sigma_raw:"σ（校准前）",sigma_factor:"σ 校准系数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_deeper:"买1 不够跟买2",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
   sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_taker_hold:"吃单前优势保持（秒）",sim_taker_hold_range:"价格阶梯吃单前优势保持（秒）",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",sim_no_odds_withdraw:"概率暂缺撤单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
   min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",big_move:"大波动日放宽 σ（倍日 σ）",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
@@ -13092,6 +13187,9 @@ class Bot:
         for card in (*self.touches.values(), *self.updowns.values()):
             if isinstance(card, IndexUpDownMarket):
                 self.index_markets.setdefault(card.spec.symbol, []).append(card)
+                ticker = config.tickers.get(card.spec.symbol)  # LEAD_QUOTE: the stock's exchange quote (StockMarket.live_quote) leads the index
+                card.lead_code = ticker.code if ticker is not None else ""
+                card.lead_mode = config.lead_quote if ticker is not None else "off"
                 continue
             self.pair_markets.setdefault(("spot", card.spec.symbol), []).append(card)
         for rm in self.ranges.values():
@@ -13979,6 +14077,11 @@ class Bot:
             row.update(up=odds.fair_up, sigma=mkt.sigma_used, sigma_raw=mkt.sigma, calib=calib[0], tau=odds.years, z=odds.z, price=float(odds.price),
                        line=float(odds.line), need=self.edge_need(mkt.model_swing(odds)), hold=self.updown_hold(mkt, odds, now_ms)[0], settled=odds.settled,
                        model=getattr(mkt, "SIGMA_MODEL", 1))  # the estimator's version: the calibration counts the current one's samples alone
+            if isinstance(mkt, IndexUpDownMarket) and not odds.settled and mkt.price and mkt.sigma_used:
+                led, gap, _ = mkt.lead_price(now_ms)  # LEAD_QUOTE: both prices' fair values, whichever the card trades on (window_report compares)
+                if led is not None:
+                    fair = lambda p: UpDownOdds(*updown_odds(float(p), float(odds.line), mkt.sigma_used, odds.years), odds.line, p, odds.years).fair_up
+                    row.update(up_index=fair(mkt.price), up_lead=fair(led), lead_gap=gap, lead_used=mkt.lead_mode == "on")
         else:
             line = mkt.close_of("start")
             row.update(note=odds, line=float(line) if line is not None else None)
@@ -14105,6 +14208,15 @@ class Bot:
                     bins.append(f"模型 {lo * 100:.0f}–{(lo + 0.2) * 100:.0f}¢ 的 {len(sel)} 条实际涨 {sum(r['result'] for r in sel) / len(sel):.0%}")
             if bins:
                 lines.append("    校准：" + "；".join(bins))
+            both = [r for r in done if r.get("up_index") is not None and r.get("up_lead") is not None]
+            if both:  # LEAD_QUOTE: the same samples priced on the index and on the exchange quote — which came closer
+                bi, _ = brier_scores([r["up_index"] for r in both], [r["result"] for r in both])
+                bl, _ = brier_scores([r["up_lead"] for r in both], [r["result"] for r in both])
+                closer = sum(abs(r["up_lead"] - r["result"]) < abs(r["up_index"] - r["result"]) for r in both) / len(both)
+                used = sum(bool(r.get("lead_used")) for r in both)
+                lines.append(f"    交易所现价先行：{len(both)} 条样本两种定价都有｜Brier 按指数 {bi:.3f}、按交易所现价 {bl:.3f}，先行更准的占 {closer:.0%}，"
+                             f"先行幅度平均 {sum(abs(float(r.get('lead_gap') or 0)) for r in both) / len(both):.2%}"
+                             f"（{used} 条按先行定价{'，其余只记录' if used < len(both) else ''}；两者差 0.01 以内多半是运气）")
             firsts: dict[str, dict] = {}  # each market's earliest sample with a move: the σ it was priced with at the start
             for r in items:
                 if r.get("move") is not None and r.get("sigma") and r.get("tau") and (r["slug"] not in firsts or r["left"] > firsts[r["slug"]]["left"]):
@@ -14129,7 +14241,7 @@ class Bot:
 
     WSAMPLE_COLUMNS = ("time", "card", "kind", "market", "window_start", "window_end", "left_s", "fair_up", "market_mid", "bid", "ask", "book_age_s",
                        "sigma_annual", "tau_years", "sigma_sqrt_tau", "z_model", "price", "line", "need", "hold", "note",
-                       "result_up", "final", "move_ln", "realized_z")
+                       "result_up", "final", "move_ln", "realized_z", "up_index", "up_lead", "lead_gap", "lead_used")
 
     def window_csv(self) -> str:
         """Every sample as a CSV (a BOM for Excel; /samples, samples.csv): one row a sample, the result columns empty while
@@ -14146,7 +14258,9 @@ class Bot:
                              r.get("left", ""), num(r.get("up")), num(r.get("mkt")), num(r.get("bid")), num(r.get("ask")), num(r.get("book_age")),
                              num(r.get("sigma")), num(r.get("tau")), num(st) if st else "", num(r.get("z")), num(r.get("price")), num(r.get("line")),
                              num(r.get("need")), r.get("hold", ""), r.get("note", ""), num(r.get("result")), num(r.get("final")), num(r.get("move")),
-                             num(r["move"] / st) if r.get("move") is not None and st > 0 else ""])
+                             num(r["move"] / st) if r.get("move") is not None and st > 0 else "",
+                             num(r.get("up_index")), num(r.get("up_lead")), num(r.get("lead_gap")),
+                             "" if r.get("lead_used") is None else int(bool(r.get("lead_used")))])
         return out.getvalue()
 
     async def cmd_samples(self, req: Request) -> Any:
@@ -15313,13 +15427,15 @@ class Bot:
         calib_note = f"，按 {calib[1]} 个窗口的实际波动校准 ×{calib[0]:.2f}" if calib[1] and abs(calib[0] - 1) > 0.005 else ""
         verdict = "涨" if odds.up else "跌"
         minutes = max(odds.years * YEAR_MS / 60_000, 0.0)
-        return {**base, "quote_ms": 0 if odds.settled else mkt.priced_ms, "source": "已结算" if odds.settled else "币安合约指数价",
+        lead_note = "" if odds.settled else mkt.lead_text(now_ms)  # LEAD_QUOTE: the exchange quote's part in the price
+        led = bool(lead_note) and mkt.effective(now_ms)[1] != ""
+        return {**base, "quote_ms": 0 if odds.settled else mkt.priced_ms, "source": "已结算" if odds.settled else "交易所现价先行" if led else "币安合约指数价",
                 "ref": f"{odds.line:,.4f}", "ref_rel": "起点", "unit": "USDT",
                 "ref_note": f"币安合约 {spec.symbol} 指数价，{mkt.point(spec.start_ms)}{agree}",
                 "eff_label": "终点" if odds.settled else "现价", "effective": f"{odds.price:,.4f}",
                 "move": float(percent(odds.price, odds.line)),
                 "proxy_note": (f"已结算：终点 {odds.price:,.4f}（{mkt.point(spec.end_ms)}）对起点 {odds.line:,.4f} → {verdict}"
-                               if odds.settled else "不用代理：结算源 Chainlink 的价格就是币安合约的指数价（markPrice 推送的 i）"),
+                               if odds.settled else lead_note or "不用代理：结算源 Chainlink 的价格就是币安合约的指数价（markPrice 推送的 i）"),
                 "warn": hold, "sigma_daily": sigma / math.sqrt(365), "remaining": odds.years * 365,
                 "sigma": sigma * math.sqrt(odds.years),
                 "sigma_note": (f"币安合约 {spec.symbol} 指数近 4 小时 1 分钟 K（近 1 小时权重过半，开盘首小时按开盘后的）年化 {sigma * 100:.1f}%{calib_note}；"
@@ -15478,13 +15594,21 @@ class Bot:
             mkt = parts["mkt"]
             odds = parts["odds"]
             spec = mkt.spec
+            lead: dict[str, Any] = {"index": float(mkt.price)} if mkt.price is not None else {}
+            sources = [price_evidence("指数", "币安合约指数价", spec.symbol, "指数价 i", mkt.price, mkt.priced_ms, mkt.priced_ms),
+                       price_evidence("起点", "币安合约指数 1 分钟 K", spec.symbol, "收盘", odds.line, spec.start_ms)]
+            q = mkt.lead
+            if q is not None and mkt.lead_mode != "off" and not odds.settled:  # LEAD_QUOTE: the exchange quote and its part in the price
+                led, gap, why = mkt.lead_price(now_ms)
+                start = mkt.lead_start()
+                lead.update(lead_price=float(q.last), lead_source=q.source, lead_quoted=stamp(q.quoted_ms), lead_start=float(start[0]) if start else None,
+                            lead_gap=gap, lead_used=mkt.lead_mode == "on" and led is not None, lead_note=mkt.lead_text(now_ms))
+                sources.append(price_evidence("交易所", q.source, mkt.lead_code, "最新价", q.last, q.quoted_ms, q.fetched_ms))
             return {"basis": {"line": float(odds.line), "price": float(odds.price), "sigma": mkt.sigma_used, "years": odds.years,
                               **({"sigma_raw": mkt.sigma, "sigma_factor": mkt.calib[0]} if mkt.calib[1] else {}),  # SIGMA_CALIB's factor in that σ
                               "settled": odds.settled, "start": mkt.point(spec.start_ms), "end": mkt.point(spec.end_ms),
-                              "window": spec.slug},
-                    "sources": [price_evidence("指数", "币安合约指数价", spec.symbol, "指数价 i", mkt.price, mkt.priced_ms, mkt.priced_ms),
-                                price_evidence("起点", "币安合约指数 1 分钟 K", spec.symbol, "收盘", odds.line, spec.start_ms)],
-                    "proxy": None}
+                              "window": spec.slug, **lead},
+                    "sources": sources, "proxy": None}
         if kind == "updown":
             mkt: UpDownMarket = parts["mkt"]
             odds: UpDownOdds = parts["odds"]
@@ -15551,7 +15675,7 @@ class Bot:
                 **({"sim_maker_floor_shares": c.sim_maker_floor_shares, "sim_maker_floor": c.sim_maker_floor} if c.sim_maker_floor_shares > 0 else {}),
                 **({"sim_maker_floor_markets": sorted(c.sim_maker_floor_markets)} if c.sim_maker_floor_markets and c.sim_maker_floor_shares > 0 else {}),
                 # 1.107.0, written whatever their value (an older record's absence says nothing of them: VERSION_KNOBS)
-                "sim_maker_follow_settle": c.sim_maker_follow_settle, "sigma_calib": c.sigma_calib,
+                "sim_maker_follow_settle": c.sim_maker_follow_settle, "sigma_calib": c.sigma_calib, "lead_quote": c.lead_quote,
                 **({"sim_maker_exit": self.sim_maker_exit()} if self.sim_maker_exit() > 0 else {}),
                 **({"sim_maker_session": True} if c.sim_maker_session else {}),
                 **({"sim_maker_deeper": True} if c.sim_maker_deeper else {}),
@@ -19050,7 +19174,7 @@ class Bot:
                   "SIM_TAKER_MAX_SHARES": plain(c.sim_taker_max_shares), "SIM_TAKER_SWEEP_SHARES": plain(c.sim_taker_sweep),
                   "SIM_TAKER_HOLD_SECONDS": f"{c.sim_taker_hold:g}", "SIM_TAKER_HOLD_RANGE_SECONDS": f"{c.sim_taker_hold_range:g}",
                   "SIM_MAX_FAIR_CENTS": f"{c.sim_max_fair * 100:g}", "SIM_AFTER_HOURS_MAX_SHARES": plain(c.sim_after_hours_max_shares),
-                  "PROB_BIG_MOVE_SIGMAS": f"{c.big_move_sigmas:g}",
+                  "PROB_BIG_MOVE_SIGMAS": f"{c.big_move_sigmas:g}", "LEAD_QUOTE": c.lead_quote,
                   "SIM_OPEN_QUIET_MINUTES": str(c.sim_open_quiet_minutes), "SIM_NO_ODDS_WITHDRAW_MINUTES": str(c.sim_no_odds_withdraw),
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
                   "SIM_GROUP_USD": plain(c.sim_group_usd), "SIM_TAKER_SESSION": flag(c.sim_taker_session),
@@ -20073,11 +20197,16 @@ class Bot:
     async def refresh_updown(self, now_ms: int) -> Refreshed:
         moved = []
         for key, mkt in self.updowns.items():
-            before = mkt.price if isinstance(mkt, IndexUpDownMarket) else None
+            index = isinstance(mkt, IndexUpDownMarket)
+            before = mkt.effective(now_ms)[0] if index else None
+            if index and mkt.lead_code:
+                # LEAD_QUOTE: the stock's exchange quote of the moment (fresh, in its session; None otherwise) leads the index
+                mkt.lead_mode = self.config.lead_quote
+                mkt.note_lead(self.stocks.live_quote(mkt.spec.symbol, now_ms)[0] if mkt.lead_mode != "off" else None, now_ms)
             # SIGMA_CALIB: σ by the windows' actual moves — a 15-minute card's own, the daily crypto cards' pooled
-            mkt.calib = self.sigma_calib(key if isinstance(mkt, IndexUpDownMarket) else CRYPTO_DAY_CALIB) if self.config.sigma_calib else (1.0, 0)
+            mkt.calib = self.sigma_calib(key if index else CRYPTO_DAY_CALIB) if self.config.sigma_calib else (1.0, 0)
             await mkt.refresh(now_ms)
-            if before is not None and mkt.price != before:
+            if before is not None and mkt.effective(now_ms)[0] != before:
                 moved.append(key)
         if moved:
             # an index read by REST that moved a 15-minute card (the futures stream mute: 1.104.2) wakes the express lane as

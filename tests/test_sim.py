@@ -164,7 +164,7 @@ async def run():
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
                                 "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60, "sim_shares_net": True, "sim_no_odds_withdraw": 30, "sim_taker_hold_range": 30.0,
-                                    "sim_maker_follow_settle": 0.0, "sigma_calib": True} and maker["market_id"] == "101"  # 1.107.0: the two always written  # LEGACY keeps the 10¢ rule
+                                    "sim_maker_follow_settle": 0.0, "sigma_calib": True, "lead_quote": "on"} and maker["market_id"] == "101"  # 1.107.0: the two always written  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
     assert len(bot.sim_trades()) == 2

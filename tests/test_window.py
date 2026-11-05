@@ -174,6 +174,67 @@ async def run():
     assert card.odds(T0 + 7_000) == "指数在最近的交易时段里没有变动，暂停概率"
     card.sigma = sigma
 
+    # --- 1.108.0: the stock's own exchange quote leads the index (LEAD_QUOTE): the index at the start times the quote's ratio to
+    # its own start price, when the quote is fresh, the start price was caught and the two agree within 1% ------------------
+    assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).lead_quote == "on" and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "LEAD_QUOTE": " Shadow"}).lead_quote == "shadow"
+    try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "LEAD_QUOTE": "maybe"}); assert False
+    except ValueError as error: assert "LEAD_QUOTE 只能是 on、shadow、off" in str(error)
+    assert "LEAD_QUOTE" in m.CONTROL_KEY_SET and bot.control_value("LEAD_QUOTE") == "on" and (sk.lead_mode, sk.lead_code) == ("on", "000660")
+    assert (card.lead_mode, card.lead_code) == ("off", "")  # UNITREEUSDT is not in this test's SYMBOLS: no exchange quote is read for it (StockMarket.refresh_live)
+    bot.config.tickers["UNITREEUSDT"] = m.parse_tickers("UNITREEUSDT=sh:688836", ("UNITREEUSDT",))["UNITREEUSDT"]  # as SYMBOLS would have it
+    card.lead_code, card.lead_mode = "688836", "on"
+    assert card.at(spec).lead_mode == "off"  # a past window's market: the index alone
+    quote = lambda last, quoted, fetched: m.IndexQuote("宇树科技", D(last), D("149.00"), None, None, None, quoted, "腾讯", "交易中", fetched)
+    assert card.lead_price(T0 + 9_000) == (None, 0.0, "交易所没有实时行情") and card.effective(T0 + 9_000) == (D("90.3300"), "") and card.lead_text(T0 + 9_000) == ""
+    bot.stocks.live["UNITREEUSDT"] = quote("150.00", T0 + 8_500, T0 + 9_000)  # the first quote after the start moment (T0): the window's start price
+    bot.price_dirty.clear(); card.times["price"] = -1e9
+    await bot.refresh_updown(T0 + 9_000)
+    assert card.lead_start() == (D("150.00"), T0 + 8_500) and store.get(f"updown:{spec.slug}:lead")["price"] == "150.00"
+    # the stock has not moved since the start: the index's 90.33 is behind — the card prices at the line, and the express lane looks
+    assert card.effective(T0 + 9_000) == (D("90.0000"), "交易所现价先行 -0.37%") and bot.price_dirty == {"UNITREE-15M"}, card.effective(T0 + 9_000)
+    bot.stocks.live["UNITREEUSDT"] = quote("150.30", T0 + 9_800, T0 + 10_000)  # +0.2% at the exchange
+    bot.price_dirty.clear(); card.times["price"] = -1e9
+    await bot.refresh_updown(T0 + 10_000)
+    led = card.effective(T0 + 10_000)[0]
+    assert led == D("90.18") and card.odds(T0 + 10_000).price == led and card.odds(T0 + 10_000).line == D("90.0000") and bot.price_dirty == {"UNITREE-15M"}
+    assert card.lead_text(T0 + 10_000) == ("交易所现价先行：腾讯 688836 最新价 150.30（" + m.stamp(T0 + 9_800) + "），相对窗口起点 150.00 为 +0.20%，"
+                                           "折算指数 90.1800，比币安指数 90.3300 -0.17%；结算仍按币安指数（Chainlink）"), card.lead_text(T0 + 10_000)
+    pay = bot.updown_payload(card, T0 + 10_000)
+    assert (pay["source"], pay["effective"]) == ("交易所现价先行", "90.1800") and pay["proxy_note"].startswith("交易所现价先行：腾讯 688836"), pay["proxy_note"]
+    ev = bot.market_evidence("updown", T0 + 10_000, mkt=card, odds=card.odds(T0 + 10_000))
+    assert (ev["basis"]["price"], ev["basis"]["index"], ev["basis"]["lead_price"], ev["basis"]["lead_start"], ev["basis"]["lead_used"]) == (90.18, 90.33, 150.3, 150.0, True)
+    assert ev["sources"][2]["what"] == "交易所" and ev["sources"][2]["symbol"] == "688836" and ev["sources"][2]["source"] == "腾讯" and ev["sources"][2]["price"] == 150.3, ev["sources"][2]
+    # a quote the poll has not refreshed for 15 s, or one 1% off the index: the index alone (the note says why)
+    assert card.lead_price(T0 + 25_001)[0] is None and card.lead_price(T0 + 25_001)[2] == "交易所行情 15 秒没读到" and card.effective(T0 + 25_001) == (D("90.3300"), "")
+    card.note_lead(quote("153.10", T0 + 10_500, T0 + 11_000), T0 + 11_000)
+    assert card.lead_price(T0 + 11_000)[0] is None and card.lead_price(T0 + 11_000)[2].startswith("交易所价折算 91.8600 与指数 90.3300 差 +1.68%，不用")
+    assert card.effective(T0 + 11_000) == (D("90.3300"), "") and card.lead_text(T0 + 11_000).startswith("交易所现价不先行：腾讯 688836 最新价 153.10")
+    # shadow: the card trades on the index, the sample keeps both fair prices; /calib scores them against the result
+    card.lead_mode = "shadow"
+    card.note_lead(quote("150.30", T0 + 11_800, T0 + 12_000), T0 + 12_000)
+    assert card.effective(T0 + 12_000) == (D("90.3300"), "") and card.odds(T0 + 12_000).price == D("90.3300") and card.lead_text(T0 + 12_000).startswith("交易所现价只记录（LEAD_QUOTE=shadow）：")
+    row = bot.window_snapshot(card, "window", 600, T0 + 12_000)
+    assert row["price"] == 90.33 and row["lead_used"] is False and abs(row["lead_gap"] - math.log(90.18 / 90.33)) < 1e-9 and 0 < row["up_lead"] < row["up_index"] < 1, row
+    assert row["up"] == row["up_index"]  # priced on the index in shadow mode
+    card.lead_mode = "on"
+    assert bot.window_snapshot(card, "window", 600, T0 + 12_000)["up"] == row["up_lead"]
+    for i, (ui, ul, res) in enumerate(((0.55, 0.62, 1.0), (0.40, 0.30, 0.0), (0.70, 0.60, 1.0))):
+        store.put(f"wsample:lead-test-{i}:840", {"t": T0 - 3_600_000 - i, "slug": f"lead-test-{i}", "key": "UNITREE-15M", "card": "宇树 15分涨跌", "kind": "window",
+                                                 "start": T0 - 3_600_000, "end": T0 - 2_700_000, "left": 840, "up": ul, "up_index": ui, "up_lead": ul, "lead_gap": 0.001,
+                                                 "lead_used": True, "result": res, "final": 1.0, "line": 1.0, "price": 1.0, "sigma": 0.5, "tau": 2.7e-5})
+    rep = "\n".join(bot.window_report())
+    assert "    交易所现价先行：3 条样本两种定价都有｜Brier 按指数 0.151、按交易所现价 0.131，先行更准的占 67%，先行幅度平均 0.10%（3 条按先行定价；" in rep, rep
+    store.delete_keys([f"wsample:lead-test-{i}:840" for i in range(3)])
+    # a bot that gets its first quote more than 20 s after a window's start prices that window on the index alone
+    late = card.at(W.window_spec(T0 + 1_800_000)); late.lead_mode, late.lead_code = "on", "688836"
+    at = late.spec.start_ms + 60_000
+    late.note_lead(quote("151.00", at + 25_000, at + 26_000), at + 26_000)
+    assert late.lead_start() is None and store.get(f"updown:{late.spec.slug}:lead")["missed"] is True
+    late.note_lead(quote("151.00", at + 27_000, at + 28_000), at + 28_000)  # still missed: the marker is kept
+    assert late.lead_start() is None and late.lead_price(at + 28_000) == (None, 0.0, "没有窗口起点的交易所价")
+    bot.stocks.live.pop("UNITREEUSDT"); card.note_lead(None, T0 + 12_000)  # the rest of the test prices on the index
+    assert card.effective(T0 + 12_000) == (D("90.3300"), "") and card.lead is None
+
     # --- what holds the card back: Predict's target price, the time range its question names --------------------------------
     odds = card.odds(T0 + 7_000)
     assert bot.updown_hold(card, odds, T0 + 7_000) == ("", "")
