@@ -317,6 +317,19 @@ async def run():
     said = await bot.cmd_markout(m.Request("/markout", ["宇树"], 1, 0, 42))
     assert said.startswith("📈 成交后市场走向｜宇树 15分涨跌（记录 ") and "15 分钟市场，按下单时离窗口结束：\n  剩 " in said and "15 分钟市场，按窗口开始（北京时间）：\n  11 时开始：" in said, said
     assert "吃单：" in said and ("已结算 1 笔，盈亏 $" in said or "还没有标记" in said), said
+    # 1.107.4: the words match a card's name with spaces and case aside; a name shared by two cards says which to type
+    base = {"v": 2, "fills": [], "revisions": [], "order": 10.0, "maker": False, "fair": 0.6, "edge": 0.1, "price": 0.5, "status": "filled",
+            "shares": 10.0, "opened": T0, "filled": T0, "side": "up", "label": "吃涨", "key": "SKHYNIX", "driver": "SKHYNIXUSDT", "driver_name": "SK 海力士"}
+    two = m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(T0), None)
+    two.sim_save([("skd|up|吃", {**base, "market": "sk-hynix-inc-2026-11-05", "slug": "sk-hynix-inc-2026-11-05", "item": "SK 海力士｜SKHYNIXUSDT 11-05", "kind": "close",
+                                 "settle": {"key": "SKHYNIXUSDT", "target": "2026-11-05", "line": 900.0, "close_ms": T0 + 3_600_000}}),
+                  ("skw|up|吃", {**base, "market": "skhynix-updown-15m-1793858400", "slug": "skhynix-updown-15m-1793858400", "item": "SK 海力士 15分涨跌 14:00–14:15",
+                                 "kind": "updown", "settle": {"end": T0 + 840_000, "start": T0 - 60_000, "window": "15m"}})])
+    assert sorted({m.card_of(t) for t in two.sim_trades().values()}) == ["SK 海力士", "SK 海力士 15分涨跌"]
+    assert two.journal_filter_words(["海力士", "挂"]) == ({}, "“海力士”匹配多个市场：SK 海力士、SK 海力士 15分涨跌。写具体些，比如 “SK 海力士” 或 “SK 海力士 15分涨跌”（空格、大小写不限）")
+    assert two.journal_filter_words(["海力士15分涨跌", "挂"]) == ({"card": "SK 海力士 15分涨跌", "way": "maker"}, "")
+    assert two.journal_filter_words(["sk海力士15分涨跌"]) == ({"card": "SK 海力士 15分涨跌"}, "") and two.journal_filter_words(["海力士", "15分"]) == ({"card": "SK 海力士 15分涨跌"}, "")
+    assert two.journal_filter_words(["sk", "海力士"]) == ({"card": "SK 海力士"}, "")  # the whole name wins over the longer one that contains it
     # an end within 0.05% of the start: Chainlink's report may differ from the index candle — Predict's result decides
     fm.index[nxt.start_ms], fm.index[nxt.end_ms] = "90.2000", "90.2300"
     tie = {**trade, "market": nxt.slug, "slug": nxt.slug, "settle": {"end": nxt.end_ms, "start": nxt.start_ms, "window": "15m"}}

@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.107.3"
+VERSION = "1.107.4"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -14181,13 +14181,16 @@ class Bot:
                 rest.append(word)
         if rest:
             text = " ".join(rest)
+            squash = lambda s: re.sub(r"\s+", "", s).casefold()  # 1.107.4: spaces and case aside (海力士15分涨跌 = SK 海力士 15分涨跌)
+            key = squash(text)
             names = sorted({card_of(t) for t in self.sim_trades().values()})
-            hits = [n for n in names if n == text] or [n for n in names if text.casefold() in n.casefold()]
+            hits = [n for n in names if squash(n) == key] or [n for n in names if key in squash(n)]
             if not hits:
                 return {}, (f"没有名字含“{text}”的市场。有记录的市场：" + "、".join(names[:15]) + ("…" if len(names) > 15 else "")
                             if names else "还没有交易记录")
             if len(hits) > 1:
-                return {}, f"“{text}”匹配多个市场：" + "、".join(hits) + "。写具体些"
+                return {}, (f"“{text}”匹配多个市场：" + "、".join(hits) + "。写具体些，比如 " + " 或 ".join(f"“{h}”" for h in hits[:2])
+                            + "（空格、大小写不限）")
             flt["card"] = hits[0]
         return flt, ""
 
