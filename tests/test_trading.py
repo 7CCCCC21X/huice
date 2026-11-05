@@ -628,6 +628,12 @@ async def run():
     fake.positions_rows.append({"id": "p2", "market": {"id": 101, "title": "恒生指数 10-05"}, "outcome": {"name": "Up", "indexSet": 1, "onChainId": "1011"},
                                 "amount": str(40 * WEI)})
     fake.positions_rows.append({"id": "p3", "market": {"id": 110, "title": "rest"}, "outcome": {"name": "Up", "indexSet": 1}, "amount": str(5 * WEI)})
+    # 1.118.2: /live positions sets each position against the records on its outcome token (the row's, else the market's at that
+    # index set): the records holding it, or 无记录 with the orders there that ended without a fill (a fill during the cancel, unread)
+    ptext = await bot.cmd_live(req("positions"))
+    assert ptext.startswith("Predict 上的持仓 3 个：") and "恒生指数 10-05｜Down 100 份｜≈$100.00｜" in ptext, ptext
+    assert f"rest｜Up 5 份｜⚠️ 无记录（这一边有 1 张没成交就结束的订单：#{oid}，可能撤单前成交了没读到）" in ptext, ptext
+    assert bot.live_status(bot.market.now_ms())["positions"] == ptext.split("\n")[1:], ptext
     lines = await bot.live_redeem(CLOSE + 70 * 60_000)
     assert len(lines) == 1 and "已领取 恒生指数 10-05 Down 100 份：0xredeem" in lines[0], lines
     assert bot.live.chain.redeemed == [("0x" + "ab" * 32, 2, 100 * WEI, False, False)] and bot.store.get("live:redeemed:101:2")["tx"] == "0xredeem"

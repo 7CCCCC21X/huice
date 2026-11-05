@@ -400,7 +400,8 @@ async def run():
     st, j = await post(port3, {"key": KEY, "action": "cancel", "id": "all"}); assert st == 200 and "没有真实挂单可撤" in j["message"]
     fake.positions_rows = [{"id": "p1", "market": {"id": 9, "title": "恒生指数"}, "outcome": {"name": "Up", "indexSet": 1}, "amount": str(3 * WEI)}]
     st, j = await post(port3, {"key": KEY, "action": "positions"}); assert st == 200 and "恒生指数｜Up 3 份" in j["message"]
-    assert (await get_json(port3, "control.json"))["live"]["positions"] == ["恒生指数｜Up 3 份"]
+    # 1.118.2: each position against the records on its outcome token; this row names no token and the market is not read yet
+    assert (await get_json(port3, "control.json"))["live"]["positions"] == ["恒生指数｜Up 3 份｜记录？（读不出结果代币，无法对照）"]
     st, j = await post(port3, {"key": KEY, "action": "check"}); assert st == 200 and "自检" in j["message"]
     st, j = await post(port3, {"key": KEY, "action": "redeem"}); assert st == 200 and "没有可领取" in j["message"]
     st, j = await post(port3, {"key": KEY, "action": "bogus"}); assert st == 400 and j["message"] == "未知操作"

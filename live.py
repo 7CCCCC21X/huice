@@ -2430,7 +2430,7 @@ class LiveBot(core.Bot):
                 return f"未就绪：{self.live.not_ready_why}"
             rows = await self.live.api.positions()
             self.live_positions = (rows, time.time())
-            return "Predict 上的持仓：\n" + ("\n".join(self.position_line(r) for r in rows[:30]) or "无")
+            return self.positions_text(rows, now_ms)
         return core.Reply(self.live_text(now_ms), html=True)
 
     # --- the control page --------------------------------------------------------------------------------------------------
@@ -2534,7 +2534,7 @@ class LiveBot(core.Bot):
                 "balance_age_s": int(time.time() - self.live.balance[2]) if self.live.balance else None, "balance_error": self.live.balance_error,
                 "placed_today": sum(int(t["opened"]) >= since for _, t in live),
                 "failed_today": sum(int(t["opened"]) >= since and t["live"].get("final") == "failed" for _, t in live),
-                "orders": rows, "positions": [self.position_line(r) for r in positions[:30]],
+                "orders": rows, "positions": self.position_lines(positions[:30], trades, now_ms),
                 "positions_at": core.stamp(at * 1000) if at else "", "errors": self.live_errors[-5:],
                 "last_test": str((self.store.get("live:test") or {}).get("text") or "")}
 
@@ -2730,6 +2730,64 @@ class LiveBot(core.Bot):
         value = row.get("valueUsd") or row.get("value")
         return (f"{market.get('title') or row.get('marketId') or '?'}｜{outcome.get('name') or '?'} {shares:g} 份"
                 + (f"｜≈${float(value):,.2f}" if value not in (None, "") else "") + (f"｜{outcome.get('status')}" if outcome.get("status") else ""))
+
+    @staticmethod
+    def position_shares(row: dict) -> float:
+        try:
+            return from_wei(int(str(row.get("amount") or "0")))
+        except ValueError:
+            return 0.0
+
+    def position_token(self, row: dict) -> str:
+        """The outcome token a Predict position is in: the row's own, else the market's outcome at that index set as
+        the bot read the market (live.markets). "" when neither says."""
+        outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
+        token = str(outcome.get("onChainId") or outcome.get("tokenId") or "")
+        if token:
+            return token
+        market = row.get("market") if isinstance(row.get("market"), dict) else {}
+        info = self.live.markets.get(str(market.get("id") or row.get("marketId") or ""))
+        if info is None:
+            return ""
+        with contextlib.suppress(TypeError, ValueError):
+            index = int(outcome.get("indexSet"))
+            return next((str(o.get("token") or "") for o in info.outcomes if int(o.get("index_set") or 0) == index), "")
+        return ""
+
+    def position_lines(self, rows: list[dict], trades: dict, now_ms: int) -> list[str]:
+        """Predict's positions, each against the bot's records on its outcome token (1.118.2): the records holding it
+        and their shares against Predict's, or ⚠️ 无记录 — then the orders on that outcome that ended without a fill in
+        the last two days, the way a fill that landed as the cancel did can go unread."""
+        out = []
+        for r in rows:
+            token, shares, line = self.position_token(r), self.position_shares(r), self.position_line(r)
+            if not token:
+                out.append(line + "｜记录？（读不出结果代币，无法对照）")
+                continue
+            mine = [(tid, t) for tid, t in trades.items()
+                    if isinstance(t.get("live"), dict) and str((t["live"].get("want") or {}).get("token") or "") == token]
+            held = [(tid, t) for tid, t in mine if float(t.get("shares") or 0) > 1e-9 and t.get("status") in {"filled", "resting", "settled"}]
+            tag = lambda tid, t: f"#{t['live']['order_id']}" if t["live"].get("order_id") else tid
+            if held:
+                total = sum(float(t["shares"]) for _, t in held)
+                diff = shares - total
+                line += (f"｜记录 {len(held)} 笔 {total:g} 份（{'、'.join(tag(tid, t) for tid, t in held[:5])}）"
+                         + (f"，比记录多 {diff:g} 份" if diff > 0.01 else f"，比记录少 {-diff:g} 份" if diff < -0.01 else "，一致"))
+            else:
+                ended = [(tid, t) for tid, t in mine if int(t.get("opened") or 0) >= now_ms - 2 * core.DAY_MS and float(t.get("shares") or 0) <= 1e-9]
+                line += "｜⚠️ 无记录" + (f"（这一边有 {len(ended)} 张没成交就结束的订单：{'、'.join(tag(tid, t) for tid, t in ended[:5])}，可能撤单前成交了没读到）"
+                                     if ended else "")
+            out.append(line)
+        return out
+
+    def positions_text(self, rows: list[dict], now_ms: int) -> str:
+        """/live positions: Predict's positions against the records (position_lines), a count of the matches first."""
+        lines = self.position_lines(rows[:30], self.sim_trades(), now_ms)
+        if not lines:
+            return "Predict 上的持仓：无"
+        missing, differ = sum("⚠️ 无记录" in l for l in lines), sum("比记录" in l for l in lines)
+        return (f"Predict 上的持仓 {len(lines)} 个：{len(lines) - missing - differ} 个与记录一致，{differ} 个份数不符，{missing} 个无记录\n"
+                + "\n".join(lines))
 
     def live_text(self, now_ms: int) -> str:
         trades = self.sim_trades()
