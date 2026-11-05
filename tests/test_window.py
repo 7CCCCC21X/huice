@@ -66,6 +66,11 @@ open_rows = rows(calm_m(121, 90), BJ(11, 30)) + rows([str(90 * (1 + 0.002 * (i %
 sh = m.session_minute_fn("sh")
 assert m.minute_vol(open_rows, BJ(13, 21), 240, sh) > 1.3 > m.minute_vol(open_rows, BJ(13, 21), 240, sh, open_floor=False) > 0.5
 assert len(m.minute_returns(open_rows, BJ(13, 21), sh)) == 139 and m.minute_returns(open_rows, BJ(13, 21), sh)[-20][0] == BJ(13, 1)
+# 1.106.1: the daily crypto cards' hourly σ weighs the last five days about half — a month of calm does not price a week that moves
+hourly = lambda closes, end: [[end - (len(closes) - i) * 3600_000, c, c, c, c, "0", end - (len(closes) - i) * 3600_000 + 3599_999, "0", 0, "0", "0", "0"]
+                              for i, c in enumerate(closes)]
+month = [str(70000 * (1 + 0.001 * (i % 2))) for i in range(600)] + [str(70000 * (1 + 0.01 * (i % 2))) for i in range(122)]
+assert m.realized_vol(hourly(month, T0), T0, half_life=120) > 1.5 * m.realized_vol(hourly(month, T0), T0) > 0 and m.UpDownMarket.SIGMA_HALF_LIFE == 120
 assert m.session_segments("sh", dt.date(2026, 11, 4)) == [(at(9, 30), at(11, 30)), (at(13, 0), at(15, 0))] and m.session_segments("kr", dt.date(2026, 11, 7)) == []
 
 
@@ -402,7 +407,17 @@ async def samples():
                                                    "left": 840, "up": 0.6, "sigma": 0.5, "sigma_raw": 0.5, "calib": 1.0, "model": 2, "tau": 2.7e-5, "line": 100.0, "move": 3 * st,
                                                    "result": 1.0, "final": 100.0 * math.exp(3 * st)})
     assert extreme.sigma_calib("SKHYNIX-15M") == (1.4, 20)
-    store.delete_keys([k for k in store.keys("wsample:") if k.startswith(("wsample:c", "wsample:e", "wsample:old"))])  # the made-up windows go
+    # the daily crypto cards (1.106.1): a window a day each, pooled under one factor; a card's own key counts its 15-minute windows alone
+    for i, key in enumerate(("BTC-DAY", "ETH-DAY", "BNB-DAY", "BTC-DAY", "ETH-DAY")):
+        st_day = 0.5 * math.sqrt(1 / 730)
+        store.put(f"wsample:d{i}-updown-day:43200", {"t": T0 - (i + 50) * 86_400_000, "start": T0 - (i + 50) * 86_400_000, "end": T0 - (i + 49) * 86_400_000,
+                                                     "slug": f"d{i}-updown-day", "key": key, "kind": "day", "card": key[:3] + " 日涨跌", "left": 43200, "up": 0.6,
+                                                     "sigma": 0.5, "sigma_raw": 0.5, "calib": 1.0, "model": 2, "tau": 1 / 730, "line": 100.0, "move": 2 * st_day,
+                                                     "result": 1.0, "final": 100.0 * math.exp(2 * st_day)})
+    pooled = m.Bot(m.Config.from_env(ENV), store, FM(T0), None)
+    assert abs(pooled.sigma_calib(m.CRYPTO_DAY_CALIB)[0] - math.sqrt((5 * 4 + 20) / 25)) < 1e-9 and pooled.sigma_calib(m.CRYPTO_DAY_CALIB)[1] == 5
+    assert pooled.sigma_calib("BTC-DAY") == (1.0, 0) and "σ 校准系数（BTC / ETH / BNB 日涨跌合并）：×1.26（按 5 个市场" in "\n".join(pooled.window_report())
+    store.delete_keys([k for k in store.keys("wsample:") if k.startswith(("wsample:c", "wsample:e", "wsample:old", "wsample:d"))])  # the made-up windows go
     bot.sigma_calib_cache.clear()
     # a window that ended while the bot was down is settled on its kept end when the samples are read; an end within the tie
     # band keeps no result (Predict's call), the move all the same

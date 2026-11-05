@@ -30,6 +30,21 @@ b = float(text.split("系数 b ")[1].split("（")[0]); assert 0.4 < b < 0.8, tex
 assert "逐日向前检验（20 日 80 条）：拟合模型 Brier" in text, text
 k = float(text.split("残差 σ ")[1].split("%")[0]); assert 0.5 < k < 1.2, text  # true residual 0.8%/day
 assert "95% 区间" in text and "区间按日数算" in text, text
+# 1.106.1: the residual factor (SIGMA_CALIB for the index cards): the day-weighted RMS of z = (y − β·move) / (raw σ·√R), pooled
+# with 20 days at 1 — the true residual 0.8%/day against a 2% σ: z's RMS about 0.47, the factor about 0.73
+done = [dict(p, y=math.log(outcomes[f"KOSPI:{p['target']}"] / p["ref"])) for p in preds if f"KOSPI:{p['target']}" in outcomes]
+f, n = m.residual_factor(done)
+assert n == 30 and 0.6 < f < 0.9 and m.residual_factor([]) == (1.0, 0), (f, n)
+assert m.residual_factor([dict(r, sigma=r["sigma"] * 0.5, sigma_raw=r["sigma"]) for r in done]) == (f, n), "a snapshot's own factor is taken off first"
+assert m.residual_factor([dict(r, y=r["y"] * 10) for r in done]) == (1.4, 30) and m.residual_factor([dict(r, y=r["beta"] * r["move"]) for r in done]) == (0.7, 30)  # no residual at all: √(20/50) = 0.63, floored at 0.7
+assert f"σ 校准系数：×{f:.2f}（按 30 日残差，先验 20 日按 1 计" in text and "逐日向前检验（σ 校准，80 条，同一公式）：不校准 Brier" in text, text
+# the volatility book applies the factor to the σ it hands out and says so; a mode without one is untouched
+vb = m.VolBook({}, None)
+plain, plain_in = vb.get("KOSPI", "KOSPI"), vb.get("KOSPI", "KOSPI", intraday=True)
+vb.calib[("KOSPI", "盘后")] = (1.25, 15)
+assert vb.get("KOSPI", "KOSPI") == (plain[0] * 1.25, plain[1] + "；按 15 日快照残差校准 ×1.25") and vb.get("KOSPI", "KOSPI", intraday=True) == plain_in
+vb.calib[("KOSPI", "盘后")] = (1.0, 15)
+assert vb.get("KOSPI", "KOSPI") == plain, "a factor of 1 adds nothing"
 few = "\n".join(m.calibration_report([p for p in preds if p["target"] < "2026-06-08"], outcomes))
 # a rate's Wilson interval: 60 of 100 is 50–69%, not "60 give or take a point"; counted in days, 3 of 3 says little
 lo, hi = m.wilson(60, 100)
@@ -104,6 +119,26 @@ async def run():
     assert [v for _, v in kbot.store.items("pred:KOSPI")][-1]["mkt"] is None  # a book for another market is not this one's
     report = kbot.calibration_text()
     assert "对比 Predict 盘口中间价（1 条/1 日）：模型 Brier 0.1" in report and "市场 0.176" in report, report
+    # 1.106.1: the Bot measures each card and mode's factor from the snapshots on disk and hands it to the volatility book (an
+    # outcome coming in measures again; the setting off clears them). 25 days moving 2% against a 1% σ: z 2, capped at ×1.4
+    for i in range(25):
+        day = (dt.date(2026, 7, 1) + dt.timedelta(days=i)).isoformat()
+        kbot.store.put(f"outcome:KOSPI:{day}", 3300.0 * math.exp(0.02 * (1 if i % 2 else -1)))
+        kbot.store.put(f"pred:KOSPI:{9_000_000 + i}", {"key": "KOSPI", "t": 9_000_000 + i, "target": day, "mode": "盘中", "ref": 3300.0, "up": 0.5,
+                                                       "move": 0.0, "beta": 1.0, "sigma": 0.01, "R": 1.0})
+    calibs = kbot.index_sigma_calibs()
+    assert calibs[("KOSPI", "盘中")][0] == 1.4 and calibs[("KOSPI", "盘中")][1] >= 25, calibs
+    kbot.vols.calib = calibs
+    assert "快照残差校准 ×1.40" in kbot.vols.get("KOSPI", "KOSPI", intraday=True)[1]
+    kbot.config = m.dataclasses.replace(kbot.config, sigma_calib=False)
+    kbot.note_outcome("KOSPI", "2026-07-26", 3300.0, "test")
+    assert kbot.vols.calib == {}
+    kbot.config = m.dataclasses.replace(kbot.config, sigma_calib=True)
+    kbot.note_outcome("KOSPI", "2026-07-27", 3300.0, "test")
+    assert kbot.vols.calib[("KOSPI", "盘中")][0] == 1.4
+    kbot.pred_last.clear(); kbot.record_predictions(t0 + 180_000)
+    last = max((v for _, v in kbot.store.items("pred:KOSPI")), key=lambda v: v["t"])  # the one just recorded (the made-up rows sort after it)
+    assert last["calib"] == kbot.vols.calib.get(("KOSPI", last["mode"]), (1.0, 0))[0] and abs(last["sigma_raw"] * last["calib"] - last["sigma"]) < 1e-12, last
 
     # --- the all-market snapshots: every priced market every 2 hours, scored by kind once it has a result ------------------
     class FM:

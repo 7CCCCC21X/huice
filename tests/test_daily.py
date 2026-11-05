@@ -135,7 +135,7 @@ async def run():
     assert (taker["status"], taker["order"], taker["shares"], taker["price"] < 0.41) == ("filled", 10, 10, True), taker
     assert taker["settle"] == mk.settle and taker["driver"] == "BTCUSDT"
     assert {k: v for k, v in taker["version"].items() if k.startswith("sim_crypto_day_")} == {
-        "sim_crypto_day_shares": 10, "sim_crypto_day_max_shares": 100, "sim_crypto_day_quiet": 30, "sim_crypto_day_edge": 0}
+        "sim_crypto_day_shares": 10, "sim_crypto_day_max_shares": 100, "sim_crypto_day_quiet": 30, "sim_crypto_day_edge": 0.1}  # 1.106.1: 10¢ by default
     # a resting order: 10 shares, not SIM_SHARES' 100
     bot.sim_quote(mk, trades, EVENING, changed)
     resting = [t for t in trades.values() if t.get("maker")]
@@ -194,8 +194,8 @@ async def run():
     assert free.sim_order_cap(mk) == math.inf and free.sim_market_room(full, mk, "up") == (math.inf, "") and free.sim_quiet(mk.settle, late) == ""
     assert free.sim_taker_shares(mk) == 100 and free.sim_maker_pick(mk, NONE, "up", maker, EVENING) == (100.0, "")
     # the settings, as the control page and /sim show them
-    assert [bot.control_value(k) for k in KEYS] == ["10", "100", "30"] and bot.control_value("SIM_CRYPTO_DAY_EDGE_CENTS") == "0"
-    assert "加密日涨跌（BTC / ETH / BNB，内测）：每次最多买 10 份，每个市场每边持仓加挂单最多 100 份，结束（12:00 ET）前 30 分钟起不买、撤掉挂单" in bot.sim_text()
+    assert [bot.control_value(k) for k in KEYS] == ["10", "100", "30"] and bot.control_value("SIM_CRYPTO_DAY_EDGE_CENTS") == "10"  # 1.106.1: 10¢ by default
+    assert "加密日涨跌（BTC / ETH / BNB，内测）：净优势 ≥ 10.0¢ 才买，每次最多买 10 份，每个市场每边持仓加挂单最多 100 份，结束（12:00 ET）前 30 分钟起不买、撤掉挂单" in bot.sim_text(), bot.sim_text()
 
     # --- the entry bar: SIM_EDGE_CENTS (10¢) unless SIM_CRYPTO_DAY_EDGE_CENTS gives these markets their own --------------------
     assert bot.sim_edge_bar(mk) == bot.sim_taker_bar(mk) == bot.sim_maker_mode(mk)[0] == 0.10 == bot.sim_edge_bar(other)

@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.106.0"
+VERSION = "1.106.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -488,7 +488,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_AFTER_HOURS_SHARES", "盘后吃单每次最多买多少份", "0～1000000：开盘前、收盘后的吃单单独按这个份数；0 = 同盘中吃单的份数"),
     ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
-    ("SIGMA_CALIB", "15 分钟涨跌 σ 自动校准", "开 = 每张 15 分钟卡的 σ 乘以按定时样本算出的系数（各窗口实际波动对预测的均方根，和 20 个“刚好”的先验窗口一起平均，限 0.7～1.4；只算新估计法的样本）；关 = 只用估计值"),
+    ("SIGMA_CALIB", "σ 自动校准", "开 = 卡片的 σ 乘以按实际结果算出的系数（限 0.7～1.4，和 20 个“刚好是 1”的先验一起平均）：15 分钟涨跌按每张卡的定时样本，加密日涨跌三张卡合并按定时样本，指数日涨跌按 /calib 的快照残差、盘中和盘后各算；关 = 只用估计值"),
     ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限、盘后每边持仓上限、加密日涨跌和 15 分钟涨跌的每边上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
     ("SIM_NO_ODDS_WITHDRAW_MINUTES", "概率暂缺多久撤单（分钟）", "0～1440：卡片的概率暂缺（如上证卡周末 A50 休市、行情断流）或暂不建议持续这么多分钟后，这个市场挂着的单撤掉（低价挂单也撤），概率回来再按新公平价重挂；没有概率时本来就不开新单；0 = 不撤、挂着等"),
@@ -850,7 +850,7 @@ class Config:
             sim_crypto_day_shares=parse_bounded(e, "SIM_CRYPTO_DAY_SHARES", "10", 0, 1_000_000),
             sim_crypto_day_max_shares=parse_bounded(e, "SIM_CRYPTO_DAY_MAX_SHARES", "100", 0, 10_000_000),
             sim_crypto_day_quiet=bounded_int(e, "SIM_CRYPTO_DAY_QUIET_MINUTES", 30, 0, 1440),
-            sim_crypto_day_edge=parse_bounded(e, "SIM_CRYPTO_DAY_EDGE_CENTS", "0", 0, 50) / 100,
+            sim_crypto_day_edge=parse_bounded(e, "SIM_CRYPTO_DAY_EDGE_CENTS", "10", 0, 50) / 100,
             sim_crypto_15m_shares=parse_bounded(e, "SIM_CRYPTO_15M_SHARES", "10", 0, 1_000_000),
             sim_crypto_15m_max_shares=parse_bounded(e, "SIM_CRYPTO_15M_MAX_SHARES", "100", 0, 10_000_000),
             sim_crypto_15m_quiet=bounded_int(e, "SIM_CRYPTO_15M_QUIET_SECONDS", 90, 0, 600),
@@ -4386,6 +4386,24 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
                             f"实际 {hit * 100:.0f}%（95% 区间 {low * 100:.0f}–{high * 100:.0f}%，{len(sel)} 条/{bin_days} 日）")
         lines.append("  校准：" + "；".join(bins) + "；区间按日数算，窄到能分辨几个点的差别之前，别把小数点后的优势当真")
         lines.extend(residual_lines(done))
+        factor, factor_days = residual_factor(done)
+        lines.append(f"  σ 校准系数：×{factor:.2f}（按 {factor_days} 日残差，先验 {RESIDUAL_PRIOR_DAYS} 日按 1 计，限 0.7～1.4；SIGMA_CALIB 开着时卡片按它定价）")
+        if len(days) >= CALIB_MIN_DAYS + 5:
+            # the factor walked forward by target day, each day priced on the days before it, against the same formula unscaled
+            base, scaled, hits = [], [], []
+            for day in days[CALIB_MIN_DAYS:]:
+                f_day, _ = residual_factor([r for r in done if r["target"] < day])
+                for r in (r for r in done if r["target"] == day and r.get("R") and float(r["R"]) > 0):
+                    sigma = float(r.get("sigma_raw") or r["sigma"]) * math.sqrt(float(r["R"]))
+                    if sigma <= 0:
+                        continue
+                    base.append(norm_cdf(float(r.get("beta") or 1.0) * float(r.get("move") or 0.0) / sigma))
+                    scaled.append(norm_cdf(float(r.get("beta") or 1.0) * float(r.get("move") or 0.0) / (sigma * f_day)))
+                    hits.append(r["hit"])
+            if hits:
+                b0, b1 = brier_scores(base, hits), brier_scores(scaled, hits)
+                lines.append(f"  逐日向前检验（σ 校准，{len(hits)} 条，同一公式）：不校准 Brier {b0[0]:.3f} / 对数损失 {b0[1]:.3f}，"
+                             f"σ×校准 {b1[0]:.3f} / {b1[1]:.3f}" + ("（校准更准）" if b1[0] < b0[0] - 1e-9 else "（校准没有更准）" if b1[0] > b0[0] + 1e-9 else ""))
         if mode != "盘后" or len(days) < 3:
             continue
         fit = fit_proxy(done)
@@ -4416,6 +4434,32 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
 
 
 CALIB_BUCKETS = ((0.0, 0.25, "R<0.25"), (0.25, 0.5, "0.25–0.5"), (0.5, 1.0, "0.5–1"), (1.0, math.inf, "R≥1"))
+
+
+RESIDUAL_PRIOR_DAYS = 20       # residual_factor: days' worth of "σ is right" the measured residuals are averaged with
+RESIDUAL_RANGE = (0.7, 1.4)
+
+
+def residual_factor(done: list[dict], prior_days: int = RESIDUAL_PRIOR_DAYS) -> tuple[float, int]:
+    """The factor an index card's σ should be scaled by on its scored snapshots (SIGMA_CALIB, 1.106.1), and the days it
+    rests on: the day-weighted RMS of the standardised residuals z = (y − β·move) / (raw σ·√R) — the raw σ, before any
+    factor the snapshot's σ already carried — pooled with ``prior_days`` days at 1, kept within RESIDUAL_RANGE. (1, 0)
+    without a scored snapshot."""
+    rows = [r for r in done if r.get("y") is not None and r.get("R") and float(r["R"]) > 0
+            and float(r.get("sigma_raw") or r.get("sigma") or 0) > 0]
+    if not rows:
+        return 1.0, 0
+    per_day: dict[str, int] = {}
+    for r in rows:
+        per_day[r["target"]] = per_day.get(r["target"], 0) + 1
+    total = 0.0
+    for r in rows:
+        sigma = float(r.get("sigma_raw") or r["sigma"])
+        z = (float(r["y"]) - float(r.get("beta") or 1.0) * float(r.get("move") or 0.0)) / (sigma * math.sqrt(float(r["R"])))
+        total += z * z / per_day[r["target"]]
+    days = len(per_day)
+    factor = math.sqrt((total + prior_days) / (days + prior_days))
+    return min(max(factor, RESIDUAL_RANGE[0]), RESIDUAL_RANGE[1]), days
 
 
 def residual_lines(done: list[dict]) -> list[str]:
@@ -4527,6 +4571,7 @@ class VolBook:
         self.shares: dict[str, tuple[float, int]] = {}           # key -> (in-session share of daily variance, n)
         self.refreshed: dict[str, float] = {}
         self.errors: dict[str, str] = {}                         # key -> why the last read of its bars failed (the figures in hand stand)
+        self.calib: dict[tuple[str, str], tuple[float, int]] = {}  # (key, 盘中 / 盘后) -> (the σ factor, the days behind it): Bot.index_sigma_calibs
 
     def due(self, key: str) -> bool:
         return key not in self.overrides and time.monotonic() - self.refreshed.get(key, -1e9) >= self.REFRESH_SECONDS
@@ -4586,6 +4631,10 @@ class VolBook:
             else:
                 sigma = math.sqrt((n * est ** 2 + PRIOR_WEIGHT * prior ** 2) / (n + PRIOR_WEIGHT))
                 note = f"{source} {n} 日 {est * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
+        factor, days = self.calib.get((key, "盘中" if intraday else "盘后"), (1.0, 0))
+        if days and abs(factor - 1) > 0.005:  # SIGMA_CALIB (1.106.1): the snapshots' residuals said σ was off by this much
+            sigma *= factor
+            note += f"；按 {days} 日快照残差校准 ×{factor:.2f}"
         share = self.shares.get(key)
         if intraday and share is not None:
             return sigma * math.sqrt(share[0]), f"{note}；盘中取 {share[0] * 100:.0f}% 方差（{share[1]} 日开盘跳空已扣除）"
@@ -6653,7 +6702,7 @@ def first_touch(spot: float, low: float, high: float, sigma: float, mu: float, y
 
 
 def realized_vol(rows: list, now_ms: int, count: int = 720, per_year: float = 365 * 24, at_least: int | None = None,
-                 what: str = "30 日小时 K 线", keep: Any = None, step_ms: int | None = None) -> float:
+                 what: str = "30 日小时 K 线", keep: Any = None, step_ms: int | None = None, half_life: int | None = None) -> float:
     """Annualised σ of a price's finished candles (Binance klines: open time, O, H, L, C, …, close time): the sample σ of
     the log returns over the last ``count`` closes (the last 720 hourly ones, 30 days, by default), ``per_year`` candles
     to a year. ``keep`` (open_ms -> bool) picks the candles that count (a session's minutes); with ``step_ms`` only
@@ -6666,6 +6715,9 @@ def realized_vol(rows: list, now_ms: int, count: int = 720, per_year: float = 36
     rets = [math.log(float(b[4]) / float(a[4])) for a, b in zip(done, done[1:]) if step_ms is None or int(b[0]) - int(a[0]) == step_ms]
     if len(rets) < (count if at_least is None else at_least):
         raise ValueError(f"{what}不足")
+    if half_life:  # the exponentially weighted RMS (zero mean), a weight halving every ``half_life`` candles back (1.106.1)
+        weights = [0.5 ** ((len(rets) - 1 - i) / half_life) for i in range(len(rets))]
+        return math.sqrt(sum(w * r * r for w, r in zip(weights, rets)) / sum(weights) * per_year)
     mean = sum(rets) / len(rets)
     var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
     return math.sqrt(var * per_year)
@@ -7123,6 +7175,9 @@ class UpDownMarket:
     PRICE_STALE_MS = TouchMarket.PRICE_STALE_MS
     SIGMA_STALE_MS = TouchMarket.SIGMA_STALE_MS
 
+    SIGMA_HALF_LIFE = 120          # σ: the last 30 days' hourly returns, a weight halving every five days back (1.106.1; a plain 30-day σ before)
+    SIGMA_MODEL = 2                # the estimator's version, kept on each sample: the calibration counts samples of the current one alone
+
     def __init__(self, store: "Store", spec: UpDownSpec):
         self.store, self.spec = store, spec
         self.price: D | None = None
@@ -7131,6 +7186,12 @@ class UpDownMarket:
         self.sigma_ms = 0
         self.error = ""
         self.times = {"price": -1e9, "vol": -1e9, "candle": -1e9}
+        self.calib = (1.0, 0)  # (the factor σ is priced with, the windows it was measured on): Bot.sigma_calib, SIGMA_CALIB
+
+    @property
+    def sigma_used(self) -> float | None:
+        """The σ the odds are priced with: the measured one times the calibration factor (1 until SIGMA_CALIB has windows)."""
+        return None if self.sigma is None else self.sigma * self.calib[0]
 
     async def get(self, path: str, **params: Any) -> Any:
         return await binance_spot(path, **params)
@@ -7195,7 +7256,10 @@ class UpDownMarket:
             self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
         if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
             self.times["vol"] = mono
-            self.sigma = realized_vol(await self.get("klines", symbol=self.spec.symbol, interval="1h", limit=722), now_ms)
+            # the last 30 days' hourly returns, the last five days weighing about half (a month-old calm does not price a
+            # week that moves: the 11-04 crypto windows moved 1.8–3.5 σ√τ)
+            self.sigma = realized_vol(await self.get("klines", symbol=self.spec.symbol, interval="1h", limit=722), now_ms,
+                                      half_life=self.SIGMA_HALF_LIFE)
             self.sigma_ms = now_ms
 
     def odds(self, now_ms: int) -> UpDownOdds | str:
@@ -7219,7 +7283,7 @@ class UpDownMarket:
         if not self.sigma > 0:
             return "波动率无效，暂停概率"
         years = (spec.end_ms + 60_000 - now_ms) / YEAR_MS
-        up, flat, down, z = updown_odds(float(self.price), float(line), self.sigma, years)
+        up, flat, down, z = updown_odds(float(self.price), float(line), self.sigma_used, years)
         return UpDownOdds(up, flat, down, z, line, self.price, years)
 
     def model_swing(self, odds: UpDownOdds) -> float:
@@ -7234,10 +7298,6 @@ class UpDownMarket:
         return max(abs(fair(sigma, drift) - odds.fair_up) for sigma, drift in
                    ((used * MODEL_SIGMA_ERROR, -0.5), (used / MODEL_SIGMA_ERROR, -0.5), (used, 0.0)))
 
-    @property
-    def sigma_used(self) -> float | None:
-        """The σ the odds are priced with (an index card's: the measured one times its calibration factor)."""
-        return self.sigma
 
     def advice_problem(self, odds: UpDownOdds, now_ms: int) -> str:
         """Why no trade is suggested from these odds ("" when one may be)."""
@@ -7248,6 +7308,7 @@ class UpDownMarket:
         return ""
 
 
+CRYPTO_DAY_CALIB = "CRYPTO-DAY"  # Bot.sigma_calib: the daily crypto cards' pooled calibration key
 MINUTE_VOL_HALF_LIFE = 60  # minute_vol: the weight of a minute's return halves every hour back — the last hour carries about half
 MINUTE_VOL_OPEN = 60       # ...and a session under this many minutes old is priced at least on its own minutes (the open's volatility)
 MINUTE_VOL_MIN = 30        # returns needed for a σ at all
@@ -7312,12 +7373,6 @@ class IndexUpDownMarket(UpDownMarket):
         self.exchange = exchange  # the stock exchange whose session the windows follow ("" = round the clock)
         self.trading = trading    # open_ms -> whether that minute is in the exchange's session (session_minute_fn): σ counts those alone
         self.index_ms = 0  # the newest index's own time (the push's event time, the read's)
-        self.calib = (1.0, 0)  # (the factor σ is priced with, the windows it was measured on): Bot.sigma_calib, SIGMA_CALIB
-
-    @property
-    def sigma_used(self) -> float | None:
-        """The σ the odds are priced with: the measured one times the calibration factor (1 until SIGMA_CALIB has windows)."""
-        return None if self.sigma is None else self.sigma * self.calib[0]
 
     async def get(self, path: str, **params: Any) -> Any:
         return await self.futures(path, **params)
@@ -12715,6 +12770,9 @@ class Bot:
             self.store.put("web_token", self.web_token)
         self.web: WebServer | None = None
         self.vols = VolBook(config.prob_vol, self.store)
+        if config.sigma_calib:
+            with contextlib.suppress(Exception):
+                self.vols.calib = self.index_sigma_calibs()  # the index cards' σ factors from the snapshots on disk
         if restored := self.vols.load():
             LOG.info("波动率历史已从数据库恢复：%d 个标的", restored)
         self.predict = PredictFeed(config)
@@ -13668,22 +13726,25 @@ class Bot:
             if self.window_settle_row(row, float(final)):
                 self.store.put(key, row)
         self.sigma_calib_cache.pop(spec.key, None)  # the card's factor is measured again on the next refresh (sigma_calib)
+        self.sigma_calib_cache.pop(CRYPTO_DAY_CALIB, None)
 
     SIGMA_CALIB_PRIOR = 20     # sigma_calib: windows' worth of "σ is right" the measured ones are averaged with
     SIGMA_CALIB_RANGE = (0.7, 1.4)
 
     def sigma_calib(self, key: str) -> tuple[float, int]:
-        """The factor a 15-minute card's σ is priced with (SIGMA_CALIB, 1.106.0) and the windows it rests on: the RMS of
-        the standardised moves of its windows — each market's earliest sample made with the current estimator
-        (IndexUpDownMarket.SIGMA_MODEL), the move from the line over the raw σ√τ priced then — pooled with
-        SIGMA_CALIB_PRIOR windows at 1 and kept within SIGMA_CALIB_RANGE. 1 with no such window yet. Cached until a
-        window of the card settles (window_resolve)."""
+        """The factor a card's σ is priced with (SIGMA_CALIB, 1.106.0) and the windows it rests on: the RMS of the
+        standardised moves of its windows — each market's earliest sample made with the current estimator
+        (SIGMA_MODEL), the move from the line over the raw σ√τ priced then — pooled with SIGMA_CALIB_PRIOR windows at 1
+        and kept within SIGMA_CALIB_RANGE. A 15-minute card's by its key; the daily crypto cards' together under
+        CRYPTO_DAY_CALIB (1.106.1: a window a day each, the three moving on the same days). 1 with no such window yet.
+        Cached until a window settles (window_resolve)."""
         cached = self.sigma_calib_cache.get(key)
         if cached is not None:
             return cached
         firsts: dict[str, dict] = {}
         for r in self.window_rows():
-            if (r.get("key") != key or r.get("move") is None or int(r.get("model") or 1) < IndexUpDownMarket.SIGMA_MODEL
+            mine = r.get("kind") == "day" if key == CRYPTO_DAY_CALIB else (r.get("key") == key and r.get("kind") == "window")
+            if (not mine or r.get("move") is None or int(r.get("model") or 1) < UpDownMarket.SIGMA_MODEL
                     or not r.get("sigma_raw") or not r.get("tau")):
                 continue
             slug = str(r.get("slug"))
@@ -13774,10 +13835,11 @@ class Bot:
                     by_hour.setdefault(dt.datetime.fromtimestamp(r["start"] / 1000, BEIJING).strftime("%H 时"), []).append(z)
                 if len(by_hour) > 1:
                     lines.append("      按开始时间：" + "、".join(f"{h} {math.sqrt(sum(z * z for z in v) / len(v)):.2f}（{len(v)}）" for h, v in sorted(by_hour.items())))
-            if items[0].get("kind") == "window":
-                factor, n = self.sigma_calib(str(items[0].get("key")))
-                lines.append(f"    σ 校准系数：×{factor:.2f}（按 {n} 个窗口；只算 1.106.0 新估计法的样本，先验 {self.SIGMA_CALIB_PRIOR} 个窗口按 1 计；"
-                             + ("卡片按它定价" if self.config.sigma_calib else "SIGMA_CALIB=off，卡片不用它") + "）")
+            pooled = items[0].get("kind") == "day"
+            factor, n = self.sigma_calib(CRYPTO_DAY_CALIB if pooled else str(items[0].get("key")))
+            lines.append(f"    σ 校准系数{'（BTC / ETH / BNB 日涨跌合并）' if pooled else ''}：×{factor:.2f}（按 {n} 个{'市场' if pooled else '窗口'}；"
+                         f"只算新估计法的样本，先验 {self.SIGMA_CALIB_PRIOR} 个按 1 计；"
+                         + ("卡片按它定价" if self.config.sigma_calib else "SIGMA_CALIB=off，卡片不用它") + "）")
         lines.append("    （市场不到 30 个时差别多半是运气；RMS z 稳定偏离 1 再调 σ 的分钟数或系数）")
         return lines
 
@@ -13913,6 +13975,8 @@ class Bot:
                 "mkt": self.predict_mid(key, slug, now_ms),  # the market's own 涨 price then: /calib scores both
                 "ref_raw": float(raw.ref), "up_raw": raw.fair_up, "strike": float(shown.ref) if shown.ref != raw.ref else None,
                 "move": raw.move, "beta": raw.beta, "sigma": raw.sigma_daily * raw.widen, "widen": raw.widen, "R": raw.remaining, "proxy": raw.proxy_note,
+                "calib": self.vols.calib.get((key, raw.mode), (1.0, 0))[0],  # the factor in that σ: the residuals are taken on the raw one
+                "sigma_raw": raw.sigma_daily * raw.widen / self.vols.calib.get((key, raw.mode), (1.0, 0))[0],
                 "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else ""})
         if time.time() - self.pred_pruned > 86400:  # the snapshots are kept PRED_KEEP_DAYS, not forever
             self.pred_pruned = time.time()
@@ -13953,6 +14017,18 @@ class Bot:
         outcomes = {k.removeprefix("outcome:"): float(v) for k, v in self.store.items("outcome:")}
         skipped = f"（忽略 {len(saved) - len(preds)} 条旧格式快照）" if len(saved) > len(preds) else ""
         return "\n".join([f"📐 概率模型回测（只评估，不会自动改参数）{skipped}"] + calibration_report(preds, outcomes) + self.mark_report() + self.shadow_report() + self.window_report())
+
+    def index_sigma_calibs(self) -> dict[tuple[str, str], tuple[float, int]]:
+        """The σ factor of each index card and mode (盘中 / 盘后) from its scored snapshots (residual_factor), for
+        VolBook.get (SIGMA_CALIB, 1.106.1): measured when an outcome comes in (note_outcome) and at the start."""
+        saved = [v for _, v in self.store.items("pred:") if isinstance(v, dict) and self.PRED_FIELDS <= v.keys()]
+        outcomes = {k.removeprefix("outcome:"): float(v) for k, v in self.store.items("outcome:")}
+        groups: dict[tuple[str, str], list[dict]] = {}
+        for p in saved:
+            close = outcomes.get(f"{p['key']}:{p['target']}")
+            if close is not None and p.get("ref_raw", p.get("ref")):
+                groups.setdefault((p["key"], str(p.get("mode") or "")), []).append(dict(p, y=math.log(close / float(p.get("ref_raw", p["ref"])))))
+        return {key: residual_factor(rows) for key, rows in groups.items()}
 
     async def cmd_calib(self, req: Request) -> str:
         return self.calibration_text()
@@ -14806,7 +14882,9 @@ class Bot:
             base["predict"] = out
         if isinstance(odds, str):
             return {**base, "missing": odds}
-        sigma = mkt.sigma or 0.0
+        sigma = mkt.sigma_used or 0.0
+        calib = getattr(mkt, "calib", (1.0, 0))
+        calib_note = f"，按 {calib[1]} 个加密日涨跌市场的实际波动校准 ×{calib[0]:.2f}" if calib[1] and abs(calib[0] - 1) > 0.005 else ""
         verdict = "涨" if odds.up else "跌" if odds.down else "持平，按 50/50"
         return {**base, "quote_ms": 0 if odds.settled else mkt.priced_ms, "source": "已结算" if odds.settled else "币安现货",
                 "ref": f"{odds.line:,.2f}", "ref_rel": "起点", "unit": "USDT",
@@ -14817,7 +14895,7 @@ class Bot:
                                if odds.settled else f"不用代理：币安 {spec.symbol} 现价就是结算源"),
                 "warn": hold, "sigma_daily": sigma / math.sqrt(365), "remaining": odds.years * 365,
                 "sigma": sigma * math.sqrt(odds.years),
-                "sigma_note": (f"币安 {spec.symbol} 30 日小时收盘年化 {sigma * 100:.1f}%；价格零漂移，中位数比现价低 σ²τ/2"
+                "sigma_note": (f"币安 {spec.symbol} 近 30 日小时收盘按指数加权（近 5 日权重过半）年化 {sigma * 100:.1f}%{calib_note}；价格零漂移，中位数比现价低 σ²τ/2"
                                if not odds.settled else "已结算"),
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down}
@@ -14902,6 +14980,7 @@ class Bot:
         value = float(value)
         if self.store.get(f"outcome:{key}:{day}") != value:
             self.store.put(f"outcome:{key}:{day}", value)
+            self.vols.calib = self.index_sigma_calibs() if self.config.sigma_calib else {}  # a new outcome: the σ factors measured again
         record = {"value": value, "source": source}
         if {k: v for k, v in (self.store.get(f"outsrc:{key}:{day}") or {}).items() if k != "at"} != record:
             self.store.put(f"outsrc:{key}:{day}", {**record, "at": self.market.now_ms()})
@@ -19548,8 +19627,8 @@ class Bot:
         moved = []
         for key, mkt in self.updowns.items():
             before = mkt.price if isinstance(mkt, IndexUpDownMarket) else None
-            if isinstance(mkt, IndexUpDownMarket):
-                mkt.calib = self.sigma_calib(key) if self.config.sigma_calib else (1.0, 0)  # SIGMA_CALIB: σ by the windows' actual moves
+            # SIGMA_CALIB: σ by the windows' actual moves — a 15-minute card's own, the daily crypto cards' pooled
+            mkt.calib = self.sigma_calib(key if isinstance(mkt, IndexUpDownMarket) else CRYPTO_DAY_CALIB) if self.config.sigma_calib else (1.0, 0)
             await mkt.refresh(now_ms)
             if before is not None and mkt.price != before:
                 moved.append(key)
