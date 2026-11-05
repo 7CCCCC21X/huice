@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.107.0"
+VERSION = "1.107.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -16706,6 +16706,10 @@ class Bot:
         end = int(s.get("close_ms") or s.get("deadline") or s.get("end") or 0)
         if not end:
             return "等市场出结果"
+        # an up/down, flip or ladder record keeps the open of its market's last 1-minute candle (updown_settle, FlipSpec /
+        # CapSpec.end_ms): the window ends a minute later, and that is the time shown (1.107.1: a 14:00–14:15 window read
+        # "等窗口结束 14:14"). Without a local result Predict's own is asked for from settle_at on (sim_due).
+        over = end + 60_000 if kind in {"updown", "flip", "ladder"} and not (s.get("close_ms") or s.get("deadline")) else end
         settle_at = end + self.SIM_SETTLE_MS
         if now_ms > settle_at:
             check = trade.get("final_check") or {}
@@ -16713,7 +16717,7 @@ class Bot:
                     else f"（Predict 市场状态：{check.get('status') or '未知'}）" if check else "")
             if kind == "close":
                 return f"收盘（{at(end)}）已过 1 小时，官方收盘还没读到，等 Predict 结算{tail}"
-            return f"窗口已结束（{at(end)}），本地数据还定不了结果，等 Predict 结算{tail}"
+            return f"窗口已结束（{at(over)}），本地数据还定不了结果，等 Predict 结算{tail}"
         if kind == "close":
             return f"等 {str(s.get('target') or '')[5:]} 收盘（{at(end)}）后 1 小时（{at(settle_at)}），按官方收盘预结算，再等 Predict 确认"
         if kind == "touch" and trade.get("key") not in self.touches:
@@ -16721,11 +16725,14 @@ class Bot:
         if kind == "touch":
             return f"先碰到哪条线就按那条线结算；都没碰到的话等截止 {at(end)} 后按 50/50（{at(settle_at)} 起核验）"
         if kind == "updown":
-            return f"等窗口结束 {at(end)}，按终点 1 分钟 K 结算（{at(settle_at)} 起）"
+            # settled locally the moment the last candle is read (sim_result: odds.settled), seconds after the window's end
+            if now_ms >= over:
+                return f"窗口已结束（{at(over)}），等终点那根 1 分钟 K：读到就按它预结算、再向 Predict 核对；{at(settle_at)} 起等 Predict 结算"
+            return f"等窗口结束 {at(over)}，读到终点那根 1 分钟 K 就按它预结算、再向 Predict 核对；读不到的话 {at(settle_at)} 起等 Predict 结算"
         if kind == "flip":
-            return f"窗口内任一分钟反超即 Yes；否则等窗口结束 {at(end)} 后按 No（{at(settle_at)} 起）"
+            return f"窗口内任一分钟反超即 Yes；否则等窗口结束 {at(over)} 后按 No（{at(settle_at)} 起）"
         if kind in {"range", "ladder"}:
-            return f"碰到档位即 Yes；否则等窗口结束 {at(end)} 后按 No（{at(settle_at)} 起）"
+            return f"碰到档位即 Yes；否则等窗口结束 {at(over)} 后按 No（{at(settle_at)} 起）"
         return f"等市场出结果（{at(end)}）"
 
     def sim_result(self, trade: dict, now_ms: int) -> tuple[float, str, dict] | None:

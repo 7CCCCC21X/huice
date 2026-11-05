@@ -249,6 +249,16 @@ async def run():
                  "settle": {"end": SPEC.end_ms, "start": SPEC.start_ms, "day": "2026-11-04"}}
     assert bot.sim_result(eth_trade, clock[0]) is None  # its final close never read: Predict's result settles it
     assert bot.sim_due(eth_trade, SPEC.end_ms + bot.SIM_SETTLE_MS + 1)
+    # 1.107.1: the wait text names the window's end (the minute after the last candle's open) and says the local result
+    # comes as soon as that candle is read — the hour-later time is only for when it cannot be
+    at = lambda ms: m.stamp(ms, seconds=False)
+    assert bot.sim_wait(eth_trade, None, SPEC.end_ms - MIN) == (
+        f"等窗口结束 {at(SPEC.end_ms + MIN)}，读到终点那根 1 分钟 K 就按它预结算、再向 Predict 核对；"
+        f"读不到的话 {at(SPEC.end_ms + bot.SIM_SETTLE_MS)} 起等 Predict 结算"), bot.sim_wait(eth_trade, None, SPEC.end_ms - MIN)
+    assert bot.sim_wait(eth_trade, None, SPEC.end_ms + 2 * MIN) == (
+        f"窗口已结束（{at(SPEC.end_ms + MIN)}），等终点那根 1 分钟 K：读到就按它预结算、再向 Predict 核对；"
+        f"{at(SPEC.end_ms + bot.SIM_SETTLE_MS)} 起等 Predict 结算")
+    assert bot.sim_wait(eth_trade, None, SPEC.end_ms + bot.SIM_SETTLE_MS + 1).startswith(f"窗口已结束（{at(SPEC.end_ms + MIN)}），本地数据还定不了结果")
 
     # --- a restart: shortly after noon the card starts on the day just over while its final close is unread -------------------
     s2 = m.Store(":memory:")

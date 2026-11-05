@@ -576,6 +576,7 @@ async def run():
     assert "｜撤单 1 笔" in dbot.cmd_sim(None).text and "撤单" not in fresh.cmd_sim(None).text  # counted only when there are any
     j = {x["id"]: x for x in dbot.journal_payload()["trades"]}
     assert j["sol#11|down|挂#1"]["wait"] == "" and j["sol#11|down|挂#1"]["text"] == "已撤单"
+    # a price ladder (kind range) keeps its real end as close_ms; this fabricated record's bare end is shown as it is (1.107.1)
     assert j["sol#12|down|挂"]["wait"] == "碰到档位即 Yes；否则等窗口结束 11-01 11:59 后按 No（11-01 12:59 起）"
     assert "已撤单" in dbot.journal_csv() and json.dumps(dbot.journal_payload())
 
