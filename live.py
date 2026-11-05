@@ -1904,7 +1904,9 @@ class LiveBot(core.Bot):
         self.sim_save([(tid, trade)])
 
     LIVE_LATE_FILLS_MS = 60_000               # live_late_fills runs at most this often
-    LIVE_LATE_FILLS_WINDOW_MS = 2 * 3_600_000  # ...over the orders that ended within this long
+    LIVE_LATE_FILLS_WINDOW_MS = 2 * core.DAY_MS  # ...over the orders that ended within this long (1.119.2: two days, as /live positions looks back;
+    #                                             two hours missed a 300-share SK Hynix fill whose orders had ended the evening before the deploy)
+    LIVE_DUST_SHARES = 0.1                     # a holding, or an excess of one, under this many shares is dust: neither adopted nor flagged
     LIVE_LATE_FILLS_GRACE_MS = 15_000          # ...and not before this long after their end: the positions list follows the matching a little late
 
     LIVE_TRIM_MAX = 0.05                       # a holding short of the records by more than this share is not a fee: left as it is (noted on the page)
@@ -1962,7 +1964,7 @@ class LiveBot(core.Bot):
             if not k[0] or not k[1] or k in seen:
                 continue
             excess = held.get(k, 0.0) - recorded.get(k, 0.0)
-            if excess <= 0.01:
+            if excess <= self.LIVE_DUST_SHARES:
                 continue
             seen.add(k)  # the newest order on the outcome takes the excess; the outcome is not trimmed in the same pass
             before, order = float(t.get("shares") or 0), float(t.get("order") or 0)
@@ -1976,7 +1978,7 @@ class LiveBot(core.Bot):
                 how = f"结束后再读订单记录，读到成交 {after - before:g} 份（累计 {after:g}/{order:g}）"
             else:
                 adopt = min(excess, order - after)
-                if adopt <= 0.01:
+                if adopt <= self.LIVE_DUST_SHARES:
                     continue
                 self.live_apply(tid, t, {"status": str(st.get("final") or "closed").upper(), "amount": str(to_wei(order)),
                                          "amountFilled": str(to_wei(after + adopt))}, None, now_ms)
@@ -2882,6 +2884,9 @@ class LiveBot(core.Bot):
         out = []
         for r in rows:
             token, shares, line = self.position_token(r), self.position_shares(r), self.position_line(r)
+            if shares < self.LIVE_DUST_SHARES:
+                out.append(line + "｜零头（不到 0.1 份），不计")
+                continue
             if not token:
                 out.append(line + "｜记录？（读不出结果代币，无法对照）")
                 continue
@@ -2906,9 +2911,9 @@ class LiveBot(core.Bot):
         lines = self.position_lines(rows[:30], self.sim_trades(), now_ms)
         if not lines:
             return "Predict 上的持仓：无"
-        missing, differ = sum("⚠️ 无记录" in l for l in lines), sum("比记录" in l for l in lines)
-        return (f"Predict 上的持仓 {len(lines)} 个：{len(lines) - missing - differ} 个与记录一致，{differ} 个份数不符，{missing} 个无记录\n"
-                + "\n".join(lines))
+        missing, differ, dust = sum("⚠️ 无记录" in l for l in lines), sum("比记录" in l for l in lines), sum("｜零头（" in l for l in lines)
+        return (f"Predict 上的持仓 {len(lines)} 个：{len(lines) - missing - differ - dust} 个与记录一致，{differ} 个份数不符，{missing} 个无记录"
+                + (f"，{dust} 个零头" if dust else "") + "\n" + "\n".join(lines))
 
     def live_text(self, now_ms: int) -> str:
         trades = self.sim_trades()

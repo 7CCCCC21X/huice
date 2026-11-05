@@ -635,8 +635,12 @@ async def run():
     assert f"rest｜Up 5 份｜⚠️ 无记录（这一边有 1 张没成交就结束的订单：#{oid}，可能撤单前成交了没读到，每分钟自动核对补记）" in ptext, ptext
     fake.positions_rows.append({"id": "p5", "market": {"id": 555, "title": "someone else's"}, "outcome": {"name": "No", "indexSet": 2, "onChainId": "5552"}, "amount": str(3 * WEI)})
     assert "someone else's｜No 3 份｜⚠️ 无记录（本机器人近两天没有这一边的订单：手动买的或旧持仓，到期照常自动领取）" in await bot.cmd_live(req("positions"))
-    fake.positions_rows.pop()
-    assert bot.live_status(bot.market.now_ms())["positions"] == ptext.split("\n")[1:], ptext
+    fake.positions_rows.append({"id": "p6", "market": {"id": 101, "title": "恒生指数 10-05"}, "outcome": {"name": "Up", "indexSet": 1, "onChainId": "1011"}, "amount": str(int(0.05 * WEI))})
+    ptext = await bot.cmd_live(req("positions"))
+    assert "恒生指数 10-05｜Up 0.05 份｜零头（不到 0.1 份），不计" in ptext and ptext.split("\n")[0].endswith("3 个无记录，1 个零头"), ptext
+    fake.positions_rows.pop(); fake.positions_rows.pop()
+    ptext = await bot.cmd_live(req("positions"))  # the control page carries the same lines as the command, from the last read
+    assert ptext.startswith("Predict 上的持仓 3 个：") and bot.live_status(bot.market.now_ms())["positions"] == ptext.split("\n")[1:], ptext
     lines = await bot.live_redeem(CLOSE + 70 * 60_000)
     assert len(lines) == 1 and "已领取 恒生指数 10-05 Down 100 份：0xredeem" in lines[0], lines
     assert bot.live.chain.redeemed == [("0x" + "ab" * 32, 2, 100 * WEI, False, False)] and bot.store.get("live:redeemed:101:2")["tx"] == "0xredeem"
@@ -982,7 +986,7 @@ async def run():
     # --- 1.119.0: fills that landed as an order was ending, read later: the orders that ended with shares unfilled are set against the
     # account's positions once a minute (not within 15 s of their end) — the order's own record first, else the position's excess is
     # taken as filled on the newest such order
-    async def late_case(by_record: bool):
+    async def late_case(by_record: bool, delay: int = 70_000):  # delay: the pass that adopts, after the cancel at NOW
         lbot = make_bot(SIM_MAKER_MIN_BID="100", SIM_MAKER_EXIT_CENTS="5", SIM_MAKER_SESSION="on", SIM_WAYS="maker")
         await lbot.live_prepare(); lfake = lbot.live.api
         await lbot.live_prefetch(NOW)
@@ -998,31 +1002,37 @@ async def run():
             lfake.closed["101"]["amountFilled"] = str(10 * WEI)  # the order's record shows the fill when read again
         await step(lbot, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000))  # within the grace and the minute: not yet
         assert next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] == 0
-        await step(lbot, NOW + 70_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 70_000))
+        await step(lbot, NOW + delay, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + delay))
         late = next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")
         assert late["status"] == "filled" and abs(late["shares"] - 10) < 1e-9 and abs(late["unfilled"] - 90) < 1e-9 and "订单结束后补记" in late["note"], late
         how = next(e["what"] for e in late["live"]["events"] if e["what"].startswith("结束后核对持仓："))
         assert how == ("结束后核对持仓：结束后再读订单记录，读到成交 10 份（累计 10/100）" if by_record
                        else "结束后核对持仓：账户在这一边的持仓比记录多 10 份、订单记录没显示：按成交 10 份补记（累计 10/100）"), how
         assert len(late["fills"]) == 1 and late["fills"][0]["shares"] == 10 and abs(lbot.live_reserved(late) - 10 * late["price"]) < 1e-9
-        await step(lbot, NOW + 140_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 140_000))  # explained now: nothing more is adopted
+        await step(lbot, NOW + delay + 70_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + delay + 70_000))  # explained now: nothing more is adopted
         assert abs(next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] - 10) < 1e-9
         # 1.119.1: the account holds a little less than the records say (the taker fee taken in shares): the records are trimmed to
         # the holding once the same shortfall has stood a minute (the second pass), no order with fills working there; a shortfall
         # beyond 5% is not a fee and is left alone
         lfake.positions_rows[0]["amount"] = str(int(9.8 * WEI))
-        await step(lbot, NOW + 210_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 210_000))  # seen once: not yet
+        await step(lbot, NOW + delay + 140_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + delay + 140_000))  # seen once: not yet
         assert abs(next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] - 10) < 1e-9
-        await step(lbot, NOW + 280_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 280_000))
+        await step(lbot, NOW + delay + 210_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + delay + 210_000))
         trimmed = next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")
         assert abs(trimmed["shares"] - 9.8) < 1e-9 and abs(trimmed["fee_shares"] - 0.2) < 1e-9 and trimmed["status"] == "filled", trimmed
         assert any(e["what"].startswith("按 Predict 持仓校正份数：10 → 9.8（账户在这一边共持有 9.8 份，比记录的 10 份少 0.2 份") for e in trimmed["live"]["events"]), trimmed["live"]["events"]
         lfake.positions_rows[0]["amount"] = str(5 * WEI)
-        for at in (NOW + 350_000, NOW + 420_000):
+        for at in (NOW + delay + 280_000, NOW + delay + 350_000):
+            await step(lbot, at, hsi(0.70, [("0.55", "300")], [("0.58", "400")], at))
+        assert abs(next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] - 9.8) < 1e-9
+        # 1.119.2: an excess under a tenth of a share is dust, not a fill to adopt
+        lfake.positions_rows[0]["amount"] = str(int(9.85 * WEI))
+        for at in (NOW + delay + 420_000, NOW + delay + 490_000):
             await step(lbot, at, hsi(0.70, [("0.55", "300")], [("0.58", "400")], at))
         assert abs(next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] - 9.8) < 1e-9
     await late_case(False)
     await late_case(True)
+    await late_case(False, delay=3 * 3_600_000)  # 1.119.2: an order that ended hours ago is still set against the positions
 
     # --- execution safety: reserved until Predict's final word, cancels confirmed, unknown results reconciled, the pre-send check
     sbot = make_bot(SIM_WAYS="both")
