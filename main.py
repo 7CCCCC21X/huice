@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.105.2"
+VERSION = "1.106.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -488,6 +488,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_AFTER_HOURS_SHARES", "盘后吃单每次最多买多少份", "0～1000000：开盘前、收盘后的吃单单独按这个份数；0 = 同盘中吃单的份数"),
     ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
+    ("SIGMA_CALIB", "15 分钟涨跌 σ 自动校准", "开 = 每张 15 分钟卡的 σ 乘以按定时样本算出的系数（各窗口实际波动对预测的均方根，和 20 个“刚好”的先验窗口一起平均，限 0.7～1.4；只算新估计法的样本）；关 = 只用估计值"),
     ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限、盘后每边持仓上限、加密日涨跌和 15 分钟涨跌的每边上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
     ("SIM_NO_ODDS_WITHDRAW_MINUTES", "概率暂缺多久撤单（分钟）", "0～1440：卡片的概率暂缺（如上证卡周末 A50 休市、行情断流）或暂不建议持续这么多分钟后，这个市场挂着的单撤掉（低价挂单也撤），概率回来再按新公平价重挂；没有概率时本来就不开新单；0 = 不撤、挂着等"),
@@ -632,6 +633,7 @@ class Config:
     sim_max_fair: float = 0.95                 # SIM_MAX_FAIR_CENTS: the trader judges a side by its fair price at most this high (the tail a normal model cannot see); 1 = as the card says
     big_move_sigmas: float = 1.5               # PROB_BIG_MOVE_SIGMAS: a daily card's σ ahead is widened once the day's move passes this many daily σ (big_move_widen); 0 = never
     sim_after_hours_max_shares: float = 300.0  # SIM_AFTER_HOURS_MAX_SHARES: after hours a market's side holds at most this many shares (positions and orders); 0 = no limit
+    sigma_calib: bool = True      # SIGMA_CALIB: a 15-minute card's σ times the factor its windows' moves imply (Bot.sigma_calib)
     sim_shares_net: bool = True   # SIM_SHARES_NET: the share caps count a side's net position — what it holds less the other side's fills; off = each side on its own
     sim_open_quiet_minutes: int = 3            # SIM_OPEN_QUIET_MINUTES: no new order on a daily card this long after its underlying opens; 0 = none
     sim_no_odds_withdraw: int = 30             # SIM_NO_ODDS_WITHDRAW_MINUTES: a resting order on a market the bot cannot price (odds missing, suggestion held) this long is withdrawn; 0 = never
@@ -866,6 +868,7 @@ class Config:
             sim_maker_deep_only=not off(e.get("SIM_MAKER_DEEP_ONLY", "off")),
             sim_maker_points=not off(e.get("SIM_MAKER_POINTS", "on")),
             sim_shares_net=not off(e.get("SIM_SHARES_NET", "on")),
+            sigma_calib=not off(e.get("SIGMA_CALIB", "on")),
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -7222,13 +7225,19 @@ class UpDownMarket:
     def model_swing(self, odds: UpDownOdds) -> float:
         """How far the fair Up price moves with σ ×/÷ 1.25, or with the median at today's price instead of σ²τ/2 below
         it (each varied alone): over a month that alone is a few cents at the line."""
-        if odds.settled or not self.sigma:
+        used = self.sigma_used
+        if odds.settled or not used:
             return 0.0
         def fair(sigma: float, drift: float) -> float:
             up, flat, _, _ = updown_odds(float(odds.price), float(odds.line), sigma, odds.years, drift)
             return up + flat / 2
         return max(abs(fair(sigma, drift) - odds.fair_up) for sigma, drift in
-                   ((self.sigma * MODEL_SIGMA_ERROR, -0.5), (self.sigma / MODEL_SIGMA_ERROR, -0.5), (self.sigma, 0.0)))
+                   ((used * MODEL_SIGMA_ERROR, -0.5), (used / MODEL_SIGMA_ERROR, -0.5), (used, 0.0)))
+
+    @property
+    def sigma_used(self) -> float | None:
+        """The σ the odds are priced with (an index card's: the measured one times its calibration factor)."""
+        return self.sigma
 
     def advice_problem(self, odds: UpDownOdds, now_ms: int) -> str:
         """Why no trade is suggested from these odds ("" when one may be)."""
@@ -7239,13 +7248,43 @@ class UpDownMarket:
         return ""
 
 
-def minute_vol(rows: list, now_ms: int, minutes: int = 240, keep: Any = None) -> float:
-    """Annualised σ of a price's finished 1-minute closes (realized_vol): over the last ``minutes`` (half an hour of them
-    at least), or over the last hour when that is higher (a quiet morning does not hide an afternoon that moves). With
-    ``keep`` (open_ms -> bool: a session's minutes) only those candles count, and only the returns between neighbouring
-    minutes — not the jump over a lunch break or a night. 0 when the price has not moved at all."""
-    vol = lambda count: realized_vol(rows, now_ms, count, 365 * 24 * 60, 30, "指数 1 分钟 K 线", keep, 60_000)
-    return max(vol(minutes), vol(60))
+MINUTE_VOL_HALF_LIFE = 60  # minute_vol: the weight of a minute's return halves every hour back — the last hour carries about half
+MINUTE_VOL_OPEN = 60       # ...and a session under this many minutes old is priced at least on its own minutes (the open's volatility)
+MINUTE_VOL_MIN = 30        # returns needed for a σ at all
+
+
+def minute_returns(rows: list, now_ms: int, keep: Any = None) -> list[tuple[int, float]]:
+    """(open_ms, log return) of a price's finished 1-minute candles (Binance klines), neighbouring minutes only — not the
+    jump over a lunch break or a night; with ``keep`` (open_ms -> bool: a session's minutes) those candles alone."""
+    done = [r for r in rows if isinstance(r, list) and len(r) > 6 and int(r[6]) < now_ms and (keep is None or keep(int(r[0])))]
+    if done and min(float(r[4]) for r in done) <= 0:
+        raise ValueError("指数 1 分钟 K 线价格无效")
+    return [(int(b[0]), math.log(float(b[4]) / float(a[4]))) for a, b in zip(done, done[1:]) if int(b[0]) - int(a[0]) == 60_000]
+
+
+def minute_vol(rows: list, now_ms: int, minutes: int = 240, keep: Any = None, half_life: int = MINUTE_VOL_HALF_LIFE,
+               open_floor: bool = True) -> float:
+    """Annualised σ of a price's finished 1-minute closes: the exponentially weighted RMS of the last ``minutes`` returns
+    (zero mean; a weight halving every ``half_life`` minutes back: the last hour carries about half), and, while a
+    session is under MINUTE_VOL_OPEN minutes old, at least the plain RMS of its own minutes (the open moves more than the
+    weights have caught up with). With ``keep`` (open_ms -> bool: a session's minutes) only those candles count, and
+    only the returns between neighbouring minutes — not the jump over a lunch break or a night. 0 when the price has
+    not moved at all. 1.106.0: 1.103.0 took the larger of the last four hours' σ and the last hour's — the open's hour
+    stayed in the four-hour figure all morning and the larger of two noisy figures is biased up: the 11-04/05 windows
+    moved 0.69 (SK 海力士) and 0.77 (宇树) of the σ√τ priced, 1.0 in the hour after the open and 0.4–0.6 later."""
+    rets = minute_returns(rows, now_ms, keep)[-minutes:]
+    if len(rets) < MINUTE_VOL_MIN:
+        raise ValueError("指数 1 分钟 K 线不足")
+    per_year = 365 * 24 * 60
+    weights = [0.5 ** ((len(rets) - 1 - i) / half_life) for i in range(len(rets))]
+    sigma = math.sqrt(sum(w * r * r for w, (_, r) in zip(weights, rets)) / sum(weights) * per_year)
+    run = 1  # the unbroken stretch of minutes up to now: a session's age, when the kept minutes are a session's
+    while run < len(rets) and rets[-run][0] - rets[-run - 1][0] == 60_000:
+        run += 1
+    if open_floor and 10 <= run < MINUTE_VOL_OPEN and run < len(rets):
+        own = [r for _, r in rets[-run:]]
+        sigma = max(sigma, math.sqrt(sum(r * r for r in own) / len(own) * per_year))
+    return sigma
 
 
 class IndexUpDownMarket(UpDownMarket):
@@ -7261,7 +7300,8 @@ class IndexUpDownMarket(UpDownMarket):
     CANDLE_GRACE_MS = 1_500      # and only this long after its minute ended
     PRICE_STALE_MS = 60_000      # an index older than this prices nothing
     SIGMA_STALE_MS = 30 * 60_000
-    SIGMA_MINUTES = 240          # σ: the last four hours of 1-minute index candles (or the last hour, when higher)
+    SIGMA_MINUTES = 240          # σ: the last four hours of 1-minute index candles, the last hour weighing about half (minute_vol)
+    SIGMA_MODEL = 2              # the estimator's version, kept on each sample: the calibration counts samples of the current one alone
     TIE = D("0.0005")            # an end this close to the start (relative) is left to Predict: Chainlink's report may differ
 
     SIGMA_ROWS = 1500            # candles read for σ when the trading minutes are a subset (the previous session's reach back a day)
@@ -7272,6 +7312,12 @@ class IndexUpDownMarket(UpDownMarket):
         self.exchange = exchange  # the stock exchange whose session the windows follow ("" = round the clock)
         self.trading = trading    # open_ms -> whether that minute is in the exchange's session (session_minute_fn): σ counts those alone
         self.index_ms = 0  # the newest index's own time (the push's event time, the read's)
+        self.calib = (1.0, 0)  # (the factor σ is priced with, the windows it was measured on): Bot.sigma_calib, SIGMA_CALIB
+
+    @property
+    def sigma_used(self) -> float | None:
+        """The σ the odds are priced with: the measured one times the calibration factor (1 until SIGMA_CALIB has windows)."""
+        return None if self.sigma is None else self.sigma * self.calib[0]
 
     async def get(self, path: str, **params: Any) -> Any:
         return await self.futures(path, **params)
@@ -7365,7 +7411,7 @@ class IndexUpDownMarket(UpDownMarket):
         if not self.sigma > 0:
             return "指数在最近的交易时段里没有变动，暂停概率"
         years = (spec.end_ms + 60_000 - now_ms) / YEAR_MS
-        up, flat, down, z = updown_odds(float(self.price), float(line), self.sigma, years)
+        up, flat, down, z = updown_odds(float(self.price), float(line), self.sigma_used, years)
         return UpDownOdds(up, flat, down, z, line, self.price, years)
 
 
@@ -9167,6 +9213,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_MAKER_DEEP_ONLY_MARKETS": {"kind": "detail", "group": "策略"},    # drawn inside the SIM_MAKER_DEEP_ONLY card
     "SIM_MAKER_POINTS": {"kind": "choice", "group": "策略", "options": [["off", "都挂"], ["on", "只挂积分已激活的"]]},
     "SIM_SHARES_NET": {"kind": "choice", "group": "策略", "options": [["on", "按净头寸"], ["off", "每边单独"]]},
+    "SIGMA_CALIB": {"kind": "choice", "group": "策略", "options": [["on", "按样本校准"], ["off", "只用估计值"]]},
     "SIM_GROUP_USD": {"kind": "number", "group": "策略", "presets": ["0", "100", "300", "500", "1000"], "unit": "$", "zero": "不限"},
     "LIVE_MAX_ORDER_USD": {"kind": "number", "group": "风控", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
     "LIVE_MAX_OPEN_USD": {"kind": "number", "group": "风控", "presets": ["100", "300", "500", "1000", "3000"], "unit": "$"},
@@ -12732,6 +12779,7 @@ class Bot:
         self.sim_requote_live = 0           # ...of which real orders (LiveBot.live_requote_freed)
         self.sim_follow_since: dict[str, tuple[float, int]] = {}  # market|side -> (the place a resting order would move to, since when it has been that: sim_follow_settled)
         self.sim_follow_timers: dict[str, asyncio.TimerHandle] = {}  # book key -> the express look due when a follow's settle runs out (sim_follow_wake)
+        self.sigma_calib_cache: dict[str, tuple[float, int]] = {}  # card key -> (σ factor, windows measured): sigma_calib
         self.sim_taker_seen: dict[str, int] = {}  # taker slot -> when (ms) its side was first buyable in the run of looks that still finds it so (SIM_TAKER_HOLD_SECONDS)
         self.sim_unpriced_since: dict[str, int] = {}  # market -> when (ms) a step first found it unpriced with an order resting (sim_unpriced_reason)
         self.sim_step_ms: dict[str, int] = {}  # the last decision phase, by part (for /diag)
@@ -13585,8 +13633,10 @@ class Bot:
                                "ask": float(book.ask[0]) if book is not None and book.ask else None,
                                "book_age": round((now_ms - book.fetched_ms) / 1000, 1) if book is not None else None}
         if isinstance(odds, UpDownOdds):
-            row.update(up=odds.fair_up, sigma=mkt.sigma, tau=odds.years, z=odds.z, price=float(odds.price), line=float(odds.line),
-                       need=self.edge_need(mkt.model_swing(odds)), hold=self.updown_hold(mkt, odds, now_ms)[0], settled=odds.settled)
+            calib = getattr(mkt, "calib", (1.0, 0))
+            row.update(up=odds.fair_up, sigma=mkt.sigma_used, sigma_raw=mkt.sigma, calib=calib[0], tau=odds.years, z=odds.z, price=float(odds.price),
+                       line=float(odds.line), need=self.edge_need(mkt.model_swing(odds)), hold=self.updown_hold(mkt, odds, now_ms)[0], settled=odds.settled,
+                       model=getattr(mkt, "SIGMA_MODEL", 1))  # the estimator's version: the calibration counts the current one's samples alone
         else:
             line = mkt.close_of("start")
             row.update(note=odds, line=float(line) if line is not None else None)
@@ -13617,6 +13667,34 @@ class Bot:
                 row["line"] = float(start.get("close") or 0) if isinstance(start, dict) else 0.0
             if self.window_settle_row(row, float(final)):
                 self.store.put(key, row)
+        self.sigma_calib_cache.pop(spec.key, None)  # the card's factor is measured again on the next refresh (sigma_calib)
+
+    SIGMA_CALIB_PRIOR = 20     # sigma_calib: windows' worth of "σ is right" the measured ones are averaged with
+    SIGMA_CALIB_RANGE = (0.7, 1.4)
+
+    def sigma_calib(self, key: str) -> tuple[float, int]:
+        """The factor a 15-minute card's σ is priced with (SIGMA_CALIB, 1.106.0) and the windows it rests on: the RMS of
+        the standardised moves of its windows — each market's earliest sample made with the current estimator
+        (IndexUpDownMarket.SIGMA_MODEL), the move from the line over the raw σ√τ priced then — pooled with
+        SIGMA_CALIB_PRIOR windows at 1 and kept within SIGMA_CALIB_RANGE. 1 with no such window yet. Cached until a
+        window of the card settles (window_resolve)."""
+        cached = self.sigma_calib_cache.get(key)
+        if cached is not None:
+            return cached
+        firsts: dict[str, dict] = {}
+        for r in self.window_rows():
+            if (r.get("key") != key or r.get("move") is None or int(r.get("model") or 1) < IndexUpDownMarket.SIGMA_MODEL
+                    or not r.get("sigma_raw") or not r.get("tau")):
+                continue
+            slug = str(r.get("slug"))
+            if slug not in firsts or int(r.get("left") or 0) > int(firsts[slug].get("left") or 0):
+                firsts[slug] = r
+        zs = [r["move"] / (float(r["sigma_raw"]) * math.sqrt(float(r["tau"]))) for r in firsts.values() if float(r["sigma_raw"]) * math.sqrt(float(r["tau"])) > 0]
+        n = len(zs)
+        factor = math.sqrt((sum(z * z for z in zs) + self.SIGMA_CALIB_PRIOR) / (n + self.SIGMA_CALIB_PRIOR)) if n else 1.0
+        low, high = self.SIGMA_CALIB_RANGE
+        self.sigma_calib_cache[key] = (min(max(factor, low), high), n)
+        return self.sigma_calib_cache[key]
 
     def window_rows(self) -> list[dict]:
         """Every sample, oldest first; one whose market ended while the bot was down is settled here on the kept end."""
@@ -13696,6 +13774,10 @@ class Bot:
                     by_hour.setdefault(dt.datetime.fromtimestamp(r["start"] / 1000, BEIJING).strftime("%H 时"), []).append(z)
                 if len(by_hour) > 1:
                     lines.append("      按开始时间：" + "、".join(f"{h} {math.sqrt(sum(z * z for z in v) / len(v)):.2f}（{len(v)}）" for h, v in sorted(by_hour.items())))
+            if items[0].get("kind") == "window":
+                factor, n = self.sigma_calib(str(items[0].get("key")))
+                lines.append(f"    σ 校准系数：×{factor:.2f}（按 {n} 个窗口；只算 1.106.0 新估计法的样本，先验 {self.SIGMA_CALIB_PRIOR} 个窗口按 1 计；"
+                             + ("卡片按它定价" if self.config.sigma_calib else "SIGMA_CALIB=off，卡片不用它") + "）")
         lines.append("    （市场不到 30 个时差别多半是运气；RMS z 稳定偏离 1 再调 σ 的分钟数或系数）")
         return lines
 
@@ -14761,7 +14843,9 @@ class Bot:
             base["predict"] = out
         if isinstance(odds, str):
             return {**base, "missing": odds}
-        sigma = mkt.sigma or 0.0
+        sigma = mkt.sigma_used or 0.0
+        calib = getattr(mkt, "calib", (1.0, 0))
+        calib_note = f"，按 {calib[1]} 个窗口的实际波动校准 ×{calib[0]:.2f}" if calib[1] and abs(calib[0] - 1) > 0.005 else ""
         verdict = "涨" if odds.up else "跌"
         minutes = max(odds.years * YEAR_MS / 60_000, 0.0)
         return {**base, "quote_ms": 0 if odds.settled else mkt.priced_ms, "source": "已结算" if odds.settled else "币安合约指数价",
@@ -14773,7 +14857,7 @@ class Bot:
                                if odds.settled else "不用代理：结算源 Chainlink 的价格就是币安合约的指数价（markPrice 推送的 i）"),
                 "warn": hold, "sigma_daily": sigma / math.sqrt(365), "remaining": odds.years * 365,
                 "sigma": sigma * math.sqrt(odds.years),
-                "sigma_note": (f"币安合约 {spec.symbol} 指数近 4 小时（或近 1 小时，取大）1 分钟 K 年化 {sigma * 100:.1f}%；"
+                "sigma_note": (f"币安合约 {spec.symbol} 指数近 4 小时 1 分钟 K（近 1 小时权重过半，开盘首小时按开盘后的）年化 {sigma * 100:.1f}%{calib_note}；"
                                f"剩 {minutes:.1f} 分钟；价格零漂移" if not odds.settled else "已结算"),
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down}
@@ -18452,7 +18536,7 @@ class Bot:
                   "SIM_CRYPTO_15M_SHARES": plain(c.sim_crypto_15m_shares), "SIM_CRYPTO_15M_MAX_SHARES": plain(c.sim_crypto_15m_max_shares),
                   "SIM_CRYPTO_15M_QUIET_SECONDS": str(c.sim_crypto_15m_quiet), "SIM_CRYPTO_15M_EDGE_CENTS": f"{c.sim_crypto_15m_edge * 100:g}",
                   "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": plain(c.sim_maker_follow_settle), "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points), "SIM_MAKER_DEEPER": flag(c.sim_maker_deeper),
-                  "SIM_SHARES_NET": flag(c.sim_shares_net),
+                  "SIM_SHARES_NET": flag(c.sim_shares_net), "SIGMA_CALIB": flag(c.sigma_calib),
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
                   "SIM_MAKER_SPREAD_CENTS": f"{c.sim_maker_spread * 100:g}", "SIM_MAKER_DEEP_ONLY": flag(c.sim_maker_deep_only),
                   "SIM_MAKER_AFTER_HOURS_MARKETS": ",".join(sorted(c.sim_maker_after_hours_markets)), "SIM_MAKER_DEEP_MARKETS": ",".join(sorted(c.sim_maker_deep_markets)),
@@ -19464,6 +19548,8 @@ class Bot:
         moved = []
         for key, mkt in self.updowns.items():
             before = mkt.price if isinstance(mkt, IndexUpDownMarket) else None
+            if isinstance(mkt, IndexUpDownMarket):
+                mkt.calib = self.sigma_calib(key) if self.config.sigma_calib else (1.0, 0)  # SIGMA_CALIB: σ by the windows' actual moves
             await mkt.refresh(now_ms)
             if before is not None and mkt.price != before:
                 moved.append(key)

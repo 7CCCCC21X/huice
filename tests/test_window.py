@@ -40,13 +40,15 @@ assert K.current(at(11, 50)).slug == "skhynix-updown-15m-1793763900" and K.curre
 assert m.stamp(K.before(K.current(at(8, 0))).start_ms + 60_000, seconds=False) == "11-03 14:15"
 assert W.ROLL_WAIT_MS == 60_000 and m.DailyUpDownSpec.ROLL_WAIT_MS == 10 * 60_000
 
-# --- σ from the index's 1-minute candles: the last four hours, or the last hour when it moves more ---------------------------
+# --- σ from the index's 1-minute candles: the last four hours, the last hour weighing about half (1.106.0) ---------------------
 rows = lambda closes, end: [[end - (len(closes) - i) * 60_000, c, c, c, c, "0", end - (len(closes) - i) * 60_000 + 59_999, "0", 0, "0", "0", "0"]
                             for i, c in enumerate(closes)]
 calm = [str(90 * (1 + 0.0002 * (i % 2))) for i in range(241)]
 assert abs(m.minute_vol(rows(calm, T0), T0) - 0.0002 * math.sqrt(365 * 24 * 60) * math.sqrt(240 / 239)) < 0.02
 lively = calm[:181] + [str(90 * (1 + 0.002 * (i % 2))) for i in range(60)]
-assert m.minute_vol(rows(lively, T0), T0) > 5 * m.minute_vol(rows(calm, T0), T0)  # the last hour's, higher
+assert m.minute_vol(rows(lively, T0), T0) > 5 * m.minute_vol(rows(calm, T0), T0)  # the last hour weighs most
+assert abs(m.minute_vol(rows(lively, T0), T0, half_life=100_000) - m.minute_vol(rows(lively, T0), T0, open_floor=False, half_life=100_000)) < 1e-12 \
+    and m.minute_vol(rows(lively, T0), T0, half_life=100_000) < 0.75 * m.minute_vol(rows(lively, T0), T0), "flat weights: the hour of moves is a quarter of the four (σ ×0.69)"
 assert m.minute_vol(rows(["90"] * 241, T0), T0) == 0.0  # not moved at all: the card pauses on it
 try:
     m.minute_vol(rows(["90"] * 30, T0), T0); assert False
@@ -58,6 +60,12 @@ day_rows = rows(calm_m(121, 90), BJ(11, 30)) + rows(["95"] * 90, BJ(13, 0)) + ro
 session_vol = m.minute_vol(day_rows, BJ(14, 1), 240, m.session_minute_fn("sh"))
 assert abs(session_vol - m.minute_vol(rows(calm_m(241, 90), BJ(11, 30)), BJ(11, 30))) < 0.02 < 1 < m.minute_vol(day_rows, BJ(14, 1), 240)
 assert m.session_minute_fn("sh")(at(9, 30)) and not m.session_minute_fn("sh")(at(11, 30)) and not m.session_minute_fn("sh")(at(9, 30, 7))
+# 1.106.0: a session under an hour old is priced at least on its own minutes — the open moves more than the weighted figure, still
+# carrying the morning's calm, has caught up with
+open_rows = rows(calm_m(121, 90), BJ(11, 30)) + rows([str(90 * (1 + 0.002 * (i % 2))) for i in range(21)], BJ(13, 21))
+sh = m.session_minute_fn("sh")
+assert m.minute_vol(open_rows, BJ(13, 21), 240, sh) > 1.3 > m.minute_vol(open_rows, BJ(13, 21), 240, sh, open_floor=False) > 0.5
+assert len(m.minute_returns(open_rows, BJ(13, 21), sh)) == 139 and m.minute_returns(open_rows, BJ(13, 21), sh)[-20][0] == BJ(13, 1)
 assert m.session_segments("sh", dt.date(2026, 11, 4)) == [(at(9, 30), at(11, 30)), (at(13, 0), at(15, 0))] and m.session_segments("kr", dt.date(2026, 11, 7)) == []
 
 
@@ -357,6 +365,45 @@ async def samples():
     assert "宇树 15分涨跌：1 个市场、3 条样本，已有结果 1 个市场 / 3 条" in report, report
     assert f"剩 14 分：1 条｜模型 Brier {(1 - first['up']) ** 2:.3f}，盘口中间价 0.331（1 条有盘口，模型更准的占 100%），抛硬币 0.250" in report, report
     assert "剩 2 分：1 条" in report and "校准：模型 80–100¢ 的" in report and "波动：1 个市场，实际 / 预测（RMS z）" in report, report
+    # 1.106.0: σ calibration from the windows' actual moves (SIGMA_CALIB): each market's earliest sample made with the current
+    # estimator, z = move / (raw σ√τ), the RMS pooled with 20 windows at 1 — ten windows that moved half of σ√τ: ×0.87; a
+    # sample of the old estimator does not count; the factor is what the card prices with, and the note and /calib say so
+    assert bot.config.sigma_calib and m.CONTROL_FORMS["SIGMA_CALIB"]["kind"] == "choice" and bot.control_value("SIGMA_CALIB") == "on"
+    assert first["sigma_raw"] == card.sigma and first["calib"] == 1.0 and first["model"] == 2 and m.IndexUpDownMarket.SIGMA_MODEL == 2
+    st = 0.5 * math.sqrt(2.7e-5)
+    for i in range(10):
+        base = {"t": T0 - (i + 2) * 900_000, "start": T0 - (i + 2) * 900_000, "end": T0 - (i + 1) * 900_000, "slug": f"c{i}-updown-15m", "key": "UNITREE-15M",
+                "kind": "window", "card": "宇树 15分涨跌", "up": 0.6,
+                "sigma": 0.5, "sigma_raw": 0.5, "calib": 1.0, "model": 2, "tau": 2.7e-5, "line": 100.0, "result": 1.0, "final": 100.0 * math.exp(0.5 * st)}
+        store.put(f"wsample:c{i}-updown-15m:840", {**base, "left": 840, "move": 0.5 * st})
+        store.put(f"wsample:c{i}-updown-15m:120", {**base, "left": 120, "move": 3 * st})  # a later sample of the same market: not the one counted
+    store.put("wsample:old-updown-15m:840", {"t": T0 - 20 * 900_000, "start": T0 - 20 * 900_000, "end": T0 - 19 * 900_000, "slug": "old-updown-15m", "key": "UNITREE-15M", "kind": "window", "card": "宇树 15分涨跌",
+                                             "left": 840, "up": 0.6, "sigma": 0.5, "sigma_raw": 0.5, "model": 1, "tau": 2.7e-5, "line": 100.0, "move": 3 * st, "result": 1.0, "final": 101.0})
+    bot.sigma_calib_cache.clear()
+    real = store.get(f"wsample:{spec.slug}:840")  # the window sampled above has its result too: the eleventh
+    z_real = real["move"] / (real["sigma_raw"] * math.sqrt(real["tau"]))
+    factor, n = bot.sigma_calib("UNITREE-15M")
+    assert n == 11 and abs(factor - math.sqrt((10 * 0.25 + z_real ** 2 + 20) / 31)) < 1e-9 and bot.sigma_calib("UNITREE-15M") == (factor, 11), (factor, n, z_real)
+    assert bot.sigma_calib("SKHYNIX-15M") == (1.0, 0)
+    card.calib = (factor, n)
+    assert abs(card.sigma_used - card.sigma * factor) < 1e-12
+    assert f"σ 校准系数：×{factor:.2f}（按 11 个窗口" in "\n".join(bot.window_report()) and "卡片按它定价" in "\n".join(bot.window_report())
+    card.calib = (1.0, 0)
+    await bot.refresh_updown(fm.now)  # the refresh applies the measured factor…
+    assert card.calib == (factor, 11), card.calib
+    bot.config = dataclasses_replace(bot.config, sigma_calib=False)  # …unless the setting is off
+    await bot.refresh_updown(fm.now)
+    assert card.calib == (1.0, 0) and "SIGMA_CALIB=off，卡片不用它" in "\n".join(bot.window_report())
+    bot.config = dataclasses_replace(bot.config, sigma_calib=True)
+    extreme = m.Bot(m.Config.from_env(ENV), store, FM(T0), None)  # the range: twenty windows at 3σ would say ×2.2, capped at 1.4
+    for i in range(20):
+        store.put(f"wsample:e{i}-updown-15m:840", {"t": T0 - (i + 30) * 900_000, "start": T0 - (i + 30) * 900_000, "end": T0 - (i + 29) * 900_000, "slug": f"e{i}-updown-15m",
+                                                   "key": "SKHYNIX-15M", "kind": "window", "card": "SK 海力士 15分涨跌",
+                                                   "left": 840, "up": 0.6, "sigma": 0.5, "sigma_raw": 0.5, "calib": 1.0, "model": 2, "tau": 2.7e-5, "line": 100.0, "move": 3 * st,
+                                                   "result": 1.0, "final": 100.0 * math.exp(3 * st)})
+    assert extreme.sigma_calib("SKHYNIX-15M") == (1.4, 20)
+    store.delete_keys([k for k in store.keys("wsample:") if k.startswith(("wsample:c", "wsample:e", "wsample:old"))])  # the made-up windows go
+    bot.sigma_calib_cache.clear()
     # a window that ended while the bot was down is settled on its kept end when the samples are read; an end within the tie
     # band keeps no result (Predict's call), the move all the same
     for slug, close in (("x-updown-15m-1", "101"), ("y-updown-15m-2", "100.02")):
