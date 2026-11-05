@@ -481,8 +481,8 @@ async def run():
     assert {"kind": "updown", "key": "BTC-15M", "name": bspec.name, "skipped": False} in bbot.sim_catalog(T0 + 6_000)
     # 1.110.0: the line is Chainlink's figure as Predict relays it (the window's start price) once it agrees with the candle; a
     # spot window waits up to 60 s for it before suggesting anything, and a figure 0.1% off holds the card instead
-    assert bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("等 Predict 公布这个窗口的起点价（最多 60 秒）", "") and bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 61_000) == ("", "")
-    assert card.STRIKE_WAIT_MS == 0 and btc.STRIKE_WAIT_MS == 60_000
+    assert bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 6_000) == ("等 Predict 公布这个窗口的起点价（最多 20 秒）", "") and bbot.updown_hold(btc, btc.odds(T0 + 6_000), T0 + 21_000) == ("", "")
+    assert card.STRIKE_WAIT_MS == 0 and btc.STRIKE_WAIT_MS == 20_000
     bbot.predict.strikes[bspec.slug] = (D("100000.50"), 0.0)
     btc.times["price"] = -1e9
     await bbot.refresh_updown(T0 + 6_500)
