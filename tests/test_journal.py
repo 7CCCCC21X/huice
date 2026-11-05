@@ -119,6 +119,12 @@ async def run():
     a = data["analysis"]
     names = [r["name"] for r in a["items"]]
     assert names == ["恒生指数", "KOSPI", "上证指数", "HYPE"] and sum(r["records"] for r in a["items"]) == 6, a["items"]  # the most traded first
+    cards = a["cards_today"]  # 1.105.1: today's records per card — a market's P&L for the day; the chips on the page filter by card
+    assert {r["name"] for r in cards} == {"恒生指数", "KOSPI", "HYPE"} and sum(r["records"] for r in cards) == 5 and cards[0]["name"] == "恒生指数" and cards[0]["settled"] == 2, cards
+    assert {t["card"] for t in data["trades"] if t["kind"] == "close"} == {"恒生指数", "KOSPI", "上证指数"} and all(t.get("card") for t in data["trades"]), [t.get("card") for t in data["trades"]]
+    assert m.card_of({"item": "宇树 15分涨跌 10:45–11:00", "kind": "updown", "settle": {"window": "15m"}}) == "宇树 15分涨跌"
+    assert m.card_of({"item": "BTC 11-04 涨跌", "kind": "updown", "settle": {"day": "2026-11-04"}, "driver": "BTCUSDT", "driver_name": "BTC"}) == "BTC 日涨跌"
+    assert m.card_of({"item": "恒生指数｜10-05", "kind": "close"}) == "恒生指数" and 'id="s-cards"' in m.JOURNAL_PAGE and "cardF" in m.JOURNAL_PAGE
     hsi_row = next(r for r in a["items"] if r["name"] == "恒生指数")
     assert hsi_row["settled"] == hsi_row["wins"] == 2 and hsi_row["hit"] == 1.0 and abs(hsi_row["avg_fair"] - 0.7) < 1e-9 and abs(hsi_row["expected"] - 48.48) < 1e-6, hsi_row
     assert [(r["name"], r["records"]) for r in a["edges"]] == [("10–15¢", 4), ("15–20¢", 2)], a["edges"]  # an edge of 0.0999…98 is 10¢; 15¢ starts the next bucket

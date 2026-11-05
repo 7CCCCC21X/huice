@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.105.0"
+VERSION = "1.105.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -9704,6 +9704,30 @@ def sim_item_name(trade: dict) -> str:
     return trade_driver(trade)[1]
 
 
+def card_of(trade: dict) -> str:
+    """The card a record was traded under, for the review page's market chips and its per-card table (1.105.1): a daily
+    card's index or stock (恒生指数), a 15-minute card without the window's times (宇树 15分涨跌 — every window of the day
+    under one name), a daily crypto card without the day (BTC 日涨跌), else the event it settles on (sim_item_name)."""
+    item, kind = str(trade.get("item") or ""), str(trade.get("kind") or "")
+    if kind == "close":
+        return item.partition("｜")[0] or str(trade.get("key") or "")
+    if kind == "updown":
+        if (trade.get("settle") or {}).get("window"):
+            return re.sub(r"\s*\d{1,2}:\d{2}\s*[–\-]\s*\d{1,2}:\d{2}\s*$", "", item) or item
+        return re.sub(r"\s*\d{1,2}-\d{1,2}\s*", " 日", item, count=1) or item
+    return sim_item_name(trade)
+
+
+def sim_by_card(trades: list[dict], marks: Mapping | None = None) -> list[dict]:
+    """summary_of per card (card_of), the most traded first, each with settled_extras: the review page's 今日按市场 table
+    (analysis.cards_today) — a market's P&L for the day, the 15-minute cards' windows together."""
+    by: dict[str, list[dict]] = {}
+    for t in trades:
+        by.setdefault(card_of(t), []).append(t)
+    out = [{"name": name, **summary_of(rows, marks), **settled_extras(rows)} for name, rows in by.items()]
+    return sorted(out, key=lambda r: (-r["records"], -r["volume"], r["name"]))
+
+
 def sim_by_item(trades: list[dict], marks: Mapping | None = None) -> list[dict]:
     """summary_of per underlying (sim_item_name), the most traded first, each with what the model expected of its
     settled records and their hit rate (settled_extras)."""
@@ -11083,7 +11107,7 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
 <div class="tiles" id="tiles"></div>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
-<div class="body" id="sumbody"><div class="tbl" id="summary"></div><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
+<div class="body" id="sumbody"><div class="tbl" id="summary"></div><h3>今日按市场</h3><div class="tbl" id="s-cards"></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。</p><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
 <h3>按标的</h3><div id="a-items"></div>
@@ -11133,7 +11157,7 @@ const CENT_KEYS=new Set(["fair_up"]);
 const STATES=[["all","全部",t=>true],["open","持仓",t=>t.status==="filled"],["rest","挂单中",t=>t.status==="resting"],["done","已结算",t=>t.status==="settled"],
   ["bad","结果不一致",t=>t.confirm==="mismatch"],["exp","未成交/撤单",t=>t.status==="expired"||t.status==="cancelled"]];
 const PAGE=50;  // rows shown at a time; the rest on request
-let data=null,stateF="all",wayF="all",kindF="all",openId=decodeURIComponent(location.hash.slice(1)||""),shown=PAGE,allLoaded=false,statsOpen=false;
+let data=null,stateF="all",wayF="all",kindF="all",cardF="all",openId=decodeURIComponent(location.hash.slice(1)||""),shown=PAGE,allLoaded=false,statsOpen=false;
 const details={};  // trade id -> its whole record, fetched when the trade is opened
 try{statsOpen=localStorage.getItem("jrnstats")==="1"}catch(e){}
 let sumOpen=true;try{sumOpen=localStorage.getItem("jrnsum")!=="0"}catch(e){}  // the daily summary: open unless folded by hand
@@ -11255,6 +11279,7 @@ function summary(){  // per day the records were opened on: records, markets, wh
   el.append(t);
   const d=rows[0];head.replaceChildren(d.label+"：记录 "+d.records+" · 成交 "+usd(d.volume)+(d.settled?" · 盈亏 ":""));
   if(d.settled){const b=$("b","",money(d.pnl));b.className=d.pnl>=0?"ok":"bad";head.append(b)}
+  const ct=(data.analysis||{}).cards_today||[],cel=document.getElementById("s-cards");cel.replaceChildren(ct.length?anaTable(ct):$("p","small mut","今天还没有记录"));
   document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"}
 function pn(x){const b=$("b","",money(x));b.className=x>=0?"ok":"bad";return b}
 function anaTable(rows,extra){  // one summary table: records, fills, the settled P&L against the model's expectation, the hit rate against the mean fair price, open, unrealized — plus a table's own columns
@@ -11329,14 +11354,22 @@ function filters(){  // one row of chips with counts; a chip nobody matches is n
   const chip=(key,t,n,on,fn)=>{const b=$("button","chip"+(on?" on":""));b.type="button";b.dataset.f=key;b.append(t,$("span","n",String(n)));b.addEventListener("click",fn);return b};
   const counts=STATES.map(([k,t,fn])=>[k,t,cnt(fn)]);
   if(!counts.some(([k,,n])=>k===stateF&&n))stateF="all";
-  counts.forEach(([k,t,n])=>{if(k==="all"||n)parts.push(chip(k,t,n,stateF===k,()=>{stateF=k;if(k==="all")wayF=kindF="all";shown=PAGE;render()}))});
+  counts.forEach(([k,t,n])=>{if(k==="all"||n)parts.push(chip(k,t,n,stateF===k,()=>{stateF=k;if(k==="all")wayF=kindF=cardF="all";shown=PAGE;render()}))});
   const mk=cnt(t=>t.maker),tk=ts.length-mk;if(!(mk&&tk))wayF="all";
   if(mk&&tk)parts.push($("i","sep"),...[["maker","挂单",mk],["taker","吃单",tk]].map(([k,t,n])=>chip(k,t,n,wayF===k,()=>{wayF=wayF===k?"all":k;shown=PAGE;render()})));
   const kinds=Object.entries(KINDS).map(([k,t])=>[k,t,cnt(x=>x.kind===k)]).filter(x=>x[2]);if(!kinds.some(([k])=>k===kindF))kindF="all";
   if(kinds.length>1)parts.push($("i","sep"),...kinds.map(([k,t,n])=>chip("k:"+k,t,n,kindF===k,()=>{kindF=kindF===k?"all":k;shown=PAGE;render()})));
+  const cards=[...new Set(ts.map(x=>x.card).filter(Boolean))].map(c=>[c,cnt(x=>x.card===c)]).sort((a,b)=>b[1]-a[1]);if(!cards.some(([c])=>c===cardF))cardF="all";
+  if(cards.length>1)parts.push($("i","sep"),...cards.map(([c,n])=>chip("c:"+c,c,n,cardF===c,()=>{cardF=cardF===c?"all":c;shown=PAGE;render()})));  // 1.105.1: one chip per card
   document.getElementById("filters").replaceChildren(...parts)}
-function dayHead(ms,items){const h=$("div","day"),done=items.filter(t=>t.pnl!=null),pnl=done.reduce((a,t)=>a+t.pnl,0);
-  const s=$("span","",items.length+" 笔"+(done.length?" · 已结算 "+done.length+" 笔 ":""));if(done.length){const b=$("b","",money(pnl));b.className=pnl>=0?"ok":"bad";s.append(b)}
+function dayHead(ms,items){  // the day's line over the rows shown (a card's, when one is chosen): fills, the settled P&L, what is open
+  const h=$("div","day"),done=items.filter(t=>t.pnl!=null),pnl=done.reduce((a,t)=>a+t.pnl,0),filled=items.filter(t=>t.shares>0);
+  const open=items.filter(t=>t.status==="filled"),rest=items.filter(t=>t.status==="resting"),marked=open.filter(t=>t.unrealized!=null),unr=marked.reduce((a,t)=>a+t.unrealized,0);
+  const s=$("span","",items.length+" 笔"+(filled.length?" · 成交 "+num(filled.reduce((a,t)=>a+t.shares,0))+" 份 "+usd(filled.reduce((a,t)=>a+t.shares*t.price,0)):"")
+    +(done.length?" · 已结算 "+done.length+" 笔（赢 "+done.filter(t=>t.payout===1).length+" 输 "+done.filter(t=>t.payout===0).length+"）":""));
+  if(done.length){const b=$("b","",money(pnl));b.className=pnl>=0?"ok":"bad";s.append(b)}
+  if(open.length){s.append(" · 持仓 "+open.length+" 笔");if(marked.length){const u=$("b","",money(unr));u.className=unr>=0?"ok":"bad";s.append("（浮动 ",u,"）")}}
+  if(rest.length)s.append(" · 挂单中 "+rest.length+" 笔");
   h.append($("b","dn",dayName(ms)),s);return h}
 function more(n){const el=document.getElementById("more");el.replaceChildren();
   if(shown<n){const b=$("button","btn","再显示 "+Math.min(PAGE,n-shown)+" 笔（还有 "+(n-shown)+" 笔）");b.type="button";b.addEventListener("click",()=>{shown+=PAGE;render()});el.append(b)}
@@ -11349,7 +11382,7 @@ function render(){
   const name=data.live?"交易复盘":"模拟交易复盘";document.getElementById("title").textContent=name;document.title=name;
   tiles();summary();analysis();stats();filters();foot();
   const st=(STATES.find(s=>s[0]===stateF)||STATES[0])[2];
-  const all=data.trades.filter(t=>st(t)&&(wayF==="all"||(wayF==="maker")===!!t.maker)&&(kindF==="all"||t.kind===kindF)),page=all.slice(0,shown);
+  const all=data.trades.filter(t=>st(t)&&(wayF==="all"||(wayF==="maker")===!!t.maker)&&(kindF==="all"||t.kind===kindF)&&(cardF==="all"||t.card===cardF)),page=all.slice(0,shown);
   const byDay=new Map();all.forEach(t=>{const k=dayKey(t.opened);if(!byDay.has(k))byDay.set(k,[]);byDay.get(k).push(t)});
   const nodes=[];let day="";page.forEach(t=>{const k=dayKey(t.opened);if(k!==day){day=k;nodes.push(dayHead(t.opened,byDay.get(k)))}nodes.push(row(t))});
   document.getElementById("list").replaceChildren(...(nodes.length?nodes:[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有交易")]));
@@ -17201,7 +17234,7 @@ class Bot:
         return {label: sim_stats([t for t in trades if int(t["settled"]) >= since]) for label, since in windows.items()}
 
     JOURNAL_HISTORY = 300  # finished trades the review page lists at first; the older ones come on request (journal.json?all=1)
-    JOURNAL_LIGHT = ("id", "market", "slug", "item", "kind", "key", "side", "label", "maker", "deep", "sweep", "floor", "price", "shares", "order",
+    JOURNAL_LIGHT = ("id", "market", "slug", "item", "kind", "key", "card", "side", "label", "maker", "deep", "sweep", "floor", "price", "shares", "order",
                      "unfilled", "opened", "filled", "settled", "status", "confirm", "payout", "edge", "fair", "note", "driver_name",
                      "text", "state", "pnl", "expected_fill", "url", "wait", "legacy", "cost_confirmed", "withdrawn", "real", "limit", "mark", "unrealized")
 
@@ -17210,7 +17243,7 @@ class Bot:
         bytes) or, when ``full``, the whole record (entry and fill snapshots, sources, settlement evidence, the real
         order's events, version), fetched when the trade is opened and for the exports."""
         st = t.get("live") if isinstance(t.get("live"), dict) else {}
-        row = {**t, "id": tid, "driver_name": trade_driver(t)[1], "text": sim_status(t), "state": sim_state(t),
+        row = {**t, "id": tid, "driver_name": trade_driver(t)[1], "card": card_of(t), "text": sim_status(t), "state": sim_state(t),
                "pnl": (t["payout"] - t["price"]) * t["shares"] if t["status"] == "settled" else None,
                "expected_fill": sim_fill_expectation(t) if float(t.get("shares") or 0) else 0.0, "url": self.sim_url(t),
                "wait": self.sim_wait(t, mk, now_ms), "real": bool(st),
@@ -17282,7 +17315,10 @@ class Bot:
         exchange_of = lambda t: (self.sim_exchange(str(t.get("key") or ""), str((t.get("settle") or {}).get("key") or ""))
                                  if t.get("kind") == "close" else "")
         holidays_of = lambda market: self.config.holidays.get(market, frozenset()) if market else frozenset()
+        today = dt.datetime.fromtimestamp(self.market.now_ms() / 1000, BEIJING).date()
+        opened_today = [t for t in trades if dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date() == today]
         return {"items": sim_by_item(trades, marks),
+                "cards_today": sim_by_card(opened_today, marks),  # 1.105.1: today's records per card — a market's P&L for the day
                 "edges": sim_by_bucket(trades, lambda t: t.get("edge"), EDGE_BUCKETS, marks),
                 "fairs": sim_by_bucket(trades, lambda t: t.get("fair"), FAIR_BUCKETS, marks),
                 "sessions": sim_by_session(trades, exchange_of, holidays_of, marks),
