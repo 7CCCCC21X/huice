@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.118.0"
+VERSION = "1.118.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -11752,6 +11752,7 @@ table{border-collapse:collapse;font-size:12.5px;width:100%;font-variant-numeric:
 td,th{border-bottom:1px solid var(--line2);padding:6px 10px;text-align:left;vertical-align:top;white-space:nowrap}
 th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;background:var(--chip)}tr:last-child td{border-bottom:0}tr:hover td{background:var(--chip)}td.wrap{white-space:normal;min-width:160px}
 .filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:12px 0 8px}
+.search{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin:14px 0 0}.search input{flex:1 1 240px;max-width:460px;font:inherit;font-size:13px;padding:7px 10px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--text)}
 .chip{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:4px 11px;font:inherit;font-size:12.5px;color:var(--muted);cursor:pointer;transition:border-color .15s,color .15s,background .15s}
 .chip:hover{border-color:var(--best-soft);color:var(--text)}.chip.on{border-color:var(--best);color:var(--on-accent);background:var(--best)}
 .chip .n{margin-left:5px;font-size:11px;opacity:.7;font-variant-numeric:tabular-nums}.chip.on .n{opacity:.9}
@@ -11803,6 +11804,7 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <h3 id="h-groups" hidden>分组</h3><div class="tbl" id="groups" hidden></div>
 <h3 id="h-risk" hidden>共同风险</h3><div id="risk" hidden></div>
 <h3>规则</h3><p class="small mut" id="intro"></p></div></section>
+<div class="search"><input type="search" id="q" placeholder="搜市场、订单号、价格（21）、份数（298.73）、状态…" autocomplete="off"><span class="small mut" id="qn"></span></div>
 <div class="filters" id="filters"></div>
 <div class="list" id="list"></div>
 <div class="morebar" id="more" hidden></div>
@@ -11837,6 +11839,9 @@ const STATES=[["all","全部",t=>true],["open","持仓",t=>t.status==="filled"||
   ["bad","结果不一致",t=>t.confirm==="mismatch"],["exp","未成交/撤单",t=>t.status==="expired"||t.status==="cancelled"]];
 const PAGE=50;  // rows shown at a time; the rest on request
 let ana=null,verAll=false;  // ana: the summary and analysis over the filter (journal.json?analysis=1&…), when one is on
+let qF="";  // the search box (1.118.1): every word must appear in the row's market, side, order id, price, count, state or note
+function matches(t){if(!qF)return true;const hay=[t.item,t.label,t.card,t.order_id?"#"+t.order_id:"",cent(t.price),num(t.shares),t.maker&&t.order?num(t.order):"",t.text,t.state,t.note,t.id].filter(Boolean).join(" ").toLowerCase();
+  return qF.toLowerCase().split(/\s+/).filter(Boolean).every(w=>hay.includes(w))}
 let data=null,stateF="all",wayF="all",kindF="all",cardF="all",openId=decodeURIComponent(location.hash.slice(1)||""),shown=PAGE,allLoaded=false,statsOpen=false;
 const details={};  // trade id -> its whole record, fetched when the trade is opened
 try{statsOpen=localStorage.getItem("jrnstats")==="1"}catch(e){}
@@ -12169,7 +12174,8 @@ function render(){
   const name=data.live?"交易复盘":"模拟交易复盘";document.getElementById("title").textContent=name;document.title=name;
   tiles();summary();analysis();stats();filters();foot();
   const st=(STATES.find(s=>s[0]===stateF)||STATES[0])[2];
-  const all=data.trades.filter(t=>st(t)&&(wayF==="all"||(wayF==="maker")===!!t.maker)&&(kindF==="all"||t.kind===kindF)&&(cardF==="all"||t.card===cardF)),page=all.slice(0,shown);
+  const all=data.trades.filter(t=>st(t)&&(wayF==="all"||(wayF==="maker")===!!t.maker)&&(kindF==="all"||t.kind===kindF)&&(cardF==="all"||t.card===cardF)&&matches(t)),page=all.slice(0,shown);
+  document.getElementById("qn").textContent=qF?"匹配 "+all.length+" 笔"+(data.more>0&&!allLoaded?"（更早的 "+data.more+" 笔还没载入，点下面“载入更早的”）":""):"";
   const byDay=new Map();all.forEach(t=>{const k=dayKey(t.opened);if(!byDay.has(k))byDay.set(k,[]);byDay.get(k).push(t)});
   const nodes=[];let day="";page.forEach(t=>{const k=dayKey(t.opened);if(k!==day){day=k;nodes.push(dayHead(t.opened,byDay.get(k)))}nodes.push(row(t))});
   document.getElementById("list").replaceChildren(...(nodes.length?nodes:[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有交易")]));
@@ -12203,6 +12209,7 @@ async function load(){  // the list: light rows, the open trades and the last fe
   catch(err){alert("导出失败："+err.message)}})});
 document.getElementById("statshd").addEventListener("click",()=>{statsOpen=!statsOpen;try{localStorage.setItem("jrnstats",statsOpen?"1":"0")}catch(e){}
   document.getElementById("statsbody").hidden=!statsOpen;document.getElementById("foldstats").textContent=statsOpen?"收起":"展开"});
+document.getElementById("q").addEventListener("input",e=>{qF=e.target.value.trim();shown=PAGE;render()});
 document.getElementById("sumhd").addEventListener("click",()=>{sumOpen=!sumOpen;try{localStorage.setItem("jrnsum",sumOpen?"1":"0")}catch(e){}
   document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"});
 async function reread(b){  // a 刷新 button (1.113.0 by 今日按市场, 1.113.1 on the 复盘分析 header): the list, the summary and the analysis re-read at once

@@ -119,6 +119,7 @@ async def run():
     assert "dayOpen" in m.JOURNAL_PAGE and 'id="scref"' in m.JOURNAL_PAGE and 'id="scat"' in m.JOURNAL_PAGE and "function clock(" in m.JOURNAL_PAGE
     assert 'id="anaref"' in m.JOURNAL_PAGE and 'id="anaat"' in m.JOURNAL_PAGE  # 1.113.1: the 复盘分析 header's refresh button and the time of its data
     assert 'id="s-detail"' in m.JOURNAL_PAGE and "rows=1" in m.JOURNAL_PAGE and "function cardDetail(" in m.JOURNAL_PAGE  # 1.114.0: a card's records under the table
+    assert 'id="q"' in m.JOURNAL_PAGE and "function matches(" in m.JOURNAL_PAGE  # 1.118.1: the search box over the list
     assert "function recTable(" in m.JOURNAL_PAGE  # 1.114.1: as one compact table (by market, a subtotal each, a total), a row opening the record
     assert 'id="d-detail"' in m.JOURNAL_PAGE and "function dayDetail(" in m.JOURNAL_PAGE and "lean=1" in m.JOURNAL_PAGE  # 1.115.0: a day's records under the summary
     # 1.81.0: the analysis tables (per underlying, per edge / fair bucket, per session part, the makers, the refused buys), the
@@ -441,6 +442,15 @@ async def browser_check(bot, data):
         assert await page.locator("#list .tr").count() == 2
         await page.click("#filters [data-f=taker]")  # the same chip again: off
         assert await page.locator("#list .tr").count() == 6
+        # 1.118.1: the search box — every word must appear in a row's market, side, order id, price, count, state or note
+        await page.fill("#q", "KOSPI")
+        assert await page.locator("#list .tr").count() == 2 and await page.inner_text("#qn") == "匹配 2 笔"
+        await page.fill("#q", "恒生 吃涨 58.8")
+        assert await page.locator("#list .tr").count() == 1 and "恒生指数 吃涨 @ 58.8¢" in await page.inner_text("#list .tr .t1")
+        await page.fill("#q", "没有这个")
+        assert await page.locator("#list .tr").count() == 0 and "没有符合条件的交易" in await page.inner_text("#list")
+        await page.fill("#q", "")
+        assert await page.locator("#list .tr").count() == 6 and await page.inner_text("#qn") == ""
         # one trade's whole record, fetched when it is opened
         await page.click(f"#list .tr:has-text('恒生指数 挂涨') button.row")
         det = page.locator("#list .tr.open .det")
