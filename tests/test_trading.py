@@ -1764,7 +1764,7 @@ async def latency():
     assert set(bot.live_step_ms) == {"预取", "决策", "下单", "同步"} and bot.live_step_ms["下单"] >= 0, bot.live_step_ms
     bot.reference_state["模拟交易"] = {"ok_at": time.time() - 2, "error": "", "error_at": 0, "ms": 900, "runs": 50}
     diag = "\n".join(bot.diag_state(NOW))
-    assert "下单链路（最近 2 笔真实订单）：盘口→决策 中位 0.0s / 最长 0.0s、决策→发出 中位 0.0s / 最长 0.0s、发出→订单号 中位 0.0s" in diag, diag
+    assert "下单链路（最近 2 笔真实订单）：盘口→决策 中位 0.0s / 最长 0.0s、决策→发出 中位 0.0s / 最长 0.0s（其中落盘等待 中位 0.0s / 最长 0.0s）、发出→订单号 中位 0.0s" in diag, diag  # 1.111.1: the flush wait shown
     api = L.PredictApi("https://x.test/v1", "k", None)
     assert api.gate._value == 3 and api.read_gate._value == 2  # the reads' own gate: a slot stays free for an order or a cancel
     print("LATENCY_OK")

@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.111.0"
+VERSION = "1.111.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5196,6 +5196,13 @@ class PredictFeed:
         if isinstance(data, dict) and data.get("errors"):
             raise RemoteError("Predict GraphQL 错误：" + clean_error(json.dumps(data["errors"], ensure_ascii=False))[:120])
         return data.get("data") if isinstance(data, dict) else None
+
+    def strike_possible(self, slug: str) -> bool:
+        """Whether a start price can come for this slug at all: its category type is known (GraphQL answered the lookup) and
+        has the field, and GraphQL is not paused (1.111.1: in a region the endpoint refuses, the type is never learnt and
+        the market's REST details carry no price — a card waiting for the figure would wait for nothing)."""
+        kind = self.types.get(slug, "")
+        return bool(kind) and kind not in self.no_strike and self.graphql_until - time.monotonic() <= 0
 
     def graphql_note(self) -> str:
         """The pause, for /diag: "" while GraphQL is asked."""
@@ -15533,8 +15540,10 @@ class Bot:
             hold = self.window_title_problem(mkt.spec)  # the window Predict names must be the one the slug was read as
         strike = (self.predict.strikes.get(mkt.spec.slug) or (None,))[0]
         if strike is None:
-            if index and not hold and not odds.settled and mkt.STRIKE_WAIT_MS and now_ms < mkt.spec.start_ms + 60_000 + mkt.STRIKE_WAIT_MS:
-                # 1.110.0: a spot window's line is the settlement source's own figure, which Predict relays: waited for a while
+            if (index and not hold and not odds.settled and mkt.STRIKE_WAIT_MS and now_ms < mkt.spec.start_ms + 60_000 + mkt.STRIKE_WAIT_MS
+                    and self.predict.strike_possible(mkt.spec.slug)):
+                # 1.110.0: a spot window's line is the settlement source's own figure, which Predict relays: waited for a while —
+                # when it can come at all (1.111.1: GraphQL refused, the type unknown: the candle is the line, at once)
                 return f"等 Predict 公布这个窗口的起点价（最多 {mkt.STRIKE_WAIT_MS // 1000} 秒）", ""
             return hold, ""
         # (percent: in %) the daily close is the very number Predict shows; an index window's start is Chainlink's report at
@@ -20123,8 +20132,8 @@ class Bot:
                 latency = getattr(self, "live_latency", None)
                 if name == "模拟交易" and latency and (lat := latency()):
                     span = lambda s: f"中位 {s['median']:.1f}s / 最长 {s['max']:.1f}s" if s else "—"
-                    detail += (f"｜下单链路（最近 {lat['n']} 笔真实订单）：盘口→决策 {span(lat['book'])}、决策→发出 {span(lat['send'])}、"
-                               f"发出→订单号 {span(lat['answer'])}"
+                    detail += (f"｜下单链路（最近 {lat['n']} 笔真实订单）：盘口→决策 {span(lat['book'])}、决策→发出 {span(lat['send'])}"
+                               + (f"（其中落盘等待 {span(lat['flush'])}）" if lat.get("flush") else "") + f"、发出→订单号 {span(lat['answer'])}"
                                + (f"、撤单→重挂发出 {span(lat['requote'])}（{lat['requotes']} 笔"
                                   + (f"；中位分段：决定→撤单发出 {p[0]:.1f}s、→Predict 确认 {p[1]:.1f}s、→补挂发出 {p[2]:.1f}s" if (p := lat.get("parts")) else "")
                                   + "）" if lat.get("requote") else ""))

@@ -1645,7 +1645,10 @@ class LiveBot(core.Bot):
                       price_per_share=from_wei(amounts["price_per_share"]), usd_cap=from_wei(amounts["maker"]),
                       shares_requested=from_wei(amounts["amount"]))
             self.sim_save([(tid, trade)])
-            if not await asyncio.to_thread(self.store.flush):  # the hash on disk before the request goes out: a crash in between is reconciled by it
+            flushing = time.monotonic()
+            flushed = await asyncio.to_thread(self.store.flush)  # the hash on disk before the request goes out: a crash in between is reconciled by it
+            st["flush_ms"] = int((time.monotonic() - flushing) * 1000)  # the wait for the writer (live_latency, /diag: 落盘等待)
+            if not flushed:
                 st.update(state="pending", hash="")
                 return self.live_defer(tid, trade, f"数据库写入未完成（{self.store.write_error or '超时'}），暂不发单", now_ms)
             # the order path's timing points (live_latency, /diag): the book's read (want.book_ms), the decision (opened), the
@@ -1771,7 +1774,8 @@ class LiveBot(core.Bot):
                 continue
             want = st.get("want") or {}
             rows.append((int(t.get("opened") or 0), int(want.get("book_ms") or 0), int(st["sent_at"]), int(st["answered_at"]),
-                         int(st.get("withdrawn_at") or 0), int(st.get("requote_cancel_sent_at") or 0), int(st.get("requote_cancel_done_at") or 0)))
+                         int(st.get("withdrawn_at") or 0), int(st.get("requote_cancel_sent_at") or 0), int(st.get("requote_cancel_done_at") or 0),
+                         st.get("flush_ms")))
         rows = sorted(rows, key=lambda r: r[2])[-last:]
         if not rows:
             return None
@@ -1779,14 +1783,15 @@ class LiveBot(core.Bot):
         def span(values: list) -> dict | None:
             values = sorted(v for v in values if v is not None and v >= 0)
             return {"median": core.median(values) / 1000, "max": values[-1] / 1000} if values else None
-        chain = [(w, cs, cd, s) for o, b, s, a, w, cs, cd in rows if w and cs and cd and w <= cs <= cd <= s]
+        chain = [(w, cs, cd, s) for o, b, s, a, w, cs, cd, _ in rows if w and cs and cd and w <= cs <= cd <= s]
         parts = None
         if chain:
             mid = lambda values: core.median(sorted(values)) / 1000
             parts = (mid([cs - w for w, cs, cd, s in chain]), mid([cd - cs for w, cs, cd, s in chain]), mid([s - cd for w, cs, cd, s in chain]))
         return {"n": len(rows), "book": span([r[0] - r[1] for r in rows if r[1] and r[0]]), "send": span([r[2] - r[0] for r in rows if r[0]]),
                 "answer": span([r[3] - r[2] for r in rows]), "requote": span([r[2] - r[4] for r in rows if r[4]]),
-                "requotes": sum(1 for r in rows if r[4]), "parts": parts}
+                "requotes": sum(1 for r in rows if r[4]), "parts": parts,
+                "flush": span([int(r[7]) for r in rows if r[7] is not None])}  # the wait for the writer before the request (1.111.1)
 
     async def live_redeem_round(self, now_ms: int) -> None:
         try:
