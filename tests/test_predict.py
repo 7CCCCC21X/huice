@@ -162,6 +162,22 @@ async def run():
     other = "x-up-or-down-on-september-29-2026"
     feed.types[other] = "X"; feed.fetch = no_field
     assert await feed.strike(other, "1") is None and "X" in feed.no_strike
+    # 1.110.1: asked eagerly (a window just started), a missing figure is asked for again after 5 s, not a minute, and the
+    # market's details are read afresh for it (the figure may sit there under another name)
+    w = "btc-updown-15m-1793871000"
+    feed.types[w] = "CryptoUpDownCategory"; shown = [None]; hits = []
+    async def late(url, payload=None):
+        hits.append(url if payload is None else "gql")
+        if payload is None:  # REST details
+            return {"id": "5", "outcomes": [{"name": "Up", "indexSet": 1}, {"name": "Down", "indexSet": 2}], "status": "OPEN", "priceToBeat": shown[0]}
+        return {"data": {"category": {"marketData": [{"marketId": "5", "startPrice": None}]}}}
+    feed.fetch = late
+    assert await feed.strike(w, "5") is None and await feed.strike(w, "5") is None and hits == ["gql"]  # a miss, cached a minute
+    assert await feed.strike(w, "5", eager=True) is None and hits == ["gql"]  # within 5 s of the miss: not asked again
+    feed.strikes[w] = (None, time.monotonic() - 6)
+    assert await feed.strike(w, "5", eager=True) is None and hits[1:] == ["gql", f"{m.PREDICT_REST}/markets/5"]  # asked again, the details read too
+    shown[0] = "80300.5"; feed.strikes[w] = (None, time.monotonic() - 6); feed.market_meta.pop("5", None)
+    assert await feed.strike(w, "5", eager=True) == D("80300.5") and feed.market_meta["5"][0]["price_fields"] == {"priceToBeat": "80300.5"}
     # the odds are measured against it; a proxy-mapped estimate moves with it, a live print does not
     kcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT"})
     kbot = m.Bot(kcfg, m.Store(":memory:"), FakeMarket(), tg)

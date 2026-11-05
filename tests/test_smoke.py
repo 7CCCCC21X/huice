@@ -22,7 +22,7 @@ async def run():
     methods = [c[0] for c in tg.calls]
     assert methods == ["setMyCommands", "setChatMenuButton"], methods
     cmds = tg.calls[0][1]["commands"]
-    assert len(cmds) == 25 and {"book", "diag", "sim", "edge", "live", "samples", "journal", "summary", "markout"} <= {c["command"] for c in cmds}  # 1.107.2–3: the exports, the markouts
+    assert len(cmds) == 26 and {"book", "diag", "sim", "edge", "live", "samples", "journal", "summary", "markout", "market"} <= {c["command"] for c in cmds}  # 1.107.2–3, 1.110.1
     for c in cmds:
         assert re.fullmatch(r"[a-z0-9_]{1,32}", c["command"]), c
         assert 1 <= len(c["description"]) <= 256, c

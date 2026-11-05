@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.110.0"
+VERSION = "1.110.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4693,6 +4693,7 @@ PREDICT_REWARD_STALE_SECONDS = 120  # allows the normal refresh to finish across
 PREDICT_POINTS_STALE_SECONDS = 3 * PREDICT_META_SECONDS  # other markets' points (read with the fee) are shown this long
 PREDICT_STRIKE_SECONDS = 300   # a known target price is re-read this often (the site may correct it)
 PREDICT_MISS_SECONDS = 60      # an unknown slug is looked up again after this long (new markets show up within a minute)
+PREDICT_STRIKE_EAGER_SECONDS = 5  # a missing start price is asked for again this soon when asked eagerly (a window just started: Bot.updown_strike)
 PREDICT_LIST_SECONDS = 600     # a category's market list is read again this often: levels and deadlines Predict adds later
 PREDICT_GRAPHQL_PAUSE_SECONDS = 1800  # after a 403 from the GraphQL endpoint (a region it does not serve) it is left alone this long: REST carries on
 PREDICT_MARKETS_PAGE = 20      # markets per GraphQL page: a category answering this many may hold more (the REST category is read too)
@@ -5288,11 +5289,14 @@ class PredictFeed:
             return predict_levels(book.get("bids"), True), predict_levels(book.get("asks"), False), key
         raise RemoteError(last or "订单簿获取失败")
 
-    async def strike(self, slug: str, market_id: str) -> D | None:
+    async def strike(self, slug: str, market_id: str, eager: bool = False) -> D | None:
         """The market's target price (目标价 / price to beat: the close it settles against), from GraphQL
-        category.marketData.startPrice. Best effort: None when the category type has no such field."""
+        category.marketData.startPrice. Best effort: None when the category type has no such field. ``eager`` (1.110.1: a
+        window that just started, whose figure appears seconds after): a missing one is asked for again after
+        PREDICT_STRIKE_EAGER_SECONDS rather than PREDICT_MISS_SECONDS, and the market's details are read afresh for it too."""
         cached = self.strikes.get(slug)
-        if cached and time.monotonic() - cached[1] < (PREDICT_STRIKE_SECONDS if cached[0] is not None else PREDICT_MISS_SECONDS):
+        miss = PREDICT_STRIKE_EAGER_SECONDS if eager else PREDICT_MISS_SECONDS
+        if cached and time.monotonic() - cached[1] < (PREDICT_STRIKE_SECONDS if cached[0] is not None else miss):
             return cached[0]
         kind = self.types.get(slug, "")
         value = cached[0] if cached else None
@@ -5313,6 +5317,10 @@ class PredictFeed:
                 pass
         if value is None:  # the market's details (read for the fee every PREDICT_META_SECONDS) may carry it: no request of its own
             meta = self.market_meta.get(str(market_id))
+            if eager and (not meta or time.monotonic() - meta[1] >= PREDICT_STRIKE_EAGER_SECONDS):
+                with contextlib.suppress(Exception):  # best effort: the details may carry the figure under another name (market_start_price)
+                    details = await self.market_details(market_id)
+                    meta = self.market_meta[str(market_id)] = (details, time.monotonic())
             if meta and isinstance(meta[0], dict) and meta[0].get("start_price"):
                 value = meta[0]["start_price"]
         self.strikes[slug] = (value, time.monotonic())
@@ -5333,8 +5341,11 @@ class PredictFeed:
         with contextlib.suppress(ValueError, TypeError):  # absent (None) or not a number: not stated
             stated = int(market.get("feeRateBps"))
             fee = stated if 0 <= stated <= 10_000 else None
+        nested = [market, *(market.get(k) for k in ("marketData", "metadata") if isinstance(market.get(k), Mapping))]
+        price_fields = {k: v for row in nested for k, v in row.items()  # the price-like scalars, for /market (1.110.1)
+                        if isinstance(v, (int, float, str)) and not isinstance(v, bool) and re.search(r"price|start|strike|target|reference", k, re.I)}
         return {"outcomes": [str(o.get("name") or "") for o in rows], "created_ms": created, "start_price": market_start_price(market),
-                "status": str(market.get("status") or ""), "fee_bps": fee, "resolved": predict_resolution(market),
+                "status": str(market.get("status") or ""), "fee_bps": fee, "resolved": predict_resolution(market), "price_fields": price_fields,
                 "rules": str(market.get("description") or market.get("rules") or "")[:3000],
                 "question": str(market.get("question") or ""),
                 "trading_status": str(market.get("tradingStatus") or ""), "rewards": market.get("rewards"),
@@ -11661,7 +11672,7 @@ const span=ms=>{if(ms==null||!isFinite(ms))return"—";const a=Math.abs(ms),s=Ma
   const t=s<90?s+" 秒":s<5400?Math.round(s/60)+" 分钟":s<172800?(s/3600).toFixed(1)+" 小时":(s/86400).toFixed(1)+" 天";return ms<0?t+"后":t};
 const KINDS={close:"指数/个股日涨跌",touch:"先触价",updown:"加密涨跌",flip:"反超",range:"价格阶梯",ladder:"市值阶梯"};
 const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参考说明",effective:"有效价",sigma_daily:"σ（日）",sigma_note:"σ 来源",
-  remaining:"剩余方差占比",sigma:"σ（剩余）",z:"z",beta:"β",mode:"口径",direct:"直接用现货",proxy_note:"代理换算",target:"目标日",warn:"提示",
+  remaining:"剩余方差占比",sigma:"σ（年化）",z:"z",beta:"β",mode:"口径",direct:"直接用现货",proxy_note:"代理换算",target:"目标日",warn:"提示",
   close_ms:"收盘/截止",price:"现价",low:"低线",high:"高线",sigma_ms:"σ 计算时间",deadline_ms:"截止",years:"剩余年数",path:"路径核验",start_ms:"窗口开始",
   line:"起点",line_source:"起点来源",settled:"已结算",start:"起点 K 线",end:"终点 K 线",index:"币安指数价",lead_price:"交易所现价",lead_source:"交易所行情来源",lead_quoted:"交易所报价时间",lead_start:"交易所起点价",lead_gap:"先行幅度（对指数）",lead_used:"按交易所现价定价",lead_note:"先行说明",a:"A 价格",b:"B 价格",ratio:"A/B",window:"窗口",cap:"市值",
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
@@ -13021,6 +13032,7 @@ COMMANDS: tuple[Command, ...] = (
             "筛选词和 /journal 一样"),
     Command("markout", "成交后市场走向（文字）：全部 / 挂单 / 吃单，15 分钟市场再按下单时离结束的分钟数和窗口开始的整点分组", "海力士 挂",
             "筛选词和 /journal 一样；1 / 5 / 30 分钟后盘口中间价 − 成交价、模型公平价的变化，持续为负 = 挂单被信息领先的对手吃掉"),
+    Command("market", "看 Predict 对一张卡当前市场的说法：市场号、类别类型、结果名称、状态、起点价（startPrice）、详情里和价格有关的字段，以及卡片定价用的起点", "btc15分涨跌"),
     Command("sim", "模拟交易：净优势 ≥10¢ 时买 100 份，看长期是赚还是亏（只记账，不下单）"),
     Command("live", "真实交易（LIVE=on）：钱包、余额、真实订单、持仓与风控；暂停/恢复/撤单/领取", "pause|resume|cancel all|redeem|check",
             "LIVE=on 时模拟交易的每个决定都会在 Predict 真实下单；/live pause 停止开新仓，/live resume 恢复"),
@@ -13365,7 +13377,7 @@ class Bot:
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
             "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib, "/samples": self.cmd_samples,
-            "/journal": self.cmd_journal, "/summary": self.cmd_summary, "/markout": self.cmd_markout,
+            "/journal": self.cmd_journal, "/summary": self.cmd_summary, "/markout": self.cmd_markout, "/market": self.cmd_market,
             "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live,
         }
 
@@ -14431,6 +14443,78 @@ class Bot:
         return Document(self.export_name("summary", flt), self.journal_summary_csv(flt).encode("utf-8"),
                         f"复盘汇总（{scope}）：每日汇总、今日按市场、按标的 / 净优势 / 公平价 / 时段、按设置版本、15 分钟表、"
                         "挂单效率与撤单原因、被拦下的机会；第一列是表名")
+
+    def market_slug_of(self, text: str, now_ms: int) -> tuple[str, str]:
+        """(the Predict slug, the card's key) a command's words name: a slug as written, else a card by part of its name or
+        key (sim_catalog, spaces and case aside) — one must match. ("", why not) otherwise."""
+        squash = lambda s: re.sub(r"\s+", "", s).casefold()
+        word = text.strip()
+        if "-" in word and " " not in word:
+            return word, next((k for k, s in self.predict_targets(now_ms).items() if s == word), "")
+        key = squash(word)
+        rows = self.sim_catalog(now_ms)
+        hits = ([r for r in rows if squash(str(r["key"])) == key or squash(str(r["name"])) == key]
+                or [r for r in rows if key in squash(str(r["name"])) or key in squash(str(r["key"]))])
+        names = list(dict.fromkeys(str(r["name"]) for r in hits))
+        if not hits:
+            return "", f"没有名字含“{word}”的卡片"
+        if len(names) > 1:
+            return "", f"“{word}”匹配多个：" + "、".join(names[:8]) + "。写具体些"
+        k = str(hits[0]["key"])
+        mkt = self.updowns.get(k)
+        slug = mkt.spec.slug if mkt is not None else self.predict_targets(now_ms).get(k, "")
+        return (slug, k) if slug else ("", f"{names[0]} 现在没有对应的 Predict 市场")
+
+    async def cmd_market(self, req: Request) -> Any:
+        """/market <卡片名 | slug>: what Predict says about a card's current market (1.110.1) — its id, category type,
+        outcomes, status, the start price (startPrice) and the price-like fields its details carry, and the line the
+        card prices on — for checking a new market type's figures against the card."""
+        if not req.args:
+            return "用法：/market 卡片名或市场 slug，如 /market btc15分涨跌、/market btc-updown-15m-1793871000"
+        if not self.config.predict:
+            return "PREDICT 未开启"
+        now_ms = self.market.now_ms()
+        slug, key = self.market_slug_of(" ".join(req.args), now_ms)
+        if not slug:
+            return key
+        lines = [f"🔎 {slug}" + (f"（{key}）" if key else "")]
+        try:
+            market = await self.predict.resolve(slug)
+        except Exception as error:
+            return "\n".join(lines + [f"Predict 查询失败：{clean_error(error) or type(error).__name__}"])
+        if market is None:
+            return "\n".join(lines + [f"Predict 上没有这个市场（{slug}）"])
+        mid = str(market["id"])
+        kind = self.predict.types.get(slug) or "未知"
+        lines.append(f"市场 #{mid}：{market.get('title') or market.get('question') or ''}；类别类型 {kind}")
+        try:
+            details = await self.predict.market_details(mid)
+            self.predict.market_meta[mid] = (details, time.monotonic())
+        except Exception as error:
+            details = None
+            lines.append(f"详情读取失败：{clean_error(error) or type(error).__name__}")
+        if details:
+            lines.append(f"结果名称 {'、'.join(details['outcomes']) or '—'}；状态 {details['status'] or '—'} / {details['trading_status'] or '—'}；"
+                         f"创建 {stamp(details['created_ms'], seconds=False) if details['created_ms'] else '—'}；手续费 "
+                         + (f"{details['fee_bps']} bps" if details['fee_bps'] is not None else "未写"))
+            fields = details.get("price_fields") or {}
+            lines.append("详情里和价格有关的字段：" + ("、".join(f"{k}={v}" for k, v in fields.items()) if fields else "没有"))
+        self.predict.strikes.pop(slug, None)  # asked afresh
+        try:
+            strike = await self.predict.strike(slug, mid, eager=True)
+        except Exception as error:
+            strike = None
+            lines.append(f"起点价查询失败：{clean_error(error) or type(error).__name__}")
+        lines.append(f"Predict 起点价（startPrice）：{strike:,.4f}" if strike is not None
+                     else "Predict 起点价（startPrice）：没有" + (f"（类型 {kind} 没有这个字段）" if kind in self.predict.no_strike else ""))
+        mkt = self.updowns.get(key) if key else next((u for u in self.updowns.values() if u.spec.slug == slug), None)
+        if isinstance(mkt, IndexUpDownMarket) and mkt.spec.slug == slug:
+            mkt.strike = strike
+            candle, line = mkt.close_of("start"), mkt.line_used()
+            lines.append("卡片：起点 K 线 " + (f"{candle:,.4f}" if candle is not None else "还没读到")
+                         + "；定价用的起点 " + (f"{line:,.4f}（{'Predict 起点价' if strike is not None and line == strike else '币安 K 线'}）" if line is not None else "—")
+                         + (f"；两者差 {float(percent(strike, candle)):+.3f}%" if strike is not None and candle else ""))
+        return "\n".join(lines)
 
     async def cmd_markout(self, req: Request) -> Any:
         """/markout [筛选词]: the fills' markouts (markout_stats) over the filter's records — all of them, the makers' and
@@ -15695,7 +15779,7 @@ class Bot:
             mkt = parts["mkt"]
             odds = parts["odds"]
             spec = mkt.spec
-            lead: dict[str, Any] = {"index": float(mkt.price)} if mkt.price is not None else {}
+            lead: dict[str, Any] = {"index": float(mkt.price)} if mkt.price is not None and mkt.VENUE == "futures" else {}  # (a spot window's price is the 现货 source line)
             sources = [price_evidence(mkt.WORD, mkt.SOURCE, spec.symbol, mkt.PRICE_KIND, mkt.price, mkt.priced_ms, mkt.priced_ms),
                        price_evidence("起点", mkt.SOURCE_LINE, spec.symbol, "收盘", odds.line, spec.start_ms)]
             q = mkt.lead
@@ -20367,7 +20451,7 @@ class Bot:
         for key, mkt in self.updowns.items():
             index = isinstance(mkt, IndexUpDownMarket)
             if index:
-                mkt.strike = (self.predict.strikes.get(mkt.spec.slug) or (None,))[0]  # Predict's start price: the line when it agrees (line_used)
+                await self.updown_strike(mkt, now_ms)  # Predict's start price: the line when it agrees (line_used); asked for eagerly after a start
             before = mkt.effective(now_ms)[0] if index else None
             if index and mkt.lead_code:
                 # LEAD_QUOTE: the stock's exchange quote of the moment (fresh, in its session; None otherwise) leads the index
@@ -20386,6 +20470,25 @@ class Bot:
         self.updown_roll(now_ms)  # a daily card whose day is over (its final close read just now) moves on to the next day
         failed = [f"{key}：{mkt.error}" for key, mkt in self.updowns.items() if mkt.error]
         return refreshed(failed, len(self.updowns) - len(failed))
+
+    STRIKE_EAGER_MS = 180_000  # after a window's start, a missing start price is asked for every PREDICT_STRIKE_EAGER_SECONDS this long
+
+    async def updown_strike(self, mkt: IndexUpDownMarket, now_ms: int) -> None:
+        """The start price Predict shows for the card's window, on the card (line_used): the feed's cached figure — and, in
+        the STRIKE_EAGER_MS after the window's start while it has none, asked for every PREDICT_STRIKE_EAGER_SECONDS (1.110.1:
+        the feed asks with the book and caches a miss a minute; the figure appears seconds after the start, and a spot
+        window waits for it before suggesting anything)."""
+        slug = mkt.spec.slug
+        cached = self.predict.strikes.get(slug)
+        value = cached[0] if cached else None
+        start = mkt.spec.start_ms + 60_000
+        if value is None and self.config.predict and start <= now_ms < start + self.STRIKE_EAGER_MS:
+            market = (self.predict.markets.get(slug) or (None,))[0]
+            if market is not None and time.monotonic() - mkt.times.get("strike", -1e9) >= PREDICT_STRIKE_EAGER_SECONDS:
+                mkt.times["strike"] = time.monotonic()
+                with contextlib.suppress(Exception):  # best effort: the card prices on the candle meanwhile
+                    value = await self.predict.strike(slug, str(market["id"]), eager=True)
+        mkt.strike = value
 
     UPDOWN_KEEP_MS = 8 * DAY_MS  # a window's kept closes outlive the settlement of its trades (SIM_GIVE_UP_MS, 7 days) by a day
 

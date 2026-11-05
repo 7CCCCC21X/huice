@@ -493,6 +493,22 @@ async def run():
     await bbot.refresh_updown(T0 + 6_600)
     assert btc.odds(T0 + 6_600).line == D("100000.00") and bbot.updown_hold(btc, btc.odds(T0 + 6_600), T0 + 6_600)[0] == "Predict 目标价 100,200.0000 与起点现货 100,000.0000 不一致，请核实；暂不给建议"
     bbot.predict.strikes.pop(bspec.slug)
+    # 1.110.1: /market shows what Predict says about the card's market, and which line the card prices on
+    assert bbot.market_slug_of("btc15分涨跌", T0 + 6_600) == (bspec.slug, "BTC-15M") and bbot.market_slug_of(bspec.slug, T0 + 6_600) == (bspec.slug, "BTC-15M")
+    assert bbot.market_slug_of("没有这个", T0 + 6_600) == ("", "没有名字含“没有这个”的卡片") and bbot.market_slug_of("btc", T0 + 6_600)[1].startswith("“btc”匹配多个：")
+    async def fake_resolve(slug): return {"id": "55", "title": "BTC 涨或跌 15分"} if slug == bspec.slug else None
+    async def fake_details(mid): return {"outcomes": ["Up", "Down"], "created_ms": T0 - 900_000, "start_price": D("100000.50"), "status": "OPEN", "fee_bps": 200,
+                                         "resolved": None, "price_fields": {"startPrice": "100000.5"}, "rules": "", "question": "", "trading_status": "TRADING"}
+    async def fake_strike(slug, mid, eager=False): return D("100000.50")
+    bbot.predict.resolve, bbot.predict.market_details, bbot.predict.strike = fake_resolve, fake_details, fake_strike
+    bbot.predict.types[bspec.slug] = "CryptoUpDownCategory"
+    said = await bbot.cmd_market(m.Request("/market", ["btc15分涨跌"], 1, 0, 42))
+    assert said.split("\n") == [f"🔎 {bspec.slug}（BTC-15M）", "市场 #55：BTC 涨或跌 15分；类别类型 CryptoUpDownCategory",
+                                 f"结果名称 Up、Down；状态 OPEN / TRADING；创建 {m.stamp(T0 - 900_000, seconds=False)}；手续费 200 bps",
+                                 "详情里和价格有关的字段：startPrice=100000.5", "Predict 起点价（startPrice）：100,000.5000",
+                                 "卡片：起点 K 线 100,000.0000；定价用的起点 100,000.5000（Predict 起点价）；两者差 +0.001%"], said
+    assert (await bbot.cmd_market(m.Request("/market", [], 1, 0, 42))).startswith("用法：/market ") and "没有名字含" in await bbot.cmd_market(m.Request("/market", ["没有这个"], 1, 0, 42))
+    btc.strike = None
     # settled on the pair's 1-minute closes: the end 0.011% over the start is 涨; one within 0.01% is left to Predict
     closes[bspec.end_ms] = "100011.00"
     btc.times["candle"] = -1e9  # the candles are asked for every 5 s (monotonic): due now
