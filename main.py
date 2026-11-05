@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.106.1"
+VERSION = "1.107.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -9830,6 +9830,230 @@ def sim_by_card(trades: list[dict], marks: Mapping | None = None) -> list[dict]:
     return sorted(out, key=lambda r: (-r["records"], -r["volume"], r["name"]))
 
 
+# --- the review page's 按设置版本 (1.107.0): the records split by every setting that changed among them -------------------------
+VERSION_UNRECORDED = object()  # VERSION_KNOBS: an absent key says nothing (the record predates it, or the setting does not apply there)
+# key -> (environment variable, unit, what an absent key stands for). "¢": a dollar fraction shown in cents. A key written only while
+# its setting is on (Bot.sim_version's conditional ones) stands for its off value when absent — the feature off, or not there yet
+VERSION_KNOBS: dict[str, tuple[str, str, Any]] = {
+    "code": ("", "", VERSION_UNRECORDED),
+    "sim_edge": ("SIM_EDGE_CENTS", "¢", VERSION_UNRECORDED),
+    "sim_shares": ("SIM_SHARES", "", VERSION_UNRECORDED),
+    "sim_ways": ("SIM_WAYS", "", VERSION_UNRECORDED),
+    "sim_markets": ("SIM_MARKETS", "", VERSION_UNRECORDED),
+    "sim_taker_max_shares": ("SIM_TAKER_MAX_SHARES", "", VERSION_UNRECORDED),
+    "sim_taker_sweep": ("SIM_TAKER_SWEEP_SHARES", "", VERSION_UNRECORDED),
+    "sim_max_fair": ("SIM_MAX_FAIR_CENTS", "¢", VERSION_UNRECORDED),
+    "sim_after_hours_max_shares": ("SIM_AFTER_HOURS_MAX_SHARES", "", VERSION_UNRECORDED),
+    "sim_open_quiet_minutes": ("SIM_OPEN_QUIET_MINUTES", "", VERSION_UNRECORDED),
+    "sim_no_odds_withdraw": ("SIM_NO_ODDS_WITHDRAW_MINUTES", "", 0.0),
+    "sim_taker_hold": ("SIM_TAKER_HOLD_SECONDS", "", 0.0),
+    "sim_taker_hold_range": ("SIM_TAKER_HOLD_RANGE_SECONDS", "", VERSION_UNRECORDED),
+    "sim_taker_shares": ("SIM_TAKER_SHARES", "", 0.0),
+    "sim_taker_after_hours_shares": ("SIM_TAKER_AFTER_HOURS_SHARES", "", 0.0),
+    "sim_group_usd": ("SIM_GROUP_USD", "", VERSION_UNRECORDED),
+    "min_edge": ("PREDICT_MIN_EDGE_CENTS", "¢", VERSION_UNRECORDED),
+    "fee_bps": ("PREDICT_FEE_BPS", "", VERSION_UNRECORDED),
+    "trade_usd": ("PREDICT_TRADE_USD", "", VERSION_UNRECORDED),
+    "a50_beta": ("A50_BETA", "", VERSION_UNRECORDED),
+    "kospi_beta": ("KOSPI_BETA", "", VERSION_UNRECORDED),
+    "sigma_error": ("", "", VERSION_UNRECORDED),
+    "beta_error": ("", "", VERSION_UNRECORDED),
+    "big_move": ("PROB_BIG_MOVE_SIGMAS", "", VERSION_UNRECORDED),
+    "sigma_calib": ("SIGMA_CALIB", "", VERSION_UNRECORDED),
+    "sim_taker_session": ("SIM_TAKER_SESSION", "", False),
+    "sim_quiet_minutes": ("SIM_QUIET_MINUTES", "", 0.0),
+    "sim_maker_min_bid": ("SIM_MAKER_MIN_BID", "", 0.0),
+    "sim_maker_follow_settle": ("SIM_MAKER_FOLLOW_SETTLE_SECONDS", "", VERSION_UNRECORDED),
+    "sim_maker_exit": ("SIM_MAKER_EXIT_CENTS", "¢", 0.0),
+    "sim_maker_session": ("SIM_MAKER_SESSION", "", False),
+    "sim_maker_deeper": ("SIM_MAKER_DEEPER", "", False),
+    "sim_maker_points": ("SIM_MAKER_POINTS", "", False),
+    "sim_maker_spread": ("SIM_MAKER_SPREAD_CENTS", "¢", 0.0),
+    "sim_maker_floor_shares": ("SIM_MAKER_FLOOR_SHARES", "", 0.0),
+    "sim_maker_floor": ("SIM_MAKER_FLOOR_CENTS", "¢", VERSION_UNRECORDED),  # (with floor orders on only)
+    "sim_maker_floor_markets": ("SIM_MAKER_FLOOR_MARKETS", "", ()),
+    "sim_maker_after_hours": ("SIM_MAKER_AFTER_HOURS_CENTS", "¢", 0.0),
+    "sim_taker_after_hours": ("SIM_TAKER_AFTER_HOURS_CENTS", "¢", 0.0),
+    "sim_after_hours_max_price": ("SIM_AFTER_HOURS_MAX_PRICE_CENTS", "¢", 0.0),
+    "sim_maker_deep": ("SIM_MAKER_DEEP_CENTS", "¢", 0.0),
+    "sim_maker_deep_only": ("SIM_MAKER_DEEP_ONLY", "", False),
+    "sim_taker_after_hours_markets": ("SIM_TAKER_AFTER_HOURS_MARKETS", "", ()),
+    "sim_maker_after_hours_markets": ("SIM_MAKER_AFTER_HOURS_MARKETS", "", ()),
+    "sim_maker_deep_markets": ("SIM_MAKER_DEEP_MARKETS", "", ()),
+    "sim_maker_deep_only_markets": ("SIM_MAKER_DEEP_ONLY_MARKETS", "", ()),
+    "sim_shares_net": ("SIM_SHARES_NET", "", False),
+    "sim_skip": ("SIM_SKIP", "", ()),
+    "sim_crypto_day_shares": ("SIM_CRYPTO_DAY_SHARES", "", VERSION_UNRECORDED),
+    "sim_crypto_day_max_shares": ("SIM_CRYPTO_DAY_MAX_SHARES", "", VERSION_UNRECORDED),
+    "sim_crypto_day_quiet": ("SIM_CRYPTO_DAY_QUIET_MINUTES", "", VERSION_UNRECORDED),
+    "sim_crypto_day_edge": ("SIM_CRYPTO_DAY_EDGE_CENTS", "¢", VERSION_UNRECORDED),
+    "sim_crypto_15m_shares": ("SIM_CRYPTO_15M_SHARES", "", VERSION_UNRECORDED),
+    "sim_crypto_15m_max_shares": ("SIM_CRYPTO_15M_MAX_SHARES", "", VERSION_UNRECORDED),
+    "sim_crypto_15m_quiet": ("SIM_CRYPTO_15M_QUIET_SECONDS", "", VERSION_UNRECORDED),
+    "sim_crypto_15m_edge": ("SIM_CRYPTO_15M_EDGE_CENTS", "¢", VERSION_UNRECORDED),
+}
+CONTROL_LABELS = {key: label for key, label, _ in CONTROL_KEYS}
+VERSION_LABELS = {"code": "代码版本", "PREDICT_FEE_BPS": "默认费率（基点）", "A50_BETA": "A50 β", "KOSPI_BETA": "KOSPI β",
+                  "sigma_error": "σ 误差系数", "beta_error": "β 误差"}
+VERSION_ZERO = {"sim_crypto_day_edge": "0（同买入门槛）", "sim_crypto_15m_edge": "0（同买入门槛）"}  # a value of 0 that means "the general one"
+VERSION_ROWS_MAX = 8  # a setting that took more values than this (the code's versions): the latest, the earlier ones in one row
+
+
+def version_value(key: str, version: Mapping) -> tuple[bool, Any]:
+    """(recorded, value) of one setting in a record's version, canonical — hashable, a number rounded, a list sorted, the
+    code's version cut to major.minor (1.106: the patches of one release together) — or (False, None) when the record says
+    nothing of it (VERSION_UNRECORDED)."""
+    off = VERSION_KNOBS[key][2]
+    if key in version:
+        value = version[key]
+    elif off is VERSION_UNRECORDED:
+        return False, None
+    else:
+        value = off
+    if key == "code":
+        return True, ".".join(str(value).split(".")[:2])
+    if isinstance(value, (bool, str)):
+        return True, value
+    if isinstance(value, (int, float)):
+        return True, round(float(value), 6)
+    if isinstance(value, (list, tuple)):
+        return True, tuple(sorted(str(x) for x in value))
+    return True, json.dumps(value, sort_keys=True, default=str)
+
+
+def version_text(key: str, value: Any) -> str:
+    """A setting's value in words: 10¢, 开 / 关, the markets it names, 1.106."""
+    _, unit, off = VERSION_KNOBS[key]
+    if isinstance(value, bool):
+        return "开" if value else "关"
+    if isinstance(value, tuple):
+        return "、".join(value) if value else ("不排除" if key == "sim_skip" else "全部市场")
+    if key in VERSION_ZERO and value == 0:
+        return VERSION_ZERO[key]
+    if isinstance(off, float) and value == off:
+        return "关"
+    if unit == "¢" and isinstance(value, float):
+        return f"{value * 100:g}¢"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def version_label(key: str) -> tuple[str, str]:
+    """(the setting's name, its environment variable): the control page's name, else VERSION_LABELS'."""
+    env = VERSION_KNOBS[key][0]
+    return CONTROL_LABELS.get(env) or VERSION_LABELS.get(env) or VERSION_LABELS.get(key) or key, env
+
+
+def sim_by_version(trades: list[dict], marks: Mapping | None = None) -> list[dict]:
+    """The review page's 按设置版本 (1.107.0): for every setting (VERSION_KNOBS) that took more than one value among the
+    records that say what it was, one table — a row per value with its records' summary_of and settled_extras, the first
+    and the last order made under it and how many separate stretches it ran, in the order the values first appeared (the
+    oldest beyond VERSION_ROWS_MAX in one row) — the settings changed most recently first, each with its switches and the
+    time of the latest. Records are read in the order they were opened; one without a version is left out. Two settings
+    changed together split the records alike: which of them made the difference, the tables cannot tell."""
+    opened = lambda t: int(t.get("opened") or 0)
+    ordered = sorted((t for t in trades if isinstance(t.get("version"), dict)), key=opened)
+    prints = [json.dumps(t["version"], sort_keys=True, default=str) for t in ordered]  # a handful of distinct versions: each read once
+    sample: dict[str, dict] = {}
+    for t, fp in zip(ordered, prints):
+        sample.setdefault(fp, t["version"])
+    out = []
+    for key in VERSION_KNOBS:
+        value_of = {fp: version_value(key, v) for fp, v in sample.items()}
+        if len({value for ok, value in value_of.values() if ok}) < 2:
+            continue
+        groups: dict[Any, list[dict]] = {}
+        runs: dict[Any, int] = {}
+        switches: list[int] = []
+        previous: Any = VERSION_UNRECORDED
+        for t, fp in zip(ordered, prints):
+            ok, value = value_of[fp]
+            if not ok:
+                continue
+            groups.setdefault(value, []).append(t)
+            if previous is VERSION_UNRECORDED or value != previous:
+                if previous is not VERSION_UNRECORDED:
+                    switches.append(opened(t))
+                runs[value] = runs.get(value, 0) + 1
+                previous = value
+
+        def row(name: str, rows: list[dict], stretches: int) -> dict:
+            return {"name": name, "first": opened(rows[0]), "last": max(opened(t) for t in rows), "runs": stretches,
+                    **summary_of(rows, marks), **settled_extras(rows)}
+        values = sorted(groups, key=lambda v: opened(groups[v][0]))
+        early = values[:-VERSION_ROWS_MAX + 1] if len(values) > VERSION_ROWS_MAX else []
+        rows = ([row(f"更早（{len(early)} 种取值）", sorted((t for v in early for t in groups[v]), key=opened), 1)] if early else []) \
+            + [row(version_text(key, v), groups[v], runs[v]) for v in values[len(early):]]
+        label, env = version_label(key)
+        out.append({"key": key, "label": label, "env": env, "changed": switches[-1] if switches else 0, "switches": len(switches), "rows": rows})
+    return sorted(out, key=lambda k: -k["changed"])
+
+
+# --- the review page's 15 分钟涨跌 tables (1.107.0) ---------------------------------------------------------------------------
+WINDOW_LEFT_BUCKETS = ((12.0, "剩 ≥12 分"), (9.0, "剩 9–12 分"), (6.0, "剩 6–9 分"), (3.0, "剩 3–6 分"), (-math.inf, "剩 <3 分"))
+
+
+def sim_by_window(trades: list[dict], marks: Mapping | None = None) -> dict:
+    """Over the records on 15-minute windows (settle.window): by the hour the window started (Beijing; the card named when
+    there are two — the hour after an open moves unlike the afternoon), and by the minutes left to the window's end when
+    the order was made (WINDOW_LEFT_BUCKETS) — each row summary_of, settled_extras and the markouts (1 and 5 minutes are
+    the ones that fall within a quarter hour)."""
+    wins = [t for t in trades if isinstance(t.get("settle"), dict) and t["settle"].get("window") and t["settle"].get("end")]
+    cards = {card_of(t) for t in wins}
+    hours: dict[tuple[str, int], list[dict]] = {}
+    left: dict[str, list[dict]] = {}
+    for t in wins:
+        s = t["settle"]
+        start = int(s.get("start") or int(s["end"]) - 15 * 60_000) + 60_000  # the window's start (its line: the minute candle ending there)
+        hours.setdefault((card_of(t) if len(cards) > 1 else "", dt.datetime.fromtimestamp(start / 1000, BEIJING).hour), []).append(t)
+        minutes = (int(s["end"]) + 60_000 - int(t.get("opened") or 0)) / 60_000
+        left.setdefault(next(name for low, name in WINDOW_LEFT_BUCKETS if minutes >= low), []).append(t)
+    row = lambda name, rows: {"name": name, **summary_of(rows, marks), **settled_extras(rows), "markout": markout_stats(rows)}
+    return {"hours": [row(f"{card} {hour:02d} 时开始".strip(), hours[(card, hour)]) for card, hour in sorted(hours)],
+            "left": [row(name, left[name]) for _, name in WINDOW_LEFT_BUCKETS if name in left]}
+
+
+# --- the review page's filter (1.107.0): the daily summary and the analysis over a card, a kind, a way of trading ----------------
+JOURNAL_WAYS = {"maker": True, "taker": False}
+
+
+def journal_filter_of(params: Mapping) -> dict[str, str]:
+    """The filter in a query's parameters (parse_qs): a card (card_of), a kind (SIM_KINDS), a way (maker / taker); unknown
+    values dropped, a card cut at 80 characters."""
+    first = lambda key: str((params.get(key) or [""])[0]).strip()
+    flt = {"card": first("card")[:80], "kind": first("kind"), "way": first("way")}
+    if flt["kind"] not in SIM_KINDS:
+        flt["kind"] = ""
+    if flt["way"] not in JOURNAL_WAYS:
+        flt["way"] = ""
+    return {k: v for k, v in flt.items() if v}
+
+
+def journal_match(trade: dict, flt: Mapping) -> bool:
+    return ((not flt.get("card") or card_of(trade) == flt["card"]) and (not flt.get("kind") or trade.get("kind") == flt["kind"])
+            and (not flt.get("way") or bool(trade.get("maker")) == JOURNAL_WAYS[flt["way"]]))
+
+
+def journal_filter_text(flt: Mapping) -> str:
+    return " · ".join(x for x in (flt.get("card", ""), SIM_KINDS.get(flt.get("kind", ""), ""),
+                                  {"maker": "挂单", "taker": "吃单"}.get(flt.get("way", ""), "")) if x)
+
+
+def block_matches(block: Mapping, flt: Mapping, markets: set) -> bool:
+    """Whether a refused buy (Bot.sim_blocks) is in the filter: its way by its label (挂… / 吃…); its card and kind as a
+    record's when it names its kind (1.107.0 on), an older one by its market being one the filtered records trade."""
+    if flt.get("way") and str(block.get("label") or "").startswith("挂") != JOURNAL_WAYS[flt["way"]]:
+        return False
+    if not (flt.get("card") or flt.get("kind")):
+        return True
+    if not block.get("kind"):
+        return str(block.get("market") or "") in markets
+    pseudo = {"item": block.get("item", ""), "kind": block["kind"], "key": block.get("key", ""), "driver": block.get("driver", ""),
+              "driver_name": block.get("name", ""), "settle": {"window": "15m"} if block.get("window") else {}}
+    return (not flt.get("card") or card_of(pseudo) == flt["card"]) and (not flt.get("kind") or block["kind"] == flt["kind"])
+
+
 def sim_by_item(trades: list[dict], marks: Mapping | None = None) -> list[dict]:
     """summary_of per underlying (sim_item_name), the most traded first, each with what the model expected of its
     settled records and their hit rate (settled_extras)."""
@@ -11173,6 +11397,7 @@ a{color:var(--best)}.mut{color:var(--muted)}.small{font-size:12.5px}.warn{color:
 .lnk{border:0;background:none;color:var(--best);font:inherit;font-size:12.5px;cursor:pointer;padding:2px 4px;white-space:nowrap}
 .box .body{padding:2px 0 12px;border-top:1px solid var(--line2)}
 .box h3{font-size:12.5px;color:var(--muted);font-weight:600;margin:14px 0 6px}
+.box div.sub{font-size:12px;font-weight:600;margin:12px 0 5px}  /* a table's own heading inside a section (a setting's, a 15-minute table's) */
 .box p{margin:4px 0}
 .tbl{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
 table{border-collapse:collapse;font-size:12.5px;width:100%;font-variant-numeric:tabular-nums}
@@ -11209,14 +11434,19 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
 <div class="tiles" id="tiles"></div>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
-<div class="body" id="sumbody"><div class="tbl" id="summary"></div><h3>今日按市场</h3><div class="tbl" id="s-cards"></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。</p><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
+<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><h3>今日按市场</h3><div class="tbl" id="s-cards"></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。</p><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
+<div class="note fline" id="anafilt" hidden></div>
+<h3>按设置版本</h3><div id="a-versions"></div>
+<p class="small mut">每笔记录都存了下单时的设置。这里把每个改过的设置单独拿出来：每种取值一行，带用它的时间段（中间换过别的值又换回来的写“N 段”），比已结算盈亏对“下单时预期”、胜率对平均公平价——改了以后这两组差距变小，就是改对了。同一时间改了几个设置时，这几张表是同一种切分，分不出是哪个起的作用；时间段不同，行情也不同，样本少时差别多半是运气。代码版本按大版本合并（1.106.x 算一个）。</p>
 <h3>按标的</h3><div id="a-items"></div>
 <h3>按下单时净优势</h3><div id="a-edges"></div>
 <p class="small mut">每桶的已结算盈亏对比“下单时预期”（净优势 × 份数），胜率（平局算半）对比平均公平价：胜率低于公平价的桶，模型把优势看高了。</p>
 <h3>按下单时公平价</h3><div id="a-fairs"></div>
 <h3>按时段</h3><div id="a-sessions"></div>
+<h3 id="h-windows" hidden>15 分钟涨跌</h3><div id="a-windows" hidden></div>
+<p class="small mut" id="p-windows" hidden>只算 15 分钟窗口的记录：按窗口开始的整点（北京时间，两张卡都有时分开写），和按下单时离窗口结束还有几分钟。胜率低于平均公平价、成交后 1 / 5 分钟市价持续为负的那一行，就是模型在那个时段或那个时点看错的地方。</p>
 <p class="small mut">按下单时标的所在的时段（交易所当地时间）；成交后市场走向 = 盘口中间价 − 成交价，每份，持续为负 = 这个时段的成交常是别人在出货；没有开盘时段的市场（加密）记在“无交易时段”。</p>
 <h3>挂单效率</h3><div id="a-makers"></div>
 <h3>被拦下的机会</h3><div id="a-blocked"></div>
@@ -11250,7 +11480,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_crypto_day_shares:"加密日涨跌每笔份数",sim_crypto_day_max_shares:"加密日涨跌每边上限",sim_crypto_day_edge:"加密日涨跌买入门槛",sim_crypto_day_quiet:"加密日涨跌结束前不买（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_floor_shares:"托底单份数",sim_maker_floor:"托底单价格",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_deeper:"买1 不够跟买2",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_crypto_day_shares:"加密日涨跌每笔份数",sim_crypto_day_max_shares:"加密日涨跌每边上限",sim_crypto_day_edge:"加密日涨跌买入门槛",sim_crypto_day_quiet:"加密日涨跌结束前不买（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_floor_shares:"托底单份数",sim_maker_floor:"托底单价格",sim_maker_floor_markets:"托底单只做",sim_maker_follow_settle:"买1 变了多久才改跟（秒）",sigma_calib:"σ 自动校准",sigma_raw:"σ（校准前）",sigma_factor:"σ 校准系数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_deeper:"买1 不够跟买2",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
   sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_taker_hold:"吃单前优势保持（秒）",sim_taker_hold_range:"价格阶梯吃单前优势保持（秒）",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",sim_no_odds_withdraw:"概率暂缺撤单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
   min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",big_move:"大波动日放宽 σ（倍日 σ）",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
@@ -11259,6 +11489,7 @@ const CENT_KEYS=new Set(["fair_up"]);
 const STATES=[["all","全部",t=>true],["open","持仓",t=>t.status==="filled"],["rest","挂单中",t=>t.status==="resting"],["done","已结算",t=>t.status==="settled"],
   ["bad","结果不一致",t=>t.confirm==="mismatch"],["exp","未成交/撤单",t=>t.status==="expired"||t.status==="cancelled"]];
 const PAGE=50;  // rows shown at a time; the rest on request
+let ana=null,verAll=false;  // ana: the summary and analysis over the filter (journal.json?analysis=1&…), when one is on
 let data=null,stateF="all",wayF="all",kindF="all",cardF="all",openId=decodeURIComponent(location.hash.slice(1)||""),shown=PAGE,allLoaded=false,statsOpen=false;
 const details={};  // trade id -> its whole record, fetched when the trade is opened
 try{statsOpen=localStorage.getItem("jrnstats")==="1"}catch(e){}
@@ -11269,7 +11500,7 @@ document.getElementById("back").href=base;document.getElementById("ctl").href=ba
 document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";  // also right under /journal/
 function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
   if(MS_KEYS.has(k))return v?when(v):"—";if(k==="high_at")return v?when(v*1000):"—";if(CENT_KEYS.has(k))return cent(v);
-  if(k==="sigma_daily"||k==="sigma")return (v*100).toFixed(2)+"%";if(k==="history")return JSON.stringify(v);
+  if(k==="sigma_daily"||k==="sigma"||k==="sigma_raw")return (v*100).toFixed(2)+"%";if(k==="history")return JSON.stringify(v);
   if(typeof v==="object")return JSON.stringify(v);return num(v)}
 function dl(obj,skip){const d=$("dl");Object.entries(obj||{}).forEach(([k,v])=>{if(skip&&skip.includes(k))return;d.append($("dt","",LABELS[k]||k),$("dd","",val(k,v)))});return d}
 const WRAP=new Set(["说明","事件","原因","依据"]);
@@ -11368,9 +11599,30 @@ async function loadDetail(id){  // one trade's whole record (its snapshots, sour
   catch(e){details[id]={id:id,error:e.message}}
   finally{loadDetail.busy=null}
   if(openId===id)render()}
+function filterKey(){const p=[];if(cardF!=="all")p.push("card="+encodeURIComponent(cardF));if(kindF!=="all")p.push("kind="+encodeURIComponent(kindF));
+  if(wayF!=="all")p.push("way="+wayF);return p.join("&")}
+function filterText(){return [cardF!=="all"?cardF:"",kindF!=="all"?(KINDS[kindF]||kindF):"",wayF!=="all"?(wayF==="maker"?"挂单":"吃单"):""].filter(Boolean).join(" · ")}
+async function loadAna(){  // the daily summary and the analysis over the filter: the server's, the records the list holds being only the latest
+  const fk=filterKey();if(!fk||loadAna.busy===fk)return;loadAna.busy=fk;
+  try{const key=ctlKey();const r=await fetch(base+"/journal.json?analysis=1&"+fk,{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
+    if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();ana=Object.assign(j,{key:fk})}
+  catch(e){if(!(ana&&ana.key===fk&&!ana.error))ana={key:fk,error:e.message||"读取失败"}}  // a failed refresh keeps what was shown
+  finally{if(loadAna.busy===fk)loadAna.busy=null}
+  if(fk===filterKey())render()}
+function src(){  // what the summary and the analysis show: every record, or the filter's (fetched once per filter, then with each refresh)
+  const fk=filterKey();if(!fk)return{s:data.summary||[],a:data.analysis||{},label:""};
+  if(ana&&ana.key===fk)return ana.error?{s:null,a:null,label:filterText(),err:ana.error}:{s:ana.summary||[],a:ana.analysis||{},label:filterText()};
+  loadAna();return{s:null,a:null,label:filterText()}}
+function filterLine(el,S){el.hidden=!S.label;if(!S.label)return;
+  const b=$("button","lnk","清除筛选");b.type="button";b.addEventListener("click",e=>{e.stopPropagation();cardF=kindF=wayF="all";shown=PAGE;render()});
+  el.replaceChildren("按筛选：",$("b","",S.label),"（下面列表的市场、类型、挂/吃筛选；状态筛选只管列表） ",b)}
 function summary(){  // per day the records were opened on: records, markets, what filled, what settled and its P&L, what is open — by kind and way under each
-  const rows=data.summary||[],el=document.getElementById("summary"),head=document.getElementById("sumsum");el.replaceChildren();
-  if(!rows.length){el.append($("p","small mut","还没有交易"));head.textContent="";document.getElementById("sumbody").hidden=!sumOpen;return}
+  const S=src(),rows=S.s,el=document.getElementById("summary"),head=document.getElementById("sumsum");el.replaceChildren();
+  filterLine(document.getElementById("sumfilt"),S);const fk=filterKey();document.getElementById("scsv").href=base+"/summary.csv"+(fk?"?"+fk:"");
+  const cel=document.getElementById("s-cards");
+  if(rows===null){el.append($("p","small mut",S.err?"按筛选读取失败："+S.err:"按筛选读取中…"));cel.replaceChildren();head.textContent=S.label;
+    document.getElementById("sumbody").hidden=!sumOpen;return}
+  if(!rows.length){el.append($("p","small mut",S.label?"这个筛选下没有交易":"还没有交易"));cel.replaceChildren();head.textContent=S.label;document.getElementById("sumbody").hidden=!sumOpen;return}
   const t=$("table"),h=$("tr");["日期 / 类别","记录","市场","成交份数","成交额","已结算","盈亏","持仓中","浮动盈亏"].forEach(x=>h.append($("th","",x)));t.append(h);
   const cell=(v,cls)=>{const c=$("td","",v);if(cls)c.className=cls;return c};
   const wl=r=>r.settled+"（赢 "+r.wins+" 输 "+r.losses+(r.ties?" 平 "+r.ties:"")+"）";
@@ -11379,9 +11631,9 @@ function summary(){  // per day the records were opened on: records, markets, wh
     cell(r.marked?money(r.unrealized)+(r.marked<r.open?"（"+r.marked+"/"+r.open+" 笔有报价）":""):"—",r.marked?(r.unrealized>=0?"ok":"bad"):""));return tr};
   rows.forEach(r=>{t.append(line(r,r.label,r.day?"":"all"));if(r.day)(r.parts||[]).forEach(p=>t.append(line(p,p.name,"sub")))});
   el.append(t);
-  const d=rows[0];head.replaceChildren(d.label+"：记录 "+d.records+" · 成交 "+usd(d.volume)+(d.settled?" · 盈亏 ":""));
+  const d=rows[0];head.replaceChildren((S.label?S.label+"｜":"")+d.label+"：记录 "+d.records+" · 成交 "+usd(d.volume)+(d.settled?" · 盈亏 ":""));
   if(d.settled){const b=$("b","",money(d.pnl));b.className=d.pnl>=0?"ok":"bad";head.append(b)}
-  const ct=(data.analysis||{}).cards_today||[],cel=document.getElementById("s-cards");cel.replaceChildren(ct.length?anaTable(ct):$("p","small mut","今天还没有记录"));
+  const ct=(S.a||{}).cards_today||[];cel.replaceChildren(ct.length?anaTable(ct):$("p","small mut","今天还没有记录"));
   document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"}
 function pn(x){const b=$("b","",money(x));b.className=x>=0?"ok":"bad";return b}
 function anaTable(rows,extra){  // one summary table: records, fills, the settled P&L against the model's expectation, the hit rate against the mean fair price, open, unrealized — plus a table's own columns
@@ -11389,11 +11641,27 @@ function anaTable(rows,extra){  // one summary table: records, fills, the settle
   const wl=r=>r.settled+"（赢 "+r.wins+" 输 "+r.losses+(r.ties?" 平 "+r.ties:"")+"）";
   return table(head,rows.map(r=>[r.name,r.records,r.markets,num(r.filled),usd(r.volume),r.settled?wl(r):"—",r.settled?pn(r.pnl):"—",r.settled?money(r.expected):"—",
     r.settled?(r.hit*100).toFixed(0)+"% / "+cent(r.avg_fair):"—",(r.open?r.open+"（"+usd(r.open_cost)+"）":"")+(r.resting?(r.open?" · ":"")+"挂单 "+r.resting:"")||"—",r.marked?pn(r.unrealized):"—"].concat(extra?extra.cells(r):[])))}
-function analysis(){  // per underlying, per net edge and fair price at the order, per part of the underlying's day, the resting orders' record, the refused buys' outcomes: folded away
-  const a=data.analysis||{},put=(id,rows,extra)=>{const el=document.getElementById(id);el.replaceChildren(rows&&rows.length?anaTable(rows,extra):$("p","small mut","还没有记录"))};
-  put("a-items",a.items);put("a-edges",a.edges);put("a-fairs",a.fairs);
+const VER_SHOW=6,mdhm=ms=>ms?MDF.format(new Date(ms)).replace("/","-")+" "+HMF.format(new Date(ms)):"—";
+function versions(a){  // 按设置版本: one table per setting that changed, a row per value with the stretch it was used
+  const vs=a.versions||[],vb=document.getElementById("a-versions");vb.replaceChildren();
+  if(!vs.length){vb.append($("p","small mut","这些记录下单时的设置都一样（或还没有记录设置）"));return}
+  (verAll?vs:vs.slice(0,VER_SHOW)).forEach(k=>{vb.append($("div","sub",k.label+(k.env?"（"+k.env+"）":"")+" · 改过 "+k.switches+" 次，最近一次 "+mdhm(k.changed)),
+    anaTable(k.rows,{head:["用的时间段"],cells:r=>[mdhm(r.first)+" – "+mdhm(r.last)+(r.runs>1?"（"+r.runs+" 段）":"")]}))});
+  if(vs.length>VER_SHOW){const b=$("button","lnk",verAll?"只看最近改的 "+VER_SHOW+" 个设置":"再显示 "+(vs.length-VER_SHOW)+" 个改过的设置");b.type="button";
+    b.addEventListener("click",()=>{verAll=!verAll;versions(a)});vb.append(b)}}
+function analysis(){  // per setting, per underlying, per net edge and fair price at the order, per part of the underlying's day, the 15-minute windows, the resting orders' record, the refused buys' outcomes: folded away
+  const S=src(),hd=document.getElementById("anasum");filterLine(document.getElementById("anafilt"),S);
+  const ids=["a-versions","a-items","a-edges","a-fairs","a-sessions","a-makers","a-blocked"];
+  if(S.a===null){ids.forEach(id=>document.getElementById(id).replaceChildren($("p","small mut",S.err?"按筛选读取失败："+S.err:"按筛选读取中…")));
+    ["h-windows","a-windows","p-windows"].forEach(id=>{document.getElementById(id).hidden=true});hd.textContent=S.label;
+    document.getElementById("anabody").hidden=!anaOpen;document.getElementById("foldana").textContent=anaOpen?"收起":"展开";return}
+  const a=S.a,put=(id,rows,extra)=>{const el=document.getElementById(id);el.replaceChildren(rows&&rows.length?anaTable(rows,extra):$("p","small mut","还没有记录"))};
+  versions(a);put("a-items",a.items);put("a-edges",a.edges);put("a-fairs",a.fairs);
   const mo=(r,k)=>r.markout&&r.markout[k]?sg(r.markout[k].avg)+"（"+r.markout[k].n+" 笔）":"—";
   put("a-sessions",a.sessions,{head:["成交后 5 分钟","成交后 30 分钟"],cells:r=>[mo(r,"5m"),mo(r,"30m")]});
+  const w=a.windows||{},wins=(w.hours||[]).length>0;["h-windows","a-windows","p-windows"].forEach(id=>{document.getElementById(id).hidden=!wins});
+  if(wins){const ex={head:["成交后 1 分钟","成交后 5 分钟"],cells:r=>[mo(r,"1m"),mo(r,"5m")]};
+    document.getElementById("a-windows").replaceChildren($("div","sub","按窗口开始（北京时间）"),anaTable(w.hours,ex),$("div","sub","按下单时离窗口结束"),anaTable(w.left||[],ex))}
   const mk=a.makers||{},mb=document.getElementById("a-makers");mb.replaceChildren();
   if(!mk.placed)mb.append($("p","small mut","还没有挂单"));
   else{const d=$("dl"),p=(k,v)=>d.append($("dt","",k),$("dd","",v));
@@ -11407,7 +11675,7 @@ function analysis(){  // per underlying, per net edge and fair price at the orde
   else{const s=$("p","small","最近一周被拦下 "+bl.n+" 次，其中市场已出结果的 "+bl.settled+" 次"+(bl.settled?"；若按 "+num(bl.shares)+" 份买入：赢 "+bl.wins+" 输 "+bl.losses+(bl.ties?" 平 "+bl.ties:"")+"，盈亏 ":""));
     if(bl.settled)s.append(pn(bl.pnl));bb.append(s);
     if((bl.rows||[]).length)bb.append(table(["时间","市场","方向","价格","结果","若买入的盈亏","原因"],bl.rows.map(r=>[when(r.at),r.item,r.label,cent(r.price),r.payout===1?"赢":r.payout===0?"输":"平",money(r.pnl),r.why])))}
-  const hd=document.getElementById("anasum");hd.replaceChildren("标的 "+(a.items||[]).length+" 个"+(mk.fill_rate!=null?" · 挂单成交率 "+(mk.fill_rate*100).toFixed(0)+"%":"")+(bl.settled?" · 被拦下的若买入 ":""));
+  hd.replaceChildren((S.label?S.label+"｜":"")+"标的 "+(a.items||[]).length+" 个"+((a.versions||[]).length?" · 改过的设置 "+a.versions.length+" 个":"")+(mk.fill_rate!=null?" · 挂单成交率 "+(mk.fill_rate*100).toFixed(0)+"%":"")+(bl.settled?" · 被拦下的若买入 ":""));
   if(bl.settled)hd.append(pn(bl.pnl));
   document.getElementById("anabody").hidden=!anaOpen;document.getElementById("foldana").textContent=anaOpen?"收起":"展开"}
 function tiles(){  // today, the last 7 days, the lifetime, what is open: the four numbers a glance needs
@@ -11501,7 +11769,7 @@ async function load(){  // the list: light rows, the open trades and the last fe
     if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}if(r.status===403&&askKey(j.message||"需要控制口令"))again=true;throw new Error(j.message||("HTTP "+r.status))}
     if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();
     if(openId&&!allLoaded&&j.more>0&&!j.trades.some(t=>t.id===openId)){allLoaded=true;again=true}  // a link to an older trade: the whole list
-    else{data=j;okAt=Date.now();
+    else{data=j;okAt=Date.now();if(filterKey())loadAna();  // the filter's tables refreshed with the list
       document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"+(data.more>0?"（更早的 "+data.more+" 笔可载入）":"")));
       render();if(openId&&details[openId])loadDetail(openId);
       const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}}
@@ -11930,8 +12198,11 @@ class WebServer:
 
     def cached(self, name: str, build: Any) -> bytes:
         entry = self.cache.get(name)
-        if entry is None or time.monotonic() >= entry[0]:
-            entry = self.cache[name] = (time.monotonic() + self.CACHE_SECONDS.get(name.partition("?")[0], 0.0), build())
+        now = time.monotonic()
+        if entry is None or now >= entry[0]:
+            if len(self.cache) >= 64:  # the filtered analyses are cached by their filter (1.107.0): the expired ones go
+                self.cache = {k: v for k, v in self.cache.items() if v[0] > now}
+            entry = self.cache[name] = (now + self.CACHE_SECONDS.get(name.partition("?")[0], 0.0), build())
         return entry[1]
 
     def compressed(self, body: bytes) -> bytes:
@@ -11973,8 +12244,9 @@ class WebServer:
                 return self.journal_json(query)
             if parts[2] == "journal.csv":
                 return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
-            if parts[2] == "summary.csv":
-                return 200, "text/csv; charset=utf-8", self.bot.journal_summary_csv().encode("utf-8")
+            if parts[2] == "summary.csv":  # with the review page's filter, when it has one (1.107.0)
+                flt = journal_filter_of(urllib.parse.parse_qs(query, keep_blank_values=True))
+                return 200, "text/csv; charset=utf-8", self.bot.journal_summary_csv(flt).encode("utf-8")
             if parts[2] == "samples.csv":  # the model samples (window_sample): the model's own figures, nothing of an account
                 return 200, "text/csv; charset=utf-8", self.bot.window_csv().encode("utf-8")
             if parts[2] == "why.json":  # the cards' "为什么挂 / 不挂单": an account's orders, keyed as the review data is (handle)
@@ -11997,6 +12269,10 @@ class WebServer:
             if row is None:
                 return 404, ctype, json.dumps({"ok": False, "message": "没有这笔记录"}, ensure_ascii=False).encode("utf-8")
             return 200, ctype, json.dumps({"version": VERSION, "trade": row}, ensure_ascii=False, default=str).encode("utf-8")
+        if flag("analysis"):  # the daily summary and the analysis over the page's filter (1.107.0)
+            flt = journal_filter_of(params)
+            name = "journal.json?analysis" + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
+            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_analysis(flt), ensure_ascii=False, default=str).encode("utf-8"))
         full, everything = flag("full"), flag("all")
         name = "journal.json" + ("?full" if full else "?all" if everything else "")
         return 200, ctype, self.cached(name, lambda: json.dumps(
@@ -15091,7 +15367,8 @@ class Bot:
             mkt = parts["mkt"]
             odds = parts["odds"]
             spec = mkt.spec
-            return {"basis": {"line": float(odds.line), "price": float(odds.price), "sigma": mkt.sigma, "years": odds.years,
+            return {"basis": {"line": float(odds.line), "price": float(odds.price), "sigma": mkt.sigma_used, "years": odds.years,
+                              **({"sigma_raw": mkt.sigma, "sigma_factor": mkt.calib[0]} if mkt.calib[1] else {}),  # SIGMA_CALIB's factor in that σ
                               "settled": odds.settled, "start": mkt.point(spec.start_ms), "end": mkt.point(spec.end_ms),
                               "window": spec.slug},
                     "sources": [price_evidence("指数", "币安合约指数价", spec.symbol, "指数价 i", mkt.price, mkt.priced_ms, mkt.priced_ms),
@@ -15101,7 +15378,8 @@ class Bot:
             mkt: UpDownMarket = parts["mkt"]
             odds: UpDownOdds = parts["odds"]
             spec = mkt.spec
-            return {"basis": {"line": float(odds.line), "price": float(odds.price), "sigma": mkt.sigma, "years": odds.years,
+            return {"basis": {"line": float(odds.line), "price": float(odds.price), "sigma": mkt.sigma_used, "years": odds.years,
+                              **({"sigma_raw": mkt.sigma, "sigma_factor": mkt.calib[0]} if mkt.calib[1] else {}),
                               "settled": odds.settled, "start": spec.label(spec.start_ms, plain=True),
                               "end": spec.label(spec.end_ms, plain=True)},
                     "sources": [price_evidence("现货", "币安现货", spec.symbol, "最新价", mkt.price, mkt.priced_ms, mkt.priced_ms),
@@ -15160,6 +15438,9 @@ class Bot:
                 **({"sim_quiet_minutes": c.sim_quiet_minutes} if c.sim_quiet_minutes else {}),
                 **({"sim_maker_min_bid": c.sim_maker_min_bid} if c.sim_maker_min_bid > 0 else {}),
                 **({"sim_maker_floor_shares": c.sim_maker_floor_shares, "sim_maker_floor": c.sim_maker_floor} if c.sim_maker_floor_shares > 0 else {}),
+                **({"sim_maker_floor_markets": sorted(c.sim_maker_floor_markets)} if c.sim_maker_floor_markets and c.sim_maker_floor_shares > 0 else {}),
+                # 1.107.0, written whatever their value (an older record's absence says nothing of them: VERSION_KNOBS)
+                "sim_maker_follow_settle": c.sim_maker_follow_settle, "sigma_calib": c.sigma_calib,
                 **({"sim_maker_exit": self.sim_maker_exit()} if self.sim_maker_exit() > 0 else {}),
                 **({"sim_maker_session": True} if c.sim_maker_session else {}),
                 **({"sim_maker_deeper": True} if c.sim_maker_deeper else {}),
@@ -17179,7 +17460,8 @@ class Bot:
         if old and now_ms - int(old.get("at") or 0) < self.SIM_BLOCK_NOTE_MS and old.get("why") == why:
             return
         blocked[tid] = {"at": now_ms, "market": mk.market, "item": mk.item, "label": label, "price": price, "why": why,
-                        "first": int((old or {}).get("first") or now_ms)}
+                        "first": int((old or {}).get("first") or now_ms), "kind": mk.kind, "key": mk.key,  # (the filter's card and kind: 1.107.0)
+                        **({"window": True} if (mk.settle or {}).get("window") else {})}
         if len(blocked) > 20:
             for key in sorted(blocked, key=lambda k: int(blocked[k].get("at") or 0))[:len(blocked) - 20]:
                 del blocked[key]
@@ -17471,10 +17753,15 @@ class Bot:
                     marks[(mk.market, side)] = mark
         return marks
 
-    def sim_analysis(self, trades: list[dict], marks: Mapping) -> dict:
+    def sim_analysis(self, trades: list[dict], marks: Mapping, flt: Mapping | None = None) -> dict:
         """The review page's analysis tables (journal.json "analysis"): per underlying, per net edge and per fair price
-        at the order, per part of the underlying's day, the resting orders' record, and what the buys the group cap
-        refused would have done."""
+        at the order, per part of the underlying's day, the resting orders' record, what the buys the group cap refused
+        would have done (those in ``flt``, the page's filter, when given), per setting that changed (sim_by_version) and
+        the 15-minute windows' (sim_by_window)."""
+        blocks = self.sim_blocks()
+        if flt:
+            traded = {str(t.get("market") or "") for t in trades}
+            blocks = [b for b in blocks if block_matches(b, flt, traded)]
         exchange_of = lambda t: (self.sim_exchange(str(t.get("key") or ""), str((t.get("settle") or {}).get("key") or ""))
                                  if t.get("kind") == "close" else "")
         holidays_of = lambda market: self.config.holidays.get(market, frozenset()) if market else frozenset()
@@ -17486,7 +17773,26 @@ class Bot:
                 "fairs": sim_by_bucket(trades, lambda t: t.get("fair"), FAIR_BUCKETS, marks),
                 "sessions": sim_by_session(trades, exchange_of, holidays_of, marks),
                 "makers": sim_maker_efficiency(trades),
-                "blocked": sim_blocked_outcomes(self.sim_blocks(), trades, self.config.sim_shares)}
+                "blocked": sim_blocked_outcomes(blocks, trades, self.config.sim_shares),
+                "versions": sim_by_version(trades, marks),  # 1.107.0: a setting changed, its values side by side
+                "windows": sim_by_window(trades, marks)}    # 1.107.0: the 15-minute windows by start hour and by minutes left
+
+    def journal_analysis(self, flt: Mapping | None = None) -> dict:
+        """The review page's daily summary and analysis over the records in ``flt`` (journal_filter_of: a card, a kind, a
+        way; none = every record): journal.json?analysis=1&card=…, and summary.csv with the same parameters (1.107.0)."""
+        flt = dict(flt or {})
+        now_ms = self.market.now_ms()
+        values = [t for t in self.sim_trades().values() if journal_match(t, flt)]
+        markets: dict[str, SimMarket] = {}
+        if any(t["status"] in {"resting", "filled"} for t in values):
+            try:
+                markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
+            except Exception as error:  # the tables are still served; open trades just cannot be marked
+                LOG.warning("journal: markets unavailable: %s", clean_error(error) or type(error).__name__)
+        marks = self.sim_marks(markets, now_ms)
+        return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）", "filter": flt,
+                "filter_text": journal_filter_text(flt), "records": len(values),
+                "summary": sim_summary(values, marks=marks), "analysis": self.sim_analysis(values, marks, flt)}
 
     def journal_trade(self, tid: str) -> dict | None:
         """One trade's whole record (None when there is no such trade): what the review page fetches when a trade is opened."""
@@ -17550,13 +17856,13 @@ class Bot:
     SUMMARY_COLUMNS = ("表", "行", "记录", "市场", "成交份数", "成交额", "已结算", "赢", "输", "平", "盈亏", "持仓中", "持仓成本", "挂单中",
                        "浮动盈亏", "有报价的持仓", "下单时预期", "平均公平价", "胜率", "成交后5分钟市价变动", "成交后30分钟市价变动")
 
-    def journal_summary_csv(self) -> str:
+    def journal_summary_csv(self, flt: Mapping | None = None) -> str:
         """The review page's summary and analysis tables as one CSV (UTF-8 with BOM), the table's name in the first
         column: the daily summary with its parts, per underlying, per net edge and per fair price at the order, per part
         of the day, the resting orders' record and withdrawal reasons, the refused buys and what they would have done."""
         import csv
         import io
-        payload = self.journal_payload(history=0)
+        payload = self.journal_analysis(flt)  # the page's filter, when it has one (1.107.0)
         when = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING).strftime("%Y-%m-%d %H:%M:%S") if ms else ""
         r4 = lambda x: round(float(x), 4) if isinstance(x, (int, float)) and not isinstance(x, bool) else ""
         col = {name: i for i, name in enumerate(self.SUMMARY_COLUMNS)}
@@ -17579,13 +17885,21 @@ class Bot:
                               "浮动盈亏": r4(r.get("unrealized")), "有报价的持仓": r.get("marked", ""), "下单时预期": r4(r.get("expected")),
                               "平均公平价": r4(r.get("avg_fair")), "胜率": r4(r.get("hit")),
                               "成交后5分钟市价变动": r4((mo.get("5m") or {}).get("avg")), "成交后30分钟市价变动": r4((mo.get("30m") or {}).get("avg"))})
+        if payload["filter"]:
+            put("筛选", payload["filter_text"], {"记录": payload["records"]})
         for r in payload["summary"]:
             line("每日汇总", r["label"], r)
             for p in r.get("parts") or []:
                 line("每日汇总", f"{r['label']}｜{p['name']}", p)
         analysis = payload["analysis"]
-        for table, key in (("按标的", "items"), ("按下单时净优势", "edges"), ("按下单时公平价", "fairs"), ("按时段", "sessions")):
+        for table, key in (("今日按市场", "cards_today"), ("按标的", "items"), ("按下单时净优势", "edges"), ("按下单时公平价", "fairs"), ("按时段", "sessions")):
             for r in analysis[key]:
+                line(table, r["name"], r)
+        for k in analysis["versions"]:
+            for r in k["rows"]:
+                line(f"按设置版本｜{k['label']}" + (f"（{k['env']}）" if k["env"] else ""), f"{r['name']}（{when(r['first'])} – {when(r['last'])}）", r)
+        for table, key in (("15 分钟涨跌｜按窗口开始", "hours"), ("15 分钟涨跌｜按下单时距结束", "left")):
+            for r in analysis["windows"][key]:
                 line(table, r["name"], r)
         mk = analysis["makers"]
         seconds = lambda ms: r4(ms / 1000) if ms is not None else ""

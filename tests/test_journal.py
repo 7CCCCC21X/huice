@@ -158,6 +158,75 @@ async def run():
     assert next(r for r in srows if r[1] == "累计")[2] == "6" and next(r for r in srows if r[0] == "挂单效率" and r[1] == "挂出")[2] == "4"
     assert next(r for r in srows if r[0] == "按标的" and r[1] == "恒生指数")[18] == "1.0" and next(r for r in srows if r[0] == "被拦下的机会")[10] == "-40.0"
     assert 'id="scsv"' in web.route("GET", f"/p/{TOKEN}/journal")[2].decode() and "jrnana" in m.JOURNAL_PAGE
+    # --- 1.107.0: the daily summary and the analysis over the page's filter (a card, a kind, a way), the summary CSV too ---------
+    fj = lambda q: json.loads(web.route("GET", f"/p/{TOKEN}/journal.json", q)[2])
+    every = bot.sim_trades().values()
+    hs = fj("analysis=1&card=" + urllib.parse.quote("恒生指数"))
+    assert hs["filter"] == {"card": "恒生指数"} and hs["filter_text"] == "恒生指数" and hs["records"] == sum(m.card_of(t) == "恒生指数" for t in every) == 2, hs["records"]
+    assert [r["name"] for r in hs["analysis"]["items"]] == ["恒生指数"] and hs["summary"][-1]["records"] == 2 and hs["analysis"]["blocked"]["n"] == 1
+    block = bot.sim_blocks()[0]
+    assert (block["kind"], block["key"], "window" in block) == ("close", "HSI", False), block  # a refused buy names its kind: the filter's card
+    ko = fj("analysis=1&card=KOSPI")
+    assert {r["name"] for r in ko["analysis"]["items"]} == {"KOSPI"} and ko["analysis"]["blocked"]["n"] == 0 and ko["records"] == 2
+    makers = fj("analysis=1&way=maker")
+    assert makers["filter_text"] == "挂单" and makers["records"] == sum(bool(t.get("maker")) for t in every) == 4 and makers["analysis"]["blocked"]["n"] == 0  # the refused buy was a taker
+    assert fj("analysis=1&kind=flip&way=maker")["records"] == 1 and fj("analysis=1&kind=flip")["filter_text"] == "反超"
+    junk = fj("analysis=1&kind=nope&way=sideways&card=")
+    assert junk["filter"] == {} and junk["records"] == 6 and junk["filter_text"] == ""
+    assert m.block_matches({"label": "吃跌", "market": "x"}, {"card": "恒生指数"}, {"x"}) and not m.block_matches({"label": "吃跌", "market": "y"}, {"card": "恒生指数"}, {"x"})  # an older block: by market
+    status, _, body = web.route("GET", f"/p/{TOKEN}/summary.csv", "card=" + urllib.parse.quote("恒生指数"))
+    frows = list(csv.reader(io.StringIO(body.decode("utf-8")[1:])))
+    assert status == 200 and frows[1][:3] == ["筛选", "恒生指数", "2"] and next(r for r in frows if r[1] == "累计")[2] == "2", frows[:3]
+    assert "今日按市场" in {r[0] for r in frows}
+    web.cache = {f"x{i}": (0.0, b"") for i in range(70)}  # the cache drops what expired once it holds many (the filtered analyses: one a filter)
+    web.cached("journal.json?analysis&card=y", lambda: b"{}")
+    assert len(web.cache) == 1
+    # --- 1.107.0: 按设置版本 — a table per setting that changed, a row per value with the stretch it ran ---------------------------
+    v0 = dict(bot.sim_version())
+    assert "sim_maker_follow_settle" in v0 and "sigma_calib" in v0 and "sim_maker_min_bid" not in v0  # (the fixture: SIM_MAKER_MIN_BID=0)
+    rec = lambda i, opened, payout=1.0, drop=(), **ver: {"market": f"m{i}", "side": "up", "kind": "close", "key": "HSI", "item": "恒生指数", "maker": False,
+                                                         "status": "settled", "shares": 10.0, "order": 10.0, "price": 0.5, "payout": payout, "edge": 0.1,
+                                                         "fair": 0.6, "opened": opened,
+                                                         "version": {k: v for k, v in {**v0, **ver}.items() if k not in drop}}
+    recs = [rec(0, 1_000, sim_edge=0.10), rec(1, 2_000, 0.0, sim_edge=0.10), rec(2, 3_000, sim_edge=0.12), rec(3, 4_000, sim_edge=0.12, code="1.106.9"),
+            rec(4, 5_000, sim_edge=0.10, code="1.106.0"), rec(5, 6_000, sim_edge=0.10, code="1.106.0", sim_maker_min_bid=100),
+            rec(6, 7_000, sim_edge=0.10, code="1.106.0", sim_maker_min_bid=100, drop=("sim_taker_hold_range", "sigma_calib")),
+            {"market": "old", "status": "settled", "opened": 500, "shares": 1.0, "price": 0.5, "payout": 1.0}]  # no version at all: left out
+    vs = m.sim_by_version(recs)
+    # the latest change first; an "on only" setting absent is off (关); one always written but absent (an older record) is no value
+    assert [k["key"] for k in vs] == ["sim_maker_min_bid", "sim_edge", "code"], [k["key"] for k in vs]
+    mb, edge, code = vs
+    assert (mb["label"], mb["env"], mb["changed"], mb["switches"]) == ("买1 至少多少份才跟", "SIM_MAKER_MIN_BID", 6_000, 1)
+    assert [(r["name"], r["records"]) for r in mb["rows"]] == [("关", 5), ("100", 2)]
+    assert (edge["label"], edge["env"], edge["changed"], edge["switches"]) == ("触发买入的净优势（¢/份）", "SIM_EDGE_CENTS", 5_000, 2)
+    r10, r12 = edge["rows"]
+    assert (r10["name"], r10["records"], r10["settled"], r10["wins"], r10["losses"], r10["first"], r10["last"], r10["runs"]) == ("10¢", 5, 5, 4, 1, 1_000, 7_000, 2), r10
+    assert abs(r10["pnl"] - 15.0) < 1e-9 and abs(r10["expected"] - 5.0) < 1e-9 and abs(r10["hit"] - 0.8) < 1e-9 and abs(r10["avg_fair"] - 0.6) < 1e-9, r10
+    assert (r12["name"], r12["records"], r12["runs"], r12["first"], r12["last"]) == ("12¢", 2, 1, 3_000, 4_000) and abs(r12["pnl"] - 10.0) < 1e-9
+    assert [(r["name"], r["records"]) for r in code["rows"]] == [(".".join(m.VERSION.split(".")[:2]), 3), ("1.106", 4)] and code["label"] == "代码版本"
+    many = m.sim_by_version([rec(i, 1_000 * (i + 1), code=f"1.{90 + i}.0") for i in range(10)])
+    assert [r["name"] for r in many[0]["rows"]] == ["更早（3 种取值）", "1.93", "1.94", "1.95", "1.96", "1.97", "1.98", "1.99"] and many[0]["rows"][0]["records"] == 3
+    assert m.version_text("sim_crypto_day_edge", 0.0) == "0（同买入门槛）" and m.version_text("sim_crypto_day_edge", 0.1) == "10¢" and m.version_text("sim_skip", ()) == "不排除"
+    assert m.version_text("sim_maker_deep_markets", ("HSI", "KOSPI")) == "HSI、KOSPI" and m.version_text("sigma_calib", False) == "关" and m.version_text("sim_maker_exit", 0.0) == "关"
+    assert m.version_value("sim_maker_deep_markets", {"sim_maker_deep_markets": ["KOSPI", "HSI"]}) == (True, ("HSI", "KOSPI")) and m.version_value("sim_edge", {}) == (False, None)
+    assert m.sim_by_version([rec(0, 1_000), rec(1, 2_000)]) == [] and data["analysis"]["versions"] == []  # nothing changed: no table
+    # --- 1.107.0: the 15-minute tables — by the window's start hour (the card named when there are two), by the minutes left -----
+    def win(item, key, start, opened, payout=1.0):
+        return {"market": f"{key}-{start}", "kind": "updown", "key": key, "item": item, "side": "up", "maker": True, "status": "settled", "shares": 10.0,
+                "order": 10.0, "price": 0.5, "payout": payout, "edge": 0.1, "fair": 0.6, "opened": opened, "fills": [],
+                "settle": {"start": start - 60_000, "end": start + 14 * 60_000, "window": "15m"}}
+    u930, u945, u1300, k800 = BJ(10, 5, 9, 30), BJ(10, 5, 9, 45), BJ(10, 5, 13, 0), BJ(10, 5, 8, 0)
+    wins = [win("宇树 15分涨跌 09:30–09:45", "UNITREE-15M", u930, u930 + 60_000), win("宇树 15分涨跌 09:45–10:00", "UNITREE-15M", u945, u945 + 10 * 60_000, 0.0),
+            win("宇树 15分涨跌 13:00–13:15", "UNITREE-15M", u1300, u1300 + 13 * 60_000), win("SK 海力士 15分涨跌 08:00–08:15", "SKHYNIX-15M", k800, k800 + 4 * 60_000),
+            dict(win("BTC 10-05 涨跌", "BTC-DAY", u930, u930), settle={"end": u930, "day": "2026-10-05"})]  # a daily card: not a window
+    w = m.sim_by_window(wins)
+    assert [(r["name"], r["records"]) for r in w["hours"]] == [("SK 海力士 15分涨跌 08 时开始", 1), ("宇树 15分涨跌 09 时开始", 2), ("宇树 15分涨跌 13 时开始", 1)], w["hours"]
+    assert [(r["name"], r["records"]) for r in w["left"]] == [("剩 ≥12 分", 1), ("剩 9–12 分", 1), ("剩 3–6 分", 1), ("剩 <3 分", 1)], w["left"]
+    assert w["hours"][1]["losses"] == 1 and "markout" in w["left"][0] and [r["name"] for r in m.sim_by_window(wins[:3])["hours"]] == ["09 时开始", "13 时开始"]
+    assert m.sim_by_window([]) == {"hours": [], "left": []} and data["analysis"]["windows"] == {"hours": [], "left": []}
+    page = m.JOURNAL_PAGE
+    for want in ('id="a-versions"', 'id="a-windows"', 'id="sumfilt"', 'id="anafilt"', "journal.json?analysis=1&", "清除筛选", "按设置版本"):
+        assert want in page, want
     # the daily report: once per day and subscription, from SIM_DAILY_REPORT (16:30) on, within six hours of it
     sent = []
 
