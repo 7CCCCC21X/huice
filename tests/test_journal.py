@@ -112,6 +112,7 @@ async def run():
     assert m.sim_summary([]) == [] and 'id="summary"' in web.route("GET", f"/p/{TOKEN}/journal")[2].decode() and "jrnsum" in m.JOURNAL_PAGE
     # 1.113.0: a day is one line until it is clicked (sumDays); 今日按市场 has a refresh button and the time of the data
     assert "sumDays" in m.JOURNAL_PAGE and 'id="scref"' in m.JOURNAL_PAGE and 'id="scat"' in m.JOURNAL_PAGE and "function clock(" in m.JOURNAL_PAGE
+    assert 'id="anaref"' in m.JOURNAL_PAGE and 'id="anaat"' in m.JOURNAL_PAGE  # 1.113.1: the 复盘分析 header's refresh button and the time of its data
     # 1.81.0: the analysis tables (per underlying, per edge / fair bucket, per session part, the makers, the refused buys), the
     # marks, the summary CSV and the daily report
     hsi_mk = m.SimMarket(HSI_SLUG, "恒生指数", "close", "HSI", 0.70, book([("0.55", "300")], [("0.58", "400")], NOW, HSI_SLUG, "HSI", "101"),
@@ -355,6 +356,16 @@ async def browser_check(bot, data):
         await page.click("#scref")  # disabled and "刷新中…" while the page re-reads, then back
         await page.wait_for_selector("#scref:not([disabled])")
         assert await page.inner_text("#scref") == "刷新" and await page.evaluate("okAt") > read_at and await page.locator("#list .tr").count() == 3
+        # 1.113.1: the 复盘分析 header has one too; it re-reads without unfolding the section (the header's click folds / unfolds)
+        assert await page.is_hidden("#anabody")
+        read_at = await page.evaluate("okAt")
+        await page.click("#anaref")
+        await page.wait_for_selector("#anaref:not([disabled])")
+        assert await page.is_hidden("#anabody") and await page.inner_text("#anaref") == "刷新" and await page.evaluate("okAt") > read_at
+        await page.click("#anahd")
+        assert await page.is_visible("#anabody") and (await page.inner_text("#anaat")).startswith("已刷新 ")
+        await page.click("#anahd")
+        assert await page.is_hidden("#anabody")
         assert not errors, errors
         # three rows at first (the resting order and the last two finished ones), every one on request, by day
         assert await page.locator("#list .tr").count() == 3 and "更早的 3 笔可载入" in await page.inner_text("#meta")

@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.113.0"
+VERSION = "1.113.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -11745,9 +11745,9 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <div class="tiles" id="tiles"></div>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
 <div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><h3>今日按市场 <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbl" id="s-cards"></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。</p><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
-<section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="foldana">展开</button></div>
+<section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="anaref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
-<div class="note fline" id="anafilt" hidden></div>
+<div class="note fline" id="anafilt" hidden></div><div class="small mut" id="anaat"></div>
 <h3>按设置版本</h3><div id="a-versions"></div>
 <p class="small mut">每笔记录都存了下单时的设置。这里把每个改过的设置单独拿出来：每种取值一行，带用它的时间段（中间换过别的值又换回来的写“N 段”），比已结算盈亏对“下单时预期”、胜率对平均公平价——改了以后这两组差距变小，就是改对了。同一时间改了几个设置时，这几张表是同一种切分，分不出是哪个起的作用；时间段不同，行情也不同，样本少时差别多半是运气。代码版本按大版本合并（1.106.x 算一个）。</p>
 <h3>按标的</h3><div id="a-items"></div>
@@ -11965,6 +11965,7 @@ function versions(a){  // 按设置版本: one table per setting that changed, a
     b.addEventListener("click",()=>{verAll=!verAll;versions(a)});vb.append(b)}}
 function analysis(){  // per setting, per underlying, per net edge and fair price at the order, per part of the underlying's day, the 15-minute windows, the resting orders' record, the refused buys' outcomes: folded away
   const S=src(),hd=document.getElementById("anasum");filterLine(document.getElementById("anafilt"),S);
+  document.getElementById("anaat").textContent=okAt?"已刷新 "+clock(okAt):"";
   const ids=["a-versions","a-items","a-edges","a-fairs","a-sessions","a-makers","a-blocked"];
   if(S.a===null){ids.forEach(id=>document.getElementById(id).replaceChildren($("p","small mut",S.err?"按筛选读取失败："+S.err:"按筛选读取中…")));
     ["h-windows","a-windows","p-windows"].forEach(id=>{document.getElementById(id).hidden=true});hd.textContent=S.label;
@@ -12102,8 +12103,10 @@ document.getElementById("statshd").addEventListener("click",()=>{statsOpen=!stat
   document.getElementById("statsbody").hidden=!statsOpen;document.getElementById("foldstats").textContent=statsOpen?"收起":"展开"});
 document.getElementById("sumhd").addEventListener("click",()=>{sumOpen=!sumOpen;try{localStorage.setItem("jrnsum",sumOpen?"1":"0")}catch(e){}
   document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"});
-document.getElementById("scref").addEventListener("click",async e=>{e.stopPropagation();const b=e.currentTarget;if(b.disabled)return;b.disabled=true;b.textContent="刷新中…";  // 1.113.0
-  try{if(load.busy)load.again=true;else await load()}finally{b.disabled=false;b.textContent="刷新"}});
+async function reread(b){  // a 刷新 button (1.113.0 by 今日按市场, 1.113.1 on the 复盘分析 header): the list, the summary and the analysis re-read at once
+  if(b.disabled)return;b.disabled=true;b.textContent="刷新中…";
+  try{if(load.busy)load.again=true;else await load()}finally{b.disabled=false;b.textContent="刷新"}}
+["scref","anaref"].forEach(id=>document.getElementById(id).addEventListener("click",e=>{e.stopPropagation();reread(e.currentTarget)}));  // on the header: no fold
 document.getElementById("anahd").addEventListener("click",()=>{anaOpen=!anaOpen;try{localStorage.setItem("jrnana",anaOpen?"1":"0")}catch(e){}
   document.getElementById("anabody").hidden=!anaOpen;document.getElementById("foldana").textContent=anaOpen?"收起":"展开"});
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
