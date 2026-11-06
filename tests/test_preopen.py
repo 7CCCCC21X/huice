@@ -38,7 +38,8 @@ class Api:
         self.ctl, self.markets = ctl, {str(x["id"]): x for x in markets}
         self.sent, self.removed, self.rows = [], [], {}
         self.orders_complete = True
-        self.pages = {}
+        self.calls = []
+        self.unlisted = set()  # category slugs that answer 404 although the market dict exists (listed later)
         self.fail_side = 0    # the n-th send: a timeout (result unknown)
         self.reject_side = 0  # the n-th send: Predict's refusal (definite)
         self.stuck = set()    # order ids a removal does not remove (answered "noop") and whose record stays OPEN
@@ -75,10 +76,13 @@ class Api:
         return [copy.deepcopy(r) for r in self.rows.values() if r["status"] == "OPEN"]
 
     async def call(self, method, path, **kwargs):
-        params = m.urllib.parse.parse_qs(m.urllib.parse.urlsplit(path).query)
-        variant = params["marketVariant"][0]
-        after = params.get("after", [""])[0]
-        return self.pages.get((variant, after), {"success": True, "data": list(self.markets.values()), "cursor": None})
+        """GET /categories/<slug>: the category of a listed market (its id in the answer), 404 for the rest."""
+        self.calls.append(path)
+        slug = path.removeprefix("/categories/")
+        for mkt in self.markets.values():
+            if mkt.get("categorySlug") == slug and slug not in self.unlisted:
+                return {"success": True, "data": {"slug": slug, "markets": [{"id": mkt["id"], "conditionId": mkt["conditionId"], "title": slug, "question": mkt.get("question", "")}]}}
+        raise m.RemoteError(f"HTTP 404: no category {slug}")
 
 
 def controller(markets=None, **env):
@@ -235,7 +239,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pair["open_seen_ms"], 0)
         api.markets["123"]["tradingStatus"] = "OPEN"
         clock.ms = c["start_ms"] - 300_000
-        await ctl.discover()  # the listing shows it OPEN: the moment kept
+        await ctl.refresh_active()  # the market shows OPEN: the moment kept
         self.assertEqual(pair["open_seen_ms"], c["start_ms"] - 300_000)
         api.stuck.add("2")
         clock.ms = c["cancel_ms"]
@@ -336,24 +340,47 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((pair["orders"]["down"]["state"], pair["phase"], pair["accounted"], ctl.risk()), ("not_found", "closed", True, 0.))
         await self.finish(ctl)
 
-    async def test_new_listing_later_page_and_duplicate_variant(self):
+    async def test_a_window_listed_later_is_found_on_the_next_poll_and_queued_once(self):
         ctl, api, _ = controller()
-        api.pages[("UP_DOWN", "")] = {"success": True, "data": [], "cursor": None}
-        api.pages[("CRYPTO_UP_DOWN", "")] = {"success": True, "data": [{"id": 999}], "cursor": "next"}
-        api.pages[("CRYPTO_UP_DOWN", "next")] = {"success": True, "data": [market(), market()], "cursor": None}
+        api.unlisted.add(market()["categorySlug"])
+        await ctl.discover()
+        self.assertEqual(ctl.queue.qsize(), 0)  # 404: not listed yet
+        api.unlisted.clear()
         await ctl.discover()
         self.assertEqual(ctl.queue.qsize(), 1)
         await ctl.discover()
-        self.assertEqual(ctl.queue.qsize(), 1)
+        self.assertEqual(ctl.queue.qsize(), 1)  # queued once
+        self.assertTrue(all(c.startswith("/categories/") for c in api.calls))
         await self.finish(ctl)
 
     async def test_discovery_takes_the_soonest_first_and_only_within_the_horizon(self):
         rows = [market(at=NOW + 45 * 60_000, mid=1), market(at=NOW + 15 * 60_000, mid=2), market(at=NOW + 3 * 3600_000, mid=3), market("skhynix", at=NOW + 30 * 60_000, mid=4)]
         ctl, api, _ = controller(rows)
+        starts = p.window_starts(NOW, ctl.owner.config, ctl.settings)
+        self.assertEqual([(r.key, (s - NOW) // 60_000) for r, s in starts][:4], [("BTC-15M", 15), ("SKHYNIX-15M", 15), ("BTC-15M", 30), ("SKHYNIX-15M", 30)])
+        self.assertTrue(all(s - NOW >= 180_000 and s - NOW <= 3_600_000 for _, s in starts) and ("UNITREE-15M", 30) in [(r.key, (s - NOW) // 60_000) for r, s in starts])
         await ctl.discover()
-        self.assertEqual(ctl.queue.qsize(), 3)  # the 3-hour one waits for a later scan
+        self.assertEqual(ctl.queue.qsize(), 3)  # the 3-hour one is not even asked for
         order = [ctl.queue.get_nowait()[2]["market_id"] for _ in range(3)]
         self.assertEqual(order, ["2", "4", "1"])
+        self.assertNotIn("/categories/" + market(at=NOW + 3 * 3600_000)["categorySlug"], api.calls)
+        await self.finish(ctl)
+
+    async def test_an_active_window_is_reread_and_withdrawn_when_its_market_closes(self):
+        ctl, api, clock = controller()
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        api.markets["123"]["tradingStatus"] = "OPEN"
+        await ctl.refresh_active()
+        self.assertEqual((pair["open_seen_ms"], pair["phase"]), (NOW, "active"))
+        api.markets["123"]["tradingStatus"] = "CANCEL_ONLY"
+        await ctl.refresh_active()
+        self.assertEqual(pair["phase"], "active", "read again only after REFRESH_MS")
+        clock.ms += p.REFRESH_MS
+        await ctl.refresh_active()
+        self.assertEqual((pair["phase"], pair["reason"]), ("closed", "市场状态 REGISTERED / CANCEL_ONLY"))
+        self.assertEqual(set(api.removed), {"1", "2"})
         await self.finish(ctl)
 
     async def test_global_budget_and_existing_risk_are_not_overridden(self):
@@ -496,18 +523,19 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ctl.settings.exclusive is False and p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_EXCLUSIVE": "on"})).exclusive)
         await self.finish(ctl)
 
-    async def test_probe_reports_fields_and_candidates(self):
-        ctl, api, _ = controller([market(), market(at=NOW, mid=5), market("eth", mid=6)])
+    async def test_probe_reports_each_coming_window(self):
+        ctl, api, _ = controller([market(), market(at=NOW + 15 * 60_000, mid=5, status="CLOSED"), market("eth", mid=6)])
         lines = await p.probe(api, ctl.owner.config, ctl.settings, NOW)
         text = "\n".join(lines)
-        self.assertIn("UP_DOWN：3 行", text)
-        self.assertIn("字段：categorySlug、conditionId、feeRateBps、id、isVisible、outcomes、status、tradingStatus", text)
-        self.assertIn("发现逻辑要用的字段缺失：makerFeeBps、question", text)
-        self.assertIn("现在会挂的：1 场；不挂的原因：", text)
-        self.assertIn("已开始或不足 3 分钟×1", text)
-        self.assertIn("不是三张 15 分钟卡的链接×1", text)
-        api.pages[("CRYPTO_UP_DOWN", "")] = {"success": True, "data": [], "cursor": None}
-        self.assertIn("CRYPTO_UP_DOWN：0 行", "\n".join(await p.probe(api, ctl.owner.config, ctl.settings, NOW)))
+        self.assertIn("btc-updown-15m-1793930400（10:00）：会挂；状态 REGISTERED / 交易状态 MATCHING_NOT_ENABLED；缺字段：question", text)  # the fixture states no question
+        self.assertIn("btc-updown-15m-1793927700（09:15）：不挂：交易状态 CLOSED", text)
+        self.assertGreaterEqual(text.count("：还没发布"), 6)  # the other BTC quarters, 海力士's and 宇树's
+        self.assertNotIn("eth", text)
+        async def broken(method, path, **kw): raise m.RemoteError("HTTP 403: 访问被拒绝")
+        api.call = broken
+        self.assertIn("读取失败：HTTP 403", "\n".join(await p.probe(api, ctl.owner.config, ctl.settings, NOW)))
+        empty = p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", "PREOPEN_MARKETS": "unitree"}))
+        self.assertIn("没有要看的场次", "\n".join(await p.probe(api, ctl.owner.config, empty, NOW - 3600_000)))  # 08:00: 宇树's session has not opened
         await self.finish(ctl)
 
     async def test_rate_limit_cooldown_is_shared_with_the_bots_client(self):

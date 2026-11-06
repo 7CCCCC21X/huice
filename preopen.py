@@ -39,9 +39,10 @@ NEVER_PLACED = {"not_sent", "rejected", "not_found"}                  # ...of wh
 RETRY_MS, RETRY_MAX_MS = 15_000, 120_000  # a closing pair's cancels and reads are tried again this long after a try, doubling to the cap
 GIVE_UP_MS = 15 * 60_000  # after a window's start + this, an order Predict cannot show by its hash is taken as never placed (it expired before the start)
 SPRINT_MS = 2_000         # the last stretch (past the cancel time, before the expiry): an order still open is asked to be cancelled this often, no backoff
+REFRESH_MS = 30_000       # an active window's market is read again this often (matching on; a status change withdraws the pair)
 SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
 DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
-LISTING_FIELDS = ("id", "conditionId", "categorySlug", "status", "tradingStatus", "isVisible", "makerFeeBps", "question", "outcomes")
+LISTING_FIELDS = ("id", "conditionId", "status", "tradingStatus", "question", "outcomes")  # the details' fields the discovery reads
 
 
 def final_order(row: dict) -> bool:
@@ -94,9 +95,9 @@ class NotSent(core.RemoteError):
 
 
 def safe_api(base: str, key: str, wallet: Any, before_send: Any = None, shared: Any = None) -> Any:
-    """A PredictApi for this mode: no pooled transport (a sendall failure cannot prove zero delivery, so no automatic
-    POST retry), every answer checked for success, ``before_send`` judged right before an order's bytes go out, and the
-    rate-limit cooldown shared with ``shared`` (the bot's own client): a 429 on either pauses both."""
+    """A PredictApi for this mode: the bot's own request path, every answer checked for success, ``before_send`` judged
+    right before an order's bytes go out, and the rate-limit cooldown shared with ``shared`` (the bot's own client): a 429
+    on either pauses both."""
     import live
 
     class Api(live.PredictApi):
@@ -116,17 +117,10 @@ def safe_api(base: str, key: str, wallet: Any, before_send: Any = None, shared: 
                 why = before_send(payload)
                 if why:
                     raise NotSent(why)
-            data = None if payload is None else json.dumps(payload).encode()
-            headers = self.headers()
-            if data is not None:
-                headers["Content-Type"] = "application/json"
-            url = self.base + path
-            try:
-                return await core.predict_blocking(core._http_urllib, url, data, headers, timeout, core.urllib.parse.urlsplit(url).hostname or "")
-            except core.RemoteError as error:
-                if error.retry_after or live.http_status(error) == 429:
-                    self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, self.BACKOFF_SECONDS))
-                raise
+            # the bot's own request path (its headers, its pooled connections: a plain request without them is refused with a 403
+            # by Predict's edge); the pool resends a POST only when the request could not be sent at all on a connection the
+            # server had closed — nothing of it taken — never after an answer went missing
+            return await super().send(method, path, payload, timeout)
 
         async def call(self, *args: Any, **kwargs: Any) -> Any:
             answer = await super().call(*args, **kwargs)
@@ -191,47 +185,67 @@ def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dic
             "day": dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat(), "name": spec.name}
 
 
-async def list_page(api: Any, variant: str, after: str = "", first: int = 100) -> dict:
-    query: dict = {"first": first, "marketVariant": variant}
-    if after:
-        query["after"] = after
-    answer = await api.call("GET", "/markets?" + core.urllib.parse.urlencode(query))
-    if not isinstance(answer["data"], list):
-        raise core.RemoteError("市场列表格式异常")
-    return answer
+def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[Any, int]]:
+    """The windows this mode looks for now: each configured card's quarter hours from PREOPEN_ENTRY_SECONDS ahead to
+    PREOPEN_AHEAD_MINUTES ahead, today (Beijing), on the card's exchange session — (card, start_ms), soonest first."""
+    out = []
+    today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date()
+    for rolling in core.WINDOW_UPDOWN_MARKETS:
+        if rolling.key not in settings.markets:
+            continue
+        holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
+        start = -(-(now_ms + settings.entry_seconds * 1000) // rolling.window_ms) * rolling.window_ms
+        while start <= now_ms + settings.ahead_minutes * 60_000:
+            if dt.datetime.fromtimestamp(start / 1000, core.BEIJING).date() == today and rolling.exists(start, holidays):
+                out.append((rolling, start))
+            start += rolling.window_ms
+    return sorted(out, key=lambda rs: (rs[1], rs[0].key))
+
+
+def window_slug(rolling: Any, start_ms: int) -> str:
+    return f"{rolling.stem}-updown-15m-{start_ms // 1000}"
+
+
+async def category_market(api: Any, slug: str) -> dict | None:
+    """A window's market, by its category (GET /categories/<slug>: the read the bot's feed has always used for these
+    markets) and then its details (GET /markets/<id>), the slug put on it; None when the category is not listed (404).
+    1.125.1: the market listing (/markets?marketVariant=…) answers 403 where the bot runs, as GraphQL does."""
+    try:
+        answer = await api.call("GET", f"/categories/{core.urllib.parse.quote(slug)}")
+    except core.RemoteError as error:
+        if "HTTP 404" in str(error):
+            return None
+        raise
+    found = core.predict_markets(answer)
+    if not found:
+        return None
+    market = await api.market(found[0]["id"])
+    return {**market, "categorySlug": slug, "id": market.get("id") or found[0]["id"]}
 
 
 async def probe(api: Any, config: Any, settings: Settings, now_ms: int) -> list[str]:
-    """One read-only page of each listing, read as the discovery reads it: the fields the rows carry, the ones the
-    discovery needs that are missing, and how many rows would be placed now — run before switching the mode on."""
+    """Every window the discovery would look at now, read as it reads them: listed or not, the details' trading status,
+    the fields the discovery needs that are missing, whether it would be placed and why not — run before switching on."""
+    hm = lambda ms: dt.datetime.fromtimestamp(ms / 1000, core.BEIJING).strftime("%H:%M")
     lines = [f"开盘前预挂探测（只读；设置：{'、'.join(sorted(settings.markets))}，{core.cents(float(settings.price))}×{settings.shares} 份，"
-             f"提前 {settings.ahead_minutes} 分钟内）"]
-    for variant in ("UP_DOWN", "CRYPTO_UP_DOWN"):
+             f"提前 {settings.ahead_minutes} 分钟内，不足 {settings.entry_seconds} 秒不挂）"]
+    starts = window_starts(now_ms, config, settings)
+    if not starts:
+        lines.append("这段时间里没有要看的场次（不在交易时段，或都在提前范围之外）")
+    for rolling, start in starts:
+        slug = window_slug(rolling, start)
         try:
-            answer = await list_page(api, variant, first=20)
+            market = await category_market(api, slug)
         except Exception as error:
-            lines.append(f"{variant}：读取失败：{core.clean_error(error) or type(error).__name__}")
+            lines.append(f"{slug}（{hm(start)}）：读取失败：{core.clean_error(error) or type(error).__name__}")
             continue
-        rows = [r for r in answer["data"] if isinstance(r, dict)]
-        cursor = answer.get("cursor")
-        if not rows:
-            lines.append(f"{variant}：0 行（游标 {cursor!r}）")
+        if market is None:
+            lines.append(f"{slug}（{hm(start)}）：还没发布")
             continue
-        fields = sorted({k for r in rows for k in r})
-        missing = [f for f in LISTING_FIELDS if not any(f in r for r in rows)]
-        problems: dict[str, int] = {}
-        ok = 0
-        for r in rows:
-            why = candidate_problem(r, now_ms, config, settings)
-            if why:
-                problems[why] = problems.get(why, 0) + 1
-            else:
-                ok += 1
-        lines.append(f"{variant}：{len(rows)} 行，游标 {type(cursor).__name__}；字段：{'、'.join(fields)}")
-        lines.append(f"  发现逻辑要用的字段缺失：{'、'.join(missing) if missing else '无'}；现在会挂的：{ok} 场"
-                     + (f"；不挂的原因：" + "；".join(f"{why}×{n}" for why, n in sorted(problems.items(), key=lambda kv: -kv[1])) if problems else ""))
-        slugs = [str(r.get("categorySlug") or r.get("slug") or "?") for r in rows[:4]]
-        lines.append("  前几行：" + "、".join(slugs))
+        why = candidate_problem(market, now_ms, config, settings)
+        missing = [f for f in LISTING_FIELDS if f not in market]
+        lines.append(f"{slug}（{hm(start)}）：{'会挂' if not why else '不挂：' + why}；状态 {market.get('status') or '缺失'} / 交易状态 "
+                     f"{market.get('tradingStatus') or '缺失'}；缺字段：{'、'.join(missing) if missing else '无'}")
     return lines
 
 
@@ -255,6 +269,7 @@ class Controller:
         self.cancelling: set[str] = set()
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()  # (start_ms, slug, candidate): the soonest window first
         self.queued: set[str] = set()
+        self.skipped: dict[str, str] = {}  # slug -> why a listed window was not placed (the status line)
         self.account_lock = asyncio.Lock()
         shared = getattr(owner.live, "api", None)  # the bot's own client: one rate-limit cooldown for all three
         self.api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, self.before_send, shared)
@@ -379,32 +394,39 @@ class Controller:
             self.account_at = self.now()
 
     async def discover(self) -> None:
-        """Scan every page; never interpret a truncated/error response as an empty catalog. The windows found go into
-        the queue soonest first, and only those within PREOPEN_AHEAD_MINUTES: the day's later windows wait their turn."""
+        """Each coming window (window_starts) not yet recorded or queued, asked for by its category: listed, it is judged
+        (candidate) and queued, the soonest first; not listed yet, it is asked again next poll."""
         found: list[dict] = []
-        for variant in ("UP_DOWN", "CRYPTO_UP_DOWN"):
-            after, seen = "", set()
-            for _ in range(100):
-                answer = await list_page(self.api, variant, after)
-                for market in answer["data"]:
-                    if not isinstance(market, dict):
-                        continue
-                    self.note_open(market)  # when a window of ours starts matching, as the listing shows it (the cancel time's evidence)
-                    c = candidate(market, self.now(), self.owner.config, self.settings)
-                    if c and c["slug"] not in self.ledger.rows and c["slug"] not in self.queued:
-                        self.queued.add(c["slug"])
-                        found.append(c)
-                cursor = str(answer.get("cursor") or "")
-                if not cursor:
-                    break
-                if cursor in seen or not answer["data"]:
-                    raise core.RemoteError("市场列表分页没有前进")
-                seen.add(cursor)
-                after = cursor
-            else:
-                raise core.RemoteError("市场列表超过100页，下一轮重新扫描")
+        for rolling, start in window_starts(self.now(), self.owner.config, self.settings):
+            slug = window_slug(rolling, start)
+            if slug in self.ledger.rows or slug in self.queued:
+                continue
+            market = await category_market(self.api, slug)
+            if market is None:
+                continue
+            c = candidate(market, self.now(), self.owner.config, self.settings)
+            if c is None:
+                self.skipped[slug] = candidate_problem(market, self.now(), self.owner.config, self.settings)
+                continue
+            self.queued.add(slug)
+            found.append(c)
         for c in sorted(found, key=lambda c: (c["start_ms"], c["slug"])):
             await self.queue.put((c["start_ms"], c["slug"], c))
+
+    async def refresh_active(self) -> None:
+        """An active window's market, read again every REFRESH_MS: when matching comes on (note_open), and a market no
+        longer registered or open for orders has its pair withdrawn."""
+        for pair in list(self.ledger.rows.values()):
+            if pair["phase"] != "active" or self.now() - int(pair.get("meta_ms") or 0) < REFRESH_MS:
+                continue
+            pair["meta_ms"] = self.now()
+            market = {**(await self.api.market(pair["market_id"])), "categorySlug": pair["slug"]}
+            self.note_open(market)
+            status, trading = str(market.get("status") or "").upper(), str(market.get("tradingStatus") or "").upper()
+            if status != "REGISTERED" or trading not in {"OPEN", "MATCHING_NOT_ENABLED"}:
+                await self.cancel_many([pair], f"市场状态 {status or '?'} / {trading or '?'}")
+            else:
+                self.ledger.save(pair)
 
     async def place_pair(self, c: dict) -> None:
         import live
@@ -733,6 +755,7 @@ class Controller:
                 if not self.blocked():
                     await self.account()
                     await self.discover()
+                    await self.refresh_active()
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -842,5 +865,6 @@ class Controller:
                 f"撤单：开场前 {self.settings.cancel_seconds} 秒发出，之后到开场前 {self.settings.expiry_seconds} 秒到期为止每 {SPRINT_MS // 1000} 秒催一次；"
                 f"不足 {self.settings.entry_seconds} 秒不再新挂\n"
                 f"已记录 {len(rows)} 场（{sum(1 for p in rows if p['phase'] == 'active')} 场挂着，{sum(1 for p in rows if p.get('accounted'))} 场已结清），队列 {self.queue.qsize()} 场\n"
-                f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}\n"
+                f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}"
+                + (f"\n没挂的已发布场次：" + "；".join(f"{k.rsplit('-', 1)[-1]} {v}" for k, v in list(self.skipped.items())[-3:]) if self.skipped else "") + "\n"
                 f"实测：{self.timing_line()}")
