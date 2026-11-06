@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.131.0"
+VERSION = "1.131.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -21529,6 +21529,8 @@ class Bot:
                      self.settings()["mode"], sum(not t.done() for t in self.deliveries.values()))
             self.last_log["heartbeat"] = time.monotonic()
 
+    COMMAND_TIMEOUT_S = 90  # a command's handling is cut off after this long (the updates are handled one after another)
+
     async def process_update(self, update: dict) -> None:
         message = update.get("message")
         if isinstance(message, dict):
@@ -21559,7 +21561,9 @@ class Bot:
                     if self.stopping.is_set():
                         break
                     try:
-                        await self.process_update(update)
+                        await asyncio.wait_for(self.process_update(update), timeout=self.COMMAND_TIMEOUT_S)  # 1.131.1: one stuck command never holds the rest
+                    except asyncio.TimeoutError:
+                        self.log_limited("command", f"命令处理超过 {self.COMMAND_TIMEOUT_S} 秒，已中止")
                     except Exception as error:
                         self.log_limited("command", "命令处理异常：" + clean_error(error))
                     offset = int(update["update_id"]) + 1

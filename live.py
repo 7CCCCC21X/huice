@@ -1959,10 +1959,13 @@ class LiveBot(core.Bot):
 
     LIVE_TRIM_MAX = 0.05                       # a holding short of the records by more than this share is not a fee: left as it is (noted on the page)
 
+    REPORT_GROUPS, REPORT_RECORDS = 8, 2  # /live fills: the outcomes with a gap shown, newest records each (1.131.1: a day of every record was dozens of messages)
+
     async def live_fills_report(self, now_ms: int) -> str:
-        """/live fills: the account's positions against the records, outcome by outcome — what the account holds, what the
-        records of the last two days say, the pre-open mode's fills, the gap — and each record's order with Predict's last
-        word on it (status, shares, how it ended). The evidence when a fill seems lost (1.130.2)."""
+        """/live fills: the account's positions against the records, the gaps first — what the account holds beyond the
+        records (a fill nobody recorded), or short of its open records — at most REPORT_GROUPS outcomes and REPORT_RECORDS
+        records each; the outcomes that agree are named in one line. A settled record explains the shares the account
+        still holds of it (until redeemed); a resolved, redeemed position is no gap."""
         try:
             rows = await self.live.api.positions()
         except Exception as error:
@@ -1980,27 +1983,36 @@ class LiveBot(core.Bot):
             held[k] = (was[0] + shares, price if price is not None else was[1], name)
         recs: dict[tuple[str, int], list[tuple[str, dict]]] = {}
         for tid, t in self.sim_trades().items():
-            if isinstance(t.get("live"), dict) and (float(t.get("shares") or 0) > 1e-9 or now_ms - core.trade_updated(t) <= 2 * core.DAY_MS):
+            if isinstance(t.get("live"), dict) and t.get("status") in {"filled", "resting", "settled"} and float(t.get("shares") or 0) > 1e-9:
                 recs.setdefault(key_of(t), []).append((tid, t))
         preopen = self.preopen_filled()
-        lines = [f"持仓核对 {core.stamp(now_ms, seconds=False)}：账户 {len(held)} 个持仓" + ("" if complete else "（列表被截断，可能不全）")
-                 + f"，两天内的记录 {sum(len(v) for v in recs.values())} 条"
-                 + (f"；上次自动核对 {(now_ms - self.live_late_checked) // 1000} 秒前" if self.live_late_checked else "；还没自动核对过")]
-        for k in sorted(set(held) | set(recs), key=lambda k: -max([held.get(k, (0.0,))[0]] + [float(t.get("shares") or 0) for _, t in recs.get(k, [])])):
+        gaps, same = [], []
+        for k in set(held) | set(recs):
             shares, price, name = held.get(k, (0.0, None, ""))
             r = sorted(recs.get(k, []), key=lambda kv: core.trade_updated(kv[1]), reverse=True)
-            name = name or (r[0][1].get("item", k[0]) + " / " + r[0][1].get("label", str(k[1])) if r else f"{k[0]} / {k[1]}")
+            name = name or (f"{r[0][1].get('item', k[0])} / {r[0][1].get('label', k[1])}" if r else f"{k[0]} / {k[1]}")
             recorded, po = sum(float(t.get("shares") or 0) for _, t in r), float(preopen.get(k, 0.0))
             gap = shares - recorded - po
+            open_recs = any(t.get("status") in {"filled", "resting"} for _, t in r)
+            if gap > self.LIVE_DUST_SHARES or (gap < -self.LIVE_DUST_SHARES and open_recs):
+                gaps.append((abs(gap), name, shares, price, recorded, po, gap, r))
+            elif shares > self.LIVE_DUST_SHARES or open_recs:
+                same.append((name, shares))
+        gaps.sort(key=lambda g: -g[0])
+        lines = [f"持仓核对 {core.stamp(now_ms, seconds=False)}：账户 {len(held)} 个持仓" + ("" if complete else "（列表被截断，可能不全）")
+                 + f"；对不上的 {len(gaps)} 个方向" + (f"（列出前 {self.REPORT_GROUPS} 个）" if len(gaps) > self.REPORT_GROUPS else "") + f"，一致的 {len(same)} 个"
+                 + (f"；上次自动核对 {(now_ms - self.live_late_checked) // 1000} 秒前" if self.live_late_checked else "")]
+        for _, name, shares, price, recorded, po, gap, r in gaps[:self.REPORT_GROUPS]:
             lines.append(f"{name}：账户 {shares:g} 份" + (f"（均价 {core.cents(price)}）" if price is not None else "") + f"，记录 {recorded:g} 份"
-                         + (f"，预挂 {po:g} 份" if po else "") + (f"，差 {gap:+g} 份" if abs(gap) > 0.01 else "，一致"))
-            for tid, t in r[:6]:
+                         + (f"，预挂 {po:g} 份" if po else "") + f"，差 {gap:+g} 份")
+            for tid, t in r[:self.REPORT_RECORDS]:
                 st = t["live"]
                 lines.append(f"  · {t.get('label', '')} {core.cents(float(t['price']))}×{float(t.get('order') or 0):g}：{t['status']}，成交 {float(t.get('shares') or 0):g} 份，"
-                             f"订单 #{st.get('order_id') or '-'}，Predict 状态 {st.get('api_status') or '?'}，{st.get('final') or st.get('state') or '?'}"
-                             + (f"；{t['note']}" if t.get("note") else ""))
-        if len(lines) == 1:
-            lines.append("两天内没有持仓，也没有记录")
+                             f"订单 #{st.get('order_id') or '-'}，Predict 状态 {st.get('api_status') or '?'}")
+        if same:
+            lines.append("一致：" + "；".join(f"{name} {shares:g} 份" for name, shares in sorted(same, key=lambda x: -x[1])[:8]) + ("；…" if len(same) > 8 else ""))
+        if not gaps and not same:
+            lines.append("没有持仓，也没有在持的记录")
         return "\n".join(lines)
 
     async def live_late_fills(self, now_ms: int) -> None:
@@ -2766,7 +2778,17 @@ class LiveBot(core.Bot):
     # --- commands and texts -------------------------------------------------------------------------------------------------
     async def cmd_live(self, req: core.Request) -> Any:
         words = [w.lower() for w in req.args]
-        return await self.live_action(words[0] if words else "", req.args[1:], self.market.now_ms())
+        action = words[0] if words else ""
+        if action in {"check", "redeem", "fills"} and self.reference_tasks:  # 1.131.1: reads or chain calls for seconds: answered in the background, the commands behind it not held
+            async def later() -> None:
+                try:
+                    answer = await self.live_action(action, req.args[1:], self.market.now_ms())
+                except Exception as error:
+                    answer = f"/live {action} 失败：{core.clean_error(error) or type(error).__name__}"
+                await self.reply(req, answer if isinstance(answer, str) else getattr(answer, "text", str(answer)))
+            asyncio.create_task(later(), name=f"live-{action}")
+            return {"check": "自检中，结果随后发来", "redeem": "领取中，结果随后发来", "fills": "持仓核对中，结果随后发来"}[action]
+        return await self.live_action(action, req.args[1:], self.market.now_ms())
 
     async def live_action(self, action: str, args: list[str], now_ms: int) -> Any:
         """/live and the control page share these: "" = the status card (a Reply), else the action's answer text."""

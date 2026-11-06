@@ -616,10 +616,11 @@ async def run():
     assert "没有真实挂单可撤" in await bot.cmd_live(req("cancel", "all"))
     fake.positions_rows = [{"id": "p1", "market": {"id": 101, "title": "恒生指数 10-05"}, "outcome": {"name": "Down", "indexSet": 2, "onChainId": "1012"},
                             "amount": str(100 * WEI), "valueUsd": "100"}]
-    report = await bot.cmd_live(req("fills"))  # 1.130.2: the account's positions against the records, outcome by outcome
-    assert "持仓核对" in report and "恒生指数 10-05 / Down：账户 100 份" in report and "订单 #" in report, report
-    # 1.130.3: the positions beyond the records, on the review page; a record whose order is still on the open list is not pruned
     fake.positions_rows.append({"id": "px", "market": {"id": 777, "title": "谁知道 11-06"}, "outcome": {"name": "Up", "indexSet": 1}, "amount": str(36 * WEI), "avgPrice": "0.03"})
+    report = await bot.cmd_live(req("fills"))  # 1.130.2 / 1.131.1: the account's positions against the records, the gaps first, bounded
+    assert "持仓核对" in report and "谁知道 11-06 / Up：账户 36 份（均价 3.0¢），记录 0 份，差 +36 份" in report and report.count("\n") < 30, report
+    assert "恒生指数 10-05 / Down" in report, report  # held and recorded alike: named in the one line of those that agree
+    # 1.130.3: the positions beyond the records, on the review page; a record whose order is still on the open list is not pruned
     bot.live_positions = (list(fake.positions_rows), time.time())
     unrec = bot.journal_payload()["live"]["unrecorded"]
     assert any(r["name"] == "谁知道 11-06 / Up" and abs(r["shares"] - 36) < 1e-6 and r["price"] == 0.03 for r in unrec), unrec
