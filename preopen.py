@@ -30,6 +30,8 @@ again under a new salt (attempt). A window withdrawn before its start by a stop,
 a pause or an external cancel is quoted again too, at most MAX_ATTEMPTS times
 (never after Predict's own refusal). The process stopping leaves the orders on
 the book: the signed expiry is the backstop, the next process takes them over.
+1.127.1: the request wrapper takes a cancel's answer (no "data" key) as the
+success it is; only an explicit success=false is a refusal.
 """
 from __future__ import annotations
 
@@ -159,10 +161,13 @@ def safe_api(base: str, key: str, wallet: Any, before_send: Any = None, shared: 
             # server had closed — nothing of it taken — never after an answer went missing
             return await super().send(method, path, payload, timeout)
 
-        async def call(self, *args: Any, **kwargs: Any) -> Any:
-            answer = await super().call(*args, **kwargs)
-            if not isinstance(answer, dict) or answer.get("success") is not True or "data" not in answer:
-                raise core.RemoteError("Predict 应答不是已确认成功的数据，保留订单状态与额度")
+        async def call(self, method: str, path: str, *args: Any, **kwargs: Any) -> Any:
+            answer = await super().call(method, path, *args, **kwargs)
+            # an explicit success=false is a refusal, whatever the status; a dict without the key passes, as the bot's own
+            # client takes it (1.127.1: POST /orders/remove answers {"success": true, "removed": [...], "noop": [...]} with
+            # no "data" key — requiring one read every cancel as a failure, and the withdrawn pairs kept their money)
+            if not isinstance(answer, dict) or answer.get("success", True) is not True:
+                raise core.RemoteError(f"Predict 应答不是已确认成功的数据（{method} {path.split('?')[0]}），保留订单状态与额度")
             return answer
 
     return Api(base, key, wallet)

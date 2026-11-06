@@ -779,9 +779,15 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             sent.append(args)
             return b'{"success":false,"error":"temporary"}'
         with patch.object(m, "predict_blocking", transport):
-            with self.assertRaises(m.RemoteError): await api.orders()
+            with self.assertRaises(m.RemoteError) as caught: await api.orders()
+        self.assertIn("（GET /orders）", str(caught.exception))  # the request named: /preopen's 最近问题 says which call it was
         self.assertEqual(len(sent), 1)
         self.assertTrue(api.orders_complete)  # no caller receives a successful empty list
+        answers = [b'{"success":true,"removed":["1"],"noop":[]}', b'{"removed":[],"noop":["1"]}']  # the cancel's answer: no "data" key (1.127.1)
+        async def cancel_transport(*args): return answers.pop(0)
+        with patch.object(m, "predict_blocking", cancel_transport):
+            self.assertEqual(await api.remove_orders(["1"]), {"removed": ["1"], "noop": []})
+            self.assertEqual(await api.remove_orders(["1"]), {"removed": [], "noop": ["1"]})
         block = {"yes": False}
         api = p.safe_api("https://offline.invalid/v1", "key", None, lambda body: "paused" if block["yes"] else "")
         api.jwt = "offline"; api.gate = asyncio.Semaphore(0)
