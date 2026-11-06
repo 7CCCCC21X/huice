@@ -615,9 +615,8 @@ class Controller:
         limit = min(self.settings.max_open_usd, self.owner.config.live_max_open_usd)
         if self.risk() + self.other_risk() + pair_usd > limit + 1e-9:
             return f"预挂资金上限不足：需要再预留 {pair_usd:g}U，限额 {limit:g}U"
-        if self.balance < max(self.open_reserved, self.risk()) + pair_usd:
-            return (f"可用USDT {self.balance:.0f}U 不足以预留下一场双边订单（账户挂单占用 {self.open_reserved:.0f}U，其中本模式 {self.risk():.0f}U，"
-                    f"其余是原策略和没记录的挂单）")
+        if self.balance < pair_usd:  # 1.130.5: the account's open orders are each their own allowance (the money is taken at a match): one pair's worth is enough
+            return f"可用USDT {self.balance:.2f}U 不够一场双边（{pair_usd:g}U）"
         if side_usd > self.owner.config.live_max_order_usd:
             return f"LIVE_MAX_ORDER_USD 小于每边 {side_usd:g}U"
         return ""
