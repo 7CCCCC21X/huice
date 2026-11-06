@@ -65,8 +65,8 @@ class Settings:
     ahead_minutes: int = 60
     max_open_usd: float = 7000.0
     price: D = D("0.49")
-    shares: D = D("50")
-    markets: frozenset = frozenset(r.key for r in core.WINDOW_UPDOWN_MARKETS)
+    shares: D = D("10")                      # PREOPEN_SHARES: the trial size; 50 was the first revision's
+    markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = the three cards
     db: str = ""
 
     @property
@@ -88,12 +88,12 @@ class Settings:
             return cls()
         poll = float(env.get("PREOPEN_POLL_SECONDS", "5"))
         cap = float(env.get("PREOPEN_MAX_OPEN_USD", "7000"))
-        cents, shares, ahead = int(env.get("PREOPEN_PRICE_CENTS", "49")), int(env.get("PREOPEN_SHARES", "50")), int(env.get("PREOPEN_AHEAD_MINUTES", "60"))
+        cents, shares, ahead = int(env.get("PREOPEN_PRICE_CENTS", "49")), int(env.get("PREOPEN_SHARES", "10")), int(env.get("PREOPEN_AHEAD_MINUTES", "60"))
         cancel, expiry, entry = int(env.get("PREOPEN_CANCEL_SECONDS", "20")), int(env.get("PREOPEN_EXPIRY_SECONDS", "10")), int(env.get("PREOPEN_ENTRY_SECONDS", "180"))
         keys = {r.key for r in core.WINDOW_UPDOWN_MARKETS}
         stems = {r.stem.lower(): r.key for r in core.WINDOW_UPDOWN_MARKETS}
-        wanted = [w.strip() for w in str(env.get("PREOPEN_MARKETS", "")).split(",") if w.strip()]
-        markets = frozenset(stems.get(w.lower(), w.upper()) for w in wanted) or frozenset(keys)
+        wanted = [w.strip() for w in str(env.get("PREOPEN_MARKETS", "btc")).split(",") if w.strip()] or ["btc"]
+        markets = frozenset(keys) if any(w.lower() == "all" for w in wanted) else frozenset(stems.get(w.lower(), w.upper()) for w in wanted)
         price = D(cents) / 100
         if (not 1 <= poll <= 60 or not 1 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
                 or not 3 <= ahead <= 1440 or not markets <= keys or float(price * shares) < live.MIN_ORDER_USD

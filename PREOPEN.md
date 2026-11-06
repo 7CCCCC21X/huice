@@ -6,12 +6,12 @@
 
 | 项目 | 行为 |
 | --- | --- |
-| 标的 | `PREOPEN_MARKETS` 里的卡（默认三张：BTC-15M、SKHYNIX-15M、UNITREE-15M） |
+| 标的 | `PREOPEN_MARKETS` 里的卡：默认只挂 BTC（`btc`）；`all` = 三张（BTC-15M、SKHYNIX-15M、UNITREE-15M），或逗号列表 |
 | 日期 | 场次开始时间落在北京时间当天 |
 | 范围 | 只挂 `PREOPEN_AHEAD_MINUTES`（默认 60）分钟内开始的场次，最近的先；股票市场遵守配置的交易日、假期和特殊时段 |
 | 新单截止 | 距场次开始不足 `PREOPEN_ENTRY_SECONDS`（默认 180）秒不再新挂；到期前不足 1 分钟的不再发送 |
 | 订单 | LIMIT，`isPostOnly=true`，`selfTradePrevention=CANCEL_TAKER` |
-| 数量 | 每场每方向累计至多 `PREOPEN_SHARES` 份、价格 `PREOPEN_PRICE_CENTS`¢（每边不少于 Predict 的 $1 最小订单），成交后不自动补单，不追价对冲 |
+| 数量 | 每场每方向累计至多 `PREOPEN_SHARES`（默认 10）份、价格 `PREOPEN_PRICE_CENTS`（默认 49）¢（每边不少于 Predict 的 $1 最小订单），成交后不自动补单，不追价对冲 |
 | 主动撤单 | 每场开始前 `PREOPEN_CANCEL_SECONDS`（默认 20）秒发出，之后到到期前每 2 秒催一次，独立于市场发现和下单队列 |
 | 签名有效期 | 每张订单在所属场次开始前 `PREOPEN_EXPIRY_SECONDS`（默认 10）秒过期：撤单失败时的兜底，到期后交易所合约不再撮合 |
 | 单边异常 | 任一方向被拒绝、未知或未发出，进入撤单/核对阶段，不重新签名补单 |
@@ -36,8 +36,8 @@
 ```env
 PREOPEN_15M=on
 PREOPEN_POLL_SECONDS=5
-PREOPEN_MARKETS=btc          # 空 = 三张都挂；第一次建议只挂一张
-PREOPEN_SHARES=10            # 每边份数（1～500）
+PREOPEN_MARKETS=btc          # 默认只挂 BTC；all = 三张都挂，或 btc,skhynix 这样的列表
+PREOPEN_SHARES=10            # 每边份数（1～500），默认 10
 PREOPEN_PRICE_CENTS=49       # 每边价格（1～50¢）
 PREOPEN_AHEAD_MINUTES=60     # 只挂这么多分钟内开始的场次（3～1440）
 PREOPEN_CANCEL_SECONDS=20    # 开场前多少秒发撤单（至少比到期多 5 秒）
@@ -47,7 +47,7 @@ PREOPEN_MAX_OPEN_USD=7000
 LIVE=on
 ```
 
-`LIVE_MAX_OPEN_USD` 与 `PREOPEN_MAX_OPEN_USD` 取较小值，普通策略已有风险也计入总限额。按默认 49¢ × 50 份，单边 24.5U、单场双边预留 49U；只挂 60 分钟内的场次时，同时占用的大约是每张卡 4 场。原有 `LIVE_MAX_OPEN_USD` 默认 500U，必须按实际余额和期望范围明确设置。
+`LIVE_MAX_OPEN_USD` 与 `PREOPEN_MAX_OPEN_USD` 取较小值，普通策略已有风险也计入总限额。按默认 49¢ × 10 份，单边 4.9U、单场双边预留 9.8U（50 份时 24.5U / 49U）；只挂 60 分钟内的场次时，同时占用的大约是每张卡 4 场。原有 `LIVE_MAX_OPEN_USD` 默认 500U，必须按实际余额和期望范围明确设置。
 
 余额、限额或授权不足时不扩大配置额度；记录问题，后续扫描再尝试尚未创建的场次。账户存在无法归属的开放订单时暂停新增，先在原控制台核对。市场接口失败、错误响应或分页不完整均不当作空账户。本模式的两个接口客户端和机器人自己的客户端共用限流冷却：任一方收到 429，三方一起等。
 

@@ -83,7 +83,8 @@ class Api:
 
 def controller(markets=None, **env):
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:",
-                             "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "LIVE_MAX_OPEN_USD": "7000", **env})
+                             "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "LIVE_MAX_OPEN_USD": "7000",
+                             "PREOPEN_MARKETS": "all", "PREOPEN_SHARES": "50", **env})  # the tests' figures: the three cards, 50 a side
     clock = types.SimpleNamespace(ms=NOW)
     wallet = types.SimpleNamespace(maker="0x" + "1" * 40,
         sign_order=lambda order, *flags: ("0x" + hashlib.sha256(json.dumps(order, sort_keys=True).encode()).hexdigest(), "0xsignature"))
@@ -159,7 +160,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
                 controller(**bad)
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_SHARES": "20"})
         self.assertFalse(p.Settings.from_config(cfg).enabled)
-        self.assertEqual((p.Settings.from_config(cfg).shares, p.Settings.from_config(cfg, force=True).shares), (50, 20))  # the probe reads them while off
+        self.assertEqual((p.Settings.from_config(cfg).shares, p.Settings.from_config(cfg, force=True).shares), (10, 20))  # the probe reads them while off
+        # the defaults are the trial: BTC alone, 10 shares a side (4.9U); "all" or a list widens it
+        on = lambda **e: p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", **e}))
+        self.assertEqual((on().shares, on().markets, on().side_usd, on().pair_usd), (10, frozenset({"BTC-15M"}), 4.9, 9.8))
+        self.assertEqual(on(PREOPEN_MARKETS="all").markets, frozenset({"BTC-15M", "SKHYNIX-15M", "UNITREE-15M"}))
+        self.assertEqual(on(PREOPEN_MARKETS="btc, skhynix").markets, frozenset({"BTC-15M", "SKHYNIX-15M"}))
+        self.assertEqual(on(PREOPEN_MARKETS="").markets, frozenset({"BTC-15M"}))
 
     async def test_failure_cancels_other_side_and_never_resubmits_unknown(self):
         ctl, api, _ = controller()
