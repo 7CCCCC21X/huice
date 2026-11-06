@@ -667,6 +667,7 @@ class Controller:
         self.category_full: bool | None = None  # whether the category answers carried everything an order needs (no details read) — None until a listing was read
         self.awaiting: dict[str, int] = {}  # card -> when its next window (beyond the known listing, not listed yet) entered the range: the sprint runs from then (1.133.1)
         self.account_pages = 1  # pages the last open-order snapshot took: its pace and staleness follow (ACCOUNT_PAGE_S)
+        self.account_rows: list[dict] = []  # the last complete snapshot's rows: the owner's whole-account view when its own read is cut (LiveBot.live_full_list, 1.136.2)
         self.account_read_s = 0.0  # how long the last complete snapshot read took: the staleness allows for it (1.136.1)
         self.account_failed = ""  # why the last snapshot read failed, until one succeeds (the hold names it: 1.136.1)
         self.probe_turn = 0  # which card of a group whose next windows start together is the pass's sentinel (the rest read once it is seen listed)
@@ -1001,6 +1002,7 @@ class Controller:
         async with self.account_lock:
             self.unmanaged, self.open_reserved, self.balance, self.unmanaged_detail = unmanaged, reserved, balance, detail
             self.listed_ids = {str(r.get("id")) for r in rows}
+            self.account_rows = rows
             by_hash = {live.order_hash_of(r): r for r in rows if live.order_hash_of(r)}
             for pair in self.ledger.rows.values():
                 changed = False
@@ -1926,7 +1928,8 @@ class Controller:
                 + f"\n最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
                 + ("\n周末不挂：现在是周末，不挂新场次，周一 00:00（北京时间）起恢复" if not self.settings.weekend and on_weekend(self.now()) else "")
-                + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：不计入预挂限额，也不挡预挂" if self.unmanaged else "")
+                + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：不计入预挂限额，也不挡预挂"
+                   + ("；其中挂在本机器人市场上的，原策略 2 分钟后自动撤掉（LIVE_ORPHAN_CANCEL）" if getattr(self.owner.config, "live_orphan_cancel", True) else "") if self.unmanaged else "")
                 + ("\n股票卡暂停：" + "；".join(self.card_holds.values()) if self.card_holds else "")
                 + ("\n发布节奏（每 15 分钟一场；预计前后每秒扫一次）：" + "；".join(f"{key} 上次 {hms(at)}，下次预计 {hms(at + LISTING_CYCLE_MS)}" for key, at in sorted(self.listed_at.items()))
                    if self.listed_at else "")

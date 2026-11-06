@@ -964,6 +964,9 @@ class LiveBot(core.Bot):
     LIVE_NOTE_SECONDS = 600     # the same failure is announced at most this often
     LIVE_PLACING_GRACE_MS = 120_000  # a record left in "placing" is reconciled by its hash after this long
     LIVE_IDLE_LIST_MS = 60_000      # the open-order list is re-read this often even with nothing in flight (orders this bot did not place)
+    LIVE_SNAPSHOT_MAX_AGE_MS = 600_000  # the pre-open mode's account snapshot stands in for a cut read of the open list while younger than this (1.136.2)
+    LIVE_ORPHAN_GRACE_MS = 120_000  # an unrecorded open order on one of this bot's markets is withdrawn once seen so for this long (LIVE_ORPHAN_CANCEL)
+    LIVE_ORPHAN_EVERY_MS = 60_000   # ...looked for this often
     LIVE_MISSES = 3             # an open order Predict stops listing without a final record counts as cancelled after this many looks...
     LIVE_MISS_WINDOW_MS = 60_000    # ...and never within a minute of its placement (Predict's reads may lag a fresh order)
     LIVE_CANCEL_RETRY_MS = 30_000   # a cancel Predict did not confirm, the order still listed (or open by its own record): asked again after this long
@@ -1007,6 +1010,10 @@ class LiveBot(core.Bot):
         self.live_wanted: set[str] = set()  # market ids a decision waited for (details read next step, whatever the edge)
         self.live_market_retry: dict[str, float] = {}  # market id -> monotonic time its details are asked for again after a failure
         self.live_unknown_open: list[dict] = []  # open orders on the account this bot has no record of (manual, or lost)
+        self.live_unknown_first: dict[str, int] = {}  # unrecorded order id -> when it was first seen so (live_orphan_sweep withdraws it after the grace, 1.136.2)
+        self.live_unrecorded_rows: dict[str, dict] = {}  # ...and its row as the list showed it (its market, for the sweep's judgement and its line)
+        self.live_orphans: list[dict] = []  # the unrecorded orders this bot withdrew ({"at", "id", "brief"}, newest last; /live)
+        self.live_orphan_swept_ms = -10 ** 15
         self.live_open_ids: set[str] = set()  # the last complete open list's order ids, and when it was read: a record whose order is on it is not pruned (prunable)
         self.live_open_ids_at = 0
         self.live_synced_at = 0  # when the open-order list was last read in full
@@ -1911,10 +1918,13 @@ class LiveBot(core.Bot):
             raise
         by_id = {str(r.get("id")): r for r in open_rows}
         by_hash = {order_hash_of(r): r for r in open_rows if order_hash_of(r)}
-        if getattr(self.live.api, "orders_complete", True):
-            self.live_open_ids, self.live_open_ids_at = set(by_id), now_ms
-        self.live_readopt(open_rows, by_id, by_hash, now_ms)
-        self.live_note_unknown(open_rows, now_ms)
+        self.live_readopt(open_rows, by_id, by_hash, now_ms, now_ms)
+        full_rows, full_at = self.live_full_list(open_rows, now_ms)  # the whole account (1.136.2): this read when whole, else the pre-open mode's snapshot
+        if full_rows is not None:
+            self.live_open_ids, self.live_open_ids_at = {str(r.get("id")) for r in full_rows}, full_at
+            if full_rows is not open_rows:
+                self.live_readopt(full_rows, {str(r.get("id")): r for r in full_rows}, {order_hash_of(r): r for r in full_rows if order_hash_of(r)}, now_ms, full_at)
+        self.live_note_unknown(full_rows if full_rows is not None else open_rows, now_ms)
         self.live_synced_at = self.live_list_at_ms = now_ms
         markets: dict[str, core.SimMarket] = {}
         with contextlib.suppress(Exception):  # the records' own cards alone (1.112.1: every card used to be priced for this, each step)
@@ -1943,6 +1953,98 @@ class LiveBot(core.Bot):
         # side by side (1.112.1: one after another, each record's reads and cancels added up to the step's 同步 seconds); the
         # API gate bounds them, and a record's own failure is noted on it alone
         await asyncio.gather(*(one(tid, trade) for tid, trade in list(active.items())))
+        await self.live_orphan_sweep(now_ms)
+
+    def live_full_list(self, open_rows: list[dict], now_ms: int) -> tuple[list[dict] | None, int]:
+        """Every open order of the account and when that list was read: this step's read when it came whole, else the
+        pre-open mode's last complete snapshot (it pages through everything every minute or two). 1.136.2: with that
+        mode's thousands of resting pairs this bot's own read — ORDERS_PAGES_MAX pages — never was whole, so an order
+        beyond them was never taken back by live_readopt when its record wrongly ended, never reported as unrecorded, and
+        sim_prune's guard never cleared. (None, 0) when neither is to be had (the snapshot older than LIVE_SNAPSHOT_MAX_AGE_MS)."""
+        if getattr(self.live.api, "orders_complete", True):
+            return open_rows, now_ms
+        preopen = getattr(self, "preopen", None)
+        rows, at = getattr(preopen, "account_rows", None), int(getattr(preopen, "account_at", 0) or 0)
+        if preopen is not None and rows is not None and at and 0 <= now_ms - at <= self.LIVE_SNAPSHOT_MAX_AGE_MS:
+            return list(rows), at
+        return None, 0
+
+    def live_known_markets(self) -> tuple[dict[str, str], dict[str, str]]:
+        """(market id -> name, outcome token -> name) of every market this bot trades or traded for real: the markets
+        priced for its orders, its records, the pre-open mode's windows."""
+        ids: dict[str, str] = {}
+        tokens: dict[str, str] = {}
+        for mid, info in getattr(self.live, "markets", {}).items():
+            ids[str(mid)] = str(mid)
+            for o in getattr(info, "outcomes", None) or []:
+                if o.get("token"):
+                    tokens[str(o["token"])] = str(mid)
+        for t in self.sim_trades().values():
+            st = t.get("live")
+            if not isinstance(st, dict):
+                continue
+            want = st.get("want") or {}
+            name = str(t.get("item") or t.get("market") or "")
+            mid = str(want.get("market_id") or t.get("market_id") or "")
+            if mid:
+                ids[mid] = name or mid
+            if want.get("token"):
+                tokens[str(want["token"])] = name or mid
+        ledger = getattr(getattr(self, "preopen", None), "ledger", None)
+        for pair in (getattr(ledger, "rows", None) or {}).values():
+            mid = str(pair.get("market_id") or "")
+            name = str(pair.get("name") or pair.get("slug") or mid)
+            if mid:
+                ids[mid] = name
+            for o in (pair.get("orders") or {}).values():
+                token = str((((o.get("body") or {}).get("data") or {}).get("order") or {}).get("tokenId") or "")
+                if token:
+                    tokens[token] = name
+        return ids, tokens
+
+    def live_market_of(self, row: dict, known: tuple[dict, dict] | None = None) -> str:
+        """Which of this bot's markets an open order is on ("" when none): by the market id the row carries, or by the
+        outcome token the order names. An order on a market neither strategy ever touched is somebody's manual order."""
+        market = row.get("market") if isinstance(row.get("market"), dict) else {}
+        order = row.get("order") if isinstance(row.get("order"), dict) else {}
+        mid, token = str(market.get("id") or row.get("marketId") or ""), str(order.get("tokenId") or "")
+        ids, tokens = known or self.live_known_markets()
+        return ids.get(mid, "") if mid and mid in ids else tokens.get(token, "") if token else ""
+
+    async def live_orphan_sweep(self, now_ms: int) -> None:
+        """The account's unrecorded open orders on this bot's own markets, seen so for LIVE_ORPHAN_GRACE_MS, are
+        withdrawn (LIVE_ORPHAN_CANCEL, 1.136.2): a record lost or wrongly ended leaves its order resting as one nobody
+        manages — it fills when the market turns against it (the 1¢ SHEIN fill, the two 恒生 bids of 11-07) and the fill
+        is booked nowhere. One on a market neither strategy touched is left alone (a manual order), only reported."""
+        if not getattr(self.config, "live_orphan_cancel", True) or not self.live_unknown_first or now_ms - self.live_orphan_swept_ms < self.LIVE_ORPHAN_EVERY_MS:
+            return
+        self.live_orphan_swept_ms = now_ms
+        waited = [i for i, first in self.live_unknown_first.items() if now_ms - first >= self.LIVE_ORPHAN_GRACE_MS]
+        known = self.live_known_markets() if waited else ({}, {})  # the records are walked once a sweep, not once an order
+        due = {i: self.live_market_of(self.live_unrecorded_rows.get(i) or {}, known) for i in waited}
+        due = {i: name for i, name in due.items() if name}
+        if not due:
+            return
+        from preopen import order_brief
+        ids = list(due)[:50]
+        try:
+            result = await self.live.api.remove_orders(ids)
+        except Exception as error:
+            self.live_note_error(f"撤无记录挂单失败：{core.clean_error(error) or type(error).__name__}")
+            return
+        removed = [i for i in ids if i in set(result.get("removed") or [])]
+        noop = [i for i in ids if i not in removed]
+        for i in ids:  # answered either way: not asked for again now (a noop is gone, or seen again on the next list and timed afresh)
+            self.live_unknown_first.pop(i, None)
+        self.live_unknown_open = [u for u in self.live_unknown_open if u["id"] not in set(ids)]
+        briefs = {i: order_brief(self.live_unrecorded_rows.get(i) or {"id": i}) + (f" {due[i]}" if due[i] not in order_brief(self.live_unrecorded_rows.get(i) or {"id": i}) else "")
+                  for i in removed}
+        self.live_orphans = [*self.live_orphans[-49:], *({"at": now_ms, "id": i, "brief": briefs[i]} for i in removed)]
+        if removed:
+            self.live_notify(f"🧹 撤掉 {len(removed)} 张本机器人没有记录、却挂在本机器人市场上的挂单（丢失跟踪的单；LIVE_ORPHAN_CANCEL=off 可关）："
+                             + "；".join(briefs[i] for i in removed[:5]) + (f"；Predict 称 {len(noop)} 张无需撤" if noop else ""), key="orphans:" + ",".join(removed[:5]))
+        elif noop:
+            self.live_note_error(f"撤无记录挂单：Predict 称 {len(noop)} 张无需撤（#{'、#'.join(noop[:5])}）")
 
     async def live_cancel_blind(self, active: dict[str, dict], now_ms: int) -> None:
         """The open list could not be read (or the express lane cannot wait for one): the withdrawn records whose order id
@@ -2361,10 +2463,14 @@ class LiveBot(core.Bot):
         seen = {u["id"] for u in self.live_unknown_open}
         self.live_unknown_open = [{"id": str(r.get("id")), "hash": order_hash_of(r), "status": str(r.get("status") or ""),
                                    "amount": str(r.get("amount") or "")} for r in unknown]
+        self.live_unknown_first = {u["id"]: self.live_unknown_first.get(u["id"], now_ms) for u in self.live_unknown_open}  # live_orphan_sweep (1.136.2)
+        self.live_unrecorded_rows = {str(r.get("id")): r for r in unknown}
         fresh = [u["id"] for u in self.live_unknown_open if u["id"] not in seen]
         if fresh:
             self.live_notify(f"⚠️ Predict 账户上有 {len(self.live_unknown_open)} 张本机器人没有记录的挂单（#{'、#'.join(fresh[:5])}）：可能是手动单、"
-                             f"挂单测试残留或丢失跟踪的单。它们不计入这里的风控额度；/live cancel account 可连同策略挂单一起撤掉。", key="unknown:" + ",".join(fresh[:5]))
+                             f"挂单测试残留或丢失跟踪的单。它们不计入这里的风控额度；"
+                             + (f"挂在本机器人市场上的 {self.LIVE_ORPHAN_GRACE_MS // 60_000} 分钟后自动撤掉（LIVE_ORPHAN_CANCEL），其余 /live cancel account 可连同策略挂单一起撤掉。"
+                                if getattr(self.config, "live_orphan_cancel", True) else "/live cancel account 可连同策略挂单一起撤掉。"), key="unknown:" + ",".join(fresh[:5]))
 
     async def live_reconcile(self, tid: str, trade: dict, by_hash: dict, now_ms: int) -> None:
         """A record whose request may or may not have reached Predict (the process died in between, the answer was
@@ -2707,15 +2813,16 @@ class LiveBot(core.Bot):
                 out.append({**h, "shares": round(excess, 4), "market_id": k[0], "index_set": k[1]})
         return sorted(out, key=lambda r: -r["shares"])
 
-    def live_readopt(self, open_rows: list[dict], by_id: dict, by_hash: dict, now_ms: int) -> None:
+    def live_readopt(self, open_rows: list[dict], by_id: dict, by_hash: dict, now_ms: int, at_ms: int | None = None) -> None:
         """An order on the open list whose record here was already finished (judged gone, lapsed, released): it is
-        live after all — tracked again with its reservation, never left as "known, so not unknown"."""
+        live after all — tracked again with its reservation, never left as "known, so not unknown". A list read before
+        the record ended (``at_ms``: the pre-open mode's snapshot) says nothing about that record (1.136.2)."""
         for tid, t in self.sim_trades().items():
             st = t.get("live")
             if not isinstance(st, dict) or st.get("state") != "done" or t.get("status") in {"settled", "expired"}:
                 continue
             row = by_id.get(str(st.get("order_id") or "-")) or by_hash.get(str(st.get("hash") or "-").lower())
-            if row is None:
+            if row is None or (at_ms is not None and at_ms < core.trade_updated(t)):
                 continue
             st.pop("final", None)
             st.pop("error", None)
@@ -3238,7 +3345,7 @@ class LiveBot(core.Bot):
                 "sync_age_s": (now_ms - self.live_synced_at) // 1000 if self.live_synced_at else None, "hold": self.live_send_hold(now_ms),
                 "unknown": self.live_unknown_rows(live, now_ms),
                 "oldest_cancel_s": max([(now_ms - int((t.get("withdrawn") or {}).get("at") or now_ms)) // 1000 for _, t in live if t["live"].get("state") == "cancelling"], default=None),
-                "unknown_open": [dict(u) for u in self.live_unknown_open], "allowed": c.live_allowed,
+                "unknown_open": [dict(u) for u in self.live_unknown_open], "orphans": [dict(o) for o in self.live_orphans[-20:]], "allowed": c.live_allowed,
                 "orders_complete": bool(getattr(self.live.api, "orders_complete", True)), "positions_complete": bool(getattr(self.live.api, "positions_complete", True)),
                 "gate": (f"未就绪：{self.live.not_ready_why}" if not self.live.ready else self.live_balance_gate() or self.live_send_hold(now_ms)),
                 "balance_age_s": int(time.time() - self.live.balance[2]) if self.live.balance else None, "balance_error": self.live.balance_error,
@@ -3588,6 +3695,9 @@ class LiveBot(core.Bot):
             lines.append(f"⏳ 未确认订单 {unconfirmed} 张（发送中 / 撤单中：Predict 确认前其额度仍占用）")
         if self.live_unknown_open:
             lines.append(f"⚠️ 账户上有 {len(self.live_unknown_open)} 张本机器人没有记录的挂单（#{'、#'.join(u['id'] for u in self.live_unknown_open[:5])}）：不计入这里的额度；/live cancel account 可全部撤掉")
+        recent = [o for o in self.live_orphans if now_ms - int(o.get("at") or 0) <= 24 * 3600_000]
+        if recent:
+            lines.append(f"🧹 24 小时内自动撤掉 {len(recent)} 张无记录挂单（丢失跟踪的单；最近：{recent[-1]['brief']}）")
         today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
         since = int(today.timestamp() * 1000)
         placed_today = sum(int(t["opened"]) >= since for t in live)

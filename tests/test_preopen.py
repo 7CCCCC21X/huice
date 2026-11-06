@@ -553,8 +553,11 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("账户挂单分页未读取完整（读了 0 条、0 页仍没到底，上限 ? 页）", str(caught.exception))
         self.assertEqual((ctl.account_at, ctl.hold()), (0, "账户快照上次读取失败（账户挂单分页未读取完整（读了 0 条、0 页仍没到底，上限 ? 页），暂停新增订单），正在重读"))
         api.orders_complete = True
+        api.rows["other"] = {"id": "manual", "status": "OPEN", "amount": str(L.to_wei(2)), "amountFilled": "0", "order": {"hash": "0xother", "side": 0, "makerAmount": str(L.to_wei(1))}}
         await ctl.account()
         self.assertEqual((ctl.account_at, ctl.account_failed, ctl.hold(), ctl.account_read_s), (NOW, "", "", 0.0))
+        self.assertEqual([r["id"] for r in ctl.account_rows], ["manual"], "the whole account, for the owner (live_full_list)")
+        self.assertIn("原策略 2 分钟后自动撤掉（LIVE_ORPHAN_CANCEL）", ctl.status())
         await self.finish(ctl)
 
     async def test_a_windows_levels_are_refreshed_with_one_read(self):

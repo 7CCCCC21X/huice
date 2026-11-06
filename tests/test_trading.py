@@ -1,5 +1,6 @@
 """Real trading (LIVE=on): the paper trader's decisions become Predict orders. Offline: the API, the chain and the
 cards are stand-ins; the signing vectors come from the official predict-sdk (same key, same order, same output)."""
+import types
 import asyncio, base64, dataclasses, json, sys, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
@@ -1346,8 +1347,38 @@ async def run():
     assert len([1 for k, _ in sfake.calls if k == "create"]) == creates and "决定已过时" in sbot.sim_trades()["late2|up|吃#2"]["note"]
     # orders on the account this bot never placed: listed, announced, not counted; /live cancel account removes them too
     sfake.open["777"] = {"id": "777", "status": "OPEN", "amount": str(10 * WEI), "amountFilled": "0", "order": {"hash": "0xforeign"}}
+    # 1.136.2: one on a market this bot trades (a lost record's order) is withdrawn after the grace; the foreign one only reported
+    mid = next(iter(sbot.live.markets))  # a market priced for a real order earlier in this run
+    sfake.open["778"] = {"id": "778", "status": "OPEN", "amount": str(300 * WEI), "amountFilled": "0", "market": {"id": mid},
+                         "order": {"hash": "0xlost", "side": 0, "makerAmount": str(78 * WEI), "takerAmount": str(300 * WEI)}}
     await step(sbot, NOW + 700_000, late_mk(NOW + 700_000))  # nothing in flight: the list is still re-read every minute
-    assert [u["id"] for u in sbot.live_unknown_open] == ["777"] and "没有记录的挂单" in sbot.live_text(NOW + 700_000) and sbot.live_status(NOW + 700_000)["unknown_open"][0]["id"] == "777"
+    assert [u["id"] for u in sbot.live_unknown_open] == ["777", "778"] and "没有记录的挂单" in sbot.live_text(NOW + 700_000) and sbot.live_status(NOW + 700_000)["unknown_open"][0]["id"] == "777"
+    assert sbot.live_market_of(sfake.open["778"]) and not sbot.live_market_of(sfake.open["777"])
+    await step(sbot, NOW + 760_000, late_mk(NOW + 760_000))  # a minute on: within the grace, nothing withdrawn
+    assert not any(k == "remove" and "778" in ids for k, ids in sfake.calls) and sbot.live_unknown_first["778"] == NOW + 700_000
+    await step(sbot, NOW + 830_000, late_mk(NOW + 830_000))  # past the two-minute grace
+    assert ("remove", ["778"]) in sfake.calls and [u["id"] for u in sbot.live_unknown_open] == ["777"] and sbot.live_orphans[-1]["id"] == "778", sfake.calls[-3:]
+    assert "#778 买 26.0¢×300" in sbot.live_orphans[-1]["brief"] and "自动撤掉 1 张无记录挂单" in sbot.live_text(NOW + 830_000) and sbot.live_status(NOW + 830_000)["orphans"][-1]["id"] == "778", (sbot.live_orphans, sbot.live_text(NOW + 830_000))
+    sbot.apply_config(dataclasses.replace(sbot.config, live_orphan_cancel=False))  # off: reported, never withdrawn
+    sfake.open["779"] = {"id": "779", "status": "OPEN", "amount": str(300 * WEI), "amountFilled": "0", "market": {"id": mid},
+                         "order": {"hash": "0xlost2", "side": 0, "makerAmount": str(63 * WEI), "takerAmount": str(300 * WEI)}}
+    await step(sbot, NOW + 900_000, late_mk(NOW + 900_000))
+    await step(sbot, NOW + 1_030_000, late_mk(NOW + 1_030_000))
+    assert not any(k == "remove" and "779" in ids for k, ids in sfake.calls) and [u["id"] for u in sbot.live_unknown_open] == ["777", "779"]
+    sbot.apply_config(dataclasses.replace(sbot.config, live_orphan_cancel=True))
+    sfake.open.pop("779")
+    await step(sbot, NOW + 1_100_000, late_mk(NOW + 1_100_000))  # gone from the list: no longer unrecorded
+    assert [u["id"] for u in sbot.live_unknown_open] == ["777"] and "779" not in sbot.live_unknown_first
+    # the whole account when this bot's own read is cut: the pre-open mode's complete snapshot, while younger than ten minutes
+    sfake.orders_complete = False
+    snapshot = types.SimpleNamespace(account_rows=[sfake.open["777"]], account_at=NOW + 1_030_000)
+    sbot.preopen = snapshot
+    assert sbot.live_full_list([], NOW + 1_030_000) == ([sfake.open["777"]], NOW + 1_030_000)
+    snapshot.account_at = NOW + 1_030_000 - 601_000
+    assert sbot.live_full_list([], NOW + 1_030_000) == (None, 0)
+    sbot.preopen = None
+    sfake.orders_complete = True
+    assert sbot.live_full_list([sfake.open["777"]], NOW + 1_030_000) == ([sfake.open["777"]], NOW + 1_030_000)
     text = await sbot.cmd_live(m.Request("/live", ["cancel", "account"], 1, 0, 1))
     assert ("remove", ["777"]) in sfake.calls and "账户上无记录的挂单 1 张：Predict 确认撤掉 1 张" in text and sbot.live_unknown_open == [], text
     # the hard switch: LIVE_TRADING_ALLOWED=off caps the mode at pause, refuses the switch to on and the sending alike

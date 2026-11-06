@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.136.1"
+VERSION = "1.136.2"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -659,6 +659,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_TAKER_RETRY_SECONDS", "吃单没成交后回避（秒）", "1～3600：吃单一份没成交（到时撤掉、公平价变了撤掉）或发送前复核作废之后，同一市场同一边多久内不再吃单；机会还在就按这个短间隔再试"),
     ("LIVE_AUTO_REDEEM", "自动领取已结算持仓", "开 = 市场结算后自动在链上领取赢的一边：每 10 分钟查一次持仓，预挂或策略的单按 Predict 结果赢了约 20 秒内就领（签名钱包需有 BNB 付 gas）"),
     ("LIVE_NOTIFY", "真实订单的 Telegram 通知", "开 = 真实下单、成交、撤单、失败都发 Telegram 通知"),
+    ("LIVE_ORPHAN_CANCEL", "自动撤掉无记录的挂单", "开 = 账户上本机器人没有记录、却挂在本机器人做过的市场上的挂单（丢失跟踪的单：重启、改设置或撤单没撤成留下的，成交了也没人记账），连续 2 分钟还在就自动撤掉并通知；没做过的市场上的挂单当作手动单，只报不撤。关 = 只报不撤，/live cancel account 手动撤"),
     ("PREOPEN_15M", "开盘前预挂（15 分钟市场）", "开 = 15 分钟场次一发布就在涨跌两边各挂一张 post-only 买单，开场前撤掉（PREOPEN.md）；需要 LIVE=on。改动即时生效：开就启动，关就撤单停下，改参数先撤单再按新参数重启。预挂的预留计入持仓+挂单上限，当日盈亏计入日亏损停机线"),
     ("PREOPEN_EXCLUSIVE", "预挂时原策略暂停开新仓", "开 = 本模式真实运行时普通模型策略不开新仓（原策略也在交易同一批 15 分钟市场时建议开）；关 = 两边同时跑，额度和日亏损合并计算"),
     ("PREOPEN_MARKETS", "预挂哪几张卡", "点亮要挂的卡，可多选，全选 = all（默认只挂 BTC）；“一键全关”= none：一张都不挂、已挂的预挂单撤掉，本模式仍开着，再点亮一张就恢复；和“做哪些市场”互不影响：那边排除 15 分钟卡只管原策略，预挂只认这里"),
@@ -850,6 +851,7 @@ class Config:
     live_max_daily_loss_usd: float = 200.0  # LIVE_MAX_DAILY_LOSS_USD: realised loss per Beijing day that stops new orders; 0 = no limit
     live_auto_redeem: bool = True      # LIVE_AUTO_REDEEM: redeem resolved positions for USDT on-chain
     live_notify: bool = True           # LIVE_NOTIFY: Telegram lines for orders, fills and failures
+    live_orphan_cancel: bool = True    # LIVE_ORPHAN_CANCEL: an unrecorded open order on one of the bot's own markets is withdrawn after two minutes (1.136.2)
     web_control_key: str = field(default="", repr=False)  # WEB_CONTROL_KEY: the control page's secret; "" = the page is read-only
     env: dict = field(default_factory=dict, repr=False, compare=False)  # the variables this was read from (runtime changes re-read it)
     preopen: PreopenSettings = field(default_factory=PreopenSettings)  # the pre-open quoting mode (preopen.py), the control page's values included
@@ -1051,6 +1053,7 @@ class Config:
             live_max_daily_loss_usd=parse_bounded(e, "LIVE_MAX_DAILY_LOSS_USD", "200", 0, 100_000_000),
             live_auto_redeem=not off(e.get("LIVE_AUTO_REDEEM", "on")),
             live_notify=not off(e.get("LIVE_NOTIFY", "on")),
+            live_orphan_cancel=not off(e.get("LIVE_ORPHAN_CANCEL", "on")),
             web_control_key=control_key, env={k: v for k, v in e.items() if isinstance(k, str) and isinstance(v, str)},
             web_base=(e.get("WEB_BASE_URL", "").strip().rstrip("/")
                       or (f"https://{e['RAILWAY_PUBLIC_DOMAIN'].strip()}" if e.get("RAILWAY_PUBLIC_DOMAIN", "").strip() else "")),
@@ -10048,6 +10051,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "LIVE_TAKER_RETRY_SECONDS": {"kind": "number", "group": "高级", "presets": ["10", "30", "60", "120"], "unit": "秒"},
     "LIVE_AUTO_REDEEM": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
     "LIVE_NOTIFY": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
+    "LIVE_ORPHAN_CANCEL": {"kind": "choice", "group": "风控", "options": [["on", "开"], ["off", "关"]]},
 }
 # The settings whose empty value is a choice of its own — every market (the detail lists), nothing left out (SIM_SKIP), every
 # quote source on (SOURCES_OFF) — not "the environment's": the page saves it as "" over a non-empty environment value, and
@@ -20372,7 +20376,7 @@ class Bot:
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,
                   "LIVE_RETRY_SECONDS": str(c.live_retry), "LIVE_TAKER_RETRY_SECONDS": str(c.live_taker_retry),
-                  "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify)}
+                  "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify), "LIVE_ORPHAN_CANCEL": flag(c.live_orphan_cancel)}
         return values.get(key, "")
 
     def control_records(self, trades: dict[str, dict], history: int = 200) -> list[dict]:
