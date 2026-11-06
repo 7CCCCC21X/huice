@@ -92,7 +92,7 @@ class Api:
 
 def controller(markets=None, **env):
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:",
-                             "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "LIVE_MAX_OPEN_USD": "7000",
+                             "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "LIVE_MAX_OPEN_USD": "7000", "PREOPEN_OPEN_QUIET_MINUTES": "0",
                              "PREOPEN_MARKETS": "btc,skhynix,unitree", "PREOPEN_SHARES": "50", "PREOPEN_AHEAD_MINUTES": "60", **env})  # the tests' figures: three cards, 50 a side, an hour ahead
     clock = types.SimpleNamespace(ms=NOW)
     wallet = types.SimpleNamespace(maker="0x" + "1" * 40,
@@ -753,6 +753,47 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(ctl.request_rate(), 1.5)
         self.assertIn("请求约 1.5 次/秒（最近一分钟）", ctl.status())
         await self.finish(ctl)
+
+    async def test_a_stock_cards_first_window_after_a_session_open_is_not_quoted(self):
+        """1.135.1: a stock card's windows starting within PREOPEN_OPEN_QUIET_MINUTES (15) of a session segment's open — the
+        day's open, the afternoon's — are left out: the auction's indicative price and the break's news are public before the
+        index moves. The round-the-clock cards are untouched; 0 quotes them all (the suite's default)."""
+        ctl, api, clock = controller(PREOPEN_OPEN_QUIET_MINUTES="15", PREOPEN_MARKETS="skhynix,unitree,btc", PREOPEN_AHEAD_MINUTES="300")
+        self.assertEqual(ctl.settings.open_quiet_minutes, 15)
+        starts = {(r.key, (s - NOW) // 60_000) for r, s in p.window_starts(NOW, ctl.owner.config, ctl.settings)}
+        self.assertNotIn(("UNITREE-15M", 30), starts, "09:30: the SSE open")
+        self.assertIn(("UNITREE-15M", 45), starts)
+        self.assertNotIn(("UNITREE-15M", 240), starts, "13:00: after the break")
+        self.assertIn(("UNITREE-15M", 255), starts)
+        self.assertIn(("SKHYNIX-15M", 15), starts, "10:15 KST: mid-session")
+        self.assertIn(("BTC-15M", 30), starts, "no exchange: round the clock")
+        unitree = next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "UNITREE-15M")
+        sk = next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "SKHYNIX-15M")
+        self.assertTrue(p.session_opening(unitree, NOW + 30 * 60_000, frozenset(), 15 * 60_000))
+        self.assertTrue(p.session_opening(sk, NOW - 60 * 60_000, frozenset(), 15 * 60_000), "08:00 Beijing = 09:00 KST, the KRX open")
+        self.assertFalse(p.session_opening(sk, NOW - 45 * 60_000, frozenset(), 15 * 60_000))
+        self.assertFalse(p.session_opening(unitree, NOW + 30 * 60_000, frozenset(), 0), "0: off")
+        self.assertIn("股票卡开盘、午后头 15 分钟内开始的场次不挂", ctl.status())
+        self.assertEqual(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline"}).preopen.open_quiet_minutes, 15, "the default")
+        await self.finish(ctl)
+        with tempfile.TemporaryDirectory() as folder:  # quoted before the rule (the suite's 0): the next start withdraws it, a free withdrawal
+            db = {"STATE_DB": str(Path(folder) / "state.sqlite3")}
+            ctl, api, clock = controller(PREOPEN_MARKETS="unitree", **db)
+            c = p.candidate(market("unitree", at=NOW + 30 * 60_000), NOW, ctl.owner.config, ctl.settings)
+            await ctl.place_pair(c)
+            self.assertEqual(ctl.ledger.rows[c["slug"]]["phase"], "active")
+            ctl.keep_on_stop = True
+            await ctl.on_stop()
+            ctl.ledger.close()
+            again, _, _ = controller(PREOPEN_MARKETS="unitree", PREOPEN_OPEN_QUIET_MINUTES="15", **db)
+            again.api = again.cancel_api = api; api.ctl = again
+            again.adopt()
+            pair = again.ledger.rows[c["slug"]]
+            self.assertEqual((pair["phase"], pair["reason"], pair.get("free"), again.resumed), ("closing", "设置不同，撤掉后重新报价", True, 0))
+            await again.cancel_pair(pair, pair["reason"])
+            await again.discover()
+            self.assertEqual(again.queue.qsize(), 0, "not quoted again: the window is left out")
+            await self.finish(again)
 
     async def test_status_says_why_nothing_is_placed(self):
         """The holds that used to be silent — the snapshot not read or stale, open orders nobody here placed — and the

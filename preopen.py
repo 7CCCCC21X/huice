@@ -244,17 +244,30 @@ def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dic
             "day": dt.datetime.fromtimestamp(start / 1000, core.BEIJING).date().isoformat(), "name": spec.name}
 
 
+def session_opening(rolling: Any, start_ms: int, holidays: frozenset, quiet_ms: int) -> bool:
+    """Whether a stock card's window starts within ``quiet_ms`` of one of its exchange's session segments' open (the day's
+    open, the afternoon's): the opening auction's indicative price and the break's news are public before the index moves,
+    so that window's direction is no coin toss (1.135.1: not quoted, PREOPEN_OPEN_QUIET_MINUTES)."""
+    if not rolling.exchange or quiet_ms <= 0:
+        return False
+    tz = dt.timezone(dt.timedelta(hours=core.STOCK_MARKETS[rolling.exchange].utc_offset))
+    day = dt.datetime.fromtimestamp(start_ms / 1000, tz).date()
+    return any(seg_open <= start_ms < seg_open + quiet_ms for seg_open, _ in core.session_segments(rolling.exchange, day, holidays))
+
+
 def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[Any, int]]:
     """The windows this mode looks for now: each configured card's quarter hours from PREOPEN_ENTRY_SECONDS ahead to
-    PREOPEN_AHEAD_MINUTES ahead, whatever the day, on the card's exchange session — (card, start_ms), soonest first."""
+    PREOPEN_AHEAD_MINUTES ahead, whatever the day, on the card's exchange session, a stock card's first windows after each
+    session open left out (session_opening) — (card, start_ms), soonest first."""
     out = []
+    quiet_ms = int(getattr(settings, "open_quiet_minutes", 0) or 0) * 60_000
     for rolling in core.WINDOW_UPDOWN_MARKETS:
         if rolling.key not in settings.markets:
             continue
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
         start = -(-(now_ms + settings.entry_seconds * 1000) // rolling.window_ms) * rolling.window_ms
         while start <= now_ms + settings.ahead_minutes * 60_000:
-            if rolling.exists(start, holidays):
+            if rolling.exists(start, holidays) and not session_opening(rolling, start, holidays, quiet_ms):
                 out.append((rolling, start))
             start += rolling.window_ms
     return sorted(out, key=lambda rs: (rs[1], rs[0].key))
@@ -986,6 +999,10 @@ class Controller:
         import live
         if pair.get("key") not in self.settings.markets or self.now() >= pair["start_ms"]:
             return False
+        rolling = next((r for r in core.WINDOW_UPDOWN_MARKETS if r.key == pair["key"]), None)
+        if rolling is None or session_opening(rolling, int(pair["start_ms"]), self.owner.config.holidays.get(rolling.exchange, frozenset()),
+                                              int(self.settings.open_quiet_minutes) * 60_000):
+            return False  # 1.135.1: a stock card's first window after a session open, quoted before the rule (or with it off): withdrawn
         if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.expiry_seconds:
             return False
         price, shares = pair_quote(pair)
@@ -1858,7 +1875,8 @@ class Controller:
                 f"扫描 {self.settings.poll:g} 秒，"
                 + ("挂 24 小时内已发布的全部场次" if self.settings.ahead_minutes >= 1440 else f"只挂 {self.settings.ahead_minutes} 分钟内开始的场次") + "\n"
                 f"撤单：开场前 {self.settings.cancel_seconds} 秒发出，之后到开场前 {self.settings.expiry_seconds} 秒到期为止每 {SPRINT_MS // 1000} 秒催一次；"
-                f"不足 {self.settings.entry_seconds} 秒不再新挂\n"
+                f"不足 {self.settings.entry_seconds} 秒不再新挂"
+                + (f"；股票卡开盘、午后头 {self.settings.open_quiet_minutes} 分钟内开始的场次不挂" if self.settings.open_quiet_minutes else "") + "\n"
                 f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清），"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"

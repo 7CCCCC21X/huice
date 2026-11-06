@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.135.0"
+VERSION = "1.135.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -512,6 +512,7 @@ class PreopenSettings:
     levels: tuple = ((D("0.49"), D("10")),)  # (price, shares) a side per level, the first = price × shares; PREOPEN_LEVELS adds deeper ones (1.129.0)
     deep_ahead_minutes: int = 1440  # PREOPEN_DEEP_AHEAD_MINUTES: the deeper levels are placed only this close to the start (the first keeps ahead_minutes)
     limit_gap_pct: float = 2.0  # PREOPEN_LIMIT_GAP_PCT: a stock card's windows are not quoted (resting ones withdrawn) within this of the day's limit, or halted; 0 = off
+    open_quiet_minutes: int = 15  # PREOPEN_OPEN_QUIET_MINUTES: a stock card's windows starting within this of a session segment's open (the day's, the afternoon's) are not quoted — the auction's indicative price, the break's news (1.135.1); 0 = all
     markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = every 15-minute card
     exclusive: bool = False    # PREOPEN_EXCLUSIVE: on = the model trader opens nothing while this mode runs for real (off: both run, jointly capped)
     db: str = ""
@@ -562,6 +563,9 @@ class PreopenSettings:
         limit_gap = float(e.get("PREOPEN_LIMIT_GAP_PCT", "2") or 0)
         if not 0 <= limit_gap <= 20:
             raise ValueError("PREOPEN_LIMIT_GAP_PCT 0～20（0 = 不管涨跌停）")
+        open_quiet = int(e.get("PREOPEN_OPEN_QUIET_MINUTES", "15") or 0)
+        if not 0 <= open_quiet <= 120:
+            raise ValueError("PREOPEN_OPEN_QUIET_MINUTES 0～120（0 = 开盘、午后第一场也挂）")
         if (len(levels) > 5 or any(not 1 <= c <= 50 or not 1 <= s <= 500 or c * s / 100 < PREOPEN_MIN_SIDE_USD for c, s in levels)
                 or any(levels[i][0] <= levels[i + 1][0] for i in range(len(levels) - 1)) or not 3 <= deep <= ahead):
             raise ValueError(f"PREOPEN_LEVELS 至多 5 档，每档价格 1～50¢、份数 1～500、每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格要比第一档低、逐档递减；"
@@ -574,7 +578,7 @@ class PreopenSettings:
                              "PREOPEN_EXPIRY_SECONDS 5～600，PREOPEN_CANCEL_SECONDS 至少比它大 5 秒、至多 900，PREOPEN_ENTRY_SECONDS 至少比撤单时间大 60 秒、至多 3600")
         return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
                    price=price, shares=D(shares), markets=markets, exclusive=exclusive, db=cls.db_of(e),
-                   levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep, limit_gap_pct=limit_gap)
+                   levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep, limit_gap_pct=limit_gap, open_quiet_minutes=open_quiet)
 
     @classmethod
     def from_config(cls, config: "Config", force: bool = False) -> "PreopenSettings":
@@ -659,6 +663,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
     ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 4 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
     ("PREOPEN_DEEP_AHEAD_MINUTES", "第 2 档起只挂几分钟内开始的场次", "3～提前范围：第一档按“只挂几分钟内开始的场次”挂（排队靠前），更深的档位离开场这么近才挂，少占资金；0 = 和第一档一样"),
+    ("PREOPEN_OPEN_QUIET_MINUTES", "股票卡开盘后几分钟内开始的场次不挂", "0～120：海力士、宇树、智谱每个交易时段（开盘、午后）开始后这么多分钟内开始的场次不挂。集合竞价的参考价（韩交所 08:30 起、港交所 09:00 起、上交所 09:15 起）和午休里的消息（A50 期货午休照常交易）在指数动之前就已公开，这几场的方向不是五五开，49¢ 的买单正好给知道方向的人接。默认 15 = 跳过开盘和午后的第一场；0 = 都挂"),
     ("PREOPEN_LIMIT_GAP_PCT", "股票卡距涨跌停不足几 % 时不挂", "0～20：海力士、宇树（智谱在港交所没有涨跌停，只看临停）的交易所现价离当日涨停或跌停（按前收盘价算：科创板 ±20%、韩交所 ±30%）不到这么多时不新挂、撤掉已挂的；交易时段里成交时间 3 分钟没动（临停、VI）同样处理；0 = 不管（默认 2）"),
     ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场、最近的先；想少占资金就调小"),
     ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
@@ -9964,6 +9969,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_LEVELS": {"kind": "text", "group": "预挂", "presets": ["", "48x20", "48x20,47x40", "48x10,47x10", "47x40", "48x10,47x20,46x40"], "unit": "", "empty": "只挂第一档"},
     "PREOPEN_DEEP_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "60", "120", "240", "1440"], "unit": "分钟", "zero": "和第一档一样"},
     "PREOPEN_LIMIT_GAP_PCT": {"kind": "number", "group": "预挂", "presets": ["0", "1", "2", "3", "5"], "unit": "%", "zero": "不管涨跌停"},
+    "PREOPEN_OPEN_QUIET_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "15", "30", "60"], "unit": "分钟", "zero": "开盘第一场也挂"},
     "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["60", "120", "240", "720", "1440"], "unit": "分钟"},
     "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "15", "20", "30", "60"], "unit": "秒"},
     "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["5", "10", "15", "30"], "unit": "秒"},
@@ -20345,7 +20351,7 @@ class Bot:
                   "PREOPEN_15M": flag(c.preopen.enabled), "PREOPEN_SHARES": plain(float(c.preopen.shares)), "PREOPEN_PRICE_CENTS": f"{float(c.preopen.price) * 100:g}",
                   "PREOPEN_LEVELS": ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.levels[1:]),
                   "PREOPEN_DEEP_AHEAD_MINUTES": str(c.preopen.deep_ahead_minutes if c.preopen.deep_ahead_minutes != c.preopen.ahead_minutes else 0),
-                  "PREOPEN_LIMIT_GAP_PCT": f"{c.preopen.limit_gap_pct:g}",
+                  "PREOPEN_LIMIT_GAP_PCT": f"{c.preopen.limit_gap_pct:g}", "PREOPEN_OPEN_QUIET_MINUTES": str(c.preopen.open_quiet_minutes),
                   "PREOPEN_MARKETS": ("all" if c.preopen.markets >= {r.key for r in WINDOW_UPDOWN_MARKETS}
                                       else ",".join(r.stem for r in WINDOW_UPDOWN_MARKETS if r.key in c.preopen.markets)),
                   "PREOPEN_AHEAD_MINUTES": str(c.preopen.ahead_minutes), "PREOPEN_CANCEL_SECONDS": str(c.preopen.cancel_seconds),
