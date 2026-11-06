@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.120.1"
+VERSION = "1.120.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4421,6 +4421,7 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
                             f"实际 {hit * 100:.0f}%（95% 区间 {low * 100:.0f}–{high * 100:.0f}%，{len(sel)} 条/{bin_days} 日）")
         lines.append("  校准：" + "；".join(bins) + "；区间按日数算，窄到能分辨几个点的差别之前，别把小数点后的优势当真")
         lines.extend(residual_lines(done))
+        lines.extend(trend_lines(done))
         factor, factor_days = residual_factor(done)
         lines.append(f"  σ 校准系数：×{factor:.2f}（按 {factor_days} 日残差，先验 {RESIDUAL_PRIOR_DAYS} 日按 1 计，限 {RESIDUAL_RANGE[0]:g}～{RESIDUAL_RANGE[1]:g}；"
                      + ("SIGMA_CALIB 开着时卡片按它定价）" if key in PREDICT_KEYS.values() else "个股卡只评估、不套用）"))
@@ -4544,6 +4545,28 @@ def residual_lines(done: list[dict]) -> list[str]:
     if len(parts) > 1:
         lines.append("  按剩余方差份额 R 分桶：" + "；".join(parts))
     return lines
+
+
+def trend_lines(done: list[dict]) -> list[str]:
+    """The model's 涨 probability against the outcomes by where the price had been going in the half hour before each
+    snapshot (1.120.2: a stock falling all evening was still given 15% to close up, the model being driftless): the
+    snapshots whose effective price had fallen since the one before by a tenth of the day's σ or more, those where it
+    had risen, those where it had barely moved — predicted against actual, the interval counted in days. A bucket where
+    the actual falls well short of the predicted says the direction carries information the model does not use."""
+    rows = [r for r in done if r.get("trend") is not None and float(r.get("sigma") or 0) > 0]
+    if not rows:
+        return []
+    parts = []
+    for label, pick in (("价在跌", lambda r: r["trend"] <= -0.1 * r["sigma"]), ("价在涨", lambda r: r["trend"] >= 0.1 * r["sigma"]),
+                        ("基本没动", lambda r: abs(r["trend"]) < 0.1 * r["sigma"])):
+        sel = [r for r in rows if pick(r)]
+        if not sel:
+            continue
+        hit, days = sum(r["hit"] for r in sel) / len(sel), len({r["target"] for r in sel})
+        low, high = wilson(hit * days, days)
+        parts.append(f"{label}：{len(sel)} 条/{days} 日，预测涨 {sum(r['up'] for r in sel) / len(sel) * 100:.0f}% 实际 {hit * 100:.0f}%"
+                     f"（95% 区间 {low * 100:.0f}–{high * 100:.0f}%）")
+    return ["  按快照前半小时的走向分桶（有效价对上一条快照，动了 0.1 个日 σ 以上才算）：" + "；".join(parts)]
 
 
 def fit_proxy(rows: list[dict]) -> tuple[float, float, float] | None:
@@ -13592,6 +13615,7 @@ class Bot:
         self.close_print_why: dict[str, str] = {}  # symbol -> why today's closing print could not be noted (note_live_close)
         self.kospi_anchor_note, self.kospi_anchor_error = "", ""
         self.pred_last: dict[str, int] = {}  # index -> ms of the last saved prediction snapshot
+        self.pred_prev: dict[str, tuple[int, str, str, float]] = {}  # key -> (ms, target, mode, effective) of that snapshot: the next one's trend (1.120.2)
         self.a50_anchor_note = "15:00"
         self.a50_anchor_error = ""  # why the last anchor lookup failed (shown in /diag and the odds row)
         self.a50_bar_checked = 0    # the close (ms) whose five-minute-bar anchor was checked against the final bar (once per close)
@@ -14920,6 +14944,10 @@ class Bot:
             if not isinstance(raw, CloseOdds) or now_ms - self.pred_last.get(key, -PRED_EVERY_MS) < PRED_EVERY_MS:
                 continue
             self.pred_last[key] = now_ms
+            prev = self.pred_prev.get(key)  # where the price had been going: the effective price against the snapshot before (1.120.2)
+            trend = (math.log(float(raw.effective) / prev[3]) if prev and prev[1] == raw.target.isoformat() and prev[2] == raw.mode
+                     and 0 < now_ms - prev[0] <= 45 * 60_000 and prev[3] > 0 and raw.effective > 0 else None)
+            self.pred_prev[key] = (now_ms, raw.target.isoformat(), raw.mode, float(raw.effective))
             shown = self.settle_on_strike(title, raw)  # exactly what the web page and /prob display
             stem = self.config.predict_slugs.get(key) if self.config.predict else None
             slug = predict_slug(stem, raw.target) if stem else ""
@@ -14929,6 +14957,7 @@ class Bot:
                 "mkt": self.predict_mid(key, slug, now_ms),  # the market's own 涨 price then: /calib scores both
                 "ref_raw": float(raw.ref), "up_raw": raw.fair_up, "strike": float(shown.ref) if shown.ref != raw.ref else None,
                 "move": raw.move, "beta": raw.beta, "sigma": raw.sigma_daily * raw.widen, "widen": raw.widen, "R": raw.remaining, "proxy": raw.proxy_note,
+                "trend": trend,  # ln(effective / the snapshot before's), about half an hour: the direction the price had been going (1.120.2)
                 "calib": self.vols.calib.get((key, raw.mode), (1.0, 0))[0],  # the factor in that σ: the residuals are taken on the raw one
                 "sigma_raw": raw.sigma_daily * raw.widen / self.vols.calib.get((key, raw.mode), (1.0, 0))[0],
                 "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else ""})

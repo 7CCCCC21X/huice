@@ -20,7 +20,7 @@ for i in range(30):
         sigma, R = 0.02, 1.0
         up = 1 - m.norm_cdf(math.log(ref / eff) / sigma)
         preds.append({"key": "KOSPI", "t": i * 10 + j, "target": day, "mode": "盘后", "ref": ref, "eff": eff,
-                      "move": move, "beta": 1.0, "sigma": sigma, "R": R, "up": up})
+                      "move": move, "beta": 1.0, "sigma": sigma, "R": R, "up": up, "trend": (-0.01, 0.01, 0.0, None)[j]})  # 1.120.2
 preds.append({"key": "KOSPI", "t": 999, "target": "2026-12-31", "mode": "盘后", "ref": 7000.0, "eff": 7000.0,
               "move": 0.0, "beta": 1.0, "sigma": 0.02, "R": 1.0, "up": 0.5})  # not resolved yet
 text = "\n".join(m.calibration_report(preds, outcomes))
@@ -30,6 +30,10 @@ b = float(text.split("系数 b ")[1].split("（")[0]); assert 0.4 < b < 0.8, tex
 assert "逐日向前检验（20 日 80 条）：拟合模型 Brier" in text, text
 k = float(text.split("残差 σ ")[1].split("%")[0]); assert 0.5 < k < 1.2, text  # true residual 0.8%/day
 assert "95% 区间" in text and "区间按日数算" in text, text
+# 1.120.2: the model's 涨 against the outcomes by where the price had been going before the snapshot (a tenth of the day's σ)
+trend_line = next(l for l in text.splitlines() if l.startswith("  按快照前半小时的走向分桶"))
+assert "价在跌：30 条/30 日，预测涨" in trend_line and "价在涨：30 条/30 日" in trend_line and "基本没动：30 条/30 日" in trend_line, trend_line
+assert m.trend_lines([]) == [] and m.trend_lines([{"trend": None, "sigma": 0.02}]) == []
 # 1.106.1: the residual factor (SIGMA_CALIB for the index cards): the day-weighted RMS of z = (y − β·move) / (raw σ·√R), pooled
 # with 20 days at 1 — the true residual 0.8%/day against a 2% σ: z's RMS about 0.47, the factor about 0.73
 done = [dict(p, y=math.log(outcomes[f"KOSPI:{p['target']}"] / p["ref"])) for p in preds if f"KOSPI:{p['target']}" in outcomes]
@@ -80,6 +84,7 @@ async def run():
         bot.record_predictions(t0 + minutes * 60_000)
     saved = [v for _, v in store.items("pred:")]
     assert [p["t"] for p in saved] == [t0, t0 + 30 * 60_000, t0 + 61 * 60_000], saved
+    assert saved[0]["trend"] is None and saved[1]["trend"] == 0.0 and saved[2]["trend"] == 0.0  # 1.120.2: the same odds each time: no move since the one before
     assert saved[0]["target"] == "2026-09-28" and saved[0]["mode"] == "盘后" and abs(saved[0]["up"] - odds.fair_up) < 1e-12
     assert store.get("outcome:KOSPI:2026-09-23") == 7080.92 and not store.items("outcome:SSE")
     bot.kospi.quote = m.IndexQuote("KOSPI", D("7100"), None, None, None, None,
