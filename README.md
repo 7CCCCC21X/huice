@@ -1,5 +1,7 @@
 # TG 合约昨收偏离提醒机器人
 
+新增可选的 [15分钟市场发布即预挂模式](PREOPEN.md)：BTC、SK海力士、宇树的当天未来场次一经扫描发现，两边49¢各50份，每场提前60秒撤单、提前30秒到期。`PREOPEN_15M=off` 为默认值；启用后普通模型策略不开新仓，原有监控、网页和控制命令保留。
+
 监控截图里的四个币安合约：**UNITREEUSDT、HK0625USDT、CXMTUSDT、SKHYNIXUSDT**。
 
 最新成交价相对参考收盘价**上涨超过 1%，或者下跌超过 1%**，向 Telegram 私聊或指定群组话题推送提醒。代码存放 GitHub，Railway 常驻运行。默认仅监控，不会自动交易、下单或撤单，也不需要交易所 API Key、钱包或私钥；配置 `LIVE=on`（见「[真实交易](#真实交易liveon)」）后，模拟交易的每个决定会在 Predict.fun 真实下单。
@@ -970,3 +972,4 @@ docker run --rm --env-file .env -v "$(pwd)/data:/data" tg-close-alert-bot
 - Railway Volume：`https://docs.railway.com/volumes`
 
 本程序使用的行情接口仅有 `/fapi/v1/time`、`/fapi/v2/ticker/price`、`/fapi/v1/klines`，没有任何交易或账户操作接口。Telegram 使用 `getMe`、`getWebhookInfo`、`getUpdates`、`sendMessage`。
+

@@ -988,6 +988,11 @@ class LiveBot(core.Bot):
         self.live_list_at_ms = -10 ** 15  # ...on the bot's clock, for the idle re-read
         self.live_auth_tried = -1e9  # monotonic time of the last sign-in renewal tried ahead of the token's expiry
         self.live_place_ms = 0       # the last step's placement time (sim_after_decide), for the phases
+        self.preopen = None
+        if str(self.config.env.get("PREOPEN_15M", "off")).lower() == "on":
+            from preopen import Controller
+            self.preopen = Controller(self)
+            self.handlers["/preopen"] = self.cmd_preopen
 
     # --- readiness -------------------------------------------------------------------------------------------------------
     async def live_prepare(self) -> list[str]:
@@ -1056,6 +1061,8 @@ class LiveBot(core.Bot):
     def live_room(self, trades: dict[str, dict], mk: core.SimMarket, side: str, price: float, shares: float,
                   taker: dict | None = None) -> str:
         c = self.config
+        if getattr(self, "preopen", None) is not None:
+            return "开盘前固定双边预挂模式：普通模型策略不开新仓"
         if c.live_mode == "off":
             return ""  # paper trading, as the base class does it
         if not self.live.ready:
@@ -1434,6 +1441,8 @@ class LiveBot(core.Bot):
         pauses, the age of the decision, the caps and the balance as they stand now — the decision was checked a step
         ago, or before a restart, and anything may have changed since. "" to send."""
         c, st = self.config, trade["live"]
+        if getattr(self, "preopen", None) is not None:
+            return "开盘前固定双边预挂模式：不发送普通模型策略的旧决定"
         if c.live_mode != "on":
             return f"LIVE={c.live_mode}，不下单"
         if not c.live_allowed:
@@ -2169,6 +2178,8 @@ class LiveBot(core.Bot):
         """Open orders on the account that no record here placed (a manual order, a lost record, another bot): kept
         for /live and the page, announced once each. They are not this strategy's to manage; /live cancel account
         withdraws them with everything else."""
+        if getattr(self, "preopen", None) is not None:
+            open_rows = self.preopen.unmanaged_rows(open_rows)
         trades = self.sim_trades()
         known_ids = {str(t["live"].get("order_id")) for t in trades.values() if isinstance(t.get("live"), dict) and t["live"].get("order_id")}
         known_hashes = {str(t["live"].get("hash") or "").lower() for t in trades.values() if isinstance(t.get("live"), dict)}
@@ -2665,6 +2676,8 @@ class LiveBot(core.Bot):
             return f"⏸ 真实交易已暂停（{why}）：不再开新仓；已有挂单保留，/live cancel all 可撤。/live resume 恢复。"
         if action == "resume":
             self.store.delete_keys(["live:paused"])
+            if getattr(self, "preopen", None) is not None:
+                self.preopen.manual_pause = self.preopen.ledger.pause(False)
             if record := self.live_kill_record():
                 self.store.put("live:killed", {**record, "resumed": True, "resumed_at": now_ms})
             return "▶️ 真实交易已恢复：满足条件的建议会重新下单。"
@@ -2759,6 +2772,8 @@ class LiveBot(core.Bot):
     def control_payload(self) -> dict:
         data = super().control_payload()
         data["mode"], data["live"] = "live", self.live_status(self.market.now_ms())
+        if getattr(self, "preopen", None) is not None:
+            data["preopen"] = {"status": self.preopen.status(), "reserved_usd": self.preopen.risk()}
         return data
 
     def live_status(self, now_ms: int) -> dict:
@@ -2911,6 +2926,9 @@ class LiveBot(core.Bot):
         elif action == "stop":  # the emergency stop: no new orders, every resting order of the strategy asked to be withdrawn
             first = await self.live_action("pause", ["紧急停止"], now_ms)
             second = await self.live_cancel_command(["all"], now_ms)
+            if getattr(self, "preopen", None) is not None:
+                await self.preopen.cancel_all("紧急停止")
+                second += "\n" + self.preopen.status()
             text = f"{first}\n{second}"
         elif action in {"resume", "redeem", "check", "orders", "positions"}:
             text = await self.live_action(action, [], now_ms)
@@ -2921,6 +2939,20 @@ class LiveBot(core.Bot):
         return {"ok": not failed, "message": message}
 
     async def live_cancel_command(self, words: list[str], now_ms: int) -> str:
+        preopen = getattr(self, "preopen", None)
+        if preopen is not None and words:
+            matches = [p for p in preopen.ledger.rows.values() if any(str(o.get("id") or "") == words[0] for o in p["orders"].values())]
+            if words[0] in {"all", "account"} or matches:
+                preopen.manual_pause = preopen.ledger.pause(True)
+                if matches and words[0] not in {"all", "account"}:
+                    await preopen.cancel_many(matches, "管理员撤单")
+                    return "已请求撤销该场双边预挂单，预挂模式已暂停。\n" + preopen.status()
+                await preopen.cancel_all("管理员撤单")
+                result = await self._live_cancel_command(words, now_ms)
+                return result + "\n已请求撤销预挂单，预挂模式已暂停。\n" + preopen.status()
+        return await self._live_cancel_command(words, now_ms)
+
+    async def _live_cancel_command(self, words: list[str], now_ms: int) -> str:
         trades = self.sim_trades()
         targets = {tid: t for tid, t in trades.items() if isinstance(t.get("live"), dict) and t["status"] == "resting"
                    and t["live"].get("state") in {"open", "placing", "pending", "unknown"}}
@@ -3150,6 +3182,8 @@ class LiveBot(core.Bot):
         if last := (self.store.get("live:test") or {}).get("text"):
             lines.append("\n最近挂单测试：" + str(last).split("\n")[0].removeprefix("🧪 挂单测试 ") + "…（/live test 重跑）")
         lines.append("\n/live mode off|pause|on｜pause｜resume｜cancel all｜redeem｜check｜orders｜positions｜test [市场] [份数] [价格¢]")
+        if getattr(self, "preopen", None) is not None:
+            lines.append("\n" + core.html.escape(self.preopen.status()) + "\n/preopen 查看预挂；紧急停止会撤销本模式订单")
         return "\n".join(lines)
 
     def sim_text(self) -> str:
@@ -3178,7 +3212,39 @@ class LiveBot(core.Bot):
                         "paused": self.live_paused(), "killed": self.live_killed()}
         return data
 
+    async def cmd_preopen(self, req: core.Request) -> str:
+        if self.preopen is None:
+            return "开盘前预挂模式未启用"
+        action = req.args[0].lower() if req.args else ""
+        if action in {"pause", "resume"}:
+            self.preopen.manual_pause = self.preopen.ledger.pause(action == "pause")
+            if action == "pause":
+                await self.preopen.cancel_all("管理员暂停开盘前模式")
+        elif action:
+            return "用法：/preopen｜/preopen pause｜/preopen resume"
+        return self.preopen.status()
+
     async def run(self) -> int:
+        task = None
+        if self.preopen is not None:
+            task = asyncio.create_task(self.preopen.run(), name="preopen")
+            def finished(t: asyncio.Task) -> None:
+                if not t.cancelled() and t.exception() is not None:
+                    LOG.error("开盘前策略异常结束：%s", core.clean_error(t.exception()))
+                    self.stopping.set()
+            task.add_done_callback(finished)
+        try:
+            return await self._run_live()
+        finally:
+            self.stopping.set()
+            if task is not None:
+                await asyncio.wait([task], timeout=15)
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                self.preopen.ledger.close()
+
+    async def _run_live(self) -> int:
         if self.config.live_mode == "off":
             LOG.info("真实交易模块已加载（LIVE=off，只记账）：/live mode pause|on 切换")
             return await super().run()
@@ -3244,3 +3310,4 @@ async def live_approve(config: core.Config, yield_bearing: bool = False) -> int:
     for label, outcome in results:
         print(f"{label}：{outcome}")
     return 0 if all(not outcome.startswith("失败") for _, outcome in results) else 1
+
