@@ -78,7 +78,8 @@ FILLED_STATUSES = {"FILLED", "COMPLETED", "DONE", "MATCHED"}  # a record that sa
 ERRORS_KEPT = 20          # the last problems kept with their time (/preopen check)
 STUCK_MS = 15 * 60_000    # a withdrawn pair not cleared this long past its cancel time is announced (check_stuck)
 LISTING_FIELDS = ("id", "conditionId", "status", "tradingStatus", "question", "outcomes")  # the details' fields the discovery reads
-MAX_ATTEMPTS = 3       # a window is quoted at most this many times (its pairs withdrawn before the start quoted again under a new salt)
+MAX_ATTEMPTS = 3       # a window's quotes that ended by its own failure, at most (a pair withdrawn before the start is quoted again under a new salt)
+FREE_REASONS = ("设置不同", "预挂模式停止", "到时撤单或真实交易暂停", "距涨停", "距跌停", "临停")  # withdrawals that were not the window's doing (counts_against)
 MISS_STOP = 4          # discover: a card's coming windows are asked in start order; this many unlisted in a row end the card's full scan
 FULL_SCAN_MS = 60_000  # a full scan (up to MISS_STOP unlisted per card) this often; between them each card's first unlisted window alone is asked every poll
 
@@ -340,6 +341,27 @@ def cards_today(rows: list[dict], now_ms: int) -> list[dict]:
                     "expected": round(sum((0.5 - q["price"]) * q["filled"] for q in settled), 4), "avg_fair": 0.5 if settled else None,
                     "hit": (r["wins"] + 0.5 * r["ties"]) / r["settled"] if r["settled"] else None})
     return sorted(out, key=lambda x: (-x["records"], x["name"]))
+
+
+def counts_against(pair: dict) -> bool:
+    """Whether a withdrawn record counts against its window's MAX_ATTEMPTS: one that ended by its own failure (a side not
+    confirmed, a side ended unfilled — an external cancel, a deferred refusal — the market's status) does; one withdrawn
+    for what was not the window's doing (a settings change, the mode stopped, LIVE paused, the stock guard) does not
+    (1.131.6: a day of settings changes used up the three quotes of every window listed the day before). Marked on the
+    record (free); an older record by its reason."""
+    if pair.get("free"):
+        return False
+    reason = str(pair.get("reason") or "")
+    return not any(word in reason for word in FREE_REASONS)
+
+
+def window_strikes(rows: Any) -> dict[str, int]:
+    """Record key (a window's level) -> its quotes that ended by its own failure (counts_against), the superseded ones included."""
+    out: dict[str, int] = {}
+    for p in rows:
+        if p.get("accounted") and p.get("phase") != "active" and counts_against(p):
+            out[record_key(p)] = out.get(record_key(p), 0) + 1
+    return out
 
 
 def record_key(pair: dict) -> str:
@@ -769,7 +791,7 @@ class Controller:
                 active = [p for p in self.ledger.rows.values() if p["phase"] == "active" and p.get("key") == rolling.key
                           and p["start_ms"] - now_ms <= CARD_HOLD_NEAR_MS]  # the next hour's windows: a day's quotes are not thrown away over a halt
                 if active:
-                    await self.cancel_many(active, why)
+                    await self.cancel_many(active, why, free=True)
             else:
                 self.card_holds.pop(rolling.key, None)
 
@@ -902,21 +924,24 @@ class Controller:
                 self.ledger.save(pair)
                 self.resumed += 1
             elif pair["phase"] != "closed" and not pair.get("accounted"):
-                pair.update(phase="closing", retry_ms=0, **({"reason": "设置不同，撤掉后重新报价"} if pair["phase"] == "active" else {}))
+                pair.update(phase="closing", retry_ms=0, **({"reason": "设置不同，撤掉后重新报价", "free": True} if pair["phase"] == "active" else {}))
                 self.ledger.save(pair)
 
-    def supersedable(self, pair: dict) -> bool:
+    def supersedable(self, pair: dict, strikes: int | None = None) -> bool:
         """A pair withdrawn before its window — a stop, a pause, a settings change, an external cancel — with the start
         still ahead: its record steps aside so the window is quoted again under a new salt. Not one Predict refused (a
         post-only order that would cross is refused again), not one with a fill (a position: that size is taken), and
-        not past MAX_ATTEMPTS. Accounted means every order verified and nothing filled."""
+        not with MAX_ATTEMPTS of the window's quotes ended by its own failure (``strikes``; window_strikes when not given:
+        1.131.6, a withdrawal that was not its doing is free). Accounted means every order verified and nothing filled."""
         if pair["phase"] == "active" or not pair.get("accounted"):
             return False
         if pair["start_ms"] - self.now() < self.settings.entry_seconds * 1000:
             return False
         if any(o["state"] == "rejected" and not o.get("limited") or o.get("refused") for o in pair["orders"].values()):
             return False  # Predict's refusal, outright or deferred (monitor_pair): the same order would be refused again
-        return int(pair.get("attempt") or 0) + 1 < MAX_ATTEMPTS
+        if strikes is None:
+            strikes = window_strikes(self.ledger.rows.values()).get(record_key(pair), 0)
+        return strikes < MAX_ATTEMPTS
 
     async def on_stop(self) -> None:
         """The way out: the orders are withdrawn when the mode is switched off or crashed; they stay on the book when the
@@ -927,7 +952,7 @@ class Controller:
             LOG.info("开盘前预挂：%d 场挂单留在簿上（签名到期兜底，重启后接管）", resting)
             return
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(self.cancel_all("预挂模式停止，撤销预挂单"), timeout=12)
+            await asyncio.wait_for(self.cancel_all("预挂模式停止，撤销预挂单", free=True), timeout=12)
 
     async def discover(self) -> None:
         """Each coming window (window_starts) not yet recorded or queued, asked for by its category, each card's in start
@@ -943,6 +968,7 @@ class Controller:
         attempts: dict[str, int] = {}  # record (a window's level) -> the attempt after its last record, the superseded ones included: an attempt that left no record is not reused (its salt would be the first attempt's)
         for p in self.ledger.rows.values():
             attempts[record_key(p)] = max(attempts.get(record_key(p), 0), int(p.get("attempt") or 0) + 1)
+        strikes = window_strikes(self.ledger.rows.values())  # 1.131.6: the cap counts failures, not the salt's attempts
         for rolling, start in window_starts(self.now(), self.owner.config, self.settings):
             if misses.get(rolling.key, 0) >= (MISS_STOP if full else 1) or (self.card_holds.get(rolling.key) and start - self.now() <= CARD_HOLD_NEAR_MS):
                 continue
@@ -954,7 +980,7 @@ class Controller:
                 if level and start - self.now() > self.settings.deep_ahead_minutes * 60_000:
                     break  # the deeper levels wait for the window to come near (PREOPEN_DEEP_AHEAD_MINUTES); the first keeps its queue position
                 key = slug if level == 0 else f"{slug}#{level}"  # sorts after the first level's key, before the next's
-                if key in self.queued or (key in self.ledger.rows and not self.supersedable(self.ledger.rows[key])) or attempts.get(key, 0) >= MAX_ATTEMPTS:
+                if key in self.queued or (key in self.ledger.rows and not self.supersedable(self.ledger.rows[key], strikes.get(key, 0))) or strikes.get(key, 0) >= MAX_ATTEMPTS:
                     continue
                 wanted.append((key, level, price, shares))
             if not wanted:
@@ -1293,14 +1319,15 @@ class Controller:
         if rejected:
             await self.cancel_many([pair], "一边未成交即结束，撤掉另一边")
 
-    async def cancel_all(self, reason: str) -> None:
-        await self.cancel_many([p for p in list(self.ledger.rows.values()) if p["phase"] != "closed"], reason)
+    async def cancel_all(self, reason: str, free: bool = False) -> None:
+        await self.cancel_many([p for p in list(self.ledger.rows.values()) if p["phase"] != "closed"], reason, free)
 
-    async def cancel_many(self, pairs: list[dict], reason: str) -> None:
-        """Bulk removals first; slow hash/fill reads never queue known IDs behind them."""
+    async def cancel_many(self, pairs: list[dict], reason: str, free: bool = False) -> None:
+        """Bulk removals first; slow hash/fill reads never queue known IDs behind them. ``free``: a withdrawal that was not
+        the window's doing — it does not count against its MAX_ATTEMPTS (counts_against)."""
         by_id: dict[str, tuple[dict, dict]] = {}
         for pair in pairs:
-            pair.update(phase="closing", reason=reason)
+            pair.update(phase="closing", reason=reason, **({"free": True} if free else {}))
             for order in pair["orders"].values():
                 if order["state"] == "prepared":
                     order["state"] = "not_sent"
@@ -1450,7 +1477,7 @@ class Controller:
             if due:
                 active = [p for p in due if p["phase"] == "active"]
                 if active:
-                    await self.cancel_many(active, "到时撤单或真实交易暂停")
+                    await self.cancel_many(active, "到时撤单或真实交易暂停", free=True)
                 for pair in due:
                     if pair["phase"] != "active" and pair["slug"] not in self.cancelling:
                         self.bookkeep(pair)  # the next try is booked now: a read that hangs does not make the loop ask again meanwhile
@@ -1539,8 +1566,32 @@ class Controller:
                             if self.settings.ahead_minutes < 1440 and leads[-1] >= self.settings.ahead_minutes - 15 else ""))
         return "；".join(parts)
 
+    def unquotable(self) -> tuple[list[dict], list[dict]]:
+        """The coming windows' levels (start beyond the new-order cutoff) this mode will not quote again, the soonest first:
+        (their failures at MAX_ATTEMPTS, refused by Predict) — each level's latest record (1.131.6: /preopen says so; a
+        window that went missing used to say nothing)."""
+        strikes = window_strikes(self.ledger.rows.values())
+        latest: dict[str, dict] = {}
+        for p in self.ledger.rows.values():
+            k = record_key(p)
+            if k not in latest or int(p.get("attempt") or 0) > int(latest[k].get("attempt") or 0):
+                latest[k] = p
+        cutoff = self.now() + self.settings.entry_seconds * 1000
+        spent, refused = [], []
+        for k, p in latest.items():
+            if p["phase"] == "active" or not p.get("accounted") or int(p.get("start_ms") or 0) <= cutoff:
+                continue
+            if any(o["state"] == "rejected" and not o.get("limited") or o.get("refused") for o in p["orders"].values()):
+                refused.append(p)
+            elif strikes.get(k, 0) >= MAX_ATTEMPTS:
+                spent.append(p)
+        soonest = lambda ps: sorted(ps, key=lambda p: int(p.get("start_ms") or 0))
+        return soonest(spent), soonest(refused)
+
     def status(self) -> str:
         rows = list(self.ledger.rows.values())
+        spent, refused = self.unquotable()
+        named = lambda ps: "、".join(str(p.get("name") or window_of(p)) + (f" 第 {int(p['level']) + 1} 档" if p.get("level") else "") for p in ps[:3]) + ("…" if len(ps) > 3 else "")
         why = (self.hold() or self.budget_problem()) if self.alive else ""
         state = "已停止" if not self.alive else f"暂停，{why}" if self.blocked() else "运行"
         until = lambda ms: f"{when(ms, self.now())}（开场前 {(ms - self.now()) / 60_000:.0f} 分钟）" if ms > self.now() else "还没见到已发布的场次"
@@ -1561,5 +1612,7 @@ class Controller:
                 + ("\n股票卡暂停：" + "；".join(self.card_holds.values()) if self.card_holds else "")
                 + ("\n发布节奏（每 15 分钟一场；预计前后每秒扫一次）：" + "；".join(f"{key} 上次 {hms(at)}，下次预计 {hms(at + LISTING_CYCLE_MS)}" for key, at in sorted(self.listed_at.items()))
                    if self.listed_at else "")
-                + (f"\n没挂的已发布场次：" + "；".join(f"{k.rsplit('-', 1)[-1]} {v}" for k, v in list(self.skipped.items())[-3:]) if self.skipped else "") + "\n"
+                + (f"\n没挂的已发布场次：" + "；".join(f"{k.rsplit('-', 1)[-1]} {v}" for k, v in list(self.skipped.items())[-3:]) if self.skipped else "")
+                + (f"\n不再报价：{len(spent)} 档失败满 {MAX_ATTEMPTS} 次（单边没确认、一边被撤或过期），如 {named(spent)}" if spent else "")
+                + (f"\n不再报价：{len(refused)} 档被 Predict 拒绝（post-only 会吃单等），如 {named(refused)}" if refused else "") + "\n"
                 f"实测：{self.timing_line()}")

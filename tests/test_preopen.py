@@ -866,10 +866,12 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bigger.risk(), 2 * 0.49 * 20)  # the withdrawn pair released, the new one reserved
             self.assertIn("已记录 1 场、2 条（1 条挂着，1 条已结清）", bigger.status())
             self.assertIn("重新报价 1 场", bigger.status())
-            # the cap and Predict's own refusal
+            # the cap (the window's own failures: the settings change above was none of them — 1.131.6) and Predict's own refusal
+            self.assertTrue(pair.get("free") and not p.counts_against(pair))
             fresh["attempt"] = p.MAX_ATTEMPTS - 1
             await bigger.cancel_pair(fresh, "test")
-            self.assertTrue(fresh["accounted"] and not bigger.supersedable(fresh))
+            self.assertTrue(fresh["accounted"] and bigger.supersedable(fresh), "one failure: quoted again, whatever the salt's attempt")
+            self.assertFalse(bigger.supersedable(fresh, strikes=p.MAX_ATTEMPTS))
             fresh["attempt"] = 0
             self.assertTrue(bigger.supersedable(fresh))
             fresh["orders"]["up"]["state"] = "rejected"
@@ -979,10 +981,32 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queued["attempt"], 1, "not attempt 0 again: that salt is the withdrawn orders'")
         ctl.queued.discard(c["slug"])
         ctl.ledger.save({**gone, "slug": c["slug"] + "@2", "attempt": 2})
+        ctl.full_scan_ms = 0  # a full scan each time: the fixture lists this window alone (the windows before it unlisted would stop a quick scan)
         await ctl.discover()
-        self.assertEqual(ctl.queue.qsize(), 0, "three attempts made: not quoted again")
-        for key in (c["slug"] + "@0", c["slug"] + "@2"):
+        queued = ctl.queue.get_nowait()[2]  # 1.131.6: two failures — the attempt that left no record sent nothing, no failure of the window
+        self.assertEqual(queued["attempt"], 3, "quoted again, under a salt of its own")
+        ctl.queued.discard(c["slug"])
+        ctl.ledger.save({**gone, "slug": c["slug"] + "@3", "attempt": 3})
+        ctl.full_scan_ms = 0
+        await ctl.discover()
+        self.assertEqual(ctl.queue.qsize(), 0, "three failures: not quoted again")
+        self.assertIn("不再报价：1 档失败满 3 次", ctl.status())
+        for key in (c["slug"] + "@0", c["slug"] + "@2", c["slug"] + "@3"):
             ctl.ledger.delete(key)
+        # 1.131.6: withdrawals that were not the window's doing — a settings change, the mode stopped, LIVE paused, the stock
+        # guard — do not use its quotes up: five of them, and it is quoted again
+        for n, reason in enumerate(("设置不同，撤掉后重新报价", "预挂模式停止，撤销预挂单", "到时撤单或真实交易暂停", "SK 海力士 现价 129,000.00 距涨停 130,000.00 不足 2%")):
+            ctl.ledger.save({**gone, "slug": f"{c['slug']}@{n}", "attempt": n, "reason": reason})
+        ctl.ledger.save({**gone, "slug": f"{c['slug']}@4", "attempt": 4, "reason": "test", "free": True})
+        self.assertEqual(p.window_strikes(ctl.ledger.rows.values()), {})
+        ctl.full_scan_ms = 0
+        await ctl.discover()
+        queued = ctl.queue.get_nowait()[2]
+        self.assertEqual(queued["attempt"], 5)
+        ctl.queued.discard(c["slug"])
+        self.assertNotIn("不再报价", ctl.status())
+        for n in range(5):
+            ctl.ledger.delete(f"{c['slug']}@{n}")
         # Predict's deferred refusal (the record ends REJECTED with nothing filled): withdrawn, and not quoted again
         await ctl.place_pair(c)
         pair = ctl.ledger.rows[c["slug"]]
