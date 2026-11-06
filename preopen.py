@@ -645,6 +645,7 @@ class Controller:
         self.rescan_ms = 0  # when the known-listed windows were last re-read (reread_known: at the poll's pace, between listings)
         self.listing_deltas: collections.deque = collections.deque(maxlen=20)  # ms: each new listing's time against the expected moment (the last listing a cycle on)
         self.category_full: bool | None = None  # whether the category answers carried everything an order needs (no details read) — None until a listing was read
+        self.awaiting: dict[str, int] = {}  # card -> when its next window (beyond the known listing, not listed yet) entered the range: the sprint runs from then (1.133.1)
         self.parked: dict[str, tuple[int, dict]] = {}  # slug -> (retry_ms, candidate): held by hold() or the budget, placed again HOLD_RETRY_MS on, still queued
         self.full_scan_ms = 0  # discover: when the last full scan ran (FULL_SCAN_MS)
         self.keep_on_stop = False  # the owner's stop for a settings change: the orders stay on the book, the next controller takes them over
@@ -1084,9 +1085,12 @@ class Controller:
             if start > known_before.get(rolling.key, 0) and not (self.card_holds.get(rolling.key) and start - self.now() <= CARD_HOLD_NEAR_MS):
                 per_card.setdefault(rolling.key, []).append((rolling, start))
         st["probed"] = len(per_card)
+        for key in list(self.awaiting):
+            if key not in per_card:
+                self.awaiting.pop(key)  # nothing beyond the known listing in the range: nothing to wait for
 
         async def one_card(items: list[tuple[Any, int]]) -> None:
-            misses = 0
+            misses, first = 0, True
             for rolling, start in items:
                 if misses >= (MISS_STOP if full else 1) or st["stopped"]:
                     return
@@ -1104,9 +1108,14 @@ class Controller:
                     self.error = f"扫描 {st['stopped']}"
                     return  # this card's pass ends here (a 429, the cooldown, a timeout): what was found is queued, the rest read next time
                 if market is None:
+                    if first:  # the card's next window is in the range and not listed yet: Predict lists it about a minute on — the sprint (poll_wait)
+                        self.awaiting[rolling.key] = start - self.settings.ahead_minutes * 60_000
+                    first = False
                     misses += 1
                     continue
+                first = False
                 misses = 0
+                self.awaiting.pop(rolling.key, None)
                 self.note_listing(rolling, start, known_before)
                 self.enqueue(market, slug, wanted, attempts, st)
         await asyncio.gather(*(one_card(items) for items in per_card.values()))
@@ -1599,6 +1608,9 @@ class Controller:
             due = at + LISTING_CYCLE_MS
             if due - LISTING_EARLY_MS <= now <= due + LISTING_LATE_MS:
                 return FAST_POLL_S
+        for entered in self.awaiting.values():  # 1.133.1: a card's next window in the range and not listed yet — Predict lists it about a minute after it enters (11-06: 85 s), whatever the last listing's time
+            if 0 <= now - entered <= LISTING_LATE_MS:
+                return FAST_POLL_S
         return min(LISTING_PROBE_S, float(self.settings.poll))  # the listings probed every LISTING_PROBE_S; the older windows re-read at the poll's pace (discovery_loop)
 
     async def discovery_loop(self) -> None:
@@ -1809,7 +1821,9 @@ class Controller:
                 f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉且一份没成交的场次立即释放）"
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，按开场先后补挂中") if pairs_left else "")
                 + f"\n扫描：{self.scan_note or '还没扫过'}（发布探测每 {LISTING_PROBE_S:g} 秒，预计发布前后每 {FAST_POLL_S:g} 秒；"
-                + ("分类应答自带下单字段，发现即下单" if self.category_full else "分类应答不带下单字段，每场多读一次详情" if self.category_full is False else "还没读过发布") + "）"
+                + ("分类应答自带下单字段，发现即下单" if self.category_full else "分类应答不带下单字段，每场多读一次详情" if self.category_full is False else "还没读过发布")
+                + (f"；冲刺中：{'、'.join(sorted(k for k, t in self.awaiting.items() if 0 <= self.now() - t <= LISTING_LATE_MS))} 的下一场已进范围、等发布"
+                   if any(0 <= self.now() - t <= LISTING_LATE_MS for t in self.awaiting.values()) else "") + "）"
                 + f"\n最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
                 + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：不计入预挂限额，也不挡预挂" if self.unmanaged else "")

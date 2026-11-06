@@ -413,6 +413,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.calls), p.MISS_STOP)
         # 1.131.0: a new listing seen anchors the rhythm: the next is expected a cycle on, polled every second around that moment
         self.assertEqual((ctl.listed_at, ctl.poll_wait()), ({}, p.LISTING_PROBE_S))  # 1.133.0: the listings probed every 2 s
+        self.assertEqual(ctl.awaiting, {"BTC-15M": NOW + 60 * 60_000 - 1440 * 60_000}, "1.133.1: the 10:00 window entered the day's range yesterday, unlisted: no sprint for it")
         api.markets["4"] = market(at=NOW + 60 * 60_000, mid=4)
         await ctl.discover()
         seen = clock.ms
@@ -639,6 +640,12 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         api.calls.clear()
         await ctl.discover(probe_only=True)
         self.assertEqual([c for c in api.calls if c.startswith("/categories/")], [window_slug_of(NOW + 14 * 15 * 60_000)], "a probe-only pass: the listing alone")
+        self.assertEqual(ctl.awaiting, {"BTC-15M": NOW + 14 * 15 * 60_000 - 240 * 60_000}, "the next window entered the range half an hour ago, not listed: no sprint any more")
+        self.assertEqual(ctl.poll_wait(), p.LISTING_PROBE_S)
+        clock.ms = ctl.awaiting["BTC-15M"] + 60_000
+        self.assertEqual(ctl.poll_wait(), p.FAST_POLL_S, "a minute after it entered: sprinting")
+        self.assertIn("冲刺中：BTC-15M 的下一场已进范围", ctl.status())
+        clock.ms = NOW
         # the category answer carrying every field: placed on as it is, the details not read
         real = api.call
         async def full(method, path, **kw):
