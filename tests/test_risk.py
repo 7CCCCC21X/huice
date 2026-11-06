@@ -50,6 +50,16 @@ assert abs(worst + 155) < 1e-9 and event == "BTC 跌到 $60k", (worst, event)
 assert m.group_worst_case([pos("close", "up", 0.6), pos("close", "up", 0.7, shares=50)], "恒生指数（10-07）") == (-95.0, "恒生指数（10-07）收跌")
 assert m.group_worst_case([pos("updown", "down", 0.4)], "BTC") == (-40.0, "BTC 收涨")
 assert m.group_worst_case([pos("touch", "down", 0.45)], "BNB") == (-45.0, "BNB 先触高线")
+# 1.122.0: a first touch and a day's close are decided by different events — a path that touches the low line and then closes
+# above the open loses both; one move used to price the pair at the loss of one. Two days' closes likewise; one day's two sides hedge
+worst, event = m.group_worst_case([pos("touch", "up", 0.55, low=70000, high=90000), pos("close", "down", 0.55, target="2026-11-06")], "ETH")
+assert abs(worst + 110) < 1e-9 and event == "ETH 先触低线、ETH 收涨", (worst, event)
+worst, event = m.group_worst_case([pos("close", "up", 0.6, target="2026-11-05"), pos("close", "down", 0.6, target="2026-11-06")], "BTC")
+assert abs(worst + 120) < 1e-9 and event == "BTC 收跌、BTC 收涨", (worst, event)
+worst, event = m.group_worst_case([pos("close", "up", 0.6, target="2026-11-05"), pos("close", "down", 0.6, target="2026-11-05")], "BTC")
+assert abs(worst + 20) < 1e-9 and event == "BTC 收平", (worst, event)  # one event: hedged (every end loses the same 20; the flat end is named first)
+assert m.group_worst_case([pos("updown", "up", 0.6, end=1), pos("updown", "down", 0.6, end=2)], "BTC")[0] == -120.0 and m.event_of(pos("updown", "up", 0.6, end=1)) == ("updown", "", "1")
+assert m.group_worst_case([{**pos("close", "up", 0.6, target="2026-11-05"), "resting": True}, pos("close", "down", 0.7, target="2026-11-05")], "BTC") == (-70.0, "BTC 收涨"), "an unfilled order is no hedge"
 assert m.group_worst_case([pos("flip", "up", 0.3)], "HYPE/SOL") == (-30.0, "HYPE/SOL 没反超")
 assert m.scenario_result("close", {}, "flat", None) == 0.5 and m.scenario_result("flip", {}, "flat", None) == 0.0
 # 1.78.0: a path that touches a level on each side (up to one, then down to another) hurts the No positions on both: the

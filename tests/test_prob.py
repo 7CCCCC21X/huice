@@ -46,6 +46,17 @@ assert m.close_odds(*sse_args[:9], "", widen=1.5).sigma_note == "" and m.close_o
 # the model's error variants keep the day's multiplier (model_swing), so the error band is of the widened odds
 wide = m.close_odds(*sse_args[:3], sse.sigma_daily * m.MODEL_SIGMA_ERROR, *sse_args[4:], widen=sse.widen)
 assert abs(m.model_swing(sse) - abs(wide.fair_up - sse.fair_up)) < 1e-12 and m.model_swing(sse) > m.model_swing(plain)
+# 1.122.0: a proxy-mapped estimate's error is β and σ wrong together too — the corners of the error box, not each edge alone
+proxy = m.close_odds("KOSPI", D("4000"), D("4040"), 0.02, 0.8, dt.date(2026, 11, 6), D("0.01"), "r", "HL KR200 代理", "x", beta=0.8, mode="盘后")
+assert not proxy.direct and abs(proxy.move - math.log(4040 / 4000) / 0.8) < 1e-12
+corners = []
+for beta in (0.8 + m.MODEL_BETA_ERROR, 0.8 - m.MODEL_BETA_ERROR):
+    eff = D("4000") * D(str(math.exp(beta * proxy.move)))
+    for sigma in (0.02, 0.02 * m.MODEL_SIGMA_ERROR, 0.02 / m.MODEL_SIGMA_ERROR):
+        corners.append(m.close_odds("KOSPI", D("4000"), eff, sigma, 0.8, dt.date(2026, 11, 6), D("0.01"), "", "", "", widen=proxy.widen).fair_up)
+edges = [m.close_odds("KOSPI", D("4000"), D("4040"), 0.02 * f, 0.8, dt.date(2026, 11, 6), D("0.01"), "", "", "", widen=proxy.widen).fair_up for f in (m.MODEL_SIGMA_ERROR, 1 / m.MODEL_SIGMA_ERROR)]
+assert abs(m.model_swing(proxy) - max(abs(v - proxy.fair_up) for v in [*corners, *edges])) < 1e-12 and m.model_swing(proxy) > max(abs(v - proxy.fair_up) for v in edges)
+assert m.model_swing(proxy) > max(abs(corners[0] - proxy.fair_up), abs(corners[3] - proxy.fair_up)), "more than either β edge alone"
 frac, target = m.session_remaining("kr", kr(2026, 9, 25, 10, 0), dt.date(2026, 9, 24))
 assert target == dt.date(2026, 9, 25) and abs(frac - 330 / 390) < 1e-9, frac               # 09:00–15:30 = 390 min, 330 left
 frac, target = m.session_remaining("hk", bj(2026, 9, 25, 12, 30), dt.date(2026, 9, 24))
@@ -68,7 +79,19 @@ assert m.intraday_share([None] * 21, closes) is None and m.intraday_share(opens[
 assert m.intraday_share([None] + closes[1:], closes)[0] == m.INTRADAY_SHARE_BOUNDS[0]  # all gap, no session move: clamped
 book.record("X", closes, "指数日K", opens)
 full, _ = book.get("X", "sh"); part, note = book.get("X", "sh", intraday=True)
-assert abs(part - full * math.sqrt(share)) < 1e-12 and f"盘中取 {share * 100:.0f}% 方差（20 日开盘跳空已扣除）" in note, note
+# 1.122.0: the in-session σ straight from the open→close returns, blended with the prior's in-session part — not the day's σ cut
+# by the share (a gap taken back inside the session leaves the day's σ small and the session's large)
+body, nb = m.body_vol(opens, closes)
+assert nb == 20 and abs(body - math.log(1.02) / 2 * math.sqrt(20 / 19)) < 1e-9 and m.body_vol(opens[:5], closes[:5]) is None and m.body_vol([None] * 21, closes) is None
+prior_in = m.PRIOR_VOL["sh"] * math.sqrt(0.65)
+assert abs(part - math.sqrt((20 * body ** 2 + m.PRIOR_WEIGHT * prior_in ** 2) / (20 + m.PRIOR_WEIGHT))) < 1e-12 \
+    and f"指数日K 20 日开盘到收盘 {body * 100:.2f}% 与盘中先验 {prior_in * 100:.2f}% 加权（盘中直接估，不按份额扣跳空）" in note, note
+assert part < full * math.sqrt(share), "the day's σ here is the body and the gap together; the body alone is less"
+flipped = [D(100)] + [D(100 * (1.02 if i % 2 else 1)) for i in range(1, 21)]  # the same closes, but each day gaps the other way and takes it back: the day's σ unchanged…
+back_opens = [None] + [c_prev * c_prev / c for c_prev, c in zip(flipped, flipped[1:])]  # open = prev² / close: gap = −body (the close back where it was, in log terms twice over)
+book.record("X", flipped, "指数日K", back_opens)
+assert book.get("X", "sh", intraday=True)[0] > part, "…while the sessions moved twice as much: the body σ says so, the share formula would have cut it"
+book.record("X", closes, "指数日K", opens)
 book.record("X", closes, "指数日K"); part, note = book.get("X", "sh", intraday=True)  # no opens: the prior share (1.70.0), named as such
 assert abs(part - book.get("X", "sh")[0] * math.sqrt(0.65)) < 1e-12 and "盘中按先验取 65% 方差（开盘跳空历史不足，先验扣除）" in note, note
 book.shares["HSI"] = (0.64, 30); assert abs(book.get("HSI", "HSI", intraday=True)[0] - 0.012 * 0.8) < 1e-12  # manual σ too

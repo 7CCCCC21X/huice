@@ -1042,6 +1042,7 @@ async def run():
         await step(lbot, NOW + delay + 210_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + delay + 210_000))
         trimmed = next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")
         assert abs(trimmed["shares"] - 9.8) < 1e-9 and abs(trimmed["fee_shares"] - 0.2) < 1e-9 and trimmed["status"] == "filled", trimmed
+        assert abs(trimmed["price"] * 9.8 - (0.55 if by_record else 0.21) * 10) < 1e-4, ("1.122.0: the money spent is the same, over the shares held", trimmed["price"])
         assert any(e["what"].startswith("按 Predict 持仓校正份数：10 → 9.8（账户在这一边共持有 9.8 份，比记录的 10 份少 0.2 份") for e in trimmed["live"]["events"]), trimmed["live"]["events"]
         lfake.positions_rows[0]["amount"] = str(5 * WEI)
         for at in (NOW + delay + 280_000, NOW + delay + 350_000):
@@ -1093,6 +1094,37 @@ async def run():
     assert real["status"] == "filled" and abs(real["shares"] - 10) < 1e-9 and any("之前按最近结束的订单补记在 #102 上的 10 份已改到这里" in e["what"] for e in real["live"]["events"]), real
     await step(lbot, NOW + 13 * 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 13 * 60_000))  # explained: nothing more moves
     assert by_oid("102")["shares"] == 0 and abs(by_oid("101")["shares"] - 10) < 1e-9
+
+    # 1.122.0: a fill adopted onto a second order on the outcome is costed at what the position's average leaves once the other
+    # record's known cost is taken out — not at the average itself (orders at 55¢ and 25¢ average 40¢: the second is 25, not 40)
+    lbot, lfake, by_oid = await two_orders()
+    tid101, first = next((k, t) for k, t in lbot.sim_trades().items() if t["live"].get("order_id") == "101")
+    first.update(shares=5.0, status="filled", unfilled=95.0, fills=[{"at": NOW, "shares": 5.0, "fair": 0.7, "how": "真实成交（挂单）"}])  # #101 filled 5 at its 55¢, known
+    lbot.sim_save([(tid101, first)])
+    lfake.closed["101"]["amountFilled"] = str(5 * WEI)  # its record shows those 5 and no more; the other 5 held are #102's
+    lfake.positions_rows[0].update(avgPrice="0.40", updatedAt=NOW + 5_500)  # 10 held at 40¢ average, last changed while #102 rested
+    await step(lbot, NOW + 70_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 70_000))  # the position's time names #102: no wait
+    second = by_oid("102")
+    assert abs(by_oid("101")["shares"] - 5) < 1e-9 and "按持仓变动时间" in second["live"]["adopted"]["by"] and not second["live"]["adopted"]["guess"], second["live"]["adopted"]
+    assert abs(second["shares"] - 5) < 1e-9 and abs(second["price"] - 0.25) < 1e-9 and by_oid("101")["price"] == 0.55, (second["price"], by_oid("101")["price"])
+    assert any("成本按Predict 持仓均价 40.0¢ 扣掉其他记录的成本后 25.0¢ 记" in e["what"] for e in second["live"]["events"]), second["live"]["events"]
+    # 1.122.0: a record settled before its late fill was read still takes the fill — the money was spent, the day's loss counts it
+    sbot2 = make_bot(SIM_MAKER_MIN_BID="100", SIM_MAKER_EXIT_CENTS="5", SIM_MAKER_SESSION="on", SIM_WAYS="maker")
+    await sbot2.live_prepare(); sfake2 = sbot2.live.api
+    await sbot2.live_prefetch(NOW)
+    await step(sbot2, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    await sbot2.cmd_live(req("cancel", "all"))
+    stid, settled_rec = next((k, t) for k, t in sbot2.sim_trades().items() if t["live"].get("order_id") == "101")
+    settled_rec.update(status="settled", payout=0.0, settled=NOW + 1_000, note="结算：跌")
+    sbot2.sim_save([(stid, settled_rec)])
+    want2 = settled_rec["live"]["want"]
+    sfake2.positions_rows = [{"id": "p1", "market": {"id": 101, "title": "恒生指数"}, "outcome": {"name": want2["outcome"], "indexSet": want2["index_set"], "onChainId": want2["token"]},
+                             "amount": str(10 * WEI)}]
+    sfake2.closed["101"]["amountFilled"] = str(10 * WEI)
+    await step(sbot2, NOW + 70_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 70_000))
+    late2 = sbot2.sim_trades()[stid]
+    assert late2["status"] == "settled" and abs(late2["shares"] - 10) < 1e-9 and any(e["what"].startswith("结束后核对持仓：结束后再读订单记录，读到成交 10 份") for e in late2["live"]["events"]), late2
+    assert abs(sbot2.live_daily_pnl(sbot2.sim_trades(), NOW + 70_000) + 10 * 0.55) < 1e-9, "the loss on the 10 shares counts for the day's stop"
 
     # --- execution safety: reserved until Predict's final word, cancels confirmed, unknown results reconciled, the pre-send check
     sbot = make_bot(SIM_WAYS="both")
@@ -2118,7 +2150,14 @@ async def cancel_reads():
         await step(bot, NOW + 5_000, mkt(NOW + 5_000))
         t = next(t for k, t in bot.sim_trades().items() if k.startswith(tid))
         assert ("remove", [oid]) in fake.calls and t["live"]["state"] == "done" and t["shares"] == 20, (case, t["shares"], t["live"]["events"])
-        assert t["status"] == "filled" and t["unfilled"] == 80 and abs(bot.live_reserved(t) - 20 * 0.55) < 1e-9, (case, t["status"], bot.live_reserved(t))
+        # 1.122.0: the unfilled 80 stay reserved until the order's own record is read after the cancel (fills_pending): read ("lagging")
+        # it is released; not readable ("unknown") it stays, until a read or FILLS_PENDING_MAX_MS
+        pending = 80 * 0.55 if case == "unknown" else 0.0
+        assert t["status"] == "filled" and t["unfilled"] == 80 and abs(bot.live_reserved(t) - 20 * 0.55 - pending) < 1e-9, (case, t["status"], bot.live_reserved(t))
+        assert bool(t["live"].get("fills_pending")) == (case == "unknown") and m.sim_open_order(t) == (case == "unknown"), (case, t["live"].get("fills_pending"))
+        if case == "unknown":
+            t["live"]["fills_pending"] = time.time() * 1000 - m.FILLS_PENDING_MAX_MS - 1
+            assert abs(bot.live_reserved(t) - 20 * 0.55) < 1e-9 and not m.sim_open_order(t), "too old to hold: released"
     # "noop", gone from the open list, OPEN by its hash: asked again 30 s on, and once more each 30 s while that holds
     bot = make_bot(SIM_WAYS="maker")
     await bot.live_prepare(); fake = bot.live.api
@@ -2141,6 +2180,70 @@ async def cancel_reads():
 
 
 asyncio.run(cancel_reads())
+
+
+async def flush_rechecks():
+    """1.122.0: judged once more after the flush, right before the request — LIVE=off, a pause or the express lane's withdrawal
+    arriving while the hash was being written sends nothing: the saved hash is void, the record a failed attempt. The
+    strategy's scope (SIM_SKIP / SIM_WAYS / SIM_MARKETS) changed while an order waited for its sign-in voids it too; an
+    answer that the order already exists is "result unknown", not a refusal; an error answered with HTTP 200 is an error."""
+    tid = f"{HSI_SLUG}|up|吃"
+    sent = lambda bot: [c for c in bot.live.api.calls if c[0] == "create"]
+    to_thread = asyncio.to_thread
+    async def inline(fn, *a, **kw):  # the flush on this thread: what it does to the bot happens under the event loop
+        return fn(*a, **kw)
+    asyncio.to_thread = inline
+    try:
+        for case in ("off", "withdrawn", "clear"):
+            bot = make_bot(SIM_WAYS="taker")
+            await bot.live_prepare(); await bot.live_prefetch(NOW)
+            def flush(timeout=10.0, bot=bot, case=case):
+                if case == "off":
+                    bot.control_set({"LIVE": "off"})
+                elif case == "withdrawn":
+                    bot.sim_withdraw(bot.sim_trades()[tid], "测试撤单", NOW)
+                return True
+            bot.store.flush = flush
+            await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+            if case == "clear":
+                assert len(sent(bot)) == 1 and bot.sim_trades()[tid]["live"]["state"] == "open", bot.sim_trades()[tid]["live"]
+                continue
+            t = next(t for k, t in bot.sim_trades().items() if k.startswith(tid))
+            assert not sent(bot) and t["live"]["final"] == "failed" and t["live"]["hash"] == "" and t["status"] == "cancelled", (case, t["live"])
+            assert "发出前已撤单" in t["note"] or (case == "off" and "LIVE=off，不下单" in t["note"]), (case, t["note"])  # LIVE=off withdraws the pending record itself
+    finally:
+        asyncio.to_thread = to_thread
+    async def down(): raise m.RemoteError("HTTP 503: sign-in down")
+    async def up(): pass
+    for key, value in (("SIM_SKIP", "HSI"), ("SIM_WAYS", "maker"), ("SIM_MARKETS", "touch")):
+        bot = make_bot(SIM_WAYS="taker")
+        await bot.live_prepare(); await bot.live_prefetch(NOW)
+        bot.live.api.ensure_auth = down
+        await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+        assert bot.sim_trades()[tid]["live"]["state"] == "pending" and not sent(bot)
+        bot.live.api.ensure_auth = up
+        bot.control_set({key: value})
+        await step(bot, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000))
+        t = next(t for k, t in bot.sim_trades().items() if k.startswith(tid))
+        assert t["live"]["final"] == "failed" and not t["live"].get("order_id") and "策略范围已变" in t["note"], (key, t["live"]["final"], t.get("note"))
+        assert len(sent(bot)) == (1 if key == "SIM_WAYS" else 0), (key, len(sent(bot)))  # SIM_WAYS=maker: the step's own maker order goes out, the old taker decision does not
+    bot = make_bot(SIM_WAYS="taker")
+    await bot.live_prepare(); await bot.live_prefetch(NOW)
+    async def dup(body): raise L.OrderRejected("下单被拒绝：Order already exists")
+    bot.live.api.create_order = dup
+    await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    t = bot.sim_trades()[tid]
+    assert t["live"]["state"] == "placing" and t["live"]["hash"] and any("下单请求结果未知" in e["what"] for e in t["live"]["events"]), t["live"]
+    assert abs(bot.live_reserved(t) - 100 * bot.live_unit_cap(t)) < 1e-9, "nothing freed: the sync adopts the order by its hash"
+    try:
+        L.PredictApi.rows({"success": False, "error": "boom"}); assert False
+    except m.RemoteError as error:
+        assert "success=false" in str(error) and "boom" in str(error), error
+    assert L.PredictApi.rows({"success": True, "data": [{"id": 1}]}) == [{"id": 1}] and L.PredictApi.rows({"data": {"items": []}}) == []
+    print("FLUSH_RECHECKS_OK")
+
+
+asyncio.run(flush_rechecks())
 
 
 async def spent_slots():

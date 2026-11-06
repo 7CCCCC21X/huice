@@ -49,7 +49,11 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.121.0"
+VERSION = "1.122.0"
+if __name__ == "__main__":
+    # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
+    # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
+    sys.modules.setdefault("main", sys.modules[__name__])
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -958,8 +962,8 @@ class Store:
         self.conn.commit()
         self.touched: dict[str, int] = {}  # key family ("sim", "notice"...) -> how many writes it has seen: in-memory views check this
         self.lock = threading.Condition()
-        self.queue: list[tuple[int, list[tuple[str, str]]]] = []  # (version, rows) batches for the writer, oldest first
-        self.pending: dict[str, tuple[int, str]] = {}  # key -> (the version of its latest queued write, its JSON): read from here until committed
+        self.queue: list[tuple[int, list[tuple[str, str | None]]]] = []  # (version, rows) batches for the writer, oldest first; a None row deletes
+        self.pending: dict[str, tuple[int, str | None]] = {}  # key -> (the version of its latest queued write, its JSON; None = deleted): read from here until committed
         self.version = 0       # the last version queued
         self.written = 0       # the last version committed
         self.closing = False
@@ -980,7 +984,7 @@ class Store:
         with self.lock:
             queued = self.pending.get(key)
         if queued is not None:
-            return json.loads(queued[1])
+            return copy.deepcopy(default) if queued[1] is None else json.loads(queued[1])  # None: a delete not committed yet
         row = self.conn.execute("SELECT v FROM records WHERE k=?", (key,)).fetchone()
         return json.loads(row[0]) if row else copy.deepcopy(default)
 
@@ -993,11 +997,17 @@ class Store:
         """Several records in one transaction (one fsync instead of one per record): queued for the writer thread, or
         written here when the store has none (":memory:")."""
         rows = [(key, json.dumps(value, ensure_ascii=False)) for key, value in pairs]
-        if not rows:
-            return
+        if rows:
+            self._write(rows)
+
+    def _write(self, rows: list[tuple[str, str | None]]) -> None:
+        """A batch for the writer, in order: (key, JSON) upserts, (key, None) deletes — one transaction, read from the
+        overlay until committed (1.122.0: a delete or a move used to run on this thread after a flush whose failure it
+        ignored, so a put still queued could write the deleted record back once the writer recovered — a cancelled order
+        reappearing resting). Written here when the store has no writer (":memory:")."""
         if self.writer is None:
             with self.conn:
-                self.conn.executemany(self.UPSERT, rows)
+                self._apply(self.conn, rows)
         else:
             with self.lock:
                 self.version += 1
@@ -1008,14 +1018,26 @@ class Store:
         for key, _ in rows:
             self._bump(key)
 
-    def _overlay(self, prefix: str) -> dict[str, str]:
-        """The queued records under ``prefix``: key -> JSON."""
+    @classmethod
+    def _apply(cls, conn: sqlite3.Connection, rows: list[tuple[str, str | None]]) -> None:
+        """A batch on a connection (inside its transaction): per key the last row wins; the deletes, then the upserts."""
+        last: dict[str, str | None] = {}
+        for key, text in rows:
+            last[key] = text
+        if gone := [(k,) for k, v in last.items() if v is None]:
+            conn.executemany("DELETE FROM records WHERE k=?", gone)
+        if kept := [(k, v) for k, v in last.items() if v is not None]:
+            conn.executemany(cls.UPSERT, kept)
+
+    def _overlay(self, prefix: str) -> dict[str, str | None]:
+        """The queued records under ``prefix``: key -> JSON (None: queued for deletion)."""
         with self.lock:
             return {k: text for k, (_, text) in self.pending.items() if k.startswith(prefix)}
 
     def keys(self, prefix: str) -> list[str]:
         found = {k for (k,) in self.conn.execute("SELECT k FROM records WHERE k >= ? AND k < ?", self._bounds(prefix))}
-        found.update(self._overlay(prefix))
+        for k, text in self._overlay(prefix).items():
+            (found.add if text is not None else found.discard)(k)
         return sorted(found)
 
     @staticmethod
@@ -1025,38 +1047,32 @@ class Store:
 
     def items(self, prefix: str) -> list[tuple[str, Any]]:
         rows = dict(self.conn.execute("SELECT k, v FROM records WHERE k >= ? AND k < ?", self._bounds(prefix)))
-        rows.update(self._overlay(prefix))
+        for k, text in self._overlay(prefix).items():
+            if text is None:
+                rows.pop(k, None)
+            else:
+                rows[k] = text
         return [(k, json.loads(rows[k])) for k in sorted(rows)]
 
     def count(self, prefix: str) -> int:
         return len(self.keys(prefix))
 
     def delete_prefix(self, prefix: str) -> None:
-        self.flush()
-        with self.conn:
-            self.conn.execute("DELETE FROM records WHERE k >= ? AND k < ?", self._bounds(prefix))
+        if keys := self.keys(prefix):
+            self._write([(k, None) for k in keys])
         self._bump(prefix)
 
     def delete_keys(self, keys: list[str]) -> None:
         if keys:
-            self.flush()
-            with self.conn:
-                self.conn.executemany("DELETE FROM records WHERE k=?", [(k,) for k in keys])
-            for key in keys:
-                self._bump(key)
+            self._write([(k, None) for k in keys])
 
     def replace(self, keys: list[str], pairs: Any) -> None:
         """Delete ``keys`` and write ``pairs`` in one transaction: a record moved to another key is at no moment gone
-        from the database (two transactions left a crash in between with the record — a real position's — lost)."""
-        rows = [(key, json.dumps(value, ensure_ascii=False)) for key, value in pairs]
-        self.flush()
-        with self.conn:
-            if keys:
-                self.conn.executemany("DELETE FROM records WHERE k=?", [(k,) for k in keys])
-            if rows:
-                self.conn.executemany(self.UPSERT, rows)
-        for key in [*keys, *(key for key, _ in rows)]:
-            self._bump(key)
+        from the database (two transactions left a crash in between with the record — a real position's — lost). In the
+        writer's queue since 1.122.0, behind every put before it."""
+        rows: list[tuple[str, str | None]] = [(key, None) for key in keys] + [(key, json.dumps(value, ensure_ascii=False)) for key, value in pairs]
+        if rows:
+            self._write(rows)
 
     def write_loop(self) -> None:
         """The writer thread: every batch queued, in one transaction; a failure (the disk) is noted and the batch tried
@@ -1072,7 +1088,7 @@ class Store:
             through = batch[-1][0]
             try:
                 with self.writer_conn:  # type: ignore[union-attr]
-                    self.writer_conn.executemany(self.UPSERT, rows)  # type: ignore[union-attr]
+                    self._apply(self.writer_conn, rows)  # type: ignore[arg-type]
             except Exception as error:
                 with self.lock:
                     self.write_error = f"{type(error).__name__}: {str(error)[:80]}"
@@ -4309,13 +4325,17 @@ LOG_DRIFT_VARIANT = 0.0   # the other drift convention a touch model's error all
 
 def model_swing(odds: CloseOdds) -> float:
     """How far the fair 涨 price moves under plausible model error: σ ×/÷ 1.25 and, for an estimate mapped from a proxy,
-    β ± 0.25 (each varied alone). An edge smaller than this lies within the model's own error."""
+    β ± 0.25 — alone and together (1.122.0). An edge smaller than this lies within the model's own error."""
     def fair(effective: D, sigma: float) -> float:
         return close_odds(odds.name, odds.ref, effective, sigma, odds.remaining, odds.target, odds.tick, "", "", "", widen=odds.widen).fair_up
     variants = [fair(odds.effective, odds.sigma_daily * MODEL_SIGMA_ERROR), fair(odds.effective, odds.sigma_daily / MODEL_SIGMA_ERROR)]
     if not odds.direct:
         for beta in (odds.beta + MODEL_BETA_ERROR, max(0.05, odds.beta - MODEL_BETA_ERROR)):
-            variants.append(fair(odds.ref * D(str(math.exp(beta * odds.move))), odds.sigma_daily))
+            effective = odds.ref * D(str(math.exp(beta * odds.move)))
+            # 1.122.0: β and σ wrong together too — the corners of the error box, not each edge alone (a 69¢ fair price swung
+            # 4.5¢ on either alone and 9¢ on both)
+            variants += [fair(effective, odds.sigma_daily), fair(effective, odds.sigma_daily * MODEL_SIGMA_ERROR),
+                         fair(effective, odds.sigma_daily / MODEL_SIGMA_ERROR)]
     return max(abs(v - odds.fair_up) for v in variants)
 
 
@@ -4351,23 +4371,27 @@ def wilson(hits: float, n: float, z: float = 1.96) -> tuple[float, float]:
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
-def brier_scores(ps: list[float], hits: list[float]) -> tuple[float, float]:
-    """(Brier, log loss) of probabilities against outcomes (1, 0 or ½)."""
-    brier = sum((p - h) ** 2 for p, h in zip(ps, hits)) / len(ps)
-    loss = -sum(h * math.log(min(max(p, 1e-6), 1 - 1e-6)) + (1 - h) * math.log(min(max(1 - p, 1e-6), 1 - 1e-6))
-                for p, h in zip(ps, hits)) / len(ps)
+def brier_scores(ps: list[float], hits: list[float], weights: list[float] | None = None) -> tuple[float, float]:
+    """(Brier, log loss) of probabilities against outcomes (1, 0 or ½); with ``weights`` each row's share of the score."""
+    ws = weights if weights is not None else [1.0] * len(ps)
+    total = sum(ws)
+    brier = sum(w * (p - h) ** 2 for p, h, w in zip(ps, hits, ws)) / total
+    loss = -sum(w * (h * math.log(min(max(p, 1e-6), 1 - 1e-6)) + (1 - h) * math.log(min(max(1 - p, 1e-6), 1 - 1e-6)))
+                for p, h, w in zip(ps, hits, ws)) / total
     return brier, loss
 
 
-def market_baseline_line(rows: list[dict], unit: str = "日") -> str:
+def market_baseline_line(rows: list[dict], unit: str = "日", weight: Any = None) -> str:
     """The model against the Predict middle it was trading against, on the scored rows that saved one: Brier / log loss
-    of each, and how often the model was the closer of the two. "" without any. A model that does not beat the market
-    here has no edge to sell, whatever its own calibration says."""
+    of each, and how often the model was the closer of the two — each row at ``weight(row)`` (1.122.0: the all-market
+    report scores a market once, so its baseline must too; by snapshot, a market sampled often decided the comparison).
+    "" without any. A model that does not beat the market here has no edge to sell, whatever its own calibration says."""
     both = [r for r in rows if r.get("mkt") is not None]
     if not both:
         return ""
-    model, market = brier_scores([r["up"] for r in both], [r["hit"] for r in both]), brier_scores([r["mkt"] for r in both], [r["hit"] for r in both])
-    closer = sum(abs(r["up"] - r["hit"]) < abs(r["mkt"] - r["hit"]) - 1e-12 for r in both) / len(both)
+    ws = [float(weight(r)) if weight is not None else 1.0 for r in both]
+    model, market = brier_scores([r["up"] for r in both], [r["hit"] for r in both], ws), brier_scores([r["mkt"] for r in both], [r["hit"] for r in both], ws)
+    closer = sum(w for r, w in zip(both, ws) if abs(r["up"] - r["hit"]) < abs(r["mkt"] - r["hit"]) - 1e-12) / sum(ws)
     units = len({r.get("target") or r.get("market") for r in both})
     return (f"  对比 Predict 盘口中间价（{len(both)} 条/{units} {unit}）：模型 Brier {model[0]:.3f} / 对数损失 {model[1]:.3f}｜"
             f"市场 {market[0]:.3f} / {market[1]:.3f}｜模型更接近结果的占 {closer * 100:.0f}%"
@@ -4440,8 +4464,12 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
                     sigma = float(r.get("sigma_raw") or r["sigma"]) * math.sqrt(float(r["R"]))
                     if sigma <= 0:
                         continue
-                    base.append(norm_cdf(float(r.get("beta") or 1.0) * float(r.get("move") or 0.0) / sigma))
-                    scaled.append(norm_cdf(float(r.get("beta") or 1.0) * float(r.get("move") or 0.0) / (sigma * f_day)))
+                    # the distance to the reference as the page showed it (1.122.0: the Predict target price when the page used it —
+                    # the hit is judged on that reference, so the formula must stand on it too; β·move stood on the model's own)
+                    gap = (math.log(float(r["eff"]) / float(r["ref"])) if float(r.get("eff") or 0) > 0 and float(r.get("ref") or 0) > 0
+                           else float(r.get("beta") or 1.0) * float(r.get("move") or 0.0))
+                    base.append(norm_cdf(gap / sigma))
+                    scaled.append(norm_cdf(gap / (sigma * f_day)))
                     hits.append(r["hit"])
             if hits:
                 b0, b1 = brier_scores(base, hits), brier_scores(scaled, hits)
@@ -4616,6 +4644,32 @@ VOL_KEEP_SECONDS = 3 * 86400  # the bars saved in the store serve after a restar
 VOL_RETRY_SECONDS = 600       # a read of the bars that failed is tried again after this long, not after the refresh interval
 
 
+def sample_z(row: Mapping, raw: bool = False) -> float | None:
+    """A settled sample's standardised move: the end over the price at the sample, divided by the σ√τ priced then (the raw
+    σ with ``raw``: the calibration measures the estimate, not the factor on it) — what the sample forecast. 1.122.0: the
+    move from the window's line over a τ counted from the sample overstated the residual by √(window / τ): a daily crypto
+    sample at 12 hours left carried a day's move over half a day's σ, ×1.41 for a perfect σ; a 15-minute card's earliest
+    sample (14 minutes left) ×1.04. Without a price at the sample (an early row) the move from the line; None without σ√τ."""
+    sigma = float((row.get("sigma_raw") if raw else row.get("sigma")) or row.get("sigma") or 0)
+    scale = sigma * math.sqrt(float(row.get("tau") or 0))
+    if scale <= 0:
+        return None
+    price, final = float(row.get("price") or 0), float(row.get("final") or 0)
+    if price > 0 and final > 0:
+        return math.log(final / price) / scale
+    return float(row["move"]) / scale if row.get("move") is not None else None
+
+
+def body_vol(opens: list[D | None], closes: list[D]) -> tuple[float, int] | None:
+    """The in-session σ straight from ln(close / open) of the days that carry an open (the sample standard deviation),
+    and the days used; None under INTRADAY_SHARE_MIN_DAYS of them."""
+    rets = [math.log(float(c / o)) for o, c in zip(opens, closes) if o and c and o > 0 and c > 0]
+    if len(rets) < INTRADAY_SHARE_MIN_DAYS:
+        return None
+    mean = sum(rets) / len(rets)
+    return math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)), len(rets)
+
+
 def intraday_share(opens: list[D | None], closes: list[D]) -> tuple[float, int] | None:
     """Share of close-to-close variance that happens open→close: Σ ln(C/O)² / (Σ ln(O/C₋₁)² + Σ ln(C/O)²).
 
@@ -4646,6 +4700,7 @@ class VolBook:
         self.store = store
         self.estimates: dict[str, tuple[float, int, str]] = {}   # key -> (sigma, n, source)
         self.shares: dict[str, tuple[float, int]] = {}           # key -> (in-session share of daily variance, n)
+        self.bodies: dict[str, tuple[float, int]] = {}           # key -> (open-to-close σ, n): the in-session σ measured directly (1.122.0)
         self.refreshed: dict[str, float] = {}
         self.errors: dict[str, str] = {}                         # key -> why the last read of its bars failed (the figures in hand stand)
         self.calib: dict[tuple[str, str], tuple[float, int]] = {}  # (key, 盘中 / 盘后) -> (the σ factor, the days behind it): Bot.index_sigma_calibs
@@ -4664,6 +4719,11 @@ class VolBook:
             self.shares.pop(key, None)
         else:
             self.shares[key] = share
+        body = body_vol(opens, closes) if opens else None
+        if body is None:
+            self.bodies.pop(key, None)
+        else:
+            self.bodies[key] = body
         if save and self.store is not None:
             self.store.put(f"vol:{key}", {"closes": [str(c) for c in closes], "source": source, "at": time.time(),
                                           "opens": [str(o) if o is not None else None for o in opens] if opens else None})
@@ -4709,9 +4769,23 @@ class VolBook:
                 sigma = math.sqrt((n * est ** 2 + PRIOR_WEIGHT * prior ** 2) / (n + PRIOR_WEIGHT))
                 note = f"{source} {n} 日 {est * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
         factor, days = self.calib.get((key, "盘中" if intraday else "盘后"), (1.0, 0))
+        calib_note = ""
         if days and abs(factor - 1) > 0.005:  # SIGMA_CALIB (1.106.1): the snapshots' residuals said σ was off by this much
             sigma *= factor
-            note += f"；按 {days} 日快照残差校准 ×{factor:.2f}"
+            calib_note = f"；按 {days} 日快照残差校准 ×{factor:.2f}"
+        note += calib_note
+        body = self.bodies.get(key)
+        if intraday and key not in self.overrides and body is not None:
+            # 1.122.0: the in-session σ straight from the sessions' own open→close returns, blended with the prior's in-session part
+            # — not the day's σ cut by the in-session share: a gap taken back inside the session leaves the day's move small and
+            # the session's large, and the share formula knows nothing of how the gap and the session move together (SSE's
+            # 盘中 residuals ran 1.59 while its day σ looked right)
+            prior_in = PRIOR_VOL[prior_key] * math.sqrt(INTRADAY_SHARE_PRIOR.get(prior_key) or INTRADAY_SHARE_BOUNDS[1])
+            sigma_in = math.sqrt((body[1] * body[0] ** 2 + PRIOR_WEIGHT * prior_in ** 2) / (body[1] + PRIOR_WEIGHT))
+            if days and abs(factor - 1) > 0.005:
+                sigma_in *= factor
+            return sigma_in, (f"{self.estimates.get(key, (0.0, 0, ''))[2] or '日K'} {body[1]} 日开盘到收盘 {body[0] * 100:.2f}% 与盘中先验 "
+                              f"{prior_in * 100:.2f}% 加权（盘中直接估，不按份额扣跳空）{calib_note}")
         share = self.shares.get(key)
         if intraday and share is not None:
             return sigma * math.sqrt(share[0]), f"{note}；盘中取 {share[0] * 100:.0f}% 方差（{share[1]} 日开盘跳空已扣除）"
@@ -7826,7 +7900,9 @@ class IndexUpDownMarket(UpDownMarket):
         if at_ms <= self.index_ms or not price > 0:
             return False
         moved = price != self.price
-        self.index_ms, self.price, self.priced_ms, self.times["price"] = at_ms, price, now_ms, time.monotonic()
+        # 1.122.0: fresh as of its own event time, not of its arrival — a frame delivered minutes late (a stalled socket catching
+        # up) used to make a stale card look current and price again on an old index
+        self.index_ms, self.price, self.priced_ms, self.times["price"] = at_ms, price, min(now_ms, at_ms), time.monotonic()
         return moved
 
     def point(self, open_ms: int) -> str:
@@ -7865,7 +7941,7 @@ class IndexUpDownMarket(UpDownMarket):
         data = await self.get("premiumIndex", symbol=self.spec.symbol)
         at = int((data or {}).get("time") or now_ms)
         if at > self.index_ms:
-            self.index_ms, self.price, self.priced_ms = at, number(data["indexPrice"], f"{self.spec.symbol} 指数价"), now_ms
+            self.index_ms, self.price, self.priced_ms = at, number(data["indexPrice"], f"{self.spec.symbol} 指数价"), min(now_ms, at)
 
     async def read_vol(self, now_ms: int) -> None:
         """σ from the 1-minute index candles: the session's minutes alone when the windows follow one (the index stands still
@@ -9810,13 +9886,27 @@ def sim_in_flight(trade: Mapping) -> bool:
     return trade.get("status") == "resting" or (isinstance(st, dict) and st.get("state") in {"pending", "placing", "open", "cancelling", "unknown"})
 
 
+FILLS_PENDING_MAX_MS = 10 * 60_000  # fills_pending: a cancelled order's fills count as "not read yet" this long at most (a read that keeps failing must not reserve forever)
+
+
+def fills_pending(st: Mapping) -> bool:
+    """A real order Predict confirmed cancelled whose fills are not read back yet (live.py sets fills_pending, the wall
+    clock, until the read): the shares it may have filled just before the cancel stay counted by the caps and the
+    reservation (1.122.0: the cancel confirmed, the whole reservation was freed and the slot quoted again at once, the
+    fills read a moment later — 90 of 100 shares filled before the cancel had let a second full-size order through)."""
+    at = st.get("fills_pending") if isinstance(st, Mapping) else None
+    return bool(at) and time.time() * 1000 - float(at) < FILLS_PENDING_MAX_MS
+
+
 def sim_open_order(trade: Mapping) -> bool:
     """Whether a record's unfilled shares may still fill, for the caps that count them (SIM_GROUP_USD, the after-hours
-    share cap): resting — on paper or for real — or a real order withdrawn whose cancel Predict has not confirmed yet.
-    A withdrawal changes the record's status at once, but the order on Predict can fill until the cancel is confirmed:
-    its shares stay counted until then, as live_reserved keeps its money (1.83.0: a 100-share order being cancelled
-    let another 100 in under a 100-share cap). A settled or expired market's records hold nothing."""
-    return trade.get("status") == "resting" or (trade.get("status") in {"filled", "cancelled"} and sim_in_flight(trade))
+    share cap): resting — on paper or for real — or a real order withdrawn whose cancel Predict has not confirmed yet,
+    or confirmed but its fills not read back yet (fills_pending). A withdrawal changes the record's status at once, but
+    the order on Predict can fill until the cancel is confirmed: its shares stay counted until then, as live_reserved
+    keeps its money (1.83.0: a 100-share order being cancelled let another 100 in under a 100-share cap). A settled or
+    expired market's records hold nothing."""
+    return trade.get("status") == "resting" or (trade.get("status") in {"filled", "cancelled"}
+                                                and (sim_in_flight(trade) or fills_pending(trade.get("live") or {})))
 
 
 def sim_position(trade: Mapping) -> bool:
@@ -10165,34 +10255,60 @@ def path_text(name: str, kinds: set[str], legs: tuple) -> str:
     return f"{name}{leg(*legs[0])} 又{leg(*legs[1])}"
 
 
-def group_worst_case(positions: list[dict], name: str = "") -> tuple[float, str]:
-    """(P&L, the move) of one driver's positions under the path that hurts them most. Candidates: the driver moves up
-    to each upward level (or past all), down to each downward level (or past all), does neither — and, where it has
-    levels on both sides, up to one then down to another (and the reverse): both touched, No positions on both lose
-    together (the single moves alone priced that pair at the loss of one). Three No positions at $300M / $500M / $1B
-    lose together on the move past $1B: that is the number to limit, not the count of markets. ``positions``: dicts
-    with kind, side, settle, price and shares; one flagged ``resting`` (an order not filled) counts only where it loses:
-    an unfilled order is no hedge."""
-    kinds = {str(p.get("kind") or "") for p in positions}
-    up_levels = sorted({float(p["settle"].get("target") or 0) for p in positions
-                        if p.get("kind") == "ladder" or (p.get("kind") == "range" and (p.get("settle") or {}).get("dir", "up") == "up")})
-    down_levels = sorted({float(p["settle"].get("target") or 0) for p in positions
-                          if p.get("kind") == "range" and (p.get("settle") or {}).get("dir", "up") == "down"}, reverse=True)
-    ups, downs = [*(("up", t) for t in up_levels), ("up", None)], [*(("down", t) for t in down_levels), ("down", None)]
-    scenarios: list[tuple] = [(("flat", None),), *((u,) for u in ups), *((d,) for d in downs)]
-    if up_levels and down_levels:
-        scenarios += [(u, d) for u in ups for d in downs] + [(d, u) for u in ups for d in downs]
+PATH_KINDS = {"range", "ladder", "touch"}  # the kinds one price path decides together; a close, a window, a flip are each decided by their own end
 
-    def pnl(legs: tuple) -> float:
-        total = 0.0
-        for p in positions:
-            up = path_result(str(p.get("kind") or ""), p.get("settle") or {}, legs)
-            payout = up if p.get("side") == "up" else 1 - up
-            gain = (payout - float(p["price"])) * float(p["shares"])
-            total += min(0.0, gain) if p.get("resting") else gain
-        return total
-    worst = min(scenarios, key=lambda s: (round(pnl(s), 6), len(s), s[-1][1] is None))  # a single move, a level reached, when as bad
-    return pnl(worst), path_text(name, kinds, worst)
+
+def event_of(p: Mapping) -> tuple:
+    """The settlement event an end-decided position belongs to: positions of one event hedge each other (the two sides of
+    one day's close), positions of different events do not (1.122.0: ETH 先触高线 and ETH 当天收跌 were hedged as if one
+    move decided both — a path that touches the low line and then closes above the open loses both)."""
+    settle = p.get("settle") or {}
+    return (str(p.get("kind") or ""), str(settle.get("key") or ""),
+            str(settle.get("target") or settle.get("end") or settle.get("deadline") or settle.get("day") or ""))
+
+
+def group_worst_case(positions: list[dict], name: str = "") -> tuple[float, str]:
+    """(P&L, the move) of one driver's positions under what hurts them most. The path-decided positions (a price ladder,
+    a range level, a first touch: PATH_KINDS) under one path: up to each upward level (or past all), down to each
+    downward level (or past all), neither — and, with levels on both sides, up to one then down to another (and the
+    reverse): both touched, No positions on both lose together (the single moves alone priced that pair at the loss of
+    one). Three No positions at $300M / $500M / $1B lose together on the move past $1B: that is the number to limit, not
+    the count of markets. The end-decided positions (a close, a window, a flip) each settlement event (event_of) at its
+    own worst end — up, down or flat — added up: one day's two sides hedge each other, two days, or a close and a touch,
+    do not, whatever one move would do to both (1.122.0). ``positions``: dicts with kind, side, settle, price and
+    shares; one flagged ``resting`` (an order not filled) counts only where it loses: an unfilled order is no hedge."""
+    def gain(p: dict, up: float) -> float:
+        payout = up if p.get("side") == "up" else 1 - up
+        g = (payout - float(p["price"])) * float(p["shares"])
+        return min(0.0, g) if p.get("resting") else g
+
+    paths = [p for p in positions if str(p.get("kind") or "") in PATH_KINDS]
+    kinds = {str(p.get("kind") or "") for p in paths}
+    total, parts = 0.0, []
+    if paths:
+        up_levels = sorted({float(p["settle"].get("target") or 0) for p in paths
+                            if p.get("kind") == "ladder" or (p.get("kind") == "range" and (p.get("settle") or {}).get("dir", "up") == "up")})
+        down_levels = sorted({float(p["settle"].get("target") or 0) for p in paths
+                              if p.get("kind") == "range" and (p.get("settle") or {}).get("dir", "up") == "down"}, reverse=True)
+        ups, downs = [*(("up", t) for t in up_levels), ("up", None)], [*(("down", t) for t in down_levels), ("down", None)]
+        scenarios: list[tuple] = [(("flat", None),), *((u,) for u in ups), *((d,) for d in downs)]
+        if up_levels and down_levels:
+            scenarios += [(u, d) for u in ups for d in downs] + [(d, u) for u in ups for d in downs]
+        pnl = lambda legs: sum(gain(p, path_result(str(p.get("kind") or ""), p.get("settle") or {}, legs)) for p in paths)
+        worst = min(scenarios, key=lambda sc: (round(pnl(sc), 6), len(sc), sc[-1][1] is None))  # a single move, a level reached, when as bad
+        total += pnl(worst)
+        parts.append(path_text(name, kinds, worst))
+    events: dict[tuple, list[dict]] = {}
+    for p in positions:
+        if str(p.get("kind") or "") not in PATH_KINDS:
+            events.setdefault(event_of(p), []).append(p)
+    for group in events.values():
+        kind = str(group[0].get("kind") or "")
+        pnls = {d: sum(gain(p, scenario_result(kind, p.get("settle") or {}, d, None)) for p in group) for d in ("flat", "up", "down")}
+        direction = min(pnls, key=lambda d: round(pnls[d], 6))  # the first of flat, up, down when as bad
+        total += pnls[direction]
+        parts.append(scenario_text(name, {kind}, direction, None))
+    return total, "、".join(dict.fromkeys(parts)) if parts else scenario_text(name, kinds, "flat", None)
 
 
 def sim_positions(trades: list[dict]) -> list[dict]:
@@ -14666,7 +14782,7 @@ class Bot:
             slug = str(r.get("slug"))
             if slug not in firsts or int(r.get("left") or 0) > int(firsts[slug].get("left") or 0):
                 firsts[slug] = r
-        zs = [r["move"] / (float(r["sigma_raw"]) * math.sqrt(float(r["tau"]))) for r in firsts.values() if float(r["sigma_raw"]) * math.sqrt(float(r["tau"])) > 0]
+        zs = [z for z in (sample_z(r, raw=True) for r in firsts.values()) if z is not None]
         n = len(zs)
         factor = math.sqrt((sum(z * z for z in zs) + self.SIGMA_CALIB_PRIOR) / (n + self.SIGMA_CALIB_PRIOR)) if n else 1.0
         low, high = self.SIGMA_CALIB_RANGE
@@ -14755,7 +14871,7 @@ class Bot:
             for r in items:
                 if r.get("move") is not None and r.get("sigma") and r.get("tau") and (r["slug"] not in firsts or r["left"] > firsts[r["slug"]]["left"]):
                     firsts[r["slug"]] = r
-            zs = [(r, r["move"] / (r["sigma"] * math.sqrt(r["tau"]))) for r in firsts.values() if r["sigma"] * math.sqrt(r["tau"]) > 0]
+            zs = [(r, z) for r, z in ((r, sample_z(r)) for r in firsts.values()) if z is not None]
             if zs:
                 rms = math.sqrt(sum(z * z for _, z in zs) / len(zs))
                 lines.append(f"    波动：{len(zs)} 个市场，实际 / 预测（RMS z）{rms:.2f}（σ 刚好是 1.00，大于 1 是 σ 偏小），"
@@ -15068,7 +15184,7 @@ class Bot:
             total = sum(weight(r) for r in scored)
             brier = sum(weight(r) * (r["up"] - r["hit"]) ** 2 for r in scored) / total
             lines.append(f"  {name}：{len(per_market)} 个市场已出结果（{len(scored)} 条，共 {markets} 个市场）：模型 Brier {brier:.3f}（抛硬币 0.250）")
-            baseline = market_baseline_line(scored, "个市场")
+            baseline = market_baseline_line(scored, "个市场", weight)  # the same weight the model's score above uses (1.122.0)
             if baseline:
                 lines.append("  " + baseline.strip())
         return lines
@@ -16635,8 +16751,8 @@ class Bot:
                 continue
             price = float(t.get("price") or 0)
             total += price * float(t.get("shares") or 0)
-            if unfilled:
-                total += price * max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0)
+            if unfilled:  # 1.122.0: the unfilled part at what it may still cost (a real taker's limit plus the fee: sim_resting_cost), not the quote's average
+                total += self.sim_resting_cost(t) * max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0)
         return total
 
     def sim_window_usd_room(self, trades: Mapping, mk: SimMarket, price: float) -> tuple[float, str]:
@@ -21067,6 +21183,8 @@ class Bot:
                 self.window_resolve(mkt, old, final)  # the samples of the market just over get its result
             mkt.spec = spec
             mkt.times["candle"] = -1e9
+            if isinstance(mkt, IndexUpDownMarket):  # 1.122.0: the start price Predict showed was the old window's; within 0.1% of the new
+                mkt.strike, mkt.times["strike"] = None, -1e9  # candle it would have priced the new window on the old line until the next refresh
             if final is not None and spec.start_ms == old.end_ms and mkt.close_of("start") is None:
                 # the new market's line is the very candle that just settled the old one: kept at once, not read again
                 self.store.put(f"updown:{spec.slug}:start", {"open": spec.start_ms, "close": str(final), "read_ms": now_ms, "from": old.slug})

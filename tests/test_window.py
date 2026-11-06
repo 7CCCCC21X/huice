@@ -112,6 +112,12 @@ try:
 except ValueError as error:
     assert str(error) == "15 分钟 K 线价格无效"
 assert (m.SHAPE_DAYS, m.SHAPE_MIN_CANDLES, m.SHAPE_PRIOR, m.SHAPE_FACTOR_BOUNDS, m.IndexUpDownMarket.SHAPE_SECONDS, m.IndexUpDownMarket.SHAPE_ROWS, m.SpotWindowMarket.SHAPE_ROWS) == (14, 96, 8, (0.4, 2.5), 3600, 1500, 1000)
+# 1.122.0: a pushed or read index is as fresh as its own event time — a frame delivered minutes late (a stalled socket catching up)
+# used to make the card look current and price again on an old index
+_late = m.IndexUpDownMarket(m.Store(":memory:"), W.current(T0), None, "sh", m.session_minute_fn("sh"))
+assert _late.push_index(D("90"), T0 - 599_000, T0) and _late.priced_ms == T0 - 599_000 and T0 - _late.priced_ms > _late.PRICE_STALE_MS and not _late.push_index(D("91"), T0 - 600_000, T0)
+assert _late.push_index(D("90.5"), T0 - 1_000, T0) and _late.priced_ms == T0 - 1_000 and T0 - _late.priced_ms <= _late.PRICE_STALE_MS
+assert _late.push_index(D("90.6"), T0 + 5_000, T0) and _late.priced_ms == T0, "an event time ahead of the bot's clock counts as now"
 # 1.106.1: the daily crypto cards' hourly σ weighs the last five days about half — a month of calm does not price a week that moves
 hourly = lambda closes, end: [[end - (len(closes) - i) * 3600_000, c, c, c, c, "0", end - (len(closes) - i) * 3600_000 + 3599_999, "0", 0, "0", "0", "0"]
                               for i, c in enumerate(closes)]
@@ -697,7 +703,10 @@ async def samples():
     fm.index[T1 - 60_000] = "90.2000"
     fm.now = bot.market.now = T1 + 2_000
     card.times["candle"] = -1e9
+    card.strike = D("90.1900")  # 1.122.0: Predict's start price of the window just over — within 0.1% of the next window's candle (90.20)
     await bot.refresh_updown(T1 + 2_000)
+    assert card.spec.start_ms == T1 - 60_000 and card.strike is None and card.times["strike"] == -1e9, "the roll drops the old window's start price"
+    assert card.line_used() == D("90.2000"), "the new window prices on its own candle, not on the old window's start price"
     rows = [r for r in bot.window_rows() if r["slug"] == spec.slug]
     assert [r["result"] for r in rows] == [1.0, 1.0, 1.0] and all(abs(r["move"] - math.log(90.2 / 90.0)) < 1e-12 and r["final"] == 90.2 for r in rows)
     report = "\n".join(bot.window_report())
@@ -722,7 +731,9 @@ async def samples():
                                              "left": 840, "up": 0.6, "sigma": 0.5, "sigma_raw": 0.5, "model": 2, "tau": 2.7e-5, "line": 100.0, "move": 3 * st, "result": 1.0, "final": 101.0})
     bot.sigma_calib_cache.clear()
     real = store.get(f"wsample:{spec.slug}:840")  # the window sampled above has its result too: the eleventh
-    z_real = real["move"] / (real["sigma_raw"] * math.sqrt(real["tau"]))
+    z_real = math.log(real["final"] / real["price"]) / (real["sigma_raw"] * math.sqrt(real["tau"]))  # 1.122.0: the end over the price at the sample
+    assert abs(m.sample_z(real, raw=True) - z_real) < 1e-12 and m.sample_z({"sigma": 0.5, "tau": 2.7e-5, "move": 0.001}) == 0.001 / (0.5 * math.sqrt(2.7e-5)) \
+        and m.sample_z({"sigma": 0.0, "tau": 1.0, "move": 0.1}) is None and m.sample_z({"sigma": 0.5, "tau": 1.0}) is None
     factor, n = bot.sigma_calib("UNITREE-15M")
     assert n == 11 and abs(factor - math.sqrt((10 * 0.25 + z_real ** 2 + 10) / 21)) < 1e-9 and bot.sigma_calib("UNITREE-15M") == (factor, 11), (factor, n, z_real)
     assert (bot.SIGMA_CALIB_PRIOR, bot.SIGMA_CALIB_RANGE) == (10, (0.5, 2.0))
