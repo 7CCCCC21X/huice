@@ -1,6 +1,6 @@
 # TG 合约昨收偏离提醒机器人
 
-新增可选的 [15分钟市场发布即预挂模式](PREOPEN.md)：15 分钟场次一经扫描发现（默认只挂 BTC，`PREOPEN_MARKETS=all` 三张都挂；只挂 `PREOPEN_AHEAD_MINUTES` 内开始的、最近的先），两边 `PREOPEN_PRICE_CENTS`（默认 49¢）各 `PREOPEN_SHARES`（默认 10）份的 post-only 买单，每场提前 60 秒撤单、提前 30 秒到期。`PREOPEN_15M=off` 默认关闭；开之前先 `/preopen probe` 只读探测市场列表。
+新增可选的 [15分钟市场发布即预挂模式](PREOPEN.md)：15 分钟场次一经扫描发现（默认只挂 BTC，`PREOPEN_MARKETS=all` 三张都挂；只挂 `PREOPEN_AHEAD_MINUTES` 内开始的、最近的先），两边 `PREOPEN_PRICE_CENTS`（默认 49¢）各 `PREOPEN_SHARES`（默认 10）份的 post-only 买单，每场提前 60 秒撤单、提前 30 秒到期。`PREOPEN_15M=off` 默认关闭；开之前先 `/preopen probe` 只读探测市场列表；开关和参数也可在控制台“开盘前预挂”一组里改，即时生效（1.124.0）。
 
 监控截图里的四个币安合约：**UNITREEUSDT、HK0625USDT、CXMTUSDT、SKHYNIXUSDT**。
 

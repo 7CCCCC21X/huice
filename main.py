@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.123.0"
+VERSION = "1.124.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -492,6 +492,76 @@ BASELINE_MODES = {
 # Settings the control page (/p/<token>/control) may change while the bot runs: (variable, label, hint). A change is
 # saved as the variable's text (control:env), re-read through Config.from_env on top of the environment (the same
 # validation and wording as at start-up), and applied at once; it survives restarts until cleared.
+PREOPEN_MIN_SIDE_USD = 1.0  # Predict refuses an order worth under about a dollar (live.MIN_ORDER_USD): a pre-open side must reach it
+
+
+@dataclasses.dataclass(frozen=True)
+class PreopenSettings:
+    """The pre-open quoting mode's settings (preopen.py), read with the rest of Config from the environment and the control
+    page's saved values: PREOPEN_15M switches it, the others size it. Validated when on; read leniently when off (a bad
+    value keeps neither the bot from starting nor the page from showing what would apply; switching on then fails there)."""
+    enabled: bool = False
+    poll: float = 5.0
+    cancel_seconds: int = 20   # PREOPEN_CANCEL_SECONDS: the cancel goes out this long before the window's start
+    expiry_seconds: int = 10   # PREOPEN_EXPIRY_SECONDS: the signed order expires this long before the start (the backstop when the cancel fails)
+    entry_seconds: int = 180   # PREOPEN_ENTRY_SECONDS: no new pair this close to the start
+    ahead_minutes: int = 60    # PREOPEN_AHEAD_MINUTES: only windows starting within this are placed, the soonest first
+    max_open_usd: float = 7000.0
+    price: D = D("0.49")       # PREOPEN_PRICE_CENTS
+    shares: D = D("10")        # PREOPEN_SHARES: the trial size; 50 was the first revision's
+    markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = the three cards
+    db: str = ""
+
+    @property
+    def side_usd(self) -> float:
+        return float(self.price * self.shares)
+
+    @property
+    def pair_usd(self) -> float:
+        return 2 * self.side_usd
+
+    @staticmethod
+    def db_of(e: Mapping) -> str:
+        state = str(e.get("STATE_DB", "./data/bot.sqlite3"))
+        return str(e.get("PREOPEN_DB") or (":memory:" if state == ":memory:" else str(Path(state).with_suffix(".preopen.sqlite3"))))
+
+    @classmethod
+    def from_env(cls, e: Mapping, force: bool = False) -> "PreopenSettings":
+        """The settings in ``e``; while PREOPEN_15M is off a value that does not parse leaves the defaults (``force``: raise)."""
+        enabled = str(e.get("PREOPEN_15M", "off")).strip().lower() == "on"
+        try:
+            return cls.parse(e, enabled)
+        except ValueError:
+            if enabled or force:
+                raise
+            return cls(db=cls.db_of(e))
+
+    @classmethod
+    def parse(cls, e: Mapping, enabled: bool) -> "PreopenSettings":
+        poll = float(e.get("PREOPEN_POLL_SECONDS", "5"))
+        cap = float(e.get("PREOPEN_MAX_OPEN_USD", "7000"))
+        cents, shares, ahead = int(e.get("PREOPEN_PRICE_CENTS", "49")), int(e.get("PREOPEN_SHARES", "10")), int(e.get("PREOPEN_AHEAD_MINUTES", "60"))
+        cancel, expiry, entry = int(e.get("PREOPEN_CANCEL_SECONDS", "20")), int(e.get("PREOPEN_EXPIRY_SECONDS", "10")), int(e.get("PREOPEN_ENTRY_SECONDS", "180"))
+        stems = {r.stem.lower(): r.key for r in WINDOW_UPDOWN_MARKETS}
+        keys = frozenset(stems.values())
+        wanted = [w.strip() for w in str(e.get("PREOPEN_MARKETS", "btc")).split(",") if w.strip()] or ["btc"]
+        markets = keys if any(w.lower() == "all" for w in wanted) else frozenset(stems.get(w.lower(), w.upper()) for w in wanted)
+        price = D(cents) / 100
+        if (not 1 <= poll <= 60 or not 1 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
+                or not 3 <= ahead <= 1440 or not markets <= keys or float(price * shares) < PREOPEN_MIN_SIDE_USD
+                or not 5 <= expiry <= 600 or not expiry + 5 <= cancel <= 900 or not cancel + 60 <= entry <= 3600):
+            raise ValueError("PREOPEN_POLL_SECONDS 1～60、PREOPEN_MAX_OPEN_USD 1～1000000、PREOPEN_PRICE_CENTS 1～50、PREOPEN_SHARES 1～500（每边不少于 "
+                             f"Predict 最小订单 ${PREOPEN_MIN_SIDE_USD:g}）、PREOPEN_AHEAD_MINUTES 3～1440、PREOPEN_MARKETS 只能是 {'、'.join(sorted(keys))} 或 all；"
+                             "PREOPEN_EXPIRY_SECONDS 5～600，PREOPEN_CANCEL_SECONDS 至少比它大 5 秒、至多 900，PREOPEN_ENTRY_SECONDS 至少比撤单时间大 60 秒、至多 3600")
+        return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
+                   price=price, shares=D(shares), markets=markets, db=cls.db_of(e))
+
+    @classmethod
+    def from_config(cls, config: "Config", force: bool = False) -> "PreopenSettings":
+        """The settings in force — the control page's saved values included: Config carries them."""
+        return config.preopen
+
+
 CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE", "真实交易模式", "off 只记账 / pause 登录 Predict、可自检和挂单测试、不开新仓 / on 真实下单（pause、on 需要已配置 PREDICT_PRIVATE_KEY）"),
     ("SIM_EDGE_CENTS", "触发买入的净优势（¢/份）", "0.5～50"),
@@ -562,6 +632,15 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_TAKER_RETRY_SECONDS", "吃单没成交后回避（秒）", "1～3600：吃单一份没成交（到时撤掉、公平价变了撤掉）或发送前复核作废之后，同一市场同一边多久内不再吃单；机会还在就按这个短间隔再试"),
     ("LIVE_AUTO_REDEEM", "自动领取已结算持仓", "开 = 市场结算后自动在链上领取赢的一边（签名钱包需有 BNB 付 gas）"),
     ("LIVE_NOTIFY", "真实订单的 Telegram 通知", "开 = 真实下单、成交、撤单、失败都发 Telegram 通知"),
+    ("PREOPEN_15M", "开盘前预挂（15 分钟市场）", "开 = 15 分钟场次一发布就在涨跌两边各挂一张 post-only 买单，开场前撤掉（PREOPEN.md）；需要 LIVE=on；运行时普通模型策略不开新仓。改动即时生效：开就启动，关就撤单停下，改参数先撤单再按新参数重启"),
+    ("PREOPEN_MARKETS", "预挂哪几张卡", "btc = 只挂 BTC（默认）；all = BTC、海力士、宇树三张"),
+    ("PREOPEN_SHARES", "预挂每边份数", "1～500：每场每边各挂这么多份（默认 10），每边不少于 $1"),
+    ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
+    ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：更晚的场次等下一轮扫描，最近的先挂（默认 60）"),
+    ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
+    ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）"),
+    ("PREOPEN_ENTRY_SECONDS", "距开场不足几秒不再新挂", "至少比撤单时间多 60 秒、至多 3600（默认 180）"),
+    ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "1～1000000：和持仓+挂单上限取较小值；每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
 # One-click combinations for the control page (一键搭配): the strategy settings only. What to trade (SIM_MARKETS, SIM_SKIP),
@@ -740,6 +819,7 @@ class Config:
     live_notify: bool = True           # LIVE_NOTIFY: Telegram lines for orders, fills and failures
     web_control_key: str = field(default="", repr=False)  # WEB_CONTROL_KEY: the control page's secret; "" = the page is read-only
     env: dict = field(default_factory=dict, repr=False, compare=False)  # the variables this was read from (runtime changes re-read it)
+    preopen: PreopenSettings = field(default_factory=PreopenSettings)  # the pre-open quoting mode (preopen.py), the control page's values included
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -819,7 +899,7 @@ class Config:
         return cls(
             token=e.get("TELEGRAM_BOT_TOKEN", "").strip(),
             admin_id=bounded_int(e, "ADMIN_USER_ID", 0, 0, 10**15),
-            symbols=symbols, db_path=e.get("STATE_DB", "./data/bot.sqlite3"),
+            symbols=symbols, db_path=e.get("STATE_DB", "./data/bot.sqlite3"), preopen=PreopenSettings.from_env(e),
             threshold=threshold,
             cooldown=bounded_int(e, "ALERT_COOLDOWN_SECONDS", 300, 0, 86400),
             poll=bounded_int(e, "POLL_SECONDS", 5, 3, 3600),
@@ -1035,8 +1115,11 @@ class Store:
             return {k: text for k, (_, text) in self.pending.items() if k.startswith(prefix)}
 
     def keys(self, prefix: str) -> list[str]:
+        # the overlay first, then the table: a write committed between the two reads is in the overlay snapshot (the other order
+        # could miss a put, or show a deleted record, for the moment between the table read and the writer clearing the queue)
+        overlay = self._overlay(prefix)
         found = {k for (k,) in self.conn.execute("SELECT k FROM records WHERE k >= ? AND k < ?", self._bounds(prefix))}
-        for k, text in self._overlay(prefix).items():
+        for k, text in overlay.items():
             (found.add if text is not None else found.discard)(k)
         return sorted(found)
 
@@ -1046,8 +1129,9 @@ class Store:
         return prefix, (prefix[:-1] + chr(ord(prefix[-1]) + 1)) if prefix else "\U0010ffff"
 
     def items(self, prefix: str) -> list[tuple[str, Any]]:
+        overlay = self._overlay(prefix)  # before the table read (keys)
         rows = dict(self.conn.execute("SELECT k, v FROM records WHERE k >= ? AND k < ?", self._bounds(prefix)))
-        for k, text in self._overlay(prefix).items():
+        for k, text in overlay.items():
             if text is None:
                 rows.pop(k, None)
             else:
@@ -9795,6 +9879,15 @@ SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": 
 # a value Config.from_env accepts (tests/test_control.py checks).
 CONTROL_FORMS: dict[str, dict] = {
     "LIVE": {"kind": "choice", "group": "策略", "options": [["off", "off 只记账"], ["pause", "pause 登录不开仓"], ["on", "on 真实下单"]]},
+    "PREOPEN_15M": {"kind": "choice", "group": "预挂", "options": [["off", "off 关"], ["on", "on 开（需要 LIVE=on）"]]},
+    "PREOPEN_MARKETS": {"kind": "choice", "group": "预挂", "options": [["btc", "只挂 BTC"], ["skhynix", "只挂海力士"], ["unitree", "只挂宇树"], ["btc,skhynix", "BTC 和海力士"], ["all", "三张都挂"]]},
+    "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
+    "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},
+    "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["15", "30", "60", "120", "240"], "unit": "分钟"},
+    "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "15", "20", "30", "60"], "unit": "秒"},
+    "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["5", "10", "15", "30"], "unit": "秒"},
+    "PREOPEN_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["90", "120", "180", "300"], "unit": "秒"},
+    "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["50", "100", "200", "500", "1000", "7000"], "unit": "$"},
     "SIM_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["3", "5", "8", "10", "15", "20"], "unit": "¢"},
     "SIM_SHARES": {"kind": "number", "group": "策略", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "SIM_TAKER_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "10", "20", "50", "100", "200"], "unit": "份", "zero": "同每次份数"},
@@ -12667,7 +12760,7 @@ function switchMode(v){if(data.live&&v===data.live.mode)return;
   const ask={on:"切到 LIVE=on 后，模拟交易的每个决定都会在 Predict 真实下单。继续？",off:"切到 LIVE=off 会撤掉未成交的真实挂单并回到只记账（已有持仓继续跟踪到结算）。继续？",pause:"切到 LIVE=pause：登录 Predict、可自检和挂单测试，不开新仓。继续？"}[v];
   if(ask&&!confirm(ask))return;act({action:"mode",value:v})}
 $("modebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b||b.disabled)return;switchMode(b.dataset.mode)});
-const GROUPS=[["策略","策略"],["风控","真实交易风控"],["高级","高级参数"]];
+const GROUPS=[["策略","策略"],["风控","真实交易风控"],["预挂","开盘前预挂（15 分钟市场）"],["高级","高级参数"]];
 function fmt(s,v){return s.unit==="$"?"$"+v:s.unit==="¢"?v+"¢":s.unit?v+" "+s.unit:v}
 function selected(s){return new Set(s.kind==="multi"?(s.value==="all"?s.options.map(o=>o[0]):s.value.split(",")):[s.value])}
 function pick(s,v){
@@ -20095,6 +20188,12 @@ class Bot:
                   "SIM_MAKER_DEEP_ONLY_MARKETS": ",".join(sorted(c.sim_maker_deep_only_markets)),
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}", "SIM_SECONDS": str(c.sim_seconds), "PREDICT_POLL_SECONDS": str(c.predict_poll),
                   "PREDICT_COLD_POLL_SECONDS": str(c.predict_cold_poll), "PREDICT_TRADE_USD": plain(c.predict_trade_usd),
+                  "PREOPEN_15M": flag(c.preopen.enabled), "PREOPEN_SHARES": plain(float(c.preopen.shares)), "PREOPEN_PRICE_CENTS": f"{float(c.preopen.price) * 100:g}",
+                  "PREOPEN_MARKETS": ("all" if c.preopen.markets >= {r.key for r in WINDOW_UPDOWN_MARKETS}
+                                      else ",".join(r.stem for r in WINDOW_UPDOWN_MARKETS if r.key in c.preopen.markets)),
+                  "PREOPEN_AHEAD_MINUTES": str(c.preopen.ahead_minutes), "PREOPEN_CANCEL_SECONDS": str(c.preopen.cancel_seconds),
+                  "PREOPEN_EXPIRY_SECONDS": str(c.preopen.expiry_seconds), "PREOPEN_ENTRY_SECONDS": str(c.preopen.entry_seconds),
+                  "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd),
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,

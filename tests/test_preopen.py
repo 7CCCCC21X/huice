@@ -160,7 +160,11 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
                 controller(**bad)
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_SHARES": "20"})
         self.assertFalse(p.Settings.from_config(cfg).enabled)
-        self.assertEqual((p.Settings.from_config(cfg).shares, p.Settings.from_config(cfg, force=True).shares), (10, 20))  # the probe reads them while off
+        self.assertEqual((p.Settings.from_config(cfg).shares, p.Settings.from_config(cfg, force=True).shares), (20, 20))  # read while off too: switching on from the page uses them
+        self.assertEqual(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_SHARES": "abc"}).preopen.shares, 10, "off: a value that does not parse leaves the defaults")
+        with self.assertRaises(ValueError):
+            m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", "PREOPEN_SHARES": "abc"})
+        self.assertTrue({"PREOPEN_15M", "PREOPEN_SHARES", "PREOPEN_MARKETS", "PREOPEN_CANCEL_SECONDS"} <= m.CONTROL_KEY_SET and p.Settings is m.PreopenSettings)
         # the defaults are the trial: BTC alone, 10 shares a side (4.9U); "all" or a list widens it
         on = lambda **e: p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", **e}))
         self.assertEqual((on().shares, on().markets, on().side_usd, on().pair_usd), (10, frozenset({"BTC-15M"}), 4.9, 9.8))
@@ -421,6 +425,52 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         bot.preopen = None
         self.assertFalse(bot.preopen_active())
         self.assertIn("未启用", await bot.cmd_preopen(m.Request("/preopen", [], 1, 0, 1)))
+
+    async def test_control_page_starts_stops_and_restarts_the_mode(self):
+        """PREOPEN_15M and the PREOPEN_* settings saved on the page: the live bot starts the mode when on, stops it when off, and
+        restarts it (its orders withdrawn by its own run) when a setting changed."""
+        class FakeCtl:
+            made = []
+            def __init__(self, owner):
+                self.owner, self.settings, self.alive, self.stop, self.error = owner, owner.config.preopen, True, asyncio.Event(), ""
+                self.ledger = types.SimpleNamespace(close=lambda: None)
+                self.ran, self.ended = asyncio.Event(), False
+                FakeCtl.made.append(self)
+            async def run(self):
+                self.ran.set()
+                try:
+                    await self.stop.wait()
+                finally:
+                    self.ended = True
+                    self.alive = False
+            def status(self): return "fake"
+        env = {"TELEGRAM_BOT_TOKEN": "offline", "STATE_DB": ":memory:", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64}
+        bot = L.LiveBot.__new__(L.LiveBot)
+        bot.config, bot.stopping = m.Config.from_env({**env, "PREOPEN_15M": "on"}), asyncio.Event()
+        bot.preopen, bot.preopen_task, bot.preopen_factory, bot.preopen_lock = None, None, FakeCtl, asyncio.Lock()
+        await bot.preopen_apply()
+        first = bot.preopen
+        self.assertIsInstance(first, FakeCtl) and self.assertTrue(bot.preopen_active())
+        await asyncio.wait_for(first.ran.wait(), 1)
+        await bot.preopen_apply()
+        self.assertIs(bot.preopen, first, "the same settings: not restarted")
+        bot.config = m.Config.from_env({**env, "PREOPEN_15M": "on", "PREOPEN_SHARES": "20"})
+        await bot.preopen_apply()
+        self.assertTrue(first.ended and bot.preopen is not first and bot.preopen.settings.shares == 20, "a setting changed: stopped, started anew")
+        second = bot.preopen
+        bot.config = m.Config.from_env({**env, "PREOPEN_15M": "off"})
+        await bot.preopen_apply()
+        self.assertTrue(second.ended and bot.preopen is None and bot.preopen_task is None and not bot.preopen_active(), "off: stopped")
+        await bot.preopen_apply()
+        self.assertIsNone(bot.preopen)
+        bot.config = m.Config.from_env({**env, "PREOPEN_15M": "on"})
+        await bot.preopen_apply()
+        third = bot.preopen
+        third.alive = False  # crashed: the next apply starts it afresh
+        await bot.preopen_apply()
+        self.assertTrue(bot.preopen is not third and bot.preopen.alive)
+        await bot.preopen_stop("test")
+        self.assertEqual(len(FakeCtl.made), 4)
 
     async def test_probe_reports_fields_and_candidates(self):
         ctl, api, _ = controller([market(), market(at=NOW, mid=5), market("eth", mid=6)])

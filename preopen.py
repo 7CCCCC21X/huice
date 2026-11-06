@@ -1,4 +1,5 @@
-"""Fixed, post-only quotes on newly listed 15-minute markets. Disabled by default.
+"""Fixed, post-only quotes on newly listed 15-minute markets. Disabled by default; switched and sized on the control page
+(PREOPEN_15M and the PREOPEN_* settings are Config's: LiveBot.preopen_apply starts, stops or restarts this mode as they change).
 
 The model trader does not choose these orders: their identity, clock and fixed
 size are checked independently. Records live in a separate, synchronous SQLite
@@ -55,55 +56,7 @@ def order_verified(order: dict) -> bool:
     return order["state"] in NEVER_PLACED or order["state"] == "final"
 
 
-@dataclass(frozen=True)
-class Settings:
-    enabled: bool = False
-    poll: float = 5.0
-    cancel_seconds: int = 20   # PREOPEN_CANCEL_SECONDS: the cancel goes out this long before the window's start
-    expiry_seconds: int = 10   # PREOPEN_EXPIRY_SECONDS: the signed order expires this long before the start (the backstop when the cancel fails)
-    entry_seconds: int = 180   # PREOPEN_ENTRY_SECONDS: no new pair this close to the start
-    ahead_minutes: int = 60
-    max_open_usd: float = 7000.0
-    price: D = D("0.49")
-    shares: D = D("10")                      # PREOPEN_SHARES: the trial size; 50 was the first revision's
-    markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = the three cards
-    db: str = ""
-
-    @property
-    def side_usd(self) -> float:
-        return float(self.price * self.shares)
-
-    @property
-    def pair_usd(self) -> float:
-        return 2 * self.side_usd
-
-    @classmethod
-    def from_config(cls, config: Any, force: bool = False) -> "Settings":
-        """The settings from the environment; the defaults, unread, while the mode is off (``force``: read them anyway,
-        for the probe)."""
-        import live
-        env = config.env
-        enabled = str(env.get("PREOPEN_15M", "off")).lower() == "on"
-        if not enabled and not force:
-            return cls()
-        poll = float(env.get("PREOPEN_POLL_SECONDS", "5"))
-        cap = float(env.get("PREOPEN_MAX_OPEN_USD", "7000"))
-        cents, shares, ahead = int(env.get("PREOPEN_PRICE_CENTS", "49")), int(env.get("PREOPEN_SHARES", "10")), int(env.get("PREOPEN_AHEAD_MINUTES", "60"))
-        cancel, expiry, entry = int(env.get("PREOPEN_CANCEL_SECONDS", "20")), int(env.get("PREOPEN_EXPIRY_SECONDS", "10")), int(env.get("PREOPEN_ENTRY_SECONDS", "180"))
-        keys = {r.key for r in core.WINDOW_UPDOWN_MARKETS}
-        stems = {r.stem.lower(): r.key for r in core.WINDOW_UPDOWN_MARKETS}
-        wanted = [w.strip() for w in str(env.get("PREOPEN_MARKETS", "btc")).split(",") if w.strip()] or ["btc"]
-        markets = frozenset(keys) if any(w.lower() == "all" for w in wanted) else frozenset(stems.get(w.lower(), w.upper()) for w in wanted)
-        price = D(cents) / 100
-        if (not 1 <= poll <= 60 or not 1 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
-                or not 3 <= ahead <= 1440 or not markets <= keys or float(price * shares) < live.MIN_ORDER_USD
-                or not 5 <= expiry <= 600 or not expiry + 5 <= cancel <= 900 or not cancel + 60 <= entry <= 3600):
-            raise ValueError("PREOPEN_POLL_SECONDS 1～60、PREOPEN_MAX_OPEN_USD 1～1000000、PREOPEN_PRICE_CENTS 1～50、PREOPEN_SHARES 1～500（每边不少于 "
-                             f"Predict 最小订单 ${live.MIN_ORDER_USD:g}）、PREOPEN_AHEAD_MINUTES 3～1440、PREOPEN_MARKETS 只能是 {'、'.join(sorted(keys))}；"
-                             "PREOPEN_EXPIRY_SECONDS 5～600，PREOPEN_CANCEL_SECONDS 至少比它大 5 秒、至多 900，PREOPEN_ENTRY_SECONDS 至少比撤单时间大 60 秒、至多 3600")
-        path = str(env.get("PREOPEN_DB") or (":memory:" if config.db_path == ":memory:" else str(Path(config.db_path).with_suffix(".preopen.sqlite3"))))
-        return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
-                   price=price, shares=D(shares), markets=markets, db=path)
+Settings = core.PreopenSettings  # the settings live in Config (PREOPEN_*, the control page's values included): Settings.from_config(config)
 
 
 class Ledger:
@@ -291,6 +244,7 @@ class Controller:
         self.ledger = Ledger(self.settings.db)
         self.error = ""
         self.alive = True
+        self.stop = asyncio.Event()  # this mode's own stop (the page switching it off, a settings change): its run() withdraws the orders on the way out
         self.manual_pause = self.ledger.pause()
         self.account_at = 0
         self.balance = 0.0
@@ -313,10 +267,13 @@ class Controller:
     def now(self) -> int:
         return self.owner.market.now_ms()
 
+    def stopped(self) -> bool:
+        return self.owner.stopping.is_set() or self.stop.is_set()
+
     def blocked(self) -> str:
         c = self.owner.config
-        if self.owner.stopping.is_set():
-            return "进程停止中"
+        if self.stopped():
+            return "进程或预挂模式停止中"
         if c.live_mode != "on" or not c.live_allowed or self.manual_pause:
             return "真实交易或开盘前策略未开启"
         reason = self.owner.live_paused() or self.owner.live_killed() or ("账户未就绪" if not self.owner.live.ready else "")
@@ -741,7 +698,7 @@ class Controller:
         return sorted(out, key=lambda p: p["cancel_ms"])
 
     async def placement_worker(self) -> None:
-        while not self.owner.stopping.is_set():
+        while not self.stopped():
             _, _, c = await self.queue.get()
             self.placing.add(c["slug"])
             try:
@@ -757,7 +714,7 @@ class Controller:
                 self.queue.task_done()
 
     async def discovery_loop(self) -> None:
-        while not self.owner.stopping.is_set():
+        while not self.stopped():
             try:
                 if not self.blocked():
                     await self.account()
@@ -770,7 +727,7 @@ class Controller:
             await asyncio.sleep(self.settings.poll)
 
     async def cancellation_loop(self) -> None:
-        while not self.owner.stopping.is_set():
+        while not self.stopped():
             now = self.now()
             due = self.due(now)
             if due:
@@ -822,16 +779,16 @@ class Controller:
             jobs = [asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
                     asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
                     *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(2))]
-            stop = asyncio.create_task(self.owner.stopping.wait())
+            stops = [asyncio.create_task(self.owner.stopping.wait()), asyncio.create_task(self.stop.wait())]
             try:
-                await asyncio.wait([stop, *jobs], return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait([*stops, *jobs], return_when=asyncio.FIRST_COMPLETED)
                 for job in jobs:
                     if job.done() and not job.cancelled() and job.exception():
                         raise job.exception()
             finally:
-                for job in [stop, *jobs]:
+                for job in [*stops, *jobs]:
                     job.cancel()
-                await asyncio.gather(stop, *jobs, return_exceptions=True)
+                await asyncio.gather(*stops, *jobs, return_exceptions=True)
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(self.cancel_all("进程停止，撤销预挂单"), timeout=12)
                 for task in self.settling.values():

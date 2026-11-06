@@ -171,7 +171,7 @@ async def run():
     assert s["SIM_SKIP"]["kind"] == "detail" and s["SIM_SKIP"]["value"] == "" and s["SIM_SKIP"]["group"] == "策略"
     assert isinstance(data["catalog"], list) and all({"kind", "key", "name", "skipped"} <= set(r) for r in data["catalog"]) and "展开详细选项" in body.decode()
     # every setting has a widget, every group is one the page knows, and every preset / option is a value the Config accepts
-    assert set(m.CONTROL_FORMS) == set(m.CONTROL_KEY_SET) and {f["group"] for f in m.CONTROL_FORMS.values()} == {"策略", "风控", "高级"}
+    assert set(m.CONTROL_FORMS) == set(m.CONTROL_KEY_SET) and {f["group"] for f in m.CONTROL_FORMS.values()} == {"策略", "风控", "预挂", "高级"}
     withkey = {**base, "PREDICT_PRIVATE_KEY": "a" * 64}
     for key, form in m.CONTROL_FORMS.items():
         if form["kind"] == "detail":  # SIM_SKIP: drawn inside the SIM_MARKETS card from the catalog, no presets or options of its own

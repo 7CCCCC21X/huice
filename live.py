@@ -988,11 +988,11 @@ class LiveBot(core.Bot):
         self.live_list_at_ms = -10 ** 15  # ...on the bot's clock, for the idle re-read
         self.live_auth_tried = -1e9  # monotonic time of the last sign-in renewal tried ahead of the token's expiry
         self.live_place_ms = 0       # the last step's placement time (sim_after_decide), for the phases
-        self.preopen = None
-        self.handlers["/preopen"] = self.cmd_preopen  # the status, pause / resume, and the read-only probe of the listing (works with the mode off)
-        if str(self.config.env.get("PREOPEN_15M", "off")).lower() == "on":
-            from preopen import Controller
-            self.preopen = Controller(self)
+        self.preopen = None  # the pre-open quoting mode's controller while it runs (preopen_apply: PREOPEN_15M, on the page or in the environment)
+        self.preopen_task: asyncio.Task | None = None
+        self.preopen_factory: Any = None  # the tests' stand-in controller class
+        self.preopen_lock = asyncio.Lock()
+        self.handlers["/preopen"] = self.cmd_preopen  # the status, on / off, pause / resume, and the read-only probe of the listing
 
     # --- readiness -------------------------------------------------------------------------------------------------------
     async def live_prepare(self) -> list[str]:
@@ -2719,6 +2719,9 @@ class LiveBot(core.Bot):
         self.live.config = config
         if before != config.live_mode:
             self.live_mode_changed(before, config.live_mode)
+        with contextlib.suppress(RuntimeError):  # no loop yet (the start-up apply): run() applies them
+            # the pre-open mode follows PREOPEN_* as saved on the control page: started, stopped, or restarted on new settings
+            asyncio.get_running_loop().create_task(self.preopen_apply(), name="preopen-apply")
 
     def live_mode_changed(self, before: str, after: str) -> None:
         """off → pause / on: sign in at the next step; → off: the resting real orders are withdrawn (the positions
@@ -3212,6 +3215,49 @@ class LiveBot(core.Bot):
                         "paused": self.live_paused(), "killed": self.live_killed()}
         return data
 
+    async def preopen_apply(self) -> None:
+        """The pre-open mode as PREOPEN_15M and the PREOPEN_* settings say now (the environment, the control page's saved
+        values over it): started when on and not running, stopped when off, restarted — its orders withdrawn first — when
+        its settings changed or it crashed."""
+        async with self.preopen_lock:
+            want = self.config.preopen
+            if self.preopen is not None and (not want.enabled or self.preopen.settings != want or not self.preopen.alive):
+                await self.preopen_stop("设置改变" if want.enabled else "PREOPEN_15M=off")
+            if want.enabled and self.preopen is None and not self.stopping.is_set():
+                self.preopen_start()
+
+    def preopen_start(self) -> None:
+        from preopen import Controller
+        preopen = self.preopen = (self.preopen_factory or Controller)(self)
+        task = self.preopen_task = asyncio.create_task(preopen.run(), name="preopen")
+
+        def finished(t: asyncio.Task) -> None:
+            if not t.cancelled() and t.exception() is not None:
+                text = core.clean_error(t.exception()) or type(t.exception()).__name__
+                LOG.error("开盘前策略异常结束：%s", text)
+                # the bot goes on (its run() withdrew this mode's orders on the way out); the model trader is free again
+                preopen.error, preopen.alive = f"预挂模式已停止：{text}", False
+                self.live_note_error(f"开盘前预挂模式异常停止：{text}")
+                self.live_notify(f"⚠️ 开盘前预挂模式异常停止：{text}（本模式的挂单已撤，重启后恢复）", key="preopen:crash")
+        task.add_done_callback(finished)
+        LOG.info("开盘前预挂模式启动：%s", "、".join(sorted(preopen.settings.markets)))
+
+    async def preopen_stop(self, why: str) -> None:
+        """The mode stopped: its own stop set (its run() withdraws its orders on the way out), its task waited for."""
+        preopen, task = self.preopen, self.preopen_task
+        if preopen is None:
+            return
+        preopen.stop.set()
+        if task is not None:
+            await asyncio.wait([task], timeout=20)
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            preopen.ledger.close()
+        self.preopen, self.preopen_task = None, None
+        LOG.info("开盘前预挂模式停止：%s", why)
+
     def preopen_active(self) -> bool:
         """Whether the pre-open mode is running for real: its orders go out only with LIVE=on, so only then does it hold
         the model trader back (paper trading goes on with LIVE=off; a mode that crashed, alive False, holds nothing)."""
@@ -3220,6 +3266,12 @@ class LiveBot(core.Bot):
 
     async def cmd_preopen(self, req: core.Request) -> str:
         action = req.args[0].lower() if req.args else ""
+        if action in {"on", "off"}:  # saved on the control page's record and applied at once, as the page would
+            result = self.control_set({"PREOPEN_15M": action})
+            if not result["ok"]:
+                return "❌ " + result["message"]
+            await self.preopen_apply()
+            return result["message"] + "\n" + (self.preopen.status() if self.preopen is not None else "开盘前预挂模式已关闭")
         if action == "probe":  # the listing's fields and the windows it would place now, read-only: run before PREOPEN_15M=on
             from preopen import Settings, probe, safe_api
             try:
@@ -3230,38 +3282,22 @@ class LiveBot(core.Bot):
                    else safe_api(API_BASES[self.config.live_chain], self.config.predict_api_key, self.live.wallet, None, self.live.api))
             return "\n".join(await probe(api, self.config, settings, self.market.now_ms()))
         if self.preopen is None:
-            return "开盘前预挂模式未启用（PREOPEN_15M=off）；/preopen probe 只读探测市场列表的字段和现在会挂的场次"
+            return "开盘前预挂模式未启用（PREOPEN_15M=off）；/preopen probe 只读探测市场列表的字段和现在会挂的场次，/preopen on 开启（也可在控制台改）"
         if action in {"pause", "resume"}:
             self.preopen.manual_pause = self.preopen.ledger.pause(action == "pause")
             if action == "pause":
                 await self.preopen.cancel_all("管理员暂停开盘前模式")
         elif action:
-            return "用法：/preopen｜/preopen pause｜/preopen resume｜/preopen probe"
+            return "用法：/preopen｜/preopen on｜/preopen off｜/preopen pause｜/preopen resume｜/preopen probe"
         return self.preopen.status()
 
     async def run(self) -> int:
-        task = None
-        if self.preopen is not None:
-            task = asyncio.create_task(self.preopen.run(), name="preopen")
-            def finished(t: asyncio.Task) -> None:
-                if not t.cancelled() and t.exception() is not None:
-                    text = core.clean_error(t.exception()) or type(t.exception()).__name__
-                    LOG.error("开盘前策略异常结束：%s", text)
-                    # the bot goes on (its run() withdrew this mode's orders on the way out); the model trader is free again
-                    self.preopen.error, self.preopen.alive = f"预挂模式已停止：{text}", False
-                    self.live_note_error(f"开盘前预挂模式异常停止：{text}")
-                    self.live_notify(f"⚠️ 开盘前预挂模式异常停止：{text}（本模式的挂单已撤，重启后恢复）", key="preopen:crash")
-            task.add_done_callback(finished)
+        await self.preopen_apply()  # PREOPEN_15M as the environment and the control page's saved values say at the start
         try:
             return await self._run_live()
         finally:
             self.stopping.set()
-            if task is not None:
-                await asyncio.wait([task], timeout=15)
-                if not task.done():
-                    task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-                self.preopen.ledger.close()
+            await self.preopen_stop("进程停止")
 
     async def _run_live(self) -> int:
         if self.config.live_mode == "off":
