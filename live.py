@@ -1192,7 +1192,7 @@ class LiveBot(core.Bot):
         c = self.config
         if c.live_mode == "off" or price <= 0:
             return math.inf
-        room = min(c.live_max_order_usd, c.live_max_open_usd - self.live_exposure(trades) - self.preopen_risk())
+        room = min(c.live_max_order_usd, c.live_max_open_usd - self.live_exposure(trades))  # 1.132.1: the pre-open's reservation is its own cap's
         usd = self.live.usd()
         if usd is not None:
             room = min(room, usd)
@@ -1204,7 +1204,7 @@ class LiveBot(core.Bot):
         c = self.config
         if c.live_mode == "off" or price <= 0:
             return ""
-        exposure = self.live_exposure(trades) + self.preopen_risk()
+        exposure = self.live_exposure(trades)
         left = c.live_max_open_usd - exposure
         if left < MIN_ORDER_USD - 1e-9:
             return f"持仓+挂单 ${exposure:,.2f} 已占满 LIVE_MAX_OPEN_USD ${c.live_max_open_usd:g}（剩 ${max(left, 0.0):,.2f}，不够一份）"
@@ -1493,7 +1493,7 @@ class LiveBot(core.Bot):
         notional = float((st.get("want") or {}).get("shares") or trade.get("order") or 0) * self.live_unit_cap(trade)
         if notional > c.live_max_order_usd + 1e-9:
             return f"单笔最多 ${notional:,.2f} 超过 LIVE_MAX_ORDER_USD ${c.live_max_order_usd:g}"
-        others = self.live_exposure(trades) - self.live_reserved(trade) + self.preopen_risk()
+        others = self.live_exposure(trades) - self.live_reserved(trade)
         if others + notional > c.live_max_open_usd + 1e-9:
             return f"持仓+挂单 ${others:,.2f} 加本单 ${notional:,.2f} 超过 LIVE_MAX_OPEN_USD ${c.live_max_open_usd:g}"
         usd = self.live.usd()
@@ -3714,8 +3714,8 @@ class LiveBot(core.Bot):
         return self.preopen_active() and bool(self.config.preopen.exclusive)
 
     def preopen_risk(self) -> float:
-        """The money the running pre-open mode may have tied up (Controller.risk), counted with the model trader's own
-        exposure against LIVE_MAX_OPEN_USD (1.125.0)."""
+        """The money the running pre-open mode may have tied up (Controller.risk). Shown; since 1.132.1 not counted against
+        LIVE_MAX_OPEN_USD (each mode keeps to its own cap: Predict locks no USDT for a resting order)."""
         return float(self.preopen.risk()) if self.preopen_active() else 0.0
 
     def preopen_pnl(self) -> float:

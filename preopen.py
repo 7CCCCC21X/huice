@@ -364,6 +364,23 @@ def window_strikes(rows: Any) -> dict[str, int]:
     return out
 
 
+def order_brief(row: dict) -> str:
+    """An open order of the account in a few words (/preopen check: the ones neither strategy recorded): its id, side,
+    price and shares as the record states them, the market's title when it carries one."""
+    import live
+    order = row.get("order") if isinstance(row.get("order"), dict) else {}
+    market = row.get("market") if isinstance(row.get("market"), dict) else {}
+    try:
+        maker, taker = D(str(order.get("makerAmount") or 0)), D(str(order.get("takerAmount") or 0))
+        buy = int(order.get("side") or 0) == 0
+        shares = live.from_wei(int(str(row.get("amount") or (taker if buy else maker) or 0)))
+        price = float((maker / taker) if buy and taker else (taker / maker) if maker else 0)
+    except (ValueError, ArithmeticError, TypeError):
+        shares, price, buy = 0.0, 0.0, True
+    title = str(market.get("title") or market.get("question") or market.get("slug") or "")
+    return f"#{row.get('id')} {'买' if buy else '卖'} {core.cents(price) if price else '?'}×{shares:g}" + (f" {title[:28]}" if title else "") + f"（{row.get('status') or '?'}）"
+
+
 def record_key(pair: dict) -> str:
     """A record's key without its attempt (a superseded record's key carries the attempt after '@'): the window's slug,
     with '#<level>' for a deeper price level (1.129.0)."""
@@ -577,6 +594,7 @@ class Controller:
         self.open_reserved = 0.0
         self.listed_ids: set[str] = set()
         self.unmanaged = 0  # open orders on the account that neither strategy placed: shown; their money is in the balance check (no hold since 1.126.0)
+        self.unmanaged_detail: list[str] = []  # ...the first few described (/preopen check)
         self.placing: set[str] = set()
         self.cancelling: set[str] = set()
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()  # (start_ms, slug, candidate): the soonest window first
@@ -668,7 +686,9 @@ class Controller:
         lines = [f"开盘前预挂体检 {hms(now)}：{'有问题' if problems else '正常'}" + ("" if self.alive else f"；本模式已停止：{self.error}")]
         lines.append(f"限流：{cooldown or '没有冷却'}；24 小时内触发 {len(limited)} 次" + (f"，最近 {hms(limited[-1])}" if limited else ""))
         lines.append(f"账户快照：{'还没读到' if not self.account_at else str((now - self.account_at) // 1000) + ' 秒前'}；余额 {self.balance:.2f}U，"
-                     f"账户挂单占用 {self.open_reserved:.2f}U，本模式预留 {self.risk():.2f}U" + (f"；另有 {self.unmanaged} 笔不认识的挂单" if self.unmanaged else ""))
+                     f"账户挂单占用 {self.open_reserved:.2f}U，本模式预留 {self.risk():.2f}U（限额 {self.settings.max_open_usd:g}U）"
+                     + (f"；另有 {self.unmanaged} 笔两个策略都没记录的挂单：" + "；".join(self.unmanaged_detail) + ("…" if self.unmanaged > len(self.unmanaged_detail) else "")
+                        if self.unmanaged else ""))
         lines.append(f"新挂：{hold or '正常'}；队列 {self.queue.qsize()} 场，等候 {len(self.parked)} 场"
                      + ("：" + "；".join(f"{c.get('name') or slug} 等到 {hms(at)}" for slug, (at, c) in list(self.parked.items())[:5]) if self.parked else ""))
         if self.card_holds:
@@ -724,13 +744,14 @@ class Controller:
         return f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）" if left > 0 else ""
 
     def budget_problem(self, pair_usd: float | None = None, side_usd: float | None = None) -> str:
-        """Why the next pair (the first level's unless given) does not fit: the joint exposure cap, the USDT balance, the
-        per-order cap."""
+        """Why the next pair (the first level's unless given) does not fit: this mode's own cap (PREOPEN_MAX_OPEN_USD —
+        1.132.1: its own, not the lesser of it and LIVE_MAX_OPEN_USD less the model trader's exposure; Predict locks no
+        USDT for a resting order, the reservation is this mode's accounting), the USDT balance, the per-order cap."""
         pair_usd = self.settings.pair_usd if pair_usd is None else pair_usd
         side_usd = self.settings.side_usd if side_usd is None else side_usd
-        limit = min(self.settings.max_open_usd, self.owner.config.live_max_open_usd)
-        if self.risk() + self.other_risk() + pair_usd > limit + 1e-9:
-            return f"预挂资金上限不足：需要再预留 {pair_usd:g}U，限额 {limit:g}U"
+        limit = self.settings.max_open_usd
+        if self.risk() + pair_usd > limit + 1e-9:
+            return f"预挂资金上限不足：已预留 {self.risk():.2f}U，再挂一场双边要 {pair_usd:g}U，限额 {limit:g}U（PREOPEN_MAX_OPEN_USD）"
         if self.balance < pair_usd:  # 1.130.5: the account's open orders are each their own allowance (the money is taken at a match): one pair's worth is enough
             return f"可用USDT {self.balance:.2f}U 不够一场双边（{pair_usd:g}U）"
         if side_usd > self.owner.config.live_max_order_usd:
@@ -808,7 +829,7 @@ class Controller:
             return "距订单到期不足一分钟，不再发送"
         if self.now() - self.account_at > 30_000:
             return "账户快照过期，不再发送"
-        if self.risk() + self.other_risk() > min(self.settings.max_open_usd, self.owner.config.live_max_open_usd) + 1e-9:
+        if self.risk() > self.settings.max_open_usd + 1e-9:  # (this mode's own cap, 1.132.1; the pair is reserved by now)
             return "最新资金限额不允许发送"
         return ""
 
@@ -825,9 +846,6 @@ class Controller:
         import live
         ids, hashes = self.known()
         return [r for r in rows if str(r.get("id")) not in ids and live.order_hash_of(r) not in hashes]
-
-    def other_risk(self) -> float:
-        return self.owner.live_exposure(self.owner.sim_trades())
 
     def risk(self) -> float:
         """The money this mode may have tied up: every order that may exist (sent, or sent for all we know) at its full
@@ -860,7 +878,9 @@ class Controller:
                     raise core.RemoteError("账户挂单分页未读取完整，暂停新增订单")
                 other = self.unmanaged_rows(rows)
                 known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)}
-                unmanaged = sum(1 for r in other if str(r.get("id")) not in known_core)
+                strangers = [r for r in other if str(r.get("id")) not in known_core]
+                unmanaged = len(strangers)
+                self.unmanaged_detail = [order_brief(r) for r in strangers[:5]]  # /preopen check names them (1.132.1)
                 reserved = 0.0
                 for row in rows:
                     order = row.get("order") or {}
@@ -1588,15 +1608,46 @@ class Controller:
         soonest = lambda ps: sorted(ps, key=lambda p: int(p.get("start_ms") or 0))
         return soonest(spent), soonest(refused)
 
+    def unplaced(self) -> tuple[int, int, float]:
+        """The listed windows' levels not quoted now — (windows, level-pairs, the reservation they would take): what the cap
+        keeps back, so the status can say what PREOPEN_MAX_OPEN_USD would need to be for all of them (1.132.1). A card's
+        windows up to the latest one seen listed count as listed; a level with its failures at the cap does not count."""
+        now = self.now()
+        active = {record_key(p) for p in self.ledger.rows.values() if p["phase"] == "active"}
+        strikes = window_strikes(self.ledger.rows.values())
+        windows: set[str] = set()
+        pairs, usd = 0, 0.0
+        for rolling, start in window_starts(now, self.owner.config, self.settings):
+            if start > self.listed_by_card.get(rolling.key, 0):
+                continue
+            slug = window_slug(rolling, start)
+            for level, (price, shares) in enumerate(self.settings.levels):
+                if level and start - now > self.settings.deep_ahead_minutes * 60_000:
+                    break
+                key = slug if level == 0 else f"{slug}#{level}"
+                if key in active or strikes.get(key, 0) >= MAX_ATTEMPTS:
+                    continue
+                windows.add(slug)
+                pairs += 1
+                usd += 2 * float(price) * float(shares)
+        return len(windows), pairs, usd
+
     def status(self) -> str:
         rows = list(self.ledger.rows.values())
         spent, refused = self.unquotable()
+        quoted_to: dict[str, int] = {}  # card -> the latest window with a quote resting (the first level's, the deeper ones wait for the start)
+        for p in rows:
+            if p["phase"] == "active" and p.get("key"):
+                quoted_to[p["key"]] = max(quoted_to.get(p["key"], 0), int(p.get("start_ms") or 0))
+        windows_left, pairs_left, usd_left = self.unplaced()
         named = lambda ps: "、".join(str(p.get("name") or window_of(p)) + (f" 第 {int(p['level']) + 1} 档" if p.get("level") else "") for p in ps[:3]) + ("…" if len(ps) > 3 else "")
         why = (self.hold() or self.budget_problem()) if self.alive else ""
         state = "已停止" if not self.alive else f"暂停，{why}" if self.blocked() else "运行"
         until = lambda ms: f"{when(ms, self.now())}（开场前 {(ms - self.now()) / 60_000:.0f} 分钟）" if ms > self.now() else "还没见到已发布的场次"
-        listed = ("已发布到 " + until(self.listed_until_ms) if len(self.settings.markets) == 1
-                  else "已发布到：" + "；".join(f"{key} {until(self.listed_by_card.get(key, 0))}" for key in sorted(self.settings.markets)))
+        reach = lambda key: (f"{key} 发布到 {until(self.listed_by_card[key])}" if self.listed_by_card.get(key, 0) > self.now() else f"{key} 还没见到已发布的场次") \
+            + (f"，挂到 {hms(quoted_to[key])}" if quoted_to.get(key) else "")
+        listed = ("已发布到 " + until(self.listed_until_ms) + (f"，挂到 {hms(max(quoted_to.values()))}" if quoted_to else "") if len(self.settings.markets) == 1
+                  else "各卡：" + "；".join(reach(key) for key in sorted(self.settings.markets)))
         return (f"开盘前自动预挂：{state}\n"
                 f"{' / '.join(sorted(self.settings.markets))}：两边各 {levels_text(self.settings)}；"
                 f"扫描 {self.settings.poll:g} 秒，"
@@ -1606,7 +1657,9 @@ class Controller:
                 f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清），"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
-                f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}"
+                f"预留 {self.risk():.2f}U / 限额 {self.settings.max_open_usd:g}U（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉且一份没成交的场次立即释放）"
+                + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if pairs_left else "")
+                + f"\n最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
                 + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：不计入预挂限额，也不挡预挂" if self.unmanaged else "")
                 + ("\n股票卡暂停：" + "；".join(self.card_holds.values()) if self.card_holds else "")

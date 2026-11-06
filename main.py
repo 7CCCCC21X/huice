@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.132.0"
+VERSION = "1.132.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -664,7 +664,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
     ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）"),
     ("PREOPEN_ENTRY_SECONDS", "距开场不足几秒不再新挂", "至少比撤单时间多 60 秒、至多 3600（默认 180）"),
-    ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "1～1000000：和持仓+挂单上限取较小值；每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放"),
+    ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "1～1000000：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金）；每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放；/preopen 会算出把已发布的全部挂上需要多少"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
 # One-click combinations for the control page (一键搭配): the strategy settings only. What to trade (SIM_MARKETS, SIM_SKIP),

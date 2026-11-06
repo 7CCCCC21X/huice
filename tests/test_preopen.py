@@ -381,7 +381,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         order = [ctl.queue.get_nowait()[2]["market_id"] for _ in range(3)]
         self.assertEqual(order, ["2", "4", "1"])
         self.assertNotIn("/categories/" + market(at=NOW + 3 * 3600_000)["categorySlug"], api.calls)
-        self.assertIn("已发布到：BTC-15M 09:45（开场前 45 分钟）；SKHYNIX-15M 09:30（开场前 30 分钟）；UNITREE-15M 还没见到已发布的场次", ctl.status())  # 1.130.4: per card
+        self.assertIn("各卡：BTC-15M 发布到 09:45（开场前 45 分钟）；SKHYNIX-15M 发布到 09:30（开场前 30 分钟）；UNITREE-15M 还没见到已发布的场次", ctl.status())  # 1.130.4: per card
         await self.finish(ctl)
 
     async def test_discovery_is_cheap_however_wide_the_horizon(self):
@@ -469,8 +469,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await ctl.place_pair(c), api.sent), ("held", []))
         ctl.account_at = NOW
         ctl.owner.config = dataclasses.replace(ctl.owner.config, live_max_open_usd=48)
+        ctl.owner.live_exposure = lambda trades: 60.
+        self.assertEqual(ctl.budget_problem(), "", "1.132.1: the model trader's cap and exposure are not this mode's")
+        ctl.settings = dataclasses.replace(ctl.settings, max_open_usd=48)
         self.assertEqual((await ctl.place_pair(c), api.sent), ("held", []))
-        self.assertTrue(ctl.error.startswith("预挂资金上限不足"))
+        self.assertEqual(ctl.error, "预挂资金上限不足：已预留 0.00U，再挂一场双边要 49U，限额 48U（PREOPEN_MAX_OPEN_USD）")
+        ctl.settings = dataclasses.replace(ctl.settings, max_open_usd=7000)
+        ctl.owner.live_exposure = lambda trades: 0.
         ctl.owner.config = dataclasses.replace(ctl.owner.config, live_max_open_usd=7000)
         ctl.account_at = NOW - 40_000
         ctl.queue.put_nowait((c["start_ms"], c["slug"], c))
@@ -553,14 +558,17 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctl.ledger.rows[far["slug"]]["phase"], "closed")
         await self.finish(ctl)
 
-    async def test_global_budget_and_existing_risk_are_not_overridden(self):
+    async def test_own_budget_only_the_model_traders_cap_and_exposure_are_not_this_modes(self):
+        """1.132.1: PREOPEN_MAX_OPEN_USD bounds this mode alone — LIVE_MAX_OPEN_USD and the model trader's exposure no longer hold
+        it back (nor does its reservation squeeze the model trader: live_fit_shares)."""
         ctl, api, _ = controller(LIVE_MAX_OPEN_USD="48")
-        await ctl.place_pair(p.candidate(market(), NOW, ctl.owner.config, ctl.settings))
-        self.assertEqual(api.sent, [])
-        ctl.owner.config = dataclasses.replace(ctl.owner.config, live_max_open_usd=100)
         ctl.owner.live_exposure = lambda trades: 60.
         await ctl.place_pair(p.candidate(market(), NOW, ctl.owner.config, ctl.settings))
-        self.assertEqual(api.sent, [])
+        self.assertEqual(len(api.sent), 2)
+        ctl.settings = dataclasses.replace(ctl.settings, max_open_usd=50)
+        c2 = p.candidate(market("btc", at=NOW + 30 * 60_000, mid=9), NOW, ctl.owner.config, ctl.settings)
+        self.assertEqual((await ctl.place_pair(c2), len(api.sent)), ("held", 2))
+        self.assertIn("已预留 49.00U，再挂一场双边要 49U，限额 50U", ctl.error)
         await self.finish(ctl)
 
     async def test_status_says_why_nothing_is_placed(self):
@@ -586,9 +594,11 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl.account_at = 0
         self.assertIn("还没有读到", ctl.hold())
         ctl.account_at = clock.ms
-        ctl.owner.config = dataclasses.replace(ctl.owner.config, live_max_open_usd=48)
+        ctl.settings = dataclasses.replace(ctl.settings, max_open_usd=48)
         self.assertEqual(ctl.hold(), "")
-        self.assertIn("\n暂不新挂：预挂资金上限不足：需要再预留 49U，限额 48U", ctl.status())
+        self.assertIn("\n暂不新挂：预挂资金上限不足：已预留 49.00U，再挂一场双边要 49U，限额 48U（PREOPEN_MAX_OPEN_USD）", ctl.status())
+        self.assertIn("预留 49.00U / 限额 48U（本模式自己的账", ctl.status())
+        self.assertIn("各卡：BTC-15M 还没见到已发布的场次，挂到 10:00:00；", ctl.status())
         ctl.manual_pause = True
         self.assertTrue(ctl.status().startswith("开盘前自动预挂：暂停，本模式已手动暂停（/preopen resume 恢复）\n"), ctl.status())
         self.assertNotIn("暂不新挂", ctl.status())
@@ -696,9 +706,9 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bot.preopen_active() and not bot.preopen_exclusive() and not bot.config.preopen.exclusive)
         self.assertEqual((bot.preopen_risk(), bot.preopen_pnl(), bot.preopen_filled()), (40., -10., {("123", 2): 50.}))
         bot.live = types.SimpleNamespace(usd=lambda: None)
-        self.assertEqual(bot.live_fit_shares({}, 0.5), 120.)  # min(100 order cap, 100 − 40) / 0.5
+        self.assertEqual(bot.live_fit_shares({}, 0.5), 200.)  # min(100 order cap, 100 − 0) / 0.5: the mode's 40U reservation is its own cap's (1.132.1; was 120)
         bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "LIVE_MAX_OPEN_USD": "40.5"})
-        self.assertIn("持仓+挂单 $40.00 已占满", bot.live_fit_why({}, 0.5))
+        self.assertEqual((bot.live_fit_why({}, 0.5), bot.live_fit_shares({}, 0.5)), ("", 81.), "the model trader keeps its whole LIVE_MAX_OPEN_USD")
         bot.preopen.alive = False
         self.assertFalse(bot.preopen_active())  # crashed: the model trader is free again — the mode's fills still its own (1.131.2), never positions to adopt
         self.assertEqual((bot.preopen_risk(), bot.preopen_pnl(), bot.preopen_filled()), (0., 0., {("123", 2): 50.}))
