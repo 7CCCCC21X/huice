@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.120.0"
+VERSION = "1.120.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -500,7 +500,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LEAD_QUOTE", "交易所现价先行（15 分钟涨跌）", "on = 卡片的现价按标的交易所的实时成交价相对窗口起点的涨跌折算（币安指数比交易所慢几秒到一分钟：卖涨给你的人先看到了下跌），和指数差超过 1% 或行情 15 秒没读到时退回指数，起点、终点仍按币安指数结算；shadow = 两种定价都记进模型样本、按指数交易，/calib 比较谁更准；off = 只用币安指数"),
     ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限、盘后每边持仓上限、加密日涨跌和 15 分钟涨跌的每边上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
-    ("SIM_AGAINST_MOVE_SIGMAS", "逆势不买：今日已动几个日 σ", "0～10：个股日涨跌市场，标的今天（盘中按实时价，盘后按代理）已经朝一边走了这么多个日 σ，就不再买另一边、挂着的撤掉——模型只按波动率算概率、不看趋势，海力士一天跌 10% 时它还给涨 15% 的概率，10¢ 的挂涨单被继续下跌的卖盘扫到（1.120.0）；默认 1；0 = 不限"),
+    ("SIM_AGAINST_MOVE_SIGMAS", "逆势不买：今日已动几个日 σ", "0～10：个股日涨跌市场，标的今天（盘中按实时价，盘后按代理）已经朝一边走了这么多个日 σ，就不再买另一边、挂着的撤掉——模型只按波动率算概率、不看趋势，海力士一天跌 10% 时它还给涨 15% 的概率，10¢ 的挂涨单被继续下跌的卖盘扫到（1.120.0）；默认 0 = 不限（先看模型的回测再决定）"),
     ("SIM_AGAINST_MOVE_INDEX", "逆势不买也管指数", "on = 恒指、KOSPI、上证的日涨跌卡也按上面的规则；默认 off：/calib 显示指数卡被压到低概率的那一边实际回来的比模型说的多"),
     ("SIM_NO_ODDS_WITHDRAW_MINUTES", "概率暂缺多久撤单（分钟）", "0～1440：卡片的概率暂缺（如上证卡周末 A50 休市、行情断流）或暂不建议持续这么多分钟后，这个市场挂着的单撤掉（低价挂单也撤），概率回来再按新公平价重挂；没有概率时本来就不开新单；0 = 不撤、挂着等"),
     ("SIM_MAX_FAIR_CENTS", "公平价最多按多少计（¢）", "50～100：这一边的公平价高于这个数时按这个数算净优势——模型再自信也只信到这里（出事时 95¢ 也能归零），接近必然的一边只在价格低到上限之下仍留足门槛时才吃、才挂：公平价 99.6¢、卖1 85¢，按 95 − 85.3 = 9.7¢ 判；100 = 按模型的公平价"),
@@ -652,8 +652,8 @@ class Config:
     lead_quote: str = "on"        # LEAD_QUOTE: a 15-minute card priced on its stock's exchange quote (on), recorded only (shadow), or not (off): IndexUpDownMarket.effective
     sim_shares_net: bool = True   # SIM_SHARES_NET: the share caps count a side's net position — what it holds less the other side's fills; off = each side on its own
     sim_open_quiet_minutes: int = 3            # SIM_OPEN_QUIET_MINUTES: no new order on a daily card this long after its underlying opens; 0 = none
-    sim_against_move_sigmas: float = 1.0       # SIM_AGAINST_MOVE_SIGMAS: a daily stock card's side the day's move has gone against by this many daily σ
-    #                                            is not bought, a resting order there withdrawn (1.120.0); 0 = never
+    sim_against_move_sigmas: float = 0.0       # SIM_AGAINST_MOVE_SIGMAS: a daily stock card's side the day's move has gone against by this many daily σ
+    #                                            is not bought, a resting order there withdrawn (1.120.0); 0 = never (the default: 1.120.1, the model first)
     sim_against_move_index: bool = False       # SIM_AGAINST_MOVE_INDEX: ...the index cards too (off: /calib finds their low buckets paying more often than priced)
     sim_no_odds_withdraw: int = 30             # SIM_NO_ODDS_WITHDRAW_MINUTES: a resting order on a market the bot cannot price (odds missing, suggestion held) this long is withdrawn; 0 = never
     sim_seconds: int = 5     # seconds between the trader's looks: the books judged, orders placed / withdrawn, real orders read back (SIM_SECONDS)
@@ -859,7 +859,7 @@ class Config:
             big_move_sigmas=parse_bounded(e, "PROB_BIG_MOVE_SIGMAS", "1.5", 0, 10),
             sim_after_hours_max_shares=parse_bounded(e, "SIM_AFTER_HOURS_MAX_SHARES", "300", 0, 10_000_000),
             sim_open_quiet_minutes=bounded_int(e, "SIM_OPEN_QUIET_MINUTES", 3, 0, 60),
-            sim_against_move_sigmas=parse_bounded(e, "SIM_AGAINST_MOVE_SIGMAS", "1", 0, 10),
+            sim_against_move_sigmas=parse_bounded(e, "SIM_AGAINST_MOVE_SIGMAS", "0", 0, 10),
             sim_against_move_index=not off(e.get("SIM_AGAINST_MOVE_INDEX", "off")),
             sim_no_odds_withdraw=bounded_int(e, "SIM_NO_ODDS_WITHDRAW_MINUTES", 30, 0, 1440),
             sim_ways=sim_ways, sim_markets=sim_markets, sim_skip=sim_skip, sources_off=sources_off,
@@ -4389,7 +4389,8 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
     for (key, mode), rows in sorted(groups.items()):
         done = [dict(r, close=outcomes[f"{key}:{r['target']}"]) for r in rows if f"{key}:{r['target']}" in outcomes]
         days = sorted({r["target"] for r in done})
-        lines.append(f"📐 {key}·{mode}：快照 {len(rows)} 条（{len({r['target'] for r in rows})} 个目标日），"
+        label = f"{NAMES[key]}｜{key}" if key in NAMES else key  # a stock card by its name (1.120.1)
+        lines.append(f"📐 {label}·{mode}：快照 {len(rows)} 条（{len({r['target'] for r in rows})} 个目标日），"
                      f"已有结果 {len(done)} 条 / {len(days)} 日")
         if not done:
             continue
@@ -4422,7 +4423,7 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
         lines.extend(residual_lines(done))
         factor, factor_days = residual_factor(done)
         lines.append(f"  σ 校准系数：×{factor:.2f}（按 {factor_days} 日残差，先验 {RESIDUAL_PRIOR_DAYS} 日按 1 计，限 {RESIDUAL_RANGE[0]:g}～{RESIDUAL_RANGE[1]:g}；"
-                     "SIGMA_CALIB 开着时卡片按它定价）")
+                     + ("SIGMA_CALIB 开着时卡片按它定价）" if key in PREDICT_KEYS.values() else "个股卡只评估、不套用）"))
         if mode == "盘中":  # 1.117.0: the σ the card priced with (the opening gap taken out, before any factor) against what the residuals ask for
             raw_rows = [r for r in done if float(r.get("sigma_raw") or r.get("sigma") or 0) > 0 and r.get("R") and float(r["R"]) > 0]
             rms, _ = residual_rms(done)
@@ -4471,7 +4472,7 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
             new = scores(fitted, [r["hit"] for r in tested])
             lines.append(f"  逐日向前检验（{len({r['target'] for r in tested})} 日 {len(tested)} 条）：拟合模型 Brier {new[0]:.3f} / "
                          f"对数损失 {new[1]:.3f}，现行 {old[0]:.3f} / {old[1]:.3f}")
-    return lines or ["📐 还没有保存的预测快照（每个指数每 30 分钟存一条，需要概率功能开启）"]
+    return lines or ["📐 还没有保存的预测快照（每个指数和个股卡每 30 分钟存一条，需要概率功能开启）"]
 
 
 CALIB_BUCKETS = ((0.0, 0.25, "R<0.25"), (0.25, 0.5, "0.25–0.5"), (0.5, 1.0, "0.5–1"), (1.0, math.inf, "R≥1"))
@@ -14908,8 +14909,13 @@ class Bot:
         can later be scored against real outcomes (/calib). The score uses the odds as displayed – against the
         Predict market's target price when the page used it – with the model's own figures, the target price and the
         market's link kept beside them."""
-        for key, title, odds_of in (("SSE", "上证指数", self.sse_odds), ("KOSPI", "KOSPI", self.kospi_odds),
-                                    ("HSI", "恒生指数", self.hsi_odds)):
+        cards: list[tuple[str, str, Any]] = [("SSE", "上证指数", self.sse_odds), ("KOSPI", "KOSPI", self.kospi_odds), ("HSI", "恒生指数", self.hsi_odds)]
+        for symbol in self.config.symbols:  # 1.120.1: the stock cards too — scored by /calib, their σ not scaled by it (index_sigma_calibs)
+            quote = (self.snapshots.get(symbol) or {}).get("quote")
+            if quote:
+                cards.append((symbol, f"{NAMES.get(symbol, symbol)}｜{symbol}",
+                              lambda now, symbol=symbol, quote=quote: self.contract_odds(symbol, quote.price, now, quote.timestamp_ms)))
+        for key, title, odds_of in cards:
             raw = odds_of(now_ms)
             if not isinstance(raw, CloseOdds) or now_ms - self.pred_last.get(key, -PRED_EVERY_MS) < PRED_EVERY_MS:
                 continue
@@ -14969,7 +14975,8 @@ class Bot:
     def index_sigma_calibs(self) -> dict[tuple[str, str], tuple[float, int]]:
         """The σ factor of each index card and mode (盘中 / 盘后) from its scored snapshots (residual_factor), for
         VolBook.get (SIGMA_CALIB, 1.106.1): measured when an outcome comes in (note_outcome) and at the start."""
-        saved = [v for _, v in self.store.items("pred:") if isinstance(v, dict) and self.PRED_FIELDS <= v.keys()]
+        saved = [v for _, v in self.store.items("pred:") if isinstance(v, dict) and self.PRED_FIELDS <= v.keys()
+                 and v.get("key") in PREDICT_KEYS.values()]  # the index cards alone: a stock card's snapshots are scored, not applied (1.120.1)
         outcomes = {k.removeprefix("outcome:"): float(v) for k, v in self.store.items("outcome:")}
         groups: dict[tuple[str, str], list[dict]] = {}
         for p in saved:

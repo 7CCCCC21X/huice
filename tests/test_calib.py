@@ -59,7 +59,7 @@ line = next(x for x in text.splitlines() if x.startswith("  对比 Predict 盘�
 assert line.startswith("  对比 Predict 盘口中间价（60 条/30 日）：模型 Brier ") and "模型更接近结果的占" in line and "没有赢过市场" not in line, line
 assert "对比 Predict" not in "\n".join(m.calibration_report(preds, outcomes))  # no middles saved: no comparison
 assert "至少要 15 个才下结论" in few, few
-assert m.calibration_report([], {}) == ["📐 还没有保存的预测快照（每个指数每 30 分钟存一条，需要概率功能开启）"]
+assert m.calibration_report([], {}) == ["📐 还没有保存的预测快照（每个指数和个股卡每 30 分钟存一条，需要概率功能开启）"]
 
 
 # --- the bot saves snapshots every 30 min and closes as they become known ----------------------------

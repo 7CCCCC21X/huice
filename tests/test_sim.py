@@ -163,7 +163,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_against_move_sigmas": 1.0, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60, "sim_shares_net": True, "sim_no_odds_withdraw": 30, "sim_taker_hold_range": 30.0,
+                                "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_against_move_sigmas": 0.0, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60, "sim_shares_net": True, "sim_no_odds_withdraw": 30, "sim_taker_hold_range": 30.0,
                                     "sim_maker_follow_settle": 0.0, "sigma_calib": True, "lead_quote": "on"} and maker["market_id"] == "101"  # 1.107.0: the two always written  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))
@@ -1868,16 +1868,18 @@ async def open_quiet():
     # bought, maker or taker, and a resting order there is withdrawn; the other side, a smaller move and the index cards are untouched
     stock = lambda move: m.dataclasses.replace(hsi(0.30, [("0.10", "300")], [("0.15", "400")], at), key="SKHYNIXUSDT", item="SK 海力士",
                                                 move=move, sigma_day=0.05, in_session=False)
-    assert qbot.config.sim_against_move_sigmas == 1.0 and qbot.config.sim_against_move_index is False
-    assert qbot.sim_against_move(stock(-0.10), "up") == "今日已跌 10.0%、2.0 个日 σ，不买涨、挂着的撤掉（SIM_AGAINST_MOVE_SIGMAS）"
-    assert qbot.sim_against_move(stock(-0.10), "down") == "" and qbot.sim_against_move(stock(-0.04), "up") == "" and qbot.sim_against_move(stock(-0.05), "up").startswith("今日已跌 5.0%、1.0 个日 σ")
-    assert qbot.sim_against_move(stock(0.10), "down") == "今日已涨 10.0%、2.0 个日 σ，不买跌、挂着的撤掉（SIM_AGAINST_MOVE_SIGMAS）" and qbot.sim_against_move(stock(0.10), "up") == ""
-    assert qbot.sim_against_move(m.dataclasses.replace(stock(-0.10), key="HSI"), "up") == "" and qbot.sim_against_move(m.dataclasses.replace(stock(-0.10), kind="updown"), "up") == ""
-    assert qbot.sim_maker_pick(stock(-0.10), qbot.sim_trades(), "up", m.BookEdge("涨", True, 0.10, 0.20, 300), at)[1].startswith("今日已跌 10.0%")
-    assert qbot.sim_maker_pick(stock(-0.10), qbot.sim_trades(), "down", m.BookEdge("跌", True, 0.85, 0.05, 400), at)[1] == ""
+    assert qbot.config.sim_against_move_sigmas == 0.0 and qbot.config.sim_against_move_index is False  # 1.120.1: off unless set
+    assert qbot.sim_against_move(stock(-0.30), "up") == "" and qbot.sim_maker_pick(stock(-0.30), qbot.sim_trades(), "up", m.BookEdge("涨", True, 0.10, 0.20, 300), at)[1] == ""
+    abot = m.Bot(m.Config.from_env({**env, "SIM_AGAINST_MOVE_SIGMAS": "1"}), m.Store(":memory:"), FM(NOW), None)
+    assert abot.sim_against_move(stock(-0.10), "up") == "今日已跌 10.0%、2.0 个日 σ，不买涨、挂着的撤掉（SIM_AGAINST_MOVE_SIGMAS）"
+    assert abot.sim_against_move(stock(-0.10), "down") == "" and abot.sim_against_move(stock(-0.04), "up") == "" and abot.sim_against_move(stock(-0.05), "up").startswith("今日已跌 5.0%、1.0 个日 σ")
+    assert abot.sim_against_move(stock(0.10), "down") == "今日已涨 10.0%、2.0 个日 σ，不买跌、挂着的撤掉（SIM_AGAINST_MOVE_SIGMAS）" and abot.sim_against_move(stock(0.10), "up") == ""
+    assert abot.sim_against_move(m.dataclasses.replace(stock(-0.10), key="HSI"), "up") == "" and abot.sim_against_move(m.dataclasses.replace(stock(-0.10), kind="updown"), "up") == ""
+    assert abot.sim_maker_pick(stock(-0.10), abot.sim_trades(), "up", m.BookEdge("涨", True, 0.10, 0.20, 300), at)[1].startswith("今日已跌 10.0%")
+    assert abot.sim_maker_pick(stock(-0.10), abot.sim_trades(), "down", m.BookEdge("跌", True, 0.85, 0.05, 400), at)[1] == ""
     bid = {"kind": "close", "key": "SKHYNIXUSDT", "market": "x", "side": "up", "label": "挂涨", "maker": True, "status": "resting", "shares": 0.0, "order": 100.0, "price": 0.10,
            "settle": {"close_ms": at + 10 * 3_600_000}}
-    assert qbot.sim_withdraw_reason(bid, stock(-0.10), at).startswith("今日已跌 10.0%") and qbot.sim_withdraw_reason(bid, stock(-0.02), at) == ""
+    assert abot.sim_withdraw_reason(bid, stock(-0.10), at).startswith("今日已跌 10.0%") and abot.sim_withdraw_reason(bid, stock(-0.02), at) == ""
     ibot = m.Bot(m.Config.from_env({**env, "SIM_AGAINST_MOVE_INDEX": "on", "SIM_AGAINST_MOVE_SIGMAS": "1.5"}), m.Store(":memory:"), FM(NOW), None)
     assert ibot.sim_against_move(m.dataclasses.replace(stock(-0.10), key="HSI"), "up").startswith("今日已跌 10.0%、2.0 个日 σ") and ibot.sim_against_move(stock(-0.07), "up") == ""
     obot = m.Bot(m.Config.from_env({**env, "SIM_AGAINST_MOVE_SIGMAS": "0"}), m.Store(":memory:"), FM(NOW), None)

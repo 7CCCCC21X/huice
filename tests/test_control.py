@@ -156,7 +156,7 @@ async def run():
     assert s["SIM_AFTER_HOURS_MAX_SHARES"]["value"] == "300" and s["SIM_AFTER_HOURS_MAX_SHARES"]["zero"] == "不限" and s["SIM_AFTER_HOURS_MAX_SHARES"]["unit"] == "份"
     assert s["SIM_SHARES_NET"]["value"] == "on" and s["SIM_SHARES_NET"]["group"] == "策略" and s["SIM_SHARES_NET"]["options"] == [["on", "按净头寸"], ["off", "每边单独"]]  # 1.91.0
     assert s["SIM_OPEN_QUIET_MINUTES"]["value"] == "3" and s["SIM_OPEN_QUIET_MINUTES"]["unit"] == "分钟" and s["SIM_OPEN_QUIET_MINUTES"]["zero"] == "不限"
-    assert s["SIM_AGAINST_MOVE_SIGMAS"]["value"] == "1" and s["SIM_AGAINST_MOVE_SIGMAS"]["unit"] == "σ" and s["SIM_AGAINST_MOVE_INDEX"]["value"] == "off"  # 1.120.0
+    assert s["SIM_AGAINST_MOVE_SIGMAS"]["value"] == "0" and s["SIM_AGAINST_MOVE_SIGMAS"]["unit"] == "σ" and s["SIM_AGAINST_MOVE_INDEX"]["value"] == "off"  # 1.120.0; off by default (1.120.1)
     assert s["SIM_NO_ODDS_WITHDRAW_MINUTES"]["value"] == "30" and s["SIM_NO_ODDS_WITHDRAW_MINUTES"]["zero"] == "不撤" and s["SIM_NO_ODDS_WITHDRAW_MINUTES"]["unit"] == "分钟" and "60" in s["SIM_NO_ODDS_WITHDRAW_MINUTES"]["presets"]  # 1.92.0
     assert s["SIM_SECONDS"]["kind"] == "number" and s["SIM_SECONDS"]["group"] == "高级" and s["SIM_SECONDS"]["value"] == "5" and s["SIM_SECONDS"]["unit"] == "秒" and "3" in s["SIM_SECONDS"]["presets"]
     assert s["PREDICT_POLL_SECONDS"]["kind"] == "number" and s["PREDICT_POLL_SECONDS"]["value"] == "10" and "5" in s["PREDICT_POLL_SECONDS"]["presets"] and data["cadence"] == {"sim": 5, "book": 10, "cold": 30}
