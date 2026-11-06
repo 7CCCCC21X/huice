@@ -97,6 +97,8 @@ assert L.jwt_expiry(tok) == 1800000000 and L.jwt_expiry("bad") == 0 and L.jwt_ex
 assert L.http_status(m.RemoteError("HTTP 401: nope")) == 401 and L.http_status(m.RemoteError("网络错误")) == 0
 assert L.order_fill({"amount": str(100 * WEI), "amountFilled": str(30 * WEI), "status": "open"}, 100) == (30.0, "OPEN")
 assert L.order_fill({"amount": "0", "status": "FILLED"}, 60) == (60.0, "FILLED") and L.order_fill({"status": "CANCELLED"}, 60) == (0.0, "CANCELLED")
+assert L.order_fill({"amount": str(100 * WEI), "amountFilled": "0", "status": "FILLED"}, 100) == (100.0, "FILLED")  # 1.130.2: filled, by its own word
+assert L.order_fill({"amount": str(100 * WEI), "status": "MATCHED"}, 100) == (100.0, "MATCHED") and L.order_fill({"amount": str(100 * WEI), "amountFilled": "0", "status": "CANCELLED"}, 100) == (0.0, "CANCELLED")
 assert L.order_fill({"amount": "100", "amountFilled": "250"}, 100) == (100.0, "")  # never more than ordered
 assert L.order_price({"averagePrice": "0.58"}) == 0.58 and L.order_price({"avgPrice": str(58 * 10 ** 16)}) == 0.58 and L.order_price({}) is None
 assert L.order_price({"averagePrice": "0"}) is None and L.order_hash_of({"order": {"hash": "0xAB"}}) == "0xab" and L.order_hash_of({"hash": "0xCD"}) == "0xcd"
@@ -614,6 +616,8 @@ async def run():
     assert "没有真实挂单可撤" in await bot.cmd_live(req("cancel", "all"))
     fake.positions_rows = [{"id": "p1", "market": {"id": 101, "title": "恒生指数 10-05"}, "outcome": {"name": "Down", "indexSet": 2, "onChainId": "1012"},
                             "amount": str(100 * WEI), "valueUsd": "100"}]
+    report = await bot.cmd_live(req("fills"))  # 1.130.2: the account's positions against the records, outcome by outcome
+    assert "持仓核对" in report and "恒生指数 10-05 / Down：账户 100 份" in report and "订单 #" in report, report
     assert "恒生指数 10-05｜Down 100 份｜≈$100.00" in await bot.cmd_live(req("positions"))
     assert "开放订单" in await bot.cmd_live(req("orders")) and "自检" in await bot.cmd_live(req("check"))
     assert (await bot.cmd_live(req("positions", "raw"))).startswith("Predict 持仓原始记录（前 10 条）：\n{") and '"id": "p1"' in await bot.cmd_live(req("positions", "raw"))  # 1.119.3

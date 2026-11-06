@@ -495,8 +495,13 @@ def order_fill(row: dict, ordered_shares: float) -> tuple[float, str]:
         except (TypeError, ValueError):
             return 0.0, status
     if amount <= 0:
-        return (ordered_shares if status == "FILLED" else 0.0), status
+        return (ordered_shares if status in FILLED_STATUSES else 0.0), status
+    if filled <= 0 and status in FILLED_STATUSES:
+        filled = amount  # 1.130.2: a record that says filled without the amount: the whole order, by its own word (not "一份都没成交")
     return min(ordered_shares, ordered_shares * filled / amount), status
+
+
+FILLED_STATUSES = {"FILLED", "MATCHED", "COMPLETED", "DONE"}  # a record ending so is every share filled, whatever amount it states
 
 
 FINAL_STATUSES = {"FILLED", "CANCELLED", "CANCELED", "EXPIRED", "INVALIDATED", "REJECTED", "FAILED", "MATCHED", "CLOSED",
@@ -1950,6 +1955,50 @@ class LiveBot(core.Bot):
 
     LIVE_TRIM_MAX = 0.05                       # a holding short of the records by more than this share is not a fee: left as it is (noted on the page)
 
+    async def live_fills_report(self, now_ms: int) -> str:
+        """/live fills: the account's positions against the records, outcome by outcome — what the account holds, what the
+        records of the last two days say, the pre-open mode's fills, the gap — and each record's order with Predict's last
+        word on it (status, shares, how it ended). The evidence when a fill seems lost (1.130.2)."""
+        try:
+            rows = await self.live.api.positions()
+        except Exception as error:
+            return f"持仓读取失败：{core.clean_error(error) or type(error).__name__}"
+        complete = getattr(self.live.api, "positions_complete", True)
+        key_of = lambda t: (str((t["live"].get("want") or {}).get("market_id") or t.get("market_id") or ""), int((t["live"].get("want") or {}).get("index_set") or 0))
+        held: dict[tuple[str, int], tuple[float, float | None, str]] = {}
+        for row in rows:
+            market = row.get("market") if isinstance(row.get("market"), dict) else {}
+            outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
+            k = (str(market.get("id") or row.get("marketId") or ""), int(outcome.get("indexSet") or 0))
+            shares, price = self.position_shares(row), self.position_price(row)
+            name = f"{market.get('title') or market.get('question') or market.get('slug') or k[0]} / {outcome.get('name') or outcome.get('title') or k[1]}"
+            was = held.get(k, (0.0, None, name))
+            held[k] = (was[0] + shares, price if price is not None else was[1], name)
+        recs: dict[tuple[str, int], list[tuple[str, dict]]] = {}
+        for tid, t in self.sim_trades().items():
+            if isinstance(t.get("live"), dict) and (float(t.get("shares") or 0) > 1e-9 or now_ms - core.trade_updated(t) <= 2 * core.DAY_MS):
+                recs.setdefault(key_of(t), []).append((tid, t))
+        preopen = self.preopen_filled()
+        lines = [f"持仓核对 {core.stamp(now_ms, seconds=False)}：账户 {len(held)} 个持仓" + ("" if complete else "（列表被截断，可能不全）")
+                 + f"，两天内的记录 {sum(len(v) for v in recs.values())} 条"
+                 + (f"；上次自动核对 {(now_ms - self.live_late_checked) // 1000} 秒前" if self.live_late_checked else "；还没自动核对过")]
+        for k in sorted(set(held) | set(recs), key=lambda k: -max([held.get(k, (0.0,))[0]] + [float(t.get("shares") or 0) for _, t in recs.get(k, [])])):
+            shares, price, name = held.get(k, (0.0, None, ""))
+            r = sorted(recs.get(k, []), key=lambda kv: core.trade_updated(kv[1]), reverse=True)
+            name = name or (r[0][1].get("item", k[0]) + " / " + r[0][1].get("label", str(k[1])) if r else f"{k[0]} / {k[1]}")
+            recorded, po = sum(float(t.get("shares") or 0) for _, t in r), float(preopen.get(k, 0.0))
+            gap = shares - recorded - po
+            lines.append(f"{name}：账户 {shares:g} 份" + (f"（均价 {core.cents(price)}）" if price is not None else "") + f"，记录 {recorded:g} 份"
+                         + (f"，预挂 {po:g} 份" if po else "") + (f"，差 {gap:+g} 份" if abs(gap) > 0.01 else "，一致"))
+            for tid, t in r[:6]:
+                st = t["live"]
+                lines.append(f"  · {t.get('label', '')} {core.cents(float(t['price']))}×{float(t.get('order') or 0):g}：{t['status']}，成交 {float(t.get('shares') or 0):g} 份，"
+                             f"订单 #{st.get('order_id') or '-'}，Predict 状态 {st.get('api_status') or '?'}，{st.get('final') or st.get('state') or '?'}"
+                             + (f"；{t['note']}" if t.get("note") else ""))
+        if len(lines) == 1:
+            lines.append("两天内没有持仓，也没有记录")
+        return "\n".join(lines)
+
     async def live_late_fills(self, now_ms: int) -> None:
         """The account's positions against the records, once a minute (1.119.0): one read of the positions, then
         (a) fills that landed as an order was ending and were not read then (a 300-share KOSPI order withdrawn with 0
@@ -2699,6 +2748,8 @@ class LiveBot(core.Bot):
         if action == "check":
             lines = await self.live_prepare()
             return "🔎 真实交易自检\n" + "\n".join(lines) + ("\n最近错误：\n" + "\n".join(self.live_errors[-5:]) if self.live_errors else "")
+        if action == "fills":  # 1.130.2: the account's positions against the records, outcome by outcome
+            return await self.live_fills_report(now_ms)
         if action == "orders":
             if not self.live.ready:
                 return f"未就绪：{self.live.not_ready_why}"
