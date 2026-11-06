@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.137.2"
+VERSION = "1.138.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -4933,7 +4933,9 @@ PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
 PREDICT_PARALLEL = 16           # Predict requests in flight at once, on Predict's own thread pool (predict_blocking): the
                                 # hot round (a dozen markets, each answer about a second) goes out in one batch
-PREDICT_POOL_WORKERS = 20       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
+PREDICT_POOL_WORKERS = 32       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
+                                # (1.138.0: 20 was the feed's 16 and the trader's 4; the pre-open mode's two clients add 8 — an order
+                                # or a cancel queued behind their reads)
                                 # feeds' pool, where a 502-ing scraper held threads for the 12-second timeout (a round took 60 s)
 PREDICT_LADDER_PARALLEL = 8     # of those, at most this many may be ladder levels at once: a hot ladder's levels never
                                 # queue the daily cards' books behind them
@@ -5474,6 +5476,7 @@ class PredictFeed:
         self.row_asked: dict[str, dict[str, float]] = {}         # item key -> market id -> the same, for a ladder's levels
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
         self.calls = 0                                           # requests sent (/diag: the request rate on the API key, 1.137.2)
+        self.limited: collections.deque = collections.deque(maxlen=500)  # monotonic times of the 429s answered (/diag, 1.138.0)
         self.rate_samples: collections.deque = collections.deque(maxlen=130)  # (monotonic, calls), sampled as the rounds run
         self.stream = PredictStream(self)                        # Predict's WebSocket: the hot markets' books pushed as they change (1.86.0)
         self.express_by_key: dict[str, asyncio.Task] = {}        # item key -> its express look under way (updated: pushes are coalesced)
@@ -5506,6 +5509,8 @@ class PredictFeed:
             except RemoteError as error:
                 if error.retry_after or "429" in str(error):
                     self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, PREDICT_BACKOFF_SECONDS))
+                    if "429" in str(error):
+                        self.limited.append(time.monotonic())  # /diag (1.138.0)
                 raise
         try:
             return json.loads(raw)
@@ -10137,6 +10142,12 @@ def sim_position(trade: Mapping) -> bool:
     return bool(trade.get("maker")) and trade.get("status") == "filled" and float(trade.get("shares") or 0) > 1e-9 and not trade.get("final")
 
 
+def same_refusal(a: str, b: str) -> bool:
+    """Whether two refusal texts say the same thing, whatever their countdown ("N 秒后再试"): a refusal the size does not change."""
+    norm = lambda s: re.sub(r"\d+ 秒", "N 秒", str(s or ""))
+    return bool(a) and norm(a) == norm(b)
+
+
 def sim_spent(trade: Mapping) -> bool:
     """A resting order that ended with nothing filled — withdrawn, cancelled or expired, whoever ended it — holds nothing:
     its slot is free for the next order, which moves it to tid#n. Before 1.101.2 only the trader's own withdrawals freed
@@ -14128,6 +14139,8 @@ class Bot:
         self.fair_sig: tuple | None = None  # the fair prices as of the last feed refresh (note_job): a change wakes the trader
         self.fair_sig_at = -1e9
         self.sim_lock = asyncio.Lock()      # the step's decisions and the express lane never run side by side
+        self.sim_follow_readonly = False    # sim_why's look: the follow's settle clocks are read, never started or reset (1.138.0)
+        self.sim_cooling_timers: dict[str, asyncio.TimerHandle] = {}  # slot -> the express look armed for its cooldown's end (sim_cooling_wake)
         self.sim_express_count = 0          # decisions made by the express lane (for /diag)
         self.sim_express_withdrawn: dict[str, tuple[float, float]] = {}  # slot -> (monotonic time, price) of the order the express lane withdrew (sim_express_cooling)
         self.sim_requote_count = 0          # orders placed in the very look that withdrew the slot's last one, or right after its confirmed cancel (for /diag)
@@ -17356,6 +17369,7 @@ class Bot:
         if c.sim_ways == "maker":
             return {**out, "state": "off", "text": "SIM_WAYS=maker：只挂单，不吃单", "short": "只挂单"}
         why = (f"卡片暂不建议（{mk.hold}）" if mk.hold else "盘口过期" if mk.book.stale(now_ms)
+               else "盘口交叉（买价高过卖价），这一刻的快照不可信" if book_crossed(mk.book)  # 1.138.0: the trader skips it; the card said 可吃单
                else self.sim_taker_closed(mk))
         sides = []
         for side in ("up", "down"):
@@ -17382,6 +17396,8 @@ class Bot:
             elif not got and ask <= cap + 1e-9:
                 block = f"封顶 {cents(cap)} 之下只有零星卖单（不足 1 份）"
             gap = round(ask - cap, 6) if ask is not None and cap > 0 else None
+            if why and not block:
+                block = why  # 1.138.0: under the headline's reason the sides are not buyable — no "可买 N 份" beside "不吃单"
             sides.append({"side": side, "label": label, "fair": fair, "model": model, "cut": cut, "capped": capped, "cap": cap, "ask": ask,
                           "gap": gap, "got": got, "taken": taken, "block": block, "edge": round(fair - q["cost"], 6) if got else None, "quote": q})
         out["sides"] = [{k: v for k, v in s.items() if k != "quote"} for s in sides]
@@ -17442,7 +17458,19 @@ class Bot:
                          (f"低价单，买1 已到 {cents(top[0])}" if top is not None and top[0] > price + 1e-9 else "买1 之上 1¢") if rest.get("deep")
                          else f"跟买{rest['join_level']}" if rest.get("join_level") else "跟买1")
                 filled = float(rest.get("shares") or 0)
-                leave = (self.sim_withdraw_reason(rest, mk, now_ms) or self.sim_requote_reason(rest, mk, now_ms)).removesuffix("，撤单")
+                self.sim_follow_readonly = True  # 1.138.0: building the card never starts or resets a follow's settle clock
+                try:
+                    leave = (self.sim_withdraw_reason(rest, mk, now_ms) or self.sim_requote_reason(rest, mk, now_ms)).removesuffix("，撤单")
+                finally:
+                    self.sim_follow_readonly = False
+                live_st = rest["live"] if isinstance(rest.get("live"), dict) else {}
+                if live_st.get("state") in ("pending", "placing"):  # 1.138.0: decided, not on Predict yet — it read 挂单中 while a cooldown held it
+                    word = "等待发送" if live_st["state"] == "pending" else "发送中"
+                    why_wait = str(live_st.get("last_error") or "") if live_st["state"] == "pending" else ""
+                    rows.append({"side": side, "label": label, "state": "resting", "short": f"{label} {word} {cents(price)}",
+                                 "text": own + f"{word}：{cents(price)}×{float(rest.get('order') or 0):g} 份（{place}），还没挂到 Predict 上"
+                                         + (f"；{why_wait}" if why_wait else "") + (f"；发出前若{leave}则不发" if leave else "")})
+                    continue
                 rows.append({"side": side, "label": label, "state": "resting", "short": f"{label} 挂单中 {cents(price)}",
                              "text": own + f"挂单中：{cents(price)}×{float(rest.get('order') or 0):g} 份（{place}"
                                      + (f"，已成交 {filled:g} 份" if filled > 1e-9 else "") + "）" + (f"；下一轮撤掉：{leave}" if leave else "")})
@@ -17906,7 +17934,13 @@ class Bot:
             if abs(float(trade.get("order") or 0) - self.sim_floor_shares(price)) > 1e-9:
                 return f"托底单份数已改为 {self.sim_floor_shares(price):g} 份，按新份数重挂"
         if c.sim_maker_min_bid > 0 or deep_order or floor_order:  # SIM_MAKER_MIN_BID=0: an ordinary order is not re-quoted; a deep-bid order keeps its place whatever the setting
-            own = max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0) if isinstance(trade.get("live"), dict) else 0.0
+            # our own unfilled shares, taken out of the level they rest at — only once Predict has the order on its book (1.138.0: a
+            # decision not yet sent, or in flight, was subtracted from a level it is not in, so a 跟买1 joining a thin 买1 saw the 买1
+            # "gone" and was voided at the send, or withdrawn by the express lane before it ever reached Predict)
+            live_st = trade.get("live") if isinstance(trade.get("live"), dict) else None
+            on_book = live_st is not None and (live_st.get("state") not in ("pending", "placing")
+                                               or (live_st.get("state") == "placing" and mk.book.fetched_ms >= int(live_st.get("sent_at") or 10 ** 15)))
+            own = max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0) if on_book else 0.0
             level = maker_level(mk.book, side, max(c.sim_maker_min_bid, SIM_MAKER_FRONT_MIN) if deep_order else c.sim_maker_min_bid, own, price)
             if level is None:
                 if floor_order:
@@ -17961,6 +17995,8 @@ class Bot:
             return True
         held = self.sim_follow_since.get(key)
         if held is None or abs(held[0] - target) >= SIM_MAKER_FOLLOW - 1e-9:
+            if self.sim_follow_readonly:
+                return False  # the card's look (sim_why): not settled, and no clock started for it
             self.sim_follow_since[key] = (target, now_ms)
             self.sim_follow_wake(book_key, settle)  # the lane looks again by itself once the settle has run out
             return False
@@ -18460,7 +18496,9 @@ class Bot:
             side = "up" if maker.side == "涨" else "down"
             tid = f"{mk.market}|{side}|挂"
             if express and self.sim_express_cooling(tid, float(maker.price)):
-                return
+                self.sim_cooling_wake(tid, mk.key)  # 1.138.0: looked at again when the cooldown ends; the other side has its turn now
+                refused.add(side)
+                continue
             held = trades.get(tid)  # one order per market, side and way at a time; a position from a filled one lets the next in
             if held is not None and not sim_position(held) and not sim_spent(held):  # (an order over unfilled: sim_spent)
                 return
@@ -18475,7 +18513,24 @@ class Bot:
                 changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]
             trades[tid] = self.sim_open(mk, side, now_ms, maker=maker, shares=count)
             changed.append((tid, trades[tid]))
+            refused.add(side)  # 1.138.0: the other side in the same look — the card showed both 可挂, the second waited for the next look
+
+    def sim_cooling_wake(self, tid: str, key: str) -> None:
+        """The express lane looks at ``key`` again when the slot's cooldown ends (a timer, as the follow settle's): nothing
+        else may come before the next step (1.138.0)."""
+        held = self.sim_express_withdrawn.get(tid)
+        if held is None or tid in self.sim_cooling_timers or not (self.config.sim and self.config.predict):
             return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        left = max(0.0, self.SIM_EXPRESS_COOLDOWN_SECONDS - (time.monotonic() - held[0]))
+
+        def fire() -> None:
+            self.sim_cooling_timers.pop(tid, None)
+            self.predict.updated(key)
+        self.sim_cooling_timers[tid] = loop.call_later(left + 0.1, fire)
 
     def sim_express_cooling(self, tid: str, price: float) -> bool:
         """Whether the express lane leaves this slot alone: it withdrew the slot's order within SIM_EXPRESS_COOLDOWN_SECONDS
@@ -18661,6 +18716,8 @@ class Bot:
                 # the smaller order is refused too, for what the full one never reached (the order limit is checked
                 # first): that is the refusal that matters (1.92.1: "单笔 $133.70 超过 LIVE_MAX_ORDER_USD" stood for an
                 # exposure limit with no room left — the bot looked unwilling to buy $100 of a 177-share chance)
+                if same_refusal(again, why):
+                    return q, why  # 1.138.0: not about the size (a backoff, an order in flight, a cooldown): said as itself, not as "缩到 N 份仍被拦"
                 return q, f"缩到 {qb['got']:g} 份（${limit * qb['got']:,.2f}）仍被拦：{again}"
         return q, self.sim_no_fit_why(trades, limit) or why
 
@@ -18721,6 +18778,8 @@ class Bot:
             again = self.sim_group_room(trades, mk, side, maker.price, float(best))
             if not again:
                 return float(best), ""
+            if same_refusal(again, why):
+                return want, why  # 1.138.0: not about the size: said as itself
             return want, f"缩到 {best:g} 份（${maker.price * best:,.2f}）仍被拦：{again}"  # (1.92.1: the refusal that matters)
         return want, self.sim_no_fit_why(trades, maker.price) or why
 
@@ -20706,7 +20765,13 @@ class Bot:
         # Discard the old batch rather than sending alerts using a now-obsolete mode.
         if self.settings() != settings:
             return
+        moved = [symbol for symbol, snap in collected.items()  # 1.138.0: a contract's sampled quote that moved goes to the express lane,
+                 if isinstance(snap.get("quote"), Quote)          # as a pushed one does (the futures stream is mute in some regions)
+                 and isinstance((old := (self.snapshots.get(symbol) or {}).get("quote")), Quote)
+                 and (snap["quote"].price != old.price or snap["quote"].source != old.source)]
         self.snapshots = collected
+        if moved and self.config.sim and self.config.predict:
+            self.priced(moved)
         if inline and self.config.probability:
             with contextlib.suppress(Exception):  # Probabilities are informational; never block alerts.
                 await self.refresh_odds_inputs(now_ms)
@@ -21062,6 +21127,9 @@ class Bot:
                 rates = getattr(self, "live_request_rates", None)
                 if name == "模拟交易" and rates and (rate_list := rates()):
                     detail += "｜Predict 请求每秒（最近一分钟，同一个 API key）：" + "、".join(rate_list)
+                limited = getattr(self, "live_limited_counts", None)
+                if name == "模拟交易" and limited:
+                    detail += "｜24 小时内被限流（429）：" + limited()
                 if name == "模拟交易" and self.sim_express_count:
                     detail += f"｜快车道决定 {self.sim_express_count} 次"
                 if name == "模拟交易" and self.sim_requote_count:
@@ -21265,23 +21333,36 @@ class Bot:
 
     def fair_signature(self, now_ms: int) -> tuple:
         """Every priced market's fair price, to the tenth of a cent: the trader looks again when it changes."""
-        return tuple(sorted((mk.market, round(mk.fair_up, 3)) for mk in self.sim_markets(now_ms)))
+        return self.fair_signature_keys(now_ms)[0]
+
+    def fair_signature_keys(self, now_ms: int) -> tuple[tuple, dict[str, str]]:
+        """The fair signature and each market's book key (note_job: the keys whose fair price moved)."""
+        markets = self.sim_markets(now_ms)
+        return tuple(sorted((mk.market, round(mk.fair_up, 3)) for mk in markets)), {mk.market: mk.key for mk in markets}
 
     def note_job(self, name: str, now_ms: int) -> None:
         """A reference feed just refreshed (reference_loop): when a fair price moved, the trader looks now — the books of
-        the last round are at most a few seconds old — instead of at its next timer or book round."""
-        if name not in self.WAKE_JOBS or not (self.config.sim and self.config.predict) or self.sim_wake:
+        the last round are at most a few seconds old — instead of at its next timer or book round; and the keys whose fair
+        price moved go to the express lane at once (priced). 1.138.0: a proxy read by REST — the HSI night futures, the A50,
+        KOSPI — only woke the step, which runs back to back at its own length (8 s and more): a chance its move opened on a
+        book that did not change waited for that step or the next book round."""
+        if name not in self.WAKE_JOBS or not (self.config.sim and self.config.predict):
             return
         if time.monotonic() - self.fair_sig_at < 1.0:  # a dozen feeds tick every second: one look a second is enough
             return
         self.fair_sig_at = time.monotonic()
         try:
-            sig = self.fair_signature(now_ms)
+            sig, keys = self.fair_signature_keys(now_ms)
         except Exception as error:
             self.log_limited("fair-sig", f"公平价签名计算失败：{clean_error(error) or type(error).__name__}")
             return
         if sig != self.fair_sig:
+            before = dict(self.fair_sig or ())
+            moved = {keys[market] for market, fair in sig if before.get(market) != fair and market in keys}
+            first = self.fair_sig is None
             self.fair_sig, self.sim_wake = sig, True
+            if moved and not first and name != "行情推送":  # a push's own keys were looked at by price_looks already
+                self.priced(moved)
 
     PRICE_LOOK_DELAY = 0.1  # pushes gathered this long before the keys they move are looked at (a busy pair ticks many times a second; 1.111.0: 0.1, was 0.2)
 

@@ -466,11 +466,11 @@ async def run():
     trades = bot.sim_trades()
     assert "deep|up|吃" not in trades and trades["deep|up|吃#1"]["status"] == "cancelled" and "103" in fake.closed
     assert trades["deep|up|吃#1"]["live"]["final"] == "failed" and "吃单未成交" in trades["deep|up|吃#1"]["note"]
-    assert ("deep", "up") in bot.live_backoff and "再试" in bot.live_room(trades, deep(NOW + 121_000), "up", 0.58, 100)
-    assert 0 < bot.live_backoff[("deep", "up")][0] - time.monotonic() <= 30, "the timer's cancel: the taker's short wait (1.90.0), not a failure's"
+    assert ("deep", "up", "吃") in bot.live_backoff and "再试" in bot.live_room(trades, deep(NOW + 121_000), "up", 0.58, 100, {"want": 100}) and not bot.live_room(trades, deep(NOW + 121_000), "up", 0.58, 100).endswith("秒后再试"), "1.138.0: by way — the maker is not shut out"
+    assert 0 < bot.live_backoff[("deep", "up", "吃")][0] - time.monotonic() <= 30, "the timer's cancel: the taker's short wait (1.90.0), not a failure's"
     await step(bot, NOW + 131_000, deep(NOW + 131_000))  # within LIVE_TAKER_RETRY_SECONDS: refused, and the refusal recorded
     assert "deep|up|吃" not in bot.sim_trades() and any(b["id"] == "deep|up|吃" and "再试" in b["why"] for b in bot.sim_blocks())
-    bot.live_backoff[("deep", "up")] = (time.monotonic() - 1, "x")
+    bot.live_backoff[("deep", "up", "吃")] = (time.monotonic() - 1, "x")
     await step(bot, NOW + 141_000, deep(NOW + 141_000))
     t = bot.sim_trades()["deep|up|吃"]
     assert t["live"]["order_id"] == "104" and bot.sim_trades()["deep|up|吃#1"]["status"] == "cancelled"  # the second attempt, the first kept
@@ -486,8 +486,8 @@ async def run():
     await step(bot, NOW + 210_000, thin(NOW + 210_000))
     trades = bot.sim_trades()
     assert "thin|up|吃" not in trades and trades["thin|up|吃#1"]["status"] == "cancelled" and "下单失败：HTTP 400" in trades["thin|up|吃#1"]["note"]
-    assert trades["thin|up|吃#1"]["live"]["state"] == "done" and ("thin", "up") in bot.live_backoff and bot.live_errors[-1].endswith("insufficient balance")
-    assert bot.live_backoff[("thin", "up")][0] - time.monotonic() > 290, "Predict's refusal: LIVE_RETRY_SECONDS"
+    assert trades["thin|up|吃#1"]["live"]["state"] == "done" and ("thin", "up", "吃") in bot.live_backoff and bot.live_errors[-1].endswith("insufficient balance")
+    assert bot.live_backoff[("thin", "up", "吃")][0] - time.monotonic() > 290, "Predict's refusal: LIVE_RETRY_SECONDS"
     # a request whose outcome is unknown (the network dropped) stays "placing": adopted by its hash when Predict lists it,
     # given up (never re-sent) when it does not within the grace period
     fake.fail_create = "网络错误 (TimeoutError)"
@@ -848,7 +848,7 @@ async def run():
         await step(sbot, NOW + 20_000, deep_at(NOW + 20_000, **move))
         tt = sbot.sim_trades()["deep|up|吃#1"]
         assert tt["live"]["cancel_why"] == why and ("remove", [st["order_id"]]) in sfake.calls and tt["status"] == "cancelled", (tt["live"], sfake.calls[-2:])
-        assert 0 < sbot.live_backoff[("deep", "up")][0] - time.monotonic() <= 30 and sbot.live_backoff[("deep", "up")][1].startswith("吃单未成交（"), "the bot's own withdrawal: the short wait (1.90.0)"
+        assert 0 < sbot.live_backoff[("deep", "up", "吃")][0] - time.monotonic() <= 30 and sbot.live_backoff[("deep", "up", "吃")][1].startswith("吃单未成交（"), "the bot's own withdrawal: the short wait (1.90.0)"
     # 1.90.0: a wobble of a few tenths across a cent boundary is not a move — the rest stays while its limit keeps the bar
     # less 2¢ (LIVE_TAKER_REST_SLACK); a real move still cancels it. (10-25: CXMT's rest at 48¢ was cancelled on a 0.3¢ dip of
     # the fair price, 48¢ -> 47¢ of cap, and its side then sat out 300 s with 649 shares on offer at 48¢ and +15¢ of edge)
@@ -2263,13 +2263,13 @@ async def send_rechecks():
         if case == "stale":  # 1.83.1: nothing to judge it on is no ground to fail it — it waits, its side not backed off
             t = bot.sim_trades()[tid]
             assert not created(bot) and t["live"]["state"] == "pending" and "没有新鲜盘口可复核" in t["live"]["last_error"], t["live"]
-            assert (HSI_SLUG, "up") not in bot.live_backoff
+            assert (HSI_SLUG, "up", "吃") not in bot.live_backoff
             continue
         t = bot.sim_trades()[f"{tid}#1"]
         assert not created(bot) and t["live"]["final"] == "failed", (case, t["live"])
         assert {"moved": "公平价变了：限价 58.0¢ 已高于现在的封顶价",
                 "held": "卡片暂不建议（测试暂不建议），5 秒前的吃单决定作废"}[case] in t["note"], (case, t["note"])
-        assert 0 < bot.live_backoff[(HSI_SLUG, "up")][0] - time.monotonic() <= 30, (case, "the re-check's drop: the short wait (1.90.0)")
+        assert 0 < bot.live_backoff[(HSI_SLUG, "up", "吃")][0] - time.monotonic() <= 30, (case, "the re-check's drop: the short wait (1.90.0)")
     # 1.83.1: a decision on a book 89 s old, its sign-in taking 1.5 s — the book is past PREDICT_STALE_MS at the re-check:
     # the order waits (it used to fail, its side backed off for 300 s), goes out once a fresh book still allows its limit,
     # and is given up only when the decision itself is too old to send
@@ -2389,9 +2389,12 @@ async def flush_rechecks():
             if case == "clear":
                 assert len(sent(bot)) == 1 and bot.sim_trades()[tid]["live"]["state"] == "open", bot.sim_trades()[tid]["live"]
                 continue
-            t = next(t for k, t in bot.sim_trades().items() if k.startswith(tid))
-            assert not sent(bot) and t["live"]["final"] == "failed" and t["live"]["hash"] == "" and t["status"] == "cancelled", (case, t["live"])
-            assert "发出前已撤单" in t["note"] or (case == "off" and "LIVE=off，不下单" in t["note"]), (case, t["note"])  # LIVE=off withdraws the pending record itself
+            keys = [k for k in bot.sim_trades() if k.startswith(tid)]
+            t = bot.sim_trades()[keys[0]]
+            # 1.138.0: withdrawn while the flush ran — never sent: finished as cancelled where it lives, one record, the side not backed off
+            assert keys == [f"{tid}#1"] and not sent(bot) and t["live"]["final"] == "cancelled" and t["live"]["hash"] == "" and t["status"] == "cancelled", (case, keys, t["live"])
+            assert t["note"].startswith("未下单：发出前已撤单（") and not any(k[:2] == (HSI_SLUG, "up") for k in bot.live_backoff), (case, t["note"], bot.live_backoff)
+            assert bot.store.get(f"sim:{tid}#1")["live"]["state"] == "done" and bot.store.get(f"sim:{tid}") is None, "one copy, in the store too"
     finally:
         asyncio.to_thread = to_thread
     async def down(): raise m.RemoteError("HTTP 503: sign-in down")
@@ -2662,3 +2665,134 @@ async def preopen_fills_not_adopted():
 
 
 asyncio.run(preopen_fills_not_adopted())
+
+
+async def missed_orders_fixes():
+    """1.138.0, from the audit of 11-07 (cards over the bar with no real order): a 429 on an order defers it; a cooldown that
+    began while a request waited for its slot sends nothing; the decision is stamped when it is made; a voided maker frees its
+    side in seconds and only its own way; an unsent order is not taken out of the book's level; a withdrawal while the request
+    is in flight keeps one copy; the whole-account snapshot releases an order of unknown state; a revived attempt is cancelled."""
+    tid = f"{HSI_SLUG}|up|挂"
+    # a 429 answered to the order: not a refusal — pending, deferred, no attempt record, no backoff
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare(); fake = bot.live.api
+    await bot.live_prefetch(NOW)
+    fake.fail_create = "HTTP 429: Too Many Requests"
+    await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    t = bot.sim_trades()[tid]
+    assert t["live"]["state"] == "pending" and t["live"]["hash"] == "" and "429" in t["live"]["last_error"] and not bot.live_backoff, (t["live"], bot.live_backoff)
+    assert f"{tid}#1" not in bot.sim_trades()
+    defers = sum(1 for e in t["live"]["events"] if e["what"].startswith("暂未发送"))
+    bot.live_defer(tid, t, "Predict 接口限流冷却中（7 秒后重试）", NOW)
+    bot.live_defer(tid, t, "Predict 接口限流冷却中（5 秒后重试）", NOW)
+    assert sum(1 for e in t["live"]["events"] if e["what"].startswith("暂未发送")) == defers + 1, "one event a cause, whatever its countdown"
+    why = bot.sim_why(hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW), bot.sim_trades(), NOW)
+    row = next(r for r in why["maker"]["sides"] if r["side"] == "up")
+    assert row["short"].startswith("挂涨 等待发送") and "还没挂到 Predict 上" in row["text"], row
+    # a cooldown that began while the request waited for its slot: nothing goes out into it
+    api = L.PredictApi("https://x", "k", None)
+    api.blocked_until = time.monotonic() + 9
+    sent = []
+    orig_blocking = m.predict_blocking
+    async def never(*a): sent.append(a)
+    m.predict_blocking = never
+    try:
+        try:
+            await api.send("POST", "/orders", {}, 5)
+            assert False, "sent into a cooldown"
+        except m.RemoteError as error:
+            assert L.http_status(error) == 0 and error.retry_after and not sent
+    finally:
+        m.predict_blocking = orig_blocking
+    # the decision's stamp: when it is made, not the pass's start
+    bot2 = make_bot(SIM_WAYS="maker")
+    await bot2.live_prepare(); await bot2.live_prefetch(NOW)
+    bot2.live.api.fail_create = "HTTP 503: down"  # the result unknown: it stays as decided
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    bot2.market.now = NOW + 1_500  # the pass took 1.5 s before this decision
+    trades = bot2.sim_trades()
+    rec = bot2.sim_open(world["markets"][0], "up", NOW, maker=bot2.sim_maker_reason(world["markets"][0], trades, NOW)[0], shares=100)
+    assert rec["live"]["events"][0]["at"] == NOW + 1_500 and rec["opened"] == NOW
+    # a maker voided by the send-time re-check: its own way backed off for seconds, the side's taker untouched
+    bot2.live_fail(tid, {**rec, "market": HSI_SLUG}, "未下单：盘口变了：测试", NOW, retry=bot2.LIVE_MAKER_VOID_SECONDS)
+    assert (HSI_SLUG, "up", "挂") in bot2.live_backoff and 0 < bot2.live_backoff[(HSI_SLUG, "up", "挂")][0] - time.monotonic() <= 3
+    mk = world["markets"][0]
+    assert bot2.live_room({}, mk, "up", 0.55, 100).endswith("秒后再试") and not bot2.live_room({}, mk, "up", 0.58, 100, {"want": 100, "cap": 0.59, "avg": 0.58, "levels": [[0.58, 100]]}).endswith("秒后再试")
+    # a decision held past LIVE_DECISION_MAX_MS: failed with no backoff (it took LIVE_RETRY_SECONDS)
+    bot3 = make_bot(SIM_WAYS="maker")
+    await bot3.live_prepare(); await bot3.live_prefetch(NOW)
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    rec3 = bot3.sim_open(world["markets"][0], "up", NOW, maker=bot3.sim_maker_reason(world["markets"][0], {}, NOW)[0], shares=100)
+    bot3.sim_save([(tid, rec3)])
+    assert not bot3.live_send_gate(tid, rec3, bot3.sim_trades(), NOW + 100_000, NOW + 100_000)
+    assert rec3["note"].startswith("未下单：决定已过时") and bot3.live_backoff[(HSI_SLUG, "up", "挂")][0] <= time.monotonic() + 0.01
+    # an unsent order is not taken out of the level it would join: a 跟买1 on a thin 买1 stays as decided
+    bot4 = make_bot(SIM_WAYS="maker", SIM_MAKER_MIN_BID="100", SIM_MAKER_FOLLOW_SETTLE_SECONDS="0")
+    await bot4.live_prepare(); await bot4.live_prefetch(NOW)
+    thin = hsi(0.70, [("0.55", "150"), ("0.53", "400")], [("0.58", "400")], NOW)
+    world["markets"] = [thin]
+    maker = bot4.sim_maker_reason(thin, {}, NOW)[0]
+    rec4 = bot4.sim_open(thin, "up", NOW, maker=maker, shares=100)
+    assert rec4["price"] == 0.55 and rec4["live"]["state"] == "pending"
+    assert bot4.sim_requote_reason(rec4, thin, NOW) == "", "pending: not on the book, nothing of the 买1 is ours"
+    rec4["live"].update(state="open", order_id="9", placed_at=NOW)
+    assert "买1" in bot4.sim_requote_reason(rec4, thin, NOW), "open: our 100 of the 150 are ours, the 买1 is not valid"
+    # withdrawn while the request is in flight: saved where the withdrawal moved it, never back at the slot
+    bot5 = make_bot(SIM_WAYS="maker")
+    await bot5.live_prepare(); fake5 = bot5.live.api
+    await bot5.live_prefetch(NOW)
+    real_create = fake5.create_order
+    async def create_then_withdraw(body):
+        out = await real_create(body)
+        t5 = bot5.sim_trades()[tid]
+        bot5.sim_withdraw(t5, "测试规则撤单", NOW)
+        t5["withdrawn"]["rule"] = True
+        bot5.sim_rekey(tid, t5)
+        return out
+    fake5.create_order = create_then_withdraw
+    await step(bot5, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    t5 = bot5.sim_trades()[f"{tid}#1"]
+    assert t5["live"]["state"] in {"cancelling", "done"} and t5["live"]["order_id"], t5["live"]
+    assert bot5.sim_trades().get(tid) is not t5 and (bot5.store.get(f"sim:{tid}") or {}).get("live", {}).get("order_id") != t5["live"]["order_id"], "one copy"
+    # an order of unknown state, the pre-open mode's complete snapshot without it: one look a snapshot
+    bot6 = make_bot(SIM_WAYS="maker")
+    st6 = {"state": "unknown", "order_id": "55", "hash": "0xgone", "unknown_since": NOW}
+    bot6.live.api.orders_complete = False
+    bot6.live_whole = ({"1", "2"}, {"0xa"}, NOW + 60_000)
+    assert bot6.live_counts_miss(st6, NOW) and not bot6.live_counts_miss(st6, NOW), "the same snapshot: one look"
+    bot6.live_whole = ({"55"}, set(), NOW + 120_000)
+    assert not bot6.live_counts_miss(st6, NOW), "on it: not a miss"
+    bot6.live_whole = (set(), set(), NOW - 1)
+    assert not bot6.live_counts_miss(st6, NOW), "read before it went unknown"
+    # a revived attempt (tid#n) is taken back to be cancelled, not left resting beside the slot's own order
+    bot7 = make_bot(SIM_WAYS="maker")
+    old = {**rec3, "status": "cancelled", "live": {**rec3["live"], "state": "done", "order_id": "77", "hash": "0xrev", "events": [{"at": NOW, "what": "x"}]}}
+    bot7.sim_save([(f"{tid}#3", old)])
+    row7 = {"id": "77", "status": "OPEN", "amount": str(100 * WEI), "amountFilled": "0", "order": {"hash": "0xrev"}}
+    bot7.live_readopt([row7], {"77": row7}, {"0xrev": row7}, NOW + 5_000)
+    assert bot7.sim_trades()[f"{tid}#3"]["live"]["state"] == "cancelling" and "尝试记录" in bot7.sim_trades()[f"{tid}#3"]["live"]["cancel_why"]
+    # a proxy move read by REST reaches the express lane (note_job → priced), not only the step
+    bot8 = make_bot(SIM_WAYS="maker")
+    moved = []
+    bot8.priced = lambda keys: moved.append(set(keys))
+    world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+    bot8.fair_sig_at = -1e9; bot8.note_job("恒指期货", NOW)
+    assert not moved, "the first signature: nothing to compare"
+    world["markets"] = [hsi(0.72, [("0.55", "300")], [("0.58", "400")], NOW)]
+    bot8.fair_sig_at = -1e9; bot8.note_job("恒指期货", NOW)
+    assert moved == [{"HSI"}] and bot8.sim_wake, moved
+    bot8.fair_sig_at = -1e9; world["markets"] = [hsi(0.74, [("0.55", "300")], [("0.58", "400")], NOW)]; bot8.note_job("行情推送", NOW)
+    assert moved == [{"HSI"}], "a push's own keys: looked at by price_looks already"
+    # both sides placeable: both quoted in one look (the second waited for the next look)
+    bot9 = make_bot(SIM_WAYS="maker", SIM_MAKER_SPREAD_CENTS="50")
+    await bot9.live_prepare(); await bot9.live_prefetch(NOW)
+    both = hsi(0.50, [("0.30", "300")], [("0.65", "300")], NOW)  # 挂涨 30¢ (+20¢), 挂跌 35¢ (+15¢)
+    trades9, changed9 = {}, []
+    bot9.sim_quote(both, trades9, NOW, changed9)
+    assert sorted(k.rsplit("|", 2)[1] for k, _ in changed9) == ["down", "up"], changed9
+    # a refusal that is not about the size is said as itself
+    assert m.same_refusal("等它结束，3 秒后再试", "等它结束，4 秒后再试") and not m.same_refusal("单笔 $10 超过", "单笔 $20 超过")
+    print("MISSED_ORDERS_FIXES_OK")
+
+
+asyncio.run(missed_orders_fixes())
