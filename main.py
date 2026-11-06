@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.128.1"
+VERSION = "1.128.2"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too

@@ -203,6 +203,9 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pair["accounted"]) and self.assertEqual(pair["pnl"], 0.)
         self.assertEqual(ctl.risk(), 0.)
         self.assertEqual(ctl.due(NOW + 10 ** 9), [])  # nothing left to try
+        ctl.stop.set()  # the stop itself is not a withdrawal: on_stop decides (1.128.2)
+        self.assertEqual(ctl.due(NOW), [])
+        ctl.stop.clear()
         await self.finish(ctl)
 
     async def test_pause_during_send_queue_blocks_http(self):
@@ -461,6 +464,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((len(api.sent), ctl.parked, ctl.queued, c["slug"] in ctl.ledger.rows), (2, {}, set(), True))
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
+        broken = {**c, "slug": "btc-updown-15m-broken", "market_id": "404"}  # its read raises: parked longer, not read again every poll
+        ctl.queue.put_nowait((broken["start_ms"], broken["slug"], broken)); ctl.queued.add(broken["slug"])
+        worker = asyncio.create_task(ctl.placement_worker())
+        await asyncio.sleep(0.05)
+        worker.cancel(); await asyncio.gather(worker, return_exceptions=True)
+        self.assertEqual((ctl.parked[broken["slug"]][0], broken["slug"] in ctl.queued), (clock.ms + p.ERROR_RETRY_MS, True))
+        del ctl.parked[broken["slug"]]; ctl.queued.discard(broken["slug"])
         late = {**c, "slug": "btc-updown-15m-late", "start_ms": clock.ms + 100_000}
         ctl.parked[late["slug"]] = (clock.ms, late); ctl.queued.add(late["slug"])
         ctl.unpark()
@@ -770,7 +780,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((set(api.removed), pair["accounted"], bigger.supersedable(pair)), ({"1", "2"}, True, True))
             await bigger.discover()
             self.assertEqual((bigger.queue.qsize(), bigger.requoted, c["slug"] in bigger.ledger.rows), (1, 1, False))
-            old_key = c["slug"] + "@" + str(pair["created_ms"])
+            old_key = c["slug"] + "@0"  # the window and the attempt that stepped aside
             self.assertIs(bigger.ledger.rows[old_key], pair)
             queued = bigger.queue.get_nowait()[2]
             self.assertEqual(queued["attempt"], 1)

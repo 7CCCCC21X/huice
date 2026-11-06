@@ -62,6 +62,7 @@ REFRESH_MS = 30_000       # an active window's market is read again this often (
 REFRESH_FAR_MS = 300_000  # ...a window starting more than an hour away: this often (a day's windows must not cost a read a second)
 REFRESH_BATCH = 8         # refresh_active: at most this many market reads an iteration, three at a time (a burst of due windows is spread)
 HOLD_RETRY_MS = 5_000     # a held candidate (hold(): a stale snapshot, the cooldown, the pause; or the budget) waits this long on the side, then is placed again — never read again meanwhile
+ERROR_RETRY_MS = 30_000   # ...and one whose placement raised (a read failed, the market's tokens could not be told) this long
 SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
 DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
 LISTING_FIELDS = ("id", "conditionId", "status", "tradingStatus", "question", "outcomes")  # the details' fields the discovery reads
@@ -522,8 +523,14 @@ class Controller:
         """The money this mode may have tied up: every order that may exist (sent, or sent for all we know) at its full
         size, until its pair is accounted — by the final reads after a cancel (nothing filled) or by the official
         result. A refusal or a never-sent order ties up nothing."""
-        return sum(self.settings.side_usd for p in self.ledger.rows.values() if not p.get("accounted")
-                   for o in p["orders"].values() if o["state"] not in NEVER_PLACED)
+        total = 0.0
+        for p in self.ledger.rows.values():
+            if p.get("accounted"):
+                continue
+            price, shares = pair_quote(p)  # the pair's own size and price: a pair from older settings keeps its own figure
+            side_usd = price * shares if price and shares else self.settings.side_usd
+            total += sum(side_usd for o in p["orders"].values() if o["state"] not in NEVER_PLACED)
+        return total
 
     def filled_by_outcome(self, days: int = 3) -> dict[tuple[str, int], float]:
         """The shares this mode's orders filled, by (market id, index set), for the windows of the last ``days`` days: the
@@ -574,7 +581,7 @@ class Controller:
                     row = by_hash.get(order.get("api_hash") or order["hash"])
                     if row is not None:
                         before = order["filled"]
-                        self.apply_fill(order, row)
+                        self.apply_fill(order, row, pair)
                         changed |= order["filled"] != before
                 if changed:
                     self.ledger.save(pair)
@@ -601,6 +608,11 @@ class Controller:
         """The records found at the start: an active pair as the settings say is taken over (resumable); any other pair not
         at its end is withdrawn and reconciled (interrupted attempts included — a recovered record never gets a new salt)."""
         for pair in list(self.ledger.rows.values()):
+            if not pair.get("price") or not pair.get("shares"):  # a record from before 1.128.0: its size and price, read off its orders, kept on it
+                price, shares = pair_quote(pair)
+                if price and shares:
+                    pair.update(price=str(price), shares=str(int(shares) if shares == int(shares) else shares))
+                    self.ledger.save(pair)
             if pair["phase"] == "active" and self.resumable(pair):
                 pair["cancel_ms"] = pair["start_ms"] - self.settings.cancel_seconds * 1000
                 self.ledger.save(pair)
@@ -666,7 +678,7 @@ class Controller:
                 self.skipped[slug] = candidate_problem(market, self.now(), self.owner.config, self.settings)
                 continue
             if slug in self.ledger.rows:  # the withdrawn pair's record steps aside: the window is quoted again (place_pair: a new salt)
-                self.ledger.rename(slug, f"{slug}@{int(self.ledger.rows[slug].get('created_ms') or 0)}")
+                self.ledger.rename(slug, f"{slug}@{int(self.ledger.rows[slug].get('attempt') or 0)}")  # the window and the attempt: one key each
                 self.requoted += 1
             c["attempt"] = attempt
             self.queued.add(slug)
@@ -796,12 +808,13 @@ class Controller:
         LOG.info("开盘前预挂 %s：%s", pair["slug"], {s: o["state"] for s, o in pair["orders"].items()})
         return ""
 
-    def apply_fill(self, order: dict, row: dict) -> None:
-        # Fixed shares are the actual signed shares, not an estimated count.
+    def apply_fill(self, order: dict, row: dict, pair: dict) -> None:
+        # Fixed shares are the actual signed shares — the pair's own (a pair from older settings keeps its size), not an estimated count.
         amount, filled = D(str(row.get("amount") or "0")), D(str(row.get("amountFilled") or "0"))
         if amount <= 0 or filled < 0 or filled > amount:
             raise core.RemoteError("成交回报数量无效，保留风险额度")
-        order["filled"] = max(float(order.get("filled") or 0), float(self.settings.shares * filled / amount))
+        shares = D(str(pair_quote(pair)[1] or self.settings.shares))
+        order["filled"] = max(float(order.get("filled") or 0), float(shares * filled / amount))
 
     def gave_up(self, pair: dict) -> bool:
         """Past the window's start by GIVE_UP_MS: an order Predict cannot show cannot fill any more (it expired before
@@ -848,7 +861,7 @@ class Controller:
         if row:
             if not order.get("id") and row.get("id") is not None:
                 order["id"] = str(row["id"])
-            self.apply_fill(order, row)
+            self.apply_fill(order, row, pair)
             if final_order(row):
                 order["state"] = "final"
         elif self.gave_up(pair):
@@ -880,7 +893,7 @@ class Controller:
                     row = await self.cancel_api.order("", order["hash"])
                     if row:
                         order["id"] = str(row["id"])
-                        self.apply_fill(order, row)
+                        self.apply_fill(order, row, pair)
                     elif self.gave_up(pair):
                         order.update(state="not_found", note="按哈希查不到，签名已过期：视为从未下单")
                         self.ledger.save(pair)
@@ -934,9 +947,9 @@ class Controller:
 
     async def monitor_pair(self, pair: dict) -> None:
         """An order ID is not proof that a deferred post-only order was accepted."""
-        if (pair["phase"] != "active" or self.now() - int(pair.get("created_ms") or 0) < 10_000
+        if (pair["phase"] != "active" or not self.account_at or self.now() - int(pair.get("created_ms") or 0) < 10_000
                 or self.now() - int(pair.get("checked_ms") or 0) < 5_000):
-            return
+            return  # (no snapshot yet: the first one covers every resting order at once — no burst of reads at a start)
         pair["checked_ms"] = self.now()
         rejected = False
         for order in pair["orders"].values():
@@ -947,7 +960,7 @@ class Controller:
             row = await self.api.order(order["id"], order.get("api_hash") or order["hash"])
             if row is None:
                 continue  # replication lag is not a zero-fill rejection
-            self.apply_fill(order, row)
+            self.apply_fill(order, row, pair)
             if final_order(row):
                 order["state"] = "final"
                 rejected |= order["filled"] <= 0
@@ -1006,7 +1019,7 @@ class Controller:
     def due(self, now_ms: int) -> list[dict]:
         """The pairs the cancellation loop acts on now: active ones at their cancel time (or the mode blocked), and
         closing or unverified ones whose next try has come (bookkeep: RETRY_MS doubling to RETRY_MAX_MS)."""
-        blocked = bool(self.blocked())
+        blocked = bool(self.blocked()) and not self.stopped()  # the stop itself withdraws nothing here: on_stop decides (keep_on_stop)
         out = []
         for p in self.ledger.rows.values():
             if p.get("accounted"):
@@ -1021,18 +1034,20 @@ class Controller:
         while not self.stopped():
             _, _, c = await self.queue.get()
             self.placing.add(c["slug"])
-            held = False
+            wait = 0
             try:
-                held = await self.place_pair(c) == "held"
+                if await self.place_pair(c) == "held":
+                    wait = HOLD_RETRY_MS
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 self.error = core.clean_error(error) or type(error).__name__
                 LOG.warning("开盘前挂单失败 %s：%s", c["slug"], self.error)
+                wait = ERROR_RETRY_MS
             finally:
                 self.placing.discard(c["slug"])
-                if held:  # still queued: placed again HOLD_RETRY_MS on (unpark), without another read of the window
-                    self.parked[c["slug"]] = (self.now() + HOLD_RETRY_MS, c)
+                if wait and not self.stopped():  # still queued: placed again later (unpark), the window not read again meanwhile
+                    self.parked[c["slug"]] = (self.now() + wait, c)
                 else:
                     self.queued.discard(c["slug"])
                 self.queue.task_done()
