@@ -2001,7 +2001,7 @@ class LiveBot(core.Bot):
         gaps.sort(key=lambda g: -g[0])
         lines = [f"持仓核对 {core.stamp(now_ms, seconds=False)}：账户 {len(held)} 个持仓" + ("" if complete else "（列表被截断，可能不全）")
                  + f"；对不上的 {len(gaps)} 个方向" + (f"（列出前 {self.REPORT_GROUPS} 个）" if len(gaps) > self.REPORT_GROUPS else "") + f"，一致的 {len(same)} 个"
-                 + (f"；上次自动核对 {(now_ms - self.live_late_checked) // 1000} 秒前" if self.live_late_checked else "")]
+                 + (f"；上次自动核对 {(now_ms - self.live_late_checked) // 1000} 秒前" if self.live_late_checked > 0 else "")]
         for _, name, shares, price, recorded, po, gap, r in gaps[:self.REPORT_GROUPS]:
             lines.append(f"{name}：账户 {shares:g} 份" + (f"（均价 {core.cents(price)}）" if price is not None else "") + f"，记录 {recorded:g} 份"
                          + (f"，预挂 {po:g} 份" if po else "") + f"，差 {gap:+g} 份")
@@ -3421,8 +3421,17 @@ class LiveBot(core.Bot):
         return float(self.preopen.daily_pnl()) if self.preopen_active() else 0.0
 
     def preopen_filled(self) -> dict[tuple[str, int], float]:
-        """The running pre-open mode's fills by outcome (Controller.filled_by_outcome): recorded shares to the positions reconciliation."""
-        return dict(self.preopen.filled_by_outcome()) if self.preopen_active() else {}
+        """The pre-open mode's fills by outcome (preopen.fills_by_outcome): recorded shares to the positions reconciliation —
+        the controller's ledger, or the file while the mode is off or stopped (1.131.2: whatever the mode's state, its fill
+        is never a position for the model trader to book onto one of its own orders)."""
+        from preopen import fills_by_outcome, read_rows
+        if self.preopen is not None:
+            return dict(self.preopen.filled_by_outcome())  # its ledger, running or stopped
+        try:
+            return fills_by_outcome(read_rows(self.config.preopen.db), self.market.now_ms())
+        except Exception as error:
+            LOG.warning("预挂成交读取失败：%s", core.clean_error(error) or type(error).__name__)
+            return {}
 
     async def cmd_preopen(self, req: core.Request) -> str:
         action = req.args[0].lower() if req.args else ""

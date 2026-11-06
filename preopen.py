@@ -66,6 +66,11 @@ HOLD_RETRY_MS = 5_000     # a held candidate (hold(): a stale snapshot, the cool
 ERROR_RETRY_MS = 30_000   # ...and one whose placement raised (a read failed, the market's tokens could not be told) this long
 HALT_MS = 180_000         # a stock card's exchange quote whose own time stands still this long in session: trading halted (a VI, a 临停)
 CARD_CHECK_MS = 5_000     # the stock cards' limit / halt check (card_hold) this often
+CARD_HOLD_NEAR_MS = 60 * 60_000  # ...and a hold keeps back / withdraws only the windows starting within this (a day's windows stay: the hold is about the next ones)
+LUNCH = {"sh": (dt.time(11, 30), dt.time(13, 0))}  # the lunch break (Beijing time) the halt rule does not count (core.quiet_ms)
+FILL_SETTLE_MS = 45 * 60_000  # a pair with a fill is cleared by the result: "stuck" only this long past the start
+SKIP_RETRY_MS = 60_000    # a listed window that is no candidate (a missing field, a fee, a status) is asked again this often, not every poll
+MONITOR_MS = 5_000        # an active pair's orders are looked at this often (monitor_pair), the first look 10 s after the placement
 SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
 DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
 REFUSED_STATUSES = {"REJECTED", "INVALIDATED", "FAILED"}  # an order's record ending so with nothing filled: Predict's deferred refusal (not quoted again)
@@ -150,6 +155,8 @@ def safe_api(base: str, key: str, wallet: Any, before_send: Any = None, shared: 
     import live
 
     class Api(live.PredictApi):
+        ORDERS_PAGES_MAX = 60  # 3000 open orders a read (1.131.2): five cards, a day, several levels pass the bot's own 1000
+
         @property
         def blocked_until(self) -> float:
             own = self.__dict__.get("_blocked_until", 0.0)
@@ -281,6 +288,22 @@ async def category_market(api: Any, slug: str) -> dict | None:
     return {**market, "categorySlug": slug, "id": market.get("id") or found[0]["id"]}
 
 
+def fills_by_outcome(rows: list[dict], now_ms: int, days: int = 3) -> dict[tuple[str, int], float]:
+    """The shares the mode's orders filled, by (market id, index set), for the windows of the last ``days`` days: the model
+    trader's positions reconciliation counts them as recorded, not as fills of its own orders to adopt — whatever the
+    mode's state (1.131.2: read off the ledger file while it is off)."""
+    since = now_ms - days * core.DAY_MS
+    out: dict[tuple[str, int], float] = {}
+    for pair in rows:
+        if int(pair.get("start_ms") or 0) < since or not pair.get("market_id"):
+            continue
+        for order in (pair.get("orders") or {}).values():
+            if float(order.get("filled") or 0) > 0 and order.get("index_set"):
+                key = (str(pair["market_id"]), int(order["index_set"]))
+                out[key] = out.get(key, 0.0) + float(order["filled"])
+    return out
+
+
 def record_key(pair: dict) -> str:
     """A record's key without its attempt (a superseded record's key carries the attempt after '@'): the window's slug,
     with '#<level>' for a deeper price level (1.129.0)."""
@@ -409,8 +432,10 @@ def review(rows: list[dict], now_ms: int) -> dict:
     recent = sorted([q for q in qs if q["filled"] > 0], key=lambda q: q["start_ms"], reverse=True)[:60]
     shown = ("start_ms", "name", "key", "filled_up", "filled_down", "price", "volume", "result", "pnl", "status", "lead_min", "cancel_s", "attempt")
     total = review_summary("全部", qs)
+    today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat()  # the daily summary takes today's and earlier windows: tomorrow's resting pairs are no day yet
     return {"total": total,
-            "daily": {"days": {date: summary_shape(review_summary(date, dates[date])) for date in dates}, "total": summary_shape(total)},  # the daily summary's share (core.merge_preopen_summary)
+            "daily": {"days": {date: summary_shape(review_summary(date, dates[date])) for date in dates if date <= today},
+                      "total": summary_shape(review_summary("全部", [q for q in qs if q["date"] <= today]))},  # the daily summary's share (core.merge_preopen_summary)
             "resting_usd": round(sum(q["price"] * q["shares"] * sum(q["sent"].values()) for q in qs if q["active"]), 4),
             "days": [review_summary(day, days[day]) for day in sorted(days, key=lambda d: max(q["start_ms"] for q in days[d]), reverse=True)],
             "cards": [review_summary(card, cards[card]) for card in sorted(cards, key=lambda c: (-len(cards[c]), c))],
@@ -497,6 +522,7 @@ class Controller:
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()  # (start_ms, slug, candidate): the soonest window first
         self.queued: set[str] = set()
         self.skipped: dict[str, str] = {}  # slug -> why a listed window was not placed (the status line)
+        self.skipped_at: dict[str, int] = {}  # slug -> when it was last judged so (asked again SKIP_RETRY_MS on)
         self.parked: dict[str, tuple[int, dict]] = {}  # slug -> (retry_ms, candidate): held by hold() or the budget, placed again HOLD_RETRY_MS on, still queued
         self.full_scan_ms = 0  # discover: when the last full scan ran (FULL_SCAN_MS)
         self.keep_on_stop = False  # the owner's stop for a settings change: the orders stay on the book, the next controller takes them over
@@ -552,14 +578,19 @@ class Controller:
 
     def stuck_pairs(self, now_ms: int) -> list[dict]:
         """The withdrawn pairs not cleared STUCK_MS past their cancel time: a cancel or a read that keeps failing, an order in doubt."""
-        return [p for p in self.ledger.rows.values() if not p.get("accounted") and p["phase"] != "active" and now_ms > int(p.get("cancel_ms") or 0) + STUCK_MS]
+        def late(p: dict) -> bool:  # a pair with a fill waits for the result (FILL_SETTLE_MS past the start); one without should clear in minutes
+            filled = any(float(o.get("filled") or 0) > 0 for o in p["orders"].values())
+            return now_ms > (int(p.get("start_ms") or 0) + FILL_SETTLE_MS if filled else int(p.get("cancel_ms") or 0) + STUCK_MS)
+        return [p for p in self.ledger.rows.values() if not p.get("accounted") and p["phase"] != "active" and late(p)]
 
     def check_stuck(self, now_ms: int) -> None:
-        """Each stuck pair announced (once in a while each)."""
-        for p in self.stuck_pairs(now_ms):
+        """The stuck pairs announced (once in a while each; at most three a pass, the count of the rest)."""
+        stuck = self.stuck_pairs(now_ms)
+        for p in stuck[:3]:
             states = "/".join(f"{s} {o['state']}" for s, o in p["orders"].items())
             self.notify(f"⚠️ 预挂 {p.get('name') or p['slug']} 撤单 {(now_ms - int(p.get('cancel_ms') or 0)) // 60_000} 分钟后仍未结清：{states}；"
-                        f"{p.get('reason') or ''}；最近问题：{self.error or '无'}", key="preopen:stuck:" + p["slug"])
+                        f"{p.get('reason') or ''}；最近问题：{self.error or '无'}" + (f"（另有 {len(stuck) - 3} 场同样未结清，/preopen check 查看）" if len(stuck) > 3 else ""),
+                        key="preopen:stuck:" + p["slug"])
 
     def check(self) -> str:
         """/preopen check: what is wrong now, in one message — the cooldown and the 429s, the account snapshot, why nothing
@@ -667,10 +698,23 @@ class Controller:
             if last <= down * (1 + gap / 100):
                 return f"{rolling.coin} 现价 {last:,.2f} 距跌停 {down:,.2f} 不足 {gap:g}%"
         quoted = int(getattr(q, "quoted_ms", 0) or 0)
-        holidays = self.owner.config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
-        if quoted and now - quoted > HALT_MS and rolling.exists(now - now % rolling.window_ms, holidays):
-            return f"{rolling.coin} 交易时段里成交时间 {(now - quoted) // 60_000} 分钟没动（临停或 VI）"
+        if quoted and rolling.exchange and self.in_continuous_trading(rolling, now):
+            quiet = core.quiet_ms(quoted, now, LUNCH.get(rolling.exchange))
+            if quiet > HALT_MS:
+                return f"{rolling.coin} 交易时段里成交时间 {quiet // 60_000} 分钟没动（临停或 VI）"
         return ""
+
+    def in_continuous_trading(self, rolling: Any, now_ms: int) -> bool:
+        """Whether the stock trades continuously now — inside a session segment, past its first five minutes (the first
+        print after an open or the lunch break lags), before the closing auction (nothing prints there: KRX from 15:20,
+        SSE from 14:57) — the only time a still quote means a halt (1.131.2: the KRX closing auction read as one every day)."""
+        tz = dt.timezone(dt.timedelta(hours=core.STOCK_MARKETS[rolling.exchange].utc_offset))
+        local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
+        holidays = self.owner.config.holidays.get(rolling.exchange, frozenset())
+        for seg_open, seg_close in core.session_segments(rolling.exchange, local.date(), holidays):
+            if seg_open <= now_ms < seg_close:
+                return now_ms - seg_open >= 5 * 60_000 and local.time() < core.closing_auction_start(rolling.exchange, local.date())
+        return False
 
     async def check_cards(self, now_ms: int) -> None:
         """The stock cards' holds (card_hold), every CARD_CHECK_MS: a card held has its resting pairs withdrawn (quoted again
@@ -684,7 +728,8 @@ class Controller:
             why = self.card_hold(rolling)
             if why:
                 self.card_holds[rolling.key] = why
-                active = [p for p in self.ledger.rows.values() if p["phase"] == "active" and p.get("key") == rolling.key]
+                active = [p for p in self.ledger.rows.values() if p["phase"] == "active" and p.get("key") == rolling.key
+                          and p["start_ms"] - now_ms <= CARD_HOLD_NEAR_MS]  # the next hour's windows: a day's quotes are not thrown away over a halt
                 if active:
                     await self.cancel_many(active, why)
             else:
@@ -697,7 +742,7 @@ class Controller:
         pair = next((p for p in self.ledger.rows.values() if any(o.get("hash") == digest for o in p["orders"].values())), None)
         if pair is None or pair["phase"] != "active" or self.now() >= pair["cancel_ms"]:
             return "市场已进入撤单阶段，不再发送"
-        if why := self.card_holds.get(str(pair.get("key") or "")):
+        if (why := self.card_holds.get(str(pair.get("key") or ""))) and pair["start_ms"] - self.now() <= CARD_HOLD_NEAR_MS:
             return why
         if pair["expires"] * 1000 - self.now() < SEND_MIN_LEFT_MS:
             return "距订单到期不足一分钟，不再发送"
@@ -740,16 +785,7 @@ class Controller:
     def filled_by_outcome(self, days: int = 3) -> dict[tuple[str, int], float]:
         """The shares this mode's orders filled, by (market id, index set), for the windows of the last ``days`` days: the
         model trader's positions reconciliation counts them as recorded, not as fills of its own orders to adopt."""
-        since = self.now() - days * core.DAY_MS
-        out: dict[tuple[str, int], float] = {}
-        for pair in self.ledger.rows.values():
-            if int(pair.get("start_ms") or 0) < since:
-                continue
-            for order in pair["orders"].values():
-                if float(order.get("filled") or 0) > 0 and order.get("index_set"):
-                    key = (str(pair["market_id"]), int(order["index_set"]))
-                    out[key] = out.get(key, 0.0) + float(order["filled"])
-        return out
+        return fills_by_outcome(list(self.ledger.rows.values()), self.now(), days)
 
     def daily_pnl(self) -> float:
         day = dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat()
@@ -802,9 +838,10 @@ class Controller:
         if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.expiry_seconds:
             return False
         price, shares = pair_quote(pair)
-        level = next((lv for lv in self.settings.levels if float(lv[0]) == price and float(lv[1]) == shares), None)
-        if level is None:
-            return False  # a price or size the settings no longer have (a level dropped, the size changed)
+        index = int(pair.get("level") or 0)
+        level = self.settings.levels[index] if index < len(self.settings.levels) else None
+        if level is None or float(level[0]) != price or float(level[1]) != shares:
+            return False  # not what the settings say at this level (a price or size changed, a level dropped): withdrawn, quoted again as they say
         amounts = live.limit_amounts(True, live.to_wei(level[0]), live.to_wei(level[1]))
         for order in pair["orders"].values():
             signed = (order.get("body") or {}).get("data", {}).get("order", {})
@@ -869,9 +906,11 @@ class Controller:
         for p in self.ledger.rows.values():
             attempts[record_key(p)] = max(attempts.get(record_key(p), 0), int(p.get("attempt") or 0) + 1)
         for rolling, start in window_starts(self.now(), self.owner.config, self.settings):
-            if misses.get(rolling.key, 0) >= (MISS_STOP if full else 1) or self.card_holds.get(rolling.key):
+            if misses.get(rolling.key, 0) >= (MISS_STOP if full else 1) or (self.card_holds.get(rolling.key) and start - self.now() <= CARD_HOLD_NEAR_MS):
                 continue
             slug = window_slug(rolling, start)
+            if self.now() - self.skipped_at.get(slug, 0) < SKIP_RETRY_MS:
+                continue  # judged no candidate a moment ago: not read again every poll
             wanted = []  # the levels to quote now: (record key, level, price, shares)
             for level, (price, shares) in enumerate(self.settings.levels):
                 if level and start - self.now() > self.settings.deep_ahead_minutes * 60_000:
@@ -894,6 +933,7 @@ class Controller:
             c = candidate(market, self.now(), self.owner.config, self.settings)
             if c is None:
                 self.skipped[slug] = candidate_problem(market, self.now(), self.owner.config, self.settings)
+                self.skipped_at[slug] = self.now()
                 continue
             for key, level, price, shares in wanted:
                 if key in self.ledger.rows:  # the withdrawn pair's record steps aside: the level is quoted again (place_pair: a new salt)
@@ -935,7 +975,7 @@ class Controller:
         import live
         if c["slug"] in self.ledger.rows:
             return ""
-        if self.hold() or self.card_holds.get(str(c.get("key") or "")):
+        if self.hold() or (self.card_holds.get(str(c.get("key") or "")) and int(c.get("start_ms") or 0) - self.now() <= CARD_HOLD_NEAR_MS):
             return "held"
         price, shares = D(str(c.get("price") or self.settings.price)), D(str(c.get("shares") or self.settings.shares))  # the level's (PREOPEN_LEVELS)
         side_usd, pair_usd = float(price * shares), 2 * float(price * shares)
@@ -977,6 +1017,7 @@ class Controller:
             for side, (outcome, _) in zip(("up", "down"), outcomes):
                 identity = (f"preopen-v2|{self.owner.config.live_chain}|{self.owner.live.wallet.maker.lower()}|{current['market_id']}|"
                             f"{outcome['token']}|{current['expires']}|{price}|{shares}"
+                            + (f"|L{c['level']}" if c.get("level") else "")      # a deeper level: its own salt, whatever price the first level moves to
                             + (f"|{c['attempt']}" if c.get("attempt") else ""))  # a window quoted again: a new salt, the first attempt's unchanged
                 salt = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big") % live.MAX_SALT
                 signed = live.build_order(self.owner.live.wallet, outcome["token"], amounts["maker"], amounts["taker"], info.fee_bps, current["expires"], salt=salt)
@@ -1373,8 +1414,8 @@ class Controller:
                         self.bookkeep(pair)  # the next try is booked now: a read that hangs does not make the loop ask again meanwhile
                         self.launch_reconcile(pair)
             for pair in list(self.ledger.rows.values()):
-                if pair["phase"] == "active":
-                    key = "monitor:" + pair["slug"]
+                if pair["phase"] == "active" and now - int(pair.get("checked_ms") or 0) >= MONITOR_MS and now - int(pair.get("created_ms") or 0) >= 10_000:
+                    key = "monitor:" + pair["slug"]  # (a look due: not a task for every active pair twice a second)
                     if key not in self.settling or self.settling[key].done():
                         async def monitor(p: dict = pair) -> None:
                             async with self.settle_gate:
@@ -1474,7 +1515,7 @@ class Controller:
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
                 f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
-                + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：占用的 USDT 计入余额核对，不计入预挂限额" if self.unmanaged else "")
+                + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：不计入预挂限额，也不挡预挂" if self.unmanaged else "")
                 + ("\n股票卡暂停：" + "；".join(self.card_holds.values()) if self.card_holds else "")
                 + ("\n发布节奏（每 15 分钟一场；预计前后每秒扫一次）：" + "；".join(f"{key} 上次 {hms(at)}，下次预计 {hms(at + LISTING_CYCLE_MS)}" for key, at in sorted(self.listed_at.items()))
                    if self.listed_at else "")

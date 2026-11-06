@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.131.1"
+VERSION = "1.131.2"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -2226,6 +2226,7 @@ class StockMarket:
         newest: dict[str, IndexQuote] = {}
 
         def consider(symbol: str, name: str, q: IndexQuote) -> None:
+            q = q if q.fetched_ms else dataclasses.replace(q, fetched_ms=now_ms)  # 1.131.2: the A-share parsers stamp no fetch time; the pre-open stock guard reads it
             if symbol not in newest or q.quoted_ms > newest[symbol].quoted_ms:
                 newest[symbol] = q
             self.live[symbol] = newest[symbol]
@@ -9913,7 +9914,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_EXCLUSIVE": {"kind": "choice", "group": "预挂", "options": [["off", "off 两边同时跑"], ["on", "on 预挂时原策略不开新仓"]]},
     "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
     "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},
-    "PREOPEN_LEVELS": {"kind": "text", "group": "预挂", "presets": ["48x20", "48x20,47x40", "48x10,47x10", "47x40", "48x10,47x20,46x40"], "unit": ""},
+    "PREOPEN_LEVELS": {"kind": "text", "group": "预挂", "presets": ["", "48x20", "48x20,47x40", "48x10,47x10", "47x40", "48x10,47x20,46x40"], "unit": "", "empty": "只挂第一档"},
     "PREOPEN_DEEP_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "60", "120", "240", "1440"], "unit": "分钟", "zero": "和第一档一样"},
     "PREOPEN_LIMIT_GAP_PCT": {"kind": "number", "group": "预挂", "presets": ["0", "1", "2", "3", "5"], "unit": "%", "zero": "不管涨跌停"},
     "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["60", "120", "240", "720", "1440"], "unit": "分钟"},
@@ -12863,7 +12864,7 @@ function card(s){
   t.append(now);c.append(t);
   c.append(el("div","hint",s.hint));
   const sel=selected(s),o=el("div","opts");
-  (s.kind==="number"||s.kind==="text"?s.presets.map(v=>[v,fmt(s,v)+(s.zero&&v==="0"?"（"+s.zero+"）":"")]):s.options).forEach(([v,cap])=>{
+  (s.kind==="number"||s.kind==="text"?s.presets.map(v=>[v,v===""?(s.empty||"清空"):fmt(s,v)+(s.zero&&v==="0"?"（"+s.zero+"）":"")]):s.options).forEach(([v,cap])=>{
     const b=el("button","opt"+(sel.has(v)?" sel":""),cap);b.dataset.v=v;b.disabled=!data.enabled;b.addEventListener("click",()=>pick(s,v));o.append(b)});
   c.append(o);
   const spec=DETAIL[s.key];

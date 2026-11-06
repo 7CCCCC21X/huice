@@ -670,6 +670,12 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         stuck = {**pair, "slug": "btc-updown-15m-stuck", "name": "BTC 15分涨跌 08:00–08:15", "phase": "closing", "accounted": False, "cancel_ms": clock.ms - 20 * 60_000,
                  "reason": "到时撤单", "orders": {"up": {"state": "unknown", "hash": "0xs", "filled": 0.0}, "down": {"state": "removed", "hash": "0xt", "id": "9", "filled": 0.0}}}
         ctl.ledger.save(stuck)
+        filled = {**stuck, "slug": "btc-updown-15m-filled", "start_ms": clock.ms - 20 * 60_000, "cancel_ms": clock.ms - 20 * 60_000 - 20_000,
+                  "orders": {"up": {"state": "final", "hash": "0xf", "id": "8", "filled": 10.0}, "down": {"state": "final", "hash": "0xg", "id": "7", "filled": 0.0}}}
+        ctl.ledger.save(filled)
+        self.assertEqual([p["slug"] for p in ctl.stuck_pairs(clock.ms)], ["btc-updown-15m-stuck"], "a fill waits for the result: not stuck 20 minutes past the start")
+        self.assertEqual(len(ctl.stuck_pairs(clock.ms + 30 * 60_000)), 2)
+        ctl.ledger.delete(filled["slug"])
         ctl.check_stuck(clock.ms)
         self.assertEqual(notes[-1][0], "preopen:stuck:btc-updown-15m-stuck")
         text = ctl.check()
@@ -694,8 +700,8 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "LIVE_MAX_OPEN_USD": "40.5"})
         self.assertIn("持仓+挂单 $40.00 已占满", bot.live_fit_why({}, 0.5))
         bot.preopen.alive = False
-        self.assertFalse(bot.preopen_active())  # crashed: the model trader is free again
-        self.assertEqual((bot.preopen_risk(), bot.preopen_pnl(), bot.preopen_filled()), (0., 0., {}))
+        self.assertFalse(bot.preopen_active())  # crashed: the model trader is free again — the mode's fills still its own (1.131.2), never positions to adopt
+        self.assertEqual((bot.preopen_risk(), bot.preopen_pnl(), bot.preopen_filled()), (0., 0., {("123", 2): 50.}))
         bot.preopen.alive = True
         bot.config = cfg  # LIVE=off: paper trading goes on
         self.assertFalse(bot.preopen_active())
@@ -901,8 +907,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
                        "attempt": 1, "orders": {"up": {"state": "removed", "filled": 2.0}, "down": {"state": "removed", "filled": 3.0}}}
             never = {**base, "slug": "btc-updown-15m-4", "name": "BTC 15分涨跌 11:00–11:15", "start_ms": NOW + 7200_000, "phase": "closed", "accounted": True,
                      "orders": {"up": {"state": "not_sent", "filled": 0.0}, "down": {"state": "rejected", "filled": 0.0}}}
-            for row in (won, withdrawn, pending, never):
+            tomorrow = {**base, "slug": "btc-updown-15m-5", "name": "BTC 15分涨跌 05:00–05:15", "start_ms": NOW + 20 * 3600_000, "phase": "active",
+                        "orders": {"up": {"state": "open", "filled": 0.0}, "down": {"state": "open", "filled": 0.0}}}
+            for row in (won, withdrawn, pending, never, tomorrow):
                 ctl.ledger.save(row)
+            r = p.review(list(ctl.ledger.rows.values()), NOW)
+            self.assertEqual(([d["name"] for d in r["days"]], sorted(r["daily"]["days"])), (["11-07", "11-06"], ["2026-11-06"]), "tomorrow's resting pairs: a table row, no summary day")
+            ctl.ledger.delete(tomorrow["slug"])
             r = p.review(list(ctl.ledger.rows.values()), NOW)
             t = r["total"]
             self.assertEqual((t["records"], t["windows"], t["resting"], t["filled_windows"], t["filled"], t["volume"], t["pending"]), (4, 4, 1, 2, 15.0, 7.35, 1))
@@ -933,6 +944,9 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([(x["records"], round(x["pnl"], 4), len(x["parts"])) for x in merged], [(6, 4.1, 2), (6, 4.1, 1)])
             bot.preopen = None
             self.assertEqual(bot.preopen_review()["total"]["records"], 4, "read off the file")
+            won["market_id"], won["orders"]["up"]["index_set"] = "777", 2
+            ctl.ledger.save(won)
+            self.assertEqual((bot.preopen_filled(), p.fills_by_outcome([won], NOW)), ({("777", 2): 10.0}, {("777", 2): 10.0}), "1.131.2: the fills count with the mode off too")
             bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "STATE_DB": ":memory:"})
             self.assertIsNone(bot.preopen_review())
             self.assertEqual(p.review([], NOW)["total"]["records"], 0)
@@ -1050,6 +1064,9 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             again.api = again.cancel_api = api; api.ctl = again
             again.adopt()
             self.assertEqual((again.resumed, again.ledger.rows[near + "#2"]["phase"], again.ledger.rows[near + "#1"]["phase"]), (3, "closing", "active"), "the level dropped is withdrawn")
+            moved, _, _ = controller(rows, PREOPEN_PRICE_CENTS="50", PREOPEN_LEVELS="49x10", PREOPEN_MARKETS="btc", PREOPEN_SHARES="10", **db)
+            self.assertFalse(moved.resumable(again.ledger.rows[near]), "1.131.2: the first level moved to 50x10 — the 49x10 record is not it, whatever level now says 49x10")
+            moved.ledger.close()
             await self.finish(again)
 
     async def test_a_stock_card_near_its_limit_or_halted_is_not_quoted(self):
@@ -1080,11 +1097,26 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("距跌停 70,000.00", ctl.card_hold(sk))
         ctl.owner.updowns["SKHYNIX-15M"].lead = quote("110000", quoted=clock.ms - 4 * 60_000)  # in session (10:00 KST), the quote's time 4 minutes still
         self.assertIn("成交时间 4 分钟没动", ctl.card_hold(sk))
+        was = clock.ms
+        clock.ms = NOW + 5 * 3600_000 + 23 * 60_000  # 15:23 KST: the closing auction prints nothing — no halt (1.131.2)
+        ctl.owner.updowns["SKHYNIX-15M"].lead = quote("110000", quoted=clock.ms - 4 * 60_000)
+        self.assertEqual(ctl.card_hold(sk), "")
+        clock.ms = NOW - 56 * 60_000  # 09:04 KST (NOW is 10:00 KST): the first minutes after the open
+        ctl.owner.updowns["SKHYNIX-15M"].lead = quote("110000", quoted=clock.ms - 4 * 60_000)
+        self.assertEqual(ctl.card_hold(sk), "")
+        clock.ms = was
         ctl.owner.updowns["SKHYNIX-15M"].lead = quote("110000", quoted=clock.ms - 4 * 60_000, fetched=clock.ms - 120_000)
         self.assertEqual(ctl.card_hold(sk), "", "the feed itself quiet: nothing judged")
         unitree = next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "UNITREE-15M")
         ctl.owner.updowns["UNITREE-15M"] = types.SimpleNamespace(lead=quote("90", "100", quoted=clock.ms - 4 * 60_000))
         self.assertEqual(ctl.card_hold(unitree), "", "09:00 Beijing: 宇树 not in session, a still quote is no halt")
+        clock.ms = NOW + 4 * 3600_000 + 30_000  # 13:00:30: the lunch break does not count, nor the first minutes after it
+        ctl.owner.updowns["UNITREE-15M"].lead = quote("90", "100", quoted=NOW + 2 * 3600_000 + 29 * 60_000)
+        self.assertEqual(ctl.card_hold(unitree), "")
+        clock.ms = NOW + 4 * 3600_000 + 10 * 60_000  # 13:10, the last print 11:29: 11 minutes of trading without one (the break not counted) — a halt
+        ctl.owner.updowns["UNITREE-15M"].lead = quote("90", "100", quoted=NOW + 2 * 3600_000 + 29 * 60_000)
+        self.assertIn("成交时间 11 分钟没动", ctl.card_hold(unitree))
+        clock.ms = NOW
         ctl.owner.updowns["UNITREE-15M"].lead = quote("119", "100")
         self.assertIn("距涨停 120.00", ctl.card_hold(unitree))
         ctl.settings = dataclasses.replace(ctl.settings, limit_gap_pct=0.0)
