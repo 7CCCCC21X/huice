@@ -7,6 +7,7 @@ import hashlib
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -88,7 +89,7 @@ class Api:
 def controller(markets=None, **env):
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:",
                              "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "LIVE_MAX_OPEN_USD": "7000",
-                             "PREOPEN_MARKETS": "all", "PREOPEN_SHARES": "50", **env})  # the tests' figures: the three cards, 50 a side
+                             "PREOPEN_MARKETS": "all", "PREOPEN_SHARES": "50", "PREOPEN_AHEAD_MINUTES": "60", **env})  # the tests' figures: the three cards, 50 a side, an hour ahead
     clock = types.SimpleNamespace(ms=NOW)
     wallet = types.SimpleNamespace(maker="0x" + "1" * 40,
         sign_order=lambda order, *flags: ("0x" + hashlib.sha256(json.dumps(order, sort_keys=True).encode()).hexdigest(), "0xsignature"))
@@ -171,7 +172,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"PREOPEN_15M", "PREOPEN_SHARES", "PREOPEN_MARKETS", "PREOPEN_CANCEL_SECONDS"} <= m.CONTROL_KEY_SET and p.Settings is m.PreopenSettings)
         # the defaults are the trial: BTC alone, 10 shares a side (4.9U); "all" or a list widens it
         on = lambda **e: p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", **e}))
-        self.assertEqual((on().shares, on().markets, on().side_usd, on().pair_usd), (10, frozenset({"BTC-15M"}), 4.9, 9.8))
+        self.assertEqual((on().shares, on().markets, on().side_usd, on().pair_usd, on().ahead_minutes), (10, frozenset({"BTC-15M"}), 4.9, 9.8, 1440))
         self.assertEqual(on(PREOPEN_MARKETS="all").markets, frozenset({"BTC-15M", "SKHYNIX-15M", "UNITREE-15M"}))
         self.assertEqual(on(PREOPEN_MARKETS="btc, skhynix").markets, frozenset({"BTC-15M", "SKHYNIX-15M"}))
         self.assertEqual(on(PREOPEN_MARKETS="").markets, frozenset({"BTC-15M"}))
@@ -341,11 +342,12 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         await self.finish(ctl)
 
     async def test_a_window_listed_later_is_found_on_the_next_poll_and_queued_once(self):
-        ctl, api, _ = controller()
+        ctl, api, clock = controller()
         api.unlisted.add(market()["categorySlug"])
         await ctl.discover()
         self.assertEqual(ctl.queue.qsize(), 0)  # 404: not listed yet
         api.unlisted.clear()
+        clock.ms += 60_000  # 09:15–09:45 are not listed: a later window listed alone is found by the full scan, once a minute
         await ctl.discover()
         self.assertEqual(ctl.queue.qsize(), 1)
         await ctl.discover()
@@ -366,8 +368,69 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/categories/" + market(at=NOW + 3 * 3600_000)["categorySlug"], api.calls)
         await self.finish(ctl)
 
+    async def test_discovery_is_cheap_however_wide_the_horizon(self):
+        """1.126.0: every listed window is quoted (PREOPEN_AHEAD_MINUTES 1440 by default, any day), and the discovery asks
+        each card's windows in start order — a full scan stops after MISS_STOP unlisted in a row, and between full scans
+        (once a minute) only the first unlisted window is asked every poll: the one Predict lists next."""
+        rows = [market(at=NOW + n * 15 * 60_000, mid=n) for n in (1, 2, 3)] + [market(at=NOW + 16 * 3600_000, mid=9)]
+        ctl, api, clock = controller(rows, PREOPEN_AHEAD_MINUTES="1440", PREOPEN_MARKETS="btc")
+        starts = p.window_starts(NOW, ctl.owner.config, ctl.settings)
+        self.assertEqual(len(starts), 96)  # the next 24 hours of BTC quarters, tomorrow's included
+        self.assertEqual(p.candidate_problem(market(at=NOW + 16 * 3600_000, mid=9), NOW, ctl.owner.config, ctl.settings), "")  # 01:00 tomorrow
+        self.assertEqual(p.candidate(market(at=NOW + 16 * 3600_000, mid=9), NOW, ctl.owner.config, ctl.settings)["day"], "2026-11-07")
+        await ctl.discover()  # the first scan is a full one
+        self.assertEqual(ctl.queue.qsize(), 3)
+        self.assertEqual(len(api.calls), 3 + p.MISS_STOP)  # the three listed, then four unlisted in a row: the rest of the day waits
+        self.assertEqual(ctl.listed_until_ms, NOW + 45 * 60_000)
+        self.assertIn("已发布到 09:45（开场前 45 分钟）", ctl.status())
+        api.calls.clear()
+        clock.ms += 5_000
+        await ctl.discover()  # a quick scan: the queued windows are skipped, the first unlisted one alone is asked
+        self.assertEqual(api.calls, ["/categories/" + market(at=NOW + 60 * 60_000)["categorySlug"]])
+        api.calls.clear()
+        clock.ms += 60_000
+        await ctl.discover()  # the full scan again, a minute on
+        self.assertEqual(len(api.calls), p.MISS_STOP)
+        await self.finish(ctl)
+
+    async def test_rate_limited_first_request_leaves_no_record_so_the_window_is_placed_later(self):
+        """The cooldown is a hold (nothing is started); a 429 on the first order leaves no record, so the next poll places
+        the window afresh; a cooldown refusal on the second order, the first placed, closes the pair as any one-sided
+        failure (the first withdrawn), and the record stays: no duplicate."""
+        ctl, api, _ = controller([market(), market(at=NOW + 30 * 60_000, mid=7)])
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        api.blocked_until = time.monotonic() + 30
+        self.assertTrue(ctl.hold().startswith("Predict 接口限流冷却中（"), ctl.hold())
+        await ctl.place_pair(c)
+        self.assertEqual((api.sent, c["slug"] in ctl.ledger.rows), ([], False))
+        api.blocked_until = 0.0
+        original = api.create_order
+        async def limited(body): raise m.RemoteError("HTTP 429: Too Many Requests")
+        api.create_order = limited
+        await ctl.place_pair(c)
+        self.assertEqual((api.sent, c["slug"] in ctl.ledger.rows), ([], False))  # nothing exists: no record
+        self.assertIn("HTTP 429", ctl.error)
+        api.create_order = original
+        await ctl.place_pair(c)
+        self.assertEqual(len(api.sent), 2)
+        first = []
+        async def second_limited(body):
+            if first: raise m.RemoteError("Predict 接口限流冷却中（20 秒后重试）")
+            first.append(1); return await original(body)
+        api.create_order = second_limited
+        c2 = p.candidate(market(at=NOW + 30 * 60_000, mid=7), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c2)
+        pair = ctl.ledger.rows[c2["slug"]]
+        self.assertEqual((pair["orders"]["up"]["state"], pair["orders"]["down"]["state"], pair["phase"]), ("final", "not_sent", "closed"))
+        self.assertIn("限流冷却中", pair["orders"]["down"]["error"])
+        self.assertIn("3", api.removed)  # the first side withdrawn
+        api.create_order = original
+        await ctl.place_pair(c2)
+        self.assertEqual(len(api.sent), 3)  # recorded: not placed again
+        await self.finish(ctl)
+
     async def test_an_active_window_is_reread_and_withdrawn_when_its_market_closes(self):
-        ctl, api, clock = controller()
+        ctl, api, clock = controller([market(), market(at=NOW + 3 * 3600_000, mid=8)], PREOPEN_AHEAD_MINUTES="240")
         c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
         await ctl.place_pair(c)
         pair = ctl.ledger.rows[c["slug"]]
@@ -381,6 +444,16 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         await ctl.refresh_active()
         self.assertEqual((pair["phase"], pair["reason"]), ("closed", "市场状态 REGISTERED / CANCEL_ONLY"))
         self.assertEqual(set(api.removed), {"1", "2"})
+        far = p.candidate(market(at=NOW + 3 * 3600_000, mid=8), clock.ms, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(far)
+        await ctl.refresh_active()
+        api.markets["8"]["tradingStatus"] = "CANCEL_ONLY"
+        clock.ms += p.REFRESH_MS
+        await ctl.refresh_active()
+        self.assertEqual(ctl.ledger.rows[far["slug"]]["phase"], "active", "more than an hour away: read again only after REFRESH_FAR_MS")
+        clock.ms += p.REFRESH_FAR_MS
+        await ctl.refresh_active()
+        self.assertEqual(ctl.ledger.rows[far["slug"]]["phase"], "closed")
         await self.finish(ctl)
 
     async def test_global_budget_and_existing_risk_are_not_overridden(self):
@@ -399,16 +472,18 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl, api, clock = controller()
         self.assertEqual((ctl.hold(), ctl.budget_problem()), ("", ""))
         self.assertNotIn("暂不新挂", ctl.status())
-        api.rows["other"] = {"id": "manual", "order": {"hash": "0xother", "side": 0, "makerAmount": "1000000"},
-                             "amount": "2000000", "amountFilled": "0", "status": "OPEN"}
+        api.rows["other"] = {"id": "manual", "order": {"hash": "0xother", "side": 0, "makerAmount": str(L.to_wei(1))},
+                             "amount": str(L.to_wei(2)), "amountFilled": "0", "status": "OPEN"}
         await ctl.account()
-        self.assertEqual(ctl.unmanaged, 1)
+        self.assertEqual((ctl.unmanaged, ctl.hold(), ctl.open_reserved), (1, "", 1.0))  # 1.126.0: shown, no hold; its money in the balance check
         await ctl.place_pair(p.candidate(market(), NOW, ctl.owner.config, ctl.settings))
-        self.assertEqual(api.sent, [])
-        self.assertIn("暂不新挂：账户有 1 笔本程序没记录的挂单", ctl.status())
+        self.assertEqual(len(api.sent), 2)
+        self.assertIn("\n账户另有 1 笔本程序没记录的挂单", ctl.status())
+        self.assertNotIn("暂不新挂", ctl.status())
         del api.rows["other"]
         await ctl.account()
         self.assertEqual((ctl.unmanaged, ctl.hold()), (0, ""))
+        self.assertNotIn("账户另有", ctl.status())
         clock.ms += 31_000
         self.assertEqual(ctl.hold(), "账户快照过期（31 秒前读到）")
         ctl.account_at = 0
@@ -560,11 +635,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("btc-updown-15m-1793927700（09:15）：不挂：交易状态 CLOSED", text)
         self.assertGreaterEqual(text.count("：还没发布"), 6)  # the other BTC quarters, 海力士's and 宇树's
         self.assertNotIn("eth", text)
+        self.assertIn("UNITREE-15M 连续 4 个刻钟没发布或读不到，更晚的不再问", text)  # the whole day is scanned, each card's list ending at four unlisted in a row
         async def broken(method, path, **kw): raise m.RemoteError("HTTP 403: 访问被拒绝")
         api.call = broken
         self.assertIn("读取失败：HTTP 403", "\n".join(await p.probe(api, ctl.owner.config, ctl.settings, NOW)))
         empty = p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", "PREOPEN_MARKETS": "unitree"}))
-        self.assertIn("没有要看的场次", "\n".join(await p.probe(api, ctl.owner.config, empty, NOW - 3600_000)))  # 08:00: 宇树's session has not opened
+        self.assertIn("没有要看的场次", "\n".join(await p.probe(api, ctl.owner.config, empty, NOW + 24 * 3600_000)))  # Saturday 09:00: no 宇树 session for a day
+        self.assertEqual("\n".join(await p.probe(api, ctl.owner.config, empty, NOW)).count("读取失败"), 4)  # failures end a card's list too
         await self.finish(ctl)
 
     async def test_rate_limit_cooldown_is_shared_with_the_bots_client(self):

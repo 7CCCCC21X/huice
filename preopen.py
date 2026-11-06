@@ -14,11 +14,20 @@ the soonest window first, only PREOPEN_AHEAD_MINUTES ahead; the size, the price
 and the cards are settings; the listing's fields can be probed read-only before
 the mode is switched on; the rate-limit cooldown is shared with the bot's own
 API client; a crash of this mode no longer stops the bot.
+
+1.126.0: every listed window is quoted — PREOPEN_AHEAD_MINUTES defaults to 1440
+(a day) and any day counts — and the discovery stays cheap at that width: each
+card's windows are asked in start order, the first unlisted one every poll (the
+one Predict lists next), up to MISS_STOP unlisted in a row once a minute. Open
+orders on the account that nobody here placed no longer hold the mode (their
+money counts in the balance check). The rate limiter's cooldown is a hold, and a
+pair whose first request it refused leaves no record: a later poll places it.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import datetime as dt
 import hashlib
 import json
@@ -40,9 +49,12 @@ RETRY_MS, RETRY_MAX_MS = 15_000, 120_000  # a closing pair's cancels and reads a
 GIVE_UP_MS = 15 * 60_000  # after a window's start + this, an order Predict cannot show by its hash is taken as never placed (it expired before the start)
 SPRINT_MS = 2_000         # the last stretch (past the cancel time, before the expiry): an order still open is asked to be cancelled this often, no backoff
 REFRESH_MS = 30_000       # an active window's market is read again this often (matching on; a status change withdraws the pair)
+REFRESH_FAR_MS = 300_000  # ...a window starting more than an hour away: this often (a day's windows must not cost a read a second)
 SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
 DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
 LISTING_FIELDS = ("id", "conditionId", "status", "tradingStatus", "question", "outcomes")  # the details' fields the discovery reads
+MISS_STOP = 4          # discover: a card's coming windows are asked in start order; this many unlisted in a row end the card's full scan
+FULL_SCAN_MS = 60_000  # a full scan (up to MISS_STOP unlisted per card) this often; between them each card's first unlisted window alone is asked every poll
 
 
 def final_order(row: dict) -> bool:
@@ -78,6 +90,13 @@ class Ledger:
         with self.conn:
             self.conn.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body", (row["slug"], body))
         self.rows[row["slug"]] = row
+
+    def delete(self, slug: str) -> None:
+        """A pair none of whose orders was ever sent (the rate limiter refused the first request): no record, so a later
+        poll places the window afresh — the same signed orders, their salt being deterministic."""
+        with self.conn:
+            self.conn.execute("DELETE FROM pairs WHERE slug=?", (slug,))
+        self.rows.pop(slug, None)
 
     def close(self) -> None:
         self.conn.close()
@@ -133,7 +152,7 @@ def safe_api(base: str, key: str, wallet: Any, before_send: Any = None, shared: 
 
 def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings) -> str:
     """Why a listed market is not one of this mode's ("" when it is): only exact, listed slugs of the configured cards,
-    starting today, within PREOPEN_AHEAD_MINUTES and not within PREOPEN's entry seconds, registered, visible, open or
+    starting within PREOPEN_AHEAD_MINUTES (any day) and not within PREOPEN's entry seconds, registered, visible, open or
     awaiting matching, with no maker fee, with an id, a condition and a question that agrees with the slug's time."""
     slug = str(market.get("categorySlug") or market.get("slug") or "")
     for rolling in core.WINDOW_UPDOWN_MARKETS:
@@ -150,9 +169,6 @@ def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings
             return "已开始或不足 3 分钟"
         if start - now_ms > settings.ahead_minutes * 60_000:
             return f"开始还在 {settings.ahead_minutes} 分钟之外（之后再扫）"
-        today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date()
-        if dt.datetime.fromtimestamp(start / 1000, core.BEIJING).date() != today:
-            return "不是北京时间当天的场次"
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
         if not rolling.exists(start, holidays):
             return "不在交易时段内"
@@ -182,21 +198,20 @@ def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dic
     spec = rolling.window_spec(start)
     return {"slug": slug, "key": rolling.key, "market_id": str(market["id"]), "start_ms": start,
             "cancel_ms": start - settings.cancel_seconds * 1000, "expires": start // 1000 - settings.expiry_seconds,
-            "day": dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat(), "name": spec.name}
+            "day": dt.datetime.fromtimestamp(start / 1000, core.BEIJING).date().isoformat(), "name": spec.name}
 
 
 def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[Any, int]]:
     """The windows this mode looks for now: each configured card's quarter hours from PREOPEN_ENTRY_SECONDS ahead to
-    PREOPEN_AHEAD_MINUTES ahead, today (Beijing), on the card's exchange session — (card, start_ms), soonest first."""
+    PREOPEN_AHEAD_MINUTES ahead, whatever the day, on the card's exchange session — (card, start_ms), soonest first."""
     out = []
-    today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date()
     for rolling in core.WINDOW_UPDOWN_MARKETS:
         if rolling.key not in settings.markets:
             continue
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
         start = -(-(now_ms + settings.entry_seconds * 1000) // rolling.window_ms) * rolling.window_ms
         while start <= now_ms + settings.ahead_minutes * 60_000:
-            if dt.datetime.fromtimestamp(start / 1000, core.BEIJING).date() == today and rolling.exists(start, holidays):
+            if rolling.exists(start, holidays):
                 out.append((rolling, start))
             start += rolling.window_ms
     return sorted(out, key=lambda rs: (rs[1], rs[0].key))
@@ -204,6 +219,12 @@ def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[An
 
 def window_slug(rolling: Any, start_ms: int) -> str:
     return f"{rolling.stem}-updown-15m-{start_ms // 1000}"
+
+
+def when(ms: int, now_ms: int) -> str:
+    """HH:MM (Beijing), with the date when it is not today's."""
+    at, today = dt.datetime.fromtimestamp(ms / 1000, core.BEIJING), dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date()
+    return at.strftime("%H:%M") if at.date() == today else at.strftime("%m-%d %H:%M")
 
 
 async def category_market(api: Any, slug: str) -> dict | None:
@@ -224,24 +245,30 @@ async def category_market(api: Any, slug: str) -> dict | None:
 
 
 async def probe(api: Any, config: Any, settings: Settings, now_ms: int) -> list[str]:
-    """Every window the discovery would look at now, read as it reads them: listed or not, the details' trading status,
-    the fields the discovery needs that are missing, whether it would be placed and why not — run before switching on."""
-    hm = lambda ms: dt.datetime.fromtimestamp(ms / 1000, core.BEIJING).strftime("%H:%M")
+    """Every window of the next day, read as the discovery reads them (each card's in start order, MISS_STOP unlisted in a
+    row ending the card's list): listed or not, the details' trading status, the fields the discovery needs that are
+    missing, whether it would be placed and why not — run before switching on; it shows how far ahead Predict lists."""
+    hm = lambda ms: when(ms, now_ms)
     lines = [f"开盘前预挂探测（只读；设置：{'、'.join(sorted(settings.markets))}，{core.cents(float(settings.price))}×{settings.shares} 份，"
              f"提前 {settings.ahead_minutes} 分钟内，不足 {settings.entry_seconds} 秒不挂）"]
-    starts = window_starts(now_ms, config, settings)
+    starts = window_starts(now_ms, config, dataclasses.replace(settings, ahead_minutes=max(settings.ahead_minutes, 1440)))
     if not starts:
-        lines.append("这段时间里没有要看的场次（不在交易时段，或都在提前范围之外）")
+        lines.append("24 小时内没有要看的场次（不在交易时段）")
+    misses: dict[str, int] = {}
     for rolling, start in starts:
-        slug = window_slug(rolling, start)
+        if misses.get(rolling.key, 0) >= MISS_STOP:
+            continue
+        slug, word = window_slug(rolling, start), ""
         try:
             market = await category_market(api, slug)
         except Exception as error:
-            lines.append(f"{slug}（{hm(start)}）：读取失败：{core.clean_error(error) or type(error).__name__}")
-            continue
+            market, word = None, f"读取失败：{core.clean_error(error) or type(error).__name__}"
         if market is None:
-            lines.append(f"{slug}（{hm(start)}）：还没发布")
+            misses[rolling.key] = misses.get(rolling.key, 0) + 1
+            lines.append(f"{slug}（{hm(start)}）：{word if word else '还没发布'}"
+                         + (f"；{rolling.key} 连续 {MISS_STOP} 个刻钟没发布或读不到，更晚的不再问" if misses[rolling.key] >= MISS_STOP else ""))
             continue
+        misses[rolling.key] = 0
         why = candidate_problem(market, now_ms, config, settings)
         missing = [f for f in LISTING_FIELDS if f not in market]
         lines.append(f"{slug}（{hm(start)}）：{'会挂' if not why else '不挂：' + why}；状态 {market.get('status') or '缺失'} / 交易状态 "
@@ -264,12 +291,14 @@ class Controller:
         self.balance = 0.0
         self.open_reserved = 0.0
         self.listed_ids: set[str] = set()
-        self.unmanaged = 0  # open orders on the account that neither strategy placed: a hold until they are withdrawn
+        self.unmanaged = 0  # open orders on the account that neither strategy placed: shown; their money is in the balance check (no hold since 1.126.0)
         self.placing: set[str] = set()
         self.cancelling: set[str] = set()
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()  # (start_ms, slug, candidate): the soonest window first
         self.queued: set[str] = set()
         self.skipped: dict[str, str] = {}  # slug -> why a listed window was not placed (the status line)
+        self.full_scan_ms = 0  # discover: when the last full scan ran (FULL_SCAN_MS)
+        self.listed_until_ms = max((int(p.get("start_ms") or 0) for p in self.ledger.rows.values()), default=0)  # the latest window seen listed
         self.account_lock = asyncio.Lock()
         shared = getattr(owner.live, "api", None)  # the bot's own client: one rate-limit cooldown for all three
         self.api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, self.before_send, shared)
@@ -303,17 +332,20 @@ class Controller:
 
     def hold(self) -> str:
         """Why no new pair goes out right now, for the status line: the pause (blocked), the account snapshot not read yet
-        or stale, or open orders on the account that neither this mode nor the model trader placed (a manual order, an
-        older version's) — nobody's to manage, so nothing new is placed until they are withdrawn."""
+        or stale, or the rate limiter's cooldown. Open orders on the account that nobody here placed (a manual order, an
+        older version's) are not a hold since 1.126.0: they are shown, and their money is in the balance check."""
         if why := self.blocked():
             return why
         if not self.account_at:
             return "账户快照还没有读到（启动后第一次扫描中）"
         if self.now() - self.account_at > 30_000:
             return f"账户快照过期（{(self.now() - self.account_at) // 1000} 秒前读到）"
-        if self.unmanaged:
-            return f"账户有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的），撤掉它们后才预挂"
-        return ""
+        return self.cooldown()
+
+    def cooldown(self) -> str:
+        """The shared rate-limit cooldown (a 429 on any client): no request goes out, so no new pair is started."""
+        left = getattr(self.api, "blocked_until", 0.0) - time.monotonic()
+        return f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）" if left > 0 else ""
 
     def budget_problem(self) -> str:
         """Why the next pair does not fit: the joint exposure cap, the USDT balance, the per-order cap."""
@@ -327,7 +359,7 @@ class Controller:
         return ""
 
     def before_send(self, body: dict) -> str:
-        if why := self.blocked():
+        if why := self.blocked() or self.cooldown():
             return why
         digest = str(body.get("data", {}).get("order", {}).get("hash") or "").lower()
         pair = next((p for p in self.ledger.rows.values() if any(o.get("hash") == digest for o in p["orders"].values())), None)
@@ -421,16 +453,27 @@ class Controller:
             self.account_at = self.now()
 
     async def discover(self) -> None:
-        """Each coming window (window_starts) not yet recorded or queued, asked for by its category: listed, it is judged
-        (candidate) and queued, the soonest first; not listed yet, it is asked again next poll."""
+        """Each coming window (window_starts) not yet recorded or queued, asked for by its category, each card's in start
+        order: listed, it is judged (candidate) and queued, the soonest first. Not listed, the card's later windows are
+        asked only in a full scan (every FULL_SCAN_MS, up to MISS_STOP unlisted in a row); between full scans each card's
+        first unlisted window alone is asked every poll — the one Predict lists next. Cheap however wide the horizon."""
+        full = self.now() - self.full_scan_ms >= FULL_SCAN_MS
+        if full:
+            self.full_scan_ms = self.now()
+        misses: dict[str, int] = {}
         found: list[dict] = []
         for rolling, start in window_starts(self.now(), self.owner.config, self.settings):
+            if misses.get(rolling.key, 0) >= (MISS_STOP if full else 1):
+                continue
             slug = window_slug(rolling, start)
             if slug in self.ledger.rows or slug in self.queued:
                 continue
             market = await category_market(self.api, slug)
             if market is None:
+                misses[rolling.key] = misses.get(rolling.key, 0) + 1
                 continue
+            misses[rolling.key] = 0
+            self.listed_until_ms = max(self.listed_until_ms, start)
             c = candidate(market, self.now(), self.owner.config, self.settings)
             if c is None:
                 self.skipped[slug] = candidate_problem(market, self.now(), self.owner.config, self.settings)
@@ -441,10 +484,12 @@ class Controller:
             await self.queue.put((c["start_ms"], c["slug"], c))
 
     async def refresh_active(self) -> None:
-        """An active window's market, read again every REFRESH_MS: when matching comes on (note_open), and a market no
-        longer registered or open for orders has its pair withdrawn."""
+        """An active window's market, read again every REFRESH_MS (REFRESH_FAR_MS while its start is more than an hour
+        away): when matching comes on (note_open), and a market no longer registered or open for orders has its pair
+        withdrawn."""
         for pair in list(self.ledger.rows.values()):
-            if pair["phase"] != "active" or self.now() - int(pair.get("meta_ms") or 0) < REFRESH_MS:
+            every = REFRESH_MS if pair["start_ms"] - self.now() <= 3_600_000 else REFRESH_FAR_MS
+            if pair["phase"] != "active" or self.now() - int(pair.get("meta_ms") or 0) < every:
                 continue
             pair["meta_ms"] = self.now()
             market = {**(await self.api.market(pair["market_id"])), "categorySlug": pair["slug"]}
@@ -513,8 +558,12 @@ class Controller:
                 pair["phase"] = "closing"
             except Exception as error:
                 text = core.clean_error(error) or type(error).__name__
-                definite = isinstance(error, live.OrderRejected) or 400 <= live.http_status(error) < 500
-                if definite and not any(w in text.lower() for w in DUPLICATE_WORDS):
+                status = live.http_status(error)
+                definite = isinstance(error, live.OrderRejected) or 400 <= status < 500
+                if status == 429 or "限流冷却中" in text:
+                    # the rate limiter refused the request before it was processed (429), or the shared cooldown kept it in: not placed
+                    order.update(state="rejected" if status == 429 else "not_sent", error=text, limited=True)
+                elif definite and not any(w in text.lower() for w in DUPLICATE_WORDS):
                     # Predict refused it (a post-only order that would cross, an invalid field): nothing was placed, nothing
                     # to reserve or reconcile (the first revision kept such an order "unknown", and its money, for good)
                     order.update(state="rejected", error=text)
@@ -526,6 +575,13 @@ class Controller:
             self.ledger.save(pair)
             if pair["phase"] != "active":
                 break
+        if all(o["state"] in {"prepared", "not_sent"} or o.get("limited") for o in pair["orders"].values()):
+            # nothing of the pair was ever placed (a gate or the rate limiter refused the first request): no record, so a
+            # later poll places the window afresh — hold() keeps it back while the reason lasts
+            self.error = next((o["error"] for o in pair["orders"].values() if o.get("error")), "")
+            self.ledger.delete(pair["slug"])
+            LOG.warning("开盘前预挂 %s 没有发出：%s", pair["slug"], self.error)
+            return
         if pair["phase"] != "active" or self.now() >= pair["cancel_ms"] or self.blocked():
             await self.cancel_pair(pair, "单边未确认或已到撤单时间")
         LOG.info("开盘前预挂 %s：%s", pair["slug"], {s: o["state"] for s, o in pair["orders"].items()})
@@ -871,19 +927,29 @@ class Controller:
         else:
             unseen = sum(1 for p in rows if not p.get("open_seen_ms") and self.now() >= p["cancel_ms"])
             parts.append(f"撮合开启：{unseen} 场到撤单时还没见到 OPEN" if unseen else "撮合开启：还没有观察")
+        placed = [p for p in rows if p.get("created_ms")][-20:]
+        if placed:  # how long before the start a window was found listed and placed: the evidence PREOPEN_AHEAD_MINUTES is set against
+            leads = sorted((p["start_ms"] - p["created_ms"]) / 60_000 for p in placed)
+            parts.append(f"挂上时距开场中位 {leads[len(leads) // 2]:.0f} 分钟（最长 {leads[-1]:.0f}；{len(placed)} 场）"
+                         + ("，贴着提前范围：Predict 可能发布得更早，可调大 PREOPEN_AHEAD_MINUTES"
+                            if self.settings.ahead_minutes < 1440 and leads[-1] >= self.settings.ahead_minutes - 15 else ""))
         return "；".join(parts)
 
     def status(self) -> str:
         rows = list(self.ledger.rows.values())
         why = (self.hold() or self.budget_problem()) if self.alive else ""
         state = "已停止" if not self.alive else f"暂停，{why}" if self.blocked() else "运行"
+        listed = (f"已发布到 {when(self.listed_until_ms, self.now())}（开场前 {(self.listed_until_ms - self.now()) / 60_000:.0f} 分钟）"
+                  if self.listed_until_ms > self.now() else "还没见到已发布的场次")
         return (f"开盘前自动预挂：{state}\n"
                 f"{' / '.join(sorted(self.settings.markets))}：两边 {core.cents(float(self.settings.price))}，各 {self.settings.shares} 份；"
-                f"扫描 {self.settings.poll:g} 秒，只挂 {self.settings.ahead_minutes} 分钟内开始的场次\n"
+                f"扫描 {self.settings.poll:g} 秒，"
+                + ("挂 24 小时内已发布的全部场次" if self.settings.ahead_minutes >= 1440 else f"只挂 {self.settings.ahead_minutes} 分钟内开始的场次") + "\n"
                 f"撤单：开场前 {self.settings.cancel_seconds} 秒发出，之后到开场前 {self.settings.expiry_seconds} 秒到期为止每 {SPRINT_MS // 1000} 秒催一次；"
                 f"不足 {self.settings.entry_seconds} 秒不再新挂\n"
-                f"已记录 {len(rows)} 场（{sum(1 for p in rows if p['phase'] == 'active')} 场挂着，{sum(1 for p in rows if p.get('accounted'))} 场已结清），队列 {self.queue.qsize()} 场\n"
+                f"已记录 {len(rows)} 场（{sum(1 for p in rows if p['phase'] == 'active')} 场挂着，{sum(1 for p in rows if p.get('accounted'))} 场已结清），队列 {self.queue.qsize()} 场；{listed}\n"
                 f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
+                + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：占用的 USDT 计入余额核对，不计入预挂限额" if self.unmanaged else "")
                 + (f"\n没挂的已发布场次：" + "；".join(f"{k.rsplit('-', 1)[-1]} {v}" for k, v in list(self.skipped.items())[-3:]) if self.skipped else "") + "\n"
                 f"实测：{self.timing_line()}")

@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.125.2"
+VERSION = "1.126.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -505,7 +505,7 @@ class PreopenSettings:
     cancel_seconds: int = 20   # PREOPEN_CANCEL_SECONDS: the cancel goes out this long before the window's start
     expiry_seconds: int = 10   # PREOPEN_EXPIRY_SECONDS: the signed order expires this long before the start (the backstop when the cancel fails)
     entry_seconds: int = 180   # PREOPEN_ENTRY_SECONDS: no new pair this close to the start
-    ahead_minutes: int = 60    # PREOPEN_AHEAD_MINUTES: only windows starting within this are placed, the soonest first
+    ahead_minutes: int = 1440  # PREOPEN_AHEAD_MINUTES: only windows starting within this are placed, the soonest first (1.126.0: a day = every listed window)
     max_open_usd: float = 7000.0
     price: D = D("0.49")       # PREOPEN_PRICE_CENTS
     shares: D = D("10")        # PREOPEN_SHARES: the trial size; 50 was the first revision's
@@ -541,7 +541,7 @@ class PreopenSettings:
     def parse(cls, e: Mapping, enabled: bool) -> "PreopenSettings":
         poll = float(e.get("PREOPEN_POLL_SECONDS", "5"))
         cap = float(e.get("PREOPEN_MAX_OPEN_USD", "7000"))
-        cents, shares, ahead = int(e.get("PREOPEN_PRICE_CENTS", "49")), int(e.get("PREOPEN_SHARES", "10")), int(e.get("PREOPEN_AHEAD_MINUTES", "60"))
+        cents, shares, ahead = int(e.get("PREOPEN_PRICE_CENTS", "49")), int(e.get("PREOPEN_SHARES", "10")), int(e.get("PREOPEN_AHEAD_MINUTES", "1440"))
         cancel, expiry, entry = int(e.get("PREOPEN_CANCEL_SECONDS", "20")), int(e.get("PREOPEN_EXPIRY_SECONDS", "10")), int(e.get("PREOPEN_ENTRY_SECONDS", "180"))
         stems = {r.stem.lower(): r.key for r in WINDOW_UPDOWN_MARKETS}
         keys = frozenset(stems.values())
@@ -639,7 +639,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_MARKETS", "预挂哪几张卡", "btc = 只挂 BTC（默认）；all = BTC、海力士、宇树三张"),
     ("PREOPEN_SHARES", "预挂每边份数", "1～500：每场每边各挂这么多份（默认 10），每边不少于 $1"),
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
-    ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：更晚的场次等下一轮扫描，最近的先挂（默认 60）"),
+    ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场、最近的先；想少占资金就调小"),
     ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
     ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）"),
     ("PREOPEN_ENTRY_SECONDS", "距开场不足几秒不再新挂", "至少比撤单时间多 60 秒、至多 3600（默认 180）"),
@@ -9887,7 +9887,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_EXCLUSIVE": {"kind": "choice", "group": "预挂", "options": [["off", "off 两边同时跑"], ["on", "on 预挂时原策略不开新仓"]]},
     "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
     "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},
-    "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["15", "30", "60", "120", "240"], "unit": "分钟"},
+    "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["60", "120", "240", "720", "1440"], "unit": "分钟"},
     "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "15", "20", "30", "60"], "unit": "秒"},
     "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["5", "10", "15", "30"], "unit": "秒"},
     "PREOPEN_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["90", "120", "180", "300"], "unit": "秒"},
