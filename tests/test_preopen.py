@@ -527,6 +527,56 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("撤单确认用时中位 0.4 秒", ctl.timing_line())
         await self.finish(ctl)
 
+    async def test_snapshot_pace_counts_from_the_reads_start_and_a_failed_read_is_named(self):
+        """1.136.1: the pre-open API reads up to 600 pages of open orders (60 — 3,000 orders — was passed by twenty cards with
+        four levels a day ahead: the snapshot never completed again and every placement was held) at LIVE_ORDERS_PAGE a
+        page; the wait after a read is the pace less the read's duration; the staleness allows for the read's duration; a
+        failed read is named by the hold (it used to say 启动后第一次扫描中), with the page count on an incomplete list."""
+        ctl, api, clock = controller()
+        fresh = p.Controller(ctl.owner)
+        self.assertEqual((fresh.api.ORDERS_PAGES_MAX, fresh.api.ORDERS_PAGE, fresh.cancel_api.ORDERS_PAGE), (600, 50, 50))
+        fresh.ledger.close()
+        wide, _, _ = controller(LIVE_ORDERS_PAGE="100")
+        fresh = p.Controller(wide.owner)
+        self.assertEqual((fresh.api.ORDERS_PAGE, fresh.cancel_api.ORDERS_PAGE), (100, 100))
+        fresh.ledger.close()
+        await self.finish(wide)
+        ctl.account_pages = 60
+        self.assertEqual((ctl.account_interval_s(), ctl.account_stale_ms()), (90.0, 190_000))
+        ctl.account_read_s = 55.0
+        self.assertEqual(ctl.account_stale_ms(), 245_000, "the read's own duration on top")
+        self.assertEqual((ctl.account_wait(40.0, False), ctl.account_wait(100.0, False), ctl.account_wait(0.0, True)), (50.0, 1.0, 10.0))
+        self.assertIn("账户快照每 90 秒（60 页挂单，上次读了 55 秒）", ctl.status())
+        api.orders_complete = False
+        with self.assertRaises(m.RemoteError) as caught:
+            await ctl.account()
+        self.assertIn("账户挂单分页未读取完整（读了 0 条、0 页仍没到底，上限 ? 页）", str(caught.exception))
+        self.assertEqual((ctl.account_at, ctl.hold()), (0, "账户快照上次读取失败（账户挂单分页未读取完整（读了 0 条、0 页仍没到底，上限 ? 页），暂停新增订单），正在重读"))
+        api.orders_complete = True
+        await ctl.account()
+        self.assertEqual((ctl.account_at, ctl.account_failed, ctl.hold(), ctl.account_read_s), (NOW, "", "", 0.0))
+        await self.finish(ctl)
+
+    async def test_a_windows_levels_are_refreshed_with_one_read(self):
+        """1.136.1: the due records of one window (its price levels) share a read of the market; a status change withdraws
+        them all. Reads of distinct windows are still REFRESH_BATCH an iteration."""
+        ctl, api, clock = controller(PREOPEN_MARKETS="btc", PREOPEN_LEVELS="48x20,47x40")
+        reads = []
+        orig = api.market
+        api.market = lambda mid: (reads.append(mid), orig(mid))[1]
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        for n in range(3):
+            ctl.ledger.save({**c, "slug": c["slug"] + (f"#{n}" if n else ""), "level": n, "phase": "active", "created_ms": NOW,
+                             "orders": {"up": {"state": "open", "id": f"u{n}", "hash": f"h{n}", "filled": 0.0}, "down": {"state": "open", "id": f"d{n}", "hash": f"g{n}", "filled": 0.0}}})
+        await ctl.refresh_active()
+        self.assertEqual((reads, all(r.get("meta_ms") == NOW for r in ctl.ledger.rows.values())), (["123"], True))
+        clock.ms += p.REFRESH_MS
+        api.markets["123"]["tradingStatus"] = "CANCEL_ONLY"
+        await ctl.refresh_active()
+        self.assertEqual((reads, sorted(r["phase"] for r in ctl.ledger.rows.values()), set(api.removed)),
+                         (["123", "123"], ["closed"] * 3, {"u0", "d0", "u1", "d1", "u2", "d2"}))
+        await self.finish(ctl)
+
     async def test_active_windows_are_refreshed_in_small_batches(self):
         rows = [market(at=NOW + n * 15 * 60_000, mid=n) for n in range(1, 11)]
         ctl, api, clock = controller(rows, PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="240")

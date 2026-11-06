@@ -158,7 +158,7 @@ def safe_api(base: str, key: str, wallet: Any, before_send: Any = None, shared: 
     import live
 
     class Api(live.PredictApi):
-        ORDERS_PAGES_MAX = 60  # 3000 open orders a read (1.131.2): five cards, a day, several levels pass the bot's own 1000
+        ORDERS_PAGES_MAX = 600  # 30,000 open orders a read at 50 a page (1.136.1: the 60 of 1.131.2 — 3,000 — was passed at 11-07 01:20 by twenty cards, four levels, a day ahead; the snapshot never completed again and every placement was held)
 
         @property
         def blocked_until(self) -> float:
@@ -667,6 +667,8 @@ class Controller:
         self.category_full: bool | None = None  # whether the category answers carried everything an order needs (no details read) — None until a listing was read
         self.awaiting: dict[str, int] = {}  # card -> when its next window (beyond the known listing, not listed yet) entered the range: the sprint runs from then (1.133.1)
         self.account_pages = 1  # pages the last open-order snapshot took: its pace and staleness follow (ACCOUNT_PAGE_S)
+        self.account_read_s = 0.0  # how long the last complete snapshot read took: the staleness allows for it (1.136.1)
+        self.account_failed = ""  # why the last snapshot read failed, until one succeeds (the hold names it: 1.136.1)
         self.probe_turn = 0  # which card of a group whose next windows start together is the pass's sentinel (the rest read once it is seen listed)
         self.rate_samples: collections.deque = collections.deque(maxlen=130)  # (ms, requests so far): the request rate of the last minute (the status)
         self.parked: dict[str, tuple[int, dict]] = {}  # slug -> (retry_ms, candidate): held by hold() or the budget, placed again HOLD_RETRY_MS on, still queued
@@ -687,6 +689,7 @@ class Controller:
         # A separate request gate leaves cancellation capacity available even when
         # placement requests are queued or their HTTP responses are slow.
         self.cancel_api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, None, shared)
+        self.api.ORDERS_PAGE = self.cancel_api.ORDERS_PAGE = int(getattr(owner.config, "live_orders_page", 50) or 50)  # LIVE_ORDERS_PAGE: fewer pages a snapshot (1.136.1)
         self.settling: dict[str, asyncio.Task] = {}
         self.settle_gate = asyncio.Semaphore(2)
 
@@ -801,9 +804,10 @@ class Controller:
         if why := self.blocked():
             return why
         if not self.account_at:
-            return "账户快照还没有读到（启动后第一次扫描中）"
+            return f"账户快照上次读取失败（{self.account_failed}），正在重读" if self.account_failed else "账户快照还没有读到（启动后第一次扫描中）"
         if self.now() - self.account_at > self.account_stale_ms():
-            return f"账户快照过期（{(self.now() - self.account_at) // 1000} 秒前读到，每 {self.account_interval_s():.0f} 秒读一次）"
+            return (f"账户快照过期（{(self.now() - self.account_at) // 1000} 秒前读到，每 {self.account_interval_s():.0f} 秒读一次"
+                    + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）")
         return self.cooldown()
 
     def account_interval_s(self) -> float:
@@ -812,8 +816,17 @@ class Controller:
         return max(float(self.settings.poll), self.account_pages * ACCOUNT_PAGE_S)
 
     def account_stale_ms(self) -> int:
-        """How old a snapshot may be before nothing new is placed on it: twice its pace and ten seconds, 30 s at least."""
-        return max(30_000, int(2 * self.account_interval_s() * 1000) + 10_000)
+        """How old a snapshot may be before nothing new is placed on it: twice its pace, the last read's own duration (the
+        snapshot is dated from the read's start: sixty pages take a minute) and ten seconds, 30 s at least."""
+        return max(30_000, int((2 * self.account_interval_s() + self.account_read_s) * 1000) + 10_000)
+
+    def account_wait(self, spent_s: float, failed: bool) -> float:
+        """Seconds from the end of a snapshot read to the start of the next: the pace less the read's own duration (1.136.1:
+        the pace used to be waited after the read, so a minute's read made the cycle twice the pace and the snapshot stale at
+        the end of each), a second at least; after a failed read, the poll or ten seconds."""
+        if failed:
+            return max(float(self.settings.poll), 10.0)
+        return max(1.0, self.account_interval_s() - spent_s)
 
     def request_rate(self) -> float | None:
         """Requests a second over the last minute (both API wrappers; the cancellation loop samples the counters): what the
@@ -962,9 +975,10 @@ class Controller:
         fetched = self.now()
         try:
             rows = await self.api.orders("OPEN")
+            page = int(getattr(self.api, "ORDERS_PAGE", 50) or 50)
             if not self.api.orders_complete:
-                raise core.RemoteError("账户挂单分页未读取完整，暂停新增订单")
-            self.account_pages = max(1, -(-len(rows) // int(getattr(self.api, "ORDERS_PAGE", 50) or 50)))
+                raise core.RemoteError(f"账户挂单分页未读取完整（读了 {len(rows)} 条、{-(-len(rows) // page)} 页仍没到底，上限 {getattr(self.api, 'ORDERS_PAGES_MAX', '?')} 页），暂停新增订单")
+            self.account_pages = max(1, -(-len(rows) // page))
             other = self.unmanaged_rows(rows)
             known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)}
             strangers = [r for r in other if str(r.get("id")) not in known_core]
@@ -979,9 +993,11 @@ class Controller:
                         raise core.RemoteError("账户订单缺少有效数量，暂停新增订单")
                     reserved += float(D(str(order["makerAmount"])) / live.WEI * (1 - filled / amount))
             balance = float(await self.owner.live.chain.usdt_balance()) / live.WEI
-        except Exception:
+        except Exception as error:
             self.account_at = 0
+            self.account_failed = core.clean_error(error) or type(error).__name__
             raise
+        self.account_read_s, self.account_failed = (self.now() - fetched) / 1000, ""
         async with self.account_lock:
             self.unmanaged, self.open_reserved, self.balance, self.unmanaged_detail = unmanaged, reserved, balance, detail
             self.listed_ids = {str(r.get("id")) for r in rows}
@@ -1248,20 +1264,27 @@ class Controller:
         withdrawn."""
         every = lambda p: REFRESH_MS if p["start_ms"] - self.now() <= 3_600_000 else REFRESH_FAR_MS
         due = sorted((p for p in self.ledger.rows.values() if p["phase"] == "active" and self.now() - int(p.get("meta_ms") or 0) >= every(p)),
-                     key=lambda p: int(p.get("meta_ms") or 0))[:REFRESH_BATCH]  # the longest unread first; a burst of due windows is spread over iterations
+                     key=lambda p: int(p.get("meta_ms") or 0))  # the longest unread first; a burst of due windows is spread over iterations
+        batch: dict[str, list[dict]] = {}  # market id -> its due records: one read a window, whatever its levels (1.136.1: four levels were four reads)
+        for pair in due:
+            key = str(pair["market_id"])
+            if key in batch or len(batch) < REFRESH_BATCH:
+                batch.setdefault(key, []).append(pair)
         gate = asyncio.Semaphore(3)
 
-        async def one(pair: dict) -> None:
+        async def one(pairs: list[dict]) -> None:
             async with gate:
-                pair["meta_ms"] = self.now()
-                market = {**(await self.api.market(pair["market_id"])), "categorySlug": pair.get("window") or window_of(pair)}
+                for pair in pairs:
+                    pair["meta_ms"] = self.now()
+                market = {**(await self.api.market(pairs[0]["market_id"])), "categorySlug": pairs[0].get("window") or window_of(pairs[0])}
                 self.note_open(market)
                 status, trading = str(market.get("status") or "").upper(), str(market.get("tradingStatus") or "").upper()
                 if status != "REGISTERED" or trading not in {"OPEN", "MATCHING_NOT_ENABLED"}:
-                    await self.cancel_many([pair], f"市场状态 {status or '?'} / {trading or '?'}")
+                    await self.cancel_many(pairs, f"市场状态 {status or '?'} / {trading or '?'}")
                 else:
-                    self.ledger.save(pair)
-        for error in await asyncio.gather(*(one(p) for p in due), return_exceptions=True):
+                    for pair in pairs:
+                        self.ledger.save(pair)
+        for error in await asyncio.gather(*(one(ps) for ps in batch.values()), return_exceptions=True):
             if isinstance(error, BaseException):
                 raise error
 
@@ -1656,15 +1679,17 @@ class Controller:
         """The account snapshot (the open orders, the fills they show, the balance) every poll, on its own: the discovery
         and the refreshes, however long they take, never let it go stale (a stale snapshot holds every placement)."""
         while not self.stopped():
+            started, failed = time.monotonic(), False
             try:
                 if not self.blocked():
                     await self.account()
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                failed = True
                 self.error = core.clean_error(error) or type(error).__name__
                 LOG.warning("开盘前账户快照：%s", self.error)
-            await asyncio.sleep(self.account_interval_s())
+            await asyncio.sleep(self.account_wait(time.monotonic() - started, failed))
 
     def poll_wait(self) -> float:
         """Seconds to the next discovery: FAST_POLL_S while a card's next listing is expected — a cycle after its last one
@@ -1893,7 +1918,7 @@ class Controller:
                 f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉且一份没成交的场次立即释放）"
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，按开场先后补挂中") if pairs_left else "")
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
-                + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单）"
+                + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）"
                 + f"\n扫描：{self.scan_note or '还没扫过'}（发布探测每 {LISTING_PROBE_S:g} 秒，预计发布前后每 {FAST_POLL_S:g} 秒；"
                 + ("分类应答自带下单字段，发现即下单" if self.category_full else "分类应答不带下单字段，每场多读一次详情" if self.category_full is False else "还没读过发布")
                 + (f"；冲刺中：{'、'.join(sorted(k for k, t in self.awaiting.items() if 0 <= self.now() - t <= LISTING_LATE_MS))} 的下一场已进范围、等发布"
