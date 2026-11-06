@@ -937,7 +937,7 @@ async def november():
         market = FakeMarket()
         bot = m.Bot(cfg, m.Store(":memory:"), market, None)
         assert list(bot.ranges) == [s.key for s in LIVE] and list(bot.touches) == ["SOL", "ETH", "BTC-2027", "BNB-2027"]  # 1.101.1: BNB 先触 decided, taken off; 1.112.3: STRC over; 1.132.0: BTC 70k/90k to May 2027; 1.132.2: BNB 600/800
-        assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY", "UNITREE-15M", "SKHYNIX-15M", "BTC-15M", "ETH-15M", "BNB-15M"] and list(bot.flips) == ["HYPE-SOL-12"] and not bot.caps  # 1.97.0: the daily up/down cards; 1.102.0 / 1.103.0 / 1.109.0: the 15-minute ones; 1.132.0: HYPE 反超 SOL by December
+        assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY", "UNITREE-15M", "SKHYNIX-15M", "BTC-15M", "ETH-15M", "BNB-15M", "XAU-15M", "CL-15M", "ZHIPU-15M"] and list(bot.flips) == ["HYPE-SOL-12"] and not bot.caps  # 1.97.0: the daily up/down cards; 1.102.0 / 1.103.0 / 1.109.0: the 15-minute ones; 1.132.0: HYPE 反超 SOL by December
         targets = bot.predict_targets(MID)
         assert all(targets[s.key] == s.slug and s.key in bot.predict.ladder_keys for s in NOV) and not any(k.endswith("-HIT-10") for k in targets)
         # BNB 先触 700/900 (BNB fell to $700 first; Predict's book was gone, the card showed its HTTP 400): no book asked for, no
@@ -963,7 +963,7 @@ async def november():
                          ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格")], items
         # the price streams follow: HYPEUSDT on futures for its ladder; HYPE and SOL on Hyperliquid for the flip (1.132.0: by December)
         assert bot.binance_streams["spot"].symbols() == ["SOLUSDT", "ETHUSDT", "BTCUSDT", "BNBUSDT", "ZECUSDT"]  # BNBUSDT for BNB's daily card
-        assert bot.binance_streams["futures"].symbols() == ["UNITREEUSDT", "SKHYNIXUSDT", "HYPEUSDT"] and {"HYPE", "SOL"} <= set(bot.hl_stream.coins())
+        assert bot.binance_streams["futures"].symbols() == ["UNITREEUSDT", "SKHYNIXUSDT", "XAUUSDT", "CLUSDT", "ZHIPUUSDT", "HYPEUSDT"] and {"HYPE", "SOL"} <= set(bot.hl_stream.coins())
         assert [rm.spec.key for rm in bot.pair_markets[("futures", "HYPEUSDT")]] == ["HYPE-HIT-11"]
         assert [rm.spec.key for rm in bot.pair_markets[("spot", "BTCUSDT")]] == ["BTC-2027", "BTC-DAY", "BTC-15M", "BTC-HIT-11", "BTC-HIT-2027"]  # 1.109.0: the 15-minute card too; 1.132.0: BTC 先触
     print("NOVEMBER_OK")

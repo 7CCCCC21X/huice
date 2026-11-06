@@ -67,7 +67,7 @@ ERROR_RETRY_MS = 30_000   # ...and one whose placement raised (a read failed, th
 HALT_MS = 180_000         # a stock card's exchange quote whose own time stands still this long in session: trading halted (a VI, a 临停)
 CARD_CHECK_MS = 5_000     # the stock cards' limit / halt check (card_hold) this often
 CARD_HOLD_NEAR_MS = 60 * 60_000  # ...and a hold keeps back / withdraws only the windows starting within this (a day's windows stay: the hold is about the next ones)
-LUNCH = {"sh": (dt.time(11, 30), dt.time(13, 0))}  # the lunch break (Beijing time) the halt rule does not count (core.quiet_ms)
+LUNCH = {"sh": (dt.time(11, 30), dt.time(13, 0)), "hk": (dt.time(12, 0), dt.time(13, 0))}  # the lunch breaks (Beijing time) the halt rule does not count (core.quiet_ms)
 FILL_SETTLE_MS = 45 * 60_000  # a pair with a fill is cleared by the result: "stuck" only this long past the start
 SKIP_RETRY_MS = 60_000    # a listed window that is no candidate (a missing field, a fee, a status) is asked again this often, not every poll
 MONITOR_MS = 5_000        # an active pair's orders are looked at this often (monitor_pair), the first look 10 s after the placement
@@ -809,15 +809,15 @@ class Controller:
         still HALT_MS in session) — the window's direction is then no coin toss, and the resting bids would be hit by those
         who know. Judged on the bot's own exchange quote (the card's lead quote); without a fresh one nothing is judged."""
         limit, gap = float(getattr(rolling, "limit_pct", 0) or 0), float(self.settings.limit_gap_pct)
-        if not limit or not gap:
-            return ""
+        if not gap or not getattr(rolling, "exchange", ""):
+            return ""  # the guard off, or no exchange (the round-the-clock cards): nothing to judge
         card = (getattr(self.owner, "updowns", None) or {}).get(rolling.key)
         q = getattr(card, "lead", None)
         now = self.now()
         if q is None or not getattr(q, "last", None) or now - int(getattr(q, "fetched_ms", 0) or 0) > 60_000:
             return ""  # no exchange quote, or the feed itself is quiet: nothing to judge by
         last, prev = float(q.last), float(getattr(q, "prev_close", None) or 0)
-        if prev > 0:
+        if limit and prev > 0:  # an exchange with a daily price limit (1.134.0: HKEX has none — the halt rule alone)
             up, down = prev * (1 + limit), prev * (1 - limit)
             if last >= up * (1 - gap / 100):
                 return f"{rolling.coin} 现价 {last:,.2f} 距涨停 {up:,.2f} 不足 {gap:g}%"

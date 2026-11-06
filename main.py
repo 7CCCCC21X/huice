@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.133.1"
+VERSION = "1.134.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -264,7 +264,7 @@ STOCK_MARKETS = {
 # SHEIN 0625.HK, CXMT 688825.SS, SK hynix 000660.KS.
 # HK0625USDT is a quanto contract: its price is the HKD stock price itself, so it compares directly (:same).
 # The others are USD-denominated, so their exchange closes are converted with the FX rate first.
-DEFAULT_TICKERS = "UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660"
+DEFAULT_TICKERS = "UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660,ZHIPUUSDT=hk:02513"  # 智谱 2513.HK (1.134.0)
 NOTICE_GRACE_SECONDS = 30  # a data fault must last this long before subscribers hear of it (one failed request is not an outage)
 WATCHDOG_SECONDS = 600     # the sampling loop not starting a cycle for this long means it is stuck: the process exits, Railway restarts it
 SHUTDOWN_GRACE_SECONDS = 8  # at shutdown, how long messages already on their way may take to finish
@@ -659,7 +659,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
     ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 4 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
     ("PREOPEN_DEEP_AHEAD_MINUTES", "第 2 档起只挂几分钟内开始的场次", "3～提前范围：第一档按“只挂几分钟内开始的场次”挂（排队靠前），更深的档位离开场这么近才挂，少占资金；0 = 和第一档一样"),
-    ("PREOPEN_LIMIT_GAP_PCT", "股票卡距涨跌停不足几 % 时不挂", "0～20：海力士、宇树的交易所现价离当日涨停或跌停（按前收盘价算：科创板 ±20%、韩交所 ±30%）不到这么多时不新挂、撤掉已挂的；交易时段里成交时间 3 分钟没动（临停、VI）同样处理；0 = 不管（默认 2）"),
+    ("PREOPEN_LIMIT_GAP_PCT", "股票卡距涨跌停不足几 % 时不挂", "0～20：海力士、宇树（智谱在港交所没有涨跌停，只看临停）的交易所现价离当日涨停或跌停（按前收盘价算：科创板 ±20%、韩交所 ±30%）不到这么多时不新挂、撤掉已挂的；交易时段里成交时间 3 分钟没动（临停、VI）同样处理；0 = 不管（默认 2）"),
     ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场、最近的先；想少占资金就调小"),
     ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
     ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）"),
@@ -920,10 +920,15 @@ class Config:
         CALENDAR.configure(parse_dates(e.get("HK_HALF_DAYS", DEFAULT_SPECIAL_DAYS["HK_HALF"]), "HK_HALF_DAYS"),
                            parse_dates(e.get("KR_LATE_DAYS", DEFAULT_SPECIAL_DAYS["KR_LATE"]), "KR_LATE_DAYS"),
                            holidays["sg"], parse_dates(e.get("SG_HALF_DAYS", DEFAULT_SPECIAL_DAYS["SG_HALF"]), "SG_HALF_DAYS"))
+        preopen = PreopenSettings.from_env(e)
+        if preopen.enabled:  # a stock card the pre-open mode quotes: its exchange ticker (the limit / halt guard's quote) even when the pair is not in SYMBOLS (1.134.0: 智谱)
+            for spec in WINDOW_UPDOWN_MARKETS:
+                if spec.exchange and spec.key in preopen.markets and spec.symbol not in tickers:
+                    tickers.update(parse_tickers(e.get("EXCHANGE_TICKERS", DEFAULT_TICKERS), (spec.symbol,)))
         return cls(
             token=e.get("TELEGRAM_BOT_TOKEN", "").strip(),
             admin_id=bounded_int(e, "ADMIN_USER_ID", 0, 0, 10**15),
-            symbols=symbols, db_path=e.get("STATE_DB", "./data/bot.sqlite3"), preopen=PreopenSettings.from_env(e),
+            symbols=symbols, db_path=e.get("STATE_DB", "./data/bot.sqlite3"), preopen=preopen,
             threshold=threshold,
             cooldown=bounded_int(e, "ALERT_COOLDOWN_SECONDS", 300, 0, 86400),
             poll=bounded_int(e, "POLL_SECONDS", 5, 3, 3600),
@@ -7505,6 +7510,15 @@ WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
     # bnb-updown-15m-…) — /preopen probe shows whether Predict lists them so; the pairs' spot trades, round the clock
     WindowUpDownSpec("ETH-15M", "eth", "ETHUSDT", "ETH", venue="spot"),
     WindowUpDownSpec("BNB-15M", "bnb", "BNBUSDT", "BNB", venue="spot"),
+    # 1.134.0: "黄金 (XAU) 涨或跌 15分" (xau-updown-15m-1793942100: 11-06 13:15–13:30 Beijing) and "CL 涨或跌 15分" (cl-updown-15m-…)
+    # on the same rules — Chainlink's XAU/USDT and CL/USDT streams, the index price (field i) of Binance's USDⓈ-M futures mark
+    # price stream; no exchange session here: Predict lists the windows while the index trades, the discovery takes what it lists
+    WindowUpDownSpec("XAU-15M", "xau", "XAUUSDT", "黄金"),
+    WindowUpDownSpec("CL-15M", "cl", "CLUSDT", "原油"),
+    # "智谱 (ZHIPU) 涨或跌 15分" (zhipu-updown-15m-1793942100: 13:15–13:30 Beijing): Chainlink's ZHIPU/USDT stream on the same
+    # rules; the windows follow the Hong Kong session (智谱 2513.HK: 09:30–12:00, 13:00–16:00), which has no daily price limit —
+    # of the pre-open mode's stock guard only the halt rule applies
+    WindowUpDownSpec("ZHIPU-15M", "zhipu", "ZHIPUUSDT", "智谱", "hk"),
 )
 
 
@@ -9925,7 +9939,7 @@ SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": 
 CONTROL_FORMS: dict[str, dict] = {
     "LIVE": {"kind": "choice", "group": "策略", "options": [["off", "off 只记账"], ["pause", "pause 登录不开仓"], ["on", "on 真实下单"]]},
     "PREOPEN_15M": {"kind": "choice", "group": "预挂", "options": [["off", "off 关"], ["on", "on 开（需要 LIVE=on）"]]},
-    "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "options": [["btc", "BTC"], ["eth", "ETH"], ["bnb", "BNB"], ["skhynix", "SK 海力士"], ["unitree", "宇树"]]},  # 1.130.7: pick the cards one by one
+    "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "options": [["btc", "BTC"], ["eth", "ETH"], ["bnb", "BNB"], ["xau", "黄金"], ["cl", "原油"], ["skhynix", "SK 海力士"], ["unitree", "宇树"], ["zhipu", "智谱"]]},  # 1.130.7: pick the cards one by one; 1.134.0: 黄金、原油、智谱
     "PREOPEN_EXCLUSIVE": {"kind": "choice", "group": "预挂", "options": [["off", "off 两边同时跑"], ["on", "on 预挂时原策略不开新仓"]]},
     "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
     "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},

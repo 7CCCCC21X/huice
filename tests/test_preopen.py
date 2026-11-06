@@ -188,7 +188,11 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         # the defaults are the trial: BTC alone, 10 shares a side (4.9U); "all" or a list widens it
         on = lambda **e: p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", **e}))
         self.assertEqual((on().shares, on().markets, on().side_usd, on().pair_usd, on().ahead_minutes), (10, frozenset({"BTC-15M"}), 4.9, 9.8, 1440))
-        self.assertEqual(on(PREOPEN_MARKETS="all").markets, frozenset({"BTC-15M", "ETH-15M", "BNB-15M", "SKHYNIX-15M", "UNITREE-15M"}))
+        self.assertEqual(on(PREOPEN_MARKETS="all").markets, frozenset({"BTC-15M", "ETH-15M", "BNB-15M", "XAU-15M", "CL-15M", "SKHYNIX-15M", "UNITREE-15M", "ZHIPU-15M"}))
+        self.assertEqual(on(PREOPEN_MARKETS="xau, zhipu").markets, frozenset({"XAU-15M", "ZHIPU-15M"}))  # 1.134.0
+        zcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "PREOPEN_MARKETS": "zhipu", "SYMBOLS": "BTCUSDT"})
+        self.assertEqual((zcfg.tickers["ZHIPUUSDT"].market, zcfg.tickers["ZHIPUUSDT"].code), ("hk", "02513"), "the quoted stock card's exchange ticker, SYMBOLS or not")
+        self.assertNotIn("ZHIPUUSDT", m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "SYMBOLS": "BTCUSDT"}).tickers)
         self.assertEqual(on(PREOPEN_MARKETS="btc,eth,bnb").markets, frozenset({"BTC-15M", "ETH-15M", "BNB-15M"}))
         self.assertEqual(on(PREOPEN_MARKETS="btc, skhynix").markets, frozenset({"BTC-15M", "SKHYNIX-15M"}))
         self.assertEqual(on(PREOPEN_MARKETS="").markets, frozenset({"BTC-15M"}))
@@ -680,6 +684,34 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         api.orders = slow_orders
         await ctl.account()
         self.assertEqual(ctl.account_at, started)
+        await self.finish(ctl)
+
+    async def test_an_hk_card_has_no_daily_limit_but_the_halt_guard(self):
+        """1.134.0: 智谱 (HKEX 2513) — no daily price limit, so of the stock guard only the halt rule: a quote standing still in a
+        continuous-trading segment; the 12:00–13:00 break not counted, the closing auction (from 16:00) not judged. 黄金 and
+        原油 have no exchange: nothing is judged."""
+        zh = next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "ZHIPU-15M")
+        self.assertEqual((zh.stem, zh.symbol, zh.exchange, zh.limit_pct, zh.venue), ("zhipu", "ZHIPUUSDT", "hk", 0.0, "futures"))
+        self.assertEqual([(r.key, r.stem, r.exchange, r.venue) for r in m.WINDOW_UPDOWN_MARKETS if r.key in {"XAU-15M", "CL-15M"}],
+                         [("XAU-15M", "xau", "", "futures"), ("CL-15M", "cl", "", "futures")])
+        ctl, api, clock = controller()
+        quote = lambda last, prev="100", quoted=None, fetched=None: types.SimpleNamespace(last=m.D(last), prev_close=m.D(prev),
+                                                                                       quoted_ms=clock.ms if quoted is None else quoted, fetched_ms=clock.ms if fetched is None else fetched)
+        clock.ms = NOW + 3600_000  # 10:00 Beijing: the morning session
+        ctl.owner.updowns = {"ZHIPU-15M": types.SimpleNamespace(lead=quote("119")), "XAU-15M": types.SimpleNamespace(lead=quote("4000", "3000", quoted=clock.ms - 3600_000))}
+        self.assertEqual(ctl.card_hold(zh), "", "up 19% on the day: HKEX has no limit")
+        self.assertEqual(ctl.card_hold(next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "XAU-15M")), "", "no exchange: nothing judged")
+        ctl.owner.updowns["ZHIPU-15M"].lead = quote("119", quoted=clock.ms - 4 * 60_000)
+        self.assertIn("智谱 交易时段里成交时间 4 分钟没动", ctl.card_hold(zh))
+        clock.ms = NOW + 3 * 3600_000 + 2 * 60_000  # 12:02: the break — nothing prints, no halt
+        ctl.owner.updowns["ZHIPU-15M"].lead = quote("119", quoted=NOW + 3 * 3600_000 - 60_000)
+        self.assertEqual(ctl.card_hold(zh), "")
+        clock.ms = NOW + 4 * 3600_000 + 12 * 60_000  # 13:12, the last print 11:59: 13 minutes of trading without one
+        ctl.owner.updowns["ZHIPU-15M"].lead = quote("119", quoted=NOW + 3 * 3600_000 - 60_000)
+        self.assertIn("成交时间 13 分钟没动", ctl.card_hold(zh))
+        clock.ms = NOW + 7 * 3600_000 + 5 * 60_000  # 16:05: the closing auction
+        ctl.owner.updowns["ZHIPU-15M"].lead = quote("119", quoted=clock.ms - 4 * 60_000)
+        self.assertEqual(ctl.card_hold(zh), "")
         await self.finish(ctl)
 
     async def test_status_says_why_nothing_is_placed(self):
