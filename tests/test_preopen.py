@@ -393,6 +393,35 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.sent, [])
         await self.finish(ctl)
 
+    async def test_status_says_why_nothing_is_placed(self):
+        """The holds that used to be silent — the snapshot not read or stale, open orders nobody here placed — and the
+        budget are on the status line; the pause names its reason."""
+        ctl, api, clock = controller()
+        self.assertEqual((ctl.hold(), ctl.budget_problem()), ("", ""))
+        self.assertNotIn("暂不新挂", ctl.status())
+        api.rows["other"] = {"id": "manual", "order": {"hash": "0xother", "side": 0, "makerAmount": "1000000"},
+                             "amount": "2000000", "amountFilled": "0", "status": "OPEN"}
+        await ctl.account()
+        self.assertEqual(ctl.unmanaged, 1)
+        await ctl.place_pair(p.candidate(market(), NOW, ctl.owner.config, ctl.settings))
+        self.assertEqual(api.sent, [])
+        self.assertIn("暂不新挂：账户有 1 笔本程序没记录的挂单", ctl.status())
+        del api.rows["other"]
+        await ctl.account()
+        self.assertEqual((ctl.unmanaged, ctl.hold()), (0, ""))
+        clock.ms += 31_000
+        self.assertEqual(ctl.hold(), "账户快照过期（31 秒前读到）")
+        ctl.account_at = 0
+        self.assertIn("还没有读到", ctl.hold())
+        ctl.account_at = clock.ms
+        ctl.owner.config = dataclasses.replace(ctl.owner.config, live_max_open_usd=48)
+        self.assertEqual(ctl.hold(), "")
+        self.assertIn("\n暂不新挂：预挂资金上限不足：需要再预留 49U，限额 48U", ctl.status())
+        ctl.manual_pause = True
+        self.assertTrue(ctl.status().startswith("开盘前自动预挂：暂停，本模式已手动暂停（/preopen resume 恢复）\n"), ctl.status())
+        self.assertNotIn("暂不新挂", ctl.status())
+        await self.finish(ctl)
+
     async def test_known_orders_are_excluded_from_unknown_warning(self):
         ctl, api, _ = controller()
         await ctl.place_pair(p.candidate(market(), NOW, ctl.owner.config, ctl.settings))

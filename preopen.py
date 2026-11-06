@@ -264,7 +264,7 @@ class Controller:
         self.balance = 0.0
         self.open_reserved = 0.0
         self.listed_ids: set[str] = set()
-        self.unmanaged = False
+        self.unmanaged = 0  # open orders on the account that neither strategy placed: a hold until they are withdrawn
         self.placing: set[str] = set()
         self.cancelling: set[str] = set()
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()  # (start_ms, slug, candidate): the soonest window first
@@ -289,14 +289,41 @@ class Controller:
         c = self.owner.config
         if self.stopped():
             return "进程或预挂模式停止中"
-        if c.live_mode != "on" or not c.live_allowed or self.manual_pause:
-            return "真实交易或开盘前策略未开启"
+        if self.manual_pause:
+            return "本模式已手动暂停（/preopen resume 恢复）"
+        if c.live_mode != "on" or not c.live_allowed:
+            return "真实交易未开启"
         reason = self.owner.live_paused() or self.owner.live_killed() or ("账户未就绪" if not self.owner.live.ready else "")
         if reason:
             return reason
         cap = c.live_max_daily_loss_usd
         if cap and self.daily_pnl() + self.owner.live_daily_pnl(self.owner.sim_trades(), self.now()) <= -cap:
             return "已达到今日真实亏损上限"
+        return ""
+
+    def hold(self) -> str:
+        """Why no new pair goes out right now, for the status line: the pause (blocked), the account snapshot not read yet
+        or stale, or open orders on the account that neither this mode nor the model trader placed (a manual order, an
+        older version's) — nobody's to manage, so nothing new is placed until they are withdrawn."""
+        if why := self.blocked():
+            return why
+        if not self.account_at:
+            return "账户快照还没有读到（启动后第一次扫描中）"
+        if self.now() - self.account_at > 30_000:
+            return f"账户快照过期（{(self.now() - self.account_at) // 1000} 秒前读到）"
+        if self.unmanaged:
+            return f"账户有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的），撤掉它们后才预挂"
+        return ""
+
+    def budget_problem(self) -> str:
+        """Why the next pair does not fit: the joint exposure cap, the USDT balance, the per-order cap."""
+        limit = min(self.settings.max_open_usd, self.owner.config.live_max_open_usd)
+        if self.risk() + self.other_risk() + self.settings.pair_usd > limit + 1e-9:
+            return f"预挂资金上限不足：需要再预留 {self.settings.pair_usd:g}U，限额 {limit:g}U"
+        if self.balance < max(self.open_reserved, self.risk()) + self.settings.pair_usd:
+            return "可用USDT不足以预留下一场双边订单"
+        if self.settings.side_usd > self.owner.config.live_max_order_usd:
+            return f"LIVE_MAX_ORDER_USD 小于每边 {self.settings.side_usd:g}U"
         return ""
 
     def before_send(self, body: dict) -> str:
@@ -365,7 +392,7 @@ class Controller:
                     raise core.RemoteError("账户挂单分页未读取完整，暂停新增订单")
                 other = self.unmanaged_rows(rows)
                 known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)}
-                unmanaged = any(str(r.get("id")) not in known_core for r in other)
+                unmanaged = sum(1 for r in other if str(r.get("id")) not in known_core)
                 reserved = 0.0
                 for row in rows:
                     order = row.get("order") or {}
@@ -449,20 +476,10 @@ class Controller:
         async with self.account_lock:
             # Only one coroutine reserves a pair at a time; reservations are saved
             # before the lock is released, including orders not visible on REST yet.
-            if c["slug"] in self.ledger.rows or self.blocked() or self.now() - self.account_at > 30_000 or self.unmanaged:
+            if c["slug"] in self.ledger.rows or self.hold():
                 return
-            limit = min(self.settings.max_open_usd, self.owner.config.live_max_open_usd)
-            if self.risk() + self.other_risk() + self.settings.pair_usd > limit + 1e-9:
-                self.error = f"预挂资金上限不足：需要再预留 {self.settings.pair_usd:g}U，限额 {limit:g}U"
-                return
-            if self.balance < max(self.open_reserved, self.risk()) + self.settings.pair_usd:
-                self.error = "可用USDT不足以预留下一场双边订单"
-                return
-            if self.settings.side_usd > self.owner.config.live_max_order_usd:
-                self.error = f"LIVE_MAX_ORDER_USD 小于每边 {self.settings.side_usd:g}U"
-                return
-            cap = self.owner.config.live_max_daily_loss_usd
-            if cap and self.daily_pnl() + self.owner.live_daily_pnl(self.owner.sim_trades(), self.now()) <= -cap:
+            if why := self.budget_problem():
+                self.error = why
                 return
             amounts = live.limit_amounts(True, live.to_wei(self.settings.price), live.to_wei(self.settings.shares))
             orders = {}
@@ -858,7 +875,8 @@ class Controller:
 
     def status(self) -> str:
         rows = list(self.ledger.rows.values())
-        state = "已停止" if not self.alive else "暂停" if self.manual_pause or self.blocked() else "运行"
+        why = (self.hold() or self.budget_problem()) if self.alive else ""
+        state = "已停止" if not self.alive else f"暂停，{why}" if self.blocked() else "运行"
         return (f"开盘前自动预挂：{state}\n"
                 f"{' / '.join(sorted(self.settings.markets))}：两边 {core.cents(float(self.settings.price))}，各 {self.settings.shares} 份；"
                 f"扫描 {self.settings.poll:g} 秒，只挂 {self.settings.ahead_minutes} 分钟内开始的场次\n"
@@ -866,5 +884,6 @@ class Controller:
                 f"不足 {self.settings.entry_seconds} 秒不再新挂\n"
                 f"已记录 {len(rows)} 场（{sum(1 for p in rows if p['phase'] == 'active')} 场挂着，{sum(1 for p in rows if p.get('accounted'))} 场已结清），队列 {self.queue.qsize()} 场\n"
                 f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}"
+                + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
                 + (f"\n没挂的已发布场次：" + "；".join(f"{k.rsplit('-', 1)[-1]} {v}" for k, v in list(self.skipped.items())[-3:]) if self.skipped else "") + "\n"
                 f"实测：{self.timing_line()}")
