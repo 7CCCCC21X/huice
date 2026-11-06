@@ -323,6 +323,20 @@ class Controller:
         return sum(self.settings.side_usd for p in self.ledger.rows.values() if not p.get("accounted")
                    for o in p["orders"].values() if o["state"] not in NEVER_PLACED)
 
+    def filled_by_outcome(self, days: int = 3) -> dict[tuple[str, int], float]:
+        """The shares this mode's orders filled, by (market id, index set), for the windows of the last ``days`` days: the
+        model trader's positions reconciliation counts them as recorded, not as fills of its own orders to adopt."""
+        since = self.now() - days * core.DAY_MS
+        out: dict[tuple[str, int], float] = {}
+        for pair in self.ledger.rows.values():
+            if int(pair.get("start_ms") or 0) < since:
+                continue
+            for order in pair["orders"].values():
+                if float(order.get("filled") or 0) > 0 and order.get("index_set"):
+                    key = (str(pair["market_id"]), int(order["index_set"]))
+                    out[key] = out.get(key, 0.0) + float(order["filled"])
+        return out
+
     def daily_pnl(self) -> float:
         day = dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat()
         return sum(float(p.get("pnl") or 0) for p in self.ledger.rows.values() if p.get("accounted_day") == day)
@@ -436,7 +450,7 @@ class Controller:
                 salt = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big") % live.MAX_SALT
                 signed = live.build_order(self.owner.live.wallet, outcome["token"], amounts["maker"], amounts["taker"], info.fee_bps, current["expires"], salt=salt)
                 digest, signature = self.owner.live.wallet.sign_order(signed, info.neg_risk, info.yield_bearing)
-                orders[side] = {"hash": digest.lower(), "id": "", "state": "prepared", "filled": 0.0,
+                orders[side] = {"hash": digest.lower(), "id": "", "state": "prepared", "filled": 0.0, "index_set": int(outcome.get("index_set") or 0),
                                 "body": {"data": {"order": {**signed, "signature": signature, "hash": digest},
                                                    "strategy": "LIMIT", "pricePerShare": str(amounts["price_per_share"]),
                                                    "isPostOnly": True, "selfTradePrevention": "CANCEL_TAKER"}}}

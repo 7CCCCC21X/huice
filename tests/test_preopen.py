@@ -412,13 +412,22 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline"})
         self.assertFalse(p.Settings.from_config(cfg).enabled)
         bot = L.LiveBot.__new__(L.LiveBot)
-        bot.preopen = types.SimpleNamespace(alive=True)
-        bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64})
-        self.assertTrue(bot.preopen_active())
+        bot.preopen = types.SimpleNamespace(alive=True, risk=lambda: 40., daily_pnl=lambda: -10., filled_by_outcome=lambda: {("123", 2): 50.})
+        bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "PREOPEN_EXCLUSIVE": "on"})
+        self.assertTrue(bot.preopen_active() and bot.preopen_exclusive())
         self.assertIn("不开新仓", bot.live_room({}, None, "up", .49, 50))
         self.assertIn("不发送", bot.live_send_block({"live": {}}, {}, NOW))
+        # 1.125.0: off by default — the two run side by side; the mode's money, day and fills count in the model trader's checks
+        bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "LIVE_MAX_OPEN_USD": "100"})
+        self.assertTrue(bot.preopen_active() and not bot.preopen_exclusive() and not bot.config.preopen.exclusive)
+        self.assertEqual((bot.preopen_risk(), bot.preopen_pnl(), bot.preopen_filled()), (40., -10., {("123", 2): 50.}))
+        bot.live = types.SimpleNamespace(usd=lambda: None)
+        self.assertEqual(bot.live_fit_shares({}, 0.5), 120.)  # min(100 order cap, 100 − 40) / 0.5
+        bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "LIVE_MAX_OPEN_USD": "40.5"})
+        self.assertIn("持仓+挂单 $40.00 已占满", bot.live_fit_why({}, 0.5))
         bot.preopen.alive = False
         self.assertFalse(bot.preopen_active())  # crashed: the model trader is free again
+        self.assertEqual((bot.preopen_risk(), bot.preopen_pnl(), bot.preopen_filled()), (0., 0., {}))
         bot.preopen.alive = True
         bot.config = cfg  # LIVE=off: paper trading goes on
         self.assertFalse(bot.preopen_active())
@@ -471,6 +480,21 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bot.preopen is not third and bot.preopen.alive)
         await bot.preopen_stop("test")
         self.assertEqual(len(FakeCtl.made), 4)
+
+    async def test_fills_by_outcome_for_the_positions_reconciliation(self):
+        ctl, api, clock = controller()
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        self.assertEqual((pair["orders"]["up"]["index_set"], pair["orders"]["down"]["index_set"]), (2, 1))  # Up is the second outcome here
+        self.assertEqual(ctl.filled_by_outcome(), {})
+        api.rows[pair["orders"]["up"]["hash"]]["amountFilled"] = str(L.to_wei(20))
+        await ctl.account()
+        self.assertEqual(ctl.filled_by_outcome(), {("123", 2): 20.})
+        clock.ms = c["start_ms"] + 4 * 86_400_000
+        self.assertEqual(ctl.filled_by_outcome(), {}, "windows older than three days: redeemed or settled by then")
+        self.assertTrue(ctl.settings.exclusive is False and p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_EXCLUSIVE": "on"})).exclusive)
+        await self.finish(ctl)
 
     async def test_probe_reports_fields_and_candidates(self):
         ctl, api, _ = controller([market(), market(at=NOW, mid=5), market("eth", mid=6)])

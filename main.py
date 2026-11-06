@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.124.0"
+VERSION = "1.125.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -510,6 +510,7 @@ class PreopenSettings:
     price: D = D("0.49")       # PREOPEN_PRICE_CENTS
     shares: D = D("10")        # PREOPEN_SHARES: the trial size; 50 was the first revision's
     markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = the three cards
+    exclusive: bool = False    # PREOPEN_EXCLUSIVE: on = the model trader opens nothing while this mode runs for real (off: both run, jointly capped)
     db: str = ""
 
     @property
@@ -547,6 +548,7 @@ class PreopenSettings:
         wanted = [w.strip() for w in str(e.get("PREOPEN_MARKETS", "btc")).split(",") if w.strip()] or ["btc"]
         markets = keys if any(w.lower() == "all" for w in wanted) else frozenset(stems.get(w.lower(), w.upper()) for w in wanted)
         price = D(cents) / 100
+        exclusive = str(e.get("PREOPEN_EXCLUSIVE", "off")).strip().lower() == "on"
         if (not 1 <= poll <= 60 or not 1 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
                 or not 3 <= ahead <= 1440 or not markets <= keys or float(price * shares) < PREOPEN_MIN_SIDE_USD
                 or not 5 <= expiry <= 600 or not expiry + 5 <= cancel <= 900 or not cancel + 60 <= entry <= 3600):
@@ -554,7 +556,7 @@ class PreopenSettings:
                              f"Predict 最小订单 ${PREOPEN_MIN_SIDE_USD:g}）、PREOPEN_AHEAD_MINUTES 3～1440、PREOPEN_MARKETS 只能是 {'、'.join(sorted(keys))} 或 all；"
                              "PREOPEN_EXPIRY_SECONDS 5～600，PREOPEN_CANCEL_SECONDS 至少比它大 5 秒、至多 900，PREOPEN_ENTRY_SECONDS 至少比撤单时间大 60 秒、至多 3600")
         return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
-                   price=price, shares=D(shares), markets=markets, db=cls.db_of(e))
+                   price=price, shares=D(shares), markets=markets, exclusive=exclusive, db=cls.db_of(e))
 
     @classmethod
     def from_config(cls, config: "Config", force: bool = False) -> "PreopenSettings":
@@ -632,7 +634,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_TAKER_RETRY_SECONDS", "吃单没成交后回避（秒）", "1～3600：吃单一份没成交（到时撤掉、公平价变了撤掉）或发送前复核作废之后，同一市场同一边多久内不再吃单；机会还在就按这个短间隔再试"),
     ("LIVE_AUTO_REDEEM", "自动领取已结算持仓", "开 = 市场结算后自动在链上领取赢的一边（签名钱包需有 BNB 付 gas）"),
     ("LIVE_NOTIFY", "真实订单的 Telegram 通知", "开 = 真实下单、成交、撤单、失败都发 Telegram 通知"),
-    ("PREOPEN_15M", "开盘前预挂（15 分钟市场）", "开 = 15 分钟场次一发布就在涨跌两边各挂一张 post-only 买单，开场前撤掉（PREOPEN.md）；需要 LIVE=on；运行时普通模型策略不开新仓。改动即时生效：开就启动，关就撤单停下，改参数先撤单再按新参数重启"),
+    ("PREOPEN_15M", "开盘前预挂（15 分钟市场）", "开 = 15 分钟场次一发布就在涨跌两边各挂一张 post-only 买单，开场前撤掉（PREOPEN.md）；需要 LIVE=on。改动即时生效：开就启动，关就撤单停下，改参数先撤单再按新参数重启。预挂的预留计入持仓+挂单上限，当日盈亏计入日亏损停机线"),
+    ("PREOPEN_EXCLUSIVE", "预挂时原策略暂停开新仓", "开 = 本模式真实运行时普通模型策略不开新仓（原策略也在交易同一批 15 分钟市场时建议开）；关 = 两边同时跑，额度和日亏损合并计算"),
     ("PREOPEN_MARKETS", "预挂哪几张卡", "btc = 只挂 BTC（默认）；all = BTC、海力士、宇树三张"),
     ("PREOPEN_SHARES", "预挂每边份数", "1～500：每场每边各挂这么多份（默认 10），每边不少于 $1"),
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
@@ -9881,6 +9884,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "LIVE": {"kind": "choice", "group": "策略", "options": [["off", "off 只记账"], ["pause", "pause 登录不开仓"], ["on", "on 真实下单"]]},
     "PREOPEN_15M": {"kind": "choice", "group": "预挂", "options": [["off", "off 关"], ["on", "on 开（需要 LIVE=on）"]]},
     "PREOPEN_MARKETS": {"kind": "choice", "group": "预挂", "options": [["btc", "只挂 BTC"], ["skhynix", "只挂海力士"], ["unitree", "只挂宇树"], ["btc,skhynix", "BTC 和海力士"], ["all", "三张都挂"]]},
+    "PREOPEN_EXCLUSIVE": {"kind": "choice", "group": "预挂", "options": [["off", "off 两边同时跑"], ["on", "on 预挂时原策略不开新仓"]]},
     "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
     "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},
     "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["15", "30", "60", "120", "240"], "unit": "分钟"},
@@ -20193,7 +20197,7 @@ class Bot:
                                       else ",".join(r.stem for r in WINDOW_UPDOWN_MARKETS if r.key in c.preopen.markets)),
                   "PREOPEN_AHEAD_MINUTES": str(c.preopen.ahead_minutes), "PREOPEN_CANCEL_SECONDS": str(c.preopen.cancel_seconds),
                   "PREOPEN_EXPIRY_SECONDS": str(c.preopen.expiry_seconds), "PREOPEN_ENTRY_SECONDS": str(c.preopen.entry_seconds),
-                  "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd),
+                  "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,

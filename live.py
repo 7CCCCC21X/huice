@@ -1061,7 +1061,7 @@ class LiveBot(core.Bot):
     def live_room(self, trades: dict[str, dict], mk: core.SimMarket, side: str, price: float, shares: float,
                   taker: dict | None = None) -> str:
         c = self.config
-        if self.preopen_active():
+        if self.preopen_exclusive():
             return "开盘前固定双边预挂模式：普通模型策略不开新仓"
         if c.live_mode == "off":
             return ""  # paper trading, as the base class does it
@@ -1166,7 +1166,7 @@ class LiveBot(core.Bot):
         c = self.config
         if c.live_mode == "off" or price <= 0:
             return math.inf
-        room = min(c.live_max_order_usd, c.live_max_open_usd - self.live_exposure(trades))
+        room = min(c.live_max_order_usd, c.live_max_open_usd - self.live_exposure(trades) - self.preopen_risk())
         usd = self.live.usd()
         if usd is not None:
             room = min(room, usd)
@@ -1178,7 +1178,7 @@ class LiveBot(core.Bot):
         c = self.config
         if c.live_mode == "off" or price <= 0:
             return ""
-        exposure = self.live_exposure(trades)
+        exposure = self.live_exposure(trades) + self.preopen_risk()
         left = c.live_max_open_usd - exposure
         if left < MIN_ORDER_USD - 1e-9:
             return f"持仓+挂单 ${exposure:,.2f} 已占满 LIVE_MAX_OPEN_USD ${c.live_max_open_usd:g}（剩 ${max(left, 0.0):,.2f}，不够一份）"
@@ -1199,7 +1199,7 @@ class LiveBot(core.Bot):
         cap = self.config.live_max_daily_loss_usd
         if not cap or self.live_kill_record():
             return  # once a day: tripped already, or resumed by hand (the losses are still there)
-        pnl = self.live_daily_pnl(trades, now_ms)
+        pnl = self.live_daily_pnl(trades, now_ms) + self.preopen_pnl()  # the pre-open mode's day counted too (1.125.0)
         if pnl <= -cap:
             why = f"今日已结算亏损 {money(pnl)} 达到 LIVE_MAX_DAILY_LOSS_USD ${cap:g}"
             self.store.put("live:killed", {"day": core.beijing_day(now_ms / 1000), "why": why, "at": now_ms})
@@ -1441,7 +1441,7 @@ class LiveBot(core.Bot):
         pauses, the age of the decision, the caps and the balance as they stand now — the decision was checked a step
         ago, or before a restart, and anything may have changed since. "" to send."""
         c, st = self.config, trade["live"]
-        if self.preopen_active():
+        if self.preopen_exclusive():
             return "开盘前固定双边预挂模式：不发送普通模型策略的旧决定"
         if c.live_mode != "on":
             return f"LIVE={c.live_mode}，不下单"
@@ -1452,7 +1452,7 @@ class LiveBot(core.Bot):
         if killed := self.live_killed():
             return f"今日停止开新仓：{killed}"
         resumed = bool(self.live_kill_record().get("resumed"))  # /live resume after today's stop: the operator's call stands
-        if (cap := c.live_max_daily_loss_usd) and not resumed and (pnl := self.live_daily_pnl(trades, now_ms)) <= -cap:
+        if (cap := c.live_max_daily_loss_usd) and not resumed and (pnl := self.live_daily_pnl(trades, now_ms) + self.preopen_pnl()) <= -cap:
             return f"今日已结算亏损 {money(pnl)} 已达 LIVE_MAX_DAILY_LOSS_USD ${cap:g}"  # recomputed now, not a flag saved a step ago
         if not self.live.ready:
             return f"真实交易未就绪：{self.live.not_ready_why}"
@@ -1464,7 +1464,7 @@ class LiveBot(core.Bot):
         notional = float((st.get("want") or {}).get("shares") or trade.get("order") or 0) * self.live_unit_cap(trade)
         if notional > c.live_max_order_usd + 1e-9:
             return f"单笔最多 ${notional:,.2f} 超过 LIVE_MAX_ORDER_USD ${c.live_max_order_usd:g}"
-        others = self.live_exposure(trades) - self.live_reserved(trade)
+        others = self.live_exposure(trades) - self.live_reserved(trade) + self.preopen_risk()
         if others + notional > c.live_max_open_usd + 1e-9:
             return f"持仓+挂单 ${others:,.2f} 加本单 ${notional:,.2f} 超过 LIVE_MAX_OPEN_USD ${c.live_max_open_usd:g}"
         usd = self.live.usd()
@@ -2003,6 +2003,8 @@ class LiveBot(core.Bot):
         for tid, t in live:
             k = key_of(t)
             recorded[k] = recorded.get(k, 0.0) + float(t.get("shares") or 0)
+        for k, shares in self.preopen_filled().items():  # the pre-open mode's fills: held for a reason, not fills of these orders (1.125.0)
+            recorded[k] = recorded.get(k, 0.0) + shares
         # (a) the shares held beyond the records, onto the order they came from: the orders' own records first — whichever shows fills
         # beyond its record (1.120.3: a KOSPI fill at 21¢ and an SK Hynix one at 10¢ had each been put on a 1¢ sweep order placed
         # after them, the newest to end) — else the order the position's price or time names, else, once the records have had
@@ -3259,10 +3261,29 @@ class LiveBot(core.Bot):
         LOG.info("开盘前预挂模式停止：%s", why)
 
     def preopen_active(self) -> bool:
-        """Whether the pre-open mode is running for real: its orders go out only with LIVE=on, so only then does it hold
-        the model trader back (paper trading goes on with LIVE=off; a mode that crashed, alive False, holds nothing)."""
+        """Whether the pre-open mode is running for real: its orders go out only with LIVE=on (paper trading goes on with
+        LIVE=off; a mode that crashed, alive False, is not running)."""
         preopen = getattr(self, "preopen", None)
         return preopen is not None and bool(getattr(preopen, "alive", True)) and self.config.live_mode == "on"
+
+    def preopen_exclusive(self) -> bool:
+        """Whether the running mode holds the model trader back (PREOPEN_EXCLUSIVE=on, 1.125.0: off by default — the two run
+        side by side, the mode's reservation in the model's exposure cap, its day's P&L in the loss stop, its fills known
+        to the positions reconciliation)."""
+        return self.preopen_active() and bool(self.config.preopen.exclusive)
+
+    def preopen_risk(self) -> float:
+        """The money the running pre-open mode may have tied up (Controller.risk), counted with the model trader's own
+        exposure against LIVE_MAX_OPEN_USD (1.125.0)."""
+        return float(self.preopen.risk()) if self.preopen_active() else 0.0
+
+    def preopen_pnl(self) -> float:
+        """The running pre-open mode's accounted P&L of the day, counted with the model trader's against LIVE_MAX_DAILY_LOSS_USD."""
+        return float(self.preopen.daily_pnl()) if self.preopen_active() else 0.0
+
+    def preopen_filled(self) -> dict[tuple[str, int], float]:
+        """The running pre-open mode's fills by outcome (Controller.filled_by_outcome): recorded shares to the positions reconciliation."""
+        return dict(self.preopen.filled_by_outcome()) if self.preopen_active() else {}
 
     async def cmd_preopen(self, req: core.Request) -> str:
         action = req.args[0].lower() if req.args else ""
