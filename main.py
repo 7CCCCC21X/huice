@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.129.1"
+VERSION = "1.130.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -511,6 +511,7 @@ class PreopenSettings:
     shares: D = D("10")        # PREOPEN_SHARES: the trial size; 50 was the first revision's
     levels: tuple = ((D("0.49"), D("10")),)  # (price, shares) a side per level, the first = price × shares; PREOPEN_LEVELS adds deeper ones (1.129.0)
     deep_ahead_minutes: int = 1440  # PREOPEN_DEEP_AHEAD_MINUTES: the deeper levels are placed only this close to the start (the first keeps ahead_minutes)
+    limit_gap_pct: float = 2.0  # PREOPEN_LIMIT_GAP_PCT: a stock card's windows are not quoted (resting ones withdrawn) within this of the day's limit, or halted; 0 = off
     markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = every 15-minute card
     exclusive: bool = False    # PREOPEN_EXCLUSIVE: on = the model trader opens nothing while this mode runs for real (off: both run, jointly capped)
     db: str = ""
@@ -558,6 +559,9 @@ class PreopenSettings:
                 raise ValueError("PREOPEN_LEVELS 的格式是 价格x份数，逗号分隔，如 48x20,47x40（第一档是 PREOPEN_PRICE_CENTS × PREOPEN_SHARES）")
             levels.append((int(found.group(1)), int(found.group(2))))
         deep = int(e.get("PREOPEN_DEEP_AHEAD_MINUTES", "0") or 0) or ahead
+        limit_gap = float(e.get("PREOPEN_LIMIT_GAP_PCT", "2") or 0)
+        if not 0 <= limit_gap <= 20:
+            raise ValueError("PREOPEN_LIMIT_GAP_PCT 0～20（0 = 不管涨跌停）")
         if (len(levels) > 5 or any(not 1 <= c <= 50 or not 1 <= s <= 500 or c * s / 100 < PREOPEN_MIN_SIDE_USD for c, s in levels)
                 or any(levels[i][0] <= levels[i + 1][0] for i in range(len(levels) - 1)) or not 3 <= deep <= ahead):
             raise ValueError(f"PREOPEN_LEVELS 至多 5 档，每档价格 1～50¢、份数 1～500、每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格要比第一档低、逐档递减；"
@@ -570,7 +574,7 @@ class PreopenSettings:
                              "PREOPEN_EXPIRY_SECONDS 5～600，PREOPEN_CANCEL_SECONDS 至少比它大 5 秒、至多 900，PREOPEN_ENTRY_SECONDS 至少比撤单时间大 60 秒、至多 3600")
         return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
                    price=price, shares=D(shares), markets=markets, exclusive=exclusive, db=cls.db_of(e),
-                   levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep)
+                   levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep, limit_gap_pct=limit_gap)
 
     @classmethod
     def from_config(cls, config: "Config", force: bool = False) -> "PreopenSettings":
@@ -655,6 +659,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
     ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 4 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
     ("PREOPEN_DEEP_AHEAD_MINUTES", "第 2 档起只挂几分钟内开始的场次", "3～提前范围：第一档按“只挂几分钟内开始的场次”挂（排队靠前），更深的档位离开场这么近才挂，少占资金；0 = 和第一档一样"),
+    ("PREOPEN_LIMIT_GAP_PCT", "股票卡距涨跌停不足几 % 时不挂", "0～20：海力士、宇树的交易所现价离当日涨停或跌停（按前收盘价算：科创板 ±20%、韩交所 ±30%）不到这么多时不新挂、撤掉已挂的；交易时段里成交时间 3 分钟没动（临停、VI）同样处理；0 = 不管（默认 2）"),
     ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场、最近的先；想少占资金就调小"),
     ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
     ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）"),
@@ -7412,6 +7417,7 @@ class WindowUpDownSpec:
     exchange: str = ""  # the stock exchange (STOCK_MARKETS: sh / kr) whose session the windows follow; "" = round the clock
     minutes: int = 15
     venue: str = "futures"  # the Binance venue the price comes from: a contract's index (IndexUpDownMarket) or a spot pair's trades (SpotWindowMarket, 1.109.0)
+    limit_pct: float = 0.0  # the exchange's daily price limit on the stock (STAR 0.20, KRX 0.30; 1.130.0): the pre-open mode stands aside near it; 0 = none
     ROLL_WAIT_MS = 60_000  # the card waits this long past a window's end for the end's index, then moves on regardless
     SCHEDULE_DAYS = 40     # how far current / before look for a trading day (the longest closure, Lunar New Year, is nine days)
 
@@ -7477,10 +7483,10 @@ WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
     # beginning of that range", Down if lower, 50-50 if equal; "the primary resolution source … is Chainlink, specifically
     # the UNITREE/USDT data stream", which "uses the index price (field i) from Binance's USDS-Margined Futures Mark Price
     # Stream for All Markets (!markPrice@arr)"; the windows follow the Shanghai session (宇树 688836.SS)
-    WindowUpDownSpec("UNITREE-15M", "unitree", "UNITREEUSDT", "宇树", "sh"),
+    WindowUpDownSpec("UNITREE-15M", "unitree", "UNITREEUSDT", "宇树", "sh", limit_pct=0.20),  # 科创板 688836: ±20% a day
     # "SK海力士 (SKHYNIX) 涨或跌 15分" (skhynix-updown-15m-1793763900: 11-04 11:45–12:00 Beijing, 12:45–13:00 KST) on the same
     # rules, Chainlink's SKHYNIX/USDT stream; the windows follow the KRX session (09:00–15:30 KST, no lunch break)
-    WindowUpDownSpec("SKHYNIX-15M", "skhynix", "SKHYNIXUSDT", "SK 海力士", "kr"),
+    WindowUpDownSpec("SKHYNIX-15M", "skhynix", "SKHYNIXUSDT", "SK 海力士", "kr", limit_pct=0.30),  # KRX: ±30% a day
     # "BTC 涨或跌 15分" (btc-updown-15m-1793867400: 11-05 16:30–16:45 Beijing; 1.109.0): Up when the BTC/USDT price at the
     # end of the window is above the one at its start, by Chainlink's BTC/USDT stream — the mid of Binance spot's top of
     # book. Round the clock, a window every quarter hour. The card reads the pair's spot trades (within a tick of that
@@ -9910,6 +9916,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},
     "PREOPEN_LEVELS": {"kind": "text", "group": "预挂", "presets": ["48x20", "48x20,47x40", "48x10,47x10", "47x40", "48x10,47x20,46x40"], "unit": ""},
     "PREOPEN_DEEP_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "60", "120", "240", "1440"], "unit": "分钟", "zero": "和第一档一样"},
+    "PREOPEN_LIMIT_GAP_PCT": {"kind": "number", "group": "预挂", "presets": ["0", "1", "2", "3", "5"], "unit": "%", "zero": "不管涨跌停"},
     "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["60", "120", "240", "720", "1440"], "unit": "分钟"},
     "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "15", "20", "30", "60"], "unit": "秒"},
     "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["5", "10", "15", "30"], "unit": "秒"},
@@ -20276,6 +20283,7 @@ class Bot:
                   "PREOPEN_15M": flag(c.preopen.enabled), "PREOPEN_SHARES": plain(float(c.preopen.shares)), "PREOPEN_PRICE_CENTS": f"{float(c.preopen.price) * 100:g}",
                   "PREOPEN_LEVELS": ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.levels[1:]),
                   "PREOPEN_DEEP_AHEAD_MINUTES": str(c.preopen.deep_ahead_minutes if c.preopen.deep_ahead_minutes != c.preopen.ahead_minutes else 0),
+                  "PREOPEN_LIMIT_GAP_PCT": f"{c.preopen.limit_gap_pct:g}",
                   "PREOPEN_MARKETS": ("all" if c.preopen.markets >= {r.key for r in WINDOW_UPDOWN_MARKETS}
                                       else ",".join(r.stem for r in WINDOW_UPDOWN_MARKETS if r.key in c.preopen.markets)),
                   "PREOPEN_AHEAD_MINUTES": str(c.preopen.ahead_minutes), "PREOPEN_CANCEL_SECONDS": str(c.preopen.cancel_seconds),

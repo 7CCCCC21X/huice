@@ -988,6 +988,56 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((again.resumed, again.ledger.rows[near + "#2"]["phase"], again.ledger.rows[near + "#1"]["phase"]), (3, "closing", "active"), "the level dropped is withdrawn")
             await self.finish(again)
 
+    async def test_a_stock_card_near_its_limit_or_halted_is_not_quoted(self):
+        """1.130.0: within PREOPEN_LIMIT_GAP_PCT of the day's limit (the previous close ± the exchange's limit) or halted (the
+        quote's own time still HALT_MS in session), a stock card's resting pairs are withdrawn and its windows passed by;
+        quoted again once the hold lifts. Judged on the card's lead quote; none, or a quiet feed: nothing judged."""
+        sk = next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "SKHYNIX-15M")
+        ctl, api, clock = controller([market("skhynix"), market("skhynix", at=NOW + 30 * 60_000, mid=9)])
+        quote = lambda last, prev="100000", quoted=None, fetched=None: types.SimpleNamespace(last=m.D(last), prev_close=m.D(prev) if prev else None,
+                                                                                            quoted_ms=clock.ms if quoted is None else quoted, fetched_ms=clock.ms if fetched is None else fetched)
+        ctl.owner.updowns = {"SKHYNIX-15M": types.SimpleNamespace(lead=None)}
+        self.assertEqual(ctl.card_hold(sk), "", "no exchange quote: nothing judged")
+        await ctl.discover()
+        far_c, c = sorted((ctl.queue.get_nowait()[2] for _ in range(ctl.queue.qsize())), key=lambda x: x["start_ms"])  # 09:30 and 10:00
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        ctl.owner.updowns["SKHYNIX-15M"].lead = quote("129000")  # KRX ±30%: the limit up is 130,000, 2% under it is 127,400
+        self.assertEqual(ctl.card_hold(sk), "SK 海力士 现价 129,000.00 距涨停 130,000.00 不足 2%")
+        await ctl.check_cards(clock.ms)
+        self.assertEqual((set(api.removed), pair["phase"], ctl.card_holds["SKHYNIX-15M"].startswith("SK 海力士 现价")), ({"1", "2"}, "closed", True))
+        self.assertIn("股票卡暂停：SK 海力士 现价", ctl.status())
+        self.assertEqual((await ctl.place_pair(far_c), len(api.sent)), ("held", 2))
+        api.calls.clear()
+        await ctl.discover()
+        self.assertFalse([x for x in api.calls if "skhynix" in x], "held: its windows are not even asked for")
+        self.assertEqual(ctl.card_hold(sk) and ctl.card_hold(sk)[:4], "SK 海")
+        ctl.owner.updowns["SKHYNIX-15M"].lead = quote("71000")  # the limit down is 70,000: 2% over it is 71,400
+        self.assertIn("距跌停 70,000.00", ctl.card_hold(sk))
+        ctl.owner.updowns["SKHYNIX-15M"].lead = quote("110000", quoted=clock.ms - 4 * 60_000)  # in session (10:00 KST), the quote's time 4 minutes still
+        self.assertIn("成交时间 4 分钟没动", ctl.card_hold(sk))
+        ctl.owner.updowns["SKHYNIX-15M"].lead = quote("110000", quoted=clock.ms - 4 * 60_000, fetched=clock.ms - 120_000)
+        self.assertEqual(ctl.card_hold(sk), "", "the feed itself quiet: nothing judged")
+        unitree = next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "UNITREE-15M")
+        ctl.owner.updowns["UNITREE-15M"] = types.SimpleNamespace(lead=quote("90", "100", quoted=clock.ms - 4 * 60_000))
+        self.assertEqual(ctl.card_hold(unitree), "", "09:00 Beijing: 宇树 not in session, a still quote is no halt")
+        ctl.owner.updowns["UNITREE-15M"].lead = quote("119", "100")
+        self.assertIn("距涨停 120.00", ctl.card_hold(unitree))
+        ctl.settings = dataclasses.replace(ctl.settings, limit_gap_pct=0.0)
+        self.assertEqual(ctl.card_hold(unitree), "", "PREOPEN_LIMIT_GAP_PCT=0: off")
+        ctl.settings = dataclasses.replace(ctl.settings, limit_gap_pct=2.0)
+        # the hold lifts: the withdrawn pair, accounted, is quoted again
+        ctl.owner.updowns["SKHYNIX-15M"].lead = quote("110000")
+        await self.settle_tasks(ctl)
+        clock.ms += p.CARD_CHECK_MS
+        await ctl.check_cards(clock.ms)
+        self.assertEqual((ctl.card_holds, pair["accounted"], ctl.supersedable(pair)), ({}, True, True))
+        ctl.queued.clear()
+        await ctl.discover()
+        self.assertIn(c["slug"], [ctl.queue.get_nowait()[2]["slug"] for _ in range(ctl.queue.qsize())])
+        self.assertTrue({"PREOPEN_LIMIT_GAP_PCT"} <= m.CONTROL_KEY_SET and sk.limit_pct == 0.30 and unitree.limit_pct == 0.20)
+        await self.finish(ctl)
+
     async def test_restart_preserves_hash_and_pause(self):
         with tempfile.TemporaryDirectory() as folder:
             path = str(Path(folder) / "state.sqlite")

@@ -63,6 +63,8 @@ REFRESH_FAR_MS = 300_000  # ...a window starting more than an hour away: this of
 REFRESH_BATCH = 8         # refresh_active: at most this many market reads an iteration, three at a time (a burst of due windows is spread)
 HOLD_RETRY_MS = 5_000     # a held candidate (hold(): a stale snapshot, the cooldown, the pause; or the budget) waits this long on the side, then is placed again — never read again meanwhile
 ERROR_RETRY_MS = 30_000   # ...and one whose placement raised (a read failed, the market's tokens could not be told) this long
+HALT_MS = 180_000         # a stock card's exchange quote whose own time stands still this long in session: trading halted (a VI, a 临停)
+CARD_CHECK_MS = 5_000     # the stock cards' limit / halt check (card_hold) this often
 SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
 DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
 REFUSED_STATUSES = {"REJECTED", "INVALIDATED", "FAILED"}  # an order's record ending so with nothing filled: Predict's deferred refusal (not quoted again)
@@ -467,6 +469,8 @@ class Controller:
         self.full_scan_ms = 0  # discover: when the last full scan ran (FULL_SCAN_MS)
         self.keep_on_stop = False  # the owner's stop for a settings change: the orders stay on the book, the next controller takes them over
         self.resumed = self.requoted = 0  # pairs taken over at this start; windows quoted again (superseded records) since
+        self.card_holds: dict[str, str] = {}  # card key -> why its windows are not quoted now (card_hold: near the day's limit, halted)
+        self.card_checked_ms = 0
         self.listed_until_ms = max((int(p.get("start_ms") or 0) for p in self.ledger.rows.values()), default=0)  # the latest window seen listed
         self.account_lock = asyncio.Lock()
         shared = getattr(owner.live, "api", None)  # the bot's own client: one rate-limit cooldown for all three
@@ -538,6 +542,50 @@ class Controller:
             return f"LIVE_MAX_ORDER_USD 小于每边 {side_usd:g}U"
         return ""
 
+    def card_hold(self, rolling: Any) -> str:
+        """Why a stock card's windows are not quoted now (""): its exchange price within PREOPEN_LIMIT_GAP_PCT of the day's
+        limit up or down (the previous close ± the exchange's limit), or trading halted (the quote's own time standing
+        still HALT_MS in session) — the window's direction is then no coin toss, and the resting bids would be hit by those
+        who know. Judged on the bot's own exchange quote (the card's lead quote); without a fresh one nothing is judged."""
+        limit, gap = float(getattr(rolling, "limit_pct", 0) or 0), float(self.settings.limit_gap_pct)
+        if not limit or not gap:
+            return ""
+        card = (getattr(self.owner, "updowns", None) or {}).get(rolling.key)
+        q = getattr(card, "lead", None)
+        now = self.now()
+        if q is None or not getattr(q, "last", None) or now - int(getattr(q, "fetched_ms", 0) or 0) > 60_000:
+            return ""  # no exchange quote, or the feed itself is quiet: nothing to judge by
+        last, prev = float(q.last), float(getattr(q, "prev_close", None) or 0)
+        if prev > 0:
+            up, down = prev * (1 + limit), prev * (1 - limit)
+            if last >= up * (1 - gap / 100):
+                return f"{rolling.coin} 现价 {last:,.2f} 距涨停 {up:,.2f} 不足 {gap:g}%"
+            if last <= down * (1 + gap / 100):
+                return f"{rolling.coin} 现价 {last:,.2f} 距跌停 {down:,.2f} 不足 {gap:g}%"
+        quoted = int(getattr(q, "quoted_ms", 0) or 0)
+        holidays = self.owner.config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
+        if quoted and now - quoted > HALT_MS and rolling.exists(now - now % rolling.window_ms, holidays):
+            return f"{rolling.coin} 交易时段里成交时间 {(now - quoted) // 60_000} 分钟没动（临停或 VI）"
+        return ""
+
+    async def check_cards(self, now_ms: int) -> None:
+        """The stock cards' holds (card_hold), every CARD_CHECK_MS: a card held has its resting pairs withdrawn (quoted again
+        once the hold lifts: supersedable), and the discovery and the placement pass its windows by meanwhile."""
+        if now_ms - self.card_checked_ms < CARD_CHECK_MS:
+            return
+        self.card_checked_ms = now_ms
+        for rolling in core.WINDOW_UPDOWN_MARKETS:
+            if rolling.key not in self.settings.markets or not getattr(rolling, "limit_pct", 0):
+                continue
+            why = self.card_hold(rolling)
+            if why:
+                self.card_holds[rolling.key] = why
+                active = [p for p in self.ledger.rows.values() if p["phase"] == "active" and p.get("key") == rolling.key]
+                if active:
+                    await self.cancel_many(active, why)
+            else:
+                self.card_holds.pop(rolling.key, None)
+
     def before_send(self, body: dict) -> str:
         if why := self.blocked() or self.cooldown():
             return why
@@ -545,6 +593,8 @@ class Controller:
         pair = next((p for p in self.ledger.rows.values() if any(o.get("hash") == digest for o in p["orders"].values())), None)
         if pair is None or pair["phase"] != "active" or self.now() >= pair["cancel_ms"]:
             return "市场已进入撤单阶段，不再发送"
+        if why := self.card_holds.get(str(pair.get("key") or "")):
+            return why
         if pair["expires"] * 1000 - self.now() < SEND_MIN_LEFT_MS:
             return "距订单到期不足一分钟，不再发送"
         if self.now() - self.account_at > 30_000:
@@ -714,7 +764,7 @@ class Controller:
         for p in self.ledger.rows.values():
             attempts[record_key(p)] = max(attempts.get(record_key(p), 0), int(p.get("attempt") or 0) + 1)
         for rolling, start in window_starts(self.now(), self.owner.config, self.settings):
-            if misses.get(rolling.key, 0) >= (MISS_STOP if full else 1):
+            if misses.get(rolling.key, 0) >= (MISS_STOP if full else 1) or self.card_holds.get(rolling.key):
                 continue
             slug = window_slug(rolling, start)
             wanted = []  # the levels to quote now: (record key, level, price, shares)
@@ -776,7 +826,7 @@ class Controller:
         import live
         if c["slug"] in self.ledger.rows:
             return ""
-        if self.hold():
+        if self.hold() or self.card_holds.get(str(c.get("key") or "")):
             return "held"
         price, shares = D(str(c.get("price") or self.settings.price)), D(str(c.get("shares") or self.settings.shares))  # the level's (PREOPEN_LEVELS)
         side_usd, pair_usd = float(price * shares), 2 * float(price * shares)
@@ -1164,6 +1214,7 @@ class Controller:
         while not self.stopped():
             self.unpark()
             now = self.now()
+            await self.check_cards(now)
             due = self.due(now)
             if due:
                 active = [p for p in due if p["phase"] == "active"]
@@ -1274,5 +1325,6 @@ class Controller:
                 f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
                 + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：占用的 USDT 计入余额核对，不计入预挂限额" if self.unmanaged else "")
+                + ("\n股票卡暂停：" + "；".join(self.card_holds.values()) if self.card_holds else "")
                 + (f"\n没挂的已发布场次：" + "；".join(f"{k.rsplit('-', 1)[-1]} {v}" for k, v in list(self.skipped.items())[-3:]) if self.skipped else "") + "\n"
                 f"实测：{self.timing_line()}")
