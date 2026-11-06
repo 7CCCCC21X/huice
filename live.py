@@ -425,11 +425,13 @@ class PredictApi:
     ORDERS_PAGE = 50      # orders per page (the API pages with first / after and answers a cursor)
     ORDERS_PAGES_MAX = 20  # ...and this many pages at most in one read (1000 orders)
 
-    async def paged(self, path: str, query: dict) -> tuple[list[dict], bool]:
+    async def paged(self, path: str, query: dict, stop_ids: set | None = None, max_pages: int | None = None) -> tuple[list[dict], bool]:
         """Every page of a list (first / after, the cursor the answer gives): (rows, complete). Not complete when the
-        page cap was reached with a cursor still on offer — the caller must not take the list for the whole truth."""
-        rows, after = [], ""
-        for _ in range(self.ORDERS_PAGES_MAX):
+        page cap was reached with a cursor still on offer — the caller must not take the list for the whole truth — or
+        when the read stopped on purpose (1.137.1): ``stop_ids`` all seen, or ``max_pages`` read."""
+        rows, after, seen = [], "", set()
+        pages = self.ORDERS_PAGES_MAX if not max_pages else max(1, min(self.ORDERS_PAGES_MAX, int(max_pages)))
+        for _ in range(pages):
             q = {**query, "first": self.ORDERS_PAGE}
             if after:
                 q["after"] = after
@@ -441,13 +443,19 @@ class PredictApi:
                 cursor = cursor.get("after") or cursor.get("next") or cursor.get("endCursor")
             if not cursor or not page or str(cursor) == after:
                 return rows, True
+            if stop_ids:
+                seen.update(str(r.get("id")) for r in page)
+                if stop_ids <= seen:
+                    return rows, False  # every order asked for is on these pages: the rest is not read
             after = str(cursor)
         return rows, False
 
-    async def orders(self, status: str = "OPEN", **params: Any) -> list[dict]:
+    async def orders(self, status: str = "OPEN", stop_ids: set | None = None, max_pages: int | None = None, **params: Any) -> list[dict]:
         """Every order of a status: the pages are followed by their cursor, so a long list is never cut off (an
-        open order missing from a cut list would look cancelled); ``orders_complete`` says whether it was."""
-        rows, self.orders_complete = await self.paged("/orders", {"status": status, **{k: v for k, v in params.items() if v not in (None, "")}})
+        open order missing from a cut list would look cancelled); ``orders_complete`` says whether it was. With
+        ``stop_ids`` / ``max_pages`` the read stops early (paged) and the list is not whole."""
+        rows, self.orders_complete = await self.paged("/orders", {"status": status, **{k: v for k, v in params.items() if v not in (None, "")}},
+                                                      stop_ids=stop_ids, max_pages=max_pages)
         return rows
 
     async def order(self, order_id: str, hash_: str = "") -> dict | None:
@@ -965,6 +973,7 @@ class LiveBot(core.Bot):
     LIVE_PLACING_GRACE_MS = 120_000  # a record left in "placing" is reconciled by its hash after this long
     LIVE_IDLE_LIST_MS = 60_000      # the open-order list is re-read this often even with nothing in flight (orders this bot did not place)
     LIVE_SNAPSHOT_MAX_AGE_MS = 600_000  # the pre-open mode's account snapshot stands in for a cut read of the open list while younger than this (1.136.2)
+    LIVE_STEP_PAGES = 3             # a step's own read of the open list: the pages until every active record's order is seen, this many at most (1.137.1)
     LIVE_ORPHAN_GRACE_MS = 120_000  # an unrecorded open order on one of this bot's markets is withdrawn once seen so for this long (LIVE_ORPHAN_CANCEL)
     LIVE_ORPHAN_EVERY_MS = 60_000   # ...looked for this often
     LIVE_MISSES = 3             # an open order Predict stops listing without a final record counts as cancelled after this many looks...
@@ -1016,6 +1025,7 @@ class LiveBot(core.Bot):
         self.live_orphan_swept_ms = -10 ** 15
         self.live_open_ids: set[str] = set()  # the last complete open list's order ids, and when it was read: a record whose order is on it is not pruned (prunable)
         self.live_open_ids_at = 0
+        self.live_full_at_ms = -10 ** 15  # when this bot last read the whole open list itself (a step reads a few pages otherwise: 1.137.1)
         self.live_synced_at = 0  # when the open-order list was last read in full
         self.live_sync_failed_ms = 0  # when a read of it last failed (a failure after the last success holds new orders)
         self.live_list_at_ms = -10 ** 15  # ...on the bot's clock, for the idle re-read
@@ -1910,12 +1920,19 @@ class LiveBot(core.Bot):
         self.live_last_redeem = min(self.live_last_redeem, time.monotonic() - self.LIVE_REDEEM_SECONDS + self.LIVE_REDEEM_SOON_SECONDS)
 
     async def live_sync_orders(self, active: dict[str, dict], now_ms: int) -> None:
+        # 1.137.1: the step reads the pages until every active record's order is seen (LIVE_STEP_PAGES at most) whenever the pre-open
+        # snapshot stands for the whole account, or within a minute of this bot's own whole read; the rest of the records are read by
+        # their hash (live_track). The 11-07 /diag: 同步 10.5 s of an 11.3 s step, twenty pages against the pre-open mode's thousands
+        wanted = {str(t["live"].get("order_id")) for t in active.values() if t["live"].get("order_id")}
+        bounded = self.live_snapshot_fresh(now_ms) or now_ms - self.live_full_at_ms < self.LIVE_IDLE_LIST_MS
         try:
-            open_rows = await self.live.api.orders("OPEN")
+            open_rows = await (self.live.api.orders("OPEN", stop_ids=wanted, max_pages=self.LIVE_STEP_PAGES) if bounded else self.live.api.orders("OPEN"))
         except Exception:
             self.live_sync_failed_ms = now_ms  # a failure after the last success: no new order until a read succeeds (live_send_hold)
             await self.live_cancel_blind(active, now_ms)  # the cancels need no list: a list that cannot be read must not keep an order resting
             raise
+        if not bounded or getattr(self.live.api, "orders_complete", True):
+            self.live_full_at_ms = now_ms
         by_id = {str(r.get("id")): r for r in open_rows}
         by_hash = {order_hash_of(r): r for r in open_rows if order_hash_of(r)}
         self.live_readopt(open_rows, by_id, by_hash, now_ms, now_ms)
@@ -1963,11 +1980,15 @@ class LiveBot(core.Bot):
         sim_prune's guard never cleared. (None, 0) when neither is to be had (the snapshot older than LIVE_SNAPSHOT_MAX_AGE_MS)."""
         if getattr(self.live.api, "orders_complete", True):
             return open_rows, now_ms
-        preopen = getattr(self, "preopen", None)
-        rows, at = getattr(preopen, "account_rows", None), int(getattr(preopen, "account_at", 0) or 0)
-        if preopen is not None and rows is not None and at and 0 <= now_ms - at <= self.LIVE_SNAPSHOT_MAX_AGE_MS:
-            return list(rows), at
+        if self.live_snapshot_fresh(now_ms):
+            return list(self.preopen.account_rows), int(self.preopen.account_at)
         return None, 0
+
+    def live_snapshot_fresh(self, now_ms: int) -> bool:
+        """Whether the pre-open mode's last complete account snapshot is young enough to stand for the whole account."""
+        preopen = getattr(self, "preopen", None)
+        at = int(getattr(preopen, "account_at", 0) or 0)
+        return preopen is not None and getattr(preopen, "account_rows", None) is not None and bool(at) and 0 <= now_ms - at <= self.LIVE_SNAPSHOT_MAX_AGE_MS
 
     def live_known_markets(self) -> tuple[dict[str, str], dict[str, str]]:
         """(market id -> name, outcome token -> name) of every market this bot trades or traded for real: the markets
@@ -2505,7 +2526,7 @@ class LiveBot(core.Bot):
                 self.live_finish(tid, trade, final, mk, now_ms)
                 return
             self.live_apply(tid, trade, final, mk, now_ms)  # Predict's own record says it is still open (the list missed it): its fills, and on with the tracking
-            if not st.get("list_missed"):
+            if not st.get("list_missed") and getattr(self.live.api, "orders_complete", True):  # a bounded read says nothing (1.137.1)
                 st["list_missed"] = now_ms
                 st["events"].append({"at": now_ms, "what": f"开放订单列表没有它，但按哈希查到仍为 {str(final.get('status') or '?')}：继续跟踪"})
             await self.live_taker_due(tid, trade, by_id, mk, now_ms)

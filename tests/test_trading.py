@@ -1379,6 +1379,36 @@ async def run():
     sbot.preopen = None
     sfake.orders_complete = True
     assert sbot.live_full_list([sfake.open["777"]], NOW + 1_030_000) == ([sfake.open["777"]], NOW + 1_030_000)
+    # 1.137.1: a step reads the open list only up to its own orders (LIVE_STEP_PAGES at most) while the pre-open snapshot stands for
+    # the whole account, or within a minute of its own whole read; the whole read when neither holds
+    seen_params = []
+    orig_orders = sfake.orders
+    async def spy(status="OPEN", **params):
+        seen_params.append(dict(params))
+        return await orig_orders(status, **params)
+    sfake.orders = spy
+    sbot.preopen = types.SimpleNamespace(account_rows=[sfake.open["777"]], account_at=NOW + 1_100_000, unmanaged_rows=lambda rows: rows)
+    await sbot.live_sync_orders({}, NOW + 1_100_000)
+    assert seen_params[-1] == {"stop_ids": set(), "max_pages": sbot.LIVE_STEP_PAGES}, seen_params
+    sbot.preopen = None
+    sbot.live_full_at_ms = -10 ** 15
+    await sbot.live_sync_orders({}, NOW + 1_100_000)
+    assert seen_params[-1] == {} and sbot.live_full_at_ms == NOW + 1_100_000, seen_params
+    await sbot.live_sync_orders({}, NOW + 1_130_000)
+    assert seen_params[-1] == {"stop_ids": set(), "max_pages": sbot.LIVE_STEP_PAGES}, "within a minute of the whole read: bounded"
+    sfake.orders = orig_orders
+    api = L.PredictApi("https://x", "k", None)  # the bounded read itself: the pages until every id asked for is seen, or the cap
+    pages = {"": {"data": [{"id": "a"}, {"id": "b"}], "cursor": {"after": "c2"}}, "c2": {"data": [{"id": "c"}], "cursor": {"after": "c3"}},
+             "c3": {"data": [{"id": "d"}], "cursor": None}}
+    asked = []
+    async def authed(method, path, *a, **k):
+        asked.append(path)
+        return pages[path.partition("after=")[2]]
+    api.authed = authed
+    assert ([r["id"] for r in await api.orders("OPEN")], api.orders_complete, len(asked)) == (["a", "b", "c", "d"], True, 3)
+    assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"a"})], api.orders_complete) == (["a", "b"], False)
+    assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"zzz"}, max_pages=2)], api.orders_complete) == (["a", "b", "c"], False)
+    assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"d"})], api.orders_complete) == (["a", "b", "c", "d"], True), "the last page ends the list: whole"
     text = await sbot.cmd_live(m.Request("/live", ["cancel", "account"], 1, 0, 1))
     assert ("remove", ["777"]) in sfake.calls and "账户上无记录的挂单 1 张：Predict 确认撤掉 1 张" in text and sbot.live_unknown_open == [], text
     # the hard switch: LIVE_TRADING_ALLOWED=off caps the mode at pause, refuses the switch to on and the sending alike
