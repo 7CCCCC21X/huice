@@ -714,6 +714,41 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctl.card_hold(zh), "")
         await self.finish(ctl)
 
+    async def test_one_sentinel_probes_for_the_cards_listed_together_and_the_snapshot_paces_itself(self):
+        """1.134.1: of the cards whose next windows start together one is probed a pass (the turn rotating), the rest read the
+        moment it is seen listed; the account snapshot's pace and staleness follow its page count; the status shows the request
+        rate."""
+        ctl, api, clock = controller([market(at=NOW + 55 * 60_000, mid=99)], PREOPEN_MARKETS="btc,skhynix")  # nothing listed on a quarter hour
+        ctl.full_scan_ms = clock.ms  # quick scans: a card's first unlisted window alone
+        await ctl.discover()
+        self.assertEqual(len(api.calls), 1, "the two cards' 09:15 windows: one sentinel probed")
+        first = api.calls[0]
+        api.calls.clear()
+        await ctl.discover()
+        self.assertEqual(len(api.calls), 1)
+        self.assertNotEqual(api.calls[0], first, "the turn rotates")
+        api.markets.update({"5": market(at=NOW + 15 * 60_000, mid=5), "6": market("skhynix", at=NOW + 15 * 60_000, mid=6)})
+        api.calls.clear()
+        await ctl.discover()
+        self.assertEqual((ctl.queue.qsize(), sum(1 for c in api.calls if c.endswith(f"-{(NOW + 15 * 60_000) // 1000}"))), (2, 2), "the sentinel listed: the other read in the same pass")
+        # the snapshot's pace: 23 pages of orders every 35 s, stale after 79 s; a page every poll (5 s), stale after 30 s
+        ctl.account_pages = 23
+        self.assertEqual((ctl.account_interval_s(), ctl.account_stale_ms()), (34.5, 79_000))
+        ctl.account_at = clock.ms - 44_000
+        self.assertEqual(ctl.hold(), "", "44 s old: fresh enough for a 23-page snapshot")
+        self.assertIn("账户快照每 34 秒（23 页挂单）", ctl.status())
+        ctl.account_pages = 1
+        self.assertEqual((ctl.account_interval_s(), ctl.account_stale_ms()), (5.0, 30_000))
+        self.assertIn("账户快照过期（44 秒前读到，每 5 秒读一次）", ctl.hold())
+        ctl.account_at = clock.ms
+        await ctl.account()
+        self.assertEqual(ctl.account_pages, 1)
+        self.assertIsNone(ctl.request_rate())
+        ctl.rate_samples.extend([(clock.ms - 60_000, 100), (clock.ms, 190)])
+        self.assertAlmostEqual(ctl.request_rate(), 1.5)
+        self.assertIn("请求约 1.5 次/秒（最近一分钟）", ctl.status())
+        await self.finish(ctl)
+
     async def test_status_says_why_nothing_is_placed(self):
         """The holds that used to be silent — the snapshot not read or stale, open orders nobody here placed — and the
         budget are on the status line; the pause names its reason."""
@@ -733,7 +768,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((ctl.unmanaged, ctl.hold()), (0, ""))
         self.assertNotIn("账户另有", ctl.status())
         clock.ms += 31_000
-        self.assertEqual(ctl.hold(), "账户快照过期（31 秒前读到）")
+        self.assertEqual(ctl.hold(), "账户快照过期（31 秒前读到，每 5 秒读一次）")
         ctl.account_at = 0
         self.assertIn("还没有读到", ctl.hold())
         ctl.account_at = clock.ms
