@@ -742,6 +742,53 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("9", api.removed, "switched off: withdrawn")
             bigger.ledger.close()
 
+    async def test_review_tables_for_the_journal_page(self):
+        """1.128.0: the review page's 开盘前预挂 section from the ledger — the totals, by day / card / start hour / side, the
+        windows that filled; a pair keeps its own price and shares, and its result once settled."""
+        with tempfile.TemporaryDirectory() as folder:
+            ctl, api, clock = controller(STATE_DB=str(Path(folder) / "s.sqlite3"))
+            c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+            await ctl.place_pair(c)  # active, nothing filled: 50 a side at 49¢ (the tests' size)
+            placed = ctl.ledger.rows[c["slug"]]
+            self.assertEqual((placed["price"], placed["shares"], p.pair_quote(placed)), ("0.49", "50", (0.49, 50.0)))
+            self.assertEqual(p.pair_quote({**placed, "price": "", "shares": ""}), (0.49, 50.0), "an older record: read off the signed order")
+            base = {"key": "BTC-15M", "price": "0.49", "shares": "10", "created_ms": NOW - 20 * 3600_000, "attempt": 0}
+            won = {**base, "slug": "btc-updown-15m-1", "name": "BTC 15分涨跌 10:00–10:15", "start_ms": NOW + 3600_000, "phase": "closed", "accounted": True,
+                   "pnl": 5.1, "result": "up", "cancel_sent_ms": NOW, "cancel_done_ms": NOW + 400,
+                   "orders": {"up": {"state": "final", "filled": 10.0}, "down": {"state": "final", "filled": 0.0}}}
+            withdrawn = {**base, "slug": "btc-updown-15m-2", "name": "BTC 15分涨跌 10:15–10:30", "start_ms": NOW + 4500_000, "phase": "closed", "accounted": True,
+                         "pnl": 0.0, "orders": {"up": {"state": "final", "filled": 0.0}, "down": {"state": "final", "filled": 0.0}}}
+            pending = {**base, "key": "UNITREE-15M", "slug": "unitree-updown-15m-3", "name": "宇树 15分涨跌 13:00–13:15", "start_ms": NOW + 4 * 3600_000, "phase": "closing",
+                       "attempt": 1, "orders": {"up": {"state": "removed", "filled": 2.0}, "down": {"state": "removed", "filled": 3.0}}}
+            never = {**base, "slug": "btc-updown-15m-4", "name": "BTC 15分涨跌 11:00–11:15", "start_ms": NOW + 7200_000, "phase": "closed", "accounted": True,
+                     "orders": {"up": {"state": "not_sent", "filled": 0.0}, "down": {"state": "rejected", "filled": 0.0}}}
+            for row in (won, withdrawn, pending, never):
+                ctl.ledger.save(row)
+            r = p.review(list(ctl.ledger.rows.values()), NOW)
+            t = r["total"]
+            self.assertEqual((t["records"], t["windows"], t["resting"], t["filled_windows"], t["filled"], t["volume"], t["pending"]), (4, 4, 1, 2, 15.0, 7.35, 1))
+            self.assertEqual((t["settled"], t["wins"], t["losses"], t["ties"], t["pnl"], t["withdrawn"]), (1, 1, 0, 0, 5.1, 1))
+            self.assertEqual(r["resting_usd"], 49.0)
+            self.assertEqual([(d["name"], d["records"]) for d in r["days"]], [("11-06", 4)])
+            self.assertEqual([(d["name"], d["records"], d["filled_windows"]) for d in r["cards"]], [("BTC 15分涨跌", 3, 1), ("宇树 15分涨跌", 1, 1)])
+            self.assertEqual([d["name"] for d in r["hours"]], ["BTC 15分涨跌 10 时开始", "宇树 15分涨跌 13 时开始"])
+            up, down = r["sides"]
+            self.assertEqual((up["name"], up["records"], up["filled_windows"], up["filled"], up["settled"], up["wins"], up["pnl"]), ("涨", 4, 2, 12.0, 1, 1, 5.1))
+            self.assertEqual((down["records"], down["filled"], down["volume"], down["settled"]), (4, 3.0, 1.47, 0))
+            self.assertEqual([(x["name"], x["status"], x["pnl"], x["attempt"]) for x in r["recent"]],
+                             [("宇树 15分涨跌 13:00–13:15", "待结算", None, 1), ("BTC 15分涨跌 10:00–10:15", "已结算", 5.1, 0)])
+            self.assertEqual((r["recent"][1]["cancel_s"], r["recent"][1]["lead_min"], r["recent"][1]["result"]), (0.4, 1260.0, "up"))
+            # the live bot: the running controller's ledger, or the file while the mode is off; nothing recorded → None
+            bot = L.LiveBot.__new__(L.LiveBot)
+            bot.preopen, bot.config, bot.market = ctl, ctl.owner.config, ctl.owner.market
+            self.assertEqual(bot.preopen_review()["total"]["records"], 4)
+            bot.preopen = None
+            self.assertEqual(bot.preopen_review()["total"]["records"], 4, "read off the file")
+            bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "STATE_DB": ":memory:"})
+            self.assertIsNone(bot.preopen_review())
+            self.assertEqual(p.review([], NOW)["total"]["records"], 0)
+            await self.finish(ctl)
+
     async def test_restart_preserves_hash_and_pause(self):
         with tempfile.TemporaryDirectory() as folder:
             path = str(Path(folder) / "state.sqlite")

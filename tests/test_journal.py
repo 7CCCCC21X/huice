@@ -256,8 +256,10 @@ async def run():
     assert w["hours"][1]["losses"] == 1 and "markout" in w["left"][0] and [r["name"] for r in m.sim_by_window(wins[:3])["hours"]] == ["09 时开始", "13 时开始"]
     assert m.sim_by_window([]) == {"hours": [], "left": [], "sides": []} and data["analysis"]["windows"] == {"hours": [], "left": [], "sides": []}
     page = m.JOURNAL_PAGE
-    for want in ('id="a-versions"', 'id="a-windows"', 'id="sumfilt"', 'id="anafilt"', "journal.json?analysis=1&", "清除筛选", "按设置版本"):
+    for want in ('id="a-versions"', 'id="a-windows"', 'id="sumfilt"', 'id="anafilt"', "journal.json?analysis=1&", "清除筛选", "按设置版本",
+                 'id="a-preopen"', "function preopenSection(", "开盘前预挂"):  # 1.128.0: the pre-open mode's section
         assert want in page, want
+    assert data["analysis"]["preopen"] is None  # the paper bot has no pre-open mode: the section stays hidden
     # the daily report: once per day and subscription, from SIM_DAILY_REPORT (16:30) on, within six hours of it
     sent = []
 

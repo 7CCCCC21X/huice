@@ -3217,6 +3217,17 @@ class LiveBot(core.Bot):
                         "paused": self.live_paused(), "killed": self.live_killed()}
         return data
 
+    def preopen_review(self) -> dict | None:
+        """The review page's 开盘前预挂 section (preopen.review): the running controller's ledger, or the file read while the
+        mode is off; None when nothing is recorded."""
+        from preopen import read_rows, review
+        try:
+            rows = list(self.preopen.ledger.rows.values()) if self.preopen is not None else read_rows(self.config.preopen.db)
+        except Exception as error:
+            LOG.warning("预挂复盘读取失败：%s", core.clean_error(error) or type(error).__name__)
+            return None
+        return review(rows, self.market.now_ms()) if rows else None
+
     async def preopen_apply(self) -> None:
         """The pre-open mode as PREOPEN_15M and the PREOPEN_* settings say now (the environment, the control page's saved
         values over it): started when on and not running, stopped when off (its orders withdrawn), restarted when its

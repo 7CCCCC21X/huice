@@ -267,6 +267,106 @@ async def category_market(api: Any, slug: str) -> dict | None:
     return {**market, "categorySlug": slug, "id": market.get("id") or found[0]["id"]}
 
 
+def window_of(pair: dict) -> str:
+    """The window's slug (a superseded record's key carries the attempt's time after '@')."""
+    return str(pair.get("slug") or "").split("@")[0]
+
+
+def pair_quote(pair: dict) -> tuple[float, float]:
+    """A pair's price and shares a side: its own fields (1.128.0), else read off a signed order (older records)."""
+    import live
+    if pair.get("price") and pair.get("shares"):
+        return float(pair["price"]), float(pair["shares"])
+    for order in (pair.get("orders") or {}).values():
+        data = (order.get("body") or {}).get("data") or {}
+        signed = data.get("order") or {}
+        if signed.get("takerAmount") and data.get("pricePerShare"):
+            return float(D(str(data["pricePerShare"])) / live.WEI), float(D(str(signed["takerAmount"])) / live.WEI)
+    return 0.0, 0.0
+
+
+def read_rows(path: str) -> list[dict]:
+    """The ledger's pairs read while the mode is off (no controller holds the file): every record, as saved."""
+    if path == ":memory:" or not Path(path).exists():
+        return []
+    conn = sqlite3.connect(path)
+    try:
+        return [json.loads(body) for (body,) in conn.execute("SELECT body FROM pairs")]
+    finally:
+        conn.close()
+
+
+def quote_of(pair: dict) -> dict:
+    """One record as the review counts it: a window, an attempt, two sides at one price; settled = accounted with a fill
+    (the official result priced it), pending = a fill the result has not priced yet, withdrawn = accounted with none."""
+    price, shares = pair_quote(pair)
+    orders = pair.get("orders") or {}
+    filled = {side: float((orders.get(side) or {}).get("filled") or 0) for side in ("up", "down")}
+    total = filled["up"] + filled["down"]
+    accounted = bool(pair.get("accounted"))
+    result = pair.get("result") if pair.get("result") in {"up", "down", "split"} else ""
+    payout = {"up": 1.0, "down": 0.0, "split": 0.5}.get(result)
+    start = int(pair.get("start_ms") or 0)
+    at = dt.datetime.fromtimestamp(start / 1000, core.BEIJING)
+    return {"window": window_of(pair), "key": str(pair.get("key") or ""), "card": str(pair.get("name") or pair.get("key") or "").rsplit(" ", 1)[0],
+            "name": str(pair.get("name") or window_of(pair)), "day": at.strftime("%m-%d"), "hour": at.hour, "start_ms": start,
+            "active": pair.get("phase") == "active", "accounted": accounted, "filled": total, "filled_up": filled["up"], "filled_down": filled["down"],
+            "sent": {side: side in orders and orders[side].get("state") not in NEVER_PLACED for side in ("up", "down")},
+            "price": price, "shares": shares, "volume": total * price, "settled": accounted and total > 0, "pending": total > 0 and not accounted,
+            "pnl": float(pair.get("pnl") or 0) if accounted and total > 0 else None, "result": result,
+            "side_pnl": {side: ((payout if side == "up" else 1 - payout) - price) * filled[side] if payout is not None else None for side in ("up", "down")},
+            "attempt": int(pair.get("attempt") or 0),
+            "lead_min": (start - int(pair["created_ms"])) / 60_000 if pair.get("created_ms") else None,
+            "cancel_s": (int(pair["cancel_done_ms"]) - int(pair["cancel_sent_ms"])) / 1000 if pair.get("cancel_sent_ms") and pair.get("cancel_done_ms") else None,
+            "status": ("挂着" if pair.get("phase") == "active" else "已结算" if accounted and total > 0 else "已撤" if accounted
+                       else "待结算" if total > 0 else "撤单中")}
+
+
+def review_summary(name: str, qs: list[dict]) -> dict:
+    settled = [q for q in qs if q["settled"]]
+    return {"name": name, "records": len(qs), "windows": len({q["window"] for q in qs}), "resting": sum(1 for q in qs if q["active"]),
+            "filled_windows": sum(1 for q in qs if q["filled"] > 0), "filled": round(sum(q["filled"] for q in qs), 4),
+            "volume": round(sum(q["volume"] for q in qs), 4), "pending": sum(1 for q in qs if q["pending"]),
+            "settled": len(settled), "wins": sum(1 for q in settled if q["pnl"] > 1e-9), "losses": sum(1 for q in settled if q["pnl"] < -1e-9),
+            "ties": sum(1 for q in settled if abs(q["pnl"]) <= 1e-9), "pnl": round(sum(q["pnl"] for q in settled), 4),
+            "withdrawn": sum(1 for q in qs if q["accounted"] and q["filled"] <= 0)}
+
+
+def review_side(name: str, side: str, qs: list[dict]) -> dict:
+    """One side over the records: the orders sent, those that filled, and what the filled ones made once the result is known."""
+    sent = [q for q in qs if q["sent"][side]]
+    filled = [q for q in sent if q[f"filled_{side}"] > 0]
+    pnls = [q["side_pnl"][side] for q in filled if q["side_pnl"][side] is not None]
+    return {"name": name, "records": len(sent), "filled_windows": len(filled), "filled": round(sum(q[f"filled_{side}"] for q in sent), 4),
+            "volume": round(sum(q[f"filled_{side}"] * q["price"] for q in sent), 4), "settled": len(pnls),
+            "wins": sum(1 for x in pnls if x > 1e-9), "losses": sum(1 for x in pnls if x < -1e-9), "ties": sum(1 for x in pnls if abs(x) <= 1e-9),
+            "pnl": round(sum(pnls), 4)}
+
+
+def review(rows: list[dict], now_ms: int) -> dict:
+    """The review page's 开盘前预挂 section (journal.json analysis.preopen): what this mode's quotes made — the totals, by the
+    window's day, card, start hour (Beijing) and side, and the windows that filled, newest first. A record is a pair
+    (one window, one attempt) at least one order of which was sent; a window's two sides are two bets at the pair's price."""
+    qs = [quote_of(p) for p in rows if any(o.get("state") not in NEVER_PLACED for o in (p.get("orders") or {}).values())]
+    days: dict[str, list[dict]] = {}
+    cards: dict[str, list[dict]] = {}
+    hours: dict[tuple[str, int], list[dict]] = {}
+    many = len({q["card"] for q in qs}) > 1
+    for q in qs:
+        days.setdefault(q["day"], []).append(q)
+        cards.setdefault(q["card"], []).append(q)
+        hours.setdefault((q["card"] if many else "", q["hour"]), []).append(q)
+    recent = sorted([q for q in qs if q["filled"] > 0], key=lambda q: q["start_ms"], reverse=True)[:60]
+    shown = ("start_ms", "name", "key", "filled_up", "filled_down", "price", "volume", "result", "pnl", "status", "lead_min", "cancel_s", "attempt")
+    return {"total": review_summary("全部", qs),
+            "resting_usd": round(sum(q["price"] * q["shares"] * sum(q["sent"].values()) for q in qs if q["active"]), 4),
+            "days": [review_summary(day, days[day]) for day in sorted(days, key=lambda d: max(q["start_ms"] for q in days[d]), reverse=True)],
+            "cards": [review_summary(card, cards[card]) for card in sorted(cards, key=lambda c: (-len(cards[c]), c))],
+            "hours": [review_summary(f"{card} {hour:02d} 时开始".strip(), hours[(card, hour)]) for card, hour in sorted(hours)],
+            "sides": [review_side(name, side, qs) for side, name in (("up", "涨"), ("down", "跌"))],
+            "recent": [{k: q[k] for k in shown} for q in recent]}
+
+
 async def probe(api: Any, config: Any, settings: Settings, now_ms: int) -> list[str]:
     """Every window of the next day, read as the discovery reads them (each card's in start order, MISS_STOP unlisted in a
     row ending the card's list): listed or not, the details' trading status, the fields the discovery needs that are
@@ -627,7 +727,8 @@ class Controller:
                                 "body": {"data": {"order": {**signed, "signature": signature, "hash": digest},
                                                    "strategy": "LIMIT", "pricePerShare": str(amounts["price_per_share"]),
                                                    "isPostOnly": True, "selfTradePrevention": "CANCEL_TAKER"}}}
-            pair = {**current, "attempt": int(c.get("attempt") or 0), "phase": "active", "orders": orders, "created_ms": self.now(), "tries": 0, "retry_ms": 0,
+            pair = {**current, "attempt": int(c.get("attempt") or 0), "price": str(self.settings.price), "shares": str(self.settings.shares),
+                    "phase": "active", "orders": orders, "created_ms": self.now(), "tries": 0, "retry_ms": 0,
                     "open_seen_ms": self.now() if str(market.get("tradingStatus") or "").upper() == "OPEN" else 0}
             self.ledger.save(pair)  # both hashes durable before either POST
         for side in ("up", "down"):
@@ -805,9 +906,10 @@ class Controller:
             if order["state"] != "final" and order["state"] not in NEVER_PLACED:
                 self.ledger.save(pair)
                 return  # a record that is not final yet keeps the full reservation (past the give-up it is final as known)
+        price = pair_quote(pair)[0]  # the pair's own price (the settings may have changed since it was placed)
         pair.update(accounted=True, accounted_day=dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat(),
-                    pnl=sum(((up if side == "up" else 1 - up) - float(self.settings.price)) * float(order.get("filled") or 0)
-                            for side, order in pair["orders"].items()))
+                    result="split" if up == 0.5 else "up" if up == 1.0 else "down",
+                    pnl=sum(((up if side == "up" else 1 - up) - price) * float(order.get("filled") or 0) for side, order in pair["orders"].items()))
         self.ledger.save(pair)
 
     async def monitor_pair(self, pair: dict) -> None:

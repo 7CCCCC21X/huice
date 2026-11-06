@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.127.1"
+VERSION = "1.128.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -12186,6 +12186,8 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <h3 id="h-windows" hidden>15 分钟涨跌</h3><div id="a-windows" hidden></div>
 <p class="small mut" id="p-windows" hidden>只算 15 分钟窗口的记录：按窗口开始的整点（北京时间，两张卡都有时分开写），和按下单时离窗口结束还有几分钟。胜率低于平均公平价、成交后 1 / 5 分钟市价持续为负的那一行，就是模型在那个时段或那个时点看错的地方。</p>
 <p class="small mut">按下单时标的所在的时段（交易所当地时间）；成交后市场走向 = 盘口中间价 − 成交价，每份，持续为负 = 这个时段的成交常是别人在出货；没有开盘时段的市场（加密）记在“无交易时段”。</p>
+<h3 id="h-preopen" hidden>开盘前预挂</h3><div id="a-preopen" hidden></div>
+<p class="small mut" id="p-preopen" hidden>开盘前预挂模式（PREOPEN_15M）自己的记录，不受上面的筛选条影响：每场涨、跌两边各一张固定价买单，成交的那一边按官方结果结算（赢 = 1 − 价格、输 = −价格，每份，平局按 0.5）。记录 = 一次报价（同一场重新报价算两条），场次 = 不同的窗口；没成交就撤掉的场次不算输赢。按日期、开始时间都是场次开始的北京时间。</p>
 <h3>挂单效率</h3><div id="a-makers"></div>
 <h3>被拦下的机会</h3><div id="a-blocked"></div>
 <p class="small mut">组上限（SIM_GROUP_USD）最近一周拦下的买入：市场已出结果的，按每笔份数（SIM_SHARES）算若当时买入的盈亏——长期为正说明上限偏紧。</p></div></section>
@@ -12459,12 +12461,26 @@ function versions(a){  // 按设置版本: one table per setting that changed, a
     anaTable(k.rows,{head:["用的时间段"],cells:r=>[mdhm(r.first)+" – "+mdhm(r.last)+(r.runs>1?"（"+r.runs+" 段）":"")]}))});
   if(vs.length>VER_SHOW){const b=$("button","lnk",verAll?"只看最近改的 "+VER_SHOW+" 个设置":"再显示 "+(vs.length-VER_SHOW)+" 个改过的设置");b.type="button";
     b.addEventListener("click",()=>{verAll=!verAll;versions(a)});vb.append(b)}}
-function analysis(){  // per setting, per underlying, per net edge and fair price at the order, per part of the underlying's day, the 15-minute windows, the resting orders' record, the refused buys' outcomes: folded away
+const poPn=x=>{const b=$("b","",money(x));b.className=x>=0?"ok":"bad";return b},poWl=r=>r.settled?r.settled+"（赢 "+r.wins+" 输 "+r.losses+(r.ties?" 平 "+r.ties:"")+"）":"—";
+function poTable(rows){  // the pre-open mode's summary table: a row per day / card / start hour
+  return table(["分组","记录","场次","挂着","有成交","成交份数","成交额","待结算","已结算","盈亏","没成交撤掉"],rows.map(r=>[r.name,r.records,r.windows,r.resting||"—",r.filled_windows||"—",num(r.filled),usd(r.volume),r.pending||"—",poWl(r),r.settled?poPn(r.pnl):"—",r.withdrawn||"—"]))}
+function preopenSection(po){  // 开盘前预挂 (1.128.0): the mode's own ledger — the totals, by day / card / start hour / side, the windows that filled
+  const el=document.getElementById("a-preopen");el.replaceChildren();
+  const t=po.total,d=$("dl"),p=(k,v)=>{const dd=$("dd","");if(Array.isArray(v))dd.append(...v);else dd.textContent=v;d.append($("dt","",k),dd)};
+  p("场次",t.windows+"（记录 "+t.records+"，挂着 "+t.resting+" 场、预留 "+usd(po.resting_usd)+"，没成交撤掉 "+t.withdrawn+"）");
+  p("有成交",t.filled_windows+" 场 · "+num(t.filled)+" 份 · "+usd(t.volume)+(t.pending?" · 待结算 "+t.pending+" 场":""));
+  p("已结算",t.settled?[t.settled+" 场（赢 "+t.wins+" 输 "+t.losses+(t.ties?" 平 "+t.ties:"")+"）盈亏 ",poPn(t.pnl)," · 平均每场 ",poPn(t.pnl/t.settled)]:"还没有结算的场次");
+  el.append(d,$("div","sub","按日期"),poTable(po.days||[]),$("div","sub","按标的"),poTable(po.cards||[]),$("div","sub","按开始时间"),poTable(po.hours||[]));
+  el.append($("div","sub","按方向（一场的涨、跌是两张单）"),table(["方向","挂出","有成交","成交份数","成交额","已结算","盈亏"],(po.sides||[]).map(r=>[r.name,r.records,r.filled_windows||"—",num(r.filled),usd(r.volume),poWl(r),r.settled?poPn(r.pnl):"—"])));
+  if((po.recent||[]).length){const res=x=>x==="up"?"涨":x==="down"?"跌":x==="split"?"平":"未出";
+    el.append($("div","sub","有成交的场次（最近 "+po.recent.length+" 场，新的在前）"),table(["开始","场次","涨成交","跌成交","价格","成交额","结果","盈亏","状态","挂上时距开场","撤单确认","第几次报价"],
+      po.recent.map(r=>[when(r.start_ms),r.name,num(r.filled_up),num(r.filled_down),cent(r.price),usd(r.volume),res(r.result),r.pnl==null?"—":poPn(r.pnl),r.status,r.lead_min==null?"—":r.lead_min.toFixed(0)+" 分钟",r.cancel_s==null?"—":r.cancel_s.toFixed(1)+" 秒",r.attempt+1])))}}
+function analysis(){  // per setting, per underlying, per net edge and fair price at the order, per part of the underlying's day, the 15-minute windows, the pre-open quotes, the resting orders' record, the refused buys' outcomes: folded away
   const S=src(),hd=document.getElementById("anasum");filterLine(document.getElementById("anafilt"),S);
   document.getElementById("anaat").textContent=okAt?"已刷新 "+clock(okAt):"";
   const ids=["a-versions","a-items","a-edges","a-fairs","a-sessions","a-makers","a-blocked"];
   if(S.a===null){ids.forEach(id=>document.getElementById(id).replaceChildren($("p","small mut",S.err?"按筛选读取失败："+S.err:"按筛选读取中…")));
-    ["h-windows","a-windows","p-windows"].forEach(id=>{document.getElementById(id).hidden=true});hd.textContent=S.label;
+    ["h-windows","a-windows","p-windows","h-preopen","a-preopen","p-preopen"].forEach(id=>{document.getElementById(id).hidden=true});hd.textContent=S.label;
     document.getElementById("anabody").hidden=!anaOpen;document.getElementById("foldana").textContent=anaOpen?"收起":"展开";return}
   const a=S.a,put=(id,rows,extra)=>{const el=document.getElementById(id);el.replaceChildren(rows&&rows.length?anaTable(rows,extra):$("p","small mut","还没有记录"))};
   versions(a);put("a-items",a.items);put("a-edges",a.edges);put("a-fairs",a.fairs);
@@ -12473,6 +12489,8 @@ function analysis(){  // per setting, per underlying, per net edge and fair pric
   const w=a.windows||{},wins=(w.hours||[]).length>0;["h-windows","a-windows","p-windows"].forEach(id=>{document.getElementById(id).hidden=!wins});
   if(wins){const ex={head:["成交后 1 分钟","成交后 5 分钟"],cells:r=>[mo(r,"1m"),mo(r,"5m")]};
     document.getElementById("a-windows").replaceChildren($("div","sub","按窗口开始（北京时间）"),anaTable(w.hours,ex),$("div","sub","按下单时离窗口结束"),anaTable(w.left||[],ex),$("div","sub","按方向（涨 / 跌各算）"),anaTable(w.sides||[],ex))}
+  const po=a.preopen,pos=!!(po&&po.total&&po.total.records);["h-preopen","a-preopen","p-preopen"].forEach(id=>{document.getElementById(id).hidden=!pos});
+  if(pos)preopenSection(po);
   const mk=a.makers||{},mb=document.getElementById("a-makers");mb.replaceChildren();
   if(!mk.placed)mb.append($("p","small mut","还没有挂单"));
   else{const d=$("dl"),p=(k,v)=>d.append($("dt","",k),$("dd","",v));
@@ -12486,8 +12504,9 @@ function analysis(){  // per setting, per underlying, per net edge and fair pric
   else{const s=$("p","small","最近一周被拦下 "+bl.n+" 次，其中市场已出结果的 "+bl.settled+" 次"+(bl.settled?"；若按 "+num(bl.shares)+" 份买入：赢 "+bl.wins+" 输 "+bl.losses+(bl.ties?" 平 "+bl.ties:"")+"，盈亏 ":""));
     if(bl.settled)s.append(pn(bl.pnl));bb.append(s);
     if((bl.rows||[]).length)bb.append(table(["时间","市场","方向","价格","结果","若买入的盈亏","原因"],bl.rows.map(r=>[when(r.at),r.item,r.label,cent(r.price),r.payout===1?"赢":r.payout===0?"输":"平",money(r.pnl),r.why])))}
-  hd.replaceChildren((S.label?S.label+"｜":"")+"标的 "+(a.items||[]).length+" 个"+((a.versions||[]).length?" · 改过的设置 "+a.versions.length+" 个":"")+(mk.fill_rate!=null?" · 挂单成交率 "+(mk.fill_rate*100).toFixed(0)+"%":"")+(bl.settled?" · 被拦下的若买入 ":""));
-  if(bl.settled)hd.append(pn(bl.pnl));
+  hd.replaceChildren((S.label?S.label+"｜":"")+"标的 "+(a.items||[]).length+" 个"+((a.versions||[]).length?" · 改过的设置 "+a.versions.length+" 个":"")+(mk.fill_rate!=null?" · 挂单成交率 "+(mk.fill_rate*100).toFixed(0)+"%":"")+(pos?" · 预挂 "+po.total.windows+" 场"+(po.total.settled?"，已结算 ":""):""));
+  if(pos&&po.total.settled)hd.append(poPn(po.total.pnl));
+  if(bl.settled)hd.append(" · 被拦下的若买入 ",pn(bl.pnl));
   document.getElementById("anabody").hidden=!anaOpen;document.getElementById("foldana").textContent=anaOpen?"收起":"展开"}
 function tiles(){  // today, the last 7 days, the lifetime, what is open: the four numbers a glance needs
   const s=data.total,el=document.getElementById("tiles"),rc={};(data.recent||[]).forEach(r=>{rc[r.name]=r});
@@ -18977,7 +18996,12 @@ class Bot:
                 "makers": sim_maker_efficiency(trades),
                 "blocked": sim_blocked_outcomes(blocks, trades, self.config.sim_shares),
                 "versions": sim_by_version(trades, marks),  # 1.107.0: a setting changed, its values side by side
-                "windows": sim_by_window(trades, marks)}    # 1.107.0: the 15-minute windows by start hour and by minutes left
+                "windows": sim_by_window(trades, marks),    # 1.107.0: the 15-minute windows by start hour and by minutes left
+                "preopen": self.preopen_review()}           # 1.128.0: the pre-open mode's own quotes (LiveBot; None without it)
+
+    def preopen_review(self) -> dict | None:
+        """The review page's 开盘前预挂 section: the pre-open mode's ledger (preopen.review); None here, where there is no mode."""
+        return None
 
     def journal_analysis(self, flt: Mapping | None = None) -> dict:
         """The review page's daily summary and analysis over the records in ``flt`` (journal_filter_of: a card, a kind, a
