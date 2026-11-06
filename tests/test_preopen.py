@@ -429,6 +429,67 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.sent), 3)  # recorded: not placed again
         await self.finish(ctl)
 
+    async def test_a_held_candidate_waits_on_the_side_without_another_read(self):
+        """1.128.1: a candidate the hold keeps back (a stale snapshot, the budget, the pause) is parked by the worker, still
+        queued — the discovery does not read it again — and goes back on the queue HOLD_RETRY_MS on; one whose window got
+        too close is dropped. The cancel measurements count the scheduled cancels only."""
+        ctl, api, clock = controller()
+        await ctl.discover()
+        _, _, c = ctl.queue.get_nowait()
+        ctl.account_at = NOW - 40_000
+        self.assertEqual((await ctl.place_pair(c), api.sent), ("held", []))
+        ctl.account_at = NOW
+        ctl.owner.config = dataclasses.replace(ctl.owner.config, live_max_open_usd=48)
+        self.assertEqual((await ctl.place_pair(c), api.sent), ("held", []))
+        self.assertTrue(ctl.error.startswith("预挂资金上限不足"))
+        ctl.owner.config = dataclasses.replace(ctl.owner.config, live_max_open_usd=7000)
+        ctl.account_at = NOW - 40_000
+        ctl.queue.put_nowait((c["start_ms"], c["slug"], c))
+        worker = asyncio.create_task(ctl.placement_worker())
+        await asyncio.sleep(0.05)
+        self.assertEqual((set(ctl.parked), ctl.queued, ctl.queue.qsize()), ({c["slug"]}, {c["slug"]}, 0))
+        api.calls.clear()
+        await ctl.discover()
+        self.assertNotIn("/categories/" + c["slug"], api.calls, "parked: not asked for again")
+        self.assertIn("队列 1 场（1 场在等，见暂不新挂）", ctl.status())
+        ctl.unpark()
+        self.assertEqual(ctl.queue.qsize(), 0, "its wait is not over")
+        clock.ms += p.HOLD_RETRY_MS
+        ctl.account_at = clock.ms
+        ctl.unpark()
+        await asyncio.sleep(0.05)
+        self.assertEqual((len(api.sent), ctl.parked, ctl.queued, c["slug"] in ctl.ledger.rows), (2, {}, set(), True))
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        late = {**c, "slug": "btc-updown-15m-late", "start_ms": clock.ms + 100_000}
+        ctl.parked[late["slug"]] = (clock.ms, late); ctl.queued.add(late["slug"])
+        ctl.unpark()
+        self.assertEqual((ctl.parked, ctl.queued, ctl.queue.qsize()), ({}, set(), 0), "too close to its start: dropped")
+        pair = ctl.ledger.rows[c["slug"]]
+        pair.update(cancel_sent_ms=NOW, cancel_done_ms=NOW + 11_000)  # a withdrawal long before the cancel time: not a measurement
+        self.assertIn("撤单确认用时：还没有撤过", ctl.timing_line())
+        pair.update(cancel_sent_ms=pair["cancel_ms"], cancel_done_ms=pair["cancel_ms"] + 400)
+        self.assertIn("撤单确认用时中位 0.4 秒", ctl.timing_line())
+        await self.finish(ctl)
+
+    async def test_active_windows_are_refreshed_in_small_batches(self):
+        rows = [market(at=NOW + n * 15 * 60_000, mid=n) for n in range(1, 11)]
+        ctl, api, clock = controller(rows, PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="240")
+        for n in range(1, 11):
+            c = p.candidate(rows[n - 1], NOW, ctl.owner.config, ctl.settings)
+            ctl.ledger.save({**c, "phase": "active", "orders": {"up": {"state": "open", "id": f"u{n}", "hash": f"h{n}", "filled": 0.0},
+                                                                "down": {"state": "open", "id": f"d{n}", "hash": f"g{n}", "filled": 0.0}}, "created_ms": NOW})
+        await ctl.refresh_active()
+        read = lambda: sorted(int(p["market_id"]) for p in ctl.ledger.rows.values() if p.get("meta_ms"))
+        self.assertEqual(len(read()), p.REFRESH_BATCH)
+        await ctl.refresh_active()
+        self.assertEqual(read(), list(range(1, 11)), "the rest the next iteration")
+        clock.ms += p.REFRESH_MS
+        api.markets["3"]["tradingStatus"] = "CANCEL_ONLY"
+        await ctl.refresh_active()
+        self.assertEqual(ctl.ledger.rows[rows[2]["categorySlug"]]["phase"], "closed")
+        await self.finish(ctl)
+
     async def test_an_active_window_is_reread_and_withdrawn_when_its_market_closes(self):
         ctl, api, clock = controller([market(), market(at=NOW + 3 * 3600_000, mid=8)], PREOPEN_AHEAD_MINUTES="240")
         c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
@@ -719,7 +780,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual({o["hash"] for o in fresh["orders"].values()}, {o["hash"] for o in pair["orders"].values()}, "a new salt")
             self.assertEqual(api.sent[2]["data"]["order"]["takerAmount"], str(L.to_wei(20)))
             self.assertEqual(bigger.risk(), 2 * 0.49 * 20)  # the withdrawn pair released, the new one reserved
-            self.assertIn("已记录 1 场（1 场挂着，1 场已结清）", bigger.status())
+            self.assertIn("已记录 1 场、2 条（1 场挂着，1 条已结清）", bigger.status())
             self.assertIn("重新报价 1 场", bigger.status())
             # the cap and Predict's own refusal
             fresh["attempt"] = p.MAX_ATTEMPTS - 1

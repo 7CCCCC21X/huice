@@ -60,6 +60,8 @@ GIVE_UP_MS = 15 * 60_000  # after a window's start + this, an order Predict cann
 SPRINT_MS = 2_000         # the last stretch (past the cancel time, before the expiry): an order still open is asked to be cancelled this often, no backoff
 REFRESH_MS = 30_000       # an active window's market is read again this often (matching on; a status change withdraws the pair)
 REFRESH_FAR_MS = 300_000  # ...a window starting more than an hour away: this often (a day's windows must not cost a read a second)
+REFRESH_BATCH = 8         # refresh_active: at most this many market reads an iteration, three at a time (a burst of due windows is spread)
+HOLD_RETRY_MS = 5_000     # a held candidate (hold(): a stale snapshot, the cooldown, the pause; or the budget) waits this long on the side, then is placed again — never read again meanwhile
 SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
 DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
 LISTING_FIELDS = ("id", "conditionId", "status", "tradingStatus", "question", "outcomes")  # the details' fields the discovery reads
@@ -420,6 +422,7 @@ class Controller:
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()  # (start_ms, slug, candidate): the soonest window first
         self.queued: set[str] = set()
         self.skipped: dict[str, str] = {}  # slug -> why a listed window was not placed (the status line)
+        self.parked: dict[str, tuple[int, dict]] = {}  # slug -> (retry_ms, candidate): held by hold() or the budget, placed again HOLD_RETRY_MS on, still queued
         self.full_scan_ms = 0  # discover: when the last full scan ran (FULL_SCAN_MS)
         self.keep_on_stop = False  # the owner's stop for a settings change: the orders stay on the book, the next controller takes them over
         self.resumed = self.requoted = 0  # pairs taken over at this start; windows quoted again (superseded records) since
@@ -675,28 +678,42 @@ class Controller:
         """An active window's market, read again every REFRESH_MS (REFRESH_FAR_MS while its start is more than an hour
         away): when matching comes on (note_open), and a market no longer registered or open for orders has its pair
         withdrawn."""
-        for pair in list(self.ledger.rows.values()):
-            every = REFRESH_MS if pair["start_ms"] - self.now() <= 3_600_000 else REFRESH_FAR_MS
-            if pair["phase"] != "active" or self.now() - int(pair.get("meta_ms") or 0) < every:
-                continue
-            pair["meta_ms"] = self.now()
-            market = {**(await self.api.market(pair["market_id"])), "categorySlug": pair["slug"]}
-            self.note_open(market)
-            status, trading = str(market.get("status") or "").upper(), str(market.get("tradingStatus") or "").upper()
-            if status != "REGISTERED" or trading not in {"OPEN", "MATCHING_NOT_ENABLED"}:
-                await self.cancel_many([pair], f"市场状态 {status or '?'} / {trading or '?'}")
-            else:
-                self.ledger.save(pair)
+        every = lambda p: REFRESH_MS if p["start_ms"] - self.now() <= 3_600_000 else REFRESH_FAR_MS
+        due = sorted((p for p in self.ledger.rows.values() if p["phase"] == "active" and self.now() - int(p.get("meta_ms") or 0) >= every(p)),
+                     key=lambda p: int(p.get("meta_ms") or 0))[:REFRESH_BATCH]  # the longest unread first; a burst of due windows is spread over iterations
+        gate = asyncio.Semaphore(3)
 
-    async def place_pair(self, c: dict) -> None:
+        async def one(pair: dict) -> None:
+            async with gate:
+                pair["meta_ms"] = self.now()
+                market = {**(await self.api.market(pair["market_id"])), "categorySlug": pair["slug"]}
+                self.note_open(market)
+                status, trading = str(market.get("status") or "").upper(), str(market.get("tradingStatus") or "").upper()
+                if status != "REGISTERED" or trading not in {"OPEN", "MATCHING_NOT_ENABLED"}:
+                    await self.cancel_many([pair], f"市场状态 {status or '?'} / {trading or '?'}")
+                else:
+                    self.ledger.save(pair)
+        for error in await asyncio.gather(*(one(p) for p in due), return_exceptions=True):
+            if isinstance(error, BaseException):
+                raise error
+
+    async def place_pair(self, c: dict) -> str:
+        """The pair for a queued candidate: "" when done with it (placed, refused, or not this window's any more), "held"
+        when a hold (a stale snapshot, the cooldown, the pause) or the budget keeps it back — nothing read then: the worker
+        parks it and tries again HOLD_RETRY_MS on."""
         import live
-        if c["slug"] in self.ledger.rows or self.blocked():
-            return
+        if c["slug"] in self.ledger.rows:
+            return ""
+        if self.hold():
+            return "held"
+        if why := self.budget_problem():
+            self.error = why
+            return "held"
         # Fresh details are authoritative, not a stale listing page or model card.
         market = await self.api.market(c["market_id"])
         current = candidate(market, self.now(), self.owner.config, self.settings)
         if current is None or current["slug"] != c["slug"]:
-            return
+            return ""
         info = live.parse_market(market, self.owner.config.predict_fee_bps)
         outcomes = [live.outcome_for_side("updown", side, info.outcomes) for side in ("up", "down")]
         if any(outcome is None or assumed for outcome, assumed in outcomes):
@@ -709,11 +726,13 @@ class Controller:
         async with self.account_lock:
             # Only one coroutine reserves a pair at a time; reservations are saved
             # before the lock is released, including orders not visible on REST yet.
-            if c["slug"] in self.ledger.rows or self.hold():
-                return
+            if c["slug"] in self.ledger.rows:
+                return ""
+            if self.hold():
+                return "held"
             if why := self.budget_problem():
                 self.error = why
-                return
+                return "held"
             amounts = live.limit_amounts(True, live.to_wei(self.settings.price), live.to_wei(self.settings.shares))
             orders = {}
             for side, (outcome, _) in zip(("up", "down"), outcomes):
@@ -771,10 +790,11 @@ class Controller:
             self.error = next((o["error"] for o in pair["orders"].values() if o.get("error")), "")
             self.ledger.delete(pair["slug"])
             LOG.warning("开盘前预挂 %s 没有发出：%s", pair["slug"], self.error)
-            return
+            return ""
         if pair["phase"] != "active" or self.now() >= pair["cancel_ms"] or self.blocked():
             await self.cancel_pair(pair, "单边未确认或已到撤单时间")
         LOG.info("开盘前预挂 %s：%s", pair["slug"], {s: o["state"] for s, o in pair["orders"].items()})
+        return ""
 
     def apply_fill(self, order: dict, row: dict) -> None:
         # Fixed shares are the actual signed shares, not an estimated count.
@@ -1001,8 +1021,9 @@ class Controller:
         while not self.stopped():
             _, _, c = await self.queue.get()
             self.placing.add(c["slug"])
+            held = False
             try:
-                await self.place_pair(c)
+                held = await self.place_pair(c) == "held"
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -1010,14 +1031,41 @@ class Controller:
                 LOG.warning("开盘前挂单失败 %s：%s", c["slug"], self.error)
             finally:
                 self.placing.discard(c["slug"])
-                self.queued.discard(c["slug"])
+                if held:  # still queued: placed again HOLD_RETRY_MS on (unpark), without another read of the window
+                    self.parked[c["slug"]] = (self.now() + HOLD_RETRY_MS, c)
+                else:
+                    self.queued.discard(c["slug"])
                 self.queue.task_done()
+
+    def unpark(self) -> None:
+        """The held candidates whose wait is over go back on the queue (the soonest first); one whose window is too close
+        to its start is dropped, as the discovery would not take it either."""
+        for slug, (at, c) in list(self.parked.items()):
+            if c["start_ms"] - self.now() < self.settings.entry_seconds * 1000:
+                del self.parked[slug]
+                self.queued.discard(slug)
+            elif self.now() >= at:
+                del self.parked[slug]
+                self.queue.put_nowait((c["start_ms"], c["slug"], c))
+
+    async def account_loop(self) -> None:
+        """The account snapshot (the open orders, the fills they show, the balance) every poll, on its own: the discovery
+        and the refreshes, however long they take, never let it go stale (a stale snapshot holds every placement)."""
+        while not self.stopped():
+            try:
+                if not self.blocked():
+                    await self.account()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.error = core.clean_error(error) or type(error).__name__
+                LOG.warning("开盘前账户快照：%s", self.error)
+            await asyncio.sleep(self.settings.poll)
 
     async def discovery_loop(self) -> None:
         while not self.stopped():
             try:
                 if not self.blocked():
-                    await self.account()
                     await self.discover()
                     await self.refresh_active()
             except asyncio.CancelledError:
@@ -1029,6 +1077,7 @@ class Controller:
 
     async def cancellation_loop(self) -> None:
         while not self.stopped():
+            self.unpark()
             now = self.now()
             due = self.due(now)
             if due:
@@ -1072,7 +1121,8 @@ class Controller:
     async def run(self) -> None:
         try:
             self.adopt()  # the last run's pairs: taken over as they are, or withdrawn and reconciled
-            jobs = [asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
+            jobs = [asyncio.create_task(self.account_loop(), name="preopen-account"),
+                    asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
                     asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
                     *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(2))]
             stops = [asyncio.create_task(self.owner.stopping.wait()), asyncio.create_task(self.stop.wait())]
@@ -1096,7 +1146,8 @@ class Controller:
         """What the last windows measured: the cancel's round trip and how long before the start it was confirmed, and how
         long before the start the listing first showed them OPEN — the evidence PREOPEN_CANCEL_SECONDS is set against."""
         rows = sorted(self.ledger.rows.values(), key=lambda p: p["cancel_ms"])
-        sent = [p for p in rows if p.get("cancel_sent_ms") and p.get("cancel_done_ms")][-20:]
+        sent = [p for p in rows if p.get("cancel_sent_ms") and p.get("cancel_done_ms")
+                and p["cancel_sent_ms"] >= p["cancel_ms"] - 1000][-20:]  # the scheduled cancels only: a withdrawal at a restart or a settings change says nothing about the last stretch
         parts = []
         if sent:
             trips = sorted((p["cancel_done_ms"] - p["cancel_sent_ms"]) / 1000 for p in sent)
@@ -1132,7 +1183,8 @@ class Controller:
                 + ("挂 24 小时内已发布的全部场次" if self.settings.ahead_minutes >= 1440 else f"只挂 {self.settings.ahead_minutes} 分钟内开始的场次") + "\n"
                 f"撤单：开场前 {self.settings.cancel_seconds} 秒发出，之后到开场前 {self.settings.expiry_seconds} 秒到期为止每 {SPRINT_MS // 1000} 秒催一次；"
                 f"不足 {self.settings.entry_seconds} 秒不再新挂\n"
-                f"已记录 {len({p['slug'].split('@')[0] for p in rows})} 场（{sum(1 for p in rows if p['phase'] == 'active')} 场挂着，{sum(1 for p in rows if p.get('accounted'))} 场已结清），队列 {self.queue.qsize()} 场；{listed}"
+                f"已记录 {len({p['slug'].split('@')[0] for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 场挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清），"
+                f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
                 f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
