@@ -199,7 +199,7 @@ def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings
     awaiting matching, with no maker fee, with an id, a condition and a question that agrees with the slug's time."""
     slug = str(market.get("categorySlug") or market.get("slug") or "")
     for rolling in core.WINDOW_UPDOWN_MARKETS:
-        prefix = f"{rolling.stem}-updown-15m-"
+        prefix = rolling.prefix  # btc-updown-15m-, btc-updown-5m- (1.137.0)
         suffix = slug.removeprefix(prefix)
         if not slug.startswith(prefix) or not suffix.isdigit():
             continue
@@ -207,7 +207,7 @@ def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings
             return "不在 PREOPEN_MARKETS 里"
         start = int(suffix) * 1000
         if start % rolling.window_ms:
-            return "链接里的时间不是整刻钟"
+            return "链接里的时间不在场次边界上"
         if start - now_ms < settings.entry_seconds * 1000:
             return "已开始或不足 3 分钟"
         if start - now_ms > settings.ahead_minutes * 60_000:
@@ -228,7 +228,7 @@ def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings
         if core.Bot.window_title_problem(checker, spec):
             return "问题里的时间段和链接对不上"
         return ""
-    return "不是 15 分钟卡的链接"
+    return "不是涨跌卡（15 分钟、5 分钟）的链接"
 
 
 def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dict | None:
@@ -236,8 +236,8 @@ def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dic
     if candidate_problem(market, now_ms, config, settings):
         return None
     slug = str(market.get("categorySlug") or market.get("slug") or "")
-    rolling = next(r for r in core.WINDOW_UPDOWN_MARKETS if slug.startswith(f"{r.stem}-updown-15m-"))
-    start = int(slug.removeprefix(f"{rolling.stem}-updown-15m-")) * 1000
+    rolling = next(r for r in core.WINDOW_UPDOWN_MARKETS if slug.startswith(r.prefix))
+    start = int(slug.removeprefix(rolling.prefix)) * 1000
     spec = rolling.window_spec(start)
     return {"slug": slug, "key": rolling.key, "market_id": str(market["id"]), "start_ms": start,
             "cancel_ms": start - settings.cancel_seconds * 1000, "expires": start // 1000 - settings.expiry_seconds,
@@ -280,7 +280,7 @@ def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[An
 
 
 def window_slug(rolling: Any, start_ms: int) -> str:
-    return f"{rolling.stem}-updown-15m-{start_ms // 1000}"
+    return f"{rolling.prefix}{start_ms // 1000}"
 
 
 def hms(ms: int) -> str:
@@ -578,6 +578,12 @@ def review(rows: list[dict], now_ms: int) -> dict:
 
 
 LISTING_CYCLE_MS = 15 * 60_000  # Predict lists one more window of a card every quarter hour (a day ahead): the next listing is expected a cycle after the last seen
+
+
+def cycle_ms(key: str) -> int:
+    """How often Predict lists one more window of a card: its window length (a 5-minute card's every five minutes, 1.137.0)."""
+    card = next((r for r in core.WINDOW_UPDOWN_MARKETS if r.key == key), None)
+    return int(card.window_ms) if card is not None else LISTING_CYCLE_MS
 LISTING_EARLY_MS, LISTING_LATE_MS = 30_000, 120_000  # ...and the discovery polls fast from this long before that moment until this long after it (or the listing)
 FAST_POLL_S = 0.5               # the fast poll's cadence (the queue position: the bid goes in within a second of the listing; 1.133.0: was 1 s)
 LISTING_PROBE_S = 2.0           # ...and each card's next listing is probed this often the rest of the time (was the poll setting, 5 s); the older windows keep the poll's pace
@@ -596,7 +602,7 @@ async def probe(api: Any, config: Any, settings: Settings, now_ms: int, hours: f
     a card is listed under the slug the bot expects. Bounded (PROBE_PER_CARD a card, two reads at a time, PROBE_BUDGET_S)."""
     hm = lambda ms: when(ms, now_ms)
     lines = [f"开盘前预挂探测（只读；设置：{'、'.join(sorted(settings.markets)) or '没选卡'}，{levels_text(settings)}，"
-             f"提前 {settings.ahead_minutes} 分钟内，不足 {settings.entry_seconds} 秒不挂；只看 {hours:g} 小时内、每张卡最近 {PROBE_PER_CARD} 个刻钟）"]
+             f"提前 {settings.ahead_minutes} 分钟内，不足 {settings.entry_seconds} 秒不挂；只看 {hours:g} 小时内、每张卡最近 {PROBE_PER_CARD} 场）"]
     per_card: dict[str, int] = {}
     picked = []
     for rolling, start in window_starts(now_ms, config, dataclasses.replace(settings, ahead_minutes=max(3, int(hours * 60)))):
@@ -1238,7 +1244,7 @@ class Controller:
         self.listed_until_ms = max(self.listed_until_ms, start)
         if known_before.get(rolling.key) and start > known_before[rolling.key]:
             if self.listed_at.get(rolling.key):
-                self.listing_deltas.append(self.now() - (self.listed_at[rolling.key] + LISTING_CYCLE_MS))
+                self.listing_deltas.append(self.now() - (self.listed_at[rolling.key] + rolling.window_ms))
             self.listed_at[rolling.key] = self.now()
         self.listed_by_card[rolling.key] = max(self.listed_by_card.get(rolling.key, 0), start)
 
@@ -1697,8 +1703,8 @@ class Controller:
         """Seconds to the next discovery: FAST_POLL_S while a card's next listing is expected — a cycle after its last one
         seen, LISTING_EARLY_MS before to LISTING_LATE_MS after (or until it is seen) — else the poll setting."""
         now = self.now()
-        for at in self.listed_at.values():
-            due = at + LISTING_CYCLE_MS
+        for key, at in self.listed_at.items():
+            due = at + cycle_ms(key)
             if due - LISTING_EARLY_MS <= now <= due + LISTING_LATE_MS:
                 return FAST_POLL_S
         for entered in self.awaiting.values():  # 1.133.1: a card's next window in the range and not listed yet — Predict lists it about a minute after it enters (11-06: 85 s), whatever the last listing's time
@@ -1931,7 +1937,7 @@ class Controller:
                 + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：不计入预挂限额，也不挡预挂"
                    + ("；其中挂在本机器人市场上的，原策略 2 分钟后自动撤掉（LIVE_ORPHAN_CANCEL）" if getattr(self.owner.config, "live_orphan_cancel", True) else "") if self.unmanaged else "")
                 + ("\n股票卡暂停：" + "；".join(self.card_holds.values()) if self.card_holds else "")
-                + ("\n发布节奏（每 15 分钟一场；预计前后每秒扫一次）：" + "；".join(f"{key} 上次 {hms(at)}，下次预计 {hms(at + LISTING_CYCLE_MS)}" for key, at in sorted(self.listed_at.items()))
+                + ("\n发布节奏（每张卡一场一次：15 分钟卡每刻钟、5 分钟卡每 5 分钟；预计前后每秒扫一次）：" + "；".join(f"{key} 上次 {hms(at)}，下次预计 {hms(at + cycle_ms(key))}" for key, at in sorted(self.listed_at.items()))
                    if self.listed_at else "")
                 + (f"\n没挂的已发布场次：" + "；".join(f"{k.rsplit('-', 1)[-1]} {v}" for k, v in list(self.skipped.items())[-3:]) if self.skipped else "")
                 + (f"\n不再报价：{len(spent)} 档失败满 {MAX_ATTEMPTS} 次（单边没确认、一边被撤或过期），如 {named(spent)}" if spent else "")

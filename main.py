@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.136.2"
+VERSION = "1.137.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -548,7 +548,7 @@ class PreopenSettings:
         cap = float(e.get("PREOPEN_MAX_OPEN_USD", "0"))  # 0 = no cap (1.132.3: Predict locks no USDT for a resting order; the balance check stands)
         cents, shares, ahead = int(e.get("PREOPEN_PRICE_CENTS", "49")), int(e.get("PREOPEN_SHARES", "10")), int(e.get("PREOPEN_AHEAD_MINUTES", "1440"))
         cancel, expiry, entry = int(e.get("PREOPEN_CANCEL_SECONDS", "20")), int(e.get("PREOPEN_EXPIRY_SECONDS", "10")), int(e.get("PREOPEN_ENTRY_SECONDS", "180"))
-        stems = {r.stem.lower(): r.key for r in WINDOW_UPDOWN_MARKETS}
+        stems = {r.short.lower(): r.key for r in WINDOW_UPDOWN_MARKETS}  # btc, eth…; btc5 for the 5-minute card (1.137.0)
         keys = frozenset(stems.values())
         wanted = [w.strip() for w in str(e.get("PREOPEN_MARKETS", "btc")).split(",") if w.strip()] or ["btc"]
         markets = (keys if any(w.lower() == "all" for w in wanted) else frozenset() if any(w.lower() == "none" for w in wanted)
@@ -662,7 +662,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_ORPHAN_CANCEL", "自动撤掉无记录的挂单", "开 = 账户上本机器人没有记录、却挂在本机器人做过的市场上的挂单（丢失跟踪的单：重启、改设置或撤单没撤成留下的，成交了也没人记账），连续 2 分钟还在就自动撤掉并通知；没做过的市场上的挂单当作手动单，只报不撤。关 = 只报不撤，/live cancel account 手动撤"),
     ("PREOPEN_15M", "开盘前预挂（15 分钟市场）", "开 = 15 分钟场次一发布就在涨跌两边各挂一张 post-only 买单，开场前撤掉（PREOPEN.md）；需要 LIVE=on。改动即时生效：开就启动，关就撤单停下，改参数先撤单再按新参数重启。预挂的预留计入持仓+挂单上限，当日盈亏计入日亏损停机线"),
     ("PREOPEN_EXCLUSIVE", "预挂时原策略暂停开新仓", "开 = 本模式真实运行时普通模型策略不开新仓（原策略也在交易同一批 15 分钟市场时建议开）；关 = 两边同时跑，额度和日亏损合并计算"),
-    ("PREOPEN_MARKETS", "预挂哪几张卡", "点亮要挂的卡，可多选，全选 = all（默认只挂 BTC）；“一键全关”= none：一张都不挂、已挂的预挂单撤掉，本模式仍开着，再点亮一张就恢复；和“做哪些市场”互不影响：那边排除 15 分钟卡只管原策略，预挂只认这里"),
+    ("PREOPEN_MARKETS", "预挂哪几张卡", "点亮要挂的卡，可多选，全选 = all（默认只挂 BTC）；BTC 5分、ETH 5分、BNB 5分 是每 5 分钟一场的卡（1.137.0，只给预挂用）；“一键全关”= none：一张都不挂、已挂的预挂单撤掉，本模式仍开着，再点亮一张就恢复；和“做哪些市场”互不影响：那边排除 15 分钟卡只管原策略，预挂只认这里"),
     ("PREOPEN_WEEKEND", "周末也挂", "开 = 周六、周日（北京时间）开始的场次照挂；关 = 周末不挂：周五起就不挂周六、周日开始的场次，周末里已挂的按“设置不同”撤掉（不算再报价次数），周一 00:00 起恢复。股票卡周末本来没有场次，这项只影响 BTC、ETH、BNB 这些周末也有场次的卡"),
     ("PREOPEN_SHARES", "预挂每边份数", "1～500：每场每边各挂这么多份（默认 10），每边不少于 $1"),
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
@@ -7451,6 +7451,17 @@ class WindowUpDownSpec:
     def window_ms(self) -> int:
         return self.minutes * 60_000
 
+    @property
+    def prefix(self) -> str:
+        """The slug's head with the window length: btc-updown-15m-, btc-updown-5m- (1.137.0)."""
+        return f"{self.stem}-updown-{self.minutes}m-"
+
+    @property
+    def short(self) -> str:
+        """The card's name in PREOPEN_MARKETS and on the control page: the stem (btc), with the minutes when not a
+        quarter hour (btc5): a 5-minute card shares its slug stem with the 15-minute one (1.137.0)."""
+        return self.stem if self.minutes == 15 else f"{self.stem}{self.minutes}"
+
     def window_spec(self, start_ms: int) -> UpDownSpec:
         """The market of the window that starts at ``start_ms``: the slug names the start in Unix seconds; the two prices
         are the closes of the index's 1-minute candles that end at the window's start and end (an UpDownSpec names its
@@ -7548,6 +7559,11 @@ WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
     WindowUpDownSpec("QQQ-15M", "qqq", "QQQUSDT", "纳指ETF", model=False),
     WindowUpDownSpec("SPY-15M", "spy", "SPYUSDT", "标普ETF", model=False),
     WindowUpDownSpec("MSFT-15M", "msft", "MSFTUSDT", "微软", model=False),
+    # 1.137.0: the 5-minute BTC / ETH / BNB cards (btc-updown-5m-1793986800: 11-07 01:40–01:45 Beijing) on the 15-minute cards'
+    # rules, a window every five minutes; the pre-open mode's alone (model=False) — PREOPEN_MARKETS names them btc5 / eth5 / bnb5
+    WindowUpDownSpec("BTC-5M", "btc", "BTCUSDT", "BTC", minutes=5, venue="spot", model=False),
+    WindowUpDownSpec("ETH-5M", "eth", "ETHUSDT", "ETH", minutes=5, venue="spot", model=False),
+    WindowUpDownSpec("BNB-5M", "bnb", "BNBUSDT", "BNB", minutes=5, venue="spot", model=False),
 )
 DEFAULT_SIM_SKIP = tuple(spec.key for spec in WINDOW_UPDOWN_MARKETS if not spec.model)  # SIM_SKIP unset: these are left out of the model trader's markets (the page's 详细选项 restores one)
 
@@ -9969,7 +9985,7 @@ SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": 
 CONTROL_FORMS: dict[str, dict] = {
     "LIVE": {"kind": "choice", "group": "策略", "options": [["off", "off 只记账"], ["pause", "pause 登录不开仓"], ["on", "on 真实下单"]]},
     "PREOPEN_15M": {"kind": "choice", "group": "预挂", "options": [["off", "off 关"], ["on", "on 开（需要 LIVE=on）"]]},
-    "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "none": "none", "options": [["btc", "BTC"], ["eth", "ETH"], ["bnb", "BNB"], ["xau", "黄金"], ["cl", "原油"], ["skhynix", "SK 海力士"], ["unitree", "宇树"], ["zhipu", "智谱"], ["mu", "美光"], ["sndk", "闪迪"], ["avgo", "博通"], ["spcx", "SPCX"], ["nvda", "英伟达"], ["googl", "谷歌"], ["meta", "Meta"], ["tsm", "台积电"], ["amzn", "亚马逊"], ["qqq", "纳指ETF"], ["spy", "标普ETF"], ["msft", "微软"]]},  # 1.130.7: pick the cards one by one; 1.134.0: 黄金、原油、智谱; 1.135.0: 美股 12 张; 1.136.0: "none" = the page's 一键全关
+    "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "none": "none", "options": [["btc", "BTC"], ["eth", "ETH"], ["bnb", "BNB"], ["btc5", "BTC 5分"], ["eth5", "ETH 5分"], ["bnb5", "BNB 5分"], ["xau", "黄金"], ["cl", "原油"], ["skhynix", "SK 海力士"], ["unitree", "宇树"], ["zhipu", "智谱"], ["mu", "美光"], ["sndk", "闪迪"], ["avgo", "博通"], ["spcx", "SPCX"], ["nvda", "英伟达"], ["googl", "谷歌"], ["meta", "Meta"], ["tsm", "台积电"], ["amzn", "亚马逊"], ["qqq", "纳指ETF"], ["spy", "标普ETF"], ["msft", "微软"]]},  # 1.130.7: pick the cards one by one; 1.134.0: 黄金、原油、智谱; 1.135.0: 美股 12 张; 1.136.0: "none" = the page's 一键全关
     "PREOPEN_WEEKEND": {"kind": "choice", "group": "预挂", "options": [["on", "on 周末照挂"], ["off", "off 周末不挂"]]},
     "PREOPEN_EXCLUSIVE": {"kind": "choice", "group": "预挂", "options": [["off", "off 两边同时跑"], ["on", "on 预挂时原策略不开新仓"]]},
     "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
@@ -18928,7 +18944,7 @@ class Bot:
                                   f"每张卡未结算窗口的持仓加挂单合计不超过 ${c.sim_crypto_15m_open_usd:g}" if c.sim_crypto_15m_open_usd > 0 else "",
                                   f"每个窗口最后 {max(c.sim_crypto_15m_quiet, 60)} 秒不下单、撤掉挂单") if part]
         if self.updown_windows and "updown" in c.sim_markets:
-            how.append("15 分钟涨跌（" + "、".join(w.coin for w in self.updown_windows.values()) + "，内测）：" + "，".join(beta) + "（SIM_CRYPTO_15M_*）")
+            how.append("15 分钟涨跌（" + "、".join(dict.fromkeys(w.coin for w in self.updown_windows.values())) + "，内测）：" + "，".join(beta) + "（SIM_CRYPTO_15M_*）")
         if r["ways"] != "只吃单":
             spread = self.config.sim_maker_spread
             how.append((f"挂单{'平时' if self.config.sim_maker_deep > 0 else ''}只挂在双边都有报价、价差不超过 {spread * 100:g}¢ 的盘口" if spread > 0
@@ -20367,7 +20383,7 @@ class Bot:
                   "PREOPEN_DEEP_AHEAD_MINUTES": str(c.preopen.deep_ahead_minutes if c.preopen.deep_ahead_minutes != c.preopen.ahead_minutes else 0),
                   "PREOPEN_LIMIT_GAP_PCT": f"{c.preopen.limit_gap_pct:g}", "PREOPEN_OPEN_QUIET_MINUTES": str(c.preopen.open_quiet_minutes),
                   "PREOPEN_MARKETS": ("all" if c.preopen.markets >= {r.key for r in WINDOW_UPDOWN_MARKETS} else "none" if not c.preopen.markets
-                                      else ",".join(r.stem for r in WINDOW_UPDOWN_MARKETS if r.key in c.preopen.markets)),
+                                      else ",".join(r.short for r in WINDOW_UPDOWN_MARKETS if r.key in c.preopen.markets)),
                   "PREOPEN_WEEKEND": flag(c.preopen.weekend),
                   "PREOPEN_AHEAD_MINUTES": str(c.preopen.ahead_minutes), "PREOPEN_CANCEL_SECONDS": str(c.preopen.cancel_seconds),
                   "PREOPEN_EXPIRY_SECONDS": str(c.preopen.expiry_seconds), "PREOPEN_ENTRY_SECONDS": str(c.preopen.entry_seconds),

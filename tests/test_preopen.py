@@ -26,8 +26,8 @@ def window_slug_of(start_ms, stem="btc"):
     return f"/categories/{stem}-updown-15m-{start_ms // 1000}"
 
 
-def market(stem="btc", at=NOW + 3600_000, mid=123, status="MATCHING_NOT_ENABLED"):
-    return {"id": mid, "categorySlug": f"{stem}-updown-15m-{at//1000}", "conditionId": "0xcondition",
+def market(stem="btc", at=NOW + 3600_000, mid=123, status="MATCHING_NOT_ENABLED", minutes=15):
+    return {"id": mid, "categorySlug": f"{stem}-updown-{minutes}m-{at//1000}", "conditionId": "0xcondition",
             "status": "REGISTERED", "tradingStatus": status, "isVisible": True, "feeRateBps": 200,
             "outcomes": [{"name": "Down", "indexSet": 1, "onChainId": str(mid * 2)},
                          {"name": "Up", "indexSet": 2, "onChainId": str(mid * 2 + 1)}]}
@@ -136,9 +136,9 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         row = market(); row["question"] = "10:00AM-10:15AM ET"
         self.assertIsNone(p.candidate(row, NOW, ctl.owner.config, ctl.settings))
         self.assertEqual(p.candidate_problem(market(at=NOW), NOW, ctl.owner.config, ctl.settings), "已开始或不足 3 分钟")
-        self.assertEqual(p.candidate_problem(market(at=NOW + 120000), NOW, ctl.owner.config, ctl.settings), "链接里的时间不是整刻钟")
+        self.assertEqual(p.candidate_problem(market(at=NOW + 120000), NOW, ctl.owner.config, ctl.settings), "链接里的时间不在场次边界上")
         self.assertEqual(p.candidate_problem(market(at=NOW + 2 * 3600_000), NOW, ctl.owner.config, ctl.settings), "开始还在 60 分钟之外（之后再扫）")
-        self.assertEqual(p.candidate_problem(market("sol"), NOW, ctl.owner.config, ctl.settings), "不是 15 分钟卡的链接")
+        self.assertEqual(p.candidate_problem(market("sol"), NOW, ctl.owner.config, ctl.settings), "不是涨跌卡（15 分钟、5 分钟）的链接")
         self.assertEqual(p.candidate_problem(market("eth"), NOW, ctl.owner.config, ctl.settings), "不在 PREOPEN_MARKETS 里")  # 1.129.1: a card, not quoted by these settings
         for stem in ("eth", "bnb"):
             self.assertIsNotNone(p.candidate(market(stem), NOW, ctl.owner.config, dataclasses.replace(ctl.settings, markets=frozenset({"ETH-15M", "BNB-15M"}))))
@@ -189,7 +189,8 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         on = lambda **e: p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", **e}))
         self.assertEqual((on().shares, on().markets, on().side_usd, on().pair_usd, on().ahead_minutes), (10, frozenset({"BTC-15M"}), 4.9, 9.8, 1440))
         self.assertEqual(on(PREOPEN_MARKETS="all").markets, frozenset({"BTC-15M", "ETH-15M", "BNB-15M", "XAU-15M", "CL-15M", "SKHYNIX-15M", "UNITREE-15M", "ZHIPU-15M", *m.DEFAULT_SIM_SKIP}))
-        self.assertEqual(set(m.DEFAULT_SIM_SKIP), {"MU-15M", "SNDK-15M", "AVGO-15M", "SPCX-15M", "NVDA-15M", "GOOGL-15M", "META-15M", "TSM-15M", "AMZN-15M", "QQQ-15M", "SPY-15M", "MSFT-15M"}, "1.135.0: the twelve US cards, the pre-open mode's alone by default")
+        self.assertEqual(set(m.DEFAULT_SIM_SKIP), {"MU-15M", "SNDK-15M", "AVGO-15M", "SPCX-15M", "NVDA-15M", "GOOGL-15M", "META-15M", "TSM-15M", "AMZN-15M", "QQQ-15M", "SPY-15M", "MSFT-15M",
+                                                   "BTC-5M", "ETH-5M", "BNB-5M"}, "1.135.0: the twelve US cards, the pre-open mode's alone by default; 1.137.0: the 5-minute cards too")
         self.assertEqual(on(PREOPEN_MARKETS="nvda,spy").markets, frozenset({"NVDA-15M", "SPY-15M"}))
         self.assertEqual(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline"}).sim_skip, frozenset(m.DEFAULT_SIM_SKIP))
         self.assertEqual(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "SIM_SKIP": ""}).sim_skip, frozenset(), "set empty on the page: the model trader takes them too")
@@ -848,6 +849,33 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(again.queue.qsize(), 0, "not quoted again: the window is left out")
             await self.finish(again)
 
+    async def test_five_minute_cards_are_quoted_on_their_own_rhythm(self):
+        """1.137.0: btc5 / eth5 / bnb5 name the 5-minute cards (btc-updown-5m-<start>): a window every five minutes, the
+        listing expected five minutes after the last; the 15-minute card keeps the stem btc. The model trader leaves them
+        alone by default (DEFAULT_SIM_SKIP)."""
+        ctl, api, clock = controller(PREOPEN_MARKETS="btc5,btc", PREOPEN_AHEAD_MINUTES="30")
+        self.assertEqual(ctl.settings.markets, frozenset({"BTC-5M", "BTC-15M"}))
+        five = next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "BTC-5M")
+        self.assertEqual((five.short, five.prefix, five.window_ms, five.model, five.venue), ("btc5", "btc-updown-5m-", 300_000, False, "spot"))
+        starts = [(r.key, (s - NOW) // 60_000) for r, s in p.window_starts(NOW, ctl.owner.config, ctl.settings)]
+        self.assertEqual([mn for key, mn in starts if key == "BTC-5M"], [5, 10, 15, 20, 25, 30])
+        self.assertEqual([mn for key, mn in starts if key == "BTC-15M"], [15, 30])
+        self.assertEqual(p.window_slug(five, NOW + 5 * 60_000), f"btc-updown-5m-{(NOW + 5 * 60_000) // 1000}")
+        c = p.candidate(market(at=NOW + 10 * 60_000, mid=7, minutes=5), NOW, ctl.owner.config, ctl.settings)
+        self.assertEqual((c["key"], c["slug"], c["name"]), ("BTC-5M", f"btc-updown-5m-{(NOW + 10 * 60_000) // 1000}", "BTC 5分涨跌 09:10–09:15"))
+        self.assertEqual(p.candidate_problem(market(at=NOW + 7 * 60_000, mid=8, minutes=5), NOW, ctl.owner.config, ctl.settings), "链接里的时间不在场次边界上")
+        self.assertEqual(p.candidate_problem({"categorySlug": "btc-updown-3m-1793986800"}, NOW, ctl.owner.config, ctl.settings), "不是涨跌卡（15 分钟、5 分钟）的链接")
+        only15, _, _ = controller(PREOPEN_MARKETS="btc")
+        self.assertEqual(p.candidate_problem(market(at=NOW + 10 * 60_000, minutes=5), NOW, only15.owner.config, only15.settings), "不在 PREOPEN_MARKETS 里")
+        await self.finish(only15)
+        self.assertEqual((p.cycle_ms("BTC-5M"), p.cycle_ms("BTC-15M"), p.cycle_ms("nope")), (300_000, 900_000, p.LISTING_CYCLE_MS))
+        ctl.listed_at["BTC-5M"] = NOW - 5 * 60_000 + 20_000  # the next 5-minute listing expected 20 s on: the fast poll
+        self.assertEqual(ctl.poll_wait(), p.FAST_POLL_S)
+        self.assertIn("BTC-5M 上次", ctl.status())
+        ctl.listed_at.clear()
+        self.assertIn("BTC-5M", m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_MARKETS": "all"}).preopen.markets)
+        await self.finish(ctl)
+
     async def test_all_cards_off_and_weekends_off(self):
         """1.136.0: PREOPEN_MARKETS=none (the page's 一键全关) quotes no card — the mode stays on, a resting pair is withdrawn
         at the takeover as a settings change (free); PREOPEN_WEEKEND=off leaves out the windows starting on a Saturday or
@@ -1115,7 +1143,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("btc-updown-15m-1793927700（09:15）：不挂：交易状态 CLOSED", text)
         self.assertGreaterEqual(text.count("：还没发布"), 6)  # the other BTC quarters, 海力士's and 宇树's
         self.assertNotIn("sol", text)
-        self.assertIn("只看 2 小时内、每张卡最近 8 个刻钟", text)  # 1.130.6: bounded — a day of five cards was hundreds of reads
+        self.assertIn("只看 2 小时内、每张卡最近 8 场", text)  # 1.130.6: bounded — a day of five cards was hundreds of reads
         self.assertLessEqual(text.count("btc-updown-15m-"), 8)
         async def broken(method, path, **kw): raise m.RemoteError("HTTP 403: 访问被拒绝")
         api.call = broken
