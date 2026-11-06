@@ -399,6 +399,21 @@ async def browser_check(bot, data):
         assert await page.is_visible("#anabody") and (await page.inner_text("#anaat")).startswith("已刷新 ")
         await page.click("#anahd")
         assert await page.is_hidden("#anabody")
+        # 1.131.5: the pre-open mode's rows in 今日按市场 (the live bot adds them, preopen.cards_today): named "· 开盘前预挂"; a click
+        # goes to the mode's own section below, no records panel opens (the model trader's records are not theirs)
+        po_row = {"name": "BTC 15分涨跌 · 开盘前预挂", "preopen": True, "records": 3, "markets": 3, "filled": 10.0, "volume": 4.9, "settled": 1, "wins": 1,
+                  "losses": 0, "ties": 0, "pnl": 5.1, "open": 0, "open_cost": 0.0, "resting": 2, "marked": 0, "unrealized": 0.0, "expected": 0.1, "hit": 1.0, "avg_fair": 0.5}
+        plain = bot.sim_analysis
+        bot.sim_analysis = lambda trades, marks, flt=None: (lambda a: {**a, "cards_today": [*a["cards_today"], *([] if flt else [po_row])]})(plain(trades, marks, flt))
+        await page.click("#scref")
+        await page.wait_for_selector("#s-cards tr.dayrow:has-text('开盘前预挂')")
+        po_line = page.locator("#s-cards tr.dayrow", has_text="开盘前预挂")
+        assert await po_line.count() == 1 and (await po_line.inner_text()).startswith("▸ BTC 15分涨跌 · 开盘前预挂") and "+$5.10" in await po_line.inner_text()
+        await po_line.locator("td").first.click()
+        assert await page.is_hidden("#s-detail") and (await po_line.inner_text()).startswith("▸ ")
+        bot.sim_analysis = plain
+        await page.click("#scref")
+        await page.wait_for_selector("#scref:not([disabled])")
         # 1.114.0: a line of 今日按市场 opens the card's records of the day under the table (read from the server), a second click folds them
         assert await page.is_hidden("#s-detail")
         hs_line = page.locator("#s-cards tr.dayrow", has_text="恒生指数")

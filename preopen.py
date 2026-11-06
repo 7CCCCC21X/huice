@@ -304,6 +304,44 @@ def fills_by_outcome(rows: list[dict], now_ms: int, days: int = 3) -> dict[tuple
     return out
 
 
+def unverified_outcomes(rows: list[dict], now_ms: int, days: int = 3) -> set[tuple[str, int]]:
+    """The outcomes (market id, index set) where an order of this mode was sent and its fills are not known for certain
+    (not order_verified: placing, open, unknown, removed with the final record unread), the windows of the last ``days``
+    days: a position there may be that order's fill, the ledger a look behind the account (1.131.5: the model trader's
+    positions check booked such a fill onto its own order on the same side)."""
+    since = now_ms - days * core.DAY_MS
+    out: set[tuple[str, int]] = set()
+    for pair in rows:
+        if int(pair.get("start_ms") or 0) < since or not pair.get("market_id"):
+            continue
+        for order in (pair.get("orders") or {}).values():
+            if order.get("index_set") and order.get("state") != "prepared" and not order_verified(order):
+                out.add((str(pair["market_id"]), int(order["index_set"])))
+    return out
+
+
+def cards_today(rows: list[dict], now_ms: int) -> list[dict]:
+    """The review page's 今日按市场 rows of this mode (1.131.5): today's windows (Beijing, by the window's start) per card,
+    in the model trader's rows' shape (core.summary_of with settled_extras): the expectation at the order is a coin toss
+    bought at the pair's price — 0.5 − price a filled share — the mean fair price 0.5, the hit rate the settled records'
+    wins (a tie half)."""
+    today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat()
+    by: dict[str, list[dict]] = {}
+    for pair in rows:
+        if any(o.get("state") not in NEVER_PLACED for o in (pair.get("orders") or {}).values()):
+            q = quote_of(pair)
+            if q["date"] == today:
+                by.setdefault(q["card"], []).append(q)
+    out = []
+    for card, qs in by.items():
+        r = review_summary(card, qs)
+        settled = [q for q in qs if q["settled"]]
+        out.append({"name": f"{card} · 开盘前预挂", **summary_shape(r), "preopen": True,
+                    "expected": round(sum((0.5 - q["price"]) * q["filled"] for q in settled), 4), "avg_fair": 0.5 if settled else None,
+                    "hit": (r["wins"] + 0.5 * r["ties"]) / r["settled"] if r["settled"] else None})
+    return sorted(out, key=lambda x: (-x["records"], x["name"]))
+
+
 def record_key(pair: dict) -> str:
     """A record's key without its attempt (a superseded record's key carries the attempt after '@'): the window's slug,
     with '#<level>' for a deeper price level (1.129.0)."""

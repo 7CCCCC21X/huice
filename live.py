@@ -2038,8 +2038,11 @@ class LiveBot(core.Bot):
             if isinstance(t.get("live"), dict) and t.get("status") in {"filled", "resting", "settled"} and float(t.get("shares") or 0) > 1e-9:
                 recs.setdefault(key_of(t), []).append((tid, t))
         preopen = self.preopen_filled()
+        busy = self.preopen_unverified()  # 1.131.5: a pre-open order's fills not read yet there — not compared
         gaps, same = [], []
         for k in set(held) | set(recs):
+            if k in busy:
+                continue
             shares, price, name = held.get(k, (0.0, None, ""))
             r = sorted(recs.get(k, []), key=lambda kv: core.trade_updated(kv[1]), reverse=True)
             name = name or (f"{r[0][1].get('item', k[0])} / {r[0][1].get('label', k[1])}" if r else f"{k[0]} / {k[1]}")
@@ -2053,6 +2056,7 @@ class LiveBot(core.Bot):
         gaps.sort(key=lambda g: -g[0])
         lines = [f"持仓核对 {core.stamp(now_ms, seconds=False)}：账户 {len(held)} 个持仓" + ("" if complete else "（列表被截断，可能不全）")
                  + f"；对不上的 {len(gaps)} 个方向" + (f"（列出前 {self.REPORT_GROUPS} 个）" if len(gaps) > self.REPORT_GROUPS else "") + f"，一致的 {len(same)} 个"
+                 + (f"；{len(busy & (set(held) | set(recs)))} 个方向有预挂订单的成交还没读完，稍后再比" if busy & (set(held) | set(recs)) else "")
                  + (f"；上次自动核对 {(now_ms - self.live_late_checked) // 1000} 秒前" if self.live_late_checked > 0 else "")]
         for _, name, shares, price, recorded, po, gap, r in gaps[:self.REPORT_GROUPS]:
             lines.append(f"{name}：账户 {shares:g} 份" + (f"（均价 {core.cents(price)}）" if price is not None else "") + f"，记录 {recorded:g} 份"
@@ -2120,8 +2124,10 @@ class LiveBot(core.Bot):
         for tid, t in live:
             k = key_of(t)
             recorded[k] = recorded.get(k, 0.0) + float(t.get("shares") or 0)
-        for k, shares in self.preopen_filled().items():  # the pre-open mode's fills: held for a reason, not fills of these orders (1.125.0)
+        po = self.preopen_filled()
+        for k, shares in po.items():  # the pre-open mode's fills: held for a reason, not fills of these orders (1.125.0)
             recorded[k] = recorded.get(k, 0.0) + shares
+        busy = self.preopen_unverified()  # 1.131.5: a pre-open order there whose fills are not read yet — the excess may be its own
         # (a) the shares held beyond the records, onto the order they came from: the orders' own records first — whichever shows fills
         # beyond its record (1.120.3: a KOSPI fill at 21¢ and an SK Hynix one at 10¢ had each been put on a 1¢ sweep order placed
         # after them, the newest to end) — else the order the position's price or time names, else, once the records have had
@@ -2132,8 +2138,13 @@ class LiveBot(core.Bot):
             k = key_of(t)
             if k[0] and k[1]:
                 by_out.setdefault(k, []).append((tid, t))
-        seen: set[tuple[str, int]] = set()
+        seen: set[tuple[str, int]] = set(busy)  # (the busy outcomes: no adoption, no cost fix, no trim until the pre-open mode has read them)
         for k, cands in by_out.items():
+            if k in busy:
+                continue
+            cands = [c for c in cands if not c[1]["live"].get("adopt_undone")]  # a record once found to hold another's fill takes none again
+            if not cands:
+                continue
             excess = held.get(k, 0.0) - recorded.get(k, 0.0)
             if excess <= self.LIVE_DUST_SHARES:
                 continue
@@ -2215,14 +2226,15 @@ class LiveBot(core.Bot):
                 self.live_adopted_status(tid2, t2, now_ms, f"结束后再读订单记录，读到成交 {got:g} 份（累计 {float(t2['shares']):g}/{float(t2.get('order') or 0):g}）；"
                                                             f"之前按最近结束的订单补记在 #{st.get('order_id')} 上的 {moved:g} 份已改到这里")
                 break
+        await self.live_undo_preopen_adoptions(live, key_of, busy, po, now_ms)
         # an earlier backfill (1.119.0–1.119.2 took the newest ended order, whatever its price) costed at that order's price: the
         # position's average price, once the row states one and this is the only record holding the outcome, is the cost
         for tid, t in open_recs:
             st, k = t["live"], key_of(t)
             backfilled = st.get("adopted") or any("补记" in str(e.get("what") or "") for e in st.get("events") or ())
             price = pos_price.get(k)
-            if not backfilled or st.get("adopted_price_fixed") or price is None or k in seen:
-                continue
+            if not backfilled or st.get("adopted_price_fixed") or price is None or k in seen or po.get(k):
+                continue  # (1.131.5: the pre-open mode holds the outcome too — the average is not this record's alone)
             if any(o is not t and key_of(o) == k and float(o.get("shares") or 0) > 1e-9 for _, o in open_recs):
                 continue  # several records hold the outcome: the average price is not this one's alone
             st["adopted_price_fixed"] = True
@@ -2239,7 +2251,8 @@ class LiveBot(core.Bot):
         for k, recs in groups.items():
             if not k[0] or not k[1] or k in seen or any(t["live"].get("state") != "done" and float(t.get("shares") or 0) > 1e-9 for _, t in recs):
                 continue  # a working order with fills there: its fills and the holding are not settled against each other yet
-            total, got = recorded.get(k, 0.0), held.get(k)
+            pk = po.get(k, 0.0)  # 1.131.5: the pre-open mode's fills there are post-only makers, no fee taken: the shortfall is the records' alone
+            total, got = recorded.get(k, 0.0) - pk, (held[k] - pk if k in held else None)
             short = total - got if got is not None and total > 1e-9 else 0.0
             if short <= 0.01 or short > self.LIVE_TRIM_MAX * total:
                 self.live_trim_seen.pop(k, None)
@@ -2261,6 +2274,48 @@ class LiveBot(core.Bot):
                 self.sim_save([(tid, t)])
             self.live_notify(f"📐 份数校正：{recs[0][1]['item']} {recs[0][1]['label']}：账户持有 {got:g} 份，记录 {total:g} 份，少的 {short:g} 份是手续费以份额扣除；"
                              f"{len(recs)} 笔记录按比例改为持有的份数（成本不变）", key=f"trim:{k[0]}:{k[1]}")
+
+    async def live_undo_preopen_adoptions(self, live: list[tuple[str, dict]], key_of: Any, busy: set, po: dict, now_ms: int) -> None:
+        """A backfill that was the pre-open mode's fill, undone (1.131.5): the order's own record, read again once the
+        adoption is LIVE_ADOPT_WAIT_MS old, shows nothing filled, every share of the record came from the backfill, and the
+        pre-open fills read on the outcome cover it — before 1.131.5 a pre-open fill the ledger had not read yet (or any,
+        while the mode was off, before 1.131.2) could be booked onto the model trader's ended order on the same side. Each
+        backfill is looked at once (LIVE_ADOPT_READS a pass); the record is never adopted onto again."""
+        reads = 0
+        for tid, t in live:
+            st = t["live"]
+            ad = st.get("adopted") or {}
+            age = now_ms - int(ad.get("at") or 0)
+            if (not ad or ad.get("moved") or ad.get("undone") or ad.get("po_checked") or not st.get("order_id")
+                    or not self.LIVE_ADOPT_WAIT_MS <= age <= self.LIVE_LATE_FILLS_WINDOW_MS):
+                continue
+            k, shares, adopted = key_of(t), float(t.get("shares") or 0), float(ad.get("shares") or 0)
+            if k in busy or shares - adopted > self.LIVE_DUST_SHARES or po.get(k, 0.0) < shares - self.LIVE_DUST_SHARES or shares <= self.LIVE_DUST_SHARES:
+                continue  # fills of its own beyond the backfill, or no pre-open fill there that could be it
+            if reads >= self.LIVE_ADOPT_READS:
+                break
+            reads += 1
+            row = None
+            with contextlib.suppress(Exception):
+                row = await self.live.api.order(str(st["order_id"]), str(st.get("hash") or ""))
+            if not isinstance(row, dict):
+                continue  # unread: asked again next pass
+            ad["po_checked"] = now_ms
+            own, _ = order_fill(row, float(t.get("order") or 0))
+            if own > self.LIVE_DUST_SHARES:
+                self.sim_save([(tid, t)])
+                continue  # the order's own record shows fills: the backfill stands
+            order = float(t.get("order") or 0)
+            ad["undone"] = {"at": now_ms, "shares": shares}
+            st["adopt_undone"] = True
+            ended = "expired" if t.get("status") in {"settled", "expired"} else "cancelled"
+            t.update(shares=0.0, fills=[], filled=None, unfilled=order, status=ended,
+                     note=(f"撤单：{st.get('cancel_why') or '已结束'}，一份都没成交（之前补记的 {shares:g} 份是开盘前预挂在同一边的成交，已撤销）" if ended == "cancelled"
+                           else f"市场已出结果，挂单一直没成交（之前补记的 {shares:g} 份是开盘前预挂在同一边的成交，已撤销）"))
+            st["events"].append({"at": now_ms, "what": f"补记撤销：订单 #{st['order_id']} 自己的记录一份都没成交，之前补记的 {shares:g} 份是开盘前预挂在同一边的成交（预挂已读到），已撤销"})
+            self.sim_save([(tid, t)])
+            self.live_notify(f"↩️ 补记撤销：{t['item']} {t['label']}：订单 #{st['order_id']} 在 Predict 的记录一份都没成交，之前补记的 {shares:g} 份"
+                             f"其实是开盘前预挂在同一边的成交，已从这笔记录撤销（预挂的记录里照常有它）", key=f"unadopt:{tid}")
 
     async def live_reread_fills(self, tid: str, t: dict, now_ms: int) -> float:
         """An ended order's own record read again, onto the trade (live_apply): the shares it shows filled beyond the
@@ -2641,9 +2696,12 @@ class LiveBot(core.Bot):
                 h["price"] = price
             h["at"] = max(h["at"], self.position_time(row))
         out = []
+        busy = self.preopen_unverified()
         for k, h in held.items():
             if (self.store.get(f"live:redeemed:{k[0]}:{k[1]}") or {}).get("lost"):
                 continue  # resolved against it (live_redeem): worth nothing, no holding to explain
+            if k in busy:
+                continue  # a pre-open order there whose fills are not read yet: likely its own (1.131.5)
             excess = h["shares"] - recorded.get(k, 0.0)
             if excess > self.LIVE_DUST_SHARES:
                 out.append({**h, "shares": round(excess, 4), "market_id": k[0], "index_set": k[1]})
@@ -3663,6 +3721,29 @@ class LiveBot(core.Bot):
     def preopen_pnl(self) -> float:
         """The running pre-open mode's accounted P&L of the day, counted with the model trader's against LIVE_MAX_DAILY_LOSS_USD."""
         return float(self.preopen.daily_pnl()) if self.preopen_active() else 0.0
+
+    def preopen_rows(self) -> list[dict]:
+        """The pre-open mode's ledger records: the controller's (running or stopped), else the file; [] when neither reads."""
+        from preopen import read_rows
+        try:
+            return list(self.preopen.ledger.rows.values()) if self.preopen is not None else read_rows(self.config.preopen.db)
+        except Exception:
+            return []
+
+    def preopen_unverified(self) -> set[tuple[str, int]]:
+        """The outcomes where a pre-open order's fills are not read for certain yet (preopen.unverified_outcomes): a position
+        there may be its fill — the positions check leaves them alone until the mode has read them (1.131.5)."""
+        from preopen import unverified_outcomes
+        return unverified_outcomes(self.preopen_rows(), self.market.now_ms())
+
+    def sim_analysis(self, trades: list[dict], marks: Any, flt: Any = None) -> dict:
+        out = super().sim_analysis(trades, marks, flt)
+        if not flt:  # the filter bar picks the model trader's records; the pre-open mode's rows stand beside them unfiltered
+            from preopen import cards_today
+            rows = self.preopen_rows()
+            if rows:
+                out["cards_today"] = [*out.get("cards_today", []), *cards_today(rows, self.market.now_ms())]  # 1.131.5: the 49¢ pairs in 今日按市场
+        return out
 
     def preopen_filled(self, days: int = 30) -> dict[tuple[str, int], float]:
         """The pre-open mode's fills by outcome (preopen.fills_by_outcome): recorded shares to the positions reconciliation —

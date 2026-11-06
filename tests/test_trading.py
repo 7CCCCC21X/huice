@@ -2487,3 +2487,75 @@ async def requote_after_cancel():
 
 
 asyncio.run(requote_after_cancel())
+
+
+async def preopen_fills_not_adopted():
+    """1.131.5: a pre-open fill the mode's ledger has not read yet is not booked onto the model trader's ended order on the
+    same outcome (it was at once, by the position's last-trade time or price); read, it explains the position; a backfill that
+    was such a fill — the order's own record showing nothing filled, the pre-open's read fills covering it — is undone."""
+    import types
+    import preopen as P
+    mtid = f"{HSI_SLUG}|up|挂"
+    req = lambda *args: m.Request("/live", list(args), 1, 0, 1)
+    bot = make_bot(SIM_MAKER_MIN_BID="100", SIM_MAKER_EXIT_CENTS="5", SIM_MAKER_SESSION="on", SIM_WAYS="maker")
+    await bot.live_prepare(); fake = bot.live.api
+    await bot.live_prefetch(NOW)
+    await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    assert bot.sim_trades()[mtid]["live"]["order_id"] == "101"
+    assert "Predict 确认撤掉 1 笔" in await bot.cmd_live(req("cancel", "all"))
+    gone = next(t for t in bot.sim_trades().values() if t["live"].get("order_id") == "101")
+    want = gone["live"]["want"]
+    k = ("101", int(want["index_set"]))
+    # the pre-open mode's order on the same outcome filled 10 at 49¢ a few seconds ago: the account shows it, the ledger has not read it
+    pair = {"slug": "w1", "key": "HSI", "name": "恒生指数 10:00–10:15", "market_id": "101", "start_ms": NOW + 600_000, "price": "0.49", "shares": "10",
+            "phase": "active", "orders": {"up": {"state": "open", "filled": 0.0, "index_set": k[1], "hash": "0xp", "id": "p1"}}}
+    bot.preopen = types.SimpleNamespace(alive=True, risk=lambda: 0.0, daily_pnl=lambda: 0.0, ledger=types.SimpleNamespace(rows={"w1": pair}),
+                                        unmanaged_rows=lambda rows: [r for r in rows if str(r.get("id")) != "p1"],
+                                        filled_by_outcome=lambda days=30: P.fills_by_outcome([pair], NOW, days))
+    fake.positions_rows = [{"id": "p1", "market": {"id": 101, "title": "恒生指数"}, "outcome": {"name": want["outcome"], "indexSet": k[1], "onChainId": want["token"]},
+                            "amount": str(10 * WEI), "avgPrice": "0.49", "lastTradeAt": NOW + 1_000}]
+    assert P.unverified_outcomes([pair], NOW) == {k} and bot.preopen_unverified() == {k}
+    await step(bot, NOW + 70_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 70_000))
+    assert bot.live_late_checked == NOW + 70_000 and not bot.live_errors, ("the positions check ran", bot.live_errors)
+    rec = next(t for t in bot.sim_trades().values() if t["live"].get("order_id") == "101")
+    assert rec["shares"] == 0 and not rec["live"].get("adopted") and rec["status"] == "cancelled", ("the pre-open's own fill is not the model order's", rec["live"].get("adopted"))
+    assert not bot.live_unrecorded_positions(), "a pre-open order there not read yet: no unrecorded holding either"
+    assert "1 个方向有预挂订单的成交还没读完" in await bot.live_fills_report(NOW + 75_000)
+    pair["orders"]["up"].update(state="final", filled=10.0)  # read: the ledger explains the position
+    await step(bot, NOW + 140_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 140_000))
+    rec = next(t for t in bot.sim_trades().values() if t["live"].get("order_id") == "101")
+    assert rec["shares"] == 0 and not rec["live"].get("adopted") and not bot.live_unrecorded_positions(), rec["live"].get("adopted")
+    # a backfill from before 1.131.5 that was the pre-open's fill: undone once the order's own record says nothing filled
+    sent = []
+    bot.live_notify = lambda text, key="": sent.append((key, text))
+    rec.update(shares=10.0, status="filled", unfilled=90.0, fills=[{"at": NOW + 1_000, "shares": 10.0, "fair": 0.7, "how": "真实成交（挂单）"}], filled=NOW + 1_000)
+    rec["live"]["adopted"] = {"at": NOW + 150_000, "by": "按持仓变动时间 10-05 10:00 对上当时挂着的这张单", "pos_price": 0.49, "shares": 10.0, "guess": False}
+    bot.sim_save([(next(tid for tid, t in bot.sim_trades().items() if t["live"].get("order_id") == "101"), rec)])
+    await step(bot, NOW + 210_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 210_000))  # under ten minutes old: not looked at yet
+    assert next(t for t in bot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] == 10.0
+    await step(bot, NOW + 150_000 + 11 * 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 150_000 + 11 * 60_000))
+    assert bot.live_late_checked == NOW + 150_000 + 11 * 60_000, bot.live_errors
+    rec = next(t for t in bot.sim_trades().values() if t["live"].get("order_id") == "101")
+    assert rec["shares"] == 0 and rec["status"] == "cancelled" and not rec["fills"] and rec["live"]["adopted"]["undone"]["shares"] == 10.0, rec
+    assert "开盘前预挂在同一边的成交" in rec["note"] and any(e["what"].startswith("补记撤销：") for e in rec["live"]["events"]) and rec["live"]["adopt_undone"], rec["note"]
+    assert [key for key, _ in sent] == [f"unadopt:{next(tid for tid, t in bot.sim_trades().items() if t['live'].get('order_id') == '101')}"], sent  # no 成本校正 on the pre-open's average
+    # an order whose own record shows the fill keeps its backfill
+    fake.closed["101"]["amountFilled"] = str(10 * WEI)
+    rec.update(shares=10.0, status="filled", unfilled=90.0)
+    rec["live"]["adopted"] = {"at": NOW + 150_000, "by": "按持仓变动时间", "pos_price": 0.49, "shares": 10.0, "guess": False}
+    await step(bot, NOW + 150_000 + 23 * 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 150_000 + 23 * 60_000))
+    rec = next(t for t in bot.sim_trades().values() if t["live"].get("order_id") == "101")
+    assert rec["shares"] == 10.0 and rec["live"]["adopted"].get("po_checked") and not rec["live"]["adopted"].get("undone"), rec["live"]["adopted"]
+    # the review page's 今日按市场: the pre-open mode's windows of the day, per card, beside the model trader's
+    pair.update(phase="closed", accounted=True, result="up", pnl=5.1)
+    rows = P.cards_today([pair], NOW)
+    assert [r["name"] for r in rows] == ["恒生指数 · 开盘前预挂"] and rows[0]["preopen"] and rows[0]["pnl"] == 5.1 and rows[0]["settled"] == 1, rows
+    assert abs(rows[0]["expected"] - 0.1) < 1e-9 and rows[0]["hit"] == 1.0 and rows[0]["avg_fair"] == 0.5, rows
+    assert P.cards_today([pair], NOW + 86_400_000) == [], "tomorrow: not today's"
+    a = bot.sim_analysis(list(bot.sim_trades().values()), {})
+    assert any(r.get("preopen") and r["name"] == "恒生指数 · 开盘前预挂" for r in a["cards_today"]), a["cards_today"]
+    assert not any(r.get("preopen") for r in bot.sim_analysis(list(bot.sim_trades().values()), {}, {"card": "恒生指数"})["cards_today"]), "the filter bar: the model's records alone"
+    print("PREOPEN_NOT_ADOPTED_OK")
+
+
+asyncio.run(preopen_fills_not_adopted())
