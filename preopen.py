@@ -1224,6 +1224,10 @@ class Controller:
                     result="split" if up == 0.5 else "up" if up == 1.0 else "down",
                     pnl=sum(((up if side == "up" else 1 - up) - price) * float(order.get("filled") or 0) for side, order in pair["orders"].items()))
         self.ledger.save(pair)
+        if any(float(order.get("filled") or 0) > 0 and (up == 0.5 or (side == "up") == (up == 1.0)) for side, order in pair["orders"].items()):
+            soon = getattr(self.owner, "live_redeem_soon", None)
+            if callable(soon) and getattr(self.owner.config, "live_auto_redeem", False):
+                soon()  # a fill on the winning side: redeemed within seconds (1.131.3), the USDT back for the next quotes
 
     async def monitor_pair(self, pair: dict) -> None:
         """An order ID is not proof that a deferred post-only order was accepted."""

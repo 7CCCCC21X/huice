@@ -686,7 +686,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline"})
         self.assertFalse(p.Settings.from_config(cfg).enabled)
         bot = L.LiveBot.__new__(L.LiveBot)
-        bot.preopen = types.SimpleNamespace(alive=True, risk=lambda: 40., daily_pnl=lambda: -10., filled_by_outcome=lambda: {("123", 2): 50.})
+        bot.preopen = types.SimpleNamespace(alive=True, risk=lambda: 40., daily_pnl=lambda: -10., filled_by_outcome=lambda days=3: {("123", 2): 50.})
         bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "PREOPEN_EXCLUSIVE": "on"})
         self.assertTrue(bot.preopen_active() and bot.preopen_exclusive())
         self.assertIn("不开新仓", bot.live_room({}, None, "up", .49, 50))
@@ -1159,9 +1159,12 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((pair["phase"], pair.get("accounted"), ctl.risk()), ("closed", None, 49.))  # filled: the result decides, reserved until then
         clock.ms = c["start_ms"] + 20 * 60_000
         api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down
+        soon = []
+        ctl.owner.live_redeem_soon = lambda: soon.append(1)
         await ctl.settle_pair(pair)
         self.assertTrue(pair["accounted"])
         self.assertAlmostEqual(pair["pnl"], 1.)
+        self.assertEqual(soon, [1], "1.131.3: a fill on the winning side (LIVE_AUTO_REDEEM on by default) — redeemed soon")
         self.assertEqual(ctl.risk(), 0.)
         await self.finish(ctl)
 

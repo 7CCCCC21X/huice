@@ -30,10 +30,21 @@ def main() -> int:
         ok = code == 0 and result_ok(stdout)
         print(f"{'PASS' if ok else 'FAIL'} {path.name} ({time.monotonic() - started:.1f}s)")
         if not ok:
-            failed.append(path.name)
+            failed.append((path.name, cause(lines)))
             print("\n".join("    " + line for line in lines[-25:]))
     print(f"\n{len(suites) - len(failed)}/{len(suites)} suites passed")
+    for name, why in failed:  # repeated at the very end: a build log's tail (all a screenshot shows) names what failed
+        print(f"FAILED {name}: {why}")
     return 1 if failed or not suites else 0
+
+
+def cause(lines: list[str]) -> str:
+    """Why a suite failed, in one line: its failing tests' names (unittest's FAIL: / ERROR: lines, three at most) and
+    the last error line of its output."""
+    tests = [line.split("(")[0].strip() for line in lines if line.startswith(("FAIL: ", "ERROR: "))][:3]
+    error = next((line.strip() for line in reversed(lines) if line.strip().startswith(("AssertionError", "TIMEOUT"))
+                  or line.strip().split(":")[0].endswith(("Error", "Exception"))), lines[-1].strip() if lines else "no output")
+    return "; ".join(tests + [error[:300]])
 
 
 def result_ok(stdout: str) -> bool:

@@ -537,6 +537,11 @@ def order_price(row: dict) -> float | None:
 
 
 # --- BNB chain (JSON-RPC): balances, allowances, approvals, redeeming -----------------------------------------------------
+class TxNotSent(core.RemoteError):
+    """A transaction that never left the bot: its nonce or gas price could not be read, or its gas not estimated (a
+    revert in simulation — a market Predict shows resolved before the chain does). Nothing spent: tried again soon."""
+
+
 class Chain:
     """The few on-chain calls real trading needs, over plain JSON-RPC: USDT / BNB balances, the exchange allowances
     and operator approvals, and the transactions that set them or redeem resolved positions (from the signing wallet;
@@ -607,9 +612,12 @@ class Chain:
             to, value = self.wallet.predict_account, 0
         sender = self.wallet.signer
         async with self.send_lock:
-            nonce = int(str(await self.rpc("eth_getTransactionCount", [sender, "pending"])), 16)
-            gas_price = int(str(await self.rpc("eth_gasPrice", [])), 16)
-            estimate = await self.rpc("eth_estimateGas", [{"from": sender, "to": to, "data": "0x" + data.hex(), "value": hex(value)}])
+            try:
+                nonce = int(str(await self.rpc("eth_getTransactionCount", [sender, "pending"])), 16)
+                gas_price = int(str(await self.rpc("eth_gasPrice", [])), 16)
+                estimate = await self.rpc("eth_estimateGas", [{"from": sender, "to": to, "data": "0x" + data.hex(), "value": hex(value)}])
+            except core.RemoteError as error:
+                raise TxNotSent(str(error), error.retry_after) from error  # nothing sent, nothing spent
             gas = int(str(estimate), 16) * 125 // 100
             tx = {"chainId": self.wallet.chain_id, "nonce": nonce, "gasPrice": gas_price, "gas": gas, "to": to,
                   "value": value, "data": "0x" + data.hex()}
@@ -944,8 +952,11 @@ class LiveBot(core.Bot):
     # open live orders are read back from Predict on every paper step (SIM_SECONDS)
     LIVE_BALANCE_SECONDS = 60   # the USDT / BNB balances are re-read this often while trading
     LIVE_APPROVALS_SECONDS = 600
-    LIVE_REDEEM_SECONDS = 600   # resolved positions are looked for this often
-    LIVE_REDEEM_RETRY_SECONDS = 3600  # a position whose redeem failed (gas, a revert) is tried again after this long, not every look
+    LIVE_REDEEM_SECONDS = 600   # resolved positions are looked for this often...
+    LIVE_REDEEM_SOON_SECONDS = 20  # ...and this soon after a real position settled in the bot's favour (live_redeem_soon: the USDT back for the next quotes)
+    LIVE_REDEEM_READS = 40      # markets read a redeem round at most, the newest positions first (the rest the next round): never a flood on the rate limit the orders share
+    LIVE_REDEEM_RETRY_SECONDS = 3600  # a position whose redeem failed (gas, a revert) is tried again after this long, not every look...
+    LIVE_REDEEM_UNSENT_RETRY_SECONDS = 300  # ...one whose transaction never left (TxNotSent: not resolved on-chain yet, an RPC blip) after this long
     LIVE_REDEEM_MIN_BNB_WEI = 5 * 10 ** 14  # under 0.0005 BNB no redeem goes out (one costs about 0.0002): one note, not a failure per position
     LIVE_NOTE_SECONDS = 600     # the same failure is announced at most this often
     LIVE_PLACING_GRACE_MS = 120_000  # a record left in "placing" is reconciled by its hash after this long
@@ -975,6 +986,7 @@ class LiveBot(core.Bot):
         self.live_redeem_task: asyncio.Task | None = None   # the auto-redeem round, beside the step (chain calls never hold a decision)
         self.live_account_task: asyncio.Task | None = None  # the balances / approvals refresh, likewise
         self.live_redeem_failed: dict[str, float] = {}      # position key -> monotonic time its redeem failed
+        self.live_redeem_lock = asyncio.Lock()               # one redeem round at a time (the command beside the automatic round)
         self.live_gas_noted = -1e9
         self.live_step_ms: dict[str, int] = {}  # the last step's phases (预取 / 决策 / 下单 / 同步), for /diag
         self.live_fill_tasks: set = set()   # the fills reads of orders confirmed removed, beside the lane (live_fills_later)
@@ -1266,6 +1278,9 @@ class LiveBot(core.Bot):
     def sim_settle(self, trade: dict, up: float, note: str, now_ms: int, by: str) -> None:
         super().sim_settle(trade, up, note, now_ms, by)
         st = trade.get("live")
+        if (isinstance(st, dict) and by == "Predict 最终结果" and trade.get("status") == "settled" and float(trade.get("shares") or 0) > 1e-9
+                and float(trade.get("payout") or 0) > 0 and self.config.live_auto_redeem):
+            self.live_redeem_soon()  # a real position settled in its favour: redeemed within seconds, not at the next ten-minute round
         if isinstance(st, dict) and st.get("state") in {"pending", "placing", "open", "unknown"} and trade["status"] in {"expired", "settled"}:
             st["state"], st["cancel_why"] = "cancelling", "市场已出结果"
             st["events"].append({"at": now_ms, "what": "撤单：市场已出结果"})
@@ -1849,6 +1864,12 @@ class LiveBot(core.Bot):
             await self.live_redeem(now_ms)
         except Exception as error:
             self.live_note_error(f"领取结算失败：{core.clean_error(error) or type(error).__name__}")
+
+    def live_redeem_soon(self) -> None:
+        """A real position just settled in the bot's favour (the pre-open mode's window, a record on Predict's final
+        result): the next automatic redeem round within LIVE_REDEEM_SOON_SECONDS, not up to LIVE_REDEEM_SECONDS later —
+        the USDT back on the account for the next quotes (1.131.3)."""
+        self.live_last_redeem = min(self.live_last_redeem, time.monotonic() - self.LIVE_REDEEM_SECONDS + self.LIVE_REDEEM_SOON_SECONDS)
 
     async def live_sync_orders(self, active: dict[str, dict], now_ms: int) -> None:
         try:
@@ -2590,6 +2611,8 @@ class LiveBot(core.Bot):
             h["at"] = max(h["at"], self.position_time(row))
         out = []
         for k, h in held.items():
+            if (self.store.get(f"live:redeemed:{k[0]}:{k[1]}") or {}).get("lost"):
+                continue  # resolved against it (live_redeem): worth nothing, no holding to explain
             excess = h["shares"] - recorded.get(k, 0.0)
             if excess > self.LIVE_DUST_SHARES:
                 out.append({**h, "shares": round(excess, 4), "market_id": k[0], "index_set": k[1]})
@@ -2708,13 +2731,26 @@ class LiveBot(core.Bot):
     async def live_redeem(self, now_ms: int) -> list[str]:
         """Positions on markets Predict has resolved: the winning outcome's shares are redeemed for USDT on-chain
         (once per market and outcome); the lines say what was done. A position whose redeem failed waits
-        LIVE_REDEEM_RETRY_SECONDS; with no BNB for gas nothing is tried and the administrator hears once."""
+        LIVE_REDEEM_RETRY_SECONDS; with no BNB for gas nothing is tried and the administrator hears once. A position
+        resolved against the bot is marked settled (``lost``) and never asked about again (1.131.3: each one cost a
+        market read every round, and the pre-open mode leaves one or more a filled window — hundreds a day against the
+        rate limit its orders and cancels share); a market is read once a round whatever outcomes are held, at most
+        LIVE_REDEEM_READS markets a round, the newest positions first (the rest the next round), and a rate limit ends
+        the round. One round at a time: the command and the automatic round never redeem one position twice."""
+        lock = getattr(self, "live_redeem_lock", None)
+        if lock is None:
+            lock = self.live_redeem_lock = asyncio.Lock()
+        async with lock:
+            return await self.live_redeem_pass(now_ms)
+
+    async def live_redeem_pass(self, now_ms: int) -> list[str]:
         rows = await self.live.api.positions()
         self.live_positions = (rows, time.time())
         done = []
         balance = self.live.balance
         low_gas = balance is not None and int(balance[1]) < self.LIVE_REDEEM_MIN_BNB_WEI
-        for row in rows:
+        markets: dict[str, dict | None] = {}  # this round's reads, one per market (None: the read failed)
+        for row in sorted(rows, key=lambda r: -self.position_time(r)):  # the newest first: a capped round reaches the fresh wins
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
             outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
             mid = str(market.get("id") or row.get("marketId") or "")
@@ -2728,16 +2764,29 @@ class LiveBot(core.Bot):
             key = f"live:redeemed:{mid}:{index_set}"
             if self.store.get(key) or time.monotonic() - self.live_redeem_failed.get(key, -1e9) < self.LIVE_REDEEM_RETRY_SECONDS:
                 continue
-            try:
-                raw = await self.live.api.market(mid)
-            except Exception:
+            if mid not in markets:
+                if len(markets) >= self.LIVE_REDEEM_READS:
+                    continue  # the next round's
+                try:
+                    markets[mid] = await self.live.api.market(mid)
+                except Exception as error:
+                    markets[mid] = None
+                    if getattr(error, "retry_after", 0) or http_status(error) == 429:
+                        break  # rate-limited: nothing more asked of Predict this round
+                    continue
+            raw = markets[mid]
+            if raw is None:
                 continue
             info = parse_market(raw, self.config.predict_fee_bps)
             resolved = core.predict_resolution(raw)
             if not core.PredictFeed.market_settled({"status": info.status}) or resolved is None:
                 continue
             won = resolved.get("split") or (resolved.get("index") is not None and index_set == int(resolved["index"]) + 1)
-            if not won or not info.condition_id:
+            if not won:
+                if resolved.get("index") is not None:  # resolved against it: worth nothing, never read again
+                    self.store.put(key, {"at": now_ms, "lost": True, "amount": str(amount), "title": str(market.get("title") or "")})
+                continue
+            if not info.condition_id:
                 continue
             if low_gas:
                 if time.monotonic() - self.live_gas_noted >= self.LIVE_REDEEM_RETRY_SECONDS:
@@ -2747,8 +2796,11 @@ class LiveBot(core.Bot):
             try:
                 tx = await self.live.chain.redeem(info.condition_id, index_set, amount, info.neg_risk, info.yield_bearing)
             except Exception as error:
-                self.live_redeem_failed[key] = time.monotonic()
-                self.live_note_error(f"领取 {market.get('title') or mid} 失败：{core.clean_error(error) or type(error).__name__}（一小时后再试）")
+                unsent = isinstance(error, TxNotSent)  # never left (1.131.3): soon again — the chain may be a moment behind Predict's result
+                wait = self.LIVE_REDEEM_UNSENT_RETRY_SECONDS if unsent else self.LIVE_REDEEM_RETRY_SECONDS
+                self.live_redeem_failed[key] = time.monotonic() - self.LIVE_REDEEM_RETRY_SECONDS + wait
+                self.live_note_error(f"领取 {market.get('title') or mid} 失败：{core.clean_error(error) or type(error).__name__}"
+                                     + ("（交易没发出，5 分钟后再试）" if unsent else "（一小时后再试）"))
                 continue
             self.store.put(key, {"at": now_ms, "tx": tx, "amount": str(amount), "title": str(market.get("title") or "")})
             line = f"💵 已领取 {market.get('title') or mid} {outcome.get('name') or ''} {from_wei(amount):g} 份：{tx}"
@@ -3420,15 +3472,16 @@ class LiveBot(core.Bot):
         """The running pre-open mode's accounted P&L of the day, counted with the model trader's against LIVE_MAX_DAILY_LOSS_USD."""
         return float(self.preopen.daily_pnl()) if self.preopen_active() else 0.0
 
-    def preopen_filled(self) -> dict[tuple[str, int], float]:
+    def preopen_filled(self, days: int = 30) -> dict[tuple[str, int], float]:
         """The pre-open mode's fills by outcome (preopen.fills_by_outcome): recorded shares to the positions reconciliation —
         the controller's ledger, or the file while the mode is off or stopped (1.131.2: whatever the mode's state, its fill
-        is never a position for the model trader to book onto one of its own orders)."""
+        is never a position for the model trader to book onto one of its own orders). The windows of the last ``days``
+        days (1.131.3: 30, was 3 — an older fill still held, unredeemed or lost, read as a position nobody recorded)."""
         from preopen import fills_by_outcome, read_rows
         if self.preopen is not None:
-            return dict(self.preopen.filled_by_outcome())  # its ledger, running or stopped
+            return dict(self.preopen.filled_by_outcome(days))  # its ledger, running or stopped
         try:
-            return fills_by_outcome(read_rows(self.config.preopen.db), self.market.now_ms())
+            return fills_by_outcome(read_rows(self.config.preopen.db), self.market.now_ms(), days)
         except Exception as error:
             LOG.warning("预挂成交读取失败：%s", core.clean_error(error) or type(error).__name__)
             return {}

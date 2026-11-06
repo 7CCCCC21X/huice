@@ -319,12 +319,14 @@ class FakeApi:
 
 
 class FakeChain:
-    def __init__(self): self.usdt, self.bnb, self.allow, self.redeemed, self.fail, self.owner = 1000 * WEI, 10 ** 17, 10 ** 30, [], "", ADDR
+    def __init__(self): self.usdt, self.bnb, self.allow, self.redeemed, self.fail, self.fail_unsent, self.owner = 1000 * WEI, 10 ** 17, 10 ** 30, [], "", "", ADDR
     async def account_owner(self, account): return self.owner
     async def usdt_balance(self, owner=None): return self.usdt
     async def bnb_balance(self, owner=None): return self.bnb
     async def allowance(self, key, owner=None): return self.allow
     async def redeem(self, cid, index_set, amount, neg, yb):
+        if self.fail_unsent:
+            raise L.TxNotSent(self.fail_unsent)
         if self.fail:
             raise m.RemoteError(self.fail)
         self.redeemed.append((cid, index_set, amount, neg, yb))
@@ -624,6 +626,9 @@ async def run():
     bot.live_positions = (list(fake.positions_rows), time.time())
     unrec = bot.journal_payload()["live"]["unrecorded"]
     assert any(r["name"] == "谁知道 11-06 / Up" and abs(r["shares"] - 36) < 1e-6 and r["price"] == 0.03 for r in unrec), unrec
+    bot.store.put("live:redeemed:777:1", {"at": NOW, "lost": True})
+    assert not any(r["market_id"] == "777" for r in bot.live_unrecorded_positions()), "1.131.3: resolved against it — no holding"
+    bot.store.delete_keys(["live:redeemed:777:1"])
     assert bot.journal_payload()["live"]["positions_at"] > 0
     fake.positions_rows.pop()
     gone = {"status": "cancelled", "shares": 0.0, "order": 10.0, "opened": NOW, "live": {"state": "done", "order_id": "77", "events": []}}
@@ -663,7 +668,29 @@ async def run():
     lines = await bot.live_redeem(CLOSE + 70 * 60_000)
     assert len(lines) == 1 and "已领取 恒生指数 10-05 Down 100 份：0xredeem" in lines[0], lines
     assert bot.live.chain.redeemed == [("0x" + "ab" * 32, 2, 100 * WEI, False, False)] and bot.store.get("live:redeemed:101:2")["tx"] == "0xredeem"
+    assert bot.store.get("live:redeemed:101:1")["lost"] is True, "1.131.3: the loser marked settled"
+    reads, read = [], bot.live.api.market
+    async def counting(mid):
+        reads.append(str(mid))
+        return await read(mid)
+    bot.live.api.market = counting
     assert await bot.live_redeem(CLOSE + 71 * 60_000) == [] and len(bot.live.chain.redeemed) == 1  # not twice; the loser and the open market untouched
+    assert "101" not in reads and "110" in reads, ("1.131.3: the redeemed and the lost outcome are not read again; the open market is", reads)
+    bot.live.api.market = read
+    last = bot.live_last_redeem
+    bot.live_last_redeem = time.monotonic()
+    bot.live_redeem_soon()  # a win settled: the next round within 20 s, not ten minutes on
+    assert bot.LIVE_REDEEM_SECONDS - bot.LIVE_REDEEM_SOON_SECONDS - 1 <= time.monotonic() - bot.live_last_redeem < bot.LIVE_REDEEM_SECONDS
+    bot.config = dataclasses.replace(bot.config, live_auto_redeem=True)
+    won = {"shares": 5.0, "order": 5.0, "side": "up", "status": "filled", "maker": False, "revisions": [], "live": {"state": "done", "events": []}}
+    bot.live_last_redeem = time.monotonic()
+    bot.sim_settle(dict(won), 1.0, "本地预结算", CLOSE, "本地预结算")
+    bot.sim_settle(dict(won), 0.0, "Predict 结算：Down", CLOSE, "Predict 最终结果")
+    assert time.monotonic() - bot.live_last_redeem < 1, "a local settlement, or a loss: no early round"
+    bot.sim_settle(dict(won), 1.0, "Predict 结算：Up", CLOSE, "Predict 最终结果")
+    assert time.monotonic() - bot.live_last_redeem >= bot.LIVE_REDEEM_SECONDS - bot.LIVE_REDEEM_SOON_SECONDS - 1, "Predict's result, a win: redeemed soon"
+    bot.config = dataclasses.replace(bot.config, live_auto_redeem=False)
+    bot.live_last_redeem = last
     assert "没有可领取" in await bot.cmd_live(req("redeem"))
     bot.live.chain.fail = "交易失败（已回滚）"
     fake.positions_rows.append({"id": "p4", "market": {"id": 101, "title": "恒生指数 10-05"}, "outcome": {"name": "Down", "indexSet": 2, "onChainId": "1012"},
@@ -673,6 +700,14 @@ async def run():
     # 1.64.0: a failed position waits an hour; no BNB for gas: one note, no attempt; the auto-redeem runs beside the step
     n = len(bot.live_errors); bot.live.chain.fail = ""
     assert await bot.live_redeem(CLOSE + 72 * 60_000 + 10_000) == [] and len(bot.live_errors) == n and len(bot.live.chain.redeemed) == 1, "backed off"
+    assert bot.LIVE_REDEEM_RETRY_SECONDS - 5 < bot.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - bot.live_redeem_failed["live:redeemed:101:2"]) <= bot.LIVE_REDEEM_RETRY_SECONDS
+    bot.live_redeem_failed.clear()
+    bot.live.chain.fail_unsent = "RPC 错误：execution reverted"  # 1.131.3: a transaction that never left (the chain behind Predict's result): five minutes, not an hour
+    assert await bot.live_redeem(CLOSE + 72 * 60_000 + 15_000) == [] and "交易没发出，5 分钟后再试" in bot.live_errors[-1], bot.live_errors[-1:]
+    left = bot.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - bot.live_redeem_failed["live:redeemed:101:2"])
+    assert bot.LIVE_REDEEM_UNSENT_RETRY_SECONDS - 5 < left <= bot.LIVE_REDEEM_UNSENT_RETRY_SECONDS, left
+    bot.live.chain.fail_unsent = ""
+    n = len(bot.live_errors)
     bot.live_redeem_failed.clear()
     bot.live.chain.bnb = 10 ** 13
     await bot.live.refresh_balance()
