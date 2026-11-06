@@ -22,6 +22,10 @@ import preopen as p
 NOW = int(dt.datetime(2026, 11, 6, 9, 0, tzinfo=m.BEIJING).timestamp() * 1000)
 
 
+def window_slug_of(start_ms, stem="btc"):
+    return f"/categories/{stem}-updown-15m-{start_ms // 1000}"
+
+
 def market(stem="btc", at=NOW + 3600_000, mid=123, status="MATCHING_NOT_ENABLED"):
     return {"id": mid, "categorySlug": f"{stem}-updown-15m-{at//1000}", "conditionId": "0xcondition",
             "status": "REGISTERED", "tradingStatus": status, "isVisible": True, "feeRateBps": 200,
@@ -408,17 +412,17 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         await ctl.discover()  # the full scan again, a minute on
         self.assertEqual(len(api.calls), p.MISS_STOP)
         # 1.131.0: a new listing seen anchors the rhythm: the next is expected a cycle on, polled every second around that moment
-        self.assertEqual((ctl.listed_at, ctl.poll_wait()), ({}, 5.0))
+        self.assertEqual((ctl.listed_at, ctl.poll_wait()), ({}, p.LISTING_PROBE_S))  # 1.133.0: the listings probed every 2 s
         api.markets["4"] = market(at=NOW + 60 * 60_000, mid=4)
         await ctl.discover()
         seen = clock.ms
         queued = [ctl.queue.get_nowait()[2] for _ in range(ctl.queue.qsize())]
         self.assertEqual((ctl.listed_at, next(q for q in queued if q["market_id"] == "4")["read_ms"]), ({"BTC-15M": seen}, seen))
-        self.assertEqual(ctl.poll_wait(), 5.0)
+        self.assertEqual(ctl.poll_wait(), p.LISTING_PROBE_S)
         clock.ms = seen + p.LISTING_CYCLE_MS - 10_000
         self.assertEqual(ctl.poll_wait(), p.FAST_POLL_S)
         clock.ms = seen + p.LISTING_CYCLE_MS + p.LISTING_LATE_MS + 1000
-        self.assertEqual(ctl.poll_wait(), 5.0)
+        self.assertEqual(ctl.poll_wait(), p.LISTING_PROBE_S)
         self.assertIn("发布节奏", ctl.status())
         await self.finish(ctl)
 
@@ -607,6 +611,68 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         await ctl.discover()
         self.assertIn("没扫：", ctl.scan_note)
         ctl.api.blocked_until = 0.0
+        await self.finish(ctl)
+
+    async def test_listings_are_probed_first_and_queued_at_once_the_details_read_only_when_needed(self):
+        """1.133.0: a pass probes each card's next listing before re-reading the older windows (they used to come first, in
+        start order) and queues the candidate the moment it is found; a probe-only pass reads nothing else; a category
+        answer carrying every field an order needs is placed on without the details read; the pair records when it was
+        found and when it was up, the status the span; the account snapshot reads outside the placement lock."""
+        rows = [market(at=NOW + n * 15 * 60_000, mid=n) for n in range(1, 14)]
+        ctl, api, clock = controller(rows, PREOPEN_AHEAD_MINUTES="240", PREOPEN_MARKETS="btc")
+        ctl.listed_by_card["BTC-15M"] = NOW + 12 * 15 * 60_000  # twelve known listed, none quoted; the thirteenth is the next listing
+        ctl.listed_at["BTC-15M"] = NOW - p.LISTING_CYCLE_MS - 3_000  # expected 3 s ago: the fast poll is on — the listing alone is probed
+        self.assertTrue(ctl.sprinting())
+        await ctl.discover()
+        cats = [c for c in api.calls if c.startswith("/categories/")]
+        self.assertEqual((cats[0], len(cats), ctl.queue.qsize()), (window_slug_of(NOW + 13 * 15 * 60_000), 4, 1),
+                         "the next listing first (then, a full scan, the three unlisted beyond it); none of the older windows while sprinting")
+        self.assertEqual(ctl.listed_by_card["BTC-15M"], NOW + 13 * 15 * 60_000)
+        self.assertEqual(list(ctl.listing_deltas), [3_000], "seen 3 s after the expected moment")
+        self.assertIn("探 1 卡、读 4 场，找到 1 档", ctl.scan_note)
+        ctl.listed_at.clear()  # not sprinting: the older windows follow the listing probe in the same pass
+        api.calls.clear()
+        await ctl.discover()
+        cats = [c for c in api.calls if c.startswith("/categories/")]
+        self.assertEqual(cats[0], window_slug_of(NOW + 14 * 15 * 60_000), "the window beyond the listing is asked first (unlisted: one miss ends the probe)")
+        self.assertEqual((ctl.queue.qsize(), len(cats)), (1 + p.DISCOVER_READS, 1 + p.DISCOVER_READS))
+        api.calls.clear()
+        await ctl.discover(probe_only=True)
+        self.assertEqual([c for c in api.calls if c.startswith("/categories/")], [window_slug_of(NOW + 14 * 15 * 60_000)], "a probe-only pass: the listing alone")
+        # the category answer carrying every field: placed on as it is, the details not read
+        real = api.call
+        async def full(method, path, **kw):
+            answer = await real(method, path, **kw)
+            mkt = next(mk for mk in api.markets.values() if mk["categorySlug"] == path.removeprefix("/categories/"))
+            answer["data"]["markets"][0] = {**mkt, "title": mkt["categorySlug"], "question": "BTC up or down?", "isNegRisk": False, "isYieldBearing": False}
+            return answer
+        api.call = full
+        got = await p.category_market(api, rows[0]["categorySlug"])
+        self.assertEqual((got["_from"], got["id"], got["categorySlug"]), ("category", "1", rows[0]["categorySlug"]))
+        self.assertFalse(p.listing_complete({**rows[0], "isNegRisk": False}), "a field short: the details are read")
+        api.call = real
+        self.assertEqual((await p.category_market(api, rows[0]["categorySlug"]))["_from"], "details")
+        # the pair keeps when it was found and when it was up; the status measures the span
+        while ctl.queue.qsize():
+            c = ctl.queue.get_nowait()[2]
+        ctl.queued.clear()
+        c = p.candidate(rows[0], NOW, ctl.owner.config, ctl.settings)
+        c.update(market=rows[0], read_ms=NOW - 1_200)
+        clock.ms = NOW
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        self.assertEqual((pair["seen_ms"], pair["placed_ms"]), (NOW - 1_200, NOW))
+        self.assertIn("发现→挂上中位 1.2 秒（最长 1.2；1 场）", ctl.status())
+        self.assertIn("发布比预计中位 +3 秒", ctl.status())
+        # the account snapshot: dated when its read began, applied under the lock, the lock free during the read
+        started = clock.ms
+        async def slow_orders(status="OPEN"):
+            clock.ms += 1_500
+            self.assertFalse(ctl.account_lock.locked(), "the page reads hold no lock")
+            return []
+        api.orders = slow_orders
+        await ctl.account()
+        self.assertEqual(ctl.account_at, started)
         await self.finish(ctl)
 
     async def test_status_says_why_nothing_is_placed(self):

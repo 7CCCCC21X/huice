@@ -78,6 +78,7 @@ FILLED_STATUSES = {"FILLED", "COMPLETED", "DONE", "MATCHED"}  # a record that sa
 ERRORS_KEPT = 20          # the last problems kept with their time (/preopen check)
 STUCK_MS = 15 * 60_000    # a withdrawn pair not cleared this long past its cancel time is announced (check_stuck)
 LISTING_FIELDS = ("id", "conditionId", "status", "tradingStatus", "question", "outcomes")  # the details' fields the discovery reads
+LISTING_FULL_FIELDS = (*LISTING_FIELDS, "feeRateBps", "isNegRisk", "isYieldBearing")  # ...and what the order itself needs: a category answer carrying them all is placed on without the details read (1.133.0)
 MAX_ATTEMPTS = 3       # a window's quotes that ended by its own failure, at most (a pair withdrawn before the start is quoted again under a new salt)
 FREE_REASONS = ("设置不同", "预挂模式停止", "到时撤单或真实交易暂停", "距涨停", "距跌停", "临停")  # withdrawals that were not the window's doing (counts_against)
 MISS_STOP = 4          # discover: a card's coming windows are asked in start order; this many unlisted in a row end the card's full scan
@@ -272,9 +273,40 @@ def when(ms: int, now_ms: int) -> str:
     return at.strftime("%H:%M") if at.date() == today else at.strftime("%m-%d %H:%M")
 
 
+def category_node(answer: Any) -> dict | None:
+    """The market object inside a category answer, as the API sent it (the first with an id, a condition and outcomes);
+    None when the answer carries none."""
+    def walk(node: Any, depth: int = 0) -> dict | None:
+        if depth > 8:
+            return None
+        if isinstance(node, dict):
+            if node.get("id") is not None and "conditionId" in node and isinstance(node.get("outcomes"), list):
+                return node
+            for value in node.values():
+                hit = walk(value, depth + 1)
+                if hit is not None:
+                    return hit
+        elif isinstance(node, list):
+            for value in node:
+                hit = walk(value, depth + 1)
+                if hit is not None:
+                    return hit
+        return None
+    return walk(answer)
+
+
+def listing_complete(node: dict) -> bool:
+    """Whether a category's market object carries everything an order needs (LISTING_FULL_FIELDS, two outcomes with their
+    tokens): placed on as it is, the details not read (1.133.0: one round trip less at a listing)."""
+    outcomes = node.get("outcomes")
+    return (all(k in node for k in LISTING_FULL_FIELDS) and isinstance(outcomes, list) and len(outcomes) >= 2
+            and all(isinstance(o, dict) and o.get("onChainId") and o.get("indexSet") is not None for o in outcomes))
+
+
 async def category_market(api: Any, slug: str) -> dict | None:
     """A window's market, by its category (GET /categories/<slug>: the read the bot's feed has always used for these
-    markets) and then its details (GET /markets/<id>), the slug put on it; None when the category is not listed (404).
+    markets), and then its details (GET /markets/<id>) unless the category's own market object carries every field the
+    order needs (listing_complete); the slug put on it, ``_from`` saying which; None when the category is not listed (404).
     1.125.1: the market listing (/markets?marketVariant=…) answers 403 where the bot runs, as GraphQL does."""
     try:
         answer = await api.call("GET", f"/categories/{core.urllib.parse.quote(slug)}")
@@ -285,8 +317,11 @@ async def category_market(api: Any, slug: str) -> dict | None:
     found = core.predict_markets(answer)
     if not found:
         return None
+    node = category_node(answer)
+    if node is not None and str(node.get("id")) == found[0]["id"] and listing_complete(node):
+        return {**node, "categorySlug": slug, "id": str(node["id"]), "_from": "category"}
     market = await api.market(found[0]["id"])
-    return {**market, "categorySlug": slug, "id": market.get("id") or found[0]["id"]}
+    return {**market, "categorySlug": slug, "id": market.get("id") or found[0]["id"], "_from": "details"}
 
 
 def fills_by_outcome(rows: list[dict], now_ms: int, days: int = 3) -> dict[tuple[str, int], float]:
@@ -523,8 +558,10 @@ def review(rows: list[dict], now_ms: int) -> dict:
 
 
 LISTING_CYCLE_MS = 15 * 60_000  # Predict lists one more window of a card every quarter hour (a day ahead): the next listing is expected a cycle after the last seen
-LISTING_EARLY_MS, LISTING_LATE_MS = 20_000, 90_000  # ...and the discovery polls fast from this long before that moment until this long after it (or the listing)
-FAST_POLL_S = 1.0               # the fast poll's cadence (the queue position: the bid goes in within a second or two of the listing)
+LISTING_EARLY_MS, LISTING_LATE_MS = 30_000, 120_000  # ...and the discovery polls fast from this long before that moment until this long after it (or the listing)
+FAST_POLL_S = 0.5               # the fast poll's cadence (the queue position: the bid goes in within a second of the listing; 1.133.0: was 1 s)
+LISTING_PROBE_S = 2.0           # ...and each card's next listing is probed this often the rest of the time (was the poll setting, 5 s); the older windows keep the poll's pace
+PLACE_WORKERS = 4               # pairs placed side by side (three cards list at once, four levels each: twelve pairs — two workers took seconds)
 MARKET_FRESH_MS = 15_000        # a window's details read by the discovery this recently are placed on, not read again
 DISCOVER_READS = 8              # listed windows with a level still to quote read in one discovery pass, the soonest first (the rest the next pass); each card's next listing is read besides (1.132.2)
 ALLOWANCE_MS = 60_000           # the exchange allowance is read again this often, not before every pair
@@ -569,7 +606,8 @@ async def probe(api: Any, config: Any, settings: Settings, now_ms: int, hours: f
         why = candidate_problem(market, now_ms, config, settings)
         missing = [f for f in LISTING_FIELDS if f not in market]
         return (f"{slug}（{hm(start)}）：{'会挂' if not why else '不挂：' + why}；状态 {market.get('status') or '缺失'} / 交易状态 "
-                f"{market.get('tradingStatus') or '缺失'}；缺字段：{'、'.join(missing) if missing else '无'}")
+                f"{market.get('tradingStatus') or '缺失'}；缺字段：{'、'.join(missing) if missing else '无'}"
+                + ("；分类应答自带下单字段" if market.get("_from") == "category" else "；下单字段要另读详情"))
     lines += list(await asyncio.gather(*(one(r, s) for r, s in picked)))
     return lines
 
@@ -603,7 +641,10 @@ class Controller:
         self.skipped: dict[str, str] = {}  # slug -> why a listed window was not placed (the status line)
         self.skipped_at: dict[str, int] = {}  # slug -> when it was last judged so (asked again SKIP_RETRY_MS on)
         self.scan_note = ""  # what the last discovery pass did (the status line): windows read, levels found, what waits, what stopped it
-        self.scan_state: dict = {"reads": 0, "asked": 0, "deferred": 0, "pending": 0, "stopped": ""}  # ...its counts (scan_windows)
+        self.scan_state: dict = {"reads": 0, "asked": 0, "found": 0, "deferred": 0, "pending": 0, "stopped": "", "probed": 0}  # ...its counts
+        self.rescan_ms = 0  # when the known-listed windows were last re-read (reread_known: at the poll's pace, between listings)
+        self.listing_deltas: collections.deque = collections.deque(maxlen=20)  # ms: each new listing's time against the expected moment (the last listing a cycle on)
+        self.category_full: bool | None = None  # whether the category answers carried everything an order needs (no details read) — None until a listing was read
         self.parked: dict[str, tuple[int, dict]] = {}  # slug -> (retry_ms, candidate): held by hold() or the budget, placed again HOLD_RETRY_MS on, still queued
         self.full_scan_ms = 0  # discover: when the last full scan ran (FULL_SCAN_MS)
         self.keep_on_stop = False  # the owner's stop for a settings change: the orders stay on the book, the next controller takes them over
@@ -873,30 +914,34 @@ class Controller:
         return sum(float(p.get("pnl") or 0) for p in self.ledger.rows.values() if p.get("accounted_day") == day)
 
     async def account(self) -> None:
+        """The account snapshot: the open orders (every page) and the USDT balance, read outside the placement lock (1.133.0:
+        a second or two of page reads every poll used to hold a placement at a listing), applied under it. The snapshot is
+        dated when its read began: an order placed meanwhile is not judged by it."""
         import live
+        fetched = self.now()
+        try:
+            rows = await self.api.orders("OPEN")
+            if not self.api.orders_complete:
+                raise core.RemoteError("账户挂单分页未读取完整，暂停新增订单")
+            other = self.unmanaged_rows(rows)
+            known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)}
+            strangers = [r for r in other if str(r.get("id")) not in known_core]
+            unmanaged = len(strangers)
+            detail = [order_brief(r) for r in strangers[:5]]  # /preopen check names them (1.132.1)
+            reserved = 0.0
+            for row in rows:
+                order = row.get("order") or {}
+                if int(order.get("side") or 0) == 0:
+                    amount, filled = D(str(row.get("amount") or "0")), D(str(row.get("amountFilled") or "0"))
+                    if amount <= 0 or not 0 <= filled <= amount:
+                        raise core.RemoteError("账户订单缺少有效数量，暂停新增订单")
+                    reserved += float(D(str(order["makerAmount"])) / live.WEI * (1 - filled / amount))
+            balance = float(await self.owner.live.chain.usdt_balance()) / live.WEI
+        except Exception:
+            self.account_at = 0
+            raise
         async with self.account_lock:
-            try:
-                rows = await self.api.orders("OPEN")
-                if not self.api.orders_complete:
-                    raise core.RemoteError("账户挂单分页未读取完整，暂停新增订单")
-                other = self.unmanaged_rows(rows)
-                known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)}
-                strangers = [r for r in other if str(r.get("id")) not in known_core]
-                unmanaged = len(strangers)
-                self.unmanaged_detail = [order_brief(r) for r in strangers[:5]]  # /preopen check names them (1.132.1)
-                reserved = 0.0
-                for row in rows:
-                    order = row.get("order") or {}
-                    if int(order.get("side") or 0) == 0:
-                        amount, filled = D(str(row.get("amount") or "0")), D(str(row.get("amountFilled") or "0"))
-                        if amount <= 0 or not 0 <= filled <= amount:
-                            raise core.RemoteError("账户订单缺少有效数量，暂停新增订单")
-                        reserved += float(D(str(order["makerAmount"])) / live.WEI * (1 - filled / amount))
-                balance = float(await self.owner.live.chain.usdt_balance()) / live.WEI
-            except Exception:
-                self.account_at = 0
-                raise
-            self.unmanaged, self.open_reserved, self.balance = unmanaged, reserved, balance
+            self.unmanaged, self.open_reserved, self.balance, self.unmanaged_detail = unmanaged, reserved, balance, detail
             self.listed_ids = {str(r.get("id")) for r in rows}
             by_hash = {live.order_hash_of(r): r for r in rows if live.order_hash_of(r)}
             for pair in self.ledger.rows.values():
@@ -909,7 +954,7 @@ class Controller:
                         changed |= order["filled"] != before
                 if changed:
                     self.ledger.save(pair)
-            self.account_at = self.now()
+            self.account_at = fetched
 
     def resumable(self, pair: dict) -> bool:
         """An active pair found at the start (a restart, a settings change) that keeps resting, its queue position with it:
@@ -946,6 +991,8 @@ class Controller:
                 pair["cancel_ms"] = pair["start_ms"] - self.settings.cancel_seconds * 1000
                 self.ledger.save(pair)
                 self.resumed += 1
+                if pair.get("key"):  # the listing horizon as the records know it: the status's 发布到, and the discovery's "beyond the listing", from the start
+                    self.listed_by_card[pair["key"]] = max(self.listed_by_card.get(pair["key"], 0), int(pair["start_ms"]))
             elif pair["phase"] != "closed" and not pair.get("accounted"):
                 pair.update(phase="closing", retry_ms=0, **({"reason": "设置不同，撤掉后重新报价", "free": True} if pair["phase"] == "active" else {}))
                 self.ledger.save(pair)
@@ -977,88 +1024,148 @@ class Controller:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(self.cancel_all("预挂模式停止，撤销预挂单", free=True), timeout=12)
 
-    async def discover(self) -> None:
-        """Each coming window (window_starts) not yet recorded or queued, asked for by its category, each card's in start
-        order: listed, it is judged (candidate) and queued, the soonest first. Not listed, the card's later windows are
-        asked only in a full scan (every FULL_SCAN_MS, up to MISS_STOP unlisted in a row); between full scans each card's
-        first unlisted window alone is asked every poll — the one Predict lists next. Cheap however wide the horizon."""
+    async def discover(self, probe_only: bool = False) -> None:
+        """One discovery pass: first each card's next listing (the windows beyond the latest known listed, concurrently across
+        cards, each candidate queued the moment it is found — the queue position), then, unless ``probe_only`` or a listing
+        is expected any second (sprinting), the known-listed windows with a level still to quote, DISCOVER_READS a pass.
+        Not listed, a card's later windows are asked only in a full scan (every FULL_SCAN_MS, up to MISS_STOP unlisted in a
+        row); between full scans each card's first unlisted window alone is asked."""
         full = self.now() - self.full_scan_ms >= FULL_SCAN_MS
         if full:
             self.full_scan_ms = self.now()
         if why := self.cooldown():
             self.scan_note = f"{hms(self.now())} 没扫：{why}"
             return
-        misses: dict[str, int] = {}
-        found: list[dict] = []
-        known_before = dict(self.listed_by_card)  # the latest windows known as this scan starts: a window beyond them is a listing seen now (the rhythm's anchor)
-        try:
-            await self.scan_windows(known_before, misses, found, full, self.scan_state)
-        finally:
-            for c in sorted(found, key=lambda c: (c["start_ms"], c["level"], c["slug"])):
-                self.queue.put_nowait((c["start_ms"], c["slug"], c))  # whatever ended the pass, what it found is queued (1.132.2: a failed read stranded them)
-            st = self.scan_state
-            self.scan_note = (f"{hms(self.now())} 读 {st['asked']} 场，找到 {len(found)} 档" + (f"，还有 {st['deferred']} 场下次再读" if st["deferred"] else "")
-                              + (f"，{st['pending']} 档在等撤单核对" if st["pending"] else "") + (f"；停在 {st['stopped']}" if st["stopped"] else ""))
-
-    async def scan_windows(self, known_before: dict, misses: dict, found: list, full: bool, st: dict) -> None:
-        """One discovery pass over the coming windows (discover: the pass's bookkeeping, what it found queued whatever ends it)."""
-        st.update(reads=0, asked=0, deferred=0, pending=0, stopped="")
+        st = self.scan_state
+        st.update(reads=0, asked=0, found=0, deferred=0, pending=0, stopped="", probed=0)
+        known_before = dict(self.listed_by_card)  # the latest windows known listed as this pass starts: a window beyond them is a listing seen now
         attempts: dict[str, int] = {}  # record (a window's level) -> the attempt after its last record, the superseded ones included: an attempt that left no record is not reused (its salt would be the first attempt's)
         for p in self.ledger.rows.values():
             attempts[record_key(p)] = max(attempts.get(record_key(p), 0), int(p.get("attempt") or 0) + 1)
         strikes = window_strikes(self.ledger.rows.values())  # 1.131.6: the cap counts failures, not the salt's attempts
+        sprint = self.sprinting()  # judged as the pass begins: a pass that started for a listing stays with the listings (the next tick re-reads)
+        try:
+            await self.probe_listings(known_before, full, attempts, strikes, st)
+            if not probe_only and not st["stopped"] and not sprint:
+                self.rescan_ms = self.now()
+                await self.reread_known(known_before, attempts, strikes, st)
+        finally:
+            self.scan_note = (f"{hms(self.now())} 探 {st['probed']} 卡、读 {st['asked']} 场，找到 {st['found']} 档"
+                              + (f"，还有 {st['deferred']} 场下次再读" if st["deferred"] else "") + (f"，{st['pending']} 档在等撤单核对" if st["pending"] else "")
+                              + (f"；停在 {st['stopped']}" if st["stopped"] else ""))
+
+    def sprinting(self) -> bool:
+        """Whether a card's next listing is expected any second (poll_wait: the fast poll): the pass probes the listings alone."""
+        return self.poll_wait() == FAST_POLL_S
+
+    def wanted_levels(self, slug: str, start: int, strikes: dict, st: dict) -> list[tuple[str, int, D, D]]:
+        """The levels of a window to quote now: (record key, level, price, shares) — not queued, not quoted, not past the
+        failures cap, not waiting on a withdrawal's reconciliation (counted as pending), the deeper ones only near the start."""
+        wanted = []
+        for level, (price, shares) in enumerate(self.settings.levels):
+            if level and start - self.now() > self.settings.deep_ahead_minutes * 60_000:
+                break  # the deeper levels wait for the window to come near (PREOPEN_DEEP_AHEAD_MINUTES); the first keeps its queue position
+            key = slug if level == 0 else f"{slug}#{level}"  # sorts after the first level's key, before the next's
+            if key in self.queued or strikes.get(key, 0) >= MAX_ATTEMPTS:
+                continue
+            if key in self.ledger.rows and not self.supersedable(self.ledger.rows[key], strikes.get(key, 0)):
+                if self.ledger.rows[key]["phase"] != "active" and not self.ledger.rows[key].get("accounted"):
+                    st["pending"] += 1  # withdrawn, its final reads not in yet: quoted again once they are
+                continue
+            wanted.append((key, level, price, shares))
+        return wanted
+
+    async def probe_listings(self, known_before: dict, full: bool, attempts: dict, strikes: dict, st: dict) -> None:
+        """Each card's windows beyond its latest known listing, in start order, the cards side by side: the next listing is
+        found within a probe of its appearance and queued at once (1.133.0: it used to wait behind the older windows' reads,
+        and for the end of the pass)."""
+        per_card: dict[str, list[tuple[Any, int]]] = {}
         for rolling, start in window_starts(self.now(), self.owner.config, self.settings):
-            if misses.get(rolling.key, 0) >= (MISS_STOP if full else 1) or (self.card_holds.get(rolling.key) and start - self.now() <= CARD_HOLD_NEAR_MS):
+            if start > known_before.get(rolling.key, 0) and not (self.card_holds.get(rolling.key) and start - self.now() <= CARD_HOLD_NEAR_MS):
+                per_card.setdefault(rolling.key, []).append((rolling, start))
+        st["probed"] = len(per_card)
+
+        async def one_card(items: list[tuple[Any, int]]) -> None:
+            misses = 0
+            for rolling, start in items:
+                if misses >= (MISS_STOP if full else 1) or st["stopped"]:
+                    return
+                slug = window_slug(rolling, start)
+                if self.now() - self.skipped_at.get(slug, 0) < SKIP_RETRY_MS:
+                    continue  # judged no candidate a moment ago: not read again every poll
+                wanted = self.wanted_levels(slug, start, strikes, st)
+                if not wanted:
+                    continue
+                st["asked"] += 1
+                try:
+                    market = await category_market(self.api, slug)
+                except Exception as error:
+                    st["stopped"] = f"{slug.rsplit('-', 1)[-1]}：{core.clean_error(error) or type(error).__name__}"
+                    self.error = f"扫描 {st['stopped']}"
+                    return  # this card's pass ends here (a 429, the cooldown, a timeout): what was found is queued, the rest read next time
+                if market is None:
+                    misses += 1
+                    continue
+                misses = 0
+                self.note_listing(rolling, start, known_before)
+                self.enqueue(market, slug, wanted, attempts, st)
+        await asyncio.gather(*(one_card(items) for items in per_card.values()))
+
+    async def reread_known(self, known_before: dict, attempts: dict, strikes: dict, st: dict) -> None:
+        """The known-listed windows with a level still to quote (a withdrawn pair's, a level the cap held back, a deeper
+        level now near its start), the soonest first, DISCOVER_READS a pass: the rest the next pass."""
+        for rolling, start in window_starts(self.now(), self.owner.config, self.settings):
+            if start > known_before.get(rolling.key, 0) or (self.card_holds.get(rolling.key) and start - self.now() <= CARD_HOLD_NEAR_MS):
                 continue
             slug = window_slug(rolling, start)
             if self.now() - self.skipped_at.get(slug, 0) < SKIP_RETRY_MS:
-                continue  # judged no candidate a moment ago: not read again every poll
-            wanted = []  # the levels to quote now: (record key, level, price, shares)
-            for level, (price, shares) in enumerate(self.settings.levels):
-                if level and start - self.now() > self.settings.deep_ahead_minutes * 60_000:
-                    break  # the deeper levels wait for the window to come near (PREOPEN_DEEP_AHEAD_MINUTES); the first keeps its queue position
-                key = slug if level == 0 else f"{slug}#{level}"  # sorts after the first level's key, before the next's
-                if key in self.queued or strikes.get(key, 0) >= MAX_ATTEMPTS:
-                    continue
-                if key in self.ledger.rows and not self.supersedable(self.ledger.rows[key], strikes.get(key, 0)):
-                    if self.ledger.rows[key]["phase"] != "active" and not self.ledger.rows[key].get("accounted"):
-                        st["pending"] += 1  # withdrawn, its final reads not in yet: quoted again once they are
-                    continue
-                wanted.append((key, level, price, shares))
+                continue
+            wanted = self.wanted_levels(slug, start, strikes, st)
             if not wanted:
                 continue
-            if start <= known_before.get(rolling.key, 0):  # known listed, a level still to quote: the budget's (the windows beyond the listing — a card's next one, MISS_STOP at most — are read whatever it: the queue position at a listing)
-                if st["reads"] >= DISCOVER_READS:
-                    st["deferred"] += 1  # the next pass's (1.132.2: every such window was read again every poll)
-                    continue
-                st["reads"] += 1
+            if st["reads"] >= DISCOVER_READS:
+                st["deferred"] += 1  # the next pass's (1.132.2: every such window was read again every poll)
+                continue
+            st["reads"] += 1
             st["asked"] += 1
             try:
                 market = await category_market(self.api, slug)
             except Exception as error:
                 st["stopped"] = f"{slug.rsplit('-', 1)[-1]}：{core.clean_error(error) or type(error).__name__}"
                 self.error = f"扫描 {st['stopped']}"
-                return  # the pass ends here (a 429, the cooldown, a timeout): what it found is queued, the rest read next time
-            if market is None:
-                misses[rolling.key] = misses.get(rolling.key, 0) + 1
+                return
+            if market is None:  # a window known listed answers 404: not asked again for a minute
+                self.skipped[slug], self.skipped_at[slug] = "已发布的场次读不到（404）", self.now()
                 continue
-            misses[rolling.key] = 0
-            self.listed_until_ms = max(self.listed_until_ms, start)
-            if known_before.get(rolling.key) and start > known_before[rolling.key]:
-                self.listed_at[rolling.key] = self.now()  # a new listing seen: the next one is expected a cycle on (poll_wait polls fast around it)
-            self.listed_by_card[rolling.key] = max(self.listed_by_card.get(rolling.key, 0), start)
-            c = candidate(market, self.now(), self.owner.config, self.settings)
-            if c is None:
-                self.skipped[slug] = candidate_problem(market, self.now(), self.owner.config, self.settings)
-                self.skipped_at[slug] = self.now()
-                continue
-            for key, level, price, shares in wanted:
-                if key in self.ledger.rows:  # the withdrawn pair's record steps aside: the level is quoted again (place_pair: a new salt)
-                    self.ledger.rename(key, f"{key}@{int(self.ledger.rows[key].get('attempt') or 0)}")  # the record and the attempt: one key each
-                    self.requoted += 1
-                self.queued.add(key)
-                found.append({**c, "slug": key, "window": slug, "level": level, "price": str(price), "shares": str(shares), "attempt": attempts.get(key, 0),
-                              "market": market, "read_ms": self.now()})  # the details just read: placed on, not read again (MARKET_FRESH_MS)
+            self.enqueue(market, slug, wanted, attempts, st)
+
+    def note_listing(self, rolling: Any, start: int, known_before: dict) -> None:
+        """A window read listed: the card's listing horizon, and — a new listing beyond the known — the rhythm's anchor
+        (poll_wait polls fast a cycle on) and how far it came from the expected moment (the status: listing_deltas)."""
+        self.listed_until_ms = max(self.listed_until_ms, start)
+        if known_before.get(rolling.key) and start > known_before[rolling.key]:
+            if self.listed_at.get(rolling.key):
+                self.listing_deltas.append(self.now() - (self.listed_at[rolling.key] + LISTING_CYCLE_MS))
+            self.listed_at[rolling.key] = self.now()
+        self.listed_by_card[rolling.key] = max(self.listed_by_card.get(rolling.key, 0), start)
+
+    def enqueue(self, market: dict, slug: str, wanted: list, attempts: dict, st: dict) -> None:
+        """A listed window judged (candidate) and its wanted levels queued at once, the details just read carried along
+        (placed on, not read again: MARKET_FRESH_MS); a window that is no candidate is noted (skipped)."""
+        self.category_full = market.get("_from") == "category"
+        c = candidate(market, self.now(), self.owner.config, self.settings)
+        if c is None:
+            self.skipped[slug] = candidate_problem(market, self.now(), self.owner.config, self.settings)
+            self.skipped_at[slug] = self.now()
+            return
+        for key, level, price, shares in wanted:
+            if key in self.ledger.rows:  # the withdrawn pair's record steps aside: the level is quoted again (place_pair: a new salt)
+                self.ledger.rename(key, f"{key}@{int(self.ledger.rows[key].get('attempt') or 0)}")  # the record and the attempt: one key each
+                self.requoted += 1
+            self.queued.add(key)
+            st["found"] += 1
+            self.queue.put_nowait((c["start_ms"], key, {**c, "slug": key, "window": slug, "level": level, "price": str(price), "shares": str(shares),
+                                                       "attempt": attempts.get(key, 0), "market": market, "read_ms": self.now()}))
 
     async def refresh_active(self) -> None:
         """An active window's market, read again every REFRESH_MS (REFRESH_FAR_MS while its start is more than an hour
@@ -1144,7 +1251,8 @@ class Controller:
             pair = {**current, "slug": c["slug"], "window": current["slug"], "level": int(c.get("level") or 0),  # the record's key: the window's slug, #<level> for a deeper level
                     "attempt": int(c.get("attempt") or 0), "price": str(price), "shares": str(shares),
                     "phase": "active", "orders": orders, "created_ms": self.now(), "tries": 0, "retry_ms": 0,
-                    "open_seen_ms": self.now() if str(market.get("tradingStatus") or "").upper() == "OPEN" else 0}
+                    "open_seen_ms": self.now() if str(market.get("tradingStatus") or "").upper() == "OPEN" else 0,
+                    "seen_ms": int(c.get("read_ms") or 0)}  # when the discovery read it listed (the 发现→挂上 of the status)
             self.ledger.save(pair)  # both hashes durable before either POST
         sides: list[str] = []
         for side in ("up", "down"):
@@ -1185,6 +1293,9 @@ class Controller:
             self.ledger.save(pair)
         if sides:
             await asyncio.gather(*(send(side) for side in sides))  # 1.131.0: side by side — the second side no longer waits a round trip
+            if any(o["state"] == "open" for o in pair["orders"].values()):
+                pair["placed_ms"] = self.now()
+                self.ledger.save(pair)
         if all(o["state"] in {"prepared", "not_sent"} or o.get("limited") for o in pair["orders"].values()):
             # nothing of the pair was ever placed (a gate or the rate limiter refused the first request): no record, so a
             # later poll places the window afresh — hold() keeps it back while the reason lasts
@@ -1488,14 +1599,14 @@ class Controller:
             due = at + LISTING_CYCLE_MS
             if due - LISTING_EARLY_MS <= now <= due + LISTING_LATE_MS:
                 return FAST_POLL_S
-        return float(self.settings.poll)
+        return min(LISTING_PROBE_S, float(self.settings.poll))  # the listings probed every LISTING_PROBE_S; the older windows re-read at the poll's pace (discovery_loop)
 
     async def discovery_loop(self) -> None:
         """The discovery on its own (1.131.0: the refreshes have their own loop — a batch of reads never delays a listing's find)."""
         while not self.stopped():
             try:
-                if not self.blocked():
-                    await self.discover()
+                if not self.blocked():  # the listings every tick; the known windows' re-read once a poll (and never while a listing is expected: discover)
+                    await self.discover(probe_only=self.now() - self.rescan_ms < self.settings.poll * 1000)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -1570,7 +1681,7 @@ class Controller:
                     asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
                     asyncio.create_task(self.refresh_loop(), name="preopen-refresh"),
                     asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
-                    *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(2))]
+                    *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(PLACE_WORKERS))]
             stops = [asyncio.create_task(self.owner.stopping.wait()), asyncio.create_task(self.stop.wait())]
             try:
                 await asyncio.wait([*stops, *jobs], return_when=asyncio.FIRST_COMPLETED)
@@ -1615,6 +1726,13 @@ class Controller:
             parts.append(f"挂上时距开场中位 {leads[len(leads) // 2]:.0f} 分钟（最长 {leads[-1]:.0f}；{len(placed)} 场）"
                          + ("，贴着提前范围：Predict 可能发布得更早，可调大 PREOPEN_AHEAD_MINUTES"
                             if self.settings.ahead_minutes < 1440 and leads[-1] >= self.settings.ahead_minutes - 15 else ""))
+        quick = [p for p in rows if p.get("seen_ms") and p.get("placed_ms") and p.get("created_ms")][-20:]
+        if quick:  # from the discovery's read of the listing to both orders answered: the bot's own share of the queue position (1.133.0)
+            spans = sorted((int(p["placed_ms"]) - int(p["seen_ms"])) / 1000 for p in quick)
+            parts.append(f"发现→挂上中位 {spans[len(spans) // 2]:.1f} 秒（最长 {spans[-1]:.1f}；{len(quick)} 场）")
+        if self.listing_deltas:  # each new listing against the moment expected (the last one a cycle on): how well the fast poll is aimed
+            deltas = sorted(d / 1000 for d in self.listing_deltas)
+            parts.append(f"发布比预计中位 {deltas[len(deltas) // 2]:+.0f} 秒（最早 {deltas[0]:+.0f}、最晚 {deltas[-1]:+.0f}；{len(deltas)} 次）")
         return "；".join(parts)
 
     def unquotable(self) -> tuple[list[dict], list[dict]]:
@@ -1690,7 +1808,8 @@ class Controller:
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
                 f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉且一份没成交的场次立即释放）"
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，按开场先后补挂中") if pairs_left else "")
-                + f"\n扫描：{self.scan_note or '还没扫过'}"
+                + f"\n扫描：{self.scan_note or '还没扫过'}（发布探测每 {LISTING_PROBE_S:g} 秒，预计发布前后每 {FAST_POLL_S:g} 秒；"
+                + ("分类应答自带下单字段，发现即下单" if self.category_full else "分类应答不带下单字段，每场多读一次详情" if self.category_full is False else "还没读过发布") + "）"
                 + f"\n最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
                 + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：不计入预挂限额，也不挡预挂" if self.unmanaged else "")
