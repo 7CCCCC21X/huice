@@ -66,6 +66,52 @@ open_rows = rows(calm_m(121, 90), BJ(11, 30)) + rows([str(90 * (1 + 0.002 * (i %
 sh = m.session_minute_fn("sh")
 assert m.minute_vol(open_rows, BJ(13, 21), 240, sh) > 1.3 > m.minute_vol(open_rows, BJ(13, 21), 240, sh, open_floor=False) > 0.5
 assert len(m.minute_returns(open_rows, BJ(13, 21), sh)) == 139 and m.minute_returns(open_rows, BJ(13, 21), sh)[-20][0] == BJ(13, 1)
+# 1.121.0: the shape of the day (vol_shape): the usual volatility by quarter hour of the local day from the last two weeks' 15-minute
+# candles; σ is the level the last hours show over the level those same hours usually have, times the window's usual (minute_vol_shaped)
+bj_day = lambda d, h, mi: int(dt.datetime(2026, 10, 20 + d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+def quarter_rows(days, lively=lambda h: 20 <= h <= 23, step=0.001, big=0.002):
+    """Ten days of 15-minute candles: ±step a candle, ±big in the lively hours (a 2× σ there)."""
+    out = []
+    for d in range(days):
+        for q in range(96):
+            o = bj_day(d, q // 4, q % 4 * 15)
+            move = (big if lively(q // 4) else step) * (1 if q % 2 else -1)
+            out.append([o, "100", "100", "100", str(100 * math.exp(move)), "0", o + 899_999, "0", 0, "0", "0", "0"])
+    return out
+SHAPE_NOW = bj_day(10, 3, 0)
+shape = m.vol_shape(quarter_rows(10), SHAPE_NOW, m.BEIJING)
+assert shape is not None and shape.candles == 960 and abs(shape.span_days - (10 - 1 / 96)) < 1e-6 and shape.slot(bj_day(3, 21, 7)) == 84 and shape.slot(bj_day(3, 0, 0)) == 0
+assert m.vol_shape(quarter_rows(10)[:95], SHAPE_NOW, m.BEIJING) is None and m.vol_shape(quarter_rows(10)[:96], SHAPE_NOW, m.BEIJING) is not None
+assert m.vol_shape(quarter_rows(10), bj_day(0, 1, 0), m.BEIJING) is None, "the running and the later candles do not count"
+assert 1.55 < shape.sigma_at(bj_day(0, 21, 30)) / shape.sigma_at(bj_day(0, 3, 0)) < 1.8, "2× σ in the lively hours, pooled with the neighbours and the day's mean"
+assert shape.sigma_at(bj_day(0, 19, 45)) > shape.sigma_at(bj_day(0, 19, 0)) and abs(shape.sigma_at(bj_day(0, 19, 0)) - shape.sigma_at(bj_day(0, 3, 0))) < 1e-12, "the quarter before a lively hour borrows half of it; a quiet one among quiet ones is the same as any"
+assert abs(shape.sigma_at(bj_day(0, 3, 0)) - math.sqrt((8 * shape.mean + 20 * 0.001 ** 2 / 15 * 365 * 24 * 60) / 28)) < 1e-9, "a quiet slot: its ten candles, the neighbours' at half, eight at the mean"
+assert shape.sigma_at(bj_day(0, 3, 0)) == shape.sigma_at(bj_day(0, 3, 14)) and shape.var_at(bj_day(0, 3, 0)) == shape.var[12]
+# the level: calm 1-minute candles in a quiet hour price a lively hour's window at the shape's ratio, a quiet one's near the plain figure
+calm_rows = rows(calm, bj_day(10, 3, 0))  # 03:00: four calm hours (23:00–03:00 crosses the lively ones: the usual there is above the 03:00 slot's)
+plain = m.minute_vol(calm_rows, SHAPE_NOW)
+shaped, factor = m.minute_vol_shaped(calm_rows, SHAPE_NOW, shape=shape, at_ms=bj_day(10, 21, 30))
+assert abs(shaped - plain * factor) < 1e-12 and 1.55 < factor < 1.65 and m.minute_vol(calm_rows, SHAPE_NOW, shape=shape, at_ms=bj_day(10, 21, 30)) == shaped, factor
+quiet_shaped, quiet_factor = m.minute_vol_shaped(calm_rows, SHAPE_NOW, shape=shape, at_ms=bj_day(10, 3, 0))
+assert 0.9 < quiet_factor < 0.97 and quiet_shaped < plain < shaped, (quiet_factor, factor)  # the recent minutes crossed the lively hours: their usual is above the 03:00 slot's
+assert m.minute_vol_shaped(calm_rows, SHAPE_NOW, shape=shape)[1] == quiet_factor, "no at_ms: now's slot"
+assert m.minute_vol_shaped(calm_rows, SHAPE_NOW)[1] == 1.0 and m.minute_vol_shaped(calm_rows, SHAPE_NOW)[0] == plain, "no shape: the plain figure"
+assert m.minute_vol_shaped(rows(["90"] * 241, SHAPE_NOW), SHAPE_NOW, shape=shape, at_ms=bj_day(10, 21, 30)) == (0.0, 1.0), "not moved at all: 0, whatever the shape"
+spike = m.VolShape({slot: (1e-3 if slot == 86 else 1e-9 if slot == 12 else 1e-5) for slot in range(96)}, 1e-5, 960, 10.0, m.BEIJING, SHAPE_NOW)
+assert m.minute_vol_shaped(calm_rows, SHAPE_NOW, shape=spike, at_ms=bj_day(10, 21, 30))[1] == 2.5 and m.minute_vol_shaped(calm_rows, SHAPE_NOW, shape=spike, at_ms=bj_day(10, 3, 0))[1] == 0.4, "bounded: a slot ten times, a hundredth of the recent minutes' usual"
+# a stock's shape counts the candles wholly inside its session: the lunch break and the night are no slot of its day
+sh_rows = quarter_rows(10, lively=lambda h: h == 9, step=0.001, big=0.003)  # the open hour's candles 3× (two of them in session: 09:30, 09:45)
+sh_shape = m.vol_shape(sh_rows, bj_day(10, 15, 0), m.BEIJING, m.session_minute_fn("sh"))
+assert sh_shape is not None and sh_shape.candles == 8 * 16, sh_shape.candles  # eight trading days of 16 quarter hours (10-24/25 are a weekend)
+in_session = [k for k in range(96) if m.session_minute_fn("sh")(bj_day(0, k // 4, k % 4 * 15))]
+assert len(in_session) == 16 and sh_shape.var[47] == sh_shape.var[49] == sh_shape.mean != sh_shape.var[52] and sh_shape.mean > sh_shape.var[46] > sh_shape.var[52], \
+    "11:30–13:00 and the night: no candles, the mean stays — the 11:30 slot borrows half of 11:15's (quiet), 13:00 is a session slot of its own"
+assert sh_shape.sigma_at(bj_day(0, 9, 30)) > 1.5 * sh_shape.sigma_at(bj_day(0, 14, 0)) and sh_shape.sigma_at(bj_day(0, 9, 45)) > sh_shape.sigma_at(bj_day(0, 10, 0)) > sh_shape.sigma_at(bj_day(0, 14, 0))
+try:
+    m.vol_shape([[bj_day(0, 1, 0), "0", "1", "1", "1", "0", bj_day(0, 1, 0) + 899_999, "0", 0, "0", "0", "0"]] * 100, SHAPE_NOW, m.BEIJING); assert False
+except ValueError as error:
+    assert str(error) == "15 分钟 K 线价格无效"
+assert (m.SHAPE_DAYS, m.SHAPE_MIN_CANDLES, m.SHAPE_PRIOR, m.SHAPE_FACTOR_BOUNDS, m.IndexUpDownMarket.SHAPE_SECONDS, m.IndexUpDownMarket.SHAPE_ROWS, m.SpotWindowMarket.SHAPE_ROWS) == (14, 96, 8, (0.4, 2.5), 3600, 1500, 1000)
 # 1.106.1: the daily crypto cards' hourly σ weighs the last five days about half — a month of calm does not price a week that moves
 hourly = lambda closes, end: [[end - (len(closes) - i) * 3600_000, c, c, c, c, "0", end - (len(closes) - i) * 3600_000 + 3599_999, "0", 0, "0", "0", "0"]
                               for i, c in enumerate(closes)]
@@ -81,13 +127,17 @@ class FM:
         self.index = {}       # candle open time -> close: the boundaries
         self.premium = None   # (price, time)
         self.closes = calm
+        self.shape_rows = []  # the 15-minute candles the shape of the day is read from (1.121.0): none = no shape, the plain σ
 
     def now_ms(self): return self.now
 
     async def get(self, path, **params):
         self.paths.append(path)
         if path == "/fapi/v1/indexPriceKlines":
-            assert params["pair"] == "UNITREEUSDT" and params["interval"] == "1m", params
+            assert params["pair"] == "UNITREEUSDT" and params["interval"] in ("1m", "15m"), params
+            if params["interval"] == "15m":
+                assert params["limit"] == 1500 and "startTime" not in params, params
+                return self.shape_rows
             if "startTime" in params:
                 close = self.index.get(params["startTime"])
                 return [] if close is None else [[params["startTime"], close, close, close, close, "0", params["startTime"] + 59_999, "0", 0, "0", "0", "0"]]
@@ -141,7 +191,34 @@ async def run():
     fm.index[T0 - 60_000], fm.premium = "90.0000", ("90.1200", T0 + 4_500)
     await card.refresh(T0 + 5_000)
     assert card.close_of("start") == D("90.0000") and card.price == D("90.1200") and card.sigma > 0 and card.error == "", card.error
-    assert fm.paths.count("/fapi/v1/indexPriceKlines") == 2 and "/fapi/v1/premiumIndex" in fm.paths
+    assert fm.paths.count("/fapi/v1/indexPriceKlines") == 3 and "/fapi/v1/premiumIndex" in fm.paths  # the start candle, the shape (15m), σ (1m)
+    assert card.shape is None and card.shape_factor == 1.0 and card.shape_error == "近 14 日的 15 分钟 K 线不足 96 根" and card.shape_ms == T0 + 5_000 - 55 * 60_000
+    # 1.121.0: the shape of the day (vol_shape) is read with σ — at once while there is none, then hourly — and σ is put on it:
+    # the window's quarter hour's usual over the recent minutes' usual; the next window's market carries the shape; the σ note says so
+    fm.shape_rows = [[o, "100", "100", "100", str(100 * math.exp((0.003 if dt.datetime.fromtimestamp(o / 1000, m.BEIJING).hour == 9 else 0.001) * (1 if (o // 900_000) % 2 else -1))),
+                      "0", o + 899_999, "0", 0, "0", "0", "0"] for o in range(T0 - 12 * 86_400_000, T0, 900_000)]  # twelve days of quarter hours, the 09:xx ones 3×
+    shaped = m.IndexUpDownMarket(store, spec, bot.binance_futures, "sh", m.session_minute_fn("sh"))
+    n_before = fm.paths.count("/fapi/v1/indexPriceKlines")
+    await shaped.read_vol(T0 + 5_000)
+    assert shaped.shape is not None and shaped.shape_ms == T0 + 5_000 and shaped.shape_error == "" and shaped.shape.candles >= 96 and shaped.shape.tz == m.BEIJING
+    assert fm.paths.count("/fapi/v1/indexPriceKlines") == n_before + 2  # the shape (15m) and σ (1m)
+    minute_rows = [[T0 - (len(calm) - i) * 60_000, c, c, c, c, "0", T0 - (len(calm) - i) * 60_000 + 59_999, "0", 0, "0", "0", "0"] for i, c in enumerate(calm)]  # what the fake serves
+    plain = m.minute_vol(minute_rows, T0 + 5_000, 240, m.session_minute_fn("sh"))
+    assert 0.5 < shaped.shape_factor < 0.95 and abs(shaped.sigma - plain * shaped.shape_factor) < 1e-12, (shaped.shape_factor, shaped.sigma, plain)  # 11:00 is a quiet quarter, the recent minutes crossed the open's
+    assert shaped.shape.sigma_at(T0 - 90 * 60_000) > 2 * shaped.shape.sigma_at(T0) and shaped.shape_note() == f"，分时形态 ×{shaped.shape_factor:.2f}（近 12 日同一时段）", shaped.shape_note()
+    shaped.push_index(D("90.1200"), T0 + 4_500, T0 + 5_000)
+    pay = bot.updown_payload(shaped, T0 + 5_000)
+    assert pay["sigma_note"].startswith("币安合约 UNITREEUSDT 指数近 4 小时 1 分钟 K（近 1 小时权重过半，开盘首小时按开盘后的）年化 ") and shaped.shape_note() in pay["sigma_note"], pay["sigma_note"]
+    assert abs(pay["sigma_daily"] - shaped.sigma / math.sqrt(365)) < 1e-12
+    await shaped.read_vol(T0 + 65_000)  # within the hour: σ alone is read again
+    assert fm.paths.count("/fapi/v1/indexPriceKlines") == n_before + 3 and shaped.shape_ms == T0 + 5_000
+    nxt = shaped.at(W.window_spec(T1))
+    assert nxt.shape is shaped.shape and nxt.shape_ms == shaped.shape_ms and nxt.shape_factor == 1.0  # carried; its own σ not read yet
+    fm.shape_rows = [[o, "0", "1", "1", "1", "0", o + 899_999, "0", 0, "0", "0", "0"] for o in range(T0 - 86_400_000, T0, 900_000)]  # a bad read an hour on
+    await shaped.read_vol(T0 + 3_605_000)
+    assert shaped.shape is not None and shaped.shape_error == "15 分钟 K 线价格无效" and shaped.shape_ms == T0 + 3_605_000 - 55 * 60_000, "the shape in hand stands; tried again in five minutes"
+    assert shaped.shape_note().startswith("，分时形态 ×") and fm.paths.count("/fapi/v1/indexPriceKlines") == n_before + 5
+    fm.shape_rows = []
     odds = card.odds(T0 + 5_000)
     up, flat, down, _ = m.updown_odds(90.12, 90.0, card.sigma, (T1 - T0 - 5_000) / m.YEAR_MS)
     assert isinstance(odds, m.UpDownOdds) and abs(odds.fair_up - (up + flat / 2)) < 1e-12 and odds.fair_up > 0.5 and not odds.settled
@@ -472,7 +549,10 @@ async def run():
         if path == "ticker/price":
             assert params == {"symbol": "BTCUSDT"}, params
             return {"symbol": "BTCUSDT", "price": tick[0]}
-        assert path == "klines" and params["symbol"] == "BTCUSDT" and params["interval"] == "1m", (path, params)
+        assert path == "klines" and params["symbol"] == "BTCUSDT" and params["interval"] in ("1m", "15m"), (path, params)
+        if params["interval"] == "15m":
+            assert params["limit"] == 1000, params  # the spot API's most (1.121.0: the shape of the day)
+            return []
         if "startTime" in params:
             o, c = params["startTime"], closes.get(params["startTime"])
             return [] if c is None else [[o, c, c, c, c, "0", o + 59_999, "0", 0, "0", "0", "0"]]
@@ -626,24 +706,26 @@ async def samples():
     assert f"剩 14 分：1 条｜模型 Brier {(1 - first['up']) ** 2:.3f}，盘口中间价 0.331（1 条有盘口，模型更准的占 100%），抛硬币 0.250" in report, report
     assert "剩 2 分：1 条" in report and "校准：模型 80–100¢ 的" in report and "波动：1 个市场，实际 / 预测（RMS z）" in report, report
     # 1.106.0: σ calibration from the windows' actual moves (SIGMA_CALIB): each market's earliest sample made with the current
-    # estimator, z = move / (raw σ√τ), the RMS pooled with 20 windows at 1 — ten windows that moved half of σ√τ: ×0.87; a
-    # sample of the old estimator does not count; the factor is what the card prices with, and the note and /calib say so
+    # estimator, z = move / (raw σ√τ), the RMS pooled with 10 windows at 1 (1.121.0; 20 before) — ten windows that moved half
+    # of σ√τ: ×0.78 alone; a sample of an earlier estimator (2: the weighted four hours; 1) does not count; the factor is what
+    # the card prices with, and the note and /calib say so
     assert bot.config.sigma_calib and m.CONTROL_FORMS["SIGMA_CALIB"]["kind"] == "choice" and bot.control_value("SIGMA_CALIB") == "on"
-    assert first["sigma_raw"] == card.sigma and first["calib"] == 1.0 and first["model"] == 2 and m.IndexUpDownMarket.SIGMA_MODEL == 2
+    assert first["sigma_raw"] == card.sigma and first["calib"] == 1.0 and first["model"] == 3 and first["shape"] == 1.0 and m.IndexUpDownMarket.SIGMA_MODEL == 3 and m.UpDownMarket.SIGMA_MODEL == 2
     st = 0.5 * math.sqrt(2.7e-5)
     for i in range(10):
         base = {"t": T0 - (i + 2) * 900_000, "start": T0 - (i + 2) * 900_000, "end": T0 - (i + 1) * 900_000, "slug": f"c{i}-updown-15m", "key": "UNITREE-15M",
                 "kind": "window", "card": "宇树 15分涨跌", "up": 0.6,
-                "sigma": 0.5, "sigma_raw": 0.5, "calib": 1.0, "model": 2, "tau": 2.7e-5, "line": 100.0, "result": 1.0, "final": 100.0 * math.exp(0.5 * st)}
+                "sigma": 0.5, "sigma_raw": 0.5, "calib": 1.0, "model": m.IndexUpDownMarket.SIGMA_MODEL, "tau": 2.7e-5, "line": 100.0, "result": 1.0, "final": 100.0 * math.exp(0.5 * st)}
         store.put(f"wsample:c{i}-updown-15m:840", {**base, "left": 840, "move": 0.5 * st})
         store.put(f"wsample:c{i}-updown-15m:120", {**base, "left": 120, "move": 3 * st})  # a later sample of the same market: not the one counted
     store.put("wsample:old-updown-15m:840", {"t": T0 - 20 * 900_000, "start": T0 - 20 * 900_000, "end": T0 - 19 * 900_000, "slug": "old-updown-15m", "key": "UNITREE-15M", "kind": "window", "card": "宇树 15分涨跌",
-                                             "left": 840, "up": 0.6, "sigma": 0.5, "sigma_raw": 0.5, "model": 1, "tau": 2.7e-5, "line": 100.0, "move": 3 * st, "result": 1.0, "final": 101.0})
+                                             "left": 840, "up": 0.6, "sigma": 0.5, "sigma_raw": 0.5, "model": 2, "tau": 2.7e-5, "line": 100.0, "move": 3 * st, "result": 1.0, "final": 101.0})
     bot.sigma_calib_cache.clear()
     real = store.get(f"wsample:{spec.slug}:840")  # the window sampled above has its result too: the eleventh
     z_real = real["move"] / (real["sigma_raw"] * math.sqrt(real["tau"]))
     factor, n = bot.sigma_calib("UNITREE-15M")
-    assert n == 11 and abs(factor - math.sqrt((10 * 0.25 + z_real ** 2 + 20) / 31)) < 1e-9 and bot.sigma_calib("UNITREE-15M") == (factor, 11), (factor, n, z_real)
+    assert n == 11 and abs(factor - math.sqrt((10 * 0.25 + z_real ** 2 + 10) / 21)) < 1e-9 and bot.sigma_calib("UNITREE-15M") == (factor, 11), (factor, n, z_real)
+    assert (bot.SIGMA_CALIB_PRIOR, bot.SIGMA_CALIB_RANGE) == (10, (0.5, 2.0))
     assert bot.sigma_calib("SKHYNIX-15M") == (1.0, 0)
     card.calib = (factor, n)
     assert abs(card.sigma_used - card.sigma * factor) < 1e-12
@@ -655,13 +737,13 @@ async def samples():
     await bot.refresh_updown(fm.now)
     assert card.calib == (1.0, 0) and "SIGMA_CALIB=off，卡片不用它" in "\n".join(bot.window_report())
     bot.config = dataclasses_replace(bot.config, sigma_calib=True)
-    extreme = m.Bot(m.Config.from_env(ENV), store, FM(T0), None)  # the range: twenty windows at 3σ would say ×2.2, capped at 1.4
+    extreme = m.Bot(m.Config.from_env(ENV), store, FM(T0), None)  # the range: twenty windows at 3σ would say ×2.5, capped at 2.0 (1.4 before 1.121.0)
     for i in range(20):
         store.put(f"wsample:e{i}-updown-15m:840", {"t": T0 - (i + 30) * 900_000, "start": T0 - (i + 30) * 900_000, "end": T0 - (i + 29) * 900_000, "slug": f"e{i}-updown-15m",
                                                    "key": "SKHYNIX-15M", "kind": "window", "card": "SK 海力士 15分涨跌",
-                                                   "left": 840, "up": 0.6, "sigma": 0.5, "sigma_raw": 0.5, "calib": 1.0, "model": 2, "tau": 2.7e-5, "line": 100.0, "move": 3 * st,
+                                                   "left": 840, "up": 0.6, "sigma": 0.5, "sigma_raw": 0.5, "calib": 1.0, "model": m.IndexUpDownMarket.SIGMA_MODEL, "tau": 2.7e-5, "line": 100.0, "move": 3 * st,
                                                    "result": 1.0, "final": 100.0 * math.exp(3 * st)})
-    assert extreme.sigma_calib("SKHYNIX-15M") == (1.4, 20)
+    assert extreme.sigma_calib("SKHYNIX-15M") == (2.0, 20)
     # the daily crypto cards (1.106.1): a window a day each, pooled under one factor; a card's own key counts its 15-minute windows alone
     for i, key in enumerate(("BTC-DAY", "ETH-DAY", "BNB-DAY", "BTC-DAY", "ETH-DAY")):
         st_day = 0.5 * math.sqrt(1 / 730)
@@ -670,8 +752,8 @@ async def samples():
                                                      "sigma": 0.5, "sigma_raw": 0.5, "calib": 1.0, "model": 2, "tau": 1 / 730, "line": 100.0, "move": 2 * st_day,
                                                      "result": 1.0, "final": 100.0 * math.exp(2 * st_day)})
     pooled = m.Bot(m.Config.from_env(ENV), store, FM(T0), None)
-    assert abs(pooled.sigma_calib(m.CRYPTO_DAY_CALIB)[0] - math.sqrt((5 * 4 + 20) / 25)) < 1e-9 and pooled.sigma_calib(m.CRYPTO_DAY_CALIB)[1] == 5
-    assert pooled.sigma_calib("BTC-DAY") == (1.0, 0) and "σ 校准系数（BTC / ETH / BNB 日涨跌合并）：×1.26（按 5 个市场" in "\n".join(pooled.window_report())
+    assert abs(pooled.sigma_calib(m.CRYPTO_DAY_CALIB)[0] - math.sqrt((5 * 4 + 10) / 15)) < 1e-9 and pooled.sigma_calib(m.CRYPTO_DAY_CALIB)[1] == 5
+    assert pooled.sigma_calib("BTC-DAY") == (1.0, 0) and "σ 校准系数（BTC / ETH / BNB 日涨跌合并）：×1.41（按 5 个市场" in "\n".join(pooled.window_report())
     store.delete_keys([k for k in store.keys("wsample:") if k.startswith(("wsample:c", "wsample:e", "wsample:old", "wsample:d"))])  # the made-up windows go
     bot.sigma_calib_cache.clear()
     # a window that ended while the bot was down is settled on its kept end when the samples are read; an end within the tie

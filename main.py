@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.120.3"
+VERSION = "1.121.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -496,7 +496,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_AFTER_HOURS_SHARES", "盘后吃单每次最多买多少份", "0～1000000：开盘前、收盘后的吃单单独按这个份数；0 = 同盘中吃单的份数"),
     ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
-    ("SIGMA_CALIB", "σ 自动校准", "开 = 卡片的 σ 乘以按实际结果算出的系数（15 分钟和加密日涨跌限 0.7～1.4、和 20 个“刚好是 1”的先验一起平均；指数日涨跌限 0.6～2.0、和 10 日先验一起平均）：15 分钟涨跌按每张卡的定时样本，加密日涨跌三张卡合并按定时样本，指数日涨跌按 /calib 的快照残差、盘中和盘后各算；关 = 只用估计值"),
+    ("SIGMA_CALIB", "σ 自动校准", "开 = 卡片的 σ 乘以按实际结果算出的系数（15 分钟和加密日涨跌限 0.5～2.0、和 10 个“刚好是 1”的先验一起平均；指数日涨跌限 0.6～2.0、和 5 日先验一起平均）：15 分钟涨跌按每张卡的定时样本，加密日涨跌三张卡合并按定时样本，指数日涨跌按 /calib 的快照残差、盘中和盘后各算；关 = 只用估计值"),
     ("LEAD_QUOTE", "交易所现价先行（15 分钟涨跌）", "on = 卡片的现价按标的交易所的实时成交价相对窗口起点的涨跌折算（币安指数比交易所慢几秒到一分钟：卖涨给你的人先看到了下跌），和指数差超过 1% 或行情 15 秒没读到时退回指数，起点、终点仍按币安指数结算；shadow = 两种定价都记进模型样本、按指数交易，/calib 比较谁更准；off = 只用币安指数"),
     ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限、盘后每边持仓上限、加密日涨跌和 15 分钟涨跌的每边上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
@@ -4454,7 +4454,9 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
             a, b, k = fit
             beta_now = sum(r["beta"] for r in done) / len(done)
             sigma_now = sum(r["sigma"] for r in done) / len(done)
-            lines.append(f"  全样本拟合：系数 b {b:.2f}（现用 β {beta_now:g}）｜截距 {a * 100:+.3f}%｜"
+            newest = max(rows, key=lambda r: int(r.get("t") or 0))  # the β the card prices with now, scored or not (1.121.0: a dynamic β
+            #                                                           shows here the day it starts; the scored mean only once its days close)
+            lines.append(f"  全样本拟合：系数 b {b:.2f}（已评分快照的 β 均值 {beta_now:g}，最新快照 β {float(newest.get('beta') or 1):g}）｜截距 {a * 100:+.3f}%｜"
                          f"残差 σ {k * 100:.2f}%/日（现用 σ 均值 {sigma_now * 100:.2f}%）")
         if len(days) < CALIB_MIN_DAYS + 5:
             lines.append(f"  逐日向前检验：目标日 {len(days)} 个，至少要 {CALIB_MIN_DAYS + 5} 个才下结论")
@@ -4479,7 +4481,8 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
 CALIB_BUCKETS = ((0.0, 0.25, "R<0.25"), (0.25, 0.5, "0.25–0.5"), (0.5, 1.0, "0.5–1"), (1.0, math.inf, "R≥1"))
 
 
-RESIDUAL_PRIOR_DAYS = 10       # residual_factor: days' worth of "σ is right" the measured residuals are averaged with (20 before 1.117.0)
+RESIDUAL_PRIOR_DAYS = 5        # residual_factor: days' worth of "σ is right" the measured residuals are averaged with (10 before 1.121.0, 20 before 1.117.0:
+#                                SSE's intraday residuals at 1.59 over 21 days were still priced at ×1.43)
 RESIDUAL_RANGE = (0.6, 2.0)    # ...and the factor's bounds (0.7–1.4 before 1.117.0: the SSE intraday residuals' 1.59 sat on the cap)
 
 
@@ -7515,6 +7518,11 @@ CRYPTO_DAY_CALIB = "CRYPTO-DAY"  # Bot.sigma_calib: the daily crypto cards' pool
 MINUTE_VOL_HALF_LIFE = 60  # minute_vol: the weight of a minute's return halves every hour back — the last hour carries about half
 MINUTE_VOL_OPEN = 60       # ...and a session under this many minutes old is priced at least on its own minutes (the open's volatility)
 MINUTE_VOL_MIN = 30        # returns needed for a σ at all
+SHAPE_SLOT_MS = 15 * 60_000      # vol_shape: the usual volatility is kept by quarter hour of the local day
+SHAPE_DAYS = 14                  # ...from the 15-minute candles of the last this many days (a stock's: its sessions' alone)
+SHAPE_MIN_CANDLES = 96           # fewer candles than this (a day round the clock; four sessions): no shape, the plain estimate stands
+SHAPE_PRIOR = 8                  # a slot's variance is pooled with its two neighbours' at half weight and this many candles' worth of the day's mean
+SHAPE_FACTOR_BOUNDS = (0.4, 2.5)  # the factor the shape puts on the recent level (the window's usual σ over the recent minutes' usual) stays within this
 
 
 def minute_returns(rows: list, now_ms: int, keep: Any = None) -> list[tuple[int, float]]:
@@ -7526,29 +7534,108 @@ def minute_returns(rows: list, now_ms: int, keep: Any = None) -> list[tuple[int,
     return [(int(b[0]), math.log(float(b[4]) / float(a[4]))) for a, b in zip(done, done[1:]) if int(b[0]) - int(a[0]) == 60_000]
 
 
+class VolShape:
+    """The usual volatility by quarter hour of the local day (vol_shape): the price's 15-minute candles of the last
+    SHAPE_DAYS days — a stock's in its session alone — give each slot the mean of ln(close/open)² per minute, pooled with
+    its two neighbours' at half weight and SHAPE_PRIOR candles' worth of the day's mean (a slot with no candle, a half
+    day's, is the mean). Annualised σ², the units minute_vol works in. The level is not the shape's business: how lively
+    the day is comes from the last hours' 1-minute candles (minute_vol_shaped), the shape says how its hours differ.
+    1.121.0: the flat four-hour estimate lagged the day's turns — BTC's windows at 20–23 时 (the US open) moved 1.9–2.1
+    of the σ√τ priced and 00–08 时 0.1–0.7; a stock's 0.4–0.75 after its open hour (/calib 按开始时间)."""
+
+    def __init__(self, var: dict[int, float], mean: float, candles: int, span_days: float, tz: dt.tzinfo, built_ms: int):
+        self.var, self.mean, self.candles, self.span_days, self.tz, self.built_ms = var, mean, candles, span_days, tz, built_ms
+
+    def slot(self, ms: int) -> int:
+        local = dt.datetime.fromtimestamp(ms / 1000, self.tz)
+        return (local.hour * 60 + local.minute) * 60_000 // SHAPE_SLOT_MS
+
+    def var_at(self, ms: int) -> float:
+        return self.var.get(self.slot(ms), self.mean)
+
+    def sigma_at(self, ms: int) -> float:
+        return math.sqrt(max(self.var_at(ms), 0.0))
+
+
+def vol_shape(rows: list, now_ms: int, tz: dt.tzinfo, keep: Any = None) -> VolShape | None:
+    """The VolShape of a price's finished 15-minute candles (Binance klines) of the last SHAPE_DAYS days; with ``keep``
+    (open_ms -> bool: a session's minutes) the candles wholly inside a session alone. None below SHAPE_MIN_CANDLES."""
+    per_year = 365 * 24 * 60
+    sums: dict[int, float] = {}
+    counts: dict[int, int] = {}
+    since, first, last = now_ms - SHAPE_DAYS * DAY_MS, None, None
+    slots = VolShape({}, 0.0, 0, 0.0, tz, now_ms)
+    for r in rows:
+        if not (isinstance(r, list) and len(r) > 6):
+            continue
+        open_ms, close_ms = int(r[0]), int(r[6])
+        if close_ms >= now_ms or open_ms < since or (keep is not None and not (keep(open_ms) and keep(close_ms - 59_999))):
+            continue
+        opened, closed = float(r[1]), float(r[4])
+        if opened <= 0 or closed <= 0:
+            raise ValueError("15 分钟 K 线价格无效")
+        minutes = max(1, round((close_ms + 1 - open_ms) / 60_000))
+        slot = slots.slot(open_ms)
+        sums[slot] = sums.get(slot, 0.0) + math.log(closed / opened) ** 2 / minutes * per_year
+        counts[slot] = counts.get(slot, 0) + 1
+        first, last = open_ms if first is None else min(first, open_ms), open_ms if last is None else max(last, open_ms)
+    n = sum(counts.values())
+    if n < SHAPE_MIN_CANDLES:
+        return None
+    mean, a_day = sum(sums.values()) / n, DAY_MS // SHAPE_SLOT_MS
+    var: dict[int, float] = {}
+    for slot in range(a_day):
+        num, den = SHAPE_PRIOR * mean, float(SHAPE_PRIOR)
+        for step, w in ((0, 1.0), (-1, 0.5), (1, 0.5)):
+            k = (slot + step) % a_day
+            if k in sums:
+                num, den = num + w * sums[k], den + w * counts[k]
+        var[slot] = num / den
+    return VolShape(var, mean, n, (last - first) / DAY_MS, tz, now_ms)
+
+
 def minute_vol(rows: list, now_ms: int, minutes: int = 240, keep: Any = None, half_life: int = MINUTE_VOL_HALF_LIFE,
-               open_floor: bool = True) -> float:
+               open_floor: bool = True, shape: "VolShape | None" = None, at_ms: int | None = None) -> float:
     """Annualised σ of a price's finished 1-minute closes: the exponentially weighted RMS of the last ``minutes`` returns
     (zero mean; a weight halving every ``half_life`` minutes back: the last hour carries about half), and, while a
     session is under MINUTE_VOL_OPEN minutes old, at least the plain RMS of its own minutes (the open moves more than the
     weights have caught up with). With ``keep`` (open_ms -> bool: a session's minutes) only those candles count, and
     only the returns between neighbouring minutes — not the jump over a lunch break or a night. 0 when the price has
-    not moved at all. 1.106.0: 1.103.0 took the larger of the last four hours' σ and the last hour's — the open's hour
+    not moved at all. With ``shape`` the figure is put on the usual volatility of the minute at ``at_ms``
+    (minute_vol_shaped). 1.106.0: 1.103.0 took the larger of the last four hours' σ and the last hour's — the open's hour
     stayed in the four-hour figure all morning and the larger of two noisy figures is biased up: the 11-04/05 windows
     moved 0.69 (SK 海力士) and 0.77 (宇树) of the σ√τ priced, 1.0 in the hour after the open and 0.4–0.6 later."""
+    return minute_vol_shaped(rows, now_ms, minutes, keep, half_life, open_floor, shape, at_ms)[0]
+
+
+def minute_vol_shaped(rows: list, now_ms: int, minutes: int = 240, keep: Any = None, half_life: int = MINUTE_VOL_HALF_LIFE,
+                      open_floor: bool = True, shape: "VolShape | None" = None, at_ms: int | None = None) -> tuple[float, float]:
+    """(σ, the shape's factor in it): the level the last ``minutes`` returns show (minute_vol's weighted RMS, its open
+    floor) over the level the shape says those same minutes usually have, times the usual σ of the minute at ``at_ms``
+    (the window's slot; now without one) — a day twice as lively as usual prices twice the usual σ of its hour. The
+    factor (the slot's usual σ over the recent minutes' usual) stays within SHAPE_FACTOR_BOUNDS. Without a shape (none
+    read yet, too few candles) the plain figure and 1."""
     rets = minute_returns(rows, now_ms, keep)[-minutes:]
     if len(rets) < MINUTE_VOL_MIN:
         raise ValueError("指数 1 分钟 K 线不足")
     per_year = 365 * 24 * 60
     weights = [0.5 ** ((len(rets) - 1 - i) / half_life) for i in range(len(rets))]
-    sigma = math.sqrt(sum(w * r * r for w, (_, r) in zip(weights, rets)) / sum(weights) * per_year)
+    level = math.sqrt(sum(w * r * r for w, (_, r) in zip(weights, rets)) / sum(weights) * per_year)
+    usual = math.sqrt(sum(w * shape.var_at(t) for w, (t, _) in zip(weights, rets)) / sum(weights)) if shape is not None else 0.0
     run = 1  # the unbroken stretch of minutes up to now: a session's age, when the kept minutes are a session's
     while run < len(rets) and rets[-run][0] - rets[-run - 1][0] == 60_000:
         run += 1
     if open_floor and 10 <= run < MINUTE_VOL_OPEN and run < len(rets):
-        own = [r for _, r in rets[-run:]]
-        sigma = max(sigma, math.sqrt(sum(r * r for r in own) / len(own) * per_year))
-    return sigma
+        own = rets[-run:]
+        own_level = math.sqrt(sum(r * r for _, r in own) / len(own) * per_year)
+        if own_level > level:
+            level = own_level
+            usual = math.sqrt(sum(shape.var_at(t) for t, _ in own) / len(own)) if shape is not None else 0.0
+    if shape is None or level <= 0 or usual <= 0:
+        return level, 1.0
+    low, high = SHAPE_FACTOR_BOUNDS
+    factor = min(high, max(low, shape.sigma_at(at_ms if at_ms is not None else now_ms) / usual))
+    return level * factor, factor
 
 
 class IndexUpDownMarket(UpDownMarket):
@@ -7565,7 +7652,11 @@ class IndexUpDownMarket(UpDownMarket):
     PRICE_STALE_MS = 60_000      # an index older than this prices nothing
     SIGMA_STALE_MS = 30 * 60_000
     SIGMA_MINUTES = 240          # σ: the last four hours of 1-minute index candles, the last hour weighing about half (minute_vol)
-    SIGMA_MODEL = 2              # the estimator's version, kept on each sample: the calibration counts samples of the current one alone
+    SIGMA_MODEL = 3              # the estimator's version, kept on each sample: the calibration counts samples of the current one alone
+    #                              (3: the shape of the day, 1.121.0; 2: the weighted four hours, 1.106.0)
+    SHAPE_SECONDS = 3600         # the shape of the day (vol_shape) is read this often, and at once while there is none
+    SHAPE_RETRY_SECONDS = 300    # ...and this soon after a read failed
+    SHAPE_ROWS = 1500            # 15-minute candles read for it (the futures API's most: 15 days round the clock; a stock's sessions within SHAPE_DAYS)
     TIE = D("0.0005")            # an end this close to the start (relative) is left to Predict: Chainlink's report may differ
 
     SIGMA_ROWS = 1500            # candles read for σ when the trading minutes are a subset (the previous session's reach back a day)
@@ -7588,11 +7679,16 @@ class IndexUpDownMarket(UpDownMarket):
     LEAD_START_TOLERANCE_MS = 20_000  # the quote taken for the window's start must be from within this of the start moment
     LEAD_MAX_GAP = 0.01               # an exchange price this far (ln) from the index is another instrument, a currency move: not used
 
-    def __init__(self, store: "Store", spec: UpDownSpec, futures: Any = None, exchange: str = "", trading: Any = None):
+    def __init__(self, store: "Store", spec: UpDownSpec, futures: Any = None, exchange: str = "", trading: Any = None,
+                 shape: "VolShape | None" = None):
         super().__init__(store, spec)
         self.futures = futures or binance_futures  # the bot passes its own futures feed (base URL, rate-limit cooldown)
         self.exchange = exchange  # the stock exchange whose session the windows follow ("" = round the clock)
         self.trading = trading    # open_ms -> whether that minute is in the exchange's session (session_minute_fn): σ counts those alone
+        self.shape = shape        # the usual volatility by quarter hour (vol_shape), carried from window to window (at); None until read
+        self.shape_ms = 0         # when it was last read, or last tried (SHAPE_SECONDS / SHAPE_RETRY_SECONDS)
+        self.shape_factor = 1.0   # the shape's factor in the σ in hand (minute_vol_shaped)
+        self.shape_error = ""     # why the last read of the shape failed (the one in hand stands)
         self.index_ms = 0  # the newest index's own time (the push's event time, the read's)
         self.lead: IndexQuote | None = None  # the exchange's realtime quote now (Bot.refresh_updown: note_lead), None when it has none
         self.strike: D | None = None  # the start price Predict shows for the window (Bot.refresh_updown): the line when it agrees with the candle (line_used)
@@ -7684,7 +7780,41 @@ class IndexUpDownMarket(UpDownMarket):
         return await self.futures(path, **params)
 
     def at(self, spec: UpDownSpec) -> "IndexUpDownMarket":
-        return IndexUpDownMarket(self.store, spec, self.futures, self.exchange, self.trading)
+        return self.carry(IndexUpDownMarket(self.store, spec, self.futures, self.exchange, self.trading, self.shape))
+
+    def carry(self, mkt: "IndexUpDownMarket") -> "IndexUpDownMarket":
+        """The next window's market with this one's shape of the day and when it was read (one read an hour, not one a window)."""
+        mkt.shape_ms = self.shape_ms
+        return mkt
+
+    def shape_tz(self) -> dt.tzinfo:
+        """The clock the shape's quarter hours follow: the stock exchange's, Beijing round the clock."""
+        return dt.timezone(dt.timedelta(hours=STOCK_MARKETS[self.exchange].utc_offset)) if self.exchange else BEIJING
+
+    async def candles(self, interval: str, limit: int) -> Any:
+        """The index's candles of ``interval``, the last ``limit``."""
+        return await self.get("indexPriceKlines", pair=self.spec.symbol, interval=interval, limit=limit)
+
+    async def read_shape(self, now_ms: int) -> None:
+        """The shape of the day (vol_shape) from the last SHAPE_ROWS 15-minute candles — read hourly (SHAPE_SECONDS); a read
+        that fails, or finds too few candles, keeps the shape in hand (none: the plain σ) and is tried again in
+        SHAPE_RETRY_SECONDS."""
+        try:
+            shape = vol_shape(await self.candles("15m", self.SHAPE_ROWS), now_ms, self.shape_tz(), self.trading)
+        except Exception as error:
+            shape, self.shape_error = None, clean_error(error) or type(error).__name__
+        else:
+            self.shape_error = "" if shape is not None else f"近 {SHAPE_DAYS} 日的 15 分钟 K 线不足 {SHAPE_MIN_CANDLES} 根"
+        if shape is not None:
+            self.shape, self.shape_ms = shape, now_ms
+        else:
+            self.shape_ms = now_ms - (self.SHAPE_SECONDS - self.SHAPE_RETRY_SECONDS) * 1000
+
+    def shape_note(self) -> str:
+        """The shape's part in the σ note: its factor and the days behind it, or why there is none."""
+        if self.shape is None:
+            return f"，分时形态未取得（{brief_error(self.shape_error, 40)}）" if self.shape_error else ""
+        return f"，分时形态 ×{self.shape_factor:.2f}（近 {self.shape.span_days:.0f} 日同一时段）"
 
     def push_price(self, price: D, now_ms: int) -> None:
         return None  # a trade is not the index: only push_index prices it
@@ -7740,10 +7870,13 @@ class IndexUpDownMarket(UpDownMarket):
     async def read_vol(self, now_ms: int) -> None:
         """σ from the 1-minute index candles: the session's minutes alone when the windows follow one (the index stands still
         outside it: a σ over the night or the lunch break would call the open near certain); enough candles to reach the
-        previous session."""
-        rows = await self.get("indexPriceKlines", pair=self.spec.symbol, interval="1m",
-                              limit=self.SIGMA_ROWS if self.trading else self.SIGMA_MINUTES + 2)
-        self.sigma, self.sigma_ms = minute_vol(rows, now_ms, self.SIGMA_MINUTES, self.trading), now_ms
+        previous session. 1.121.0: the level they show is put on the shape of the day (read_shape, minute_vol_shaped)."""
+        if self.shape is None or now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:
+            await self.read_shape(now_ms)  # the usual volatility of the window's quarter hour, which the level below is put on
+        rows = await self.candles("1m", self.SIGMA_ROWS if self.trading else self.SIGMA_MINUTES + 2)
+        self.sigma, self.shape_factor = minute_vol_shaped(rows, now_ms, self.SIGMA_MINUTES, self.trading, shape=self.shape,
+                                                          at_ms=self.spec.start_ms + 60_000)
+        self.sigma_ms = now_ms
 
     def odds(self, now_ms: int) -> UpDownOdds | str:
         spec = self.spec
@@ -7789,6 +7922,7 @@ class SpotWindowMarket(IndexUpDownMarket):
     SOURCE_LINE = "币安现货 1 分钟 K"
     PRICE_TEXT = "币安现货 {symbol} 价格"
     SIGMA_TEXT = "币安现货 {symbol} 近 4 小时 1 分钟 K（近 1 小时权重过半）"
+    SHAPE_ROWS = 1000   # the spot API's most 15-minute candles a read: ten days round the clock
     PROXY_NOTE = "不用代理：结算源 Chainlink 取币安现货买卖一的中间价，卡片按最新成交价，两者相差不到一个最小价位"
     GROUP = "crypto"
     TIE = D("0.0001")
@@ -7801,7 +7935,10 @@ class SpotWindowMarket(IndexUpDownMarket):
         return await binance_spot(path, **params)
 
     def at(self, spec: UpDownSpec) -> "SpotWindowMarket":
-        return SpotWindowMarket(self.store, spec)
+        return self.carry(SpotWindowMarket(self.store, spec, shape=self.shape))
+
+    async def candles(self, interval: str, limit: int) -> Any:
+        return await self.get("klines", symbol=self.spec.symbol, interval=interval, limit=limit)
 
     def push_price(self, price: D, now_ms: int) -> None:
         """A trade pushed in without its own time: taken as newer than whatever the card holds (trades come in order)."""
@@ -7814,9 +7951,12 @@ class SpotWindowMarket(IndexUpDownMarket):
             self.index_ms, self.price, self.priced_ms = now_ms, number(data["price"], f"{self.spec.symbol} 现货价"), now_ms
 
     async def read_vol(self, now_ms: int) -> None:
-        """σ from the pair's 1-minute candles (minute_vol)."""
-        rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", limit=self.SIGMA_MINUTES + 2)
-        self.sigma, self.sigma_ms = minute_vol(rows, now_ms, self.SIGMA_MINUTES), now_ms
+        """σ from the pair's 1-minute candles (minute_vol), put on the shape of the day (1.121.0: read_shape, minute_vol_shaped)."""
+        if self.shape is None or now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:
+            await self.read_shape(now_ms)
+        rows = await self.candles("1m", self.SIGMA_MINUTES + 2)
+        self.sigma, self.shape_factor = minute_vol_shaped(rows, now_ms, self.SIGMA_MINUTES, shape=self.shape, at_ms=self.spec.start_ms + 60_000)
+        self.sigma_ms = now_ms
 
     async def read_candle(self, open_ms: int) -> D:
         """The close of exactly the pair's 1-minute candle that opens at open_ms (a neighbouring minute is never taken)."""
@@ -14456,7 +14596,8 @@ class Bot:
             calib = getattr(mkt, "calib", (1.0, 0))
             row.update(up=odds.fair_up, sigma=mkt.sigma_used, sigma_raw=mkt.sigma, calib=calib[0], tau=odds.years, z=odds.z, price=float(odds.price),
                        line=float(odds.line), need=self.edge_need(mkt.model_swing(odds)), hold=self.updown_hold(mkt, odds, now_ms)[0], settled=odds.settled,
-                       model=getattr(mkt, "SIGMA_MODEL", 1))  # the estimator's version: the calibration counts the current one's samples alone
+                       model=getattr(mkt, "SIGMA_MODEL", 1),  # the estimator's version: the calibration counts the current one's samples alone
+                       shape=getattr(mkt, "shape_factor", 1.0))  # the shape of the day's factor in that σ (1.121.0)
             if isinstance(mkt, IndexUpDownMarket) and not odds.settled and mkt.price and mkt.sigma_used:
                 led, gap, _ = mkt.lead_price(now_ms)  # LEAD_QUOTE: both prices' fair values, whichever the card trades on (window_report compares)
                 if led is not None:
@@ -14499,8 +14640,9 @@ class Bot:
         self.sigma_calib_cache.pop(spec.key, None)  # the card's factor is measured again on the next refresh (sigma_calib)
         self.sigma_calib_cache.pop(CRYPTO_DAY_CALIB, None)
 
-    SIGMA_CALIB_PRIOR = 20     # sigma_calib: windows' worth of "σ is right" the measured ones are averaged with
-    SIGMA_CALIB_RANGE = (0.7, 1.4)
+    SIGMA_CALIB_PRIOR = 10     # sigma_calib: windows' worth of "σ is right" the measured ones are averaged with (20 before 1.121.0)
+    SIGMA_CALIB_RANGE = (0.5, 2.0)  # ...and the factor's bounds (0.7–1.4 before 1.121.0: SK 海力士's windows moved 0.69 of the σ√τ
+    #                                 priced and 13 of them against the prior of 20 reached ×0.89; the daily crypto cards' 2.9 sat on 1.4)
 
     def sigma_calib(self, key: str) -> tuple[float, int]:
         """The factor a card's σ is priced with (SIGMA_CALIB, 1.106.0) and the windows it rests on: the RMS of the
@@ -14513,9 +14655,12 @@ class Bot:
         if cached is not None:
             return cached
         firsts: dict[str, dict] = {}
+        # the current estimator's samples alone: the daily cards' (UpDownMarket), or this card's own (1.121.0: the 15-minute
+        # cards moved to the shape of the day, version 3; the daily cards stayed at 2)
+        current = UpDownMarket.SIGMA_MODEL if key == CRYPTO_DAY_CALIB else getattr(self.updowns.get(key), "SIGMA_MODEL", IndexUpDownMarket.SIGMA_MODEL)
         for r in self.window_rows():
             mine = r.get("kind") == "day" if key == CRYPTO_DAY_CALIB else (r.get("key") == key and r.get("kind") == "window")
-            if (not mine or r.get("move") is None or int(r.get("model") or 1) < UpDownMarket.SIGMA_MODEL
+            if (not mine or r.get("move") is None or int(r.get("model") or 1) < current
                     or not r.get("sigma_raw") or not r.get("tau")):
                 continue
             slug = str(r.get("slug"))
@@ -15920,6 +16065,7 @@ class Bot:
         sigma = mkt.sigma_used or 0.0
         calib = getattr(mkt, "calib", (1.0, 0))
         calib_note = f"，按 {calib[1]} 个窗口的实际波动校准 ×{calib[0]:.2f}" if calib[1] and abs(calib[0] - 1) > 0.005 else ""
+        shape_note = mkt.shape_note() if isinstance(mkt, IndexUpDownMarket) else ""  # 1.121.0: the shape of the day in it
         verdict = "涨" if odds.up else "跌"
         minutes = max(odds.years * YEAR_MS / 60_000, 0.0)
         lead_note = "" if odds.settled else mkt.lead_text(now_ms)  # LEAD_QUOTE: the exchange quote's part in the price
@@ -15933,7 +16079,7 @@ class Bot:
                                if odds.settled else lead_note or mkt.PROXY_NOTE),
                 "warn": hold, "sigma_daily": sigma / math.sqrt(365), "remaining": odds.years * 365,
                 "sigma": sigma * math.sqrt(odds.years),
-                "sigma_note": (f"{mkt.SIGMA_TEXT.format(symbol=spec.symbol)}年化 {sigma * 100:.1f}%{calib_note}；"
+                "sigma_note": (f"{mkt.SIGMA_TEXT.format(symbol=spec.symbol)}年化 {sigma * 100:.1f}%{calib_note}{shape_note}；"
                                f"剩 {minutes:.1f} 分钟；价格零漂移" if not odds.settled else "已结算"),
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down}

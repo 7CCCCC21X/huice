@@ -35,15 +35,16 @@ trend_line = next(l for l in text.splitlines() if l.startswith("  按快照前�
 assert "价在跌：30 条/30 日，预测涨" in trend_line and "价在涨：30 条/30 日" in trend_line and "基本没动：30 条/30 日" in trend_line, trend_line
 assert m.trend_lines([]) == [] and m.trend_lines([{"trend": None, "sigma": 0.02}]) == []
 # 1.106.1: the residual factor (SIGMA_CALIB for the index cards): the day-weighted RMS of z = (y − β·move) / (raw σ·√R), pooled
-# with 20 days at 1 — the true residual 0.8%/day against a 2% σ: z's RMS about 0.47, the factor about 0.73
+# with 5 days at 1 (1.121.0; 10 in 1.117.0, 20 before) — the true residual 0.8%/day against a 2% σ: z's RMS about 0.47, floored at 0.6
 done = [dict(p, y=math.log(outcomes[f"KOSPI:{p['target']}"] / p["ref"])) for p in preds if f"KOSPI:{p['target']}" in outcomes]
 f, n = m.residual_factor(done)
 assert n == 30 and 0.6 <= f < 0.9 and m.residual_factor([]) == (1.0, 0), (f, n)  # 1.117.0: the fixture's small residuals sit on the 0.6 floor
 assert m.residual_factor([dict(r, sigma=r["sigma"] * 0.5, sigma_raw=r["sigma"]) for r in done]) == (f, n), "a snapshot's own factor is taken off first"
 assert m.residual_factor([dict(r, y=r["y"] * 10) for r in done]) == (2.0, 30) and m.residual_factor([dict(r, y=r["beta"] * r["move"]) for r in done]) == (0.6, 30)  # 1.117.0: no residual at all: √(10/40) = 0.5, floored at 0.6
-rms, rms_days = m.residual_rms(done)  # the factor is the day-weighted RMS pooled with the 10-day prior at 1
-assert rms_days == 30 and abs(f - min(2.0, max(0.6, math.sqrt((rms * rms * 30 + 10) / 40)))) < 1e-12 and m.residual_rms([]) == (0.0, 0), (f, rms)
-assert f"σ 校准系数：×{f:.2f}（按 30 日残差，先验 10 日按 1 计，限 0.6～2" in text and "逐日向前检验（σ 校准，80 条，同一公式）：不校准 Brier" in text, text
+rms, rms_days = m.residual_rms(done)  # the factor is the day-weighted RMS pooled with the 5-day prior at 1
+assert rms_days == 30 and abs(f - min(2.0, max(0.6, math.sqrt((rms * rms * 30 + 5) / 35)))) < 1e-12 and m.residual_rms([]) == (0.0, 0), (f, rms)
+assert m.RESIDUAL_PRIOR_DAYS == 5 and m.RESIDUAL_RANGE == (0.6, 2.0)
+assert f"σ 校准系数：×{f:.2f}（按 30 日残差，先验 5 日按 1 计，限 0.6～2" in text and "逐日向前检验（σ 校准，80 条，同一公式）：不校准 Brier" in text, text
 # the volatility book applies the factor to the σ it hands out and says so; a mode without one is untouched
 vb = m.VolBook({}, None)
 plain, plain_in = vb.get("KOSPI", "KOSPI"), vb.get("KOSPI", "KOSPI", intraday=True)
@@ -135,15 +136,15 @@ async def run():
         kbot.store.put(f"pred:KOSPI:{9_000_000 + i}", {"key": "KOSPI", "t": 9_000_000 + i, "target": day, "mode": "盘中", "ref": 3300.0, "up": 0.5,
                                                        "move": 0.0, "beta": 1.0, "sigma": 0.01, "R": 1.0})
     calibs = kbot.index_sigma_calibs()
-    assert 1.74 < calibs[("KOSPI", "盘中")][0] < 1.76 and calibs[("KOSPI", "盘中")][1] == 26, calibs  # (the fixture's own earlier snapshot is the 26th day)
+    assert 1.83 < calibs[("KOSPI", "盘中")][0] < 1.85 and calibs[("KOSPI", "盘中")][1] == 26, calibs  # (the fixture's own earlier snapshot is the 26th day; 1.121.0: the 5-day prior)
     kbot.vols.calib = calibs
-    assert "快照残差校准 ×1.75" in kbot.vols.get("KOSPI", "KOSPI", intraday=True)[1]
+    assert "快照残差校准 ×1.84" in kbot.vols.get("KOSPI", "KOSPI", intraday=True)[1]
     kbot.config = m.dataclasses.replace(kbot.config, sigma_calib=False)
     kbot.note_outcome("KOSPI", "2026-07-26", 3300.0, "test")
     assert kbot.vols.calib == {}
     kbot.config = m.dataclasses.replace(kbot.config, sigma_calib=True)
     kbot.note_outcome("KOSPI", "2026-07-27", 3300.0, "test")
-    assert 1.7 < kbot.vols.calib[("KOSPI", "盘中")][0] < 1.8  # measured again on the outcome (1.117.0: no longer the 1.4 cap)
+    assert 1.8 < kbot.vols.calib[("KOSPI", "盘中")][0] < 1.9  # measured again on the outcome (1.117.0: no longer the 1.4 cap; 1.121.0: the 5-day prior)
     kbot.pred_last.clear(); kbot.record_predictions(t0 + 180_000)
     last = max((v for _, v in kbot.store.items("pred:KOSPI")), key=lambda v: v["t"])  # the one just recorded (the made-up rows sort after it)
     assert last["calib"] == kbot.vols.calib.get(("KOSPI", last["mode"]), (1.0, 0))[0] and abs(last["sigma_raw"] * last["calib"] - last["sigma"]) < 1e-12, last
