@@ -689,7 +689,7 @@ class Controller:
         lines = [f"开盘前预挂体检 {hms(now)}：{'有问题' if problems else '正常'}" + ("" if self.alive else f"；本模式已停止：{self.error}")]
         lines.append(f"限流：{cooldown or '没有冷却'}；24 小时内触发 {len(limited)} 次" + (f"，最近 {hms(limited[-1])}" if limited else ""))
         lines.append(f"账户快照：{'还没读到' if not self.account_at else str((now - self.account_at) // 1000) + ' 秒前'}；余额 {self.balance:.2f}U，"
-                     f"账户挂单占用 {self.open_reserved:.2f}U，本模式预留 {self.risk():.2f}U（限额 {self.settings.max_open_usd:g}U）"
+                     f"账户挂单占用 {self.open_reserved:.2f}U，本模式预留 {self.risk():.2f}U（{f'限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '不设上限'}）"
                      + (f"；另有 {self.unmanaged} 笔两个策略都没记录的挂单：" + "；".join(self.unmanaged_detail) + ("…" if self.unmanaged > len(self.unmanaged_detail) else "")
                         if self.unmanaged else ""))
         lines.append(f"新挂：{hold or '正常'}；队列 {self.queue.qsize()} 场，等候 {len(self.parked)} 场"
@@ -752,8 +752,8 @@ class Controller:
         USDT for a resting order, the reservation is this mode's accounting), the USDT balance, the per-order cap."""
         pair_usd = self.settings.pair_usd if pair_usd is None else pair_usd
         side_usd = self.settings.side_usd if side_usd is None else side_usd
-        limit = self.settings.max_open_usd
-        if self.risk() + pair_usd > limit + 1e-9:
+        limit = self.settings.max_open_usd  # 0: none (1.132.3) — the balance (one pair's worth) and the per-order cap still hold
+        if limit and self.risk() + pair_usd > limit + 1e-9:
             return f"预挂资金上限不足：已预留 {self.risk():.2f}U，再挂一场双边要 {pair_usd:g}U，限额 {limit:g}U（PREOPEN_MAX_OPEN_USD）"
         if self.balance < pair_usd:  # 1.130.5: the account's open orders are each their own allowance (the money is taken at a match): one pair's worth is enough
             return f"可用USDT {self.balance:.2f}U 不够一场双边（{pair_usd:g}U）"
@@ -832,7 +832,7 @@ class Controller:
             return "距订单到期不足一分钟，不再发送"
         if self.now() - self.account_at > 30_000:
             return "账户快照过期，不再发送"
-        if self.risk() > self.settings.max_open_usd + 1e-9:  # (this mode's own cap, 1.132.1; the pair is reserved by now)
+        if self.settings.max_open_usd and self.risk() > self.settings.max_open_usd + 1e-9:  # (this mode's own cap, 1.132.1; the pair is reserved by now)
             return "最新资金限额不允许发送"
         return ""
 
@@ -1688,8 +1688,8 @@ class Controller:
                 f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清），"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
-                f"预留 {self.risk():.2f}U / 限额 {self.settings.max_open_usd:g}U（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉且一份没成交的场次立即释放）"
-                + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if pairs_left else "")
+                f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉且一份没成交的场次立即释放）"
+                + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，按开场先后补挂中") if pairs_left else "")
                 + f"\n扫描：{self.scan_note or '还没扫过'}"
                 + f"\n最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")

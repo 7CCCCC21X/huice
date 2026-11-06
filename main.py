@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.132.2"
+VERSION = "1.132.3"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -506,7 +506,7 @@ class PreopenSettings:
     expiry_seconds: int = 10   # PREOPEN_EXPIRY_SECONDS: the signed order expires this long before the start (the backstop when the cancel fails)
     entry_seconds: int = 180   # PREOPEN_ENTRY_SECONDS: no new pair this close to the start
     ahead_minutes: int = 1440  # PREOPEN_AHEAD_MINUTES: only windows starting within this are placed, the soonest first (1.126.0: a day = every listed window)
-    max_open_usd: float = 7000.0
+    max_open_usd: float = 0.0  # PREOPEN_MAX_OPEN_USD: this mode's own reservation cap; 0 = none (1.132.3, the default)
     price: D = D("0.49")       # PREOPEN_PRICE_CENTS
     shares: D = D("10")        # PREOPEN_SHARES: the trial size; 50 was the first revision's
     levels: tuple = ((D("0.49"), D("10")),)  # (price, shares) a side per level, the first = price × shares; PREOPEN_LEVELS adds deeper ones (1.129.0)
@@ -543,7 +543,7 @@ class PreopenSettings:
     @classmethod
     def parse(cls, e: Mapping, enabled: bool) -> "PreopenSettings":
         poll = float(e.get("PREOPEN_POLL_SECONDS", "5"))
-        cap = float(e.get("PREOPEN_MAX_OPEN_USD", "7000"))
+        cap = float(e.get("PREOPEN_MAX_OPEN_USD", "0"))  # 0 = no cap (1.132.3: Predict locks no USDT for a resting order; the balance check stands)
         cents, shares, ahead = int(e.get("PREOPEN_PRICE_CENTS", "49")), int(e.get("PREOPEN_SHARES", "10")), int(e.get("PREOPEN_AHEAD_MINUTES", "1440"))
         cancel, expiry, entry = int(e.get("PREOPEN_CANCEL_SECONDS", "20")), int(e.get("PREOPEN_EXPIRY_SECONDS", "10")), int(e.get("PREOPEN_ENTRY_SECONDS", "180"))
         stems = {r.stem.lower(): r.key for r in WINDOW_UPDOWN_MARKETS}
@@ -566,10 +566,10 @@ class PreopenSettings:
                 or any(levels[i][0] <= levels[i + 1][0] for i in range(len(levels) - 1)) or not 3 <= deep <= ahead):
             raise ValueError(f"PREOPEN_LEVELS 至多 5 档，每档价格 1～50¢、份数 1～500、每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格要比第一档低、逐档递减；"
                              "PREOPEN_DEEP_AHEAD_MINUTES 3～PREOPEN_AHEAD_MINUTES（0 = 和第一档一样）")
-        if (not 1 <= poll <= 60 or not 1 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
+        if (not 1 <= poll <= 60 or not 0 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
                 or not 3 <= ahead <= 1440 or not markets <= keys or float(price * shares) < PREOPEN_MIN_SIDE_USD
                 or not 5 <= expiry <= 600 or not expiry + 5 <= cancel <= 900 or not cancel + 60 <= entry <= 3600):
-            raise ValueError("PREOPEN_POLL_SECONDS 1～60、PREOPEN_MAX_OPEN_USD 1～1000000、PREOPEN_PRICE_CENTS 1～50、PREOPEN_SHARES 1～500（每边不少于 "
+            raise ValueError("PREOPEN_POLL_SECONDS 1～60、PREOPEN_MAX_OPEN_USD 0～1000000（0 = 不限）、PREOPEN_PRICE_CENTS 1～50、PREOPEN_SHARES 1～500（每边不少于 "
                              f"Predict 最小订单 ${PREOPEN_MIN_SIDE_USD:g}）、PREOPEN_AHEAD_MINUTES 3～1440、PREOPEN_MARKETS 只能是 {'、'.join(sorted(keys))} 或 all；"
                              "PREOPEN_EXPIRY_SECONDS 5～600，PREOPEN_CANCEL_SECONDS 至少比它大 5 秒、至多 900，PREOPEN_ENTRY_SECONDS 至少比撤单时间大 60 秒、至多 3600")
         return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
@@ -664,7 +664,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
     ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）"),
     ("PREOPEN_ENTRY_SECONDS", "距开场不足几秒不再新挂", "至少比撤单时间多 60 秒、至多 3600（默认 180）"),
-    ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "1～1000000：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金）；每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放；/preopen 会算出把已发布的全部挂上需要多少"),
+    ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
 # One-click combinations for the control page (一键搭配): the strategy settings only. What to trade (SIM_MARKETS, SIM_SKIP),
@@ -9936,7 +9936,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "15", "20", "30", "60"], "unit": "秒"},
     "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["5", "10", "15", "30"], "unit": "秒"},
     "PREOPEN_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["90", "120", "180", "300"], "unit": "秒"},
-    "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["50", "100", "200", "500", "1000", "7000"], "unit": "$"},
+    "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "7000", "20000"], "unit": "$", "zero": "不限"},
     "SIM_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["3", "5", "8", "10", "15", "20"], "unit": "¢"},
     "SIM_SHARES": {"kind": "number", "group": "策略", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "SIM_TAKER_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "10", "20", "50", "100", "200"], "unit": "份", "zero": "同每次份数"},

@@ -632,6 +632,9 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl.account_at = 0
         self.assertIn("还没有读到", ctl.hold())
         ctl.account_at = clock.ms
+        self.assertEqual((ctl.settings.max_open_usd, ctl.budget_problem(9_000.0)), (0.0, ""), "1.132.3: no cap by default — Predict locks nothing for a resting order")
+        self.assertIn("不够一场双边", ctl.budget_problem(49_000_000.0), "the balance must still cover one pair")
+        self.assertIn("预留 49.00U，不设上限（本模式自己的账", ctl.status())
         ctl.settings = dataclasses.replace(ctl.settings, max_open_usd=48)
         self.assertEqual(ctl.hold(), "")
         self.assertIn("\n暂不新挂：预挂资金上限不足：已预留 49.00U，再挂一场双边要 49U，限额 48U（PREOPEN_MAX_OPEN_USD）", ctl.status())
