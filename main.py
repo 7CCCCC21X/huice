@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.130.2"
+VERSION = "1.130.3"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -12226,6 +12226,8 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
 <div class="tiles" id="tiles"></div>
+<section class="box" id="unrecbox" hidden><div class="hd"><h2>账户里有、记录里没有的持仓</h2><span class="sum" id="unrecsum"></span></div>
+<div class="body" id="unrecbody"></div><p class="small mut" id="unrecnote" hidden>按最近一次读到的 Predict 持仓，减去记录和开盘前预挂的份数；多出来的多半是没有记录的挂单成交了（手动单、丢失跟踪的单）。每分钟一次的持仓核对会把它补记到同一方向最近结束的订单上，没有这样的订单就留在这里；/live fills 给出逐项对照。</p></section>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
 <div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>今日按市场 <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。</p><p class="small mut">按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="anaref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><button type="button" class="lnk" id="foldana">展开</button></div>
@@ -12638,7 +12640,7 @@ function foot(){document.getElementById("foot").textContent=data.live?"真实订
 function render(){
   if(!data)return;
   const name=data.live?"交易复盘":"模拟交易复盘";document.getElementById("title").textContent=name;document.title=name;
-  tiles();summary();analysis();stats();filters();foot();
+  tiles();unrecorded();summary();analysis();stats();filters();foot();
   const st=(STATES.find(s=>s[0]===stateF)||STATES[0])[2];
   const all=data.trades.filter(t=>st(t)&&(wayF==="all"||(wayF==="maker")===!!t.maker)&&(kindF==="all"||t.kind===kindF)&&(cardF==="all"||t.card===cardF)&&matches(t)),page=all.slice(0,shown);
   document.getElementById("qn").textContent=qF?"匹配 "+all.length+" 笔"+(data.more>0&&!allLoaded?"（更早的 "+data.more+" 笔还没载入，点下面“载入更早的”）":""):"";
@@ -12646,6 +12648,10 @@ function render(){
   const nodes=[];let day="";page.forEach(t=>{const k=dayKey(t.opened);if(k!==day){day=k;nodes.push(dayHead(t.opened,byDay.get(k)))}nodes.push(row(t))});
   document.getElementById("list").replaceChildren(...(nodes.length?nodes:[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有交易")]));
   more(all.length)}
+function unrecorded(){  // the positions the account holds beyond the records (1.130.3), and the orders without a record
+  const L=data.live||{},rows=L.unrecorded||[],box=document.getElementById("unrecbox");box.hidden=!rows.length&&!L.unknown_orders;document.getElementById("unrecnote").hidden=box.hidden;if(box.hidden)return;
+  document.getElementById("unrecsum").textContent=(L.unknown_orders?"账户上还有 "+L.unknown_orders+" 张没有记录的挂单；":"")+(L.positions_at?"持仓读于 "+when(L.positions_at):"还没读过持仓");
+  document.getElementById("unrecbody").replaceChildren(rows.length?table(["市场 / 方向","账户多出的份数","Predict 均价","持仓时间"],rows.map(r=>[r.name,num(r.shares),r.price==null?"—":cent(r.price),r.at?when(r.at):"—"])):$("p","small mut","持仓和记录一致"))}
 let okAt=0,dead=false;
 function two(n){return String(n).padStart(2,"0")}
 function clock(ms){const d=new Date(ms);return two(d.getHours())+":"+two(d.getMinutes())+":"+two(d.getSeconds())}
@@ -17914,6 +17920,8 @@ class Bot:
             st = t.get("live")
             if isinstance(st, dict) and st.get("state") not in (None, "done"):
                 continue  # a real order not at its final word yet
+            if not self.prunable(t):
+                continue  # 1.130.3: its order may still be on the book (LiveBot.prunable): kept, so live_readopt can take it back
             by_slot.setdefault(f"{head}|{label}", []).append((int(t.get("opened") or 0), tid))
         doomed = [tid for rows in by_slot.values() for _, tid in sorted(rows, reverse=True)[self.SIM_ATTEMPTS_KEEP:]]
         if doomed:
@@ -17923,6 +17931,11 @@ class Bot:
                     self.sim_cache.pop(tid, None)
                 self.sim_gen = self.store.touched.get("sim", 0)
         return len(doomed)
+
+    def prunable(self, trade: dict) -> bool:
+        """Whether sim_prune may drop this record of an attempt that filled nothing; on paper always (LiveBot: not while its
+        real order may still be on the book)."""
+        return True
 
     def sim_withdraw(self, trade: dict, why: str, now_ms: int) -> None:
         """Withdraw a resting order: the shares it had filled stay a position, the rest lapses now, not at the result."""

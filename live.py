@@ -988,6 +988,8 @@ class LiveBot(core.Bot):
         self.live_wanted: set[str] = set()  # market ids a decision waited for (details read next step, whatever the edge)
         self.live_market_retry: dict[str, float] = {}  # market id -> monotonic time its details are asked for again after a failure
         self.live_unknown_open: list[dict] = []  # open orders on the account this bot has no record of (manual, or lost)
+        self.live_open_ids: set[str] = set()  # the last complete open list's order ids, and when it was read: a record whose order is on it is not pruned (prunable)
+        self.live_open_ids_at = 0
         self.live_synced_at = 0  # when the open-order list was last read in full
         self.live_sync_failed_ms = 0  # when a read of it last failed (a failure after the last success holds new orders)
         self.live_list_at_ms = -10 ** 15  # ...on the bot's clock, for the idle re-read
@@ -1857,6 +1859,8 @@ class LiveBot(core.Bot):
             raise
         by_id = {str(r.get("id")): r for r in open_rows}
         by_hash = {order_hash_of(r): r for r in open_rows if order_hash_of(r)}
+        if getattr(self.live.api, "orders_complete", True):
+            self.live_open_ids, self.live_open_ids_at = set(by_id), now_ms
         self.live_readopt(open_rows, by_id, by_hash, now_ms)
         self.live_note_unknown(open_rows, now_ms)
         self.live_synced_at = self.live_list_at_ms = now_ms
@@ -2532,6 +2536,52 @@ class LiveBot(core.Bot):
             if str(o_want.get("market_id") or other.get("market_id") or "") == mid and int(o_want.get("index_set") or 0) == index_set:
                 explained += float(other.get("shares") or 0)
         return max(0.0, held - explained)
+
+    def prunable(self, trade: dict) -> bool:
+        """A live record that filled nothing is pruned only once a complete open list read after it ended did not show
+        its order (1.130.3): a record that wrongly ended — a removal answered but not done, a list that missed the order —
+        stays for live_readopt to take the order back; pruned, the order rested on as one nobody here knew, its fills
+        unrecorded (the "没有记录的挂单" of 11-06)."""
+        st = trade.get("live")
+        if not isinstance(st, dict) or not st.get("order_id"):
+            return True
+        return bool(self.live_open_ids_at) and self.live_open_ids_at > core.trade_updated(trade) and str(st["order_id"]) not in self.live_open_ids
+
+    def live_recorded_by_outcome(self) -> dict[tuple[str, int], float]:
+        """The shares the records (and the pre-open mode's fills) explain, by (market id, index set)."""
+        out: dict[tuple[str, int], float] = {}
+        for t in self.sim_trades().values():
+            st = t.get("live")
+            if isinstance(st, dict):
+                k = (str((st.get("want") or {}).get("market_id") or t.get("market_id") or ""), int((st.get("want") or {}).get("index_set") or 0))
+                out[k] = out.get(k, 0.0) + float(t.get("shares") or 0)
+        for k, shares in self.preopen_filled().items():
+            out[k] = out.get(k, 0.0) + shares
+        return out
+
+    def live_unrecorded_positions(self) -> list[dict]:
+        """The positions the account holds beyond the records, from the last positions read (live_positions): the review
+        page's 账户里有、记录里没有的持仓 (1.130.3). Dust left out."""
+        rows, _ = self.live_positions
+        recorded = self.live_recorded_by_outcome()
+        held: dict[tuple[str, int], dict] = {}
+        for row in rows:
+            market = row.get("market") if isinstance(row.get("market"), dict) else {}
+            outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
+            k = (str(market.get("id") or row.get("marketId") or ""), int(outcome.get("indexSet") or 0))
+            h = held.setdefault(k, {"name": f"{market.get('title') or market.get('question') or market.get('slug') or k[0]} / {outcome.get('name') or outcome.get('title') or k[1]}",
+                                    "shares": 0.0, "price": None, "at": 0})
+            h["shares"] += self.position_shares(row)
+            price = self.position_price(row)
+            if price is not None:
+                h["price"] = price
+            h["at"] = max(h["at"], self.position_time(row))
+        out = []
+        for k, h in held.items():
+            excess = h["shares"] - recorded.get(k, 0.0)
+            if excess > self.LIVE_DUST_SHARES:
+                out.append({**h, "shares": round(excess, 4), "market_id": k[0], "index_set": k[1]})
+        return sorted(out, key=lambda r: -r["shares"])
 
     def live_readopt(self, open_rows: list[dict], by_id: dict, by_hash: dict, now_ms: int) -> None:
         """An order on the open list whose record here was already finished (judged gone, lapsed, released): it is
@@ -3265,7 +3315,9 @@ class LiveBot(core.Bot):
         data = super().journal_payload(full, history)
         data["mode"] = "live"
         data["live"] = {"enabled": True, "account": short_addr(self.live.wallet.maker), "ready": self.live.ready,
-                        "paused": self.live_paused(), "killed": self.live_killed()}
+                        "paused": self.live_paused(), "killed": self.live_killed(),
+                        "unrecorded": self.live_unrecorded_positions(), "unknown_orders": len(self.live_unknown_open),  # 1.130.3
+                        "positions_at": int(self.live_positions[1] * 1000) if self.live_positions[1] else 0}
         return data
 
     def preopen_review(self) -> dict | None:

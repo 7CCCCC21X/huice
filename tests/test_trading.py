@@ -618,13 +618,26 @@ async def run():
                             "amount": str(100 * WEI), "valueUsd": "100"}]
     report = await bot.cmd_live(req("fills"))  # 1.130.2: the account's positions against the records, outcome by outcome
     assert "持仓核对" in report and "恒生指数 10-05 / Down：账户 100 份" in report and "订单 #" in report, report
+    # 1.130.3: the positions beyond the records, on the review page; a record whose order is still on the open list is not pruned
+    fake.positions_rows.append({"id": "px", "market": {"id": 777, "title": "谁知道 11-06"}, "outcome": {"name": "Up", "indexSet": 1}, "amount": str(36 * WEI), "avgPrice": "0.03"})
+    bot.live_positions = (list(fake.positions_rows), time.time())
+    unrec = bot.journal_payload()["live"]["unrecorded"]
+    assert any(r["name"] == "谁知道 11-06 / Up" and abs(r["shares"] - 36) < 1e-6 and r["price"] == 0.03 for r in unrec), unrec
+    assert bot.journal_payload()["live"]["positions_at"] > 0
+    fake.positions_rows.pop()
+    gone = {"status": "cancelled", "shares": 0.0, "order": 10.0, "opened": NOW, "live": {"state": "done", "order_id": "77", "events": []}}
+    bot.live_open_ids, bot.live_open_ids_at = {"77"}, NOW + 1000
+    assert not bot.prunable(gone), "its order is still on the open list: kept for live_readopt"
+    bot.live_open_ids = set()
+    assert bot.prunable(gone) and not bot.prunable({**gone, "opened": NOW + 2000}), "a list read before it ended says nothing"
+    assert bot.prunable({"status": "cancelled", "shares": 0.0, "order": 10.0, "opened": NOW})  # on paper: always
     assert "恒生指数 10-05｜Down 100 份｜≈$100.00" in await bot.cmd_live(req("positions"))
     assert "开放订单" in await bot.cmd_live(req("orders")) and "自检" in await bot.cmd_live(req("check"))
     assert (await bot.cmd_live(req("positions", "raw"))).startswith("Predict 持仓原始记录（前 10 条）：\n{") and '"id": "p1"' in await bot.cmd_live(req("positions", "raw"))  # 1.119.3
     assert "真实下单：LIVE=on" in bot.sim_text() and "/live" in bot.sim_text() and "💰" in bot.sim_text()
     assert "LIVE=on" in bot.cmd_help(None) and "不会自动下单" not in bot.cmd_help(None)
     assert "💰 真实交易" in bot.status("1:0") and "不会自动撤单" not in bot.status("1:0")
-    assert bot.journal_payload()["live"] == {"enabled": True, "account": "0x8fd3…7A03", "ready": True, "paused": "", "killed": ""}
+    assert {k: v for k, v in bot.journal_payload()["live"].items() if k in {"enabled", "account", "ready", "paused", "killed"}} == {"enabled": True, "account": "0x8fd3…7A03", "ready": True, "paused": "", "killed": ""}
     assert bot.journal_csv().count("\n") >= 8 and json.dumps(bot.journal_payload(), default=str) and json.dumps(bot.sim_report())
 
     # --- redeeming: the winning outcome of a resolved market, once ----------------------------------------------------------------
