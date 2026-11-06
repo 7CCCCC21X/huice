@@ -1028,11 +1028,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl.settings = dataclasses.replace(ctl.settings, limit_gap_pct=2.0)
         # the hold lifts: the withdrawn pair, accounted, is quoted again
         ctl.owner.updowns["SKHYNIX-15M"].lead = quote("110000")
+        ctl.owner.updowns["UNITREE-15M"].lead = quote("110", "100")
         await self.settle_tasks(ctl)
         clock.ms += p.CARD_CHECK_MS
         await ctl.check_cards(clock.ms)
         self.assertEqual((ctl.card_holds, pair["accounted"], ctl.supersedable(pair)), ({}, True, True))
         ctl.queued.clear()
+        clock.ms += p.FULL_SCAN_MS  # a full scan: the window sits behind unlisted quarters
         await ctl.discover()
         self.assertIn(c["slug"], [ctl.queue.get_nowait()[2]["slug"] for _ in range(ctl.queue.qsize())])
         self.assertTrue({"PREOPEN_LIMIT_GAP_PCT"} <= m.CONTROL_KEY_SET and sk.limit_pct == 0.30 and unitree.limit_pct == 0.20)
