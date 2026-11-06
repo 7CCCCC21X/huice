@@ -37,6 +37,8 @@ TERMINAL = {"removed", "not_sent", "rejected", "not_found", "final"}  # states a
 NEVER_PLACED = {"not_sent", "rejected", "not_found"}                  # ...of which these never tied money up
 RETRY_MS, RETRY_MAX_MS = 15_000, 120_000  # a closing pair's cancels and reads are tried again this long after a try, doubling to the cap
 GIVE_UP_MS = 15 * 60_000  # after a window's start + this, an order Predict cannot show by its hash is taken as never placed (it expired before the start)
+SPRINT_MS = 2_000         # the last stretch (past the cancel time, before the expiry): an order still open is asked to be cancelled this often, no backoff
+SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
 DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
 LISTING_FIELDS = ("id", "conditionId", "categorySlug", "status", "tradingStatus", "isVisible", "makerFeeBps", "question", "outcomes")
 
@@ -57,9 +59,9 @@ def order_verified(order: dict) -> bool:
 class Settings:
     enabled: bool = False
     poll: float = 5.0
-    cancel_seconds: int = 60
-    expiry_seconds: int = 30
-    entry_seconds: int = 180
+    cancel_seconds: int = 20   # PREOPEN_CANCEL_SECONDS: the cancel goes out this long before the window's start
+    expiry_seconds: int = 10   # PREOPEN_EXPIRY_SECONDS: the signed order expires this long before the start (the backstop when the cancel fails)
+    entry_seconds: int = 180   # PREOPEN_ENTRY_SECONDS: no new pair this close to the start
     ahead_minutes: int = 60
     max_open_usd: float = 7000.0
     price: D = D("0.49")
@@ -87,17 +89,21 @@ class Settings:
         poll = float(env.get("PREOPEN_POLL_SECONDS", "5"))
         cap = float(env.get("PREOPEN_MAX_OPEN_USD", "7000"))
         cents, shares, ahead = int(env.get("PREOPEN_PRICE_CENTS", "49")), int(env.get("PREOPEN_SHARES", "50")), int(env.get("PREOPEN_AHEAD_MINUTES", "60"))
+        cancel, expiry, entry = int(env.get("PREOPEN_CANCEL_SECONDS", "20")), int(env.get("PREOPEN_EXPIRY_SECONDS", "10")), int(env.get("PREOPEN_ENTRY_SECONDS", "180"))
         keys = {r.key for r in core.WINDOW_UPDOWN_MARKETS}
         stems = {r.stem.lower(): r.key for r in core.WINDOW_UPDOWN_MARKETS}
         wanted = [w.strip() for w in str(env.get("PREOPEN_MARKETS", "")).split(",") if w.strip()]
         markets = frozenset(stems.get(w.lower(), w.upper()) for w in wanted) or frozenset(keys)
         price = D(cents) / 100
         if (not 1 <= poll <= 60 or not 1 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
-                or not 3 <= ahead <= 1440 or not markets <= keys or float(price * shares) < live.MIN_ORDER_USD):
+                or not 3 <= ahead <= 1440 or not markets <= keys or float(price * shares) < live.MIN_ORDER_USD
+                or not 5 <= expiry <= 600 or not expiry + 5 <= cancel <= 900 or not cancel + 60 <= entry <= 3600):
             raise ValueError("PREOPEN_POLL_SECONDS 1～60、PREOPEN_MAX_OPEN_USD 1～1000000、PREOPEN_PRICE_CENTS 1～50、PREOPEN_SHARES 1～500（每边不少于 "
-                             f"Predict 最小订单 ${live.MIN_ORDER_USD:g}）、PREOPEN_AHEAD_MINUTES 3～1440、PREOPEN_MARKETS 只能是 {'、'.join(sorted(keys))}")
+                             f"Predict 最小订单 ${live.MIN_ORDER_USD:g}）、PREOPEN_AHEAD_MINUTES 3～1440、PREOPEN_MARKETS 只能是 {'、'.join(sorted(keys))}；"
+                             "PREOPEN_EXPIRY_SECONDS 5～600，PREOPEN_CANCEL_SECONDS 至少比它大 5 秒、至多 900，PREOPEN_ENTRY_SECONDS 至少比撤单时间大 60 秒、至多 3600")
         path = str(env.get("PREOPEN_DB") or (":memory:" if config.db_path == ":memory:" else str(Path(config.db_path).with_suffix(".preopen.sqlite3"))))
-        return cls(enabled, poll=poll, ahead_minutes=ahead, max_open_usd=cap, price=price, shares=D(shares), markets=markets, db=path)
+        return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
+                   price=price, shares=D(shares), markets=markets, db=path)
 
 
 class Ledger:
@@ -328,8 +334,8 @@ class Controller:
         pair = next((p for p in self.ledger.rows.values() if any(o.get("hash") == digest for o in p["orders"].values())), None)
         if pair is None or pair["phase"] != "active" or self.now() >= pair["cancel_ms"]:
             return "市场已进入撤单阶段，不再发送"
-        if pair["expires"] * 1000 - self.now() < 120_000:
-            return "距订单到期不足两分钟，不再发送"
+        if pair["expires"] * 1000 - self.now() < SEND_MIN_LEFT_MS:
+            return "距订单到期不足一分钟，不再发送"
         if self.now() - self.account_at > 30_000:
             return "账户快照过期，不再发送"
         if self.risk() + self.other_risk() > min(self.settings.max_open_usd, self.owner.config.live_max_open_usd) + 1e-9:
@@ -410,7 +416,10 @@ class Controller:
             for _ in range(100):
                 answer = await list_page(self.api, variant, after)
                 for market in answer["data"]:
-                    c = candidate(market, self.now(), self.owner.config, self.settings) if isinstance(market, dict) else None
+                    if not isinstance(market, dict):
+                        continue
+                    self.note_open(market)  # when a window of ours starts matching, as the listing shows it (the cancel time's evidence)
+                    c = candidate(market, self.now(), self.owner.config, self.settings)
                     if c and c["slug"] not in self.ledger.rows and c["slug"] not in self.queued:
                         self.queued.add(c["slug"])
                         found.append(c)
@@ -474,7 +483,8 @@ class Controller:
                                 "body": {"data": {"order": {**signed, "signature": signature, "hash": digest},
                                                    "strategy": "LIMIT", "pricePerShare": str(amounts["price_per_share"]),
                                                    "isPostOnly": True, "selfTradePrevention": "CANCEL_TAKER"}}}
-            pair = {**current, "phase": "active", "orders": orders, "created_ms": self.now(), "tries": 0, "retry_ms": 0}
+            pair = {**current, "phase": "active", "orders": orders, "created_ms": self.now(), "tries": 0, "retry_ms": 0,
+                    "open_seen_ms": self.now() if str(market.get("tradingStatus") or "").upper() == "OPEN" else 0}
             self.ledger.save(pair)  # both hashes durable before either POST
         for side in ("up", "down"):
             order = pair["orders"][side]
@@ -522,11 +532,32 @@ class Controller:
         the start), and what it shows is final."""
         return self.now() >= pair["start_ms"] + GIVE_UP_MS
 
+    def note_open(self, market: dict) -> None:
+        """The first time the listing shows one of this mode's windows OPEN (matching on): kept on the pair — how long
+        before the start matching begins is what the cancel time should be set against (/preopen shows the median)."""
+        slug = str(market.get("categorySlug") or market.get("slug") or "")
+        pair = self.ledger.rows.get(slug)
+        if pair is not None and not pair.get("open_seen_ms") and str(market.get("tradingStatus") or "").upper() == "OPEN":
+            pair["open_seen_ms"] = self.now()
+            self.ledger.save(pair)
+
+    def in_sprint(self, pair: dict) -> bool:
+        """The last stretch: past the cancel time, before the signed expiry, with an order that may still be on the book —
+        the cancel is asked for every SPRINT_MS, whatever the count (the backoff is for after the expiry, when nothing can
+        fill any more and only the records are being read)."""
+        now = self.now()
+        return (now >= pair["cancel_ms"] and now < pair["expires"] * 1000
+                and any(o["state"] in {"open", "placing", "unknown"} for o in pair["orders"].values()))
+
     def bookkeep(self, pair: dict) -> None:
-        """A closing or unverified pair's next try: RETRY_MS after this one, doubling to RETRY_MAX_MS; closed once nothing
-        is left to cancel; accounted (its money released) once every order is verified and nothing filled."""
-        tries = int(pair.get("tries") or 0) + 1
-        pair["tries"], pair["retry_ms"] = tries, self.now() + min(RETRY_MS * 2 ** (tries - 1), RETRY_MAX_MS)
+        """A closing or unverified pair's next try: SPRINT_MS on in the last stretch (in_sprint), else RETRY_MS after this one,
+        doubling to RETRY_MAX_MS; closed once nothing is left to cancel; accounted (its money released) once every order is
+        verified and nothing filled."""
+        if self.in_sprint(pair):
+            pair["retry_ms"] = self.now() + SPRINT_MS
+        else:
+            tries = int(pair.get("tries") or 0) + 1
+            pair["tries"], pair["retry_ms"] = tries, self.now() + min(RETRY_MS * 2 ** (tries - 1), RETRY_MAX_MS)
         if pair["phase"] != "closed" and all(o["state"] in TERMINAL for o in pair["orders"].values()):
             pair["phase"] = "closed"
         if (not pair.get("accounted") and all(order_verified(o) for o in pair["orders"].values())
@@ -580,9 +611,11 @@ class Controller:
                         continue
                     else:
                         continue
+                pair.setdefault("cancel_sent_ms", self.now())
                 result = await self.cancel_api.remove_orders([order["id"]])
                 if order["id"] in result["removed"]:
                     order["state"] = "removed"
+                    pair.setdefault("cancel_done_ms", self.now())
                     self.ledger.save(pair)
                 await self.read_final(order, pair)  # the fills before the removal (bulk removals went first: no cancel waits behind this)
                 self.ledger.save(pair)
@@ -660,12 +693,15 @@ class Controller:
                     by_id[str(order["id"])] = pair, order
             self.ledger.save(pair)
         ids = list(by_id)
+        for pair, _ in by_id.values():
+            pair.setdefault("cancel_sent_ms", self.now())  # the round trip and the lead on the start: /preopen shows them (the cancel time's evidence)
         async def batch(chunk: list[str]) -> None:
             result = await self.cancel_api.remove_orders(chunk)
             for oid in result["removed"]:
                 if oid in by_id:
                     pair, order = by_id[oid]
                     order["state"] = "removed"
+                    pair.setdefault("cancel_done_ms", self.now())
                     self.ledger.save(pair)
         results = await asyncio.gather(*(batch(ids[n:n + 20]) for n in range(0, len(ids), 20)), return_exceptions=True)
         for error in results:
@@ -804,12 +840,36 @@ class Controller:
         finally:
             self.alive = False  # the model trader opens orders again (LiveBot.preopen_active)
 
+    def timing_line(self) -> str:
+        """What the last windows measured: the cancel's round trip and how long before the start it was confirmed, and how
+        long before the start the listing first showed them OPEN — the evidence PREOPEN_CANCEL_SECONDS is set against."""
+        rows = sorted(self.ledger.rows.values(), key=lambda p: p["cancel_ms"])
+        sent = [p for p in rows if p.get("cancel_sent_ms") and p.get("cancel_done_ms")][-20:]
+        parts = []
+        if sent:
+            trips = sorted((p["cancel_done_ms"] - p["cancel_sent_ms"]) / 1000 for p in sent)
+            leads = sorted((p["start_ms"] - p["cancel_done_ms"]) / 1000 for p in sent)
+            parts.append(f"撤单确认用时中位 {trips[len(trips) // 2]:.1f} 秒（最长 {trips[-1]:.1f}），确认时距开场中位 {leads[len(leads) // 2]:.0f} 秒"
+                         f"（最短 {leads[0]:.0f}；最近 {len(sent)} 场）")
+        else:
+            parts.append("撤单确认用时：还没有撤过")
+        opened = [p for p in rows if p.get("open_seen_ms")][-20:]
+        if opened:
+            leads = sorted((p["start_ms"] - p["open_seen_ms"]) / 1000 for p in opened)
+            parts.append(f"撮合开启（列表显示 OPEN）在开场前中位 {leads[len(leads) // 2]:.0f} 秒（最早 {leads[-1]:.0f}、最晚 {leads[0]:.0f}；{len(opened)} 场）")
+        else:
+            unseen = sum(1 for p in rows if not p.get("open_seen_ms") and self.now() >= p["cancel_ms"])
+            parts.append(f"撮合开启：{unseen} 场到撤单时还没见到 OPEN" if unseen else "撮合开启：还没有观察")
+        return "；".join(parts)
+
     def status(self) -> str:
         rows = list(self.ledger.rows.values())
         state = "已停止" if not self.alive else "暂停" if self.manual_pause or self.blocked() else "运行"
         return (f"开盘前自动预挂：{state}\n"
                 f"{' / '.join(sorted(self.settings.markets))}：两边 {core.cents(float(self.settings.price))}，各 {self.settings.shares} 份；"
                 f"扫描 {self.settings.poll:g} 秒，只挂 {self.settings.ahead_minutes} 分钟内开始的场次\n"
-                f"每场提前 {self.settings.cancel_seconds} 秒撤单、提前 {self.settings.expiry_seconds} 秒到期；"
+                f"撤单：开场前 {self.settings.cancel_seconds} 秒发出，之后到开场前 {self.settings.expiry_seconds} 秒到期为止每 {SPRINT_MS // 1000} 秒催一次；"
+                f"不足 {self.settings.entry_seconds} 秒不再新挂\n"
                 f"已记录 {len(rows)} 场（{sum(1 for p in rows if p['phase'] == 'active')} 场挂着，{sum(1 for p in rows if p.get('accounted'))} 场已结清），队列 {self.queue.qsize()} 场\n"
-                f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}")
+                f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}\n"
+                f"实测：{self.timing_line()}")

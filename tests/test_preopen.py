@@ -137,7 +137,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data["pricePerShare"], str(L.to_wei(".49")))
             self.assertEqual(order["makerAmount"], str(L.to_wei("24.5")))
             self.assertEqual(order["takerAmount"], str(L.to_wei(50)))
-            self.assertEqual(int(order["expiration"]), c["start_ms"] // 1000 - 30)
+            self.assertEqual(int(order["expiration"]), c["start_ms"] // 1000 - ctl.settings.expiry_seconds)  # 10 s before the start (the backstop)
             tokens.append(order["tokenId"])
         self.assertEqual(tokens, ["247", "246"])  # reversed metadata maps by name
         self.assertEqual(ctl.risk(), 49.)
@@ -198,10 +198,63 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctl.risk(), 0.)
         await self.finish(ctl)
 
+    async def test_cancel_timing_settings_and_validation(self):
+        ctl, api, clock = controller()
+        self.assertEqual((ctl.settings.cancel_seconds, ctl.settings.expiry_seconds, ctl.settings.entry_seconds), (20, 10, 180))
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        self.assertEqual((c["cancel_ms"], c["expires"]), (c["start_ms"] - 20_000, c["start_ms"] // 1000 - 10))
+        await self.finish(ctl)
+        ctl, api, clock = controller(PREOPEN_CANCEL_SECONDS="12", PREOPEN_EXPIRY_SECONDS="6", PREOPEN_ENTRY_SECONDS="120")
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        self.assertEqual((c["cancel_ms"], c["expires"]), (c["start_ms"] - 12_000, c["start_ms"] // 1000 - 6))
+        self.assertEqual(p.candidate_problem(market(at=NOW + 15 * 60_000), NOW + 15 * 60_000 - 119_000, ctl.owner.config, ctl.settings), "已开始或不足 3 分钟")
+        self.assertIsNotNone(p.candidate(market(at=NOW + 15 * 60_000), NOW + 15 * 60_000 - 121_000, ctl.owner.config, ctl.settings))
+        await self.finish(ctl)
+        for bad in ({"PREOPEN_EXPIRY_SECONDS": "4"}, {"PREOPEN_CANCEL_SECONDS": "14"}, {"PREOPEN_ENTRY_SECONDS": "79"}, {"PREOPEN_CANCEL_SECONDS": "901", "PREOPEN_ENTRY_SECONDS": "3600"}):
+            with self.assertRaises(ValueError):
+                controller(**bad)
+
+    async def test_last_stretch_sprints_and_the_status_measures_it(self):
+        """Past the cancel time an order still open is asked to be cancelled every two seconds (no backoff) until the
+        signed expiry; the round trip, the lead on the start and the moment the listing showed OPEN are measured."""
+        ctl, api, clock = controller()
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        self.assertEqual(pair["open_seen_ms"], 0)
+        api.markets["123"]["tradingStatus"] = "OPEN"
+        clock.ms = c["start_ms"] - 300_000
+        await ctl.discover()  # the listing shows it OPEN: the moment kept
+        self.assertEqual(pair["open_seen_ms"], c["start_ms"] - 300_000)
+        api.stuck.add("2")
+        clock.ms = c["cancel_ms"]
+        self.assertEqual([x["slug"] for x in ctl.due(clock.ms)], [c["slug"]])
+        await ctl.cancel_many([pair], "deadline")
+        await self.settle_tasks(ctl)
+        self.assertEqual((pair["orders"]["up"]["state"], pair["orders"]["down"]["state"]), ("final", "open"))
+        self.assertEqual((pair["cancel_sent_ms"], pair["cancel_done_ms"]), (clock.ms, clock.ms))
+        self.assertTrue(ctl.in_sprint(pair))
+        self.assertEqual((pair["retry_ms"], pair["tries"]), (clock.ms + p.SPRINT_MS, 0))  # two seconds, the count untouched
+        clock.ms += p.SPRINT_MS
+        asked = api.removed.count("2")
+        self.assertEqual([x["slug"] for x in ctl.due(clock.ms)], [c["slug"]])
+        ctl.bookkeep(pair); ctl.launch_reconcile(pair)
+        await self.settle_tasks(ctl)
+        self.assertGreater(api.removed.count("2"), asked)
+        clock.ms = c["expires"] * 1000  # expired: nothing can fill; the reads back off from here
+        self.assertFalse(ctl.in_sprint(pair))
+        ctl.bookkeep(pair)
+        self.assertEqual((pair["tries"], pair["retry_ms"]), (1, clock.ms + p.RETRY_MS))
+        text = ctl.status()
+        self.assertIn("撤单：开场前 20 秒发出，之后到开场前 10 秒到期为止每 2 秒催一次；不足 180 秒不再新挂", text)
+        self.assertIn("撤单确认用时中位 0.0 秒（最长 0.0），确认时距开场中位 20 秒（最短 20；最近 1 场）", text)
+        self.assertIn("撮合开启（列表显示 OPEN）在开场前中位 300 秒（最早 300、最晚 300；1 场）", text)
+        await self.finish(ctl)
+
     async def test_expiry_rechecked_after_auth_delay(self):
         ctl, api, clock = controller()
         c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
-        async def slow_auth(): clock.ms = c["start_ms"] - 70_000
+        async def slow_auth(): clock.ms = c["start_ms"] - 65_000  # under a minute to the expiry (start − 10 s): not sent
         api.auth = slow_auth
         await ctl.place_pair(c)
         self.assertEqual(api.sent, [])
@@ -230,6 +283,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         pair = ctl.ledger.rows[c["slug"]]
         api.stuck.add("2")
         clock.ms = c["start_ms"] - 60_000
+        ctl.manual_pause = True  # blocked: withdrawn now, before the cancel time (outside the last stretch: the backoff applies)
         self.assertEqual([x["slug"] for x in ctl.due(clock.ms)], [c["slug"]])
         await ctl.cancel_many([pair], "deadline")
         await self.settle_tasks(ctl)
