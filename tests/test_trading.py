@@ -1409,6 +1409,48 @@ async def run():
     assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"a"})], api.orders_complete) == (["a", "b"], False)
     assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"zzz"}, max_pages=2)], api.orders_complete) == (["a", "b", "c"], False)
     assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"d"})], api.orders_complete) == (["a", "b", "c", "d"], True), "the last page ends the list: whole"
+    # 1.137.2: no cut full read while the pre-open mode runs; resting maker orders the bounded list did not show are read by their
+    # hash in rotation, LIVE_TRACK_READS a step, each at most every LIVE_TRACK_READ_MS, the longest unread first
+    sbot.live_full_cut, sbot.live_full_at_ms = True, -10 ** 15
+    sbot.preopen = types.SimpleNamespace(account_rows=[], account_at=0, unmanaged_rows=lambda rows: rows, request_rate=lambda: 3.5)
+    seen_params.clear()
+    sfake.orders = spy
+    await sbot.live_sync_orders({}, NOW + 1_200_000)
+    assert seen_params[-1] == {"stop_ids": set(), "max_pages": sbot.LIVE_STEP_PAGES}, "cut before, the pre-open mode on: bounded"
+    sfake.orders = orig_orders
+    hidden = {}
+    for n in range(8):
+        oid = f"9{n:02d}"
+        sfake.open[oid] = {"id": oid, "status": "OPEN", "amount": str(10 * WEI), "amountFilled": "0", "order": {"hash": f"0xrest{n}"}}
+        hidden[f"rest{n}|up|挂"] = {"item": f"rest{n}", "label": "挂涨", "market": f"rest{n}", "maker": True, "status": "resting", "order": 10.0, "shares": 0.0,
+                                   "price": 0.4, "side": "up", "fills": [], "live": {"state": "open", "order_id": oid, "hash": f"0xrest{n}", "events": [], "placed_at": NOW}}
+    reads = []
+    orig_order = sfake.order
+    async def count_order(oid, hash_=""):
+        reads.append(oid)
+        return await orig_order(oid, hash_)
+    sfake.order = count_order
+    async def hide(status="OPEN", **params):  # the bounded read never reaches them
+        return []
+    sfake.orders = hide
+    sfake.orders_complete = False
+    sbot.live.api.orders_complete = False
+    await sbot.live_sync_orders(hidden, NOW + 1_210_000)
+    assert len(reads) == sbot.LIVE_TRACK_READS and sbot.live_sync_detail["reads"] == 6 and sbot.live_sync_detail["later"] == 2, (reads, sbot.live_sync_detail)
+    first = set(reads)
+    reads.clear()
+    await sbot.live_sync_orders(hidden, NOW + 1_215_000)
+    assert set(reads) == {"906", "907"}, ("the two left over, the others read 5 s ago", reads)
+    reads.clear()
+    await sbot.live_sync_orders(hidden, NOW + 1_226_000)
+    assert len(reads) == 6 and set(reads) == first, ("15 s on: the six read longest ago", reads)
+    sfake.order, sfake.orders = orig_order, orig_orders
+    sfake.orders_complete = True
+    for n in range(8):
+        sfake.open.pop(f"9{n:02d}")
+    assert "原策略" in "、".join(sbot.live_request_rates()) or len(sbot.live_rate_samples) < 2
+    assert "预挂 3.5" in "、".join(sbot.live_request_rates())
+    sbot.preopen = None
     text = await sbot.cmd_live(m.Request("/live", ["cancel", "account"], 1, 0, 1))
     assert ("remove", ["777"]) in sfake.calls and "账户上无记录的挂单 1 张：Predict 确认撤掉 1 张" in text and sbot.live_unknown_open == [], text
     # the hard switch: LIVE_TRADING_ALLOWED=off caps the mode at pause, refuses the switch to on and the sending alike

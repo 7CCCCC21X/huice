@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import contextlib
 import dataclasses
 import datetime as dt
@@ -974,6 +975,8 @@ class LiveBot(core.Bot):
     LIVE_IDLE_LIST_MS = 60_000      # the open-order list is re-read this often even with nothing in flight (orders this bot did not place)
     LIVE_SNAPSHOT_MAX_AGE_MS = 600_000  # the pre-open mode's account snapshot stands in for a cut read of the open list while younger than this (1.136.2)
     LIVE_STEP_PAGES = 3             # a step's own read of the open list: the pages until every active record's order is seen, this many at most (1.137.1)
+    LIVE_TRACK_READS = 6            # resting maker orders the bounded list did not show, read by their hash a step at most, the longest unread first (1.137.2)
+    LIVE_TRACK_READ_MS = 15_000     # ...each at most this often: its fills are seen within this, not every step at two reads at a time
     LIVE_ORPHAN_GRACE_MS = 120_000  # an unrecorded open order on one of this bot's markets is withdrawn once seen so for this long (LIVE_ORPHAN_CANCEL)
     LIVE_ORPHAN_EVERY_MS = 60_000   # ...looked for this often
     LIVE_MISSES = 3             # an open order Predict stops listing without a final record counts as cancelled after this many looks...
@@ -1026,6 +1029,10 @@ class LiveBot(core.Bot):
         self.live_open_ids: set[str] = set()  # the last complete open list's order ids, and when it was read: a record whose order is on it is not pruned (prunable)
         self.live_open_ids_at = 0
         self.live_full_at_ms = -10 ** 15  # when this bot last read the whole open list itself (a step reads a few pages otherwise: 1.137.1)
+        self.live_full_cut = False  # that read came cut at the page cap: while the pre-open mode runs, its snapshot stands for the account instead (1.137.2)
+        self.live_track_reads: dict[str, int] = {}  # record id -> when its order was last read by its hash in the sync (the rotation, 1.137.2)
+        self.live_sync_detail: dict = {}  # the last sync's parts, for /diag: the list's pages and seconds, the hash reads, the ones left for later
+        self.live_rate_samples: collections.deque = collections.deque(maxlen=130)  # (monotonic, the model trader's requests so far), each step
         self.live_synced_at = 0  # when the open-order list was last read in full
         self.live_sync_failed_ms = 0  # when a read of it last failed (a failure after the last success holds new orders)
         self.live_list_at_ms = -10 ** 15  # ...on the bot's clock, for the idle re-read
@@ -1365,6 +1372,10 @@ class LiveBot(core.Bot):
         except Exception as error:
             self.live_note_error(f"同步真实订单失败：{core.clean_error(error) or type(error).__name__}")
         self.live_step_ms = marks
+        calls = getattr(self.live.api, "calls", 0)
+        self.live_rate_samples.append((time.monotonic(), calls if isinstance(calls, int) else len(calls or ())))  # a counter (a stand-in's call log: its length)
+        while len(self.live_rate_samples) > 2 and self.live_rate_samples[-1][0] - self.live_rate_samples[1][0] >= 60:
+            self.live_rate_samples.popleft()  # the last minute's
         return result
 
     async def sim_after_decide(self, now_ms: int) -> None:
@@ -1924,13 +1935,18 @@ class LiveBot(core.Bot):
         # snapshot stands for the whole account, or within a minute of this bot's own whole read; the rest of the records are read by
         # their hash (live_track). The 11-07 /diag: 同步 10.5 s of an 11.3 s step, twenty pages against the pre-open mode's thousands
         wanted = {str(t["live"].get("order_id")) for t in active.values() if t["live"].get("order_id")}
-        bounded = self.live_snapshot_fresh(now_ms) or now_ms - self.live_full_at_ms < self.LIVE_IDLE_LIST_MS
+        bounded = (self.live_snapshot_fresh(now_ms) or now_ms - self.live_full_at_ms < self.LIVE_IDLE_LIST_MS
+                   or (self.live_full_cut and getattr(self, "preopen", None) is not None))  # 1.137.2: a cut full read tells nothing the snapshot will not
+        listing = time.monotonic()
         try:
             open_rows = await (self.live.api.orders("OPEN", stop_ids=wanted, max_pages=self.LIVE_STEP_PAGES) if bounded else self.live.api.orders("OPEN"))
         except Exception:
             self.live_sync_failed_ms = now_ms  # a failure after the last success: no new order until a read succeeds (live_send_hold)
             await self.live_cancel_blind(active, now_ms)  # the cancels need no list: a list that cannot be read must not keep an order resting
             raise
+        list_s = time.monotonic() - listing
+        if not bounded:
+            self.live_full_cut = not getattr(self.live.api, "orders_complete", True)
         if not bounded or getattr(self.live.api, "orders_complete", True):
             self.live_full_at_ms = now_ms
         by_id = {str(r.get("id")): r for r in open_rows}
@@ -1967,10 +1983,42 @@ class LiveBot(core.Bot):
                 return  # moved to an attempt record (live_fail): saved there, never again under the old key
             if json.dumps(trade, sort_keys=True, default=str) != before:
                 self.sim_save([(tid, trade)])
+        # 1.137.2: a resting maker order the list did not show is read by its hash LIVE_TRACK_READS a step at most, each at most every
+        # LIVE_TRACK_READ_MS, the longest unread first — seventeen of them read every step, two at a time, were most of the sync's seconds
+        unseen = sorted((tid for tid, t in active.items() if t["live"].get("state") == "open" and t.get("maker")
+                         and str(t["live"].get("order_id") or "") not in by_id), key=lambda tid: self.live_track_reads.get(tid, 0))
+        later: set[str] = set()
+        reads = 0
+        for tid in unseen:
+            if reads < self.LIVE_TRACK_READS and now_ms - self.live_track_reads.get(tid, -10 ** 15) >= self.LIVE_TRACK_READ_MS:
+                reads += 1
+                self.live_track_reads[tid] = now_ms
+            else:
+                later.add(tid)
+        self.live_track_reads = {tid: at for tid, at in self.live_track_reads.items() if tid in active}
         # side by side (1.112.1: one after another, each record's reads and cancels added up to the step's 同步 seconds); the
         # API gate bounds them, and a record's own failure is noted on it alone
-        await asyncio.gather(*(one(tid, trade) for tid, trade in list(active.items())))
+        working = time.monotonic()
+        await asyncio.gather(*(one(tid, trade) for tid, trade in list(active.items()) if tid not in later))
+        page = int(getattr(self.live.api, "ORDERS_PAGE", 50) or 50)
+        self.live_sync_detail = {"pages": -(-len(open_rows) // page) if open_rows else 1, "bounded": bounded, "list_s": list_s,
+                                 "reads": reads, "later": len(later), "work_s": time.monotonic() - working, "records": len(active)}
         await self.live_orphan_sweep(now_ms)
+
+    def live_request_rates(self) -> list[str]:
+        """The requests a second over the last minute of each Predict client on this API key (the rate limit is the key's):
+        the orderbook feed, this trader, the pre-open mode — for /diag."""
+        out = []
+        samples = self.live_rate_samples
+        if len(samples) >= 2 and samples[-1][0] > samples[0][0]:
+            out.append(f"原策略 {(samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0]):.1f}")
+        feed = getattr(getattr(self, "predict", None), "rate", None)
+        if callable(feed) and (rate := feed()) is not None:
+            out.append(f"盘口 {rate:.1f}")
+        preopen = getattr(self, "preopen", None)
+        if preopen is not None and (rate := preopen.request_rate()) is not None:
+            out.append(f"预挂 {rate:.1f}")
+        return out
 
     def live_full_list(self, open_rows: list[dict], now_ms: int) -> tuple[list[dict] | None, int]:
         """Every open order of the account and when that list was read: this step's read when it came whole, else the

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import contextvars
 import io
@@ -49,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.137.1"
+VERSION = "1.137.2"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -5472,6 +5473,8 @@ class PredictFeed:
         self.book_asked: dict[str, float] = {}                   # item key -> monotonic time the stored book was asked for
         self.row_asked: dict[str, dict[str, float]] = {}         # item key -> market id -> the same, for a ladder's levels
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
+        self.calls = 0                                           # requests sent (/diag: the request rate on the API key, 1.137.2)
+        self.rate_samples: collections.deque = collections.deque(maxlen=130)  # (monotonic, calls), sampled as the rounds run
         self.stream = PredictStream(self)                        # Predict's WebSocket: the hot markets' books pushed as they change (1.86.0)
         self.express_by_key: dict[str, asyncio.Task] = {}        # item key -> its express look under way (updated: pushes are coalesced)
         self.express_dirty: set[str] = set()                     # item keys whose books came in during their look: looked at once more after it
@@ -5479,11 +5482,24 @@ class PredictFeed:
     def headers(self) -> dict[str, str]:
         return {"x-api-key": self.config.predict_api_key} if self.config.predict_api_key else {}
 
+    def rate(self) -> float | None:
+        """Requests a second over the last minute (the REST reads: books, markets), or None before two samples."""
+        now = time.monotonic()
+        self.rate_samples.append((now, self.calls))
+        while len(self.rate_samples) > 2 and now - self.rate_samples[1][0] >= 60:
+            self.rate_samples.popleft()
+        (t0, n0), (t1, n1) = self.rate_samples[0], self.rate_samples[-1]
+        return (n1 - n0) / (t1 - t0) if t1 - t0 >= 5 else None
+
     async def fetch(self, url: str, payload: dict | None = None) -> Any:
         """One Predict request, at most PREDICT_PARALLEL at a time; a 429 (or any retry_after) pauses them all."""
         left = self.blocked_until - time.monotonic()
         if left > 0:
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
+        if url.startswith(PREDICT_REST):
+            self.calls += 1
+            if not self.rate_samples or time.monotonic() - self.rate_samples[-1][0] >= 1:
+                self.rate()  # sampled as the reads go, so /diag has a minute of them
         async with self.gate:
             try:
                 raw = await predict_blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
@@ -21038,6 +21054,14 @@ class Bot:
                     size = self.sim_step_info
                     detail += ("（决策内：" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in self.sim_step_ms.items())
                                + (f"；{size['markets']} 个市场、{size['records']} 条记录" if size else "") + "）")
+                sync = getattr(self, "live_sync_detail", None)
+                if name == "模拟交易" and sync:  # 1.137.2: what the sync's seconds went to
+                    detail += (f"（同步内：挂单列表 {sync['pages']} 页 {sync['list_s']:.1f}s" + ("，只读到自己的单" if sync["bounded"] else "，全量")
+                               + f"、按哈希单读 {sync['reads']} 张" + (f"（另 {sync['later']} 张轮到再读）" if sync["later"] else "")
+                               + f"、核对 {sync['records']} 条记录 {sync['work_s']:.1f}s）")
+                rates = getattr(self, "live_request_rates", None)
+                if name == "模拟交易" and rates and (rate_list := rates()):
+                    detail += "｜Predict 请求每秒（最近一分钟，同一个 API key）：" + "、".join(rate_list)
                 if name == "模拟交易" and self.sim_express_count:
                     detail += f"｜快车道决定 {self.sim_express_count} 次"
                 if name == "模拟交易" and self.sim_requote_count:
