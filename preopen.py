@@ -65,6 +65,7 @@ HOLD_RETRY_MS = 5_000     # a held candidate (hold(): a stale snapshot, the cool
 ERROR_RETRY_MS = 30_000   # ...and one whose placement raised (a read failed, the market's tokens could not be told) this long
 SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
 DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
+REFUSED_STATUSES = {"REJECTED", "INVALIDATED", "FAILED"}  # an order's record ending so with nothing filled: Predict's deferred refusal (not quoted again)
 LISTING_FIELDS = ("id", "conditionId", "status", "tradingStatus", "question", "outcomes")  # the details' fields the discovery reads
 MAX_ATTEMPTS = 3       # a window is quoted at most this many times (its pairs withdrawn before the start quoted again under a new salt)
 MISS_STOP = 4          # discover: a card's coming windows are asked in start order; this many unlisted in a row end the card's full scan
@@ -308,6 +309,14 @@ def quote_of(pair: dict) -> dict:
     total = filled["up"] + filled["down"]
     accounted = bool(pair.get("accounted"))
     result = pair.get("result") if pair.get("result") in {"up", "down", "split"} else ""
+    if not result and accounted and total > 0 and (filled["up"] > 0) != (filled["down"] > 0):
+        # a record settled before 1.128.0 (no result kept): one side filled, so its payout — pnl / filled + price — says
+        side = "up" if filled["up"] > 0 else "down"
+        payout = float(pair.get("pnl") or 0) / filled[side] + price
+        if abs(payout - 0.5) < 0.01:
+            result = "split"
+        elif abs(payout - 1) < 0.01 or abs(payout) < 0.01:
+            result = side if abs(payout - 1) < 0.01 else ("down" if side == "up" else "up")
     payout = {"up": 1.0, "down": 0.0, "split": 0.5}.get(result)
     start = int(pair.get("start_ms") or 0)
     at = dt.datetime.fromtimestamp(start / 1000, core.BEIJING)
@@ -443,21 +452,29 @@ class Controller:
     def stopped(self) -> bool:
         return self.owner.stopping.is_set() or self.stop.is_set()
 
-    def blocked(self) -> str:
+    def withdrawing(self) -> str:
+        """An operator's stop, which withdraws the resting pairs: the mode paused, real trading off, paused or killed, the
+        day's loss cap reached. Not the process or the mode stopping (on_stop decides what stays on the book), and not the
+        account not verified yet at a start (1.128.3: that withdrew every pair just taken over, and re-quoted them)."""
         c = self.owner.config
-        if self.stopped():
-            return "进程或预挂模式停止中"
         if self.manual_pause:
             return "本模式已手动暂停（/preopen resume 恢复）"
         if c.live_mode != "on" or not c.live_allowed:
             return "真实交易未开启"
-        reason = self.owner.live_paused() or self.owner.live_killed() or ("账户未就绪" if not self.owner.live.ready else "")
-        if reason:
+        if reason := self.owner.live_paused() or self.owner.live_killed():
             return reason
         cap = c.live_max_daily_loss_usd
         if cap and self.daily_pnl() + self.owner.live_daily_pnl(self.owner.sim_trades(), self.now()) <= -cap:
             return "已达到今日真实亏损上限"
         return ""
+
+    def blocked(self) -> str:
+        """Why nothing new goes out: stopping, an operator's stop (withdrawing), or the account not verified yet."""
+        if self.stopped():
+            return "进程或预挂模式停止中"
+        if why := self.withdrawing():
+            return why
+        return "账户未就绪" if not self.owner.live.ready else ""
 
     def hold(self) -> str:
         """Why no new pair goes out right now, for the status line: the pause (blocked), the account snapshot not read yet
@@ -630,8 +647,8 @@ class Controller:
             return False
         if pair["start_ms"] - self.now() < self.settings.entry_seconds * 1000:
             return False
-        if any(o["state"] == "rejected" and not o.get("limited") for o in pair["orders"].values()):
-            return False
+        if any(o["state"] == "rejected" and not o.get("limited") or o.get("refused") for o in pair["orders"].values()):
+            return False  # Predict's refusal, outright or deferred (monitor_pair): the same order would be refused again
         return int(pair.get("attempt") or 0) + 1 < MAX_ATTEMPTS
 
     async def on_stop(self) -> None:
@@ -655,18 +672,20 @@ class Controller:
             self.full_scan_ms = self.now()
         misses: dict[str, int] = {}
         found: list[dict] = []
+        attempts: dict[str, int] = {}  # window -> the attempt after its last record, the superseded ones included: an attempt that left no record is not reused (its salt would be the first attempt's)
+        for p in self.ledger.rows.values():
+            attempts[window_of(p)] = max(attempts.get(window_of(p), 0), int(p.get("attempt") or 0) + 1)
         for rolling, start in window_starts(self.now(), self.owner.config, self.settings):
             if misses.get(rolling.key, 0) >= (MISS_STOP if full else 1):
                 continue
             slug = window_slug(rolling, start)
             if slug in self.queued:
                 continue
-            attempt = 0
-            if slug in self.ledger.rows:
-                before = self.ledger.rows[slug]
-                if not self.supersedable(before):
-                    continue
-                attempt = int(before.get("attempt") or 0) + 1
+            if slug in self.ledger.rows and not self.supersedable(self.ledger.rows[slug]):
+                continue
+            attempt = attempts.get(slug, 0)
+            if attempt >= MAX_ATTEMPTS:
+                continue
             market = await category_market(self.api, slug)
             if market is None:
                 misses[rolling.key] = misses.get(rolling.key, 0) + 1
@@ -803,7 +822,7 @@ class Controller:
             self.ledger.delete(pair["slug"])
             LOG.warning("开盘前预挂 %s 没有发出：%s", pair["slug"], self.error)
             return ""
-        if pair["phase"] != "active" or self.now() >= pair["cancel_ms"] or self.blocked():
+        if pair["phase"] != "active" or self.now() >= pair["cancel_ms"] or self.withdrawing():
             await self.cancel_pair(pair, "单边未确认或已到撤单时间")
         LOG.info("开盘前预挂 %s：%s", pair["slug"], {s: o["state"] for s, o in pair["orders"].items()})
         return ""
@@ -864,6 +883,8 @@ class Controller:
             self.apply_fill(order, row, pair)
             if final_order(row):
                 order["state"] = "final"
+            elif self.gave_up(pair):  # a record Predict still shows open past the give-up: its signature expired long ago, nothing more can fill
+                order.update(state="final", note="开始后 15 分钟记录仍不是终态，签名早已过期：按已知成交记账")
         elif self.gave_up(pair):
             if order.get("id"):
                 order.update(state="final", note="撤单后按编号查不到记录，按已知成交记账")
@@ -963,7 +984,10 @@ class Controller:
             self.apply_fill(order, row, pair)
             if final_order(row):
                 order["state"] = "final"
-                rejected |= order["filled"] <= 0
+                if order["filled"] <= 0:
+                    rejected = True
+                    if str(row.get("status") or "").upper() in REFUSED_STATUSES:
+                        order["refused"] = True  # Predict's deferred refusal (a post-only order that would cross): the window is not quoted again
         self.ledger.save(pair)
         if rejected:
             await self.cancel_many([pair], "一边未成交即结束，撤掉另一边")
@@ -1019,7 +1043,7 @@ class Controller:
     def due(self, now_ms: int) -> list[dict]:
         """The pairs the cancellation loop acts on now: active ones at their cancel time (or the mode blocked), and
         closing or unverified ones whose next try has come (bookkeep: RETRY_MS doubling to RETRY_MAX_MS)."""
-        blocked = bool(self.blocked()) and not self.stopped()  # the stop itself withdraws nothing here: on_stop decides (keep_on_stop)
+        blocked = bool(self.withdrawing())  # an operator's stop withdraws the active pairs; not the stop itself (on_stop decides), not an account not verified yet
         out = []
         for p in self.ledger.rows.values():
             if p.get("accounted"):

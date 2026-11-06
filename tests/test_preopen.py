@@ -860,6 +860,67 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(p.review([], NOW)["total"]["records"], 0)
             await self.finish(ctl)
 
+    async def test_review_findings_only_an_operators_stop_withdraws_and_attempts_are_not_reused(self):
+        """1.128.3: the account not verified yet at a start (or the stop itself) withdraws nothing — an operator's stop does;
+        the attempt after a superseded record is not reused when the re-quote left no record; Predict's deferred refusal
+        is not quoted again; a record still open past the give-up is final as known; the review derives an old settled
+        record's result from its one filled side."""
+        ctl, api, clock = controller()
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        ctl.owner.live.ready = False
+        self.assertEqual((ctl.hold(), ctl.withdrawing(), ctl.due(NOW)), ("账户未就绪", "", []))
+        ctl.owner.live.ready = True
+        ctl.stop.set()
+        self.assertEqual((ctl.blocked(), ctl.withdrawing(), ctl.due(NOW)), ("进程或预挂模式停止中", "", []))
+        ctl.stop.clear()
+        ctl.owner.live_paused = lambda: "已暂停"
+        self.assertEqual((ctl.withdrawing(), [x["slug"] for x in ctl.due(NOW)]), ("已暂停", [c["slug"]]))
+        ctl.owner.live_paused = lambda: ""
+        # the attempt after the records that stepped aside, the latest having left no record (its first request rate-limited)
+        gone = {**pair, "slug": c["slug"] + "@0", "attempt": 0, "phase": "closed", "accounted": True,
+                "orders": {s: {**o, "state": "final", "filled": 0.0} for s, o in pair["orders"].items()}}
+        ctl.ledger.delete(c["slug"]); ctl.ledger.save(gone)
+        await ctl.discover()
+        queued = ctl.queue.get_nowait()[2]
+        self.assertEqual(queued["attempt"], 1, "not attempt 0 again: that salt is the withdrawn orders'")
+        ctl.queued.discard(c["slug"])
+        ctl.ledger.save({**gone, "slug": c["slug"] + "@2", "attempt": 2})
+        await ctl.discover()
+        self.assertEqual(ctl.queue.qsize(), 0, "three attempts made: not quoted again")
+        for key in (c["slug"] + "@0", c["slug"] + "@2"):
+            ctl.ledger.delete(key)
+        # Predict's deferred refusal (the record ends REJECTED with nothing filled): withdrawn, and not quoted again
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        up = pair["orders"]["up"]
+        api.rows[up["hash"]].update(status="REJECTED")
+        clock.ms += 10_000; ctl.account_at = clock.ms; ctl.listed_ids = set()
+        await ctl.monitor_pair(pair)
+        await self.settle_tasks(ctl)
+        self.assertEqual((up["state"], up.get("refused"), pair["accounted"], ctl.supersedable(pair)), ("final", True, True, False))
+        # a record Predict still shows open past the give-up: final as known
+        stuck = {**pair, "slug": "btc-updown-15m-stuck", "phase": "closing", "accounted": False,
+                 "orders": {"up": {"hash": "0xstuck", "id": "77", "state": "removed", "filled": 0.0}}}
+        api.rows["0xstuck"] = {"id": "77", "order": {"hash": "0xstuck"}, "amount": str(L.to_wei(50)), "amountFilled": "0", "status": "OPEN"}
+        await ctl.read_final(stuck["orders"]["up"], stuck)
+        self.assertEqual(stuck["orders"]["up"]["state"], "removed", "before the give-up: still waited for")
+        clock.ms = stuck["start_ms"] + p.GIVE_UP_MS
+        await ctl.read_final(stuck["orders"]["up"], stuck)
+        self.assertEqual(stuck["orders"]["up"]["state"], "final")
+        self.assertIn("签名早已过期", stuck["orders"]["up"]["note"])
+        # the review: an old settled record without its result, from its one filled side
+        old = {"slug": "btc-updown-15m-old", "key": "BTC-15M", "name": "BTC 15分涨跌 10:00–10:15", "start_ms": NOW + 3600_000, "created_ms": NOW,
+               "price": "0.49", "shares": "10", "phase": "closed", "accounted": True, "pnl": -4.9,
+               "orders": {"up": {"state": "final", "filled": 0.0}, "down": {"state": "final", "filled": 10.0}}}
+        self.assertEqual(p.quote_of(old)["result"], "up")  # the down side lost: up won
+        self.assertEqual(p.quote_of({**old, "pnl": 5.1})["result"], "down")
+        self.assertEqual(p.quote_of({**old, "pnl": 0.1})["result"], "split")
+        self.assertEqual(p.quote_of({**old, "orders": {"up": {"state": "final", "filled": 4.0}, "down": {"state": "final", "filled": 10.0}}})["result"], "", "both sides: ambiguous")
+        self.assertEqual(p.review([old], NOW)["sides"][1]["pnl"], -4.9)
+        await self.finish(ctl)
+
     async def test_restart_preserves_hash_and_pause(self):
         with tempfile.TemporaryDirectory() as folder:
             path = str(Path(folder) / "state.sqlite")
