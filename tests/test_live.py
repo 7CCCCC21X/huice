@@ -72,7 +72,7 @@ async def run():
     try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "QUOTE_REFRESH_SECONDS": "0"}); assert False
     except ValueError as e: assert "QUOTE_REFRESH_SECONDS" in str(e), e
     o = bot.contract_odds("UNITREEUSDT", D("10.80"), now)
-    assert isinstance(o, m.CloseOdds) and o.effective == D("78.00") and o.ref == D("76.50") and o.mode == "盘中", o
+    assert isinstance(o, m.CloseOdds) and o.effective == D("78.00") and o.ref == D("76.50") and o.mode == "盘中", o  # the live print: 盘中 (a proxy estimate is 盘后, 1.120.3)
     assert o.proxy_note == "上交所现货 78（腾讯·盘中直接用现货）" and o.ref_note.endswith("·腾讯") and o.unit == "CNY", o
     assert o.target == dt.date(2026, 9, 28) and abs(o.remaining - 209 / 240) < 1e-9, o.remaining
 

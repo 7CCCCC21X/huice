@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.120.2"
+VERSION = "1.120.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -15324,7 +15324,8 @@ class Bot:
         return close_odds(NAMES.get(symbol, symbol), base_value, base_value * price / anchor[1], sigma, remaining, target,
                           price_tick(ticker.market, base_value), base_label,
                           f"币安 {fmt_price(price)} / 收盘时刻 {fmt_price(anchor[1])} → {move:+.3f}%"
-                          + (f"｜{live_why}，暂用币安" if live_why else ""), sigma_note, unit, sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
+                          + (f"｜{live_why}，暂用币安" if live_why else ""), sigma_note, unit, mode="盘后",  # 1.120.3: a proxy estimate, as the index cards' are labelled
+                          sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
 
     HSI_PRINT_MS = 5 * 60_000  # the first futures print this soon after the 16:10 cash close is its anchor
 

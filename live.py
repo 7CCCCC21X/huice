@@ -1907,6 +1907,9 @@ class LiveBot(core.Bot):
     LIVE_LATE_FILLS_WINDOW_MS = 2 * core.DAY_MS  # ...over the orders that ended within this long (1.119.2: two days, as /live positions looks back;
     #                                             two hours missed a 300-share SK Hynix fill whose orders had ended the evening before the deploy)
     LIVE_DUST_SHARES = 0.1                     # a holding, or an excess of one, under this many shares is dust: neither adopted nor flagged
+    LIVE_ADOPT_READS = 8                       # an outcome's ended orders whose own records are read for the fills, newest first (1.120.3)
+    LIVE_ADOPT_WAIT_MS = 10 * 60_000           # ...and how long after the newest ended those records get before the fill is guessed onto the newest
+    LIVE_ADOPT_RECHECK_MS = 2 * 3_600_000      # ...and how long a guess is checked against the other orders' records
     LIVE_LATE_FILLS_GRACE_MS = 15_000          # ...and not before this long after their end: the positions list follows the matching a little late
 
     LIVE_TRIM_MAX = 0.05                       # a holding short of the records by more than this share is not a fee: left as it is (noted on the page)
@@ -1964,8 +1967,10 @@ class LiveBot(core.Bot):
         for tid, t in live:
             k = key_of(t)
             recorded[k] = recorded.get(k, 0.0) + float(t.get("shares") or 0)
-        # (a) the shares held beyond the records, onto the order they came from (live_pick_adoptee), else the newest that ended
-        # with shares unfilled; an earlier backfill costed at the wrong order's price is set to the position's average price
+        # (a) the shares held beyond the records, onto the order they came from: the orders' own records first — whichever shows fills
+        # beyond its record (1.120.3: a KOSPI fill at 21¢ and an SK Hynix one at 10¢ had each been put on a 1¢ sweep order placed
+        # after them, the newest to end) — else the order the position's price or time names, else, once the records have had
+        # LIVE_ADOPT_WAIT_MS to catch up, the newest as a guess, checked against the other orders' records for LIVE_ADOPT_RECHECK_MS
         ended.sort(key=lambda kv: core.trade_updated(kv[1]), reverse=True)
         by_out: dict[tuple[str, int], list[tuple[str, dict]]] = {}
         for tid, t in ended:
@@ -1978,42 +1983,74 @@ class LiveBot(core.Bot):
             if excess <= self.LIVE_DUST_SHARES:
                 continue
             seen.add(k)  # the outcome is not trimmed in the same pass
+            left = excess
+            for tid, t in cands[:self.LIVE_ADOPT_READS]:
+                if left <= self.LIVE_DUST_SHARES:
+                    break
+                got = await self.live_reread_fills(tid, t, now_ms)
+                if got > 1e-9:
+                    left -= got
+                    recorded[k] = recorded.get(k, 0.0) + got
+                    self.live_adopted_status(tid, t, now_ms, f"结束后再读订单记录，读到成交 {got:g} 份（累计 {float(t['shares']):g}/{float(t.get('order') or 0):g}）")
+            if left <= self.LIVE_DUST_SHARES:
+                continue
             price, when = pos_price.get(k), pos_time.get(k, 0)
-            tid, t, by = self.live_pick_adoptee(cands, price, when, self.LIVE_LATE_FILLS_GRACE_MS)
+            room = [c for c in cands if float(c[1].get("order") or 0) - float(c[1].get("shares") or 0) > 1e-9]
+            tid, t, by = self.live_pick_adoptee(room or cands, price, when, self.LIVE_LATE_FILLS_GRACE_MS)
+            guess = by.startswith("按最近结束")
+            if guess and now_ms - max(core.trade_updated(c[1]) for c in cands) < self.LIVE_ADOPT_WAIT_MS:
+                continue  # neither the records nor the position say which order filled: the records get a while to catch up
             st = t["live"]
             before, order = float(t.get("shares") or 0), float(t.get("order") or 0)
-            row = None
-            with contextlib.suppress(Exception):
-                row = await self.live.api.order(str(st["order_id"]), str(st.get("hash") or ""))
-            if isinstance(row, dict):
-                self.live_apply(tid, t, row, None, now_ms)
+            adopt = min(left, order - before)
+            if adopt <= self.LIVE_DUST_SHARES:
+                continue
+            self.live_apply(tid, t, {"status": str(st.get("final") or "closed").upper(), "amount": str(to_wei(order)),
+                                     "amountFilled": str(to_wei(before + adopt))}, None, now_ms)
             after = float(t.get("shares") or 0)
-            if after > before + 1e-9:
-                how = f"结束后再读订单记录，读到成交 {after - before:g} 份（累计 {after:g}/{order:g}）"
-            else:
-                adopt = min(excess, order - after)
-                if adopt <= self.LIVE_DUST_SHARES:
-                    continue
-                self.live_apply(tid, t, {"status": str(st.get("final") or "closed").upper(), "amount": str(to_wei(order)),
-                                         "amountFilled": str(to_wei(after + adopt))}, None, now_ms)
-                after = float(t.get("shares") or 0)
-                how = f"账户在这一边的持仓比记录多 {excess:g} 份、订单记录没显示：按成交 {adopt:g} 份补记（累计 {after:g}/{order:g}，{by}）"
-                if when and t.get("fills"):
-                    t["fills"][-1]["at"] = when  # the position's own time: the fill's, not this pass's
-                    t["filled"] = when
-                st["adopted"] = {"at": now_ms, "by": by, "pos_price": price}
-                if price is not None and abs(price - float(t["price"])) > 0.0051:
-                    cost = price if t.get("maker") else price + core.taker_fee(price, int((st.get("want") or {}).get("fee_bps") or 0))
-                    how += f"；成本按 Predict 持仓均价 {core.cents(price)} 记（订单 #{st['order_id']} 的价 {core.cents(float(t['price']))} 不是这笔成交的）"
-                    t["price"] = cost
+            how = f"账户在这一边的持仓比记录多 {excess:g} 份、订单记录没显示：按成交 {adopt:g} 份补记（累计 {after:g}/{order:g}，{by}）"
+            if when and t.get("fills"):
+                t["fills"][-1]["at"] = when  # the position's own time: the fill's, not this pass's
+                t["filled"] = when
+            st["adopted"] = {"at": now_ms, "by": by, "pos_price": price, "shares": adopt, "guess": guess}
+            if price is not None and abs(price - float(t["price"])) > 0.0051:
+                cost = price if t.get("maker") else price + core.taker_fee(price, int((st.get("want") or {}).get("fee_bps") or 0))
+                how += f"；成本按 Predict 持仓均价 {core.cents(price)} 记（订单 #{st['order_id']} 的价 {core.cents(float(t['price']))} 不是这笔成交的）"
+                t["price"] = cost
+            if guess:
+                how += "；之后两小时内继续核对这一边其他订单的记录，哪张显示了成交就改到哪张"
             recorded[k] = recorded.get(k, 0.0) + after - before
-            if t["status"] not in {"settled", "expired"} and after > 1e-9:
-                t.update(status="filled", unfilled=max(order - after, 0.0),
-                         note=f"真实成交 {after:g}/{order:g} 份（订单结束后补记），其余 {max(order - after, 0.0):g} 份{st.get('cancel_why') or '已结束'}")
-            st["events"].append({"at": now_ms, "what": "结束后核对持仓：" + how})
-            self.live_notify(f"📌 补记成交：{t['item']} {t['label']} {core.cents(float(t['price']))}：{how}（订单 #{st['order_id']}，请在 Predict 核对）",
-                             key=f"latefill:{st['order_id']}")
-            self.sim_save([(tid, t)])
+            self.live_adopted_status(tid, t, now_ms, how)
+        # a guessed adoption against the other orders' records (1.120.3): the one whose record shows the fills takes the shares back
+        for tid, t in open_recs:
+            st, k = t["live"], key_of(t)
+            ad = st.get("adopted") or {}
+            if not ad.get("guess") or ad.get("moved") or now_ms - int(ad.get("at") or 0) > self.LIVE_ADOPT_RECHECK_MS or k in seen:
+                continue
+            for tid2, t2 in [c for c in by_out.get(k, []) if c[0] != tid][:self.LIVE_ADOPT_READS]:
+                got = await self.live_reread_fills(tid2, t2, now_ms)
+                if got <= 1e-9:
+                    continue
+                oid2 = str(t2["live"].get("order_id") or "")
+                moved = round(min(got, float(ad.get("shares") or 0) or float(t.get("shares") or 0), float(t.get("shares") or 0)), 6)
+                order = float(t.get("order") or 0)
+                t["shares"] = round(float(t["shares"]) - moved, 6)
+                if t.get("fills"):  # the adopted fill, taken back
+                    t["fills"][-1]["shares"] = round(float(t["fills"][-1].get("shares") or 0) - moved, 6)
+                    if t["fills"][-1]["shares"] <= 1e-9:
+                        t["fills"].pop()
+                ad["moved"] = {"to": tid2, "order_id": oid2, "shares": moved, "at": now_ms}
+                if t["shares"] <= 1e-9:
+                    t.update(status="cancelled", shares=0.0, unfilled=order, filled=None,
+                             note=f"撤单：{st.get('cancel_why') or '已结束'}，一份都没成交（补记的 {moved:g} 份其实是订单 #{oid2} 的，已改到那笔）")
+                else:
+                    t.update(unfilled=max(order - float(t["shares"]), 0.0),
+                             note=f"真实成交 {float(t['shares']):g}/{order:g} 份（订单结束后补记），其余 {max(order - float(t['shares']), 0.0):g} 份{st.get('cancel_why') or '已结束'}")
+                st["events"].append({"at": now_ms, "what": f"补记改正：按最近结束的订单补记的 {moved:g} 份其实是订单 #{oid2} 的（它的记录显示了成交），已改到那笔"})
+                self.sim_save([(tid, t)])
+                self.live_adopted_status(tid2, t2, now_ms, f"结束后再读订单记录，读到成交 {got:g} 份（累计 {float(t2['shares']):g}/{float(t2.get('order') or 0):g}）；"
+                                                            f"之前按最近结束的订单补记在 #{st.get('order_id')} 上的 {moved:g} 份已改到这里")
+                break
         # an earlier backfill (1.119.0–1.119.2 took the newest ended order, whatever its price) costed at that order's price: the
         # position's average price, once the row states one and this is the only record holding the outcome, is the cost
         for tid, t in open_recs:
@@ -2058,6 +2095,31 @@ class LiveBot(core.Bot):
                 self.sim_save([(tid, t)])
             self.live_notify(f"📐 份数校正：{recs[0][1]['item']} {recs[0][1]['label']}：账户持有 {got:g} 份，记录 {total:g} 份，少的 {short:g} 份是手续费以份额扣除；"
                              f"{len(recs)} 笔记录按比例改为持有的份数（成本不变）", key=f"trim:{k[0]}:{k[1]}")
+
+    async def live_reread_fills(self, tid: str, t: dict, now_ms: int) -> float:
+        """An ended order's own record read again, onto the trade (live_apply): the shares it shows filled beyond the
+        record; 0 when none, or the record cannot be read."""
+        st = t["live"]
+        before = float(t.get("shares") or 0)
+        row = None
+        with contextlib.suppress(Exception):
+            row = await self.live.api.order(str(st["order_id"]), str(st.get("hash") or ""))
+        if not isinstance(row, dict):
+            return 0.0
+        self.live_apply(tid, t, row, None, now_ms)
+        return max(0.0, float(t.get("shares") or 0) - before)
+
+    def live_adopted_status(self, tid: str, t: dict, now_ms: int, how: str) -> None:
+        """A record that gained fills after its order ended: a position now (unless settled), the event, the notice, saved."""
+        st = t["live"]
+        after, order = float(t.get("shares") or 0), float(t.get("order") or 0)
+        if t["status"] not in {"settled", "expired"} and after > 1e-9:
+            t.update(status="filled", unfilled=max(order - after, 0.0),
+                     note=f"真实成交 {after:g}/{order:g} 份（订单结束后补记），其余 {max(order - after, 0.0):g} 份{st.get('cancel_why') or '已结束'}")
+        st["events"].append({"at": now_ms, "what": "结束后核对持仓：" + how})
+        self.live_notify(f"📌 补记成交：{t['item']} {t['label']} {core.cents(float(t['price']))}：{how}（订单 #{st.get('order_id')}，请在 Predict 核对）",
+                         key=f"latefill:{st.get('order_id')}")
+        self.sim_save([(tid, t)])
 
     async def live_fills_wait(self) -> None:
         """Every fills read in flight (live_fills_later), waited for: the step's sync and the tests."""

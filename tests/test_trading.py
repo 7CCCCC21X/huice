@@ -1000,7 +1000,8 @@ async def run():
     taker = [("t", {"price": 0.3, "maker": False, "opened": NOW, "live": {"want": {"limit": 0.3}, "events": []}})]
     assert L.LiveBot.live_pick_adoptee(taker, 0.28, 0, 15_000)[2].startswith("按 Predict 持仓均价 28.0¢") and L.LiveBot.live_pick_adoptee(taker, 0.31, 0, 15_000)[2].startswith("按最近结束")
 
-    async def late_case(by_record: bool, delay: int = 70_000):  # delay: the pass that adopts, after the cancel at NOW
+    async def late_case(by_record: bool, delay: int = 0):  # delay: the pass that adopts, after the cancel at NOW
+        delay = delay or (70_000 if by_record else 11 * 60_000)  # 1.120.3: a guess waits ten minutes for the records to catch up
         lbot = make_bot(SIM_MAKER_MIN_BID="100", SIM_MAKER_EXIT_CENTS="5", SIM_MAKER_SESSION="on", SIM_WAYS="maker")
         await lbot.live_prepare(); lfake = lbot.live.api
         await lbot.live_prefetch(NOW)
@@ -1021,9 +1022,10 @@ async def run():
         assert late["status"] == "filled" and abs(late["shares"] - 10) < 1e-9 and abs(late["unfilled"] - 90) < 1e-9 and "订单结束后补记" in late["note"], late
         how = next(e["what"] for e in late["live"]["events"] if e["what"].startswith("结束后核对持仓："))
         assert how == ("结束后核对持仓：结束后再读订单记录，读到成交 10 份（累计 10/100）" if by_record
-                       else "结束后核对持仓：账户在这一边的持仓比记录多 10 份、订单记录没显示：按成交 10 份补记（累计 10/100，按最近结束的订单对应（Predict 持仓没给均价和时间））"), how
+                       else "结束后核对持仓：账户在这一边的持仓比记录多 10 份、订单记录没显示：按成交 10 份补记（累计 10/100，按最近结束的订单对应（Predict 持仓没给均价和时间））"
+                            "；之后两小时内继续核对这一边其他订单的记录，哪张显示了成交就改到哪张"), how
         assert len(late["fills"]) == 1 and late["fills"][0]["shares"] == 10 and abs(lbot.live_reserved(late) - 10 * late["price"]) < 1e-9
-        assert late["price"] == 0.55 and (by_record or late["live"]["adopted"]["by"].startswith("按最近结束"))
+        assert late["price"] == 0.55 and (by_record or (late["live"]["adopted"]["by"].startswith("按最近结束") and late["live"]["adopted"]["guess"]))
         if not by_record:  # 1.119.3: the row now states the average price: the backfilled record's cost follows it (the only record there)
             lfake.positions_rows[0]["avgPrice"] = "0.21"
         await step(lbot, NOW + delay + 70_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + delay + 70_000))  # explained now: nothing more is adopted
@@ -1053,6 +1055,44 @@ async def run():
     await late_case(False)
     await late_case(True)
     await late_case(False, delay=3 * 3_600_000)  # 1.119.2: an order that ended hours ago is still set against the positions
+
+    async def two_orders():
+        """Two orders ended on the outcome: #101 withdrawn at NOW, #102 placed on the freed slot and withdrawn five seconds later."""
+        lbot = make_bot(SIM_MAKER_MIN_BID="100", SIM_MAKER_EXIT_CENTS="5", SIM_MAKER_SESSION="on", SIM_WAYS="maker")
+        await lbot.live_prepare(); lfake = lbot.live.api
+        await lbot.live_prefetch(NOW)
+        await step(lbot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+        await lbot.cmd_live(req("cancel", "all"))
+        await step(lbot, NOW + 5_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 5_000))
+        assert lbot.sim_trades()[mtid]["live"]["order_id"] == "102"
+        await lbot.cmd_live(req("cancel", "all"))
+        by_oid = lambda oid: next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == oid)
+        assert by_oid("101")["status"] == "cancelled" and by_oid("102")["status"] == "cancelled"
+        want = by_oid("101")["live"]["want"]
+        lfake.positions_rows = [{"id": "p1", "market": {"id": 101, "title": "恒生指数"}, "outcome": {"name": want["outcome"], "indexSet": want["index_set"], "onChainId": want["token"]},
+                                 "amount": str(10 * WEI)}]
+        return lbot, lfake, by_oid
+    # 1.120.3: the orders' own records first — the older #101 shows the fill, so it takes it, not the newest #102
+    lbot, lfake, by_oid = await two_orders()
+    lfake.closed["101"]["amountFilled"] = str(10 * WEI)
+    await step(lbot, NOW + 70_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 70_000))
+    assert abs(by_oid("101")["shares"] - 10) < 1e-9 and by_oid("101")["status"] == "filled" and by_oid("102")["shares"] == 0 and by_oid("102")["status"] == "cancelled", (by_oid("101"), by_oid("102"))
+    assert any(e["what"] == "结束后核对持仓：结束后再读订单记录，读到成交 10 份（累计 10/100）" for e in by_oid("101")["live"]["events"])
+    # ...and a guess made after ten minutes without any record showing the fill is corrected once #101's record does
+    lbot, lfake, by_oid = await two_orders()
+    await step(lbot, NOW + 70_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 70_000))
+    assert by_oid("101")["shares"] == 0 and by_oid("102")["shares"] == 0, "no record shows the fill and ten minutes have not passed: no guess yet"
+    await step(lbot, NOW + 11 * 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 11 * 60_000))
+    guessed = by_oid("102")
+    assert abs(guessed["shares"] - 10) < 1e-9 and guessed["status"] == "filled" and guessed["live"]["adopted"]["guess"] and by_oid("101")["shares"] == 0, guessed
+    lfake.closed["101"]["amountFilled"] = str(10 * WEI)  # Predict's record of the older order catches up
+    await step(lbot, NOW + 12 * 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 12 * 60_000))
+    back, real = by_oid("102"), by_oid("101")
+    assert back["status"] == "cancelled" and back["shares"] == 0 and not back["fills"] and "补记的 10 份其实是订单 #101 的，已改到那笔" in back["note"], back
+    assert back["live"]["adopted"]["moved"]["order_id"] == "101" and any(e["what"].startswith("补记改正：") for e in back["live"]["events"]), back["live"]["events"]
+    assert real["status"] == "filled" and abs(real["shares"] - 10) < 1e-9 and any("之前按最近结束的订单补记在 #102 上的 10 份已改到这里" in e["what"] for e in real["live"]["events"]), real
+    await step(lbot, NOW + 13 * 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 13 * 60_000))  # explained: nothing more moves
+    assert by_oid("102")["shares"] == 0 and abs(by_oid("101")["shares"] - 10) < 1e-9
 
     # --- execution safety: reserved until Predict's final word, cancels confirmed, unknown results reconciled, the pre-send check
     sbot = make_bot(SIM_WAYS="both")
