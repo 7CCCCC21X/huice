@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.131.6"
+VERSION = "1.132.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -6909,6 +6909,10 @@ TOUCH_MARKETS = (
               int(dt.datetime(2026, 3, 12, 13, 27, 8, 415000, tzinfo=dt.timezone.utc).timestamp() * 1000)),
     # window opens at the market's creation (from Predict; the rules give no date)
     TouchSpec("ETH", "will-ethereum-hit-1k-or-3k-first", "ETHUSDT", D("1000"), D("3000")),
+    # "between November 5th 2026 at 9:00 AM ET and May 5th, 2027 at 11:59 PM ET" (EST, then EDT): Binance BTC/USDT 1-minute
+    # High / Low; neither hit → 50/50. Its own key: the earlier BTC 70k/90k (Aug 25 – Oct 25) stays "BTC" in TOUCH_SETTLED (1.132.0)
+    TouchSpec("BTC-2027", "will-btc-hit-70000-or-90000-first-before-may-6-2027", "BTCUSDT", D("70000"), D("90000"),
+              et_ms(2026, 11, 5, 9, 0, -5), et_ms(2027, 5, 5, 23, 59, -4), -4, fixed_start=True),
 )
 # Touch markets no longer listed: no card, no book, no trading. Kept only so that a trade bought on one is still settled
 # on Predict's result, whose outcome names ("$700" / "$900") are read against the market's two lines (touch_spec).
@@ -8170,17 +8174,23 @@ class FlipSpec:
     name: str        # card title
     coin: str        # the one that has to climb (HYPE)
     other: str       # the one it has to pass (SOL)
-    start_ms: int    # open time of the first 1-minute candle that counts
+    start_ms: int    # open time of the first 1-minute candle that counts (0 with from_creation: not read yet)
     end_ms: int      # open time of the last one
+    from_creation: bool = False  # the window opens at the market's creation, Predict's time (the rules give no date; 1.132.0)
 
     def window(self) -> str:
         et = lambda ms: dt.datetime.fromtimestamp(ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(ms)))).strftime("%m-%d %H:%M")
+        if not self.start_ms:
+            return f"市场创建时起 – {et(self.end_ms)} ET（北京 {stamp(self.end_ms, seconds=False)}）"
         return (f"{et(self.start_ms)} – {et(self.end_ms)} ET（北京 {stamp(self.start_ms, seconds=False)} – "
                 f"{stamp(self.end_ms, seconds=False)}）")
 
 
 FLIP_MARKETS: tuple[FlipSpec, ...] = (
-    # none listed now: HYPE 反超 SOL (will-hype-flip-sol-by-nov-26) ended 10-31 23:59 ET; tests/retired.py keeps its line
+    # "at any point between market creation and November 30, 2026, 11:59 PM ET" (EST): the HYPE/USDC and SOL/USDC 1-minute
+    # closes with the same timestamp on Hyperliquid; the window opens at the market's creation, as Predict gives it (1.132.0).
+    # Its own key: the October one (will-hype-flip-sol-by-nov-26, "HYPE-SOL") ended 10-31; tests/retired.py keeps its line
+    FlipSpec("HYPE-SOL-12", "will-hype-flip-sol-by-december-2026", "HYPE 反超 SOL", "HYPE", "SOL", 0, et_ms(2026, 11, 30, 23, 59, -5), from_creation=True),
 )
 
 
@@ -8289,6 +8299,8 @@ class FlipMarket:
         spec, hist = self.spec, self.history
         if hist.get("kind") == "flip":
             return
+        if not spec.start_ms:
+            raise ValueError("等 Predict 给出市场创建时间（窗口从创建起算）")  # nothing checked, nothing suggested (advice_problem) until it is read
         end = min(now_ms - now_ms % 60_000, spec.end_ms + 60_000)  # minutes opening before this have closed
         if end <= spec.start_ms:
             return  # the window has not opened yet: nothing to check
@@ -21303,6 +21315,11 @@ class Bot:
 
     async def refresh_flip(self, now_ms: int) -> Refreshed:
         for fm in self.flips.values():
+            if fm.spec.from_creation:  # the window opens at the market's creation, as Predict gives it (the touch markets' way)
+                created = int((self.predict.info.get(fm.spec.slug) or {}).get("created_ms") or 0)
+                if created and created != fm.spec.start_ms:
+                    fm.spec = dataclasses.replace(fm.spec, start_ms=created)
+                    fm.times["scan"] = -1e9  # check the path from the opening at once
             await fm.refresh(now_ms)
         failed = [f"{key}：{fm.error}" for key, fm in self.flips.items() if fm.error]
         return refreshed(failed, len(self.flips) - len(failed))

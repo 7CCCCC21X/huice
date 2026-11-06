@@ -6,6 +6,14 @@ import retired  # the markets main no longer lists (their windows are over), put
 retired.install()
 D = m.D
 BNB, SOL, BTC, ETH = m.TOUCH_MARKETS
+# 1.132.0: BTC 先触 70k/90k to May 2027, under its own key — the earlier one (to 10-25) stays "BTC" for the trades bought on it
+assert [s.key for s in retired.LIVE["TOUCH_MARKETS"]] == ["SOL", "ETH", "BTC-2027"]
+NEW_BTC = retired.LIVE["TOUCH_MARKETS"][2]
+assert NEW_BTC.slug == "will-btc-hit-70000-or-90000-first-before-may-6-2027" and NEW_BTC.symbol == "BTCUSDT" and (NEW_BTC.low, NEW_BTC.high) == (D("70000"), D("90000"))
+assert NEW_BTC.fixed_start and NEW_BTC.created_ms == int(dt.datetime(2026, 11, 5, 14, 0, tzinfo=dt.timezone.utc).timestamp() * 1000)  # 09:00 EST
+assert NEW_BTC.deadline_ms == int(dt.datetime(2027, 5, 6, 3, 59, tzinfo=dt.timezone.utc).timestamp() * 1000)  # 23:59 EDT
+assert NEW_BTC.close_label() == "05-05 23:59 ET（北京 05-06 11:59）截止；都没碰到按 50/50 结算", NEW_BTC.close_label()
+assert BTC.key == "BTC" and BTC in m.TOUCH_SETTLED and BTC.slug == "will-btc-hit-70000-or-90000-first"
 
 # --- model: symmetric-ish band, long horizon -> both sides ~50%, none ~0; short -> mostly none ------------------
 o = m.first_touch(800, 700, 900, 0.6, 0, 1.0)

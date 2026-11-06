@@ -180,6 +180,30 @@ async def run():
     off = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BNB_TOUCH": "off"}), m.Store(":memory:"), FM(NOW), None)
     assert SPEC.key not in off.predict_targets(NOW) and "反超市场" not in [name for name, _ in off.reference_jobs()]
     assert not any(i["name"] == "HYPE 反超 SOL" for i in off.odds_payload()["items"])
+    # 1.132.0: HYPE 反超 SOL by December — the window opens at the market's creation, as Predict gives it; until it is read
+    # the card checks nothing (no scan from 1970) and suggests nothing
+    (DEC,) = retired.LIVE["FLIP_MARKETS"]
+    assert (DEC.key, DEC.slug, DEC.from_creation, DEC.start_ms, DEC.end_ms) == ("HYPE-SOL-12", "will-hype-flip-sol-by-december-2026", True, 0, utc(2026, 12, 1, 4, 59))
+    assert DEC.window() == "市场创建时起 – 11-30 23:59 ET（北京 12-01 12:59）", DEC.window()
+    dm = m.FlipMarket(m.Store(":memory:"), DEC)
+    try:
+        await dm.scan(NOW)
+        assert False, "no scan before the opening is known"
+    except ValueError as error:
+        assert "市场创建时间" in str(error)
+    assert dm.advice_problem(NOW) == "窗口开始以来是否反超尚未核验；暂不给建议"
+    m.FLIP_MARKETS, kept = (DEC,), m.FLIP_MARKETS
+    dbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}), m.Store(":memory:"), FM(NOW), None)
+    m.FLIP_MARKETS = kept
+    fm, starts = dbot.flips["HYPE-SOL-12"], []
+    async def look(now_ms):
+        starts.append(fm.spec.start_ms)
+    fm.refresh = look
+    await dbot.refresh_flip(NOW)
+    dbot.predict.info[DEC.slug] = {"created_ms": utc(2026, 11, 1, 16, 0)}
+    await dbot.refresh_flip(NOW)
+    assert starts == [0, utc(2026, 11, 1, 16, 0)] and fm.times["scan"] == -1e9, starts
+    assert fm.spec.window().startswith("11-01 11:00 – 11-30 23:59 ET"), fm.spec.window()
     await layout_check()
     print("FLIP_OK")
 

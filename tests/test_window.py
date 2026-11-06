@@ -544,7 +544,7 @@ async def run():
     bbot = m.Bot(m.Config.from_env(ENV), store2, FM(T0 + 5_000), None)
     btc = bbot.updowns["BTC-15M"]
     assert isinstance(btc, m.SpotWindowMarket) and btc.spec == bspec and btc.lead_mode == "off" and btc.GROUP == "crypto" and btc.TIE == D("0.0001")
-    assert "BTCUSDT" not in bbot.index_markets and [c.spec.key for c in bbot.pair_markets[("spot", "BTCUSDT")]][:2] == ["BTC-DAY", "BTC-15M"]  # then the price ladders
+    assert "BTCUSDT" not in bbot.index_markets and [c.spec.key for c in bbot.pair_markets[("spot", "BTCUSDT")]][:3] == ["BTC-2027", "BTC-DAY", "BTC-15M"]  # the touch card (1.132.0), then the price ladders
     assert "BTCUSDT" in bbot.binance_streams["spot"].symbols() and "btcusdt@aggTrade" in bbot.binance_streams["spot"].names()
     assert "BTCUSDT" not in bbot.binance_streams["futures"].symbols() and set(bbot.index_markets) == {"UNITREEUSDT", "SKHYNIXUSDT"}
     assert bbot.predict_targets(T0 + 5_000)["BTC-15M"] == bspec.slug and bspec.slug in bbot.predict.want_info
