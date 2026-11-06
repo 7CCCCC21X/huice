@@ -3318,12 +3318,14 @@ class LiveBot(core.Bot):
             return "\n".join(await probe(api, self.config, settings, self.market.now_ms()))
         if self.preopen is None:
             return "开盘前预挂模式未启用（PREOPEN_15M=off）；/preopen probe 只读探测市场列表的字段和现在会挂的场次，/preopen on 开启（也可在控制台改）"
+        if action == "check":  # what is wrong now, in one message (1.130.1)
+            return self.preopen.check()
         if action in {"pause", "resume"}:
             self.preopen.manual_pause = self.preopen.ledger.pause(action == "pause")
             if action == "pause":
                 await self.preopen.cancel_all("管理员暂停开盘前模式")
         elif action:
-            return "用法：/preopen｜/preopen on｜/preopen off｜/preopen pause｜/preopen resume｜/preopen probe"
+            return "用法：/preopen｜/preopen check｜/preopen on｜/preopen off｜/preopen pause｜/preopen resume｜/preopen probe"
         return self.preopen.status()
 
     async def run(self) -> int:

@@ -36,6 +36,7 @@ success it is; only an explicit success=false is a refusal.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import dataclasses
 import datetime as dt
@@ -68,6 +69,9 @@ CARD_CHECK_MS = 5_000     # the stock cards' limit / halt check (card_hold) this
 SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
 DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
 REFUSED_STATUSES = {"REJECTED", "INVALIDATED", "FAILED"}  # an order's record ending so with nothing filled: Predict's deferred refusal (not quoted again)
+FILLED_STATUSES = {"FILLED", "COMPLETED", "DONE", "MATCHED"}  # a record that says so without an amount filled: the whole order, by its own word
+ERRORS_KEPT = 20          # the last problems kept with their time (/preopen check)
+STUCK_MS = 15 * 60_000    # a withdrawn pair not cleared this long past its cancel time is announced (check_stuck)
 LISTING_FIELDS = ("id", "conditionId", "status", "tradingStatus", "question", "outcomes")  # the details' fields the discovery reads
 MAX_ATTEMPTS = 3       # a window is quoted at most this many times (its pairs withdrawn before the start quoted again under a new salt)
 MISS_STOP = 4          # discover: a card's coming windows are asked in start order; this many unlisted in a row end the card's full scan
@@ -78,7 +82,7 @@ def final_order(row: dict) -> bool:
     status = str(row.get("status") or "").upper()
     amount, filled = D(str(row.get("amount") or "0")), D(str(row.get("amountFilled") or "0"))
     return amount > 0 and (filled >= amount or status in {
-        "FILLED", "CANCELLED", "CANCELED", "EXPIRED", "INVALIDATED", "REJECTED", "FAILED", "CLOSED", "COMPLETED", "DONE", "SETTLED", "RESOLVED"})
+        "FILLED", "MATCHED", "CANCELLED", "CANCELED", "EXPIRED", "INVALIDATED", "REJECTED", "FAILED", "CLOSED", "COMPLETED", "DONE", "SETTLED", "RESOLVED"})
 
 
 def order_verified(order: dict) -> bool:
@@ -451,8 +455,13 @@ class Controller:
         self.owner = owner
         self.settings = Settings.from_config(owner.config)
         self.ledger = Ledger(self.settings.db)
+        self.errors: collections.deque = collections.deque(maxlen=ERRORS_KEPT)  # (ms, text): the last problems (the error setter)
+        self._error = ""
         self.error = ""
         self.alive = True
+        self.limited_at: collections.deque = collections.deque(maxlen=50)  # when a cooldown began (a 429 on the shared client)
+        self.in_cooldown = False
+        self.stuck_checked_ms = 0
         self.stop = asyncio.Event()  # this mode's own stop (the page switching it off, a settings change): its run() withdraws the orders on the way out
         self.manual_pause = self.ledger.pause()
         self.account_at = 0
@@ -483,6 +492,73 @@ class Controller:
 
     def now(self) -> int:
         return self.owner.market.now_ms()
+
+    @property
+    def error(self) -> str:
+        return self._error
+
+    @error.setter
+    def error(self, text: str) -> None:
+        """The latest problem (the status line); each new one kept with its time (/preopen check) and announced once in a while."""
+        text = str(text or "")
+        fresh = text and text != self._error
+        self._error = text
+        if fresh:
+            self.errors.append((self.now(), text))
+            self.notify(f"⚠️ 开盘前预挂：{text}", key="preopen:error:" + text[:40])
+
+    def notify(self, text: str, key: str = "") -> None:
+        """A line to the administrator's chats (LiveBot.live_notify: a keyed notice repeats at most every LIVE_NOTE_SECONDS)."""
+        send = getattr(self.owner, "live_notify", None)
+        if send is not None:
+            with contextlib.suppress(Exception):
+                send(text, key=key)
+
+    def note_cooldown(self) -> None:
+        """A cooldown beginning (a 429 on any client sharing it) is counted and announced."""
+        why = self.cooldown()
+        if why and not self.in_cooldown:
+            self.limited_at.append(self.now())
+            self.notify(f"⚠️ 开盘前预挂：{why}（24 小时内第 {sum(1 for t in self.limited_at if self.now() - t <= core.DAY_MS)} 次）", key="preopen:429")
+        self.in_cooldown = bool(why)
+
+    def stuck_pairs(self, now_ms: int) -> list[dict]:
+        """The withdrawn pairs not cleared STUCK_MS past their cancel time: a cancel or a read that keeps failing, an order in doubt."""
+        return [p for p in self.ledger.rows.values() if not p.get("accounted") and p["phase"] != "active" and now_ms > int(p.get("cancel_ms") or 0) + STUCK_MS]
+
+    def check_stuck(self, now_ms: int) -> None:
+        """Each stuck pair announced (once in a while each)."""
+        for p in self.stuck_pairs(now_ms):
+            states = "/".join(f"{s} {o['state']}" for s, o in p["orders"].items())
+            self.notify(f"⚠️ 预挂 {p.get('name') or p['slug']} 撤单 {(now_ms - int(p.get('cancel_ms') or 0)) // 60_000} 分钟后仍未结清：{states}；"
+                        f"{p.get('reason') or ''}；最近问题：{self.error or '无'}", key="preopen:stuck:" + p["slug"])
+
+    def check(self) -> str:
+        """/preopen check: what is wrong now, in one message — the cooldown and the 429s, the account snapshot, why nothing
+        new is placed, the stock cards held, the candidates waiting, the pairs not cleared long after their cancel time, the
+        orders in doubt, the last problems."""
+        now = self.now()
+        hms = lambda ms: dt.datetime.fromtimestamp(ms / 1000, core.BEIJING).strftime("%H:%M:%S")
+        hold = (self.hold() or self.budget_problem()) if self.alive else ""
+        cooldown = self.cooldown()
+        limited = [t for t in self.limited_at if now - t <= core.DAY_MS]
+        stuck = self.stuck_pairs(now)
+        unknown = [(p, s) for p in self.ledger.rows.values() if not p.get("accounted") for s, o in p["orders"].items() if o["state"] == "unknown"]
+        recent = [(t, e) for t, e in self.errors if now - t <= 600_000]
+        problems = bool(cooldown or hold or self.card_holds or stuck or unknown or recent or not self.alive)
+        lines = [f"开盘前预挂体检 {hms(now)}：{'有问题' if problems else '正常'}" + ("" if self.alive else f"；本模式已停止：{self.error}")]
+        lines.append(f"限流：{cooldown or '没有冷却'}；24 小时内触发 {len(limited)} 次" + (f"，最近 {hms(limited[-1])}" if limited else ""))
+        lines.append(f"账户快照：{'还没读到' if not self.account_at else str((now - self.account_at) // 1000) + ' 秒前'}；余额 {self.balance:.2f}U，"
+                     f"账户挂单占用 {self.open_reserved:.2f}U，本模式预留 {self.risk():.2f}U" + (f"；另有 {self.unmanaged} 笔不认识的挂单" if self.unmanaged else ""))
+        lines.append(f"新挂：{hold or '正常'}；队列 {self.queue.qsize()} 场，等候 {len(self.parked)} 场"
+                     + ("：" + "；".join(f"{c.get('name') or slug} 等到 {hms(at)}" for slug, (at, c) in list(self.parked.items())[:5]) if self.parked else ""))
+        if self.card_holds:
+            lines.append("股票卡暂停：" + "；".join(self.card_holds.values()))
+        lines.append(f"撤单后超过 {STUCK_MS // 60_000} 分钟未结清：{len(stuck)} 场"
+                     + ("：" + "；".join(f"{p.get('name') or p['slug']}（{'/'.join(o['state'] for o in p['orders'].values())}，{p.get('reason') or '?'}）" for p in stuck[:5]) if stuck else ""))
+        lines.append(f"状态未知的订单：{len(unknown)} 张" + ("：" + "；".join(f"{p.get('name') or p['slug']} {s}" for p, s in unknown[:5]) if unknown else ""))
+        lines.append("最近 10 分钟的问题：" + ("；".join(f"{hms(t)} {e}" for t, e in recent[-5:]) if recent else "无"))
+        return "\n".join(lines)
 
     def stopped(self) -> bool:
         return self.owner.stopping.is_set() or self.stop.is_set()
@@ -923,7 +999,9 @@ class Controller:
 
     def apply_fill(self, order: dict, row: dict, pair: dict) -> None:
         # Fixed shares are the actual signed shares — the pair's own (a pair from older settings keeps its size), not an estimated count.
-        amount, filled = D(str(row.get("amount") or "0")), D(str(row.get("amountFilled") or "0"))
+        amount, filled = D(str(row.get("amount") or "0")), D(str(row.get("amountFilled") or row.get("filled") or "0"))  # the fill field as live.order_fill reads it
+        if filled <= 0 and str(row.get("status") or "").upper() in FILLED_STATUSES:
+            filled = amount  # a record that says filled without the amount: the whole order, by its own word (not a zero-fill end: the other side stays)
         if amount <= 0 or filled < 0 or filled > amount:
             raise core.RemoteError("成交回报数量无效，保留风险额度")
         shares = D(str(pair_quote(pair)[1] or self.settings.shares))
@@ -1215,6 +1293,10 @@ class Controller:
             self.unpark()
             now = self.now()
             await self.check_cards(now)
+            self.note_cooldown()
+            if now - self.stuck_checked_ms >= 60_000:
+                self.stuck_checked_ms = now
+                self.check_stuck(now)
             due = self.due(now)
             if due:
                 active = [p for p in due if p["phase"] == "active"]

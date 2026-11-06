@@ -612,6 +612,46 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         await bot.cmd_preopen(req)
         self.assertFalse(ctl.manual_pause)
         self.assertFalse(ctl.ledger.pause())
+        self.assertIn("开盘前预挂体检", await bot.cmd_preopen(m.Request("/preopen", ["check"], 1, 0, 1)))
+        await self.finish(ctl)
+
+    async def test_check_reports_anomalies_and_the_alerts_go_out(self):
+        """1.130.1: /preopen check says what is wrong (the cooldown and the 429s, the snapshot, the holds, the parked
+        candidates, the stuck pairs, the orders in doubt, the last problems), and a cooldown, a stuck pair and a new problem
+        are announced to the administrator's chats; a record that says FILLED without an amount is the whole order."""
+        ctl, api, clock = controller()
+        notes = []
+        ctl.owner.live_notify = lambda text, key="": notes.append((key, text))
+        self.assertIn("：正常", ctl.check())
+        ctl.error = "HTTP 500: boom"
+        self.assertEqual((ctl.errors[-1][1], notes[-1][0]), ("HTTP 500: boom", "preopen:error:HTTP 500: boom"))
+        ctl.error = "HTTP 500: boom"
+        self.assertEqual(len(ctl.errors), 1, "the same problem again: kept once")
+        api.blocked_until = time.monotonic() + 30
+        ctl.note_cooldown(); ctl.note_cooldown()
+        self.assertEqual((len(ctl.limited_at), notes[-1][0], ctl.in_cooldown), (1, "preopen:429", True))
+        text = ctl.check()
+        self.assertTrue("：有问题" in text and "限流冷却中" in text and "24 小时内触发 1 次" in text and "HTTP 500: boom" in text, text)
+        api.blocked_until = 0.0
+        ctl.note_cooldown()
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        # a record that says FILLED without the amount: the whole order — the other side stays
+        up = pair["orders"]["up"]
+        api.rows[up["hash"]].update(status="FILLED", amountFilled="0")
+        clock.ms += 10_000; ctl.account_at = clock.ms; ctl.listed_ids = set()
+        await ctl.monitor_pair(pair)
+        self.assertEqual((up["state"], up["filled"], api.removed, pair["phase"]), ("final", 50.0, [], "active"))
+        self.assertIn("按全部成交记", up.get("note", "")) if up.get("note") else None
+        # a stuck pair: withdrawn long ago, never cleared
+        stuck = {**pair, "slug": "btc-updown-15m-stuck", "name": "BTC 15分涨跌 08:00–08:15", "phase": "closing", "accounted": False, "cancel_ms": clock.ms - 20 * 60_000,
+                 "reason": "到时撤单", "orders": {"up": {"state": "unknown", "hash": "0xs", "filled": 0.0}, "down": {"state": "removed", "hash": "0xt", "id": "9", "filled": 0.0}}}
+        ctl.ledger.save(stuck)
+        ctl.check_stuck(clock.ms)
+        self.assertEqual(notes[-1][0], "preopen:stuck:btc-updown-15m-stuck")
+        text = ctl.check()
+        self.assertTrue("未结清：1 场" in text and "状态未知的订单：1 张" in text and "up unknown" in notes[-1][1], text)
         await self.finish(ctl)
 
     async def test_default_is_off_and_normal_strategy_held_only_while_the_mode_runs_for_real(self):
