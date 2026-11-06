@@ -3,6 +3,16 @@
 The model trader does not choose these orders: their identity, clock and fixed
 size are checked independently. Records live in a separate, synchronous SQLite
 ledger; unknown submissions are looked up by their saved hash, never re-signed.
+
+Review fixes (the second revision): a definite refusal (post-only crossing, a
+4xx) ends the order instead of leaving it "unknown" with its money reserved for
+good; cancels and reads of a pair that has not reached its end are tried again
+with a growing wait, not every half second; a pair whose orders are confirmed
+gone with nothing filled gives its reservation back at once, and the queue takes
+the soonest window first, only PREOPEN_AHEAD_MINUTES ahead; the size, the price
+and the cards are settings; the listing's fields can be probed read-only before
+the mode is switched on; the rate-limit cooldown is shared with the bot's own
+API client; a crash of this mode no longer stops the bot.
 """
 from __future__ import annotations
 
@@ -23,9 +33,12 @@ from typing import Any
 import main as core
 
 LOG = logging.getLogger(__name__)
-PRICE, SHARES = D("0.49"), D("50")
-PAIR_USD = float(PRICE * SHARES * 2)
-TERMINAL = {"removed", "not_sent", "final"}
+TERMINAL = {"removed", "not_sent", "rejected", "not_found", "final"}  # states an order cannot leave: nothing is left to cancel
+NEVER_PLACED = {"not_sent", "rejected", "not_found"}                  # ...of which these never tied money up
+RETRY_MS, RETRY_MAX_MS = 15_000, 120_000  # a closing pair's cancels and reads are tried again this long after a try, doubling to the cap
+GIVE_UP_MS = 15 * 60_000  # after a window's start + this, an order Predict cannot show by its hash is taken as never placed (it expired before the start)
+DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
+LISTING_FIELDS = ("id", "conditionId", "categorySlug", "status", "tradingStatus", "isVisible", "makerFeeBps", "question", "outcomes")
 
 
 def final_order(row: dict) -> bool:
@@ -35,6 +48,11 @@ def final_order(row: dict) -> bool:
         "FILLED", "CANCELLED", "CANCELED", "EXPIRED", "INVALIDATED", "REJECTED", "FAILED", "CLOSED", "COMPLETED", "DONE", "SETTLED", "RESOLVED"})
 
 
+def order_verified(order: dict) -> bool:
+    """Whether the order's money is accounted for: never placed, or its final record read."""
+    return order["state"] in NEVER_PLACED or order["state"] == "final"
+
+
 @dataclass(frozen=True)
 class Settings:
     enabled: bool = False
@@ -42,21 +60,44 @@ class Settings:
     cancel_seconds: int = 60
     expiry_seconds: int = 30
     entry_seconds: int = 180
+    ahead_minutes: int = 60
     max_open_usd: float = 7000.0
+    price: D = D("0.49")
+    shares: D = D("50")
+    markets: frozenset = frozenset(r.key for r in core.WINDOW_UPDOWN_MARKETS)
     db: str = ""
 
+    @property
+    def side_usd(self) -> float:
+        return float(self.price * self.shares)
+
+    @property
+    def pair_usd(self) -> float:
+        return 2 * self.side_usd
+
     @classmethod
-    def from_config(cls, config: Any) -> "Settings":
+    def from_config(cls, config: Any, force: bool = False) -> "Settings":
+        """The settings from the environment; the defaults, unread, while the mode is off (``force``: read them anyway,
+        for the probe)."""
+        import live
         env = config.env
         enabled = str(env.get("PREOPEN_15M", "off")).lower() == "on"
-        if not enabled:
+        if not enabled and not force:
             return cls()
         poll = float(env.get("PREOPEN_POLL_SECONDS", "5"))
         cap = float(env.get("PREOPEN_MAX_OPEN_USD", "7000"))
-        if not 1 <= poll <= 60 or not 49 <= cap <= 1_000_000:
-            raise ValueError("PREOPEN_POLL_SECONDS 必须为 1～60，PREOPEN_MAX_OPEN_USD 必须为 49～1000000")
+        cents, shares, ahead = int(env.get("PREOPEN_PRICE_CENTS", "49")), int(env.get("PREOPEN_SHARES", "50")), int(env.get("PREOPEN_AHEAD_MINUTES", "60"))
+        keys = {r.key for r in core.WINDOW_UPDOWN_MARKETS}
+        stems = {r.stem.lower(): r.key for r in core.WINDOW_UPDOWN_MARKETS}
+        wanted = [w.strip() for w in str(env.get("PREOPEN_MARKETS", "")).split(",") if w.strip()]
+        markets = frozenset(stems.get(w.lower(), w.upper()) for w in wanted) or frozenset(keys)
+        price = D(cents) / 100
+        if (not 1 <= poll <= 60 or not 1 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
+                or not 3 <= ahead <= 1440 or not markets <= keys or float(price * shares) < live.MIN_ORDER_USD):
+            raise ValueError("PREOPEN_POLL_SECONDS 1～60、PREOPEN_MAX_OPEN_USD 1～1000000、PREOPEN_PRICE_CENTS 1～50、PREOPEN_SHARES 1～500（每边不少于 "
+                             f"Predict 最小订单 ${live.MIN_ORDER_USD:g}）、PREOPEN_AHEAD_MINUTES 3～1440、PREOPEN_MARKETS 只能是 {'、'.join(sorted(keys))}")
         path = str(env.get("PREOPEN_DB") or (":memory:" if config.db_path == ":memory:" else str(Path(config.db_path).with_suffix(".preopen.sqlite3"))))
-        return cls(True, poll=poll, max_open_usd=cap, db=path)
+        return cls(enabled, poll=poll, ahead_minutes=ahead, max_open_usd=cap, price=price, shares=D(shares), markets=markets, db=path)
 
 
 class Ledger:
@@ -93,18 +134,29 @@ class NotSent(core.RemoteError):
     """A local gate refused the request before its bytes were dispatched."""
 
 
-def safe_api(base: str, key: str, wallet: Any, before_send: Any = None) -> Any:
-    # Imported at runtime: live imports this module only after defining its API.
+def safe_api(base: str, key: str, wallet: Any, before_send: Any = None, shared: Any = None) -> Any:
+    """A PredictApi for this mode: no pooled transport (a sendall failure cannot prove zero delivery, so no automatic
+    POST retry), every answer checked for success, ``before_send`` judged right before an order's bytes go out, and the
+    rate-limit cooldown shared with ``shared`` (the bot's own client): a 429 on either pauses both."""
     import live
 
     class Api(live.PredictApi):
+        @property
+        def blocked_until(self) -> float:
+            own = self.__dict__.get("_blocked_until", 0.0)
+            return max(own, getattr(shared, "blocked_until", 0.0)) if shared is not None else own
+
+        @blocked_until.setter
+        def blocked_until(self, value: float) -> None:
+            self.__dict__["_blocked_until"] = value
+            if shared is not None and value > getattr(shared, "blocked_until", 0.0):
+                shared.blocked_until = value
+
         async def send(self, method: str, path: str, payload: Any, timeout: int) -> bytes:
             if path == "/orders" and method == "POST" and before_send is not None:
                 why = before_send(payload)
                 if why:
                     raise NotSent(why)
-            # A sendall failure cannot prove zero delivery. In particular, do not
-            # use the pooled transport's automatic POST retry for this strategy.
             data = None if payload is None else json.dumps(payload).encode()
             headers = self.headers()
             if data is not None:
@@ -126,39 +178,102 @@ def safe_api(base: str, key: str, wallet: Any, before_send: Any = None) -> Any:
     return Api(base, key, wallet)
 
 
-def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dict | None:
-    """Only exact, listed slugs of the three configured assets, starting today."""
+def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings) -> str:
+    """Why a listed market is not one of this mode's ("" when it is): only exact, listed slugs of the configured cards,
+    starting today, within PREOPEN_AHEAD_MINUTES and not within PREOPEN's entry seconds, registered, visible, open or
+    awaiting matching, with no maker fee, with an id, a condition and a question that agrees with the slug's time."""
     slug = str(market.get("categorySlug") or market.get("slug") or "")
     for rolling in core.WINDOW_UPDOWN_MARKETS:
         prefix = f"{rolling.stem}-updown-15m-"
         suffix = slug.removeprefix(prefix)
         if not slug.startswith(prefix) or not suffix.isdigit():
             continue
+        if rolling.key not in settings.markets:
+            return "不在 PREOPEN_MARKETS 里"
         start = int(suffix) * 1000
-        if start % rolling.window_ms or start - now_ms < settings.entry_seconds * 1000:
-            return None
+        if start % rolling.window_ms:
+            return "链接里的时间不是整刻钟"
+        if start - now_ms < settings.entry_seconds * 1000:
+            return "已开始或不足 3 分钟"
+        if start - now_ms > settings.ahead_minutes * 60_000:
+            return f"开始还在 {settings.ahead_minutes} 分钟之外（之后再扫）"
         today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date()
         if dt.datetime.fromtimestamp(start / 1000, core.BEIJING).date() != today:
-            return None
+            return "不是北京时间当天的场次"
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
         if not rolling.exists(start, holidays):
-            return None
+            return "不在交易时段内"
         if str(market.get("status") or "").upper() != "REGISTERED" or market.get("isVisible") is False:
-            return None
+            return f"状态 {market.get('status') or '?'}" + ("、不可见" if market.get("isVisible") is False else "")
         if str(market.get("tradingStatus") or "").upper() not in {"OPEN", "MATCHING_NOT_ENABLED"}:
-            return None
+            return f"交易状态 {market.get('tradingStatus') or '缺失'}"
         if str(market.get("makerFeeBps") or "0") not in {"0", "0.0"}:
-            return None
+            return f"挂单费率 {market.get('makerFeeBps')} bps"
         if not market.get("id") or not market.get("conditionId"):
-            return None
+            return "缺少 id 或 conditionId"
         spec = rolling.window_spec(start)
         checker = SimpleNamespace(predict=SimpleNamespace(info={slug: {"question": str(market.get("question") or market.get("title") or "")}}))
         if core.Bot.window_title_problem(checker, spec):
-            return None
-        return {"slug": slug, "key": rolling.key, "market_id": str(market["id"]), "start_ms": start,
-                "cancel_ms": start - settings.cancel_seconds * 1000, "expires": start // 1000 - settings.expiry_seconds,
-                "day": today.isoformat(), "name": spec.name}
-    return None
+            return "问题里的时间段和链接对不上"
+        return ""
+    return "不是三张 15 分钟卡的链接"
+
+
+def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dict | None:
+    """The pair to place for a listed market (candidate_problem says why not), or None."""
+    if candidate_problem(market, now_ms, config, settings):
+        return None
+    slug = str(market.get("categorySlug") or market.get("slug") or "")
+    rolling = next(r for r in core.WINDOW_UPDOWN_MARKETS if slug.startswith(f"{r.stem}-updown-15m-"))
+    start = int(slug.removeprefix(f"{rolling.stem}-updown-15m-")) * 1000
+    spec = rolling.window_spec(start)
+    return {"slug": slug, "key": rolling.key, "market_id": str(market["id"]), "start_ms": start,
+            "cancel_ms": start - settings.cancel_seconds * 1000, "expires": start // 1000 - settings.expiry_seconds,
+            "day": dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat(), "name": spec.name}
+
+
+async def list_page(api: Any, variant: str, after: str = "", first: int = 100) -> dict:
+    query: dict = {"first": first, "marketVariant": variant}
+    if after:
+        query["after"] = after
+    answer = await api.call("GET", "/markets?" + core.urllib.parse.urlencode(query))
+    if not isinstance(answer["data"], list):
+        raise core.RemoteError("市场列表格式异常")
+    return answer
+
+
+async def probe(api: Any, config: Any, settings: Settings, now_ms: int) -> list[str]:
+    """One read-only page of each listing, read as the discovery reads it: the fields the rows carry, the ones the
+    discovery needs that are missing, and how many rows would be placed now — run before switching the mode on."""
+    lines = [f"开盘前预挂探测（只读；设置：{'、'.join(sorted(settings.markets))}，{core.cents(float(settings.price))}×{settings.shares} 份，"
+             f"提前 {settings.ahead_minutes} 分钟内）"]
+    for variant in ("UP_DOWN", "CRYPTO_UP_DOWN"):
+        try:
+            answer = await list_page(api, variant, first=20)
+        except Exception as error:
+            lines.append(f"{variant}：读取失败：{core.clean_error(error) or type(error).__name__}")
+            continue
+        rows = [r for r in answer["data"] if isinstance(r, dict)]
+        cursor = answer.get("cursor")
+        if not rows:
+            lines.append(f"{variant}：0 行（游标 {cursor!r}）")
+            continue
+        fields = sorted({k for r in rows for k in r})
+        missing = [f for f in LISTING_FIELDS if not any(f in r for r in rows)]
+        problems: dict[str, int] = {}
+        ok = 0
+        for r in rows:
+            why = candidate_problem(r, now_ms, config, settings)
+            if why:
+                problems[why] = problems.get(why, 0) + 1
+            else:
+                ok += 1
+        lines.append(f"{variant}：{len(rows)} 行，游标 {type(cursor).__name__}；字段：{'、'.join(fields)}")
+        lines.append(f"  发现逻辑要用的字段缺失：{'、'.join(missing) if missing else '无'}；现在会挂的：{ok} 场"
+                     + (f"；不挂的原因：" + "；".join(f"{why}×{n}" for why, n in sorted(problems.items(), key=lambda kv: -kv[1])) if problems else ""))
+        slugs = [str(r.get("categorySlug") or r.get("slug") or "?") for r in rows[:4]]
+        lines.append("  前几行：" + "、".join(slugs))
+    return lines
 
 
 class Controller:
@@ -169,6 +284,7 @@ class Controller:
         self.settings = Settings.from_config(owner.config)
         self.ledger = Ledger(self.settings.db)
         self.error = ""
+        self.alive = True
         self.manual_pause = self.ledger.pause()
         self.account_at = 0
         self.balance = 0.0
@@ -177,18 +293,16 @@ class Controller:
         self.unmanaged = False
         self.placing: set[str] = set()
         self.cancelling: set[str] = set()
-        self.queue: asyncio.Queue = asyncio.Queue()
+        self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()  # (start_ms, slug, candidate): the soonest window first
         self.queued: set[str] = set()
         self.account_lock = asyncio.Lock()
-        self.api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, self.before_send)
+        shared = getattr(owner.live, "api", None)  # the bot's own client: one rate-limit cooldown for all three
+        self.api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, self.before_send, shared)
         # A separate request gate leaves cancellation capacity available even when
         # placement requests are queued or their HTTP responses are slow.
-        self.cancel_api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet)
+        self.cancel_api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, None, shared)
         self.settling: dict[str, asyncio.Task] = {}
         self.settle_gate = asyncio.Semaphore(2)
-        core.CALENDAR.configure(owner.config.hk_half_days, owner.config.kr_late_days,
-                                owner.config.holidays.get("sg", frozenset()),
-                                core.parse_dates(owner.config.env.get("SG_HALF_DAYS", core.DEFAULT_SPECIAL_DAYS["SG_HALF"]), "SG_HALF_DAYS"))
 
     def now(self) -> int:
         return self.owner.market.now_ms()
@@ -240,10 +354,11 @@ class Controller:
         return self.owner.live_exposure(self.owner.sim_trades())
 
     def risk(self) -> float:
-        # A removal acknowledgement alone does not tell us its final fills.
-        # Preserve the whole reservation until official resolution + final reads.
-        return sum(float(PRICE * SHARES) for p in self.ledger.rows.values() if not p.get("accounted")
-                   for o in p["orders"].values() if o["state"] != "not_sent")
+        """The money this mode may have tied up: every order that may exist (sent, or sent for all we know) at its full
+        size, until its pair is accounted — by the final reads after a cancel (nothing filled) or by the official
+        result. A refusal or a never-sent order ties up nothing."""
+        return sum(self.settings.side_usd for p in self.ledger.rows.values() if not p.get("accounted")
+                   for o in p["orders"].values() if o["state"] not in NEVER_PLACED)
 
     def daily_pnl(self) -> float:
         day = dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat()
@@ -287,21 +402,18 @@ class Controller:
             self.account_at = self.now()
 
     async def discover(self) -> None:
-        """Scan every page; never interpret a truncated/error response as an empty catalog."""
+        """Scan every page; never interpret a truncated/error response as an empty catalog. The windows found go into
+        the queue soonest first, and only those within PREOPEN_AHEAD_MINUTES: the day's later windows wait their turn."""
+        found: list[dict] = []
         for variant in ("UP_DOWN", "CRYPTO_UP_DOWN"):
             after, seen = "", set()
             for _ in range(100):
-                query = {"first": 100, "marketVariant": variant}
-                if after:
-                    query["after"] = after
-                answer = await self.api.call("GET", "/markets?" + core.urllib.parse.urlencode(query))
-                if not isinstance(answer["data"], list):
-                    raise core.RemoteError("市场列表格式异常")
+                answer = await list_page(self.api, variant, after)
                 for market in answer["data"]:
                     c = candidate(market, self.now(), self.owner.config, self.settings) if isinstance(market, dict) else None
                     if c and c["slug"] not in self.ledger.rows and c["slug"] not in self.queued:
                         self.queued.add(c["slug"])
-                        await self.queue.put(c)
+                        found.append(c)
                 cursor = str(answer.get("cursor") or "")
                 if not cursor:
                     break
@@ -311,6 +423,8 @@ class Controller:
                 after = cursor
             else:
                 raise core.RemoteError("市场列表超过100页，下一轮重新扫描")
+        for c in sorted(found, key=lambda c: (c["start_ms"], c["slug"])):
+            await self.queue.put((c["start_ms"], c["slug"], c))
 
     async def place_pair(self, c: dict) -> None:
         import live
@@ -327,7 +441,7 @@ class Controller:
             raise core.RemoteError("开盘前市场的涨跌代币无法确认")
         if outcomes[0][0]["token"] == outcomes[1][0]["token"]:
             raise core.RemoteError("涨跌结果指向相同代币")
-        if not await self.owner.live.chain.allowance(live.exchange_key(info.neg_risk, info.yield_bearing)) >= live.to_wei(PAIR_USD):
+        if not await self.owner.live.chain.allowance(live.exchange_key(info.neg_risk, info.yield_bearing)) >= live.to_wei(self.settings.pair_usd):
             raise core.RemoteError("开盘前双边挂单授权额度不足")
         await self.api.ensure_auth()
         async with self.account_lock:
@@ -336,22 +450,23 @@ class Controller:
             if c["slug"] in self.ledger.rows or self.blocked() or self.now() - self.account_at > 30_000 or self.unmanaged:
                 return
             limit = min(self.settings.max_open_usd, self.owner.config.live_max_open_usd)
-            if self.risk() + self.other_risk() + PAIR_USD > limit + 1e-9:
-                self.error = f"全天预挂资金上限不足：需要再预留 {PAIR_USD:g}U，限额 {limit:g}U"
+            if self.risk() + self.other_risk() + self.settings.pair_usd > limit + 1e-9:
+                self.error = f"预挂资金上限不足：需要再预留 {self.settings.pair_usd:g}U，限额 {limit:g}U"
                 return
-            if self.balance < max(self.open_reserved, self.risk()) + PAIR_USD:
+            if self.balance < max(self.open_reserved, self.risk()) + self.settings.pair_usd:
                 self.error = "可用USDT不足以预留下一场双边订单"
                 return
-            if float(PRICE * SHARES) > self.owner.config.live_max_order_usd:
-                self.error = "LIVE_MAX_ORDER_USD 小于每边24.5U"
+            if self.settings.side_usd > self.owner.config.live_max_order_usd:
+                self.error = f"LIVE_MAX_ORDER_USD 小于每边 {self.settings.side_usd:g}U"
                 return
             cap = self.owner.config.live_max_daily_loss_usd
             if cap and self.daily_pnl() + self.owner.live_daily_pnl(self.owner.sim_trades(), self.now()) <= -cap:
                 return
-            amounts = live.limit_amounts(True, live.to_wei(PRICE), live.to_wei(SHARES))
+            amounts = live.limit_amounts(True, live.to_wei(self.settings.price), live.to_wei(self.settings.shares))
             orders = {}
             for side, (outcome, _) in zip(("up", "down"), outcomes):
-                identity = f"preopen49-v1|{self.owner.config.live_chain}|{self.owner.live.wallet.maker.lower()}|{current['market_id']}|{outcome['token']}|{current['expires']}"
+                identity = (f"preopen-v2|{self.owner.config.live_chain}|{self.owner.live.wallet.maker.lower()}|{current['market_id']}|"
+                            f"{outcome['token']}|{current['expires']}|{self.settings.price}|{self.settings.shares}")
                 salt = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big") % live.MAX_SALT
                 signed = live.build_order(self.owner.live.wallet, outcome["token"], amounts["maker"], amounts["taker"], info.fee_bps, current["expires"], salt=salt)
                 digest, signature = self.owner.live.wallet.sign_order(signed, info.neg_risk, info.yield_bearing)
@@ -359,7 +474,7 @@ class Controller:
                                 "body": {"data": {"order": {**signed, "signature": signature, "hash": digest},
                                                    "strategy": "LIMIT", "pricePerShare": str(amounts["price_per_share"]),
                                                    "isPostOnly": True, "selfTradePrevention": "CANCEL_TAKER"}}}
-            pair = {**current, "phase": "active", "orders": orders, "created_ms": self.now()}
+            pair = {**current, "phase": "active", "orders": orders, "created_ms": self.now(), "tries": 0, "retry_ms": 0}
             self.ledger.save(pair)  # both hashes durable before either POST
         for side in ("up", "down"):
             order = pair["orders"][side]
@@ -377,9 +492,16 @@ class Controller:
                 order.update(state="not_sent", error=core.clean_error(error))
                 pair["phase"] = "closing"
             except Exception as error:
-                # A timeout, malformed answer or duplicate response does not prove
-                # no order exists. Keep its hash and full reservation; do not retry.
-                order.update(state="unknown", error=core.clean_error(error))
+                text = core.clean_error(error) or type(error).__name__
+                definite = isinstance(error, live.OrderRejected) or 400 <= live.http_status(error) < 500
+                if definite and not any(w in text.lower() for w in DUPLICATE_WORDS):
+                    # Predict refused it (a post-only order that would cross, an invalid field): nothing was placed, nothing
+                    # to reserve or reconcile (the first revision kept such an order "unknown", and its money, for good)
+                    order.update(state="rejected", error=text)
+                else:
+                    # A timeout, malformed answer or duplicate response does not prove
+                    # no order exists. Keep its hash and full reservation; do not retry.
+                    order.update(state="unknown", error=text)
                 pair["phase"] = "closing"
             self.ledger.save(pair)
             if pair["phase"] != "active":
@@ -388,27 +510,63 @@ class Controller:
             await self.cancel_pair(pair, "单边未确认或已到撤单时间")
         LOG.info("开盘前预挂 %s：%s", pair["slug"], {s: o["state"] for s, o in pair["orders"].items()})
 
-    @staticmethod
-    def apply_fill(order: dict, row: dict) -> None:
+    def apply_fill(self, order: dict, row: dict) -> None:
         # Fixed shares are the actual signed shares, not an estimated count.
         amount, filled = D(str(row.get("amount") or "0")), D(str(row.get("amountFilled") or "0"))
         if amount <= 0 or filled < 0 or filled > amount:
             raise core.RemoteError("成交回报数量无效，保留风险额度")
-        order["filled"] = max(float(order.get("filled") or 0), float(SHARES * filled / amount))
+        order["filled"] = max(float(order.get("filled") or 0), float(self.settings.shares * filled / amount))
+
+    def gave_up(self, pair: dict) -> bool:
+        """Past the window's start by GIVE_UP_MS: an order Predict cannot show cannot fill any more (it expired before
+        the start), and what it shows is final."""
+        return self.now() >= pair["start_ms"] + GIVE_UP_MS
+
+    def bookkeep(self, pair: dict) -> None:
+        """A closing or unverified pair's next try: RETRY_MS after this one, doubling to RETRY_MAX_MS; closed once nothing
+        is left to cancel; accounted (its money released) once every order is verified and nothing filled."""
+        tries = int(pair.get("tries") or 0) + 1
+        pair["tries"], pair["retry_ms"] = tries, self.now() + min(RETRY_MS * 2 ** (tries - 1), RETRY_MAX_MS)
+        if pair["phase"] != "closed" and all(o["state"] in TERMINAL for o in pair["orders"].values()):
+            pair["phase"] = "closed"
+        if (not pair.get("accounted") and all(order_verified(o) for o in pair["orders"].values())
+                and all(float(o.get("filled") or 0) <= 0 for o in pair["orders"].values())):
+            pair.update(accounted=True, accounted_day=dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat(), pnl=0.0)
+        self.ledger.save(pair)
+
+    async def read_final(self, order: dict, pair: dict) -> None:
+        """An order's own record, for its final fills: final → "final"; none, past the give-up — never placed (no id) or
+        final as known (an id Predict no longer answers to)."""
+        row = await self.cancel_api.order(order.get("id", ""), order.get("api_hash") or order["hash"])
+        if row:
+            if not order.get("id") and row.get("id") is not None:
+                order["id"] = str(row["id"])
+            self.apply_fill(order, row)
+            if final_order(row):
+                order["state"] = "final"
+        elif self.gave_up(pair):
+            if order.get("id"):
+                order.update(state="final", note="撤单后按编号查不到记录，按已知成交记账")
+            else:
+                order.update(state="not_found", note="按哈希查不到，签名已过期：视为从未下单")
 
     async def cancel_pair(self, pair: dict, reason: str) -> None:
         if pair["slug"] in self.cancelling:
             return
         self.cancelling.add(pair["slug"])
         try:
-            pair.update(phase="closing", reason=reason)
+            pair.update(phase="closing" if pair["phase"] != "closed" else "closed", reason=reason)
             self.ledger.save(pair)
             for order in pair["orders"].values():
                 if order["state"] == "prepared":
                     order["state"] = "not_sent"
                     self.ledger.save(pair)
                     continue
-                if order["state"] in TERMINAL:
+                if order["state"] in NEVER_PLACED or order["state"] == "final":
+                    continue
+                if order["state"] == "removed":  # removed: its final fills, read once more (nothing is left to cancel)
+                    await self.read_final(order, pair)
+                    self.ledger.save(pair)
                     continue
                 # Unknown submissions are reconciled by their original hash.
                 if not order.get("id"):
@@ -416,22 +574,19 @@ class Controller:
                     if row:
                         order["id"] = str(row["id"])
                         self.apply_fill(order, row)
+                    elif self.gave_up(pair):
+                        order.update(state="not_found", note="按哈希查不到，签名已过期：视为从未下单")
+                        self.ledger.save(pair)
+                        continue
                     else:
                         continue
                 result = await self.cancel_api.remove_orders([order["id"]])
                 if order["id"] in result["removed"]:
                     order["state"] = "removed"
                     self.ledger.save(pair)
-                    continue  # final-fill reads must not delay the next cancellation
-                row = await self.cancel_api.order(order["id"], order.get("api_hash") or order["hash"])
-                if row:
-                    self.apply_fill(order, row)
-                    if final_order(row):
-                        order["state"] = "final"
+                await self.read_final(order, pair)  # the fills before the removal (bulk removals went first: no cancel waits behind this)
                 self.ledger.save(pair)
-            if all(o["state"] in TERMINAL for o in pair["orders"].values()):
-                pair["phase"] = "closed"
-                self.ledger.save(pair)
+            self.bookkeep(pair)
         finally:
             self.cancelling.discard(pair["slug"])
 
@@ -456,15 +611,15 @@ class Controller:
         else:
             return
         for order in pair["orders"].values():
-            if order["state"] == "not_sent":
+            if order["state"] in NEVER_PLACED:
                 continue
-            row = await self.cancel_api.order(order.get("id", ""), order.get("api_hash") or order["hash"])
-            if row is None or not final_order(row):
-                return  # unresolved submissions retain the full reservation
-            self.apply_fill(order, row)
-            order["state"] = "final"
+            await self.read_final(order, pair)
+            if order["state"] != "final" and order["state"] not in NEVER_PLACED:
+                self.ledger.save(pair)
+                return  # a record that is not final yet keeps the full reservation (past the give-up it is final as known)
         pair.update(accounted=True, accounted_day=dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat(),
-                    pnl=sum(((up if side == "up" else 1 - up) - float(PRICE)) * order["filled"] for side, order in pair["orders"].items()))
+                    pnl=sum(((up if side == "up" else 1 - up) - float(self.settings.price)) * float(order.get("filled") or 0)
+                            for side, order in pair["orders"].items()))
         self.ledger.save(pair)
 
     async def monitor_pair(self, pair: dict) -> None:
@@ -517,11 +672,9 @@ class Controller:
             if isinstance(error, BaseException):
                 self.error = core.clean_error(error)
         for pair in pairs:
-            if all(o["state"] in TERMINAL for o in pair["orders"].values()):
-                pair["phase"] = "closed"
-                self.ledger.save(pair)
-            elif pair["slug"] not in self.cancelling:
-                self.launch_reconcile(pair)
+            self.bookkeep(pair)  # closed once nothing is left to cancel; the next try RETRY_MS on, doubling (not every half second)
+            if not pair.get("accounted") and pair["slug"] not in self.cancelling:
+                self.launch_reconcile(pair)  # the removed orders' final fills, the unknown ones' hashes: the reservation ends on what they show
 
     def launch_reconcile(self, pair: dict) -> None:
         key = "cancel:" + pair["slug"]
@@ -530,16 +683,30 @@ class Controller:
         async def reconcile() -> None:
             async with self.settle_gate:
                 try:
-                    await self.cancel_pair(pair, "撤单状态核对")
+                    await self.cancel_pair(pair, pair.get("reason") or "撤单状态核对")
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
                     self.error = core.clean_error(error)
         self.settling[key] = asyncio.create_task(reconcile(), name=key)
 
+    def due(self, now_ms: int) -> list[dict]:
+        """The pairs the cancellation loop acts on now: active ones at their cancel time (or the mode blocked), and
+        closing or unverified ones whose next try has come (bookkeep: RETRY_MS doubling to RETRY_MAX_MS)."""
+        blocked = bool(self.blocked())
+        out = []
+        for p in self.ledger.rows.values():
+            if p.get("accounted"):
+                continue
+            if p["phase"] == "active" and (now_ms >= p["cancel_ms"] or blocked):
+                out.append(p)
+            elif p["phase"] != "active" and now_ms >= int(p.get("retry_ms") or 0):
+                out.append(p)
+        return sorted(out, key=lambda p: p["cancel_ms"])
+
     async def placement_worker(self) -> None:
         while not self.owner.stopping.is_set():
-            c = await self.queue.get()
+            _, _, c = await self.queue.get()
             self.placing.add(c["slug"])
             try:
                 await self.place_pair(c)
@@ -568,10 +735,16 @@ class Controller:
 
     async def cancellation_loop(self) -> None:
         while not self.owner.stopping.is_set():
-            due = [p for p in list(self.ledger.rows.values()) if p["phase"] != "closed"
-                   and (p["phase"] == "closing" or self.now() >= p["cancel_ms"] or self.blocked())]
+            now = self.now()
+            due = self.due(now)
             if due:
-                await self.cancel_many(sorted(due, key=lambda p: p["cancel_ms"]), "到时撤单或真实交易暂停")
+                active = [p for p in due if p["phase"] == "active"]
+                if active:
+                    await self.cancel_many(active, "到时撤单或真实交易暂停")
+                for pair in due:
+                    if pair["phase"] != "active" and pair["slug"] not in self.cancelling:
+                        self.bookkeep(pair)  # the next try is booked now: a read that hangs does not make the loop ask again meanwhile
+                        self.launch_reconcile(pair)
             for pair in list(self.ledger.rows.values()):
                 if pair["phase"] == "active":
                     key = "monitor:" + pair["slug"]
@@ -605,32 +778,38 @@ class Controller:
     async def run(self) -> None:
         # Recovered prepared records never acquire a new salt on restart. Anything
         # already saved is closed/reconciled, including attempts interrupted mid-POST.
-        for pair in self.ledger.rows.values():
-            if pair["phase"] != "closed":
-                pair["phase"] = "closing"
-                self.ledger.save(pair)
-        jobs = [asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
-                asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
-                *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(2))]
-        stop = asyncio.create_task(self.owner.stopping.wait())
         try:
-            await asyncio.wait([stop, *jobs], return_when=asyncio.FIRST_COMPLETED)
-            for job in jobs:
-                if job.done() and not job.cancelled() and job.exception():
-                    raise job.exception()
+            for pair in self.ledger.rows.values():
+                if pair["phase"] != "closed" and not pair.get("accounted"):
+                    pair.update(phase="closing", retry_ms=0)
+                    self.ledger.save(pair)
+            jobs = [asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
+                    asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
+                    *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(2))]
+            stop = asyncio.create_task(self.owner.stopping.wait())
+            try:
+                await asyncio.wait([stop, *jobs], return_when=asyncio.FIRST_COMPLETED)
+                for job in jobs:
+                    if job.done() and not job.cancelled() and job.exception():
+                        raise job.exception()
+            finally:
+                for job in [stop, *jobs]:
+                    job.cancel()
+                await asyncio.gather(stop, *jobs, return_exceptions=True)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self.cancel_all("进程停止，撤销预挂单"), timeout=12)
+                for task in self.settling.values():
+                    task.cancel()
+                await asyncio.gather(*self.settling.values(), return_exceptions=True)
         finally:
-            for job in [stop, *jobs]:
-                job.cancel()
-            await asyncio.gather(stop, *jobs, return_exceptions=True)
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(self.cancel_all("进程停止，撤销预挂单"), timeout=12)
-            for task in self.settling.values():
-                task.cancel()
-            await asyncio.gather(*self.settling.values(), return_exceptions=True)
+            self.alive = False  # the model trader opens orders again (LiveBot.preopen_active)
 
     def status(self) -> str:
         rows = list(self.ledger.rows.values())
-        return (f"开盘前自动预挂：{'暂停' if self.manual_pause or self.blocked() else '运行'}\n"
-                f"海力士 / BTC / 宇树15分钟：两边49¢，各50份；扫描{self.settings.poll:g}秒\n"
-                f"每场提前60秒撤单、提前30秒到期；已记录{len(rows)}场，队列{self.queue.qsize()}场\n"
-                f"保守预留 {self.risk():.2f}U；最近问题：{self.error or '无'}")
+        state = "已停止" if not self.alive else "暂停" if self.manual_pause or self.blocked() else "运行"
+        return (f"开盘前自动预挂：{state}\n"
+                f"{' / '.join(sorted(self.settings.markets))}：两边 {core.cents(float(self.settings.price))}，各 {self.settings.shares} 份；"
+                f"扫描 {self.settings.poll:g} 秒，只挂 {self.settings.ahead_minutes} 分钟内开始的场次\n"
+                f"每场提前 {self.settings.cancel_seconds} 秒撤单、提前 {self.settings.expiry_seconds} 秒到期；"
+                f"已记录 {len(rows)} 场（{sum(1 for p in rows if p['phase'] == 'active')} 场挂着，{sum(1 for p in rows if p.get('accounted'))} 场已结清），队列 {self.queue.qsize()} 场\n"
+                f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}")

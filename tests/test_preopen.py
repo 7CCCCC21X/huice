@@ -39,9 +39,12 @@ class Api:
         self.sent, self.removed, self.rows = [], [], {}
         self.orders_complete = True
         self.pages = {}
-        self.fail_side = 0
+        self.fail_side = 0    # the n-th send: a timeout (result unknown)
+        self.reject_side = 0  # the n-th send: Predict's refusal (definite)
+        self.stuck = set()    # order ids a removal does not remove (answered "noop") and whose record stays OPEN
         self.before = None
         self.auth = None
+        self.blocked_until = 0.0
 
     async def market(self, mid): return copy.deepcopy(self.markets[mid])
     async def ensure_auth(self):
@@ -52,6 +55,7 @@ class Api:
         if why := self.ctl.before_send(body): raise p.NotSent(why)
         self.sent.append(copy.deepcopy(body))
         if len(self.sent) == self.fail_side: raise m.RemoteError("timeout: delivery unknown")
+        if len(self.sent) == self.reject_side: raise L.OrderRejected("下单被拒绝：HTTP 400: post-only order would cross")
         oid = str(len(self.sent))
         signed = body["data"]["order"]
         self.rows[signed["hash"]] = {"id": oid, "order": signed, "amount": signed["takerAmount"], "amountFilled": "0", "status": "OPEN"}
@@ -59,9 +63,10 @@ class Api:
 
     async def remove_orders(self, ids):
         self.removed.extend(ids)
+        gone = [i for i in ids if i not in self.stuck]
         for row in self.rows.values():
-            if row["id"] in ids: row["status"] = "CANCELLED"
-        return {"removed": list(ids), "noop": []}
+            if row["id"] in gone: row["status"] = "CANCELLED"
+        return {"removed": gone, "noop": [i for i in ids if i in self.stuck]}
 
     async def order(self, oid, digest=""):
         return copy.deepcopy(self.rows.get(digest))
@@ -83,7 +88,7 @@ def controller(markets=None, **env):
     wallet = types.SimpleNamespace(maker="0x" + "1" * 40,
         sign_order=lambda order, *flags: ("0x" + hashlib.sha256(json.dumps(order, sort_keys=True).encode()).hexdigest(), "0xsignature"))
     owner = types.SimpleNamespace(config=cfg, market=types.SimpleNamespace(now_ms=lambda: clock.ms), stopping=asyncio.Event(),
-                                  live=types.SimpleNamespace(wallet=wallet, chain=Chain(), ready=True),
+                                  live=types.SimpleNamespace(wallet=wallet, chain=Chain(), ready=True, api=types.SimpleNamespace(blocked_until=0.0)),
                                   live_paused=lambda: "", live_killed=lambda: "", live_exposure=lambda trades: 0.,
                                   sim_trades=lambda: {}, live_daily_pnl=lambda trades, now: 0.)
     ctl = p.Controller(owner)
@@ -99,6 +104,10 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*ctl.settling.values(), return_exceptions=True)
         ctl.ledger.close()
 
+    async def settle_tasks(self, ctl):
+        """The reconcile / verify tasks the loop would run: awaited here."""
+        await asyncio.gather(*list(ctl.settling.values()), return_exceptions=True)
+
     async def test_identity_clock_and_all_three(self):
         ctl, api, clock = controller()
         for stem in ("btc", "unitree", "skhynix"):
@@ -108,6 +117,11 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(p.candidate(row, NOW, ctl.owner.config, ctl.settings))
         row = market(); row["question"] = "10:00AM-10:15AM ET"
         self.assertIsNone(p.candidate(row, NOW, ctl.owner.config, ctl.settings))
+        self.assertEqual(p.candidate_problem(market(at=NOW), NOW, ctl.owner.config, ctl.settings), "已开始或不足 3 分钟")
+        self.assertEqual(p.candidate_problem(market(at=NOW + 120000), NOW, ctl.owner.config, ctl.settings), "链接里的时间不是整刻钟")
+        self.assertEqual(p.candidate_problem(market(at=NOW + 2 * 3600_000), NOW, ctl.owner.config, ctl.settings), "开始还在 60 分钟之外（之后再扫）")
+        self.assertEqual(p.candidate_problem(market("eth"), NOW, ctl.owner.config, ctl.settings), "不是三张 15 分钟卡的链接")
+        self.assertEqual(p.candidate_problem(market(status="CLOSED"), NOW, ctl.owner.config, ctl.settings), "交易状态 CLOSED")
         await self.finish(ctl)
 
     async def test_pair_exact_amounts_postonly_ttl_and_dedup(self):
@@ -131,16 +145,48 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.sent), 2)
         await self.finish(ctl)
 
+    async def test_settings_size_price_cards_and_limits(self):
+        ctl, api, _ = controller(PREOPEN_SHARES="10", PREOPEN_PRICE_CENTS="45", PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="90")
+        self.assertEqual((ctl.settings.shares, ctl.settings.price, ctl.settings.markets, ctl.settings.ahead_minutes), (10, m.D("0.45"), frozenset({"BTC-15M"}), 90))
+        self.assertEqual(p.candidate_problem(market("skhynix"), NOW, ctl.owner.config, ctl.settings), "不在 PREOPEN_MARKETS 里")
+        await ctl.place_pair(p.candidate(market(), NOW, ctl.owner.config, ctl.settings))
+        order = api.sent[0]["data"]["order"]
+        self.assertEqual((order["makerAmount"], order["takerAmount"], api.sent[0]["data"]["pricePerShare"]), (str(L.to_wei("4.5")), str(L.to_wei(10)), str(L.to_wei(".45"))))
+        self.assertEqual(ctl.risk(), 9.)
+        await self.finish(ctl)
+        for bad in ({"PREOPEN_SHARES": "1"}, {"PREOPEN_PRICE_CENTS": "51"}, {"PREOPEN_MARKETS": "eth"}, {"PREOPEN_AHEAD_MINUTES": "2"}):
+            with self.assertRaises(ValueError):
+                controller(**bad)
+        cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_SHARES": "20"})
+        self.assertFalse(p.Settings.from_config(cfg).enabled)
+        self.assertEqual((p.Settings.from_config(cfg).shares, p.Settings.from_config(cfg, force=True).shares), (50, 20))  # the probe reads them while off
+
     async def test_failure_cancels_other_side_and_never_resubmits_unknown(self):
         ctl, api, _ = controller()
         api.fail_side = 2
         c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
         await ctl.place_pair(c)
         self.assertEqual(api.removed, ["1"])
-        self.assertEqual(ctl.ledger.rows[c["slug"]]["orders"]["down"]["state"], "unknown")
-        self.assertEqual(ctl.risk(), 49.)
+        pair = ctl.ledger.rows[c["slug"]]
+        self.assertEqual((pair["orders"]["down"]["state"], pair["orders"]["up"]["state"]), ("unknown", "final"))
+        self.assertEqual(ctl.risk(), 49.)  # the unknown side may exist; the removed side's record read: nothing filled, still reserved until the pair is accounted
         await ctl.place_pair(c)
         self.assertEqual(len(api.sent), 2)
+        await self.finish(ctl)
+
+    async def test_refusal_is_final_and_releases(self):
+        """A definite refusal (post-only would cross) ends the order: nothing reserved for good, the other side withdrawn,
+        the pair accounted at once (the first revision kept it "unknown" with its money, and asked every half second)."""
+        ctl, api, _ = controller()
+        api.reject_side = 2
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        self.assertEqual((pair["orders"]["down"]["state"], pair["orders"]["up"]["state"], pair["phase"]), ("rejected", "final", "closed"))
+        self.assertIn("would cross", pair["orders"]["down"]["error"])
+        self.assertTrue(pair["accounted"]) and self.assertEqual(pair["pnl"], 0.)
+        self.assertEqual(ctl.risk(), 0.)
+        self.assertEqual(ctl.due(NOW + 10 ** 9), [])  # nothing left to try
         await self.finish(ctl)
 
     async def test_pause_during_send_queue_blocks_http(self):
@@ -161,7 +207,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.sent, [])
         await self.finish(ctl)
 
-    async def test_bulk_cancels_do_not_release_unread_fill_reservation(self):
+    async def test_bulk_cancels_keep_the_reservation_until_the_records_are_read(self):
         ctl, api, clock = controller()
         c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
         await ctl.place_pair(c)
@@ -170,7 +216,59 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         await ctl.cancel_many([pair], "deadline")
         self.assertEqual(set(api.removed), {"1", "2"})
         self.assertEqual(pair["phase"], "closed")
+        self.assertEqual(ctl.risk(), 49.)  # removed, fills not read yet
+        await self.settle_tasks(ctl)  # the reconcile the loop runs: both records final, nothing filled — released now, not at the result
+        self.assertTrue(pair["accounted"])
+        self.assertEqual((ctl.risk(), pair["pnl"]), (0., 0.))
+        await self.finish(ctl)
+
+    async def test_stuck_cancel_backs_off(self):
+        """A removal Predict does not confirm is asked again after RETRY_MS, doubling to RETRY_MAX_MS — not every half second."""
+        ctl, api, clock = controller()
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        api.stuck.add("2")
+        clock.ms = c["start_ms"] - 60_000
+        self.assertEqual([x["slug"] for x in ctl.due(clock.ms)], [c["slug"]])
+        await ctl.cancel_many([pair], "deadline")
+        await self.settle_tasks(ctl)
+        self.assertEqual((pair["orders"]["up"]["state"], pair["orders"]["down"]["state"], pair["phase"]), ("final", "open", "closing"))
         self.assertEqual(ctl.risk(), 49.)
+        asked = api.removed.count("2")
+        self.assertEqual(ctl.due(clock.ms), [])
+        self.assertEqual(ctl.due(clock.ms + p.RETRY_MS - 1), [])
+        self.assertEqual([x["slug"] for x in ctl.due(pair["retry_ms"])], [c["slug"]])
+        tries = pair["tries"]
+        for _ in range(4):
+            clock.ms = pair["retry_ms"]
+            ctl.bookkeep(pair); ctl.launch_reconcile(pair)
+            await self.settle_tasks(ctl)
+        self.assertGreater(api.removed.count("2"), asked)
+        self.assertEqual(pair["retry_ms"] - clock.ms, p.RETRY_MAX_MS)  # capped
+        self.assertGreater(pair["tries"], tries)
+        api.stuck.clear()
+        clock.ms = pair["retry_ms"]
+        ctl.bookkeep(pair); ctl.launch_reconcile(pair)
+        await self.settle_tasks(ctl)
+        self.assertEqual((pair["orders"]["down"]["state"], pair["phase"], pair["accounted"], ctl.risk()), ("final", "closed", True, 0.))
+        await self.finish(ctl)
+
+    async def test_unknown_submission_gives_up_after_the_window(self):
+        """An order Predict never showed by its hash cannot fill after the start (it expired 30 s before): past the give-up it
+        is taken as never placed and its money released."""
+        ctl, api, clock = controller()
+        api.fail_side = 2
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        self.assertEqual(pair["orders"]["down"]["state"], "unknown")
+        clock.ms = c["start_ms"] + 5 * 60_000
+        await ctl.cancel_pair(pair, "again")
+        self.assertEqual((pair["orders"]["down"]["state"], ctl.risk()), ("unknown", 49.))  # before the give-up: still reserved
+        clock.ms = c["start_ms"] + p.GIVE_UP_MS
+        await ctl.cancel_pair(pair, "again")
+        self.assertEqual((pair["orders"]["down"]["state"], pair["phase"], pair["accounted"], ctl.risk()), ("not_found", "closed", True, 0.))
         await self.finish(ctl)
 
     async def test_new_listing_later_page_and_duplicate_variant(self):
@@ -182,6 +280,15 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctl.queue.qsize(), 1)
         await ctl.discover()
         self.assertEqual(ctl.queue.qsize(), 1)
+        await self.finish(ctl)
+
+    async def test_discovery_takes_the_soonest_first_and_only_within_the_horizon(self):
+        rows = [market(at=NOW + 45 * 60_000, mid=1), market(at=NOW + 15 * 60_000, mid=2), market(at=NOW + 3 * 3600_000, mid=3), market("skhynix", at=NOW + 30 * 60_000, mid=4)]
+        ctl, api, _ = controller(rows)
+        await ctl.discover()
+        self.assertEqual(ctl.queue.qsize(), 3)  # the 3-hour one waits for a later scan
+        order = [ctl.queue.get_nowait()[2]["market_id"] for _ in range(3)]
+        self.assertEqual(order, ["2", "4", "1"])
         await self.finish(ctl)
 
     async def test_global_budget_and_existing_risk_are_not_overridden(self):
@@ -236,13 +343,48 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ctl.ledger.pause())
         await self.finish(ctl)
 
-    async def test_default_is_off_and_normal_strategy_cannot_open_in_preopen(self):
+    async def test_default_is_off_and_normal_strategy_held_only_while_the_mode_runs_for_real(self):
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline"})
         self.assertFalse(p.Settings.from_config(cfg).enabled)
         bot = L.LiveBot.__new__(L.LiveBot)
-        bot.preopen = object(); bot.config = cfg
+        bot.preopen = types.SimpleNamespace(alive=True)
+        bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64})
+        self.assertTrue(bot.preopen_active())
         self.assertIn("不开新仓", bot.live_room({}, None, "up", .49, 50))
         self.assertIn("不发送", bot.live_send_block({"live": {}}, {}, NOW))
+        bot.preopen.alive = False
+        self.assertFalse(bot.preopen_active())  # crashed: the model trader is free again
+        bot.preopen.alive = True
+        bot.config = cfg  # LIVE=off: paper trading goes on
+        self.assertFalse(bot.preopen_active())
+        bot.preopen = None
+        self.assertFalse(bot.preopen_active())
+        self.assertIn("未启用", await bot.cmd_preopen(m.Request("/preopen", [], 1, 0, 1)))
+
+    async def test_probe_reports_fields_and_candidates(self):
+        ctl, api, _ = controller([market(), market(at=NOW, mid=5), market("eth", mid=6)])
+        lines = await p.probe(api, ctl.owner.config, ctl.settings, NOW)
+        text = "\n".join(lines)
+        self.assertIn("UP_DOWN：3 行", text)
+        self.assertIn("字段：categorySlug、conditionId、feeRateBps、id、isVisible、outcomes、status、tradingStatus", text)
+        self.assertIn("发现逻辑要用的字段缺失：makerFeeBps、question", text)
+        self.assertIn("现在会挂的：1 场；不挂的原因：", text)
+        self.assertIn("已开始或不足 3 分钟×1", text)
+        self.assertIn("不是三张 15 分钟卡的链接×1", text)
+        api.pages[("CRYPTO_UP_DOWN", "")] = {"success": True, "data": [], "cursor": None}
+        self.assertIn("CRYPTO_UP_DOWN：0 行", "\n".join(await p.probe(api, ctl.owner.config, ctl.settings, NOW)))
+        await self.finish(ctl)
+
+    async def test_rate_limit_cooldown_is_shared_with_the_bots_client(self):
+        shared = types.SimpleNamespace(blocked_until=0.0)
+        api = p.safe_api("https://offline.invalid/v1", "key", None, None, shared)
+        api.blocked_until = 5.0
+        self.assertEqual(shared.blocked_until, 5.0)
+        shared.blocked_until = 9.0
+        self.assertEqual(api.blocked_until, 9.0)
+        alone = p.safe_api("https://offline.invalid/v1", "key", None)
+        alone.blocked_until = 3.0
+        self.assertEqual(alone.blocked_until, 3.0)
 
     async def test_account_refresh_commits_snapshot_atomically(self):
         ctl, api, _ = controller()
@@ -278,11 +420,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
         await ctl.place_pair(c)
         pair = ctl.ledger.rows[c["slug"]]
+        for row in api.rows.values():
+            row["amountFilled"] = row["amount"]  # both filled before the cancel
         await ctl.cancel_many([pair], "cancel")
+        await self.settle_tasks(ctl)
+        self.assertEqual((pair["phase"], pair.get("accounted"), ctl.risk()), ("closed", None, 49.))  # filled: the result decides, reserved until then
         clock.ms = c["start_ms"] + 20 * 60_000
         api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down
-        for row in api.rows.values():
-            row["amountFilled"] = row["amount"]  # final records caught up only now
         await ctl.settle_pair(pair)
         self.assertTrue(pair["accounted"])
         self.assertAlmostEqual(pair["pnl"], 1.)

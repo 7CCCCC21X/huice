@@ -13566,6 +13566,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("sim", "模拟交易：净优势 ≥10¢ 时买 100 份，看长期是赚还是亏（只记账，不下单）"),
     Command("live", "真实交易（LIVE=on）：钱包、余额、真实订单、持仓与风控；暂停/恢复/撤单/领取", "pause|resume|cancel all|redeem|check",
             "LIVE=on 时模拟交易的每个决定都会在 Predict 真实下单；/live pause 停止开新仓，/live resume 恢复"),
+    Command("preopen", "15 分钟市场开盘前双边预挂（PREOPEN_15M=on，真实交易）：状态；pause / resume 暂停恢复；probe 只读探测市场列表", "pause|resume|probe"),
     Command("diag", "逐个检测数据源（币安/交易所/上证/A50/恒指/KOSPI/HL/汇率），找出哪里出问题"),
     Command("test", "发送测试消息，不代表行情正常"),
     Command("id", "查看你的用户 ID、聊天 ID、话题 ID"),
@@ -13909,7 +13910,7 @@ class Bot:
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
             "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib, "/samples": self.cmd_samples,
             "/journal": self.cmd_journal, "/summary": self.cmd_summary, "/markout": self.cmd_markout, "/market": self.cmd_market,
-            "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live,
+            "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live, "/preopen": self.cmd_preopen,
         }
 
     def settings(self) -> dict:
@@ -19073,6 +19074,9 @@ class Bot:
         if not self.config.sim or not self.config.predict:
             return Reply("模拟交易已关闭（SIM=off 或 PREDICT=off）。")
         return Reply(self.sim_text(), html=True)
+
+    def cmd_preopen(self, req: Request) -> Any:
+        return "开盘前预挂模式在真实交易模块里：设置 PREDICT_PRIVATE_KEY 启动真实交易模块后，PREOPEN_15M=on 开启，/preopen probe 只读探测"
 
     def cmd_live(self, req: Request) -> Any:
         return ("真实交易模块未加载：没有配置 PREDICT_PRIVATE_KEY（和 PREDICT_API_KEY）。在 Railway Variables 配置后重新部署，之后用 "

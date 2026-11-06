@@ -1,6 +1,6 @@
 # TG 合约昨收偏离提醒机器人
 
-新增可选的 [15分钟市场发布即预挂模式](PREOPEN.md)：BTC、SK海力士、宇树的当天未来场次一经扫描发现，两边49¢各50份，每场提前60秒撤单、提前30秒到期。`PREOPEN_15M=off` 为默认值；启用后普通模型策略不开新仓，原有监控、网页和控制命令保留。
+新增可选的 [15分钟市场发布即预挂模式](PREOPEN.md)：BTC、SK海力士、宇树的 15 分钟场次一经扫描发现（只挂 `PREOPEN_AHEAD_MINUTES` 内开始的、最近的先），两边 `PREOPEN_PRICE_CENTS`（默认 49¢）各 `PREOPEN_SHARES`（默认 50）份的 post-only 买单，每场提前 60 秒撤单、提前 30 秒到期。`PREOPEN_15M=off` 默认关闭；开之前先 `/preopen probe` 只读探测市场列表。
 
 监控截图里的四个币安合约：**UNITREEUSDT、HK0625USDT、CXMTUSDT、SKHYNIXUSDT**。
 

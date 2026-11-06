@@ -989,10 +989,10 @@ class LiveBot(core.Bot):
         self.live_auth_tried = -1e9  # monotonic time of the last sign-in renewal tried ahead of the token's expiry
         self.live_place_ms = 0       # the last step's placement time (sim_after_decide), for the phases
         self.preopen = None
+        self.handlers["/preopen"] = self.cmd_preopen  # the status, pause / resume, and the read-only probe of the listing (works with the mode off)
         if str(self.config.env.get("PREOPEN_15M", "off")).lower() == "on":
             from preopen import Controller
             self.preopen = Controller(self)
-            self.handlers["/preopen"] = self.cmd_preopen
 
     # --- readiness -------------------------------------------------------------------------------------------------------
     async def live_prepare(self) -> list[str]:
@@ -1061,7 +1061,7 @@ class LiveBot(core.Bot):
     def live_room(self, trades: dict[str, dict], mk: core.SimMarket, side: str, price: float, shares: float,
                   taker: dict | None = None) -> str:
         c = self.config
-        if getattr(self, "preopen", None) is not None:
+        if self.preopen_active():
             return "开盘前固定双边预挂模式：普通模型策略不开新仓"
         if c.live_mode == "off":
             return ""  # paper trading, as the base class does it
@@ -1441,7 +1441,7 @@ class LiveBot(core.Bot):
         pauses, the age of the decision, the caps and the balance as they stand now — the decision was checked a step
         ago, or before a restart, and anything may have changed since. "" to send."""
         c, st = self.config, trade["live"]
-        if getattr(self, "preopen", None) is not None:
+        if self.preopen_active():
             return "开盘前固定双边预挂模式：不发送普通模型策略的旧决定"
         if c.live_mode != "on":
             return f"LIVE={c.live_mode}，不下单"
@@ -3212,16 +3212,31 @@ class LiveBot(core.Bot):
                         "paused": self.live_paused(), "killed": self.live_killed()}
         return data
 
+    def preopen_active(self) -> bool:
+        """Whether the pre-open mode is running for real: its orders go out only with LIVE=on, so only then does it hold
+        the model trader back (paper trading goes on with LIVE=off; a mode that crashed, alive False, holds nothing)."""
+        preopen = getattr(self, "preopen", None)
+        return preopen is not None and bool(getattr(preopen, "alive", True)) and self.config.live_mode == "on"
+
     async def cmd_preopen(self, req: core.Request) -> str:
-        if self.preopen is None:
-            return "开盘前预挂模式未启用"
         action = req.args[0].lower() if req.args else ""
+        if action == "probe":  # the listing's fields and the windows it would place now, read-only: run before PREOPEN_15M=on
+            from preopen import Settings, probe, safe_api
+            try:
+                settings = self.preopen.settings if self.preopen is not None else Settings.from_config(self.config, force=True)
+            except ValueError as error:
+                return f"设置有误：{core.clean_error(error)}"
+            api = (self.preopen.cancel_api if self.preopen is not None
+                   else safe_api(API_BASES[self.config.live_chain], self.config.predict_api_key, self.live.wallet, None, self.live.api))
+            return "\n".join(await probe(api, self.config, settings, self.market.now_ms()))
+        if self.preopen is None:
+            return "开盘前预挂模式未启用（PREOPEN_15M=off）；/preopen probe 只读探测市场列表的字段和现在会挂的场次"
         if action in {"pause", "resume"}:
             self.preopen.manual_pause = self.preopen.ledger.pause(action == "pause")
             if action == "pause":
                 await self.preopen.cancel_all("管理员暂停开盘前模式")
         elif action:
-            return "用法：/preopen｜/preopen pause｜/preopen resume"
+            return "用法：/preopen｜/preopen pause｜/preopen resume｜/preopen probe"
         return self.preopen.status()
 
     async def run(self) -> int:
@@ -3230,8 +3245,12 @@ class LiveBot(core.Bot):
             task = asyncio.create_task(self.preopen.run(), name="preopen")
             def finished(t: asyncio.Task) -> None:
                 if not t.cancelled() and t.exception() is not None:
-                    LOG.error("开盘前策略异常结束：%s", core.clean_error(t.exception()))
-                    self.stopping.set()
+                    text = core.clean_error(t.exception()) or type(t.exception()).__name__
+                    LOG.error("开盘前策略异常结束：%s", text)
+                    # the bot goes on (its run() withdrew this mode's orders on the way out); the model trader is free again
+                    self.preopen.error, self.preopen.alive = f"预挂模式已停止：{text}", False
+                    self.live_note_error(f"开盘前预挂模式异常停止：{text}")
+                    self.live_notify(f"⚠️ 开盘前预挂模式异常停止：{text}（本模式的挂单已撤，重启后恢复）", key="preopen:crash")
             task.add_done_callback(finished)
         try:
             return await self._run_live()
