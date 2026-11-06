@@ -399,6 +399,19 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         clock.ms += 60_000
         await ctl.discover()  # the full scan again, a minute on
         self.assertEqual(len(api.calls), p.MISS_STOP)
+        # 1.131.0: a new listing seen anchors the rhythm: the next is expected a cycle on, polled every second around that moment
+        self.assertEqual((ctl.listed_at, ctl.poll_wait()), ({}, 5.0))
+        api.markets["4"] = market(at=NOW + 60 * 60_000, mid=4)
+        await ctl.discover()
+        seen = clock.ms
+        queued = [ctl.queue.get_nowait()[2] for _ in range(ctl.queue.qsize())]
+        self.assertEqual((ctl.listed_at, next(q for q in queued if q["market_id"] == "4")["read_ms"]), ({"BTC-15M": seen}, seen))
+        self.assertEqual(ctl.poll_wait(), 5.0)
+        clock.ms = seen + p.LISTING_CYCLE_MS - 10_000
+        self.assertEqual(ctl.poll_wait(), p.FAST_POLL_S)
+        clock.ms = seen + p.LISTING_CYCLE_MS + p.LISTING_LATE_MS + 1000
+        self.assertEqual(ctl.poll_wait(), 5.0)
+        self.assertIn("发布节奏", ctl.status())
         await self.finish(ctl)
 
     async def test_rate_limited_first_request_leaves_no_record_so_the_window_is_placed_later(self):
@@ -469,7 +482,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((len(api.sent), ctl.parked, ctl.queued, c["slug"] in ctl.ledger.rows), (2, {}, set(), True))
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
-        broken = {**c, "slug": "btc-updown-15m-broken", "market_id": "404"}  # its read raises: parked longer, not read again every poll
+        broken = {**c, "slug": "btc-updown-15m-broken", "market_id": "404", "market": None}  # its read raises: parked longer, not read again every poll
         ctl.queue.put_nowait((broken["start_ms"], broken["slug"], broken)); ctl.queued.add(broken["slug"])
         worker = asyncio.create_task(ctl.placement_worker())
         await asyncio.sleep(0.05)

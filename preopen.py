@@ -254,6 +254,10 @@ def window_slug(rolling: Any, start_ms: int) -> str:
     return f"{rolling.stem}-updown-15m-{start_ms // 1000}"
 
 
+def hms(ms: int) -> str:
+    return dt.datetime.fromtimestamp(ms / 1000, core.BEIJING).strftime("%H:%M:%S")
+
+
 def when(ms: int, now_ms: int) -> str:
     """HH:MM (Beijing), with the date when it is not today's."""
     at, today = dt.datetime.fromtimestamp(ms / 1000, core.BEIJING), dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date()
@@ -416,6 +420,11 @@ def review(rows: list[dict], now_ms: int) -> dict:
             "recent": [{k: q[k] for k in shown} for q in recent]}
 
 
+LISTING_CYCLE_MS = 15 * 60_000  # Predict lists one more window of a card every quarter hour (a day ahead): the next listing is expected a cycle after the last seen
+LISTING_EARLY_MS, LISTING_LATE_MS = 20_000, 90_000  # ...and the discovery polls fast from this long before that moment until this long after it (or the listing)
+FAST_POLL_S = 1.0               # the fast poll's cadence (the queue position: the bid goes in within a second or two of the listing)
+MARKET_FRESH_MS = 15_000        # a window's details read by the discovery this recently are placed on, not read again
+ALLOWANCE_MS = 60_000           # the exchange allowance is read again this often, not before every pair
 PROBE_HOURS = 2.0      # /preopen probe: the quarters of the next this many hours, each card's at most PROBE_PER_CARD — five cards over a day
 PROBE_PER_CARD = 8     # were hundreds of reads, and the commands are answered one after another (1.130.6)
 PROBE_BUDGET_S = 15.0  # ...and this long at most: what is left is said, not read
@@ -496,6 +505,8 @@ class Controller:
         self.card_checked_ms = 0
         self.listed_until_ms = max((int(p.get("start_ms") or 0) for p in self.ledger.rows.values()), default=0)  # the latest window seen listed
         self.listed_by_card: dict[str, int] = {}  # card key -> the latest window of it seen listed (the status, per card: a card never found stands out)
+        self.listed_at: dict[str, int] = {}  # card key -> when its latest window was first seen listed: the next listing is expected LISTING_CYCLE_MS on (poll_wait)
+        self.allowance_cache: dict[str, tuple[int, int]] = {}  # exchange key -> (read at, allowance in wei)
         for p in self.ledger.rows.values():
             self.listed_by_card[str(p.get("key") or "")] = max(self.listed_by_card.get(str(p.get("key") or ""), 0), int(p.get("start_ms") or 0))
         self.account_lock = asyncio.Lock()
@@ -853,6 +864,7 @@ class Controller:
             self.full_scan_ms = self.now()
         misses: dict[str, int] = {}
         found: list[dict] = []
+        known_before = dict(self.listed_by_card)  # the latest windows known as this scan starts: a window beyond them is a listing seen now (the rhythm's anchor)
         attempts: dict[str, int] = {}  # record (a window's level) -> the attempt after its last record, the superseded ones included: an attempt that left no record is not reused (its salt would be the first attempt's)
         for p in self.ledger.rows.values():
             attempts[record_key(p)] = max(attempts.get(record_key(p), 0), int(p.get("attempt") or 0) + 1)
@@ -876,6 +888,8 @@ class Controller:
                 continue
             misses[rolling.key] = 0
             self.listed_until_ms = max(self.listed_until_ms, start)
+            if known_before.get(rolling.key) and start > known_before[rolling.key]:
+                self.listed_at[rolling.key] = self.now()  # a new listing seen: the next one is expected a cycle on (poll_wait polls fast around it)
             self.listed_by_card[rolling.key] = max(self.listed_by_card.get(rolling.key, 0), start)
             c = candidate(market, self.now(), self.owner.config, self.settings)
             if c is None:
@@ -886,7 +900,8 @@ class Controller:
                     self.ledger.rename(key, f"{key}@{int(self.ledger.rows[key].get('attempt') or 0)}")  # the record and the attempt: one key each
                     self.requoted += 1
                 self.queued.add(key)
-                found.append({**c, "slug": key, "window": slug, "level": level, "price": str(price), "shares": str(shares), "attempt": attempts.get(key, 0)})
+                found.append({**c, "slug": key, "window": slug, "level": level, "price": str(price), "shares": str(shares), "attempt": attempts.get(key, 0),
+                              "market": market, "read_ms": self.now()})  # the details just read: placed on, not read again (MARKET_FRESH_MS)
         for c in sorted(found, key=lambda c: (c["start_ms"], c["level"], c["slug"])):
             await self.queue.put((c["start_ms"], c["slug"], c))
 
@@ -927,8 +942,9 @@ class Controller:
         if why := self.budget_problem(pair_usd, side_usd):
             self.error = why
             return "held"
-        # Fresh details are authoritative, not a stale listing page or model card.
-        market = {**(await self.api.market(c["market_id"])), "categorySlug": c.get("window", c["slug"])}  # the window the category named: the details' own slug may differ
+        # Fresh details are authoritative, not a stale listing page or model card — the discovery's own read, when seconds old (MARKET_FRESH_MS)
+        fresh = c.get("market") if c.get("market") and self.now() - int(c.get("read_ms") or 0) <= MARKET_FRESH_MS else None
+        market = {**(fresh or await self.api.market(c["market_id"])), "categorySlug": c.get("window", c["slug"])}  # the window the category named: the details' own slug may differ
         current = candidate(market, self.now(), self.owner.config, self.settings)
         if current is None or current["slug"] != c.get("window", c["slug"]):
             return ""
@@ -938,7 +954,12 @@ class Controller:
             raise core.RemoteError("开盘前市场的涨跌代币无法确认")
         if outcomes[0][0]["token"] == outcomes[1][0]["token"]:
             raise core.RemoteError("涨跌结果指向相同代币")
-        if not await self.owner.live.chain.allowance(live.exchange_key(info.neg_risk, info.yield_bearing)) >= live.to_wei(pair_usd):
+        exchange = live.exchange_key(info.neg_risk, info.yield_bearing)
+        cached = self.allowance_cache.get(exchange)
+        if cached is None or self.now() - cached[0] > ALLOWANCE_MS:
+            cached = (self.now(), int(await self.owner.live.chain.allowance(exchange)))
+            self.allowance_cache[exchange] = cached
+        if not cached[1] >= live.to_wei(pair_usd):
             raise core.RemoteError("开盘前双边挂单授权额度不足")
         await self.api.ensure_auth()
         async with self.account_lock:
@@ -969,15 +990,20 @@ class Controller:
                     "phase": "active", "orders": orders, "created_ms": self.now(), "tries": 0, "retry_ms": 0,
                     "open_seen_ms": self.now() if str(market.get("tradingStatus") or "").upper() == "OPEN" else 0}
             self.ledger.save(pair)  # both hashes durable before either POST
+        sides: list[str] = []
         for side in ("up", "down"):
-            order = pair["orders"][side]
-            if self.before_send(order["body"]):
-                order["state"] = "not_sent"
+            if why := self.before_send(pair["orders"][side]["body"]):
+                pair["orders"][side].update(state="not_sent", error=why)
                 pair["phase"] = "closing"
-                self.ledger.save(pair)
+                sides = []  # a pair refused in part sends nothing: the side that passed stays prepared (never sent)
                 break
-            order["state"] = "placing"
-            self.ledger.save(pair)
+            sides.append(side)
+        for side in sides:
+            pair["orders"][side]["state"] = "placing"
+        self.ledger.save(pair)
+
+        async def send(side: str) -> None:
+            order = pair["orders"][side]
             try:
                 result = await self.api.create_order(order["body"])
                 order.update(id=result["order_id"], state="open", api_hash=str(result.get("hash") or "").lower())
@@ -1001,8 +1027,8 @@ class Controller:
                     order.update(state="unknown", error=text)
                 pair["phase"] = "closing"
             self.ledger.save(pair)
-            if pair["phase"] != "active":
-                break
+        if sides:
+            await asyncio.gather(*(send(side) for side in sides))  # 1.131.0: side by side — the second side no longer waits a round trip
         if all(o["state"] in {"prepared", "not_sent"} or o.get("limited") for o in pair["orders"].values()):
             # nothing of the pair was ever placed (a gate or the rate limiter refused the first request): no record, so a
             # later poll places the window afresh — hold() keeps it back while the reason lasts
@@ -1293,17 +1319,39 @@ class Controller:
                 LOG.warning("开盘前账户快照：%s", self.error)
             await asyncio.sleep(self.settings.poll)
 
+    def poll_wait(self) -> float:
+        """Seconds to the next discovery: FAST_POLL_S while a card's next listing is expected — a cycle after its last one
+        seen, LISTING_EARLY_MS before to LISTING_LATE_MS after (or until it is seen) — else the poll setting."""
+        now = self.now()
+        for at in self.listed_at.values():
+            due = at + LISTING_CYCLE_MS
+            if due - LISTING_EARLY_MS <= now <= due + LISTING_LATE_MS:
+                return FAST_POLL_S
+        return float(self.settings.poll)
+
     async def discovery_loop(self) -> None:
+        """The discovery on its own (1.131.0: the refreshes have their own loop — a batch of reads never delays a listing's find)."""
         while not self.stopped():
             try:
                 if not self.blocked():
                     await self.discover()
-                    await self.refresh_active()
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 self.error = core.clean_error(error) or type(error).__name__
                 LOG.warning("开盘前市场扫描：%s", self.error)
+            await asyncio.sleep(self.poll_wait())
+
+    async def refresh_loop(self) -> None:
+        while not self.stopped():
+            try:
+                if not self.blocked():
+                    await self.refresh_active()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.error = core.clean_error(error) or type(error).__name__
+                LOG.warning("开盘前市场重读：%s", self.error)
             await asyncio.sleep(self.settings.poll)
 
     async def cancellation_loop(self) -> None:
@@ -1359,6 +1407,7 @@ class Controller:
             self.adopt()  # the last run's pairs: taken over as they are, or withdrawn and reconciled
             jobs = [asyncio.create_task(self.account_loop(), name="preopen-account"),
                     asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
+                    asyncio.create_task(self.refresh_loop(), name="preopen-refresh"),
                     asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
                     *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(2))]
             stops = [asyncio.create_task(self.owner.stopping.wait()), asyncio.create_task(self.stop.wait())]
@@ -1427,5 +1476,7 @@ class Controller:
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
                 + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：占用的 USDT 计入余额核对，不计入预挂限额" if self.unmanaged else "")
                 + ("\n股票卡暂停：" + "；".join(self.card_holds.values()) if self.card_holds else "")
+                + ("\n发布节奏（每 15 分钟一场；预计前后每秒扫一次）：" + "；".join(f"{key} 上次 {hms(at)}，下次预计 {hms(at + LISTING_CYCLE_MS)}" for key, at in sorted(self.listed_at.items()))
+                   if self.listed_at else "")
                 + (f"\n没挂的已发布场次：" + "；".join(f"{k.rsplit('-', 1)[-1]} {v}" for k, v in list(self.skipped.items())[-3:]) if self.skipped else "") + "\n"
                 f"实测：{self.timing_line()}")
