@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.128.3"
+VERSION = "1.128.4"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -10495,6 +10495,31 @@ def sim_summary(trades: list[dict], days: int = 14, marks: Mapping | None = None
     return out
 
 
+def merge_preopen_summary(rows: list[dict], extra: Mapping, days: int = 14) -> list[dict]:
+    """The pre-open mode's figures (preopen.review "daily": summary_of-shaped, by the window's day and in all) counted into
+    the daily summary (1.128.4): added to the day's line — one made for a day that has only them — and standing as the
+    part 开盘前预挂 under it; into 累计 the same way. The latest ``days`` days kept, newest first, 累计 last."""
+    keys = ("records", "markets", "filled", "volume", "settled", "wins", "losses", "ties", "pnl", "open", "open_cost", "resting", "marked", "unrealized")
+    by_day = {r["day"]: r for r in rows if r.get("day")}
+    total = next((r for r in rows if not r.get("day")), None)
+
+    def add(row: dict, fig: Mapping) -> None:
+        for k in keys:
+            row[k] = row.get(k, 0) + fig.get(k, 0)
+        row.setdefault("parts", []).append({"name": "开盘前预挂", **{k: fig.get(k, 0) for k in keys}})
+
+    for day, fig in (extra.get("days") or {}).items():
+        if day not in by_day:
+            d = dt.date.fromisoformat(day)
+            by_day[day] = {"day": day, "label": f"{d:%m-%d} {WEEKDAYS[d.weekday()]}", **summary_of([]), "parts": []}
+        add(by_day[day], fig)
+    if extra.get("total"):
+        if total is None:
+            total = {"day": "", "label": "累计", **summary_of([]), "parts": []}
+        add(total, extra["total"])
+    return [by_day[d] for d in sorted(by_day, reverse=True)[:days]] + ([total] if total else [])
+
+
 # --- the review page's analysis: by underlying, by edge and fair price at the order, by session part, the makers, the refused buys
 def book_mark(book: "PredictBook | None", side: str) -> float | None:
     """The book's middle as the mark of an open position on ``side`` (the Yes bid and ask for 涨 / Yes, their complement
@@ -12172,7 +12197,7 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
 <div class="tiles" id="tiles"></div>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
-<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>今日按市场 <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。</p><p class="small mut">按下单日期（北京时间）统计；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
+<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>今日按市场 <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。</p><p class="small mut">按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="anaref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
 <div class="note fline" id="anafilt" hidden></div><div class="small mut" id="anaat"></div>
@@ -18955,7 +18980,7 @@ class Bot:
                 "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
                           for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
                 "groups": sim_groups(values), "sources": sim_sources(values), "blocks": self.sim_blocks(),
-                "summary": sim_summary(values, marks=marks),  # per day the records were opened on, per kind and way under each, and 累计
+                "summary": self.summary_rows(values, marks),  # per day the records were opened on, per kind and way under each, and 累计 (the pre-open quotes counted in)
                 "analysis": self.sim_analysis(values, marks),  # per underlying, per edge / fair bucket, per session part, the makers, the refused buys
                 "unrealized": totals["unrealized"], "marked": totals["marked"],  # the open positions at the fresh books' middles
                 "group_cap": self.config.sim_group_usd, "history": limit, "more": len(rows) - len(shown), "trades": shown}
@@ -19003,6 +19028,13 @@ class Bot:
         """The review page's 开盘前预挂 section: the pre-open mode's ledger (preopen.review); None here, where there is no mode."""
         return None
 
+    def summary_rows(self, values: list[dict], marks: Mapping, flt: Mapping | None = None) -> list[dict]:
+        """The daily summary (sim_summary) with the pre-open mode's quotes counted in (merge_preopen_summary) when the page
+        has no filter: by the window's day, into the day's line and as a part under it, and into 累计 (1.128.4)."""
+        rows = sim_summary(values, marks=marks)
+        extra = (self.preopen_review() or {}).get("daily") if not flt else None
+        return merge_preopen_summary(rows, extra) if extra else rows
+
     def journal_analysis(self, flt: Mapping | None = None) -> dict:
         """The review page's daily summary and analysis over the records in ``flt`` (journal_filter_of: a card, a kind, a
         way; none = every record): journal.json?analysis=1&card=…, and summary.csv with the same parameters (1.107.0)."""
@@ -19018,7 +19050,7 @@ class Bot:
         marks = self.sim_marks(markets, now_ms)
         return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）", "filter": flt,
                 "filter_text": journal_filter_text(flt), "records": len(values),
-                "summary": sim_summary(values, marks=marks), "analysis": self.sim_analysis(values, marks, flt)}
+                "summary": self.summary_rows(values, marks, flt), "analysis": self.sim_analysis(values, marks, flt)}
 
     def journal_rows(self, flt: Mapping | None = None, day: str = "", lean: bool = False) -> dict:
         """The records in ``flt`` (journal_filter_of) opened on ``day`` — a Beijing date, "today" for the bot's, "" (or

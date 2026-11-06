@@ -850,9 +850,19 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
                              [("宇树 15分涨跌 13:00–13:15", "待结算", None, 1), ("BTC 15分涨跌 10:00–10:15", "已结算", 5.1, 0)])
             self.assertEqual((r["recent"][1]["cancel_s"], r["recent"][1]["lead_min"], r["recent"][1]["result"]), (0.4, 1260.0, "up"))
             # the live bot: the running controller's ledger, or the file while the mode is off; nothing recorded → None
+            self.assertEqual((r["daily"]["days"]["2026-11-06"]["records"], r["daily"]["days"]["2026-11-06"]["pnl"], r["daily"]["total"]["open"], r["daily"]["total"]["open_cost"]), (4, 5.1, 1, 2.45))
             bot = L.LiveBot.__new__(L.LiveBot)
             bot.preopen, bot.config, bot.market = ctl, ctl.owner.config, ctl.owner.market
             self.assertEqual(bot.preopen_review()["total"]["records"], 4)
+            # the daily summary: the day's line counts the quotes in and has them as a part; 累计 too; not under a filter
+            rows = bot.summary_rows([], {})
+            self.assertEqual([(x["label"], x["records"], x["pnl"], [q["name"] for q in x["parts"]]) for x in rows],
+                             [("11-06 周五", 4, 5.1, ["开盘前预挂"]), ("累计", 4, 5.1, ["开盘前预挂"])])
+            self.assertEqual((rows[0]["open"], rows[0]["open_cost"], rows[0]["resting"], rows[0]["markets"]), (1, 2.45, 1, 4))
+            self.assertEqual(bot.summary_rows([], {}, {"card": "x"}), [])
+            day = {"day": "2026-11-06", "label": "11-06 周五", **m.summary_of([]), "records": 2, "pnl": -1.0, "parts": [{"name": "挂单", **m.summary_of([])}]}
+            merged = m.merge_preopen_summary([day, {"day": "", "label": "累计", **m.summary_of([]), "records": 2, "pnl": -1.0, "parts": []}], r["daily"])
+            self.assertEqual([(x["records"], round(x["pnl"], 4), len(x["parts"])) for x in merged], [(6, 4.1, 2), (6, 4.1, 1)])
             bot.preopen = None
             self.assertEqual(bot.preopen_review()["total"]["records"], 4, "read off the file")
             bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "STATE_DB": ":memory:"})

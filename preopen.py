@@ -321,7 +321,7 @@ def quote_of(pair: dict) -> dict:
     start = int(pair.get("start_ms") or 0)
     at = dt.datetime.fromtimestamp(start / 1000, core.BEIJING)
     return {"window": window_of(pair), "key": str(pair.get("key") or ""), "card": str(pair.get("name") or pair.get("key") or "").rsplit(" ", 1)[0],
-            "name": str(pair.get("name") or window_of(pair)), "day": at.strftime("%m-%d"), "hour": at.hour, "start_ms": start,
+            "name": str(pair.get("name") or window_of(pair)), "day": at.strftime("%m-%d"), "date": at.date().isoformat(), "hour": at.hour, "start_ms": start,
             "active": pair.get("phase") == "active", "accounted": accounted, "filled": total, "filled_up": filled["up"], "filled_down": filled["down"],
             "sent": {side: side in orders and orders[side].get("state") not in NEVER_PLACED for side in ("up", "down")},
             "price": price, "shares": shares, "volume": total * price, "settled": accounted and total > 0, "pending": total > 0 and not accounted,
@@ -341,7 +341,16 @@ def review_summary(name: str, qs: list[dict]) -> dict:
             "volume": round(sum(q["volume"] for q in qs), 4), "pending": sum(1 for q in qs if q["pending"]),
             "settled": len(settled), "wins": sum(1 for q in settled if q["pnl"] > 1e-9), "losses": sum(1 for q in settled if q["pnl"] < -1e-9),
             "ties": sum(1 for q in settled if abs(q["pnl"]) <= 1e-9), "pnl": round(sum(q["pnl"] for q in settled), 4),
+            "pending_cost": round(sum(q["volume"] for q in qs if q["pending"]), 4),
             "withdrawn": sum(1 for q in qs if q["accounted"] and q["filled"] <= 0)}
+
+
+def summary_shape(r: dict) -> dict:
+    """A review_summary row in the daily summary's shape (core.summary_of): the pending fills are its open positions, the
+    resting pairs its resting orders; nothing is marked."""
+    return {"records": r["records"], "markets": r["windows"], "filled": r["filled"], "volume": r["volume"], "settled": r["settled"],
+            "wins": r["wins"], "losses": r["losses"], "ties": r["ties"], "pnl": r["pnl"], "open": r["pending"], "open_cost": r["pending_cost"],
+            "resting": r["resting"], "marked": 0, "unrealized": 0.0}
 
 
 def review_side(name: str, side: str, qs: list[dict]) -> dict:
@@ -361,16 +370,20 @@ def review(rows: list[dict], now_ms: int) -> dict:
     (one window, one attempt) at least one order of which was sent; a window's two sides are two bets at the pair's price."""
     qs = [quote_of(p) for p in rows if any(o.get("state") not in NEVER_PLACED for o in (p.get("orders") or {}).values())]
     days: dict[str, list[dict]] = {}
+    dates: dict[str, list[dict]] = {}
     cards: dict[str, list[dict]] = {}
     hours: dict[tuple[str, int], list[dict]] = {}
     many = len({q["card"] for q in qs}) > 1
     for q in qs:
         days.setdefault(q["day"], []).append(q)
+        dates.setdefault(q["date"], []).append(q)
         cards.setdefault(q["card"], []).append(q)
         hours.setdefault((q["card"] if many else "", q["hour"]), []).append(q)
     recent = sorted([q for q in qs if q["filled"] > 0], key=lambda q: q["start_ms"], reverse=True)[:60]
     shown = ("start_ms", "name", "key", "filled_up", "filled_down", "price", "volume", "result", "pnl", "status", "lead_min", "cancel_s", "attempt")
-    return {"total": review_summary("全部", qs),
+    total = review_summary("全部", qs)
+    return {"total": total,
+            "daily": {"days": {date: summary_shape(review_summary(date, dates[date])) for date in dates}, "total": summary_shape(total)},  # the daily summary's share (core.merge_preopen_summary)
             "resting_usd": round(sum(q["price"] * q["shares"] * sum(q["sent"].values()) for q in qs if q["active"]), 4),
             "days": [review_summary(day, days[day]) for day in sorted(days, key=lambda d: max(q["start_ms"] for q in days[d]), reverse=True)],
             "cards": [review_summary(card, cards[card]) for card in sorted(cards, key=lambda c: (-len(cards[c]), c))],
