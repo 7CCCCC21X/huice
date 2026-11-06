@@ -110,6 +110,14 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*ctl.settling.values(), return_exceptions=True)
         ctl.ledger.close()
 
+    async def until(self, cond, timeout: float = 3.0) -> None:
+        """A worker task's effect waited for, polling (a slow builder is no reason for a fixed short sleep to fall short)."""
+        for _ in range(int(timeout / 0.01)):
+            if cond():
+                return
+            await asyncio.sleep(0.01)
+        self.fail(f"waited {timeout:g}s")
+
     async def settle_tasks(self, ctl):
         """The reconcile / verify tasks the loop would run: awaited here."""
         await asyncio.gather(*list(ctl.settling.values()), return_exceptions=True)
@@ -467,7 +475,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl.account_at = NOW - 40_000
         ctl.queue.put_nowait((c["start_ms"], c["slug"], c))
         worker = asyncio.create_task(ctl.placement_worker())
-        await asyncio.sleep(0.05)
+        await self.until(lambda: c["slug"] in ctl.parked)
         self.assertEqual((set(ctl.parked), ctl.queued, ctl.queue.qsize()), ({c["slug"]}, {c["slug"]}, 0))
         api.calls.clear()
         await ctl.discover()
@@ -478,14 +486,14 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         clock.ms += p.HOLD_RETRY_MS
         ctl.account_at = clock.ms
         ctl.unpark()
-        await asyncio.sleep(0.05)
+        await self.until(lambda: len(api.sent) >= 2 and not ctl.parked and not ctl.queued)
         self.assertEqual((len(api.sent), ctl.parked, ctl.queued, c["slug"] in ctl.ledger.rows), (2, {}, set(), True))
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
         broken = {**c, "slug": "btc-updown-15m-broken", "market_id": "404", "market": None}  # its read raises: parked longer, not read again every poll
         ctl.queue.put_nowait((broken["start_ms"], broken["slug"], broken)); ctl.queued.add(broken["slug"])
         worker = asyncio.create_task(ctl.placement_worker())
-        await asyncio.sleep(0.05)
+        await self.until(lambda: broken["slug"] in ctl.parked)
         worker.cancel(); await asyncio.gather(worker, return_exceptions=True)
         self.assertEqual((ctl.parked[broken["slug"]][0], broken["slug"] in ctl.queued), (clock.ms + p.ERROR_RETRY_MS, True))
         del ctl.parked[broken["slug"]]; ctl.queued.discard(broken["slug"])
