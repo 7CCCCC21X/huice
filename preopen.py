@@ -22,6 +22,14 @@ one Predict lists next), up to MISS_STOP unlisted in a row once a minute. Open
 orders on the account that nobody here placed no longer hold the mode (their
 money counts in the balance check). The rate limiter's cooldown is a hold, and a
 pair whose first request it refused leaves no record: a later poll places it.
+
+1.127.0: the quotes survive a restart and a settings change — an active pair
+that is what the settings say (size, price, signed expiry, card) is taken over,
+its queue position kept; one that is not is withdrawn and the window quoted
+again under a new salt (attempt). A window withdrawn before its start by a stop,
+a pause or an external cancel is quoted again too, at most MAX_ATTEMPTS times
+(never after Predict's own refusal). The process stopping leaves the orders on
+the book: the signed expiry is the backstop, the next process takes them over.
 """
 from __future__ import annotations
 
@@ -53,6 +61,7 @@ REFRESH_FAR_MS = 300_000  # ...a window starting more than an hour away: this of
 SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
 DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
 LISTING_FIELDS = ("id", "conditionId", "status", "tradingStatus", "question", "outcomes")  # the details' fields the discovery reads
+MAX_ATTEMPTS = 3       # a window is quoted at most this many times (its pairs withdrawn before the start quoted again under a new salt)
 MISS_STOP = 4          # discover: a card's coming windows are asked in start order; this many unlisted in a row end the card's full scan
 FULL_SCAN_MS = 60_000  # a full scan (up to MISS_STOP unlisted per card) this often; between them each card's first unlisted window alone is asked every poll
 
@@ -97,6 +106,15 @@ class Ledger:
         with self.conn:
             self.conn.execute("DELETE FROM pairs WHERE slug=?", (slug,))
         self.rows.pop(slug, None)
+
+    def rename(self, slug: str, new_slug: str) -> None:
+        """A record stepping aside (its window quoted again under a new attempt): kept, under a key that is not the window's."""
+        row = self.rows.pop(slug)
+        row["slug"] = new_slug
+        with self.conn:
+            self.conn.execute("DELETE FROM pairs WHERE slug=?", (slug,))
+            self.conn.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body", (new_slug, json.dumps(row, ensure_ascii=False)))
+        self.rows[new_slug] = row
 
     def close(self) -> None:
         self.conn.close()
@@ -298,6 +316,8 @@ class Controller:
         self.queued: set[str] = set()
         self.skipped: dict[str, str] = {}  # slug -> why a listed window was not placed (the status line)
         self.full_scan_ms = 0  # discover: when the last full scan ran (FULL_SCAN_MS)
+        self.keep_on_stop = False  # the owner's stop for a settings change: the orders stay on the book, the next controller takes them over
+        self.resumed = self.requoted = 0  # pairs taken over at this start; windows quoted again (superseded records) since
         self.listed_until_ms = max((int(p.get("start_ms") or 0) for p in self.ledger.rows.values()), default=0)  # the latest window seen listed
         self.account_lock = asyncio.Lock()
         shared = getattr(owner.live, "api", None)  # the bot's own client: one rate-limit cooldown for all three
@@ -452,6 +472,59 @@ class Controller:
                     self.ledger.save(pair)
             self.account_at = self.now()
 
+    def resumable(self, pair: dict) -> bool:
+        """An active pair found at the start (a restart, a settings change) that keeps resting, its queue position with it:
+        every order open with an id, the card still quoted, the size, price and signed expiry as the settings say (the
+        cancel time is derived again), the start still ahead. Anything else is withdrawn."""
+        import live
+        if pair.get("key") not in self.settings.markets or self.now() >= pair["start_ms"]:
+            return False
+        if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.expiry_seconds:
+            return False
+        amounts = live.limit_amounts(True, live.to_wei(self.settings.price), live.to_wei(self.settings.shares))
+        for order in pair["orders"].values():
+            signed = (order.get("body") or {}).get("data", {}).get("order", {})
+            if (order["state"] != "open" or not order.get("id")
+                    or str(signed.get("makerAmount")) != str(amounts["maker"]) or str(signed.get("takerAmount")) != str(amounts["taker"])):
+                return False
+        return True
+
+    def adopt(self) -> None:
+        """The records found at the start: an active pair as the settings say is taken over (resumable); any other pair not
+        at its end is withdrawn and reconciled (interrupted attempts included — a recovered record never gets a new salt)."""
+        for pair in list(self.ledger.rows.values()):
+            if pair["phase"] == "active" and self.resumable(pair):
+                pair["cancel_ms"] = pair["start_ms"] - self.settings.cancel_seconds * 1000
+                self.ledger.save(pair)
+                self.resumed += 1
+            elif pair["phase"] != "closed" and not pair.get("accounted"):
+                pair.update(phase="closing", retry_ms=0, **({"reason": "设置不同，撤掉后重新报价"} if pair["phase"] == "active" else {}))
+                self.ledger.save(pair)
+
+    def supersedable(self, pair: dict) -> bool:
+        """A pair withdrawn before its window — a stop, a pause, a settings change, an external cancel — with the start
+        still ahead: its record steps aside so the window is quoted again under a new salt. Not one Predict refused (a
+        post-only order that would cross is refused again), not one with a fill (a position: that size is taken), and
+        not past MAX_ATTEMPTS. Accounted means every order verified and nothing filled."""
+        if pair["phase"] == "active" or not pair.get("accounted"):
+            return False
+        if pair["start_ms"] - self.now() < self.settings.entry_seconds * 1000:
+            return False
+        if any(o["state"] == "rejected" and not o.get("limited") for o in pair["orders"].values()):
+            return False
+        return int(pair.get("attempt") or 0) + 1 < MAX_ATTEMPTS
+
+    async def on_stop(self) -> None:
+        """The way out: the orders are withdrawn when the mode is switched off or crashed; they stay on the book when the
+        process is stopping or the owner restarts the mode for a settings change (keep_on_stop) — the signed expiry is the
+        backstop, and the next controller takes them over (adopt)."""
+        resting = sum(1 for p in self.ledger.rows.values() if p["phase"] == "active")
+        if self.owner.stopping.is_set() or self.keep_on_stop:
+            LOG.info("开盘前预挂：%d 场挂单留在簿上（签名到期兜底，重启后接管）", resting)
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(self.cancel_all("预挂模式停止，撤销预挂单"), timeout=12)
+
     async def discover(self) -> None:
         """Each coming window (window_starts) not yet recorded or queued, asked for by its category, each card's in start
         order: listed, it is judged (candidate) and queued, the soonest first. Not listed, the card's later windows are
@@ -466,8 +539,14 @@ class Controller:
             if misses.get(rolling.key, 0) >= (MISS_STOP if full else 1):
                 continue
             slug = window_slug(rolling, start)
-            if slug in self.ledger.rows or slug in self.queued:
+            if slug in self.queued:
                 continue
+            attempt = 0
+            if slug in self.ledger.rows:
+                before = self.ledger.rows[slug]
+                if not self.supersedable(before):
+                    continue
+                attempt = int(before.get("attempt") or 0) + 1
             market = await category_market(self.api, slug)
             if market is None:
                 misses[rolling.key] = misses.get(rolling.key, 0) + 1
@@ -478,6 +557,10 @@ class Controller:
             if c is None:
                 self.skipped[slug] = candidate_problem(market, self.now(), self.owner.config, self.settings)
                 continue
+            if slug in self.ledger.rows:  # the withdrawn pair's record steps aside: the window is quoted again (place_pair: a new salt)
+                self.ledger.rename(slug, f"{slug}@{int(self.ledger.rows[slug].get('created_ms') or 0)}")
+                self.requoted += 1
+            c["attempt"] = attempt
             self.queued.add(slug)
             found.append(c)
         for c in sorted(found, key=lambda c: (c["start_ms"], c["slug"])):
@@ -530,7 +613,8 @@ class Controller:
             orders = {}
             for side, (outcome, _) in zip(("up", "down"), outcomes):
                 identity = (f"preopen-v2|{self.owner.config.live_chain}|{self.owner.live.wallet.maker.lower()}|{current['market_id']}|"
-                            f"{outcome['token']}|{current['expires']}|{self.settings.price}|{self.settings.shares}")
+                            f"{outcome['token']}|{current['expires']}|{self.settings.price}|{self.settings.shares}"
+                            + (f"|{c['attempt']}" if c.get("attempt") else ""))  # a window quoted again: a new salt, the first attempt's unchanged
                 salt = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big") % live.MAX_SALT
                 signed = live.build_order(self.owner.live.wallet, outcome["token"], amounts["maker"], amounts["taker"], info.fee_bps, current["expires"], salt=salt)
                 digest, signature = self.owner.live.wallet.sign_order(signed, info.neg_risk, info.yield_bearing)
@@ -538,7 +622,7 @@ class Controller:
                                 "body": {"data": {"order": {**signed, "signature": signature, "hash": digest},
                                                    "strategy": "LIMIT", "pricePerShare": str(amounts["price_per_share"]),
                                                    "isPostOnly": True, "selfTradePrevention": "CANCEL_TAKER"}}}
-            pair = {**current, "phase": "active", "orders": orders, "created_ms": self.now(), "tries": 0, "retry_ms": 0,
+            pair = {**current, "attempt": int(c.get("attempt") or 0), "phase": "active", "orders": orders, "created_ms": self.now(), "tries": 0, "retry_ms": 0,
                     "open_seen_ms": self.now() if str(market.get("tradingStatus") or "").upper() == "OPEN" else 0}
             self.ledger.save(pair)  # both hashes durable before either POST
         for side in ("up", "down"):
@@ -879,13 +963,8 @@ class Controller:
             await asyncio.sleep(0.5)
 
     async def run(self) -> None:
-        # Recovered prepared records never acquire a new salt on restart. Anything
-        # already saved is closed/reconciled, including attempts interrupted mid-POST.
         try:
-            for pair in self.ledger.rows.values():
-                if pair["phase"] != "closed" and not pair.get("accounted"):
-                    pair.update(phase="closing", retry_ms=0)
-                    self.ledger.save(pair)
+            self.adopt()  # the last run's pairs: taken over as they are, or withdrawn and reconciled
             jobs = [asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
                     asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
                     *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(2))]
@@ -899,8 +978,7 @@ class Controller:
                 for job in [*stops, *jobs]:
                     job.cancel()
                 await asyncio.gather(*stops, *jobs, return_exceptions=True)
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(self.cancel_all("进程停止，撤销预挂单"), timeout=12)
+                await self.on_stop()
                 for task in self.settling.values():
                     task.cancel()
                 await asyncio.gather(*self.settling.values(), return_exceptions=True)
@@ -947,7 +1025,8 @@ class Controller:
                 + ("挂 24 小时内已发布的全部场次" if self.settings.ahead_minutes >= 1440 else f"只挂 {self.settings.ahead_minutes} 分钟内开始的场次") + "\n"
                 f"撤单：开场前 {self.settings.cancel_seconds} 秒发出，之后到开场前 {self.settings.expiry_seconds} 秒到期为止每 {SPRINT_MS // 1000} 秒催一次；"
                 f"不足 {self.settings.entry_seconds} 秒不再新挂\n"
-                f"已记录 {len(rows)} 场（{sum(1 for p in rows if p['phase'] == 'active')} 场挂着，{sum(1 for p in rows if p.get('accounted'))} 场已结清），队列 {self.queue.qsize()} 场；{listed}\n"
+                f"已记录 {len({p['slug'].split('@')[0] for p in rows})} 场（{sum(1 for p in rows if p['phase'] == 'active')} 场挂着，{sum(1 for p in rows if p.get('accounted'))} 场已结清），队列 {self.queue.qsize()} 场；{listed}"
+                + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
                 f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
                 + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：占用的 USDT 计入余额核对，不计入预挂限额" if self.unmanaged else "")

@@ -3219,12 +3219,13 @@ class LiveBot(core.Bot):
 
     async def preopen_apply(self) -> None:
         """The pre-open mode as PREOPEN_15M and the PREOPEN_* settings say now (the environment, the control page's saved
-        values over it): started when on and not running, stopped when off, restarted — its orders withdrawn first — when
-        its settings changed or it crashed."""
+        values over it): started when on and not running, stopped when off (its orders withdrawn), restarted when its
+        settings changed — the orders stay on the book, the new controller takes over those the settings still describe
+        and withdraws the rest — or when it crashed."""
         async with self.preopen_lock:
             want = self.config.preopen
             if self.preopen is not None and (not want.enabled or self.preopen.settings != want or not self.preopen.alive):
-                await self.preopen_stop("设置改变" if want.enabled else "PREOPEN_15M=off")
+                await self.preopen_stop("设置改变" if want.enabled else "PREOPEN_15M=off", keep=want.enabled)
             if want.enabled and self.preopen is None and not self.stopping.is_set():
                 self.preopen_start()
 
@@ -3244,11 +3245,13 @@ class LiveBot(core.Bot):
         task.add_done_callback(finished)
         LOG.info("开盘前预挂模式启动：%s", "、".join(sorted(preopen.settings.markets)))
 
-    async def preopen_stop(self, why: str) -> None:
-        """The mode stopped: its own stop set (its run() withdraws its orders on the way out), its task waited for."""
+    async def preopen_stop(self, why: str, keep: bool = False) -> None:
+        """The mode stopped: its own stop set, its task waited for. Its run() withdraws its orders on the way out unless
+        ``keep`` (a settings change, the process stopping): they stay on the book for the next controller to take over."""
         preopen, task = self.preopen, self.preopen_task
         if preopen is None:
             return
+        preopen.keep_on_stop = keep
         preopen.stop.set()
         if task is not None:
             await asyncio.wait([task], timeout=20)
@@ -3318,7 +3321,7 @@ class LiveBot(core.Bot):
             return await self._run_live()
         finally:
             self.stopping.set()
-            await self.preopen_stop("进程停止")
+            await self.preopen_stop("进程停止", keep=True)  # the orders stay on the book: the signed expiry is the backstop, the next process takes them over
 
     async def _run_live(self) -> int:
         if self.config.live_mode == "off":

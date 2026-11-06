@@ -597,10 +597,12 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         bot.config = m.Config.from_env({**env, "PREOPEN_15M": "on", "PREOPEN_SHARES": "20"})
         await bot.preopen_apply()
         self.assertTrue(first.ended and bot.preopen is not first and bot.preopen.settings.shares == 20, "a setting changed: stopped, started anew")
+        self.assertTrue(first.keep_on_stop, "a settings change leaves the orders on the book for the next controller")
         second = bot.preopen
         bot.config = m.Config.from_env({**env, "PREOPEN_15M": "off"})
         await bot.preopen_apply()
         self.assertTrue(second.ended and bot.preopen is None and bot.preopen_task is None and not bot.preopen_active(), "off: stopped")
+        self.assertFalse(second.keep_on_stop, "off: withdrawn")
         await bot.preopen_apply()
         self.assertIsNone(bot.preopen)
         bot.config = m.Config.from_env({**env, "PREOPEN_15M": "on"})
@@ -672,6 +674,73 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(m.RemoteError): await ctl.account()
         self.assertEqual(ctl.account_at, 0)
         await self.finish(ctl)
+
+    async def test_restart_takes_over_matching_quotes_and_requotes_withdrawn_windows(self):
+        """1.127.0: at a start the last run's active pair that is what the settings say keeps resting (its queue position
+        with it); one that is not is withdrawn and the window quoted again under a new salt; a window withdrawn by a stop
+        is quoted again too, at most MAX_ATTEMPTS times, never after Predict's own refusal; the process stopping or a
+        settings change leaves the orders on the book, switching off withdraws them."""
+        with tempfile.TemporaryDirectory() as folder:
+            db = {"STATE_DB": str(Path(folder) / "state.sqlite3")}
+            ctl, api, clock = controller(**db)
+            c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+            await ctl.place_pair(c)
+            ctl.keep_on_stop = True
+            await ctl.on_stop()
+            self.assertEqual(api.removed, [], "a settings change: the orders stay")
+            ctl.ledger.close()
+            again, _, _ = controller(**db)
+            again.api = again.cancel_api = api; api.ctl = again  # the same account: the orders placed by the last run
+            again.adopt()
+            pair = again.ledger.rows[c["slug"]]
+            self.assertEqual((pair["phase"], again.resumed, pair["cancel_ms"]), ("active", 1, NOW + 3600_000 - 20_000))
+            await again.discover()
+            self.assertEqual(again.queue.qsize(), 0, "taken over: not quoted again")
+            again.owner.stopping.set()
+            await again.on_stop()
+            self.assertEqual(api.removed, [], "the process stopping: the orders stay")
+            again.ledger.close()
+            bigger, _, bclock = controller(PREOPEN_SHARES="20", **db)
+            bigger.api = bigger.cancel_api = api; api.ctl = bigger
+            bigger.adopt()
+            pair = bigger.ledger.rows[c["slug"]]
+            self.assertEqual((pair["phase"], pair["reason"], bigger.resumed), ("closing", "设置不同，撤掉后重新报价", 0))
+            await bigger.cancel_pair(pair, pair["reason"])
+            self.assertEqual((set(api.removed), pair["accounted"], bigger.supersedable(pair)), ({"1", "2"}, True, True))
+            await bigger.discover()
+            self.assertEqual((bigger.queue.qsize(), bigger.requoted, c["slug"] in bigger.ledger.rows), (1, 1, False))
+            old_key = c["slug"] + "@" + str(pair["created_ms"])
+            self.assertIs(bigger.ledger.rows[old_key], pair)
+            queued = bigger.queue.get_nowait()[2]
+            self.assertEqual(queued["attempt"], 1)
+            await bigger.place_pair(queued)
+            fresh = bigger.ledger.rows[c["slug"]]
+            self.assertEqual((fresh["attempt"], len(api.sent)), (1, 4))
+            self.assertNotEqual({o["hash"] for o in fresh["orders"].values()}, {o["hash"] for o in pair["orders"].values()}, "a new salt")
+            self.assertEqual(api.sent[2]["data"]["order"]["takerAmount"], str(L.to_wei(20)))
+            self.assertEqual(bigger.risk(), 2 * 0.49 * 20)  # the withdrawn pair released, the new one reserved
+            self.assertIn("已记录 1 场（1 场挂着，1 场已结清）", bigger.status())
+            self.assertIn("重新报价 1 场", bigger.status())
+            # the cap and Predict's own refusal
+            fresh["attempt"] = p.MAX_ATTEMPTS - 1
+            await bigger.cancel_pair(fresh, "test")
+            self.assertTrue(fresh["accounted"] and not bigger.supersedable(fresh))
+            fresh["attempt"] = 0
+            self.assertTrue(bigger.supersedable(fresh))
+            fresh["orders"]["up"]["state"] = "rejected"
+            self.assertFalse(bigger.supersedable(fresh))
+            fresh["orders"]["up"]["limited"] = True
+            self.assertTrue(bigger.supersedable(fresh))
+            bclock.ms = NOW + 3600_000 - 170_000  # bigger's own clock
+            self.assertFalse(bigger.supersedable(fresh), "too close to the start")
+            bigger.keep_on_stop = False
+            bigger.owner.stopping.clear()
+            await self.finish(bigger)
+            bigger.ledger = p.Ledger(db["STATE_DB"] + ".x")  # on_stop on a closed ledger would fail: a fresh one for the off case
+            bigger.ledger.save({**ctl.ledger.rows.get(c["slug"], fresh), "slug": "w", "phase": "active", "orders": {"up": {"id": "9", "state": "open", "hash": "x", "filled": 0.0}}, "start_ms": NOW + 3600_000, "cancel_ms": NOW + 3580_000, "expires": NOW // 1000 + 3590})
+            await bigger.on_stop()
+            self.assertIn("9", api.removed, "switched off: withdrawn")
+            bigger.ledger.close()
 
     async def test_restart_preserves_hash_and_pause(self):
         with tempfile.TemporaryDirectory() as folder:
