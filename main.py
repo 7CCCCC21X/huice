@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.135.1"
+VERSION = "1.136.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -515,6 +515,7 @@ class PreopenSettings:
     open_quiet_minutes: int = 15  # PREOPEN_OPEN_QUIET_MINUTES: a stock card's windows starting within this of a session segment's open (the day's, the afternoon's) are not quoted — the auction's indicative price, the break's news (1.135.1); 0 = all
     markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = every 15-minute card
     exclusive: bool = False    # PREOPEN_EXCLUSIVE: on = the model trader opens nothing while this mode runs for real (off: both run, jointly capped)
+    weekend: bool = True       # PREOPEN_WEEKEND: off = no window starting on a Saturday or Sunday (Beijing time) is quoted, resting ones withdrawn (1.136.0)
     db: str = ""
 
     @property
@@ -550,9 +551,11 @@ class PreopenSettings:
         stems = {r.stem.lower(): r.key for r in WINDOW_UPDOWN_MARKETS}
         keys = frozenset(stems.values())
         wanted = [w.strip() for w in str(e.get("PREOPEN_MARKETS", "btc")).split(",") if w.strip()] or ["btc"]
-        markets = keys if any(w.lower() == "all" for w in wanted) else frozenset(stems.get(w.lower(), w.upper()) for w in wanted)
+        markets = (keys if any(w.lower() == "all" for w in wanted) else frozenset() if any(w.lower() == "none" for w in wanted)
+                   else frozenset(stems.get(w.lower(), w.upper()) for w in wanted))  # none = no card: the page's 一键全关 (1.136.0)
         price = D(cents) / 100
         exclusive = str(e.get("PREOPEN_EXCLUSIVE", "off")).strip().lower() == "on"
+        weekend = str(e.get("PREOPEN_WEEKEND", "on")).strip().lower() != "off"
         levels = [(cents, shares)]
         for part in [x.strip() for x in str(e.get("PREOPEN_LEVELS", "")).replace("，", ",").split(",") if x.strip()]:
             found = re.fullmatch(r"(\d+)\s*[xX×*:：]\s*(\d+)", part)
@@ -574,10 +577,10 @@ class PreopenSettings:
                 or not 3 <= ahead <= 1440 or not markets <= keys or float(price * shares) < PREOPEN_MIN_SIDE_USD
                 or not 5 <= expiry <= 600 or not expiry + 5 <= cancel <= 900 or not cancel + 60 <= entry <= 3600):
             raise ValueError("PREOPEN_POLL_SECONDS 1～60、PREOPEN_MAX_OPEN_USD 0～1000000（0 = 不限）、PREOPEN_PRICE_CENTS 1～50、PREOPEN_SHARES 1～500（每边不少于 "
-                             f"Predict 最小订单 ${PREOPEN_MIN_SIDE_USD:g}）、PREOPEN_AHEAD_MINUTES 3～1440、PREOPEN_MARKETS 只能是 {'、'.join(sorted(keys))} 或 all；"
+                             f"Predict 最小订单 ${PREOPEN_MIN_SIDE_USD:g}）、PREOPEN_AHEAD_MINUTES 3～1440、PREOPEN_MARKETS 只能是 {'、'.join(sorted(keys))}、all 或 none；"
                              "PREOPEN_EXPIRY_SECONDS 5～600，PREOPEN_CANCEL_SECONDS 至少比它大 5 秒、至多 900，PREOPEN_ENTRY_SECONDS 至少比撤单时间大 60 秒、至多 3600")
         return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
-                   price=price, shares=D(shares), markets=markets, exclusive=exclusive, db=cls.db_of(e),
+                   price=price, shares=D(shares), markets=markets, exclusive=exclusive, weekend=weekend, db=cls.db_of(e),
                    levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep, limit_gap_pct=limit_gap, open_quiet_minutes=open_quiet)
 
     @classmethod
@@ -658,7 +661,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_NOTIFY", "真实订单的 Telegram 通知", "开 = 真实下单、成交、撤单、失败都发 Telegram 通知"),
     ("PREOPEN_15M", "开盘前预挂（15 分钟市场）", "开 = 15 分钟场次一发布就在涨跌两边各挂一张 post-only 买单，开场前撤掉（PREOPEN.md）；需要 LIVE=on。改动即时生效：开就启动，关就撤单停下，改参数先撤单再按新参数重启。预挂的预留计入持仓+挂单上限，当日盈亏计入日亏损停机线"),
     ("PREOPEN_EXCLUSIVE", "预挂时原策略暂停开新仓", "开 = 本模式真实运行时普通模型策略不开新仓（原策略也在交易同一批 15 分钟市场时建议开）；关 = 两边同时跑，额度和日亏损合并计算"),
-    ("PREOPEN_MARKETS", "预挂哪几张卡", "点亮要挂的卡，可多选，全选 = all（默认只挂 BTC）；和“做哪些市场”互不影响：那边排除 15 分钟卡只管原策略，预挂只认这里"),
+    ("PREOPEN_MARKETS", "预挂哪几张卡", "点亮要挂的卡，可多选，全选 = all（默认只挂 BTC）；“一键全关”= none：一张都不挂、已挂的预挂单撤掉，本模式仍开着，再点亮一张就恢复；和“做哪些市场”互不影响：那边排除 15 分钟卡只管原策略，预挂只认这里"),
+    ("PREOPEN_WEEKEND", "周末也挂", "开 = 周六、周日（北京时间）开始的场次照挂；关 = 周末不挂：周五起就不挂周六、周日开始的场次，周末里已挂的按“设置不同”撤掉（不算再报价次数），周一 00:00 起恢复。股票卡周末本来没有场次，这项只影响 BTC、ETH、BNB 这些周末也有场次的卡"),
     ("PREOPEN_SHARES", "预挂每边份数", "1～500：每场每边各挂这么多份（默认 10），每边不少于 $1"),
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
     ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 4 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
@@ -9962,7 +9966,8 @@ SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": 
 CONTROL_FORMS: dict[str, dict] = {
     "LIVE": {"kind": "choice", "group": "策略", "options": [["off", "off 只记账"], ["pause", "pause 登录不开仓"], ["on", "on 真实下单"]]},
     "PREOPEN_15M": {"kind": "choice", "group": "预挂", "options": [["off", "off 关"], ["on", "on 开（需要 LIVE=on）"]]},
-    "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "options": [["btc", "BTC"], ["eth", "ETH"], ["bnb", "BNB"], ["xau", "黄金"], ["cl", "原油"], ["skhynix", "SK 海力士"], ["unitree", "宇树"], ["zhipu", "智谱"], ["mu", "美光"], ["sndk", "闪迪"], ["avgo", "博通"], ["spcx", "SPCX"], ["nvda", "英伟达"], ["googl", "谷歌"], ["meta", "Meta"], ["tsm", "台积电"], ["amzn", "亚马逊"], ["qqq", "纳指ETF"], ["spy", "标普ETF"], ["msft", "微软"]]},  # 1.130.7: pick the cards one by one; 1.134.0: 黄金、原油、智谱; 1.135.0: 美股 12 张
+    "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "none": "none", "options": [["btc", "BTC"], ["eth", "ETH"], ["bnb", "BNB"], ["xau", "黄金"], ["cl", "原油"], ["skhynix", "SK 海力士"], ["unitree", "宇树"], ["zhipu", "智谱"], ["mu", "美光"], ["sndk", "闪迪"], ["avgo", "博通"], ["spcx", "SPCX"], ["nvda", "英伟达"], ["googl", "谷歌"], ["meta", "Meta"], ["tsm", "台积电"], ["amzn", "亚马逊"], ["qqq", "纳指ETF"], ["spy", "标普ETF"], ["msft", "微软"]]},  # 1.130.7: pick the cards one by one; 1.134.0: 黄金、原油、智谱; 1.135.0: 美股 12 张; 1.136.0: "none" = the page's 一键全关
+    "PREOPEN_WEEKEND": {"kind": "choice", "group": "预挂", "options": [["on", "on 周末照挂"], ["off", "off 周末不挂"]]},
     "PREOPEN_EXCLUSIVE": {"kind": "choice", "group": "预挂", "options": [["off", "off 两边同时跑"], ["on", "on 预挂时原策略不开新仓"]]},
     "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
     "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},
@@ -12906,14 +12911,14 @@ function fmt(s,v){return s.unit==="$"?"$"+v:s.unit==="¢"?v+"¢":s.unit?v+" "+s.
 function selected(s){return new Set(s.kind==="multi"?(s.value==="all"?s.options.map(o=>o[0]):s.value.split(",")):[s.value])}
 function pick(s,v){
   if(s.key==="LIVE")return data.live?switchMode(v):act({action:"set",values:{LIVE:v}});
-  if(s.kind==="multi"){const sel=selected(s);if(sel.has(v)){if(sel.size===1)return toast("至少保留一个市场",false);sel.delete(v)}else sel.add(v);
-    const keys=s.options.map(o=>o[0]).filter(k=>sel.has(k));return act({action:"set",values:{[s.key]:keys.length===s.options.length?"all":keys.join(",")}})}
+  if(s.kind==="multi"){const sel=selected(s);if(sel.has(v)){if(sel.size===1&&!s.none)return toast("至少保留一个市场",false);sel.delete(v)}else sel.add(v);
+    const keys=s.options.map(o=>o[0]).filter(k=>sel.has(k));return act({action:"set",values:{[s.key]:keys.length===s.options.length?"all":keys.length?keys.join(","):s.none}})}
   if(v!==s.value)act({action:"set",values:{[s.key]:v}})}
 function card(s){
   if(s.kind==="detail")return null;  // drawn inside another card as its market chips (DETAIL)
   const c=el("div","set");c.dataset.key=s.key;
   const t=el("div","ttl");t.append(el("b","",s.label));
-  const now=el("span","now","当前 "+(s.kind==="number"?fmt(s,s.value):s.value)+" ");
+  const now=el("span","now","当前 "+(s.kind==="number"?fmt(s,s.value):s.none&&s.value===s.none?"无（一键全关）":s.value)+" ");
   now.append(s.saved||s.overridden?el("span","badge saved","已保存"):el("span","badge",s.env?"环境变量 "+s.env:"默认值"));
   if(MAKER_MODES.has(s.key)&&s.value!=="0"&&(data.settings.find(x=>x.key==="SIM_WAYS")||{}).value==="taker")now.append(" ",el("span","badge warn","挂单没开，不生效"));
   t.append(now);c.append(t);
@@ -12922,6 +12927,11 @@ function card(s){
   (s.kind==="number"||s.kind==="text"?s.presets.map(v=>[v,v===""?(s.empty||"清空"):fmt(s,v)+(s.zero&&v==="0"?"（"+s.zero+"）":"")]):s.options).forEach(([v,cap])=>{
     const b=el("button","opt"+(sel.has(v)?" sel":""),cap);b.dataset.v=v;b.disabled=!data.enabled;b.addEventListener("click",()=>pick(s,v));o.append(b)});
   c.append(o);
+  if(s.kind==="multi"&&s.none){const a=el("div","opts");  // 1.136.0: every card on or off in one click (none = no card, the mode stays on)
+    const on=el("button","opt","一键全开");on.disabled=!data.enabled||s.value==="all";on.addEventListener("click",()=>act({action:"set",values:{[s.key]:"all"}}));
+    const off=el("button","opt","一键全关");off.disabled=!data.enabled||s.value===s.none;
+    off.addEventListener("click",()=>{if(confirm("一键全关：预挂不再挂任何卡，已挂的预挂单会撤掉（本模式仍开着，再点亮一张卡就恢复）。继续？"))act({action:"set",values:{[s.key]:s.none}})});
+    a.append(on,off);c.append(a)}
   const spec=DETAIL[s.key];
   if(spec){const open=!!detailOpen[s.key];const val=((data.settings.find(x=>x.key===spec.key)||{}).value||"");const list=new Set(val?val.split(","):[]);
     const mk=data.settings.find(x=>x.key==="SIM_MARKETS")||{options:[],value:""};const kinds=selected(mk);
@@ -20352,8 +20362,9 @@ class Bot:
                   "PREOPEN_LEVELS": ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.levels[1:]),
                   "PREOPEN_DEEP_AHEAD_MINUTES": str(c.preopen.deep_ahead_minutes if c.preopen.deep_ahead_minutes != c.preopen.ahead_minutes else 0),
                   "PREOPEN_LIMIT_GAP_PCT": f"{c.preopen.limit_gap_pct:g}", "PREOPEN_OPEN_QUIET_MINUTES": str(c.preopen.open_quiet_minutes),
-                  "PREOPEN_MARKETS": ("all" if c.preopen.markets >= {r.key for r in WINDOW_UPDOWN_MARKETS}
+                  "PREOPEN_MARKETS": ("all" if c.preopen.markets >= {r.key for r in WINDOW_UPDOWN_MARKETS} else "none" if not c.preopen.markets
                                       else ",".join(r.stem for r in WINDOW_UPDOWN_MARKETS if r.key in c.preopen.markets)),
+                  "PREOPEN_WEEKEND": flag(c.preopen.weekend),
                   "PREOPEN_AHEAD_MINUTES": str(c.preopen.ahead_minutes), "PREOPEN_CANCEL_SECONDS": str(c.preopen.cancel_seconds),
                   "PREOPEN_EXPIRY_SECONDS": str(c.preopen.expiry_seconds), "PREOPEN_ENTRY_SECONDS": str(c.preopen.entry_seconds),
                   "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),

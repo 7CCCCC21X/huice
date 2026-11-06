@@ -795,6 +795,51 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(again.queue.qsize(), 0, "not quoted again: the window is left out")
             await self.finish(again)
 
+    async def test_all_cards_off_and_weekends_off(self):
+        """1.136.0: PREOPEN_MARKETS=none (the page's 一键全关) quotes no card — the mode stays on, a resting pair is withdrawn
+        at the takeover as a settings change (free); PREOPEN_WEEKEND=off leaves out the windows starting on a Saturday or
+        Sunday (Beijing time) and withdraws resting ones the same way. NOW is Friday 09:00 Beijing."""
+        ctl, api, clock = controller(PREOPEN_MARKETS="none")
+        self.assertEqual(ctl.settings.markets, frozenset())
+        self.assertEqual(p.window_starts(NOW, ctl.owner.config, ctl.settings), [])
+        self.assertIn("没选卡：不挂新场次", ctl.status())
+        await ctl.discover()
+        self.assertEqual(ctl.queue.qsize(), 0)
+        await self.finish(ctl)
+        self.assertTrue(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline"}).preopen.weekend, "the default: weekends quoted")
+        with self.assertRaises(ValueError):
+            m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "PREOPEN_MARKETS": "nope"})
+        sat = NOW + 15 * 3600_000  # Saturday 00:00 Beijing
+        self.assertEqual([p.on_weekend(t) for t in (NOW, sat - 1, sat, sat + 47 * 3600_000, sat + 48 * 3600_000)], [False, False, True, True, False])
+        ctl, api, clock = controller(PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="1440", PREOPEN_WEEKEND="off")
+        self.assertFalse(ctl.settings.weekend)
+        starts = [s for _, s in p.window_starts(NOW, ctl.owner.config, ctl.settings)]
+        self.assertEqual((max(starts), sat in starts), (sat - 15 * 60_000, False), "Friday's last window is the last")
+        self.assertIn("周末不挂（北京时间周六、周日开始的场次）", ctl.status())
+        clock.ms = sat + 3600_000
+        self.assertEqual(p.window_starts(clock.ms, ctl.owner.config, ctl.settings), [])
+        self.assertIn("周末不挂：现在是周末", ctl.status())
+        await self.finish(ctl)
+        for env, note in (({"PREOPEN_MARKETS": "none"}, "一键全关"), ({"PREOPEN_WEEKEND": "off"}, "the weekend switched off")):
+            with tempfile.TemporaryDirectory() as folder:  # quoted before the switch: the next start withdraws it, a free withdrawal
+                db = {"STATE_DB": str(Path(folder) / "state.sqlite3")}
+                ctl, api, clock = controller([market(at=sat)], PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="1440", **db)
+                c = p.candidate(market(at=sat), NOW, ctl.owner.config, ctl.settings)
+                await ctl.place_pair(c)
+                self.assertEqual(ctl.ledger.rows[c["slug"]]["phase"], "active", note)
+                ctl.keep_on_stop = True
+                await ctl.on_stop()
+                ctl.ledger.close()
+                again, _, _ = controller([market(at=sat)], PREOPEN_AHEAD_MINUTES="1440", **{"PREOPEN_MARKETS": "btc", **env}, **db)
+                again.api = again.cancel_api = api; api.ctl = again
+                again.adopt()
+                pair = again.ledger.rows[c["slug"]]
+                self.assertEqual((pair["phase"], pair["reason"], pair.get("free"), again.resumed), ("closing", "设置不同，撤掉后重新报价", True, 0), note)
+                await again.cancel_pair(pair, pair["reason"])
+                await again.discover()
+                self.assertEqual(again.queue.qsize(), 0, note)
+                await self.finish(again)
+
     async def test_status_says_why_nothing_is_placed(self):
         """The holds that used to be silent — the snapshot not read or stale, open orders nobody here placed — and the
         budget are on the status line; the pause names its reason."""

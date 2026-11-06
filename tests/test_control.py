@@ -210,6 +210,13 @@ async def run():
     data = await get_json(port, "control.json")
     s = {x["key"]: x for x in data["settings"]}
     assert s["SIM_WAYS"]["saved"] == "" and s["SIM_WAYS"]["value"] == "taker" and s["SIM_EDGE_CENTS"]["saved"] == "12" and s["SIM_MARKETS"]["value"] == "all"
+    assert s["PREOPEN_MARKETS"]["none"] == "none" and s["PREOPEN_MARKETS"]["value"] == "btc" and s["PREOPEN_WEEKEND"]["options"] == [["on", "on 周末照挂"], ["off", "off 周末不挂"]] and s["PREOPEN_WEEKEND"]["value"] == "on"  # 1.136.0
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"PREOPEN_MARKETS": "none", "PREOPEN_WEEKEND": "off"}})
+    assert st == 200 and j["ok"] and bot.config.preopen.markets == frozenset() and bot.config.preopen.weekend is False, j
+    s = {x["key"]: x for x in (await get_json(port, "control.json"))["settings"]}
+    assert s["PREOPEN_MARKETS"]["value"] == "none" and s["PREOPEN_WEEKEND"]["value"] == "off"
+    st, j = await post(port, {"key": KEY, "action": "set", "values": {"PREOPEN_MARKETS": None, "PREOPEN_WEEKEND": None}})
+    assert st == 200 and bot.config.preopen.markets == frozenset({"BTC-15M"}) and bot.config.preopen.weekend is True, j
     st, j = await post(port, {"key": KEY, "action": "set", "values": {"SIM_MARKETS": "all"}})
     assert st == 200 and j["message"] == "已保存，设置没有变化。"
     # the cadence: the trader and the orderbook feed (its own reference to the config) both run on the new numbers at once

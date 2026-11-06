@@ -255,19 +255,25 @@ def session_opening(rolling: Any, start_ms: int, holidays: frozenset, quiet_ms: 
     return any(seg_open <= start_ms < seg_open + quiet_ms for seg_open, _ in core.session_segments(rolling.exchange, day, holidays))
 
 
+def on_weekend(ms: int) -> bool:
+    """Whether the moment falls on a Saturday or Sunday, Beijing time (PREOPEN_WEEKEND=off: no such window is quoted, 1.136.0)."""
+    return dt.datetime.fromtimestamp(ms / 1000, core.BEIJING).weekday() >= 5
+
+
 def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[Any, int]]:
     """The windows this mode looks for now: each configured card's quarter hours from PREOPEN_ENTRY_SECONDS ahead to
     PREOPEN_AHEAD_MINUTES ahead, whatever the day, on the card's exchange session, a stock card's first windows after each
-    session open left out (session_opening) — (card, start_ms), soonest first."""
+    session open left out (session_opening), the weekend's when PREOPEN_WEEKEND is off — (card, start_ms), soonest first."""
     out = []
     quiet_ms = int(getattr(settings, "open_quiet_minutes", 0) or 0) * 60_000
+    weekend = getattr(settings, "weekend", True)
     for rolling in core.WINDOW_UPDOWN_MARKETS:
         if rolling.key not in settings.markets:
             continue
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
         start = -(-(now_ms + settings.entry_seconds * 1000) // rolling.window_ms) * rolling.window_ms
         while start <= now_ms + settings.ahead_minutes * 60_000:
-            if rolling.exists(start, holidays) and not session_opening(rolling, start, holidays, quiet_ms):
+            if rolling.exists(start, holidays) and not session_opening(rolling, start, holidays, quiet_ms) and (weekend or not on_weekend(start)):
                 out.append((rolling, start))
             start += rolling.window_ms
     return sorted(out, key=lambda rs: (rs[1], rs[0].key))
@@ -589,7 +595,7 @@ async def probe(api: Any, config: Any, settings: Settings, now_ms: int, hours: f
     discovery needs that are missing, whether it would be placed and why not — run before switching on, and to see whether
     a card is listed under the slug the bot expects. Bounded (PROBE_PER_CARD a card, two reads at a time, PROBE_BUDGET_S)."""
     hm = lambda ms: when(ms, now_ms)
-    lines = [f"开盘前预挂探测（只读；设置：{'、'.join(sorted(settings.markets))}，{levels_text(settings)}，"
+    lines = [f"开盘前预挂探测（只读；设置：{'、'.join(sorted(settings.markets)) or '没选卡'}，{levels_text(settings)}，"
              f"提前 {settings.ahead_minutes} 分钟内，不足 {settings.entry_seconds} 秒不挂；只看 {hours:g} 小时内、每张卡最近 {PROBE_PER_CARD} 个刻钟）"]
     per_card: dict[str, int] = {}
     picked = []
@@ -1003,6 +1009,8 @@ class Controller:
         if rolling is None or session_opening(rolling, int(pair["start_ms"]), self.owner.config.holidays.get(rolling.exchange, frozenset()),
                                               int(self.settings.open_quiet_minutes) * 60_000):
             return False  # 1.135.1: a stock card's first window after a session open, quoted before the rule (or with it off): withdrawn
+        if not self.settings.weekend and on_weekend(int(pair["start_ms"])):
+            return False  # 1.136.0: the weekend switched off since it was quoted: withdrawn
         if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.expiry_seconds:
             return False
         price, shares = pair_quote(pair)
@@ -1868,15 +1876,17 @@ class Controller:
         until = lambda ms: f"{when(ms, self.now())}（开场前 {(ms - self.now()) / 60_000:.0f} 分钟）" if ms > self.now() else "还没见到已发布的场次"
         reach = lambda key: (f"{key} 发布到 {until(self.listed_by_card[key])}" if self.listed_by_card.get(key, 0) > self.now() else f"{key} 还没见到已发布的场次") \
             + (f"，挂到 {hms(quoted_to[key])}" if quoted_to.get(key) else "")
-        listed = ("已发布到 " + until(self.listed_until_ms) + (f"，挂到 {hms(max(quoted_to.values()))}" if quoted_to else "") if len(self.settings.markets) == 1
+        listed = ("没选卡：不挂新场次（控制台“预挂哪几张卡”一键全关；再点亮一张就恢复）" if not self.settings.markets
+                  else "已发布到 " + until(self.listed_until_ms) + (f"，挂到 {hms(max(quoted_to.values()))}" if quoted_to else "") if len(self.settings.markets) == 1
                   else "各卡：" + "；".join(reach(key) for key in sorted(self.settings.markets)))
         return (f"开盘前自动预挂：{state}\n"
-                f"{' / '.join(sorted(self.settings.markets))}：两边各 {levels_text(self.settings)}；"
+                f"{' / '.join(sorted(self.settings.markets)) or '没选卡'}：两边各 {levels_text(self.settings)}；"
                 f"扫描 {self.settings.poll:g} 秒，"
                 + ("挂 24 小时内已发布的全部场次" if self.settings.ahead_minutes >= 1440 else f"只挂 {self.settings.ahead_minutes} 分钟内开始的场次") + "\n"
                 f"撤单：开场前 {self.settings.cancel_seconds} 秒发出，之后到开场前 {self.settings.expiry_seconds} 秒到期为止每 {SPRINT_MS // 1000} 秒催一次；"
                 f"不足 {self.settings.entry_seconds} 秒不再新挂"
-                + (f"；股票卡开盘、午后头 {self.settings.open_quiet_minutes} 分钟内开始的场次不挂" if self.settings.open_quiet_minutes else "") + "\n"
+                + (f"；股票卡开盘、午后头 {self.settings.open_quiet_minutes} 分钟内开始的场次不挂" if self.settings.open_quiet_minutes else "")
+                + ("；周末不挂（北京时间周六、周日开始的场次）" if not self.settings.weekend else "") + "\n"
                 f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清），"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
@@ -1890,6 +1900,7 @@ class Controller:
                    if any(0 <= self.now() - t <= LISTING_LATE_MS for t in self.awaiting.values()) else "") + "）"
                 + f"\n最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
+                + ("\n周末不挂：现在是周末，不挂新场次，周一 00:00（北京时间）起恢复" if not self.settings.weekend and on_weekend(self.now()) else "")
                 + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：不计入预挂限额，也不挡预挂" if self.unmanaged else "")
                 + ("\n股票卡暂停：" + "；".join(self.card_holds.values()) if self.card_holds else "")
                 + ("\n发布节奏（每 15 分钟一场；预计前后每秒扫一次）：" + "；".join(f"{key} 上次 {hms(at)}，下次预计 {hms(at + LISTING_CYCLE_MS)}" for key, at in sorted(self.listed_at.items()))
