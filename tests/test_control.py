@@ -177,7 +177,7 @@ async def run():
         if form["kind"] == "detail":  # SIM_SKIP: drawn inside the SIM_MARKETS card from the catalog, no presets or options of its own
             assert "presets" not in form and "options" not in form and key in {"SIM_SKIP", "SIM_MAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_DEEP_MARKETS", "SIM_MAKER_DEEP_ONLY_MARKETS", "SIM_TAKER_AFTER_HOURS_MARKETS", "SIM_MAKER_FLOOR_MARKETS"}, key
             continue
-        assert form["kind"] in {"choice", "multi", "number"} and (form["kind"] == "number") == ("presets" in form) and (form["kind"] != "number") == ("options" in form), key
+        assert form["kind"] in {"choice", "multi", "number", "text"} and (form["kind"] in {"number", "text"}) == ("presets" in form) and (form["kind"] not in {"number", "text"}) == ("options" in form), key  # 1.129.0: text (PREOPEN_LEVELS)
         for value in (form.get("presets") or [o[0] for o in form.get("options", [])]):
             m.Config.from_env({**withkey, key: value})  # raises when a preset is out of range
         if form["kind"] == "multi":

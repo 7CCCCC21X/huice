@@ -1,6 +1,6 @@
 # TG 合约昨收偏离提醒机器人
 
-新增可选的 [15分钟市场发布即预挂模式](PREOPEN.md)：15 分钟场次一经扫描发现（默认只挂 BTC，`PREOPEN_MARKETS=all` 三张都挂；默认挂 24 小时内已发布的全部场次、最近的先，`PREOPEN_AHEAD_MINUTES` 可缩小范围），两边 `PREOPEN_PRICE_CENTS`（默认 49¢）各 `PREOPEN_SHARES`（默认 10）份的 post-only 买单，每场提前 60 秒撤单、提前 30 秒到期。`PREOPEN_15M=off` 默认关闭；开之前先 `/preopen probe` 只读探测市场列表；开关和参数也可在控制台“开盘前预挂”一组里改，即时生效（1.124.0）。默认和原策略同时跑，预留计入持仓+挂单上限、当日盈亏计入停机线；`PREOPEN_EXCLUSIVE=on` 时预挂期间原策略不开新仓（1.125.0）。
+新增可选的 [15分钟市场发布即预挂模式](PREOPEN.md)：15 分钟场次一经扫描发现（默认只挂 BTC，`PREOPEN_MARKETS=all` 三张都挂；默认挂 24 小时内已发布的全部场次、最近的先，`PREOPEN_AHEAD_MINUTES` 可缩小范围），两边 `PREOPEN_PRICE_CENTS`（默认 49¢）各 `PREOPEN_SHARES`（默认 10）份的 post-only 买单（`PREOPEN_LEVELS` 可在其下再挂 48x20、47x40 这样的更深档位，离开场 `PREOPEN_DEEP_AHEAD_MINUTES` 分钟内才挂），每场提前 60 秒撤单、提前 30 秒到期。`PREOPEN_15M=off` 默认关闭；开之前先 `/preopen probe` 只读探测市场列表；开关和参数也可在控制台“开盘前预挂”一组里改，即时生效（1.124.0）。默认和原策略同时跑，预留计入持仓+挂单上限、当日盈亏计入停机线；`PREOPEN_EXCLUSIVE=on` 时预挂期间原策略不开新仓（1.125.0）。
 
 监控截图里的四个币安合约：**UNITREEUSDT、HK0625USDT、CXMTUSDT、SKHYNIXUSDT**。
 

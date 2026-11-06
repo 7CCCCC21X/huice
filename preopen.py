@@ -271,9 +271,23 @@ async def category_market(api: Any, slug: str) -> dict | None:
     return {**market, "categorySlug": slug, "id": market.get("id") or found[0]["id"]}
 
 
-def window_of(pair: dict) -> str:
-    """The window's slug (a superseded record's key carries the attempt's time after '@')."""
+def record_key(pair: dict) -> str:
+    """A record's key without its attempt (a superseded record's key carries the attempt after '@'): the window's slug,
+    with '#<level>' for a deeper price level (1.129.0)."""
     return str(pair.get("slug") or "").split("@")[0]
+
+
+def window_of(pair: dict) -> str:
+    """The window's slug behind a record's key."""
+    return record_key(pair).split("#")[0]
+
+
+def levels_text(settings: Settings) -> str:
+    """The levels as the status and the probe say them: 49.0¢×10 份、48.0¢×20 份 …, and when the deeper ones wait for the start."""
+    text = "、".join(f"{core.cents(float(p))}×{float(s):g} 份" for p, s in settings.levels)
+    if len(settings.levels) > 1 and settings.deep_ahead_minutes < settings.ahead_minutes:
+        text += f"（第 2 档起只挂 {settings.deep_ahead_minutes} 分钟内开始的场次）"
+    return text
 
 
 def pair_quote(pair: dict) -> tuple[float, float]:
@@ -322,6 +336,7 @@ def quote_of(pair: dict) -> dict:
     at = dt.datetime.fromtimestamp(start / 1000, core.BEIJING)
     return {"window": window_of(pair), "key": str(pair.get("key") or ""), "card": str(pair.get("name") or pair.get("key") or "").rsplit(" ", 1)[0],
             "name": str(pair.get("name") or window_of(pair)), "day": at.strftime("%m-%d"), "date": at.date().isoformat(), "hour": at.hour, "start_ms": start,
+            "level_name": f"{price * 100:g}¢×{shares:g}",
             "active": pair.get("phase") == "active", "accounted": accounted, "filled": total, "filled_up": filled["up"], "filled_down": filled["down"],
             "sent": {side: side in orders and orders[side].get("state") not in NEVER_PLACED for side in ("up", "down")},
             "price": price, "shares": shares, "volume": total * price, "settled": accounted and total > 0, "pending": total > 0 and not accounted,
@@ -372,12 +387,14 @@ def review(rows: list[dict], now_ms: int) -> dict:
     days: dict[str, list[dict]] = {}
     dates: dict[str, list[dict]] = {}
     cards: dict[str, list[dict]] = {}
+    levels: dict[tuple[float, float], list[dict]] = {}
     hours: dict[tuple[str, int], list[dict]] = {}
     many = len({q["card"] for q in qs}) > 1
     for q in qs:
         days.setdefault(q["day"], []).append(q)
         dates.setdefault(q["date"], []).append(q)
         cards.setdefault(q["card"], []).append(q)
+        levels.setdefault((q["price"], q["shares"]), []).append(q)
         hours.setdefault((q["card"] if many else "", q["hour"]), []).append(q)
     recent = sorted([q for q in qs if q["filled"] > 0], key=lambda q: q["start_ms"], reverse=True)[:60]
     shown = ("start_ms", "name", "key", "filled_up", "filled_down", "price", "volume", "result", "pnl", "status", "lead_min", "cancel_s", "attempt")
@@ -387,6 +404,7 @@ def review(rows: list[dict], now_ms: int) -> dict:
             "resting_usd": round(sum(q["price"] * q["shares"] * sum(q["sent"].values()) for q in qs if q["active"]), 4),
             "days": [review_summary(day, days[day]) for day in sorted(days, key=lambda d: max(q["start_ms"] for q in days[d]), reverse=True)],
             "cards": [review_summary(card, cards[card]) for card in sorted(cards, key=lambda c: (-len(cards[c]), c))],
+            "levels": [review_summary(levels[k][0]["level_name"], levels[k]) for k in sorted(levels, reverse=True)],  # the highest bid first
             "hours": [review_summary(f"{card} {hour:02d} 时开始".strip(), hours[(card, hour)]) for card, hour in sorted(hours)],
             "sides": [review_side(name, side, qs) for side, name in (("up", "涨"), ("down", "跌"))],
             "recent": [{k: q[k] for k in shown} for q in recent]}
@@ -397,7 +415,7 @@ async def probe(api: Any, config: Any, settings: Settings, now_ms: int) -> list[
     row ending the card's list): listed or not, the details' trading status, the fields the discovery needs that are
     missing, whether it would be placed and why not — run before switching on; it shows how far ahead Predict lists."""
     hm = lambda ms: when(ms, now_ms)
-    lines = [f"开盘前预挂探测（只读；设置：{'、'.join(sorted(settings.markets))}，{core.cents(float(settings.price))}×{settings.shares} 份，"
+    lines = [f"开盘前预挂探测（只读；设置：{'、'.join(sorted(settings.markets))}，{levels_text(settings)}，"
              f"提前 {settings.ahead_minutes} 分钟内，不足 {settings.entry_seconds} 秒不挂）"]
     starts = window_starts(now_ms, config, dataclasses.replace(settings, ahead_minutes=max(settings.ahead_minutes, 1440)))
     if not starts:
@@ -506,15 +524,18 @@ class Controller:
         left = getattr(self.api, "blocked_until", 0.0) - time.monotonic()
         return f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）" if left > 0 else ""
 
-    def budget_problem(self) -> str:
-        """Why the next pair does not fit: the joint exposure cap, the USDT balance, the per-order cap."""
+    def budget_problem(self, pair_usd: float | None = None, side_usd: float | None = None) -> str:
+        """Why the next pair (the first level's unless given) does not fit: the joint exposure cap, the USDT balance, the
+        per-order cap."""
+        pair_usd = self.settings.pair_usd if pair_usd is None else pair_usd
+        side_usd = self.settings.side_usd if side_usd is None else side_usd
         limit = min(self.settings.max_open_usd, self.owner.config.live_max_open_usd)
-        if self.risk() + self.other_risk() + self.settings.pair_usd > limit + 1e-9:
-            return f"预挂资金上限不足：需要再预留 {self.settings.pair_usd:g}U，限额 {limit:g}U"
-        if self.balance < max(self.open_reserved, self.risk()) + self.settings.pair_usd:
+        if self.risk() + self.other_risk() + pair_usd > limit + 1e-9:
+            return f"预挂资金上限不足：需要再预留 {pair_usd:g}U，限额 {limit:g}U"
+        if self.balance < max(self.open_reserved, self.risk()) + pair_usd:
             return "可用USDT不足以预留下一场双边订单"
-        if self.settings.side_usd > self.owner.config.live_max_order_usd:
-            return f"LIVE_MAX_ORDER_USD 小于每边 {self.settings.side_usd:g}U"
+        if side_usd > self.owner.config.live_max_order_usd:
+            return f"LIVE_MAX_ORDER_USD 小于每边 {side_usd:g}U"
         return ""
 
     def before_send(self, body: dict) -> str:
@@ -626,7 +647,11 @@ class Controller:
             return False
         if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.expiry_seconds:
             return False
-        amounts = live.limit_amounts(True, live.to_wei(self.settings.price), live.to_wei(self.settings.shares))
+        price, shares = pair_quote(pair)
+        level = next((lv for lv in self.settings.levels if float(lv[0]) == price and float(lv[1]) == shares), None)
+        if level is None:
+            return False  # a price or size the settings no longer have (a level dropped, the size changed)
+        amounts = live.limit_amounts(True, live.to_wei(level[0]), live.to_wei(level[1]))
         for order in pair["orders"].values():
             signed = (order.get("body") or {}).get("data", {}).get("order", {})
             if (order["state"] != "open" or not order.get("id")
@@ -685,19 +710,22 @@ class Controller:
             self.full_scan_ms = self.now()
         misses: dict[str, int] = {}
         found: list[dict] = []
-        attempts: dict[str, int] = {}  # window -> the attempt after its last record, the superseded ones included: an attempt that left no record is not reused (its salt would be the first attempt's)
+        attempts: dict[str, int] = {}  # record (a window's level) -> the attempt after its last record, the superseded ones included: an attempt that left no record is not reused (its salt would be the first attempt's)
         for p in self.ledger.rows.values():
-            attempts[window_of(p)] = max(attempts.get(window_of(p), 0), int(p.get("attempt") or 0) + 1)
+            attempts[record_key(p)] = max(attempts.get(record_key(p), 0), int(p.get("attempt") or 0) + 1)
         for rolling, start in window_starts(self.now(), self.owner.config, self.settings):
             if misses.get(rolling.key, 0) >= (MISS_STOP if full else 1):
                 continue
             slug = window_slug(rolling, start)
-            if slug in self.queued:
-                continue
-            if slug in self.ledger.rows and not self.supersedable(self.ledger.rows[slug]):
-                continue
-            attempt = attempts.get(slug, 0)
-            if attempt >= MAX_ATTEMPTS:
+            wanted = []  # the levels to quote now: (record key, level, price, shares)
+            for level, (price, shares) in enumerate(self.settings.levels):
+                if level and start - self.now() > self.settings.deep_ahead_minutes * 60_000:
+                    break  # the deeper levels wait for the window to come near (PREOPEN_DEEP_AHEAD_MINUTES); the first keeps its queue position
+                key = slug if level == 0 else f"{slug}#{level}"  # sorts after the first level's key, before the next's
+                if key in self.queued or (key in self.ledger.rows and not self.supersedable(self.ledger.rows[key])) or attempts.get(key, 0) >= MAX_ATTEMPTS:
+                    continue
+                wanted.append((key, level, price, shares))
+            if not wanted:
                 continue
             market = await category_market(self.api, slug)
             if market is None:
@@ -709,13 +737,13 @@ class Controller:
             if c is None:
                 self.skipped[slug] = candidate_problem(market, self.now(), self.owner.config, self.settings)
                 continue
-            if slug in self.ledger.rows:  # the withdrawn pair's record steps aside: the window is quoted again (place_pair: a new salt)
-                self.ledger.rename(slug, f"{slug}@{int(self.ledger.rows[slug].get('attempt') or 0)}")  # the window and the attempt: one key each
-                self.requoted += 1
-            c["attempt"] = attempt
-            self.queued.add(slug)
-            found.append(c)
-        for c in sorted(found, key=lambda c: (c["start_ms"], c["slug"])):
+            for key, level, price, shares in wanted:
+                if key in self.ledger.rows:  # the withdrawn pair's record steps aside: the level is quoted again (place_pair: a new salt)
+                    self.ledger.rename(key, f"{key}@{int(self.ledger.rows[key].get('attempt') or 0)}")  # the record and the attempt: one key each
+                    self.requoted += 1
+                self.queued.add(key)
+                found.append({**c, "slug": key, "window": slug, "level": level, "price": str(price), "shares": str(shares), "attempt": attempts.get(key, 0)})
+        for c in sorted(found, key=lambda c: (c["start_ms"], c["level"], c["slug"])):
             await self.queue.put((c["start_ms"], c["slug"], c))
 
     async def refresh_active(self) -> None:
@@ -750,13 +778,15 @@ class Controller:
             return ""
         if self.hold():
             return "held"
-        if why := self.budget_problem():
+        price, shares = D(str(c.get("price") or self.settings.price)), D(str(c.get("shares") or self.settings.shares))  # the level's (PREOPEN_LEVELS)
+        side_usd, pair_usd = float(price * shares), 2 * float(price * shares)
+        if why := self.budget_problem(pair_usd, side_usd):
             self.error = why
             return "held"
         # Fresh details are authoritative, not a stale listing page or model card.
         market = await self.api.market(c["market_id"])
         current = candidate(market, self.now(), self.owner.config, self.settings)
-        if current is None or current["slug"] != c["slug"]:
+        if current is None or current["slug"] != c.get("window", c["slug"]):
             return ""
         info = live.parse_market(market, self.owner.config.predict_fee_bps)
         outcomes = [live.outcome_for_side("updown", side, info.outcomes) for side in ("up", "down")]
@@ -764,7 +794,7 @@ class Controller:
             raise core.RemoteError("开盘前市场的涨跌代币无法确认")
         if outcomes[0][0]["token"] == outcomes[1][0]["token"]:
             raise core.RemoteError("涨跌结果指向相同代币")
-        if not await self.owner.live.chain.allowance(live.exchange_key(info.neg_risk, info.yield_bearing)) >= live.to_wei(self.settings.pair_usd):
+        if not await self.owner.live.chain.allowance(live.exchange_key(info.neg_risk, info.yield_bearing)) >= live.to_wei(pair_usd):
             raise core.RemoteError("开盘前双边挂单授权额度不足")
         await self.api.ensure_auth()
         async with self.account_lock:
@@ -774,14 +804,14 @@ class Controller:
                 return ""
             if self.hold():
                 return "held"
-            if why := self.budget_problem():
+            if why := self.budget_problem(pair_usd, side_usd):
                 self.error = why
                 return "held"
-            amounts = live.limit_amounts(True, live.to_wei(self.settings.price), live.to_wei(self.settings.shares))
+            amounts = live.limit_amounts(True, live.to_wei(price), live.to_wei(shares))
             orders = {}
             for side, (outcome, _) in zip(("up", "down"), outcomes):
                 identity = (f"preopen-v2|{self.owner.config.live_chain}|{self.owner.live.wallet.maker.lower()}|{current['market_id']}|"
-                            f"{outcome['token']}|{current['expires']}|{self.settings.price}|{self.settings.shares}"
+                            f"{outcome['token']}|{current['expires']}|{price}|{shares}"
                             + (f"|{c['attempt']}" if c.get("attempt") else ""))  # a window quoted again: a new salt, the first attempt's unchanged
                 salt = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big") % live.MAX_SALT
                 signed = live.build_order(self.owner.live.wallet, outcome["token"], amounts["maker"], amounts["taker"], info.fee_bps, current["expires"], salt=salt)
@@ -790,7 +820,8 @@ class Controller:
                                 "body": {"data": {"order": {**signed, "signature": signature, "hash": digest},
                                                    "strategy": "LIMIT", "pricePerShare": str(amounts["price_per_share"]),
                                                    "isPostOnly": True, "selfTradePrevention": "CANCEL_TAKER"}}}
-            pair = {**current, "attempt": int(c.get("attempt") or 0), "price": str(self.settings.price), "shares": str(self.settings.shares),
+            pair = {**current, "slug": c["slug"], "window": current["slug"], "level": int(c.get("level") or 0),  # the record's key: the window's slug, #<level> for a deeper level
+                    "attempt": int(c.get("attempt") or 0), "price": str(price), "shares": str(shares),
                     "phase": "active", "orders": orders, "created_ms": self.now(), "tries": 0, "retry_ms": 0,
                     "open_seen_ms": self.now() if str(market.get("tradingStatus") or "").upper() == "OPEN" else 0}
             self.ledger.save(pair)  # both hashes durable before either POST
@@ -857,10 +888,12 @@ class Controller:
         """The first time the listing shows one of this mode's windows OPEN (matching on): kept on the pair — how long
         before the start matching begins is what the cancel time should be set against (/preopen shows the median)."""
         slug = str(market.get("categorySlug") or market.get("slug") or "")
-        pair = self.ledger.rows.get(slug)
-        if pair is not None and not pair.get("open_seen_ms") and str(market.get("tradingStatus") or "").upper() == "OPEN":
-            pair["open_seen_ms"] = self.now()
-            self.ledger.save(pair)
+        if str(market.get("tradingStatus") or "").upper() != "OPEN":
+            return
+        for pair in self.ledger.rows.values():  # every level's record of the window
+            if pair["phase"] == "active" and window_of(pair) == slug and not pair.get("open_seen_ms"):
+                pair["open_seen_ms"] = self.now()
+                self.ledger.save(pair)
 
     def in_sprint(self, pair: dict) -> bool:
         """The last stretch: past the cancel time, before the signed expiry, with an order that may still be on the book —
@@ -1230,12 +1263,12 @@ class Controller:
         listed = (f"已发布到 {when(self.listed_until_ms, self.now())}（开场前 {(self.listed_until_ms - self.now()) / 60_000:.0f} 分钟）"
                   if self.listed_until_ms > self.now() else "还没见到已发布的场次")
         return (f"开盘前自动预挂：{state}\n"
-                f"{' / '.join(sorted(self.settings.markets))}：两边 {core.cents(float(self.settings.price))}，各 {self.settings.shares} 份；"
+                f"{' / '.join(sorted(self.settings.markets))}：两边各 {levels_text(self.settings)}；"
                 f"扫描 {self.settings.poll:g} 秒，"
                 + ("挂 24 小时内已发布的全部场次" if self.settings.ahead_minutes >= 1440 else f"只挂 {self.settings.ahead_minutes} 分钟内开始的场次") + "\n"
                 f"撤单：开场前 {self.settings.cancel_seconds} 秒发出，之后到开场前 {self.settings.expiry_seconds} 秒到期为止每 {SPRINT_MS // 1000} 秒催一次；"
                 f"不足 {self.settings.entry_seconds} 秒不再新挂\n"
-                f"已记录 {len({p['slug'].split('@')[0] for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 场挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清），"
+                f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清），"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
                 f"预留 {self.risk():.2f}U（撤掉且一份没成交的场次立即释放）；最近问题：{self.error or '无'}"

@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.128.4"
+VERSION = "1.129.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -509,6 +509,8 @@ class PreopenSettings:
     max_open_usd: float = 7000.0
     price: D = D("0.49")       # PREOPEN_PRICE_CENTS
     shares: D = D("10")        # PREOPEN_SHARES: the trial size; 50 was the first revision's
+    levels: tuple = ((D("0.49"), D("10")),)  # (price, shares) a side per level, the first = price × shares; PREOPEN_LEVELS adds deeper ones (1.129.0)
+    deep_ahead_minutes: int = 1440  # PREOPEN_DEEP_AHEAD_MINUTES: the deeper levels are placed only this close to the start (the first keeps ahead_minutes)
     markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = the three cards
     exclusive: bool = False    # PREOPEN_EXCLUSIVE: on = the model trader opens nothing while this mode runs for real (off: both run, jointly capped)
     db: str = ""
@@ -549,6 +551,17 @@ class PreopenSettings:
         markets = keys if any(w.lower() == "all" for w in wanted) else frozenset(stems.get(w.lower(), w.upper()) for w in wanted)
         price = D(cents) / 100
         exclusive = str(e.get("PREOPEN_EXCLUSIVE", "off")).strip().lower() == "on"
+        levels = [(cents, shares)]
+        for part in [x.strip() for x in str(e.get("PREOPEN_LEVELS", "")).replace("，", ",").split(",") if x.strip()]:
+            found = re.fullmatch(r"(\d+)\s*[xX×*:：]\s*(\d+)", part)
+            if not found:
+                raise ValueError("PREOPEN_LEVELS 的格式是 价格x份数，逗号分隔，如 48x20,47x40（第一档是 PREOPEN_PRICE_CENTS × PREOPEN_SHARES）")
+            levels.append((int(found.group(1)), int(found.group(2))))
+        deep = int(e.get("PREOPEN_DEEP_AHEAD_MINUTES", "0") or 0) or ahead
+        if (len(levels) > 5 or any(not 1 <= c <= 50 or not 1 <= s <= 500 or c * s / 100 < PREOPEN_MIN_SIDE_USD for c, s in levels)
+                or any(levels[i][0] <= levels[i + 1][0] for i in range(len(levels) - 1)) or not 3 <= deep <= ahead):
+            raise ValueError(f"PREOPEN_LEVELS 至多 5 档，每档价格 1～50¢、份数 1～500、每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格要比第一档低、逐档递减；"
+                             "PREOPEN_DEEP_AHEAD_MINUTES 3～PREOPEN_AHEAD_MINUTES（0 = 和第一档一样）")
         if (not 1 <= poll <= 60 or not 1 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
                 or not 3 <= ahead <= 1440 or not markets <= keys or float(price * shares) < PREOPEN_MIN_SIDE_USD
                 or not 5 <= expiry <= 600 or not expiry + 5 <= cancel <= 900 or not cancel + 60 <= entry <= 3600):
@@ -556,7 +569,8 @@ class PreopenSettings:
                              f"Predict 最小订单 ${PREOPEN_MIN_SIDE_USD:g}）、PREOPEN_AHEAD_MINUTES 3～1440、PREOPEN_MARKETS 只能是 {'、'.join(sorted(keys))} 或 all；"
                              "PREOPEN_EXPIRY_SECONDS 5～600，PREOPEN_CANCEL_SECONDS 至少比它大 5 秒、至多 900，PREOPEN_ENTRY_SECONDS 至少比撤单时间大 60 秒、至多 3600")
         return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
-                   price=price, shares=D(shares), markets=markets, exclusive=exclusive, db=cls.db_of(e))
+                   price=price, shares=D(shares), markets=markets, exclusive=exclusive, db=cls.db_of(e),
+                   levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep)
 
     @classmethod
     def from_config(cls, config: "Config", force: bool = False) -> "PreopenSettings":
@@ -639,6 +653,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_MARKETS", "预挂哪几张卡", "btc = 只挂 BTC（默认）；all = BTC、海力士、宇树三张"),
     ("PREOPEN_SHARES", "预挂每边份数", "1～500：每场每边各挂这么多份（默认 10），每边不少于 $1"),
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
+    ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 4 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
+    ("PREOPEN_DEEP_AHEAD_MINUTES", "第 2 档起只挂几分钟内开始的场次", "3～提前范围：第一档按“只挂几分钟内开始的场次”挂（排队靠前），更深的档位离开场这么近才挂，少占资金；0 = 和第一档一样"),
     ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场、最近的先；想少占资金就调小"),
     ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
     ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）"),
@@ -9887,6 +9903,8 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_EXCLUSIVE": {"kind": "choice", "group": "预挂", "options": [["off", "off 两边同时跑"], ["on", "on 预挂时原策略不开新仓"]]},
     "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
     "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},
+    "PREOPEN_LEVELS": {"kind": "text", "group": "预挂", "presets": ["48x20", "48x20,47x40", "48x10,47x10", "47x40", "48x10,47x20,46x40"], "unit": ""},
+    "PREOPEN_DEEP_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "60", "120", "240", "1440"], "unit": "分钟", "zero": "和第一档一样"},
     "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["60", "120", "240", "720", "1440"], "unit": "分钟"},
     "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "15", "20", "30", "60"], "unit": "秒"},
     "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["5", "10", "15", "30"], "unit": "秒"},
@@ -12495,7 +12513,9 @@ function preopenSection(po){  // 开盘前预挂 (1.128.0): the mode's own ledge
   p("场次",t.windows+"（记录 "+t.records+"，挂着 "+t.resting+" 场、预留 "+usd(po.resting_usd)+"，没成交撤掉 "+t.withdrawn+"）");
   p("有成交",t.filled_windows+" 场 · "+num(t.filled)+" 份 · "+usd(t.volume)+(t.pending?" · 待结算 "+t.pending+" 场":""));
   p("已结算",t.settled?[t.settled+" 场（赢 "+t.wins+" 输 "+t.losses+(t.ties?" 平 "+t.ties:"")+"）盈亏 ",poPn(t.pnl)," · 平均每场 ",poPn(t.pnl/t.settled)]:"还没有结算的场次");
-  el.append(d,$("div","sub","按日期"),poTable(po.days||[]),$("div","sub","按标的"),poTable(po.cards||[]),$("div","sub","按开始时间"),poTable(po.hours||[]));
+  el.append(d,$("div","sub","按日期"),poTable(po.days||[]),$("div","sub","按标的"),poTable(po.cards||[]));
+  if((po.levels||[]).length>1)el.append($("div","sub","按价格档位（每档一条记录）"),poTable(po.levels));
+  el.append($("div","sub","按开始时间"),poTable(po.hours||[]));
   el.append($("div","sub","按方向（一场的涨、跌是两张单）"),table(["方向","挂出","有成交","成交份数","成交额","已结算","盈亏"],(po.sides||[]).map(r=>[r.name,r.records,r.filled_windows||"—",num(r.filled),usd(r.volume),poWl(r),r.settled?poPn(r.pnl):"—"])));
   if((po.recent||[]).length){const res=x=>x==="up"?"涨":x==="down"?"跌":x==="split"?"平":"未出";
     el.append($("div","sub","有成交的场次（最近 "+po.recent.length+" 场，新的在前）"),table(["开始","场次","涨成交","跌成交","价格","成交额","结果","盈亏","状态","挂上时距开场","撤单确认","第几次报价"],
@@ -12826,7 +12846,7 @@ function card(s){
   t.append(now);c.append(t);
   c.append(el("div","hint",s.hint));
   const sel=selected(s),o=el("div","opts");
-  (s.kind==="number"?s.presets.map(v=>[v,fmt(s,v)+(s.zero&&v==="0"?"（"+s.zero+"）":"")]):s.options).forEach(([v,cap])=>{
+  (s.kind==="number"||s.kind==="text"?s.presets.map(v=>[v,fmt(s,v)+(s.zero&&v==="0"?"（"+s.zero+"）":"")]):s.options).forEach(([v,cap])=>{
     const b=el("button","opt"+(sel.has(v)?" sel":""),cap);b.dataset.v=v;b.disabled=!data.enabled;b.addEventListener("click",()=>pick(s,v));o.append(b)});
   c.append(o);
   const spec=DETAIL[s.key];
@@ -12857,7 +12877,7 @@ function card(s){
       if(!any&&!extra.length)d.append(el("div","mut","所选类型下还没有可列出的市场（等卡片加载后再看）"))}
     c.append(d)}
   const cu=el("div","custom");
-  if(s.kind==="number"){const inp=el("input");inp.type="text";inp.inputMode="decimal";inp.placeholder="自定义";inp.dataset.key=s.key;inp.autocomplete="off";inp.disabled=!data.enabled;
+  if(s.kind==="number"||s.kind==="text"){const inp=el("input");inp.type="text";if(s.kind==="number")inp.inputMode="decimal";inp.placeholder="自定义";inp.dataset.key=s.key;inp.autocomplete="off";inp.disabled=!data.enabled;
     inp.value=drafts[s.key]||"";const mark=el("span","draft","未保存");mark.style.display=drafts[s.key]?"":"none";
     inp.addEventListener("input",()=>{if(inp.value.trim())drafts[s.key]=inp.value;else delete drafts[s.key];mark.style.display=drafts[s.key]?"":"none"});
     const go=el("button","opt","保存");go.disabled=!data.enabled;go.addEventListener("click",async()=>{const v=inp.value.trim();if(v&&await act({action:"set",values:{[s.key]:v}}))delete drafts[s.key]});
@@ -20249,6 +20269,8 @@ class Bot:
                   "PREDICT_MIN_EDGE_CENTS": f"{c.predict_min_edge * 100:g}", "SIM_SECONDS": str(c.sim_seconds), "PREDICT_POLL_SECONDS": str(c.predict_poll),
                   "PREDICT_COLD_POLL_SECONDS": str(c.predict_cold_poll), "PREDICT_TRADE_USD": plain(c.predict_trade_usd),
                   "PREOPEN_15M": flag(c.preopen.enabled), "PREOPEN_SHARES": plain(float(c.preopen.shares)), "PREOPEN_PRICE_CENTS": f"{float(c.preopen.price) * 100:g}",
+                  "PREOPEN_LEVELS": ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.levels[1:]),
+                  "PREOPEN_DEEP_AHEAD_MINUTES": str(c.preopen.deep_ahead_minutes if c.preopen.deep_ahead_minutes != c.preopen.ahead_minutes else 0),
                   "PREOPEN_MARKETS": ("all" if c.preopen.markets >= {r.key for r in WINDOW_UPDOWN_MARKETS}
                                       else ",".join(r.stem for r in WINDOW_UPDOWN_MARKETS if r.key in c.preopen.markets)),
                   "PREOPEN_AHEAD_MINUTES": str(c.preopen.ahead_minutes), "PREOPEN_CANCEL_SECONDS": str(c.preopen.cancel_seconds),

@@ -790,7 +790,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual({o["hash"] for o in fresh["orders"].values()}, {o["hash"] for o in pair["orders"].values()}, "a new salt")
             self.assertEqual(api.sent[2]["data"]["order"]["takerAmount"], str(L.to_wei(20)))
             self.assertEqual(bigger.risk(), 2 * 0.49 * 20)  # the withdrawn pair released, the new one reserved
-            self.assertIn("已记录 1 场、2 条（1 场挂着，1 条已结清）", bigger.status())
+            self.assertIn("已记录 1 场、2 条（1 条挂着，1 条已结清）", bigger.status())
             self.assertIn("重新报价 1 场", bigger.status())
             # the cap and Predict's own refusal
             fresh["attempt"] = p.MAX_ATTEMPTS - 1
@@ -930,6 +930,59 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p.quote_of({**old, "orders": {"up": {"state": "final", "filled": 4.0}, "down": {"state": "final", "filled": 10.0}}})["result"], "", "both sides: ambiguous")
         self.assertEqual(p.review([old], NOW)["sides"][1]["pnl"], -4.9)
         await self.finish(ctl)
+
+    async def test_price_levels_quote_each_level_as_its_own_record(self):
+        """1.129.0: PREOPEN_LEVELS adds deeper bids under the first level; each level is a record (slug#cents) with its own
+        price and size, placed only within PREOPEN_DEEP_AHEAD_MINUTES of the start (the first level keeps the wide horizon);
+        one read a window; the takeover goes by each record's own level; the review counts by level."""
+        on = lambda **e: p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", **e}))
+        s = on(PREOPEN_LEVELS="48x20, 47×40", PREOPEN_DEEP_AHEAD_MINUTES="120")
+        self.assertEqual((s.levels, s.deep_ahead_minutes, s.price, s.shares), (((m.D("0.49"), m.D("10")), (m.D("0.48"), m.D("20")), (m.D("0.47"), m.D("40"))), 120, m.D("0.49"), m.D("10")))
+        self.assertEqual((on().levels, on().deep_ahead_minutes, on(PREOPEN_LEVELS="48x20").deep_ahead_minutes), (((m.D("0.49"), m.D("10")),), 1440, 1440))
+        for bad in ("49x10", "48x20,48x10", "abc", "48x20,47x20,46x20,45x20,44x20", "48x1", "60x5"):
+            with self.assertRaises(ValueError, msg=bad):
+                on(PREOPEN_LEVELS=bad)
+        with self.assertRaises(ValueError):
+            on(PREOPEN_LEVELS="48x20", PREOPEN_DEEP_AHEAD_MINUTES="2000")
+        self.assertTrue({"PREOPEN_LEVELS", "PREOPEN_DEEP_AHEAD_MINUTES"} <= m.CONTROL_KEY_SET and m.CONTROL_FORMS["PREOPEN_LEVELS"]["kind"] == "text")
+        self.assertIn("48.0¢×20 份、47.0¢×40 份（第 2 档起只挂 120 分钟内开始的场次）", p.levels_text(s))
+        with tempfile.TemporaryDirectory() as folder:
+            db = {"STATE_DB": str(Path(folder) / "s.sqlite3")}
+            rows = [market(at=NOW + 15 * 60_000, mid=1), market(at=NOW + 45 * 60_000, mid=2)]
+            ctl, api, clock = controller(rows, PREOPEN_LEVELS="48x20,47x40", PREOPEN_DEEP_AHEAD_MINUTES="30", PREOPEN_MARKETS="btc", PREOPEN_SHARES="10", **db)
+            await ctl.discover()
+            keys = [ctl.queue.get_nowait()[2] for _ in range(ctl.queue.qsize())]
+            near, far = rows[0]["categorySlug"], rows[1]["categorySlug"]
+            self.assertEqual([(c["slug"], c["level"], c["price"], c["shares"]) for c in keys],
+                             [(near, 0, "0.49", "10"), (near + "#1", 1, "0.48", "20"), (near + "#2", 2, "0.47", "40"), (far, 0, "0.49", "10")])
+            self.assertEqual(api.calls.count("/categories/" + near), 1, "one read a window, whatever the levels")
+            for c in keys:
+                self.assertEqual(await ctl.place_pair(c), "")
+            self.assertEqual(len(api.sent), 8)
+            deep = ctl.ledger.rows[near + "#1"]
+            self.assertEqual((deep["window"], deep["level"], deep["price"], deep["shares"], p.window_of(deep), p.record_key(deep)), (near, 1, "0.48", "20", near, near + "#1"))
+            self.assertEqual(api.sent[2]["data"]["order"]["makerAmount"], str(L.to_wei("9.6")))  # 48¢ × 20
+            self.assertEqual(len({o["hash"] for r in ctl.ledger.rows.values() for o in r["orders"].values()}), 8, "a salt a level")
+            self.assertAlmostEqual(ctl.risk(), 2 * (4.9 + 9.6 + 18.8) + 9.8)
+            self.assertIn("已记录 2 场、4 条（4 条挂着", ctl.status())
+            self.assertIn("两边各 49.0¢×10 份、48.0¢×20 份、47.0¢×40 份（第 2 档起只挂 30 分钟内开始的场次）", ctl.status())
+            api.markets["1"]["tradingStatus"] = "OPEN"
+            await ctl.refresh_active()
+            self.assertTrue(all(ctl.ledger.rows[k].get("open_seen_ms") for k in (near, near + "#1", near + "#2")), "matching on: noted on every level")
+            clock.ms += 20 * 60_000  # the far window comes within the deeper levels' horizon
+            ctl.account_at = clock.ms
+            await ctl.discover()
+            self.assertEqual(sorted(ctl.queue.get_nowait()[2]["slug"] for _ in range(ctl.queue.qsize())), [far + "#1", far + "#2"])
+            r = p.review(list(ctl.ledger.rows.values()), clock.ms)
+            self.assertEqual([(x["name"], x["records"]) for x in r["levels"]], [("49¢×10", 2), ("48¢×20", 1), ("47¢×40", 1)])
+            ctl.keep_on_stop = True
+            await ctl.on_stop()
+            ctl.ledger.close()
+            again, _, _ = controller(rows, PREOPEN_LEVELS="48x20", PREOPEN_MARKETS="btc", PREOPEN_SHARES="10", **db)
+            again.api = again.cancel_api = api; api.ctl = again
+            again.adopt()
+            self.assertEqual((again.resumed, again.ledger.rows[near + "#2"]["phase"], again.ledger.rows[near + "#1"]["phase"]), (3, "closing", "active"), "the level dropped is withdrawn")
+            await self.finish(again)
 
     async def test_restart_preserves_hash_and_pause(self):
         with tempfile.TemporaryDirectory() as folder:
