@@ -96,7 +96,7 @@ async def run():
     assert {s.day_spec(NOV4).slug for s in m.DAILY_UPDOWN_MARKETS} <= bot.predict.want_info  # the outcome names: which side is Up
     assert [(r["key"], r["name"]) for r in bot.sim_catalog(EVENING) if r["kind"] == "updown"] == [
         ("BTC-DAY", "BTC 11-04 涨跌"), ("ETH-DAY", "ETH 11-04 涨跌"), ("BNB-DAY", "BNB 11-04 涨跌")]
-    assert [rm.spec.key for rm in bot.pair_markets[("spot", "BNBUSDT")]] == ["BNB-DAY"]  # (BNB 先触 shared it until 1.101.1)
+    assert [rm.spec.key for rm in bot.pair_markets[("spot", "BNBUSDT")]] == ["BNB-2027", "BNB-DAY"]  # (BNB 先触 700/900 shared it until 1.101.1; 600/800 since 1.132.2)
     assert {"BTCUSDT", "ETHUSDT", "BNBUSDT"} <= set(bot.binance_streams["spot"].symbols())
     btc, eth = bot.updowns["BTC-DAY"], bot.updowns["ETH-DAY"]
     clock, closes = [EVENING], {SPEC.start_ms: "70000"}

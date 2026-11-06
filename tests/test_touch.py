@@ -7,7 +7,14 @@ retired.install()
 D = m.D
 BNB, SOL, BTC, ETH = m.TOUCH_MARKETS
 # 1.132.0: BTC 先触 70k/90k to May 2027, under its own key — the earlier one (to 10-25) stays "BTC" for the trades bought on it
-assert [s.key for s in retired.LIVE["TOUCH_MARKETS"]] == ["SOL", "ETH", "BTC-2027"]
+assert [s.key for s in retired.LIVE["TOUCH_MARKETS"]] == ["SOL", "ETH", "BTC-2027", "BNB-2027"]
+# 1.132.2: BNB 先触 600/800 to May 2027, from the market's creation (Predict's time), under its own key: the decided 700/900 stays "BNB"
+NEW_BNB = retired.LIVE["TOUCH_MARKETS"][3]
+assert NEW_BNB.slug == "will-bnb-hit-600-or-800-first" and NEW_BNB.symbol == "BNBUSDT" and (NEW_BNB.low, NEW_BNB.high) == (D("600"), D("800"))
+assert not NEW_BNB.fixed_start and NEW_BNB.created_ms == 0 and NEW_BNB.deadline_ms == int(dt.datetime(2027, 5, 6, 3, 59, tzinfo=dt.timezone.utc).timestamp() * 1000)
+m.TOUCH_MARKETS, kept = retired.LIVE["TOUCH_MARKETS"], m.TOUCH_MARKETS  # main's own tables for a moment: a record keyed "BNB" still finds the 700/900 lines
+assert m.touch_spec("BNB").slug == "will-bnb-hit-700-or-900" and m.touch_spec("BNB-2027") is NEW_BNB and m.touch_spec("BTC").slug == "will-btc-hit-70000-or-90000-first"
+m.TOUCH_MARKETS = kept
 NEW_BTC = retired.LIVE["TOUCH_MARKETS"][2]
 assert NEW_BTC.slug == "will-btc-hit-70000-or-90000-first-before-may-6-2027" and NEW_BTC.symbol == "BTCUSDT" and (NEW_BTC.low, NEW_BTC.high) == (D("70000"), D("90000"))
 assert NEW_BTC.fixed_start and NEW_BTC.created_ms == int(dt.datetime(2026, 11, 5, 14, 0, tzinfo=dt.timezone.utc).timestamp() * 1000)  # 09:00 EST

@@ -936,7 +936,7 @@ async def november():
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
         market = FakeMarket()
         bot = m.Bot(cfg, m.Store(":memory:"), market, None)
-        assert list(bot.ranges) == [s.key for s in LIVE] and list(bot.touches) == ["SOL", "ETH", "BTC-2027"]  # 1.101.1: BNB 先触 decided, taken off; 1.112.3: STRC over; 1.132.0: BTC 70k/90k to May 2027
+        assert list(bot.ranges) == [s.key for s in LIVE] and list(bot.touches) == ["SOL", "ETH", "BTC-2027", "BNB-2027"]  # 1.101.1: BNB 先触 decided, taken off; 1.112.3: STRC over; 1.132.0: BTC 70k/90k to May 2027; 1.132.2: BNB 600/800
         assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY", "UNITREE-15M", "SKHYNIX-15M", "BTC-15M", "ETH-15M", "BNB-15M"] and list(bot.flips) == ["HYPE-SOL-12"] and not bot.caps  # 1.97.0: the daily up/down cards; 1.102.0 / 1.103.0 / 1.109.0: the 15-minute ones; 1.132.0: HYPE 反超 SOL by December
         targets = bot.predict_targets(MID)
         assert all(targets[s.key] == s.slug and s.key in bot.predict.ladder_keys for s in NOV) and not any(k.endswith("-HIT-10") for k in targets)
@@ -955,7 +955,7 @@ async def november():
         assert (await bot.ranges["HYPE-HIT-11"].get("ticker/price", symbol="HYPEUSDT"))["price"] == "45.12"
         assert market.paths == [("/fapi/v1/ticker/price", {"symbol": "HYPEUSDT"})]  # the bot's own futures feed (BINANCE_BASE_URL)
         items = [(i["group"], i["name"]) for i in bot.odds_payload()["items"] if i["group"] in {"crypto", "levels", "ladder"}]
-        assert items == [("crypto", "SOL 先触 60/140"), ("crypto", "ETH 先触 1k/3k"), ("crypto", "BTC 先触 70k/90k"),  # 1.132.0: to May 2027
+        assert items == [("crypto", "SOL 先触 60/140"), ("crypto", "ETH 先触 1k/3k"), ("crypto", "BTC 先触 70k/90k"), ("crypto", "BNB 先触 600/800"),  # 1.132.0 / 1.132.2: to May 2027
                          ("crypto", "BTC 11-05 涨跌"), ("crypto", "ETH 11-05 涨跌"), ("crypto", "BNB 11-05 涨跌"), ("crypto", "BTC 15分涨跌 16:00–16:15"),  # 1.109.0: in 加密
                          ("crypto", "ETH 15分涨跌 16:00–16:15"), ("crypto", "BNB 15分涨跌 16:00–16:15"),  # 1.129.1
                          ("crypto", "HYPE 反超 SOL"),  # 1.132.0: by December

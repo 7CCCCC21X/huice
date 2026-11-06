@@ -8,7 +8,7 @@
 | --- | --- |
 | 标的 | `PREOPEN_MARKETS` 里的卡：默认只挂 BTC（`btc`）；`eth`、`bnb`、`skhynix`、`unitree`，或逗号列表；`all` = 五张（BTC-15M、ETH-15M、BNB-15M、SKHYNIX-15M、UNITREE-15M） |
 | 日期 | 不限当天：提前范围内的任何一天（跨午夜的场次也挂） |
-| 范围 | 只挂 `PREOPEN_AHEAD_MINUTES`（默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场）分钟内开始的场次，最近的先；股票市场遵守配置的交易日、假期和特殊时段 |
+| 范围 | 只挂 `PREOPEN_AHEAD_MINUTES`（默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场）分钟内开始的场次，最近的先；股票市场遵守配置的交易日、假期和特殊时段。扫描每轮最多重读 8 场已发布、还有档位没挂的场次（最近的先），各卡的下一场照常读；读失败时这一轮停下、已找到的照常排队；`/preopen` 的“扫描”一行写明每轮读了几场、找到几档、还有几场下次读、停在哪（1.132.2） |
 | 新单截止 | 距场次开始不足 `PREOPEN_ENTRY_SECONDS`（默认 180）秒不再新挂；到期前不足 1 分钟的不再发送 |
 | 订单 | LIMIT，`isPostOnly=true`，`selfTradePrevention=CANCEL_TAKER` |
 | 数量 | 每场每方向第一档 `PREOPEN_SHARES`（默认 10）份、价格 `PREOPEN_PRICE_CENTS`（默认 49）¢（每边不少于 Predict 的 $1 最小订单），成交后不自动补单，不追价对冲 |

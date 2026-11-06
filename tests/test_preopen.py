@@ -571,6 +571,44 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已预留 49.00U，再挂一场双边要 49U，限额 50U", ctl.error)
         await self.finish(ctl)
 
+    async def test_discovery_reads_a_few_windows_a_pass_and_a_failed_read_strands_nothing(self):
+        """1.132.2: a pass reads DISCOVER_READS listed windows with a level still to quote (the soonest first), each card's
+        next listing besides; the rest wait for the next pass. A read that fails mid-pass ends the pass with the error kept,
+        what was found is queued, and nothing stays marked queued without being on the queue (every listed window used to be
+        read every poll, and a 429 mid-pass left the ones found before it unquoted for good)."""
+        rows = [market(at=NOW + n * 15 * 60_000, mid=n) for n in range(1, 13)]
+        ctl, api, clock = controller(rows, PREOPEN_AHEAD_MINUTES="240", PREOPEN_MARKETS="btc")
+        ctl.listed_by_card["BTC-15M"] = NOW + 12 * 15 * 60_000  # the twelve known listed (seen before), none quoted yet: the budget's
+        reads = lambda: sum(1 for c in api.calls if c.startswith("/categories/"))
+        await ctl.discover()  # a full scan: the budget's eight, then the four unlisted beyond the listing (MISS_STOP, read whatever the budget)
+        self.assertEqual((ctl.queue.qsize(), reads()), (p.DISCOVER_READS, p.DISCOVER_READS + p.MISS_STOP))
+        self.assertIn(f"读 {p.DISCOVER_READS + p.MISS_STOP} 场，找到 {p.DISCOVER_READS} 档，还有 {12 - p.DISCOVER_READS} 场下次再读", ctl.scan_note)
+        self.assertIn("\n扫描：", ctl.status())
+        api.calls.clear()
+        await ctl.discover()  # a quick scan: the four left, then the first beyond the listing (read whatever the budget; unlisted: one miss ends the card)
+        self.assertEqual((ctl.queue.qsize(), reads()), (12, 12 - p.DISCOVER_READS + 1))
+        self.assertEqual(sorted(ctl.queued), sorted(c["categorySlug"] for c in rows))
+        while ctl.queue.qsize():
+            ctl.queue.get_nowait()
+        ctl.queued.clear()
+        real = api.call
+        async def flaky(method, path, **kw):
+            if path.endswith(f"-{(NOW + 3 * 15 * 60_000) // 1000}"):
+                raise m.RemoteError("HTTP 429: rate limited", 20)
+            return await real(method, path, **kw)
+        api.call = flaky
+        ctl.full_scan_ms = 0
+        await ctl.discover()
+        queued = [ctl.queue.get_nowait()[1] for _ in range(ctl.queue.qsize())]
+        self.assertEqual((len(queued), sorted(ctl.queued)), (2, sorted(queued)), "the two found before the failed read: queued, and nothing else marked queued")
+        self.assertTrue(ctl.error.startswith("扫描 ") and "HTTP 429" in ctl.error and "停在" in ctl.scan_note, (ctl.error, ctl.scan_note))
+        api.call = real
+        ctl.api.blocked_until = time.monotonic() + 10  # the shared cooldown: no pass at all, said so
+        await ctl.discover()
+        self.assertIn("没扫：", ctl.scan_note)
+        ctl.api.blocked_until = 0.0
+        await self.finish(ctl)
+
     async def test_status_says_why_nothing_is_placed(self):
         """The holds that used to be silent — the snapshot not read or stale, open orders nobody here placed — and the
         budget are on the status line; the pause names its reason."""

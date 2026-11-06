@@ -526,6 +526,7 @@ LISTING_CYCLE_MS = 15 * 60_000  # Predict lists one more window of a card every 
 LISTING_EARLY_MS, LISTING_LATE_MS = 20_000, 90_000  # ...and the discovery polls fast from this long before that moment until this long after it (or the listing)
 FAST_POLL_S = 1.0               # the fast poll's cadence (the queue position: the bid goes in within a second or two of the listing)
 MARKET_FRESH_MS = 15_000        # a window's details read by the discovery this recently are placed on, not read again
+DISCOVER_READS = 8              # listed windows with a level still to quote read in one discovery pass, the soonest first (the rest the next pass); each card's next listing is read besides (1.132.2)
 ALLOWANCE_MS = 60_000           # the exchange allowance is read again this often, not before every pair
 PROBE_HOURS = 2.0      # /preopen probe: the quarters of the next this many hours, each card's at most PROBE_PER_CARD — five cards over a day
 PROBE_PER_CARD = 8     # were hundreds of reads, and the commands are answered one after another (1.130.6)
@@ -601,6 +602,8 @@ class Controller:
         self.queued: set[str] = set()
         self.skipped: dict[str, str] = {}  # slug -> why a listed window was not placed (the status line)
         self.skipped_at: dict[str, int] = {}  # slug -> when it was last judged so (asked again SKIP_RETRY_MS on)
+        self.scan_note = ""  # what the last discovery pass did (the status line): windows read, levels found, what waits, what stopped it
+        self.scan_state: dict = {"reads": 0, "asked": 0, "deferred": 0, "pending": 0, "stopped": ""}  # ...its counts (scan_windows)
         self.parked: dict[str, tuple[int, dict]] = {}  # slug -> (retry_ms, candidate): held by hold() or the budget, placed again HOLD_RETRY_MS on, still queued
         self.full_scan_ms = 0  # discover: when the last full scan ran (FULL_SCAN_MS)
         self.keep_on_stop = False  # the owner's stop for a settings change: the orders stay on the book, the next controller takes them over
@@ -982,9 +985,24 @@ class Controller:
         full = self.now() - self.full_scan_ms >= FULL_SCAN_MS
         if full:
             self.full_scan_ms = self.now()
+        if why := self.cooldown():
+            self.scan_note = f"{hms(self.now())} 没扫：{why}"
+            return
         misses: dict[str, int] = {}
         found: list[dict] = []
         known_before = dict(self.listed_by_card)  # the latest windows known as this scan starts: a window beyond them is a listing seen now (the rhythm's anchor)
+        try:
+            await self.scan_windows(known_before, misses, found, full, self.scan_state)
+        finally:
+            for c in sorted(found, key=lambda c: (c["start_ms"], c["level"], c["slug"])):
+                self.queue.put_nowait((c["start_ms"], c["slug"], c))  # whatever ended the pass, what it found is queued (1.132.2: a failed read stranded them)
+            st = self.scan_state
+            self.scan_note = (f"{hms(self.now())} 读 {st['asked']} 场，找到 {len(found)} 档" + (f"，还有 {st['deferred']} 场下次再读" if st["deferred"] else "")
+                              + (f"，{st['pending']} 档在等撤单核对" if st["pending"] else "") + (f"；停在 {st['stopped']}" if st["stopped"] else ""))
+
+    async def scan_windows(self, known_before: dict, misses: dict, found: list, full: bool, st: dict) -> None:
+        """One discovery pass over the coming windows (discover: the pass's bookkeeping, what it found queued whatever ends it)."""
+        st.update(reads=0, asked=0, deferred=0, pending=0, stopped="")
         attempts: dict[str, int] = {}  # record (a window's level) -> the attempt after its last record, the superseded ones included: an attempt that left no record is not reused (its salt would be the first attempt's)
         for p in self.ledger.rows.values():
             attempts[record_key(p)] = max(attempts.get(record_key(p), 0), int(p.get("attempt") or 0) + 1)
@@ -1000,12 +1018,27 @@ class Controller:
                 if level and start - self.now() > self.settings.deep_ahead_minutes * 60_000:
                     break  # the deeper levels wait for the window to come near (PREOPEN_DEEP_AHEAD_MINUTES); the first keeps its queue position
                 key = slug if level == 0 else f"{slug}#{level}"  # sorts after the first level's key, before the next's
-                if key in self.queued or (key in self.ledger.rows and not self.supersedable(self.ledger.rows[key], strikes.get(key, 0))) or strikes.get(key, 0) >= MAX_ATTEMPTS:
+                if key in self.queued or strikes.get(key, 0) >= MAX_ATTEMPTS:
+                    continue
+                if key in self.ledger.rows and not self.supersedable(self.ledger.rows[key], strikes.get(key, 0)):
+                    if self.ledger.rows[key]["phase"] != "active" and not self.ledger.rows[key].get("accounted"):
+                        st["pending"] += 1  # withdrawn, its final reads not in yet: quoted again once they are
                     continue
                 wanted.append((key, level, price, shares))
             if not wanted:
                 continue
-            market = await category_market(self.api, slug)
+            if start <= known_before.get(rolling.key, 0):  # known listed, a level still to quote: the budget's (the windows beyond the listing — a card's next one, MISS_STOP at most — are read whatever it: the queue position at a listing)
+                if st["reads"] >= DISCOVER_READS:
+                    st["deferred"] += 1  # the next pass's (1.132.2: every such window was read again every poll)
+                    continue
+                st["reads"] += 1
+            st["asked"] += 1
+            try:
+                market = await category_market(self.api, slug)
+            except Exception as error:
+                st["stopped"] = f"{slug.rsplit('-', 1)[-1]}：{core.clean_error(error) or type(error).__name__}"
+                self.error = f"扫描 {st['stopped']}"
+                return  # the pass ends here (a 429, the cooldown, a timeout): what it found is queued, the rest read next time
             if market is None:
                 misses[rolling.key] = misses.get(rolling.key, 0) + 1
                 continue
@@ -1026,8 +1059,6 @@ class Controller:
                 self.queued.add(key)
                 found.append({**c, "slug": key, "window": slug, "level": level, "price": str(price), "shares": str(shares), "attempt": attempts.get(key, 0),
                               "market": market, "read_ms": self.now()})  # the details just read: placed on, not read again (MARKET_FRESH_MS)
-        for c in sorted(found, key=lambda c: (c["start_ms"], c["level"], c["slug"])):
-            await self.queue.put((c["start_ms"], c["slug"], c))
 
     async def refresh_active(self) -> None:
         """An active window's market, read again every REFRESH_MS (REFRESH_FAR_MS while its start is more than an hour
@@ -1659,6 +1690,7 @@ class Controller:
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
                 f"预留 {self.risk():.2f}U / 限额 {self.settings.max_open_usd:g}U（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉且一份没成交的场次立即释放）"
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if pairs_left else "")
+                + f"\n扫描：{self.scan_note or '还没扫过'}"
                 + f"\n最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
                 + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：不计入预挂限额，也不挡预挂" if self.unmanaged else "")

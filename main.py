@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.132.1"
+VERSION = "1.132.2"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -6913,6 +6913,9 @@ TOUCH_MARKETS = (
     # High / Low; neither hit → 50/50. Its own key: the earlier BTC 70k/90k (Aug 25 – Oct 25) stays "BTC" in TOUCH_SETTLED (1.132.0)
     TouchSpec("BTC-2027", "will-btc-hit-70000-or-90000-first-before-may-6-2027", "BTCUSDT", D("70000"), D("90000"),
               et_ms(2026, 11, 5, 9, 0, -5), et_ms(2027, 5, 5, 23, 59, -4), -4, fixed_start=True),
+    # "between the creation of this market and May 5th 2027 at 11:59 PM ET" (EDT): Binance BNB/USDT 1-minute High / Low, neither
+    # hit → 50/50; the window opens at the creation Predict gives. Its own key: BNB 700/900 (decided 11-04) stays "BNB" in TOUCH_SETTLED (1.132.2)
+    TouchSpec("BNB-2027", "will-bnb-hit-600-or-800-first", "BNBUSDT", D("600"), D("800"), 0, et_ms(2027, 5, 5, 23, 59, -4), -4),
 )
 # Touch markets no longer listed: no card, no book, no trading. Kept only so that a trade bought on one is still settled
 # on Predict's result, whose outcome names ("$700" / "$900") are read against the market's two lines (touch_spec).
