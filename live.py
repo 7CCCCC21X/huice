@@ -1947,26 +1947,40 @@ class LiveBot(core.Bot):
         if not getattr(self.live.api, "positions_complete", True):
             return  # cut at the page cap: a position missing from it says nothing
         held: dict[tuple[str, int], float] = {}
+        priced: dict[tuple[str, int], tuple[float, float]] = {}  # outcome -> (Σ price × shares, Σ shares) of the rows stating a price
+        pos_time: dict[tuple[str, int], int] = {}
         for row in rows:
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
             outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
             k = (str(market.get("id") or row.get("marketId") or ""), int(outcome.get("indexSet") or 0))
-            held[k] = held.get(k, 0.0) + self.position_shares(row)
+            shares = self.position_shares(row)
+            held[k] = held.get(k, 0.0) + shares
+            price = self.position_price(row)
+            if price is not None and shares > 0:
+                priced[k] = (priced.get(k, (0.0, 0.0))[0] + price * shares, priced.get(k, (0.0, 0.0))[1] + shares)
+            pos_time[k] = max(pos_time.get(k, 0), self.position_time(row))
+        pos_price = {k: round(v / n, 6) for k, (v, n) in priced.items() if n > 0}
         recorded: dict[tuple[str, int], float] = {}
         for tid, t in live:
             k = key_of(t)
             recorded[k] = recorded.get(k, 0.0) + float(t.get("shares") or 0)
-        # (a) the shares held beyond the records, onto the newest order that ended with shares unfilled
+        # (a) the shares held beyond the records, onto the order they came from (live_pick_adoptee), else the newest that ended
+        # with shares unfilled; an earlier backfill costed at the wrong order's price is set to the position's average price
         ended.sort(key=lambda kv: core.trade_updated(kv[1]), reverse=True)
-        seen: set[tuple[str, int]] = set()
+        by_out: dict[tuple[str, int], list[tuple[str, dict]]] = {}
         for tid, t in ended:
-            st, k = t["live"], key_of(t)
-            if not k[0] or not k[1] or k in seen:
-                continue
+            k = key_of(t)
+            if k[0] and k[1]:
+                by_out.setdefault(k, []).append((tid, t))
+        seen: set[tuple[str, int]] = set()
+        for k, cands in by_out.items():
             excess = held.get(k, 0.0) - recorded.get(k, 0.0)
             if excess <= self.LIVE_DUST_SHARES:
                 continue
-            seen.add(k)  # the newest order on the outcome takes the excess; the outcome is not trimmed in the same pass
+            seen.add(k)  # the outcome is not trimmed in the same pass
+            price, when = pos_price.get(k), pos_time.get(k, 0)
+            tid, t, by = self.live_pick_adoptee(cands, price, when, self.LIVE_LATE_FILLS_GRACE_MS)
+            st = t["live"]
             before, order = float(t.get("shares") or 0), float(t.get("order") or 0)
             row = None
             with contextlib.suppress(Exception):
@@ -1983,7 +1997,15 @@ class LiveBot(core.Bot):
                 self.live_apply(tid, t, {"status": str(st.get("final") or "closed").upper(), "amount": str(to_wei(order)),
                                          "amountFilled": str(to_wei(after + adopt))}, None, now_ms)
                 after = float(t.get("shares") or 0)
-                how = f"账户在这一边的持仓比记录多 {excess:g} 份、订单记录没显示：按成交 {adopt:g} 份补记（累计 {after:g}/{order:g}）"
+                how = f"账户在这一边的持仓比记录多 {excess:g} 份、订单记录没显示：按成交 {adopt:g} 份补记（累计 {after:g}/{order:g}，{by}）"
+                if when and t.get("fills"):
+                    t["fills"][-1]["at"] = when  # the position's own time: the fill's, not this pass's
+                    t["filled"] = when
+                st["adopted"] = {"at": now_ms, "by": by, "pos_price": price}
+                if price is not None and abs(price - float(t["price"])) > 0.0051:
+                    cost = price if t.get("maker") else price + core.taker_fee(price, int((st.get("want") or {}).get("fee_bps") or 0))
+                    how += f"；成本按 Predict 持仓均价 {core.cents(price)} 记（订单 #{st['order_id']} 的价 {core.cents(float(t['price']))} 不是这笔成交的）"
+                    t["price"] = cost
             recorded[k] = recorded.get(k, 0.0) + after - before
             if t["status"] not in {"settled", "expired"} and after > 1e-9:
                 t.update(status="filled", unfilled=max(order - after, 0.0),
@@ -1991,6 +2013,23 @@ class LiveBot(core.Bot):
             st["events"].append({"at": now_ms, "what": "结束后核对持仓：" + how})
             self.live_notify(f"📌 补记成交：{t['item']} {t['label']} {core.cents(float(t['price']))}：{how}（订单 #{st['order_id']}，请在 Predict 核对）",
                              key=f"latefill:{st['order_id']}")
+            self.sim_save([(tid, t)])
+        # an earlier backfill (1.119.0–1.119.2 took the newest ended order, whatever its price) costed at that order's price: the
+        # position's average price, once the row states one and this is the only record holding the outcome, is the cost
+        for tid, t in open_recs:
+            st, k = t["live"], key_of(t)
+            backfilled = st.get("adopted") or any("补记" in str(e.get("what") or "") for e in st.get("events") or ())
+            price = pos_price.get(k)
+            if not backfilled or st.get("adopted_price_fixed") or price is None or k in seen:
+                continue
+            if any(o is not t and key_of(o) == k and float(o.get("shares") or 0) > 1e-9 for _, o in open_recs):
+                continue  # several records hold the outcome: the average price is not this one's alone
+            st["adopted_price_fixed"] = True
+            if abs(price - float(t["price"])) > 0.0051:
+                was = float(t["price"])
+                t["price"] = price if t.get("maker") else price + core.taker_fee(price, int((st.get("want") or {}).get("fee_bps") or 0))
+                st["events"].append({"at": now_ms, "what": f"补记的成本按 Predict 持仓均价改为 {core.cents(price)}（原按订单 #{st.get('order_id')} 的价 {core.cents(was)} 记）"})
+                self.live_notify(f"📌 成本校正：{t['item']} {t['label']}：补记那笔的成本按 Predict 持仓均价改为 {core.cents(price)}（原 {core.cents(was)}）", key=f"adoptprice:{tid}")
             self.sim_save([(tid, t)])
         # (b) a holding a little short of the open records: the fee taken in shares — the records trimmed to it, in proportion
         groups: dict[tuple[str, int], list[tuple[str, dict]]] = {}
@@ -2553,6 +2592,8 @@ class LiveBot(core.Bot):
                 return f"未就绪：{self.live.not_ready_why}"
             rows = await self.live.api.positions()
             self.live_positions = (rows, time.time())
+            if words and words[0] == "raw":  # 1.119.3: the rows as Predict sends them (which fields carry a price and a time)
+                return "Predict 持仓原始记录（前 10 条）：\n" + ("\n".join(core.brief_error(json.dumps(r, ensure_ascii=False), 600) for r in rows[:10]) or "无")
             return self.positions_text(rows, now_ms)
         return core.Reply(self.live_text(now_ms), html=True)
 
@@ -2853,6 +2894,58 @@ class LiveBot(core.Bot):
         value = row.get("valueUsd") or row.get("value")
         return (f"{market.get('title') or row.get('marketId') or '?'}｜{outcome.get('name') or '?'} {shares:g} 份"
                 + (f"｜≈${float(value):,.2f}" if value not in (None, "") else "") + (f"｜{outcome.get('status')}" if outcome.get("status") else ""))
+
+    @staticmethod
+    def position_price(row: dict) -> float | None:
+        """The average price a position was bought at, as its row states it (several spellings; a fraction, cents or
+        wei): None when it states none (1.119.3)."""
+        for key in ("avgPrice", "averagePrice", "avgCost", "averageCost", "costBasis", "entryPrice", "avgEntryPrice", "price"):
+            value = row.get(key)
+            if value in (None, "", 0, "0"):
+                continue
+            with contextlib.suppress(TypeError, ValueError, decimal.InvalidOperation):
+                price = D(str(value))
+                if price > 100:
+                    price = price / WEI
+                elif price > 1:
+                    price = price / 100
+                if 0 < price <= 1:
+                    return float(price)
+        return None
+
+    @staticmethod
+    def position_time(row: dict) -> int:
+        """When a position last changed, as its row states it (ISO text, or an epoch in seconds or ms), in ms; 0 when
+        it states none (1.119.3)."""
+        for key in ("lastTradeAt", "lastFilledAt", "updatedAt", "lastUpdatedAt", "timestamp", "createdAt"):
+            value = row.get(key)
+            if value in (None, "", 0, "0"):
+                continue
+            with contextlib.suppress(TypeError, ValueError, OverflowError):
+                if isinstance(value, (int, float)) or str(value).strip().isdigit():
+                    n = int(float(value))
+                    return n if n > 10 ** 11 else n * 1000
+                return int(dt.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00")).timestamp() * 1000)
+        return 0
+
+    @staticmethod
+    def live_pick_adoptee(cands: list[tuple[str, dict]], price: float | None, when: int, grace_ms: int) -> tuple[str, dict, str]:
+        """Which of an outcome's ended orders (newest first) a late fill goes on, and why (1.119.3): the newest whose
+        price is the position's average (a maker fills at its price; a taker at or under its limit), else the newest
+        that was open when the position last changed, else the newest of all (1.119.0–1.119.2 always took that one: a
+        KOSPI fill at 21¢ landed on a 1¢ sweep order placed after it)."""
+        if price is not None:
+            for tid, t in cands:
+                want = t["live"].get("want") or {}
+                limit = float(want.get("limit") or want.get("cap") or 0) or float(t["price"])
+                if (t.get("maker") and abs(float(t["price"]) - price) <= 0.0051) or (not t.get("maker") and price <= limit + 0.0051):
+                    return tid, t, f"按 Predict 持仓均价 {core.cents(price)} 对上这张单"
+        if when:
+            for tid, t in cands:
+                if int(t.get("opened") or 0) - 60_000 <= when <= core.trade_updated(t) + grace_ms:
+                    return tid, t, f"按持仓变动时间 {core.stamp(when, seconds=False)} 对上当时挂着的这张单"
+        tid, t = cands[0]
+        return tid, t, "按最近结束的订单对应（Predict 持仓没给均价和时间）"
 
     @staticmethod
     def position_shares(row: dict) -> float:

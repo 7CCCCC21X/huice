@@ -616,6 +616,7 @@ async def run():
                             "amount": str(100 * WEI), "valueUsd": "100"}]
     assert "恒生指数 10-05｜Down 100 份｜≈$100.00" in await bot.cmd_live(req("positions"))
     assert "开放订单" in await bot.cmd_live(req("orders")) and "自检" in await bot.cmd_live(req("check"))
+    assert (await bot.cmd_live(req("positions", "raw"))).startswith("Predict 持仓原始记录（前 10 条）：\n{") and '"id": "p1"' in await bot.cmd_live(req("positions", "raw"))  # 1.119.3
     assert "真实下单：LIVE=on" in bot.sim_text() and "/live" in bot.sim_text() and "💰" in bot.sim_text()
     assert "LIVE=on" in bot.cmd_help(None) and "不会自动下单" not in bot.cmd_help(None)
     assert "💰 真实交易" in bot.status("1:0") and "不会自动撤单" not in bot.status("1:0")
@@ -986,6 +987,19 @@ async def run():
     # --- 1.119.0: fills that landed as an order was ending, read later: the orders that ended with shares unfilled are set against the
     # account's positions once a minute (not within 15 s of their end) — the order's own record first, else the position's excess is
     # taken as filled on the newest such order
+    # 1.119.3: the helpers reading a position's price and time, and the choice of the order a late fill goes on
+    assert L.LiveBot.position_price({"avgPrice": "0.21"}) == 0.21 and L.LiveBot.position_price({"averagePrice": 21}) == 0.21
+    assert L.LiveBot.position_price({"price": str(21 * WEI // 100)}) == 0.21 and L.LiveBot.position_price({"amount": "5"}) is None and L.LiveBot.position_price({"avgPrice": "0"}) is None
+    assert L.LiveBot.position_time({"updatedAt": "2026-10-05T02:00:00Z"}) == NOW - 86_400_000 * 0 - (NOW - 1791165600000) and L.LiveBot.position_time({"updatedAt": "2026-10-05T02:00:00Z"}) == 1791165600000
+    assert L.LiveBot.position_time({"lastTradeAt": 1791165600}) == 1791165600000 and L.LiveBot.position_time({"lastTradeAt": "1791165600123"}) == 1791165600123 and L.LiveBot.position_time({}) == 0
+    cands = [("b", {"price": 0.01, "maker": True, "opened": NOW + 300_000, "live": {"want": {}, "events": [{"at": NOW + 310_000}]}}),
+             ("a", {"price": 0.21, "maker": True, "opened": NOW, "live": {"want": {}, "events": [{"at": NOW + 120_000}]}})]
+    assert L.LiveBot.live_pick_adoptee(cands, 0.21, 0, 15_000)[0] == "a" and L.LiveBot.live_pick_adoptee(cands, 0.01, 0, 15_000)[0] == "b"
+    assert L.LiveBot.live_pick_adoptee(cands, None, NOW + 60_000, 15_000)[0] == "a" and L.LiveBot.live_pick_adoptee(cands, None, NOW + 305_000, 15_000)[0] == "b"
+    assert L.LiveBot.live_pick_adoptee(cands, None, 0, 15_000)[0] == "b" and L.LiveBot.live_pick_adoptee(cands, 0.5, 0, 15_000)[2].startswith("按最近结束的订单对应")
+    taker = [("t", {"price": 0.3, "maker": False, "opened": NOW, "live": {"want": {"limit": 0.3}, "events": []}})]
+    assert L.LiveBot.live_pick_adoptee(taker, 0.28, 0, 15_000)[2].startswith("按 Predict 持仓均价 28.0¢") and L.LiveBot.live_pick_adoptee(taker, 0.31, 0, 15_000)[2].startswith("按最近结束")
+
     async def late_case(by_record: bool, delay: int = 70_000):  # delay: the pass that adopts, after the cancel at NOW
         lbot = make_bot(SIM_MAKER_MIN_BID="100", SIM_MAKER_EXIT_CENTS="5", SIM_MAKER_SESSION="on", SIM_WAYS="maker")
         await lbot.live_prepare(); lfake = lbot.live.api
@@ -1007,10 +1021,16 @@ async def run():
         assert late["status"] == "filled" and abs(late["shares"] - 10) < 1e-9 and abs(late["unfilled"] - 90) < 1e-9 and "订单结束后补记" in late["note"], late
         how = next(e["what"] for e in late["live"]["events"] if e["what"].startswith("结束后核对持仓："))
         assert how == ("结束后核对持仓：结束后再读订单记录，读到成交 10 份（累计 10/100）" if by_record
-                       else "结束后核对持仓：账户在这一边的持仓比记录多 10 份、订单记录没显示：按成交 10 份补记（累计 10/100）"), how
+                       else "结束后核对持仓：账户在这一边的持仓比记录多 10 份、订单记录没显示：按成交 10 份补记（累计 10/100，按最近结束的订单对应（Predict 持仓没给均价和时间））"), how
         assert len(late["fills"]) == 1 and late["fills"][0]["shares"] == 10 and abs(lbot.live_reserved(late) - 10 * late["price"]) < 1e-9
+        assert late["price"] == 0.55 and (by_record or late["live"]["adopted"]["by"].startswith("按最近结束"))
+        if not by_record:  # 1.119.3: the row now states the average price: the backfilled record's cost follows it (the only record there)
+            lfake.positions_rows[0]["avgPrice"] = "0.21"
         await step(lbot, NOW + delay + 70_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + delay + 70_000))  # explained now: nothing more is adopted
-        assert abs(next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")["shares"] - 10) < 1e-9
+        fixed = next(t for t in lbot.sim_trades().values() if t["live"].get("order_id") == "101")
+        assert abs(fixed["shares"] - 10) < 1e-9 and abs(fixed["price"] - (0.55 if by_record else 0.21)) < 1e-9, fixed["price"]
+        if not by_record:
+            assert any(e["what"] == "补记的成本按 Predict 持仓均价改为 21.0¢（原按订单 #101 的价 55.0¢ 记）" for e in fixed["live"]["events"]) and fixed["live"]["adopted_price_fixed"], fixed["live"]["events"]
         # 1.119.1: the account holds a little less than the records say (the taker fee taken in shares): the records are trimmed to
         # the holding once the same shortfall has stood a minute (the second pass), no order with fills working there; a shortfall
         # beyond 5% is not a fee and is left alone
