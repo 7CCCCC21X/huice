@@ -3418,7 +3418,21 @@ class LiveBot(core.Bot):
                 return f"设置有误：{core.clean_error(error)}"
             api = (self.preopen.cancel_api if self.preopen is not None
                    else safe_api(API_BASES[self.config.live_chain], self.config.predict_api_key, self.live.wallet, None, self.live.api))
-            return "\n".join(await probe(api, self.config, settings, self.market.now_ms()))
+            from preopen import PROBE_BUDGET_S, PROBE_HOURS, PROBE_PER_CARD
+            try:
+                hours = min(24.0, max(0.5, float(req.args[1]))) if len(req.args) > 1 else PROBE_HOURS
+            except ValueError:
+                hours = PROBE_HOURS
+
+            async def later() -> None:  # 1.130.6: in the background — the commands are answered one after another, and this one reads for seconds
+                try:
+                    text = "\n".join(await probe(api, self.config, settings, self.market.now_ms(), hours))
+                except Exception as error:
+                    text = f"探测失败：{core.clean_error(error) or type(error).__name__}"
+                await self.reply(req, text)
+            asyncio.create_task(later(), name="preopen-probe")
+            return (f"探测中：{len(settings.markets)} 张卡，各问最近 {PROBE_PER_CARD} 个刻钟（{hours:g} 小时内），最多 {PROBE_BUDGET_S:g} 秒，结果随后发来"
+                    "（/preopen probe 6 = 看 6 小时内）")
         if self.preopen is None:
             return "开盘前预挂模式未启用（PREOPEN_15M=off）；/preopen probe 只读探测市场列表的字段和现在会挂的场次，/preopen on 开启（也可在控制台改）"
         if action == "check":  # what is wrong now, in one message (1.130.1)

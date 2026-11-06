@@ -753,13 +753,15 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("btc-updown-15m-1793927700（09:15）：不挂：交易状态 CLOSED", text)
         self.assertGreaterEqual(text.count("：还没发布"), 6)  # the other BTC quarters, 海力士's and 宇树's
         self.assertNotIn("sol", text)
-        self.assertIn("UNITREE-15M 连续 4 个刻钟没发布或读不到，更晚的不再问", text)  # the whole day is scanned, each card's list ending at four unlisted in a row
+        self.assertIn("只看 2 小时内、每张卡最近 8 个刻钟", text)  # 1.130.6: bounded — a day of five cards was hundreds of reads
+        self.assertLessEqual(text.count("btc-updown-15m-"), 8)
         async def broken(method, path, **kw): raise m.RemoteError("HTTP 403: 访问被拒绝")
         api.call = broken
         self.assertIn("读取失败：HTTP 403", "\n".join(await p.probe(api, ctl.owner.config, ctl.settings, NOW)))
         empty = p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", "PREOPEN_MARKETS": "unitree"}))
         self.assertIn("没有要看的场次", "\n".join(await p.probe(api, ctl.owner.config, empty, NOW + 24 * 3600_000)))  # Saturday 09:00: no 宇树 session for a day
-        self.assertEqual("\n".join(await p.probe(api, ctl.owner.config, empty, NOW)).count("读取失败"), 4)  # failures end a card's list too
+        text = "\n".join(await p.probe(api, ctl.owner.config, empty, NOW))
+        self.assertTrue(2 <= text.count("）：读取失败：") <= 4 and text.count("没问（UNITREE-15M 连续读取失败）") >= 3, text)  # failures end a card's reads
         await self.finish(ctl)
 
     async def test_rate_limit_cooldown_is_shared_with_the_bots_client(self):

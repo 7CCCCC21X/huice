@@ -416,35 +416,49 @@ def review(rows: list[dict], now_ms: int) -> dict:
             "recent": [{k: q[k] for k in shown} for q in recent]}
 
 
-async def probe(api: Any, config: Any, settings: Settings, now_ms: int) -> list[str]:
-    """Every window of the next day, read as the discovery reads them (each card's in start order, MISS_STOP unlisted in a
-    row ending the card's list): listed or not, the details' trading status, the fields the discovery needs that are
-    missing, whether it would be placed and why not — run before switching on; it shows how far ahead Predict lists."""
+PROBE_HOURS = 2.0      # /preopen probe: the quarters of the next this many hours, each card's at most PROBE_PER_CARD — five cards over a day
+PROBE_PER_CARD = 8     # were hundreds of reads, and the commands are answered one after another (1.130.6)
+PROBE_BUDGET_S = 15.0  # ...and this long at most: what is left is said, not read
+
+
+async def probe(api: Any, config: Any, settings: Settings, now_ms: int, hours: float = PROBE_HOURS) -> list[str]:
+    """The next hours' windows, read as the discovery reads them: listed or not, the details' trading status, the fields the
+    discovery needs that are missing, whether it would be placed and why not — run before switching on, and to see whether
+    a card is listed under the slug the bot expects. Bounded (PROBE_PER_CARD a card, two reads at a time, PROBE_BUDGET_S)."""
     hm = lambda ms: when(ms, now_ms)
     lines = [f"开盘前预挂探测（只读；设置：{'、'.join(sorted(settings.markets))}，{levels_text(settings)}，"
-             f"提前 {settings.ahead_minutes} 分钟内，不足 {settings.entry_seconds} 秒不挂）"]
-    starts = window_starts(now_ms, config, dataclasses.replace(settings, ahead_minutes=max(settings.ahead_minutes, 1440)))
-    if not starts:
-        lines.append("24 小时内没有要看的场次（不在交易时段）")
-    misses: dict[str, int] = {}
-    for rolling, start in starts:
-        if misses.get(rolling.key, 0) >= MISS_STOP:
-            continue
-        slug, word = window_slug(rolling, start), ""
-        try:
-            market = await category_market(api, slug)
-        except Exception as error:
-            market, word = None, f"读取失败：{core.clean_error(error) or type(error).__name__}"
+             f"提前 {settings.ahead_minutes} 分钟内，不足 {settings.entry_seconds} 秒不挂；只看 {hours:g} 小时内、每张卡最近 {PROBE_PER_CARD} 个刻钟）"]
+    per_card: dict[str, int] = {}
+    picked = []
+    for rolling, start in window_starts(now_ms, config, dataclasses.replace(settings, ahead_minutes=max(3, int(hours * 60)))):
+        if per_card.get(rolling.key, 0) < PROBE_PER_CARD:
+            per_card[rolling.key] = per_card.get(rolling.key, 0) + 1
+            picked.append((rolling, start))
+    if not picked:
+        lines.append(f"{hours:g} 小时内没有要看的场次（不在交易时段）")
+    gate = asyncio.Semaphore(2)
+    deadline = time.monotonic() + PROBE_BUDGET_S
+    failures: dict[str, int] = {}
+
+    async def one(rolling: Any, start: int) -> str:
+        slug = window_slug(rolling, start)
+        async with gate:
+            if time.monotonic() > deadline:
+                return f"{slug}（{hm(start)}）：没问（探测限 {PROBE_BUDGET_S:g} 秒）"
+            if failures.get(rolling.key, 0) >= 2:
+                return f"{slug}（{hm(start)}）：没问（{rolling.key} 连续读取失败）"
+            try:
+                market = await category_market(api, slug)
+            except Exception as error:
+                failures[rolling.key] = failures.get(rolling.key, 0) + 1
+                return f"{slug}（{hm(start)}）：读取失败：{core.clean_error(error) or type(error).__name__}"
         if market is None:
-            misses[rolling.key] = misses.get(rolling.key, 0) + 1
-            lines.append(f"{slug}（{hm(start)}）：{word if word else '还没发布'}"
-                         + (f"；{rolling.key} 连续 {MISS_STOP} 个刻钟没发布或读不到，更晚的不再问" if misses[rolling.key] >= MISS_STOP else ""))
-            continue
-        misses[rolling.key] = 0
+            return f"{slug}（{hm(start)}）：还没发布"
         why = candidate_problem(market, now_ms, config, settings)
         missing = [f for f in LISTING_FIELDS if f not in market]
-        lines.append(f"{slug}（{hm(start)}）：{'会挂' if not why else '不挂：' + why}；状态 {market.get('status') or '缺失'} / 交易状态 "
-                     f"{market.get('tradingStatus') or '缺失'}；缺字段：{'、'.join(missing) if missing else '无'}")
+        return (f"{slug}（{hm(start)}）：{'会挂' if not why else '不挂：' + why}；状态 {market.get('status') or '缺失'} / 交易状态 "
+                f"{market.get('tradingStatus') or '缺失'}；缺字段：{'、'.join(missing) if missing else '无'}")
+    lines += list(await asyncio.gather(*(one(r, s) for r, s in picked)))
     return lines
 
 
