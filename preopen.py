@@ -481,6 +481,9 @@ class Controller:
         self.card_holds: dict[str, str] = {}  # card key -> why its windows are not quoted now (card_hold: near the day's limit, halted)
         self.card_checked_ms = 0
         self.listed_until_ms = max((int(p.get("start_ms") or 0) for p in self.ledger.rows.values()), default=0)  # the latest window seen listed
+        self.listed_by_card: dict[str, int] = {}  # card key -> the latest window of it seen listed (the status, per card: a card never found stands out)
+        for p in self.ledger.rows.values():
+            self.listed_by_card[str(p.get("key") or "")] = max(self.listed_by_card.get(str(p.get("key") or ""), 0), int(p.get("start_ms") or 0))
         self.account_lock = asyncio.Lock()
         shared = getattr(owner.live, "api", None)  # the bot's own client: one rate-limit cooldown for all three
         self.api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, self.before_send, shared)
@@ -613,7 +616,8 @@ class Controller:
         if self.risk() + self.other_risk() + pair_usd > limit + 1e-9:
             return f"预挂资金上限不足：需要再预留 {pair_usd:g}U，限额 {limit:g}U"
         if self.balance < max(self.open_reserved, self.risk()) + pair_usd:
-            return "可用USDT不足以预留下一场双边订单"
+            return (f"可用USDT {self.balance:.0f}U 不足以预留下一场双边订单（账户挂单占用 {self.open_reserved:.0f}U，其中本模式 {self.risk():.0f}U，"
+                    f"其余是原策略和没记录的挂单）")
         if side_usd > self.owner.config.live_max_order_usd:
             return f"LIVE_MAX_ORDER_USD 小于每边 {side_usd:g}U"
         return ""
@@ -859,6 +863,7 @@ class Controller:
                 continue
             misses[rolling.key] = 0
             self.listed_until_ms = max(self.listed_until_ms, start)
+            self.listed_by_card[rolling.key] = max(self.listed_by_card.get(rolling.key, 0), start)
             c = candidate(market, self.now(), self.owner.config, self.settings)
             if c is None:
                 self.skipped[slug] = candidate_problem(market, self.now(), self.owner.config, self.settings)
@@ -884,7 +889,7 @@ class Controller:
         async def one(pair: dict) -> None:
             async with gate:
                 pair["meta_ms"] = self.now()
-                market = {**(await self.api.market(pair["market_id"])), "categorySlug": pair["slug"]}
+                market = {**(await self.api.market(pair["market_id"])), "categorySlug": pair.get("window") or window_of(pair)}
                 self.note_open(market)
                 status, trading = str(market.get("status") or "").upper(), str(market.get("tradingStatus") or "").upper()
                 if status != "REGISTERED" or trading not in {"OPEN", "MATCHING_NOT_ENABLED"}:
@@ -910,7 +915,7 @@ class Controller:
             self.error = why
             return "held"
         # Fresh details are authoritative, not a stale listing page or model card.
-        market = await self.api.market(c["market_id"])
+        market = {**(await self.api.market(c["market_id"])), "categorySlug": c.get("window", c["slug"])}  # the window the category named: the details' own slug may differ
         current = candidate(market, self.now(), self.owner.config, self.settings)
         if current is None or current["slug"] != c.get("window", c["slug"]):
             return ""
@@ -1393,8 +1398,9 @@ class Controller:
         rows = list(self.ledger.rows.values())
         why = (self.hold() or self.budget_problem()) if self.alive else ""
         state = "已停止" if not self.alive else f"暂停，{why}" if self.blocked() else "运行"
-        listed = (f"已发布到 {when(self.listed_until_ms, self.now())}（开场前 {(self.listed_until_ms - self.now()) / 60_000:.0f} 分钟）"
-                  if self.listed_until_ms > self.now() else "还没见到已发布的场次")
+        until = lambda ms: f"{when(ms, self.now())}（开场前 {(ms - self.now()) / 60_000:.0f} 分钟）" if ms > self.now() else "还没见到已发布的场次"
+        listed = ("已发布到 " + until(self.listed_until_ms) if len(self.settings.markets) == 1
+                  else "已发布到：" + "；".join(f"{key} {until(self.listed_by_card.get(key, 0))}" for key in sorted(self.settings.markets)))
         return (f"开盘前自动预挂：{state}\n"
                 f"{' / '.join(sorted(self.settings.markets))}：两边各 {levels_text(self.settings)}；"
                 f"扫描 {self.settings.poll:g} 秒，"

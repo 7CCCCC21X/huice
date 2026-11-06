@@ -373,6 +373,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         order = [ctl.queue.get_nowait()[2]["market_id"] for _ in range(3)]
         self.assertEqual(order, ["2", "4", "1"])
         self.assertNotIn("/categories/" + market(at=NOW + 3 * 3600_000)["categorySlug"], api.calls)
+        self.assertIn("已发布到：BTC-15M 09:45（开场前 45 分钟）；SKHYNIX-15M 09:30（开场前 30 分钟）；UNITREE-15M 还没见到已发布的场次", ctl.status())  # 1.130.4: per card
         await self.finish(ctl)
 
     async def test_discovery_is_cheap_however_wide_the_horizon(self):
