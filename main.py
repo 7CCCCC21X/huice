@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.134.1"
+VERSION = "1.135.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -604,7 +604,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_HOLD_RANGE_SECONDS", "价格阶梯吃单前净优势至少连续保持多少秒", "0～600：价格阶梯（BTC / ETH 等按币安现货实时定价的各档）单独按这个秒数，不按上一项：几十个档位的盘口每分钟才刷一次，一根插针推出的假优势要等更久才露馅；0 = 一够就吃"),
     ("SIM_WAYS", "做哪种单", "吃单 = 算出仍留足净优势的最高价位（封顶价），盘口在它之下的立即买（真实交易用封顶限价单）；挂单 = 按建议价挂着等成交"),
     ("SIM_MARKETS", "做哪些市场", "可多选；全选 = all；展开详细选项可按市场逐个排除"),
-    ("SIM_SKIP", "不做的市场（详细选项）", "逗号分隔的市场代码；在“做哪些市场”卡片展开详细选项点选，空 = 所选类型里的市场都做"),
+    ("SIM_SKIP", "不做的市场（详细选项）", "逗号分隔的市场代码；在“做哪些市场”卡片展开详细选项点选，空 = 所选类型里的市场都做；没设过时默认排除美股的 12 张 15 分钟卡（只给预挂用），要原策略也做就在详细选项里恢复"),
     ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "容不下想买的份数时只买到刚好不超过的份数，一份都容不下才不买；0 = 不限"),
     ("SIM_TAKER_SESSION", "只在标的开盘时段吃单", "开 = 指数/个股日涨跌的吃单只在标的开盘时段（卡片按现货定价时）进行，盘后只挂单；挂单不受影响"),
     ("SOURCES_OFF", "关闭的行情源", "海外机房常被东方财富拒绝（502 / 直接断开）：关掉后每一轮、每个锚点查找和 /diag 都不再问它，由腾讯、新浪、Yahoo、Naver 顶上（A50 的 15:00 锚点只能用新浪 5 分钟 K 的近似值）"),
@@ -873,7 +873,7 @@ class Config:
             if len(keys) > 200 or any(len(k) > 40 for k in keys):
                 raise ValueError(f"{name} 应是逗号分隔的市场代码（最多 200 个，每个不超过 40 字符）")
             return keys
-        sim_skip = market_keys("SIM_SKIP")
+        sim_skip = market_keys("SIM_SKIP") if "SIM_SKIP" in e else frozenset(DEFAULT_SIM_SKIP)  # unset: the cards the model trader does not trade by default (1.135.0); set, even empty: as given
         sources_off = frozenset(t.strip().lower() for t in e.get("SOURCES_OFF", "").split(",") if t.strip())
         if unknown := sorted(sources_off - set(SourceHealth.NAMES)):
             raise ValueError(f"SOURCES_OFF 只认 {'、'.join(SourceHealth.NAMES)}（不认识：{'、'.join(unknown)}）")
@@ -7431,6 +7431,7 @@ class WindowUpDownSpec:
     minutes: int = 15
     venue: str = "futures"  # the Binance venue the price comes from: a contract's index (IndexUpDownMarket) or a spot pair's trades (SpotWindowMarket, 1.109.0)
     limit_pct: float = 0.0  # the exchange's daily price limit on the stock (STAR 0.20, KRX 0.30; 1.130.0): the pre-open mode stands aside near it; 0 = none
+    model: bool = True      # whether the model trader trades the card unless told otherwise: False puts it on SIM_SKIP's default — the pre-open mode's alone until restored on the page (1.135.0)
     ROLL_WAIT_MS = 60_000  # the card waits this long past a window's end for the end's index, then moves on regardless
     SCHEDULE_DAYS = 40     # how far current / before look for a trading day (the longest closure, Lunar New Year, is nine days)
 
@@ -7519,7 +7520,24 @@ WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
     # rules; the windows follow the Hong Kong session (智谱 2513.HK: 09:30–12:00, 13:00–16:00), which has no daily price limit —
     # of the pre-open mode's stock guard only the halt rule applies
     WindowUpDownSpec("ZHIPU-15M", "zhipu", "ZHIPUUSDT", "智谱", "hk"),
+    # 1.135.0: twelve US stocks and ETFs (mu-updown-15m-1793983500: 11-07 00:45–01:00 Beijing, 11-06 11:45 ET) on the same rules,
+    # Chainlink's <X>/USDT streams on Binance's futures index; no session here (the bot has no US quote feed: no stock guard) —
+    # Predict lists the windows while the US session runs and the discovery takes what it lists; the model trader leaves them
+    # alone by default (model=False: SIM_SKIP's default), the pre-open mode quotes them when PREOPEN_MARKETS names them
+    WindowUpDownSpec("MU-15M", "mu", "MUUSDT", "美光", model=False),
+    WindowUpDownSpec("SNDK-15M", "sndk", "SNDKUSDT", "闪迪", model=False),
+    WindowUpDownSpec("AVGO-15M", "avgo", "AVGOUSDT", "博通", model=False),
+    WindowUpDownSpec("SPCX-15M", "spcx", "SPCXUSDT", "SPCX", model=False),
+    WindowUpDownSpec("NVDA-15M", "nvda", "NVDAUSDT", "英伟达", model=False),
+    WindowUpDownSpec("GOOGL-15M", "googl", "GOOGLUSDT", "谷歌", model=False),
+    WindowUpDownSpec("META-15M", "meta", "METAUSDT", "Meta", model=False),
+    WindowUpDownSpec("TSM-15M", "tsm", "TSMUSDT", "台积电", model=False),
+    WindowUpDownSpec("AMZN-15M", "amzn", "AMZNUSDT", "亚马逊", model=False),
+    WindowUpDownSpec("QQQ-15M", "qqq", "QQQUSDT", "纳指ETF", model=False),
+    WindowUpDownSpec("SPY-15M", "spy", "SPYUSDT", "标普ETF", model=False),
+    WindowUpDownSpec("MSFT-15M", "msft", "MSFTUSDT", "微软", model=False),
 )
+DEFAULT_SIM_SKIP = tuple(spec.key for spec in WINDOW_UPDOWN_MARKETS if not spec.model)  # SIM_SKIP unset: these are left out of the model trader's markets (the page's 详细选项 restores one)
 
 
 def updown_odds(price: float, line: float, sigma: float, years: float, drift: float = -0.5,
@@ -9939,7 +9957,7 @@ SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": 
 CONTROL_FORMS: dict[str, dict] = {
     "LIVE": {"kind": "choice", "group": "策略", "options": [["off", "off 只记账"], ["pause", "pause 登录不开仓"], ["on", "on 真实下单"]]},
     "PREOPEN_15M": {"kind": "choice", "group": "预挂", "options": [["off", "off 关"], ["on", "on 开（需要 LIVE=on）"]]},
-    "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "options": [["btc", "BTC"], ["eth", "ETH"], ["bnb", "BNB"], ["xau", "黄金"], ["cl", "原油"], ["skhynix", "SK 海力士"], ["unitree", "宇树"], ["zhipu", "智谱"]]},  # 1.130.7: pick the cards one by one; 1.134.0: 黄金、原油、智谱
+    "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "options": [["btc", "BTC"], ["eth", "ETH"], ["bnb", "BNB"], ["xau", "黄金"], ["cl", "原油"], ["skhynix", "SK 海力士"], ["unitree", "宇树"], ["zhipu", "智谱"], ["mu", "美光"], ["sndk", "闪迪"], ["avgo", "博通"], ["spcx", "SPCX"], ["nvda", "英伟达"], ["googl", "谷歌"], ["meta", "Meta"], ["tsm", "台积电"], ["amzn", "亚马逊"], ["qqq", "纳指ETF"], ["spy", "标普ETF"], ["msft", "微软"]]},  # 1.130.7: pick the cards one by one; 1.134.0: 黄金、原油、智谱; 1.135.0: 美股 12 张
     "PREOPEN_EXCLUSIVE": {"kind": "choice", "group": "预挂", "options": [["off", "off 两边同时跑"], ["on", "on 预挂时原策略不开新仓"]]},
     "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
     "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},
@@ -20427,8 +20445,8 @@ class Bot:
             changed.append(key)  # the message names those whose value in force changed
             if value:
                 saved[key] = value
-            elif key in CONTROL_CLEARABLE and str(self.config.env.get(key) or "").strip():
-                saved[key] = ""  # chosen over the environment's list: kept, or popping it would bring that list back
+            elif key in CONTROL_CLEARABLE and (str(self.config.env.get(key) or "").strip() or (key == "SIM_SKIP" and DEFAULT_SIM_SKIP)):
+                saved[key] = ""  # chosen over the environment's list (or SIM_SKIP's default, 1.135.0): kept, or popping it would bring that list back
             else:
                 saved.pop(key, None)
         unknown = [k for k in values if k not in CONTROL_KEY_SET]

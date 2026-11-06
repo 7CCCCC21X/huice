@@ -188,7 +188,12 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         # the defaults are the trial: BTC alone, 10 shares a side (4.9U); "all" or a list widens it
         on = lambda **e: p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", **e}))
         self.assertEqual((on().shares, on().markets, on().side_usd, on().pair_usd, on().ahead_minutes), (10, frozenset({"BTC-15M"}), 4.9, 9.8, 1440))
-        self.assertEqual(on(PREOPEN_MARKETS="all").markets, frozenset({"BTC-15M", "ETH-15M", "BNB-15M", "XAU-15M", "CL-15M", "SKHYNIX-15M", "UNITREE-15M", "ZHIPU-15M"}))
+        self.assertEqual(on(PREOPEN_MARKETS="all").markets, frozenset({"BTC-15M", "ETH-15M", "BNB-15M", "XAU-15M", "CL-15M", "SKHYNIX-15M", "UNITREE-15M", "ZHIPU-15M", *m.DEFAULT_SIM_SKIP}))
+        self.assertEqual(set(m.DEFAULT_SIM_SKIP), {"MU-15M", "SNDK-15M", "AVGO-15M", "SPCX-15M", "NVDA-15M", "GOOGL-15M", "META-15M", "TSM-15M", "AMZN-15M", "QQQ-15M", "SPY-15M", "MSFT-15M"}, "1.135.0: the twelve US cards, the pre-open mode's alone by default")
+        self.assertEqual(on(PREOPEN_MARKETS="nvda,spy").markets, frozenset({"NVDA-15M", "SPY-15M"}))
+        self.assertEqual(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline"}).sim_skip, frozenset(m.DEFAULT_SIM_SKIP))
+        self.assertEqual(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "SIM_SKIP": ""}).sim_skip, frozenset(), "set empty on the page: the model trader takes them too")
+        self.assertEqual(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "SIM_SKIP": "hsi"}).sim_skip, frozenset({"HSI"}))
         self.assertEqual(on(PREOPEN_MARKETS="xau, zhipu").markets, frozenset({"XAU-15M", "ZHIPU-15M"}))  # 1.134.0
         zcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "PREOPEN_MARKETS": "zhipu", "SYMBOLS": "BTCUSDT"})
         self.assertEqual((zcfg.tickers["ZHIPUUSDT"].market, zcfg.tickers["ZHIPUUSDT"].code), ("hk", "02513"), "the quoted stock card's exchange ticker, SYMBOLS or not")

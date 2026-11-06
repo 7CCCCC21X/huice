@@ -168,7 +168,7 @@ async def run():
     assert all(x in body.decode() for x in ('id="exbox"', "renderExceptions", 'data-act="stop"', 'class="cols"', "const drafts", "lockView", "REC_LABELS")), "the page's new parts"
     assert "全部市场" in body.decode() and ".sw.on" in body.decode() and "绿色 = 开" in body.decode() and "挂单没开，不生效" in body.decode()
     assert 'act({action:"stop"},true)' in body.decode() and "async function act(body,urgent){if(busy&&!urgent)return false" in body.decode(), "1.77.0: the stop is never held back by another request"
-    assert s["SIM_SKIP"]["kind"] == "detail" and s["SIM_SKIP"]["value"] == "" and s["SIM_SKIP"]["group"] == "策略"
+    assert s["SIM_SKIP"]["kind"] == "detail" and s["SIM_SKIP"]["value"] == ",".join(sorted(m.DEFAULT_SIM_SKIP)) and s["SIM_SKIP"]["group"] == "策略"
     assert isinstance(data["catalog"], list) and all({"kind", "key", "name", "skipped"} <= set(r) for r in data["catalog"]) and "展开详细选项" in body.decode()
     # every setting has a widget, every group is one the page knows, and every preset / option is a value the Config accepts
     assert set(m.CONTROL_FORMS) == set(m.CONTROL_KEY_SET) and {f["group"] for f in m.CONTROL_FORMS.values()} == {"策略", "风控", "预挂", "高级"}
@@ -457,7 +457,8 @@ async def run():
     assert r["ok"] and ebot.config.sim_maker_deep_markets == {"HSI"} and ebot.config.sources_off == {"eastmoney"} and estore.get("control:env") == {"SIM_SKIP": ""}, r
     assert ebot.control_set({"SIM_WAYS": ""})["ok"] and ebot.config.sim_ways == "taker" and "SIM_WAYS" not in estore.get("control:env")  # elsewhere "" is the environment's
     plain = m.Bot(m.Config.from_env({**base, "WEB_CONTROL_KEY": KEY}), m.Store(":memory:"), FM(NOW), None)  # no environment list: nothing to stand over
-    assert plain.control_set({"SIM_SKIP": "hsi"})["ok"] and plain.control_set({"SIM_SKIP": ""})["ok"] and plain.store.get("control:env") == {}
+    assert plain.control_set({"SIM_SKIP": "hsi"})["ok"] and plain.control_set({"SIM_SKIP": ""})["ok"]
+    assert plain.store.get("control:env") == {"SIM_SKIP": ""} and plain.config.sim_skip == frozenset(), "1.135.0: the empty choice stands over SIM_SKIP's default (the US cards)"
     assert "values:{[s.key]:null}" in m.CONTROL_PAGE and "ds.overridden&&ds.env" in m.CONTROL_PAGE and "s.saved||s.overridden" in m.CONTROL_PAGE
     print("CONTROL_OK")
 

@@ -41,7 +41,7 @@ assert abs(c.sim_taker_after_hours - 0.15) < 1e-12 and c.sim_after_hours_max_pri
 for bad in ({"SIM_TAKER_AFTER_HOURS_CENTS": "51"}, {"SIM_AFTER_HOURS_MAX_PRICE_CENTS": "100"}):
     try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
     except ValueError: pass
-assert c.sim_skip == frozenset()  # the detail chips: SIM_SKIP names markets left out of the chosen kinds, upper-cased, blanks dropped
+assert c.sim_skip == frozenset(m.DEFAULT_SIM_SKIP)  # the detail chips: SIM_SKIP names markets left out of the chosen kinds, upper-cased, blanks dropped; unset: the US 15-minute cards (1.135.0)
 assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_SKIP": " hsi, bnb ,HSI,"}).sim_skip == frozenset({"HSI", "BNB"})
 c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEP_MARKETS": " hsi, kospi ", "SIM_MAKER_AFTER_HOURS_MARKETS": "sse", "SIM_TAKER_AFTER_HOURS_MARKETS": " hk0625usdt ,HSI"})
 assert c.sim_maker_deep_markets == {"HSI", "KOSPI"} and c.sim_maker_after_hours_markets == {"SSE"} and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).sim_maker_deep_markets == frozenset()
@@ -161,7 +161,7 @@ async def run():
     assert entry["sources"] == [{"what": "恒指期货", "source": "etnet"}] and entry["proxy"]["anchor"] == 24500.0
     assert entry["book"] == {"bids": [[0.55, 300.0]], "asks": [[0.58, 400.0]], "fetched_ms": NOW, "market_id": "101", "fee_bps": None}
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
-    assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
+    assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_skip": sorted(m.DEFAULT_SIM_SKIP), "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
                                 "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_against_move_sigmas": 0.0, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60, "sim_shares_net": True, "sim_no_odds_withdraw": 30, "sim_taker_hold_range": 30.0,
                                     "sim_maker_follow_settle": 0.0, "sigma_calib": True, "lead_quote": "on"} and maker["market_id"] == "101"  # 1.107.0: the two always written  # LEGACY keeps the 10¢ rule
@@ -513,7 +513,7 @@ async def run():
     assert all(k.startswith("will-bnb-hit-700-or-900|") for k in kbot.sim_trades()) and kbot.sim_trades(), sorted(kbot.sim_trades())
     rows = {r["market"]: r for r in kbot.sim_checks(NOW)}
     assert rows[HSI_SLUG]["maker_why"] == rows[HSI_SLUG]["taker_why"] == "详细选项里已排除这个市场" and rows["will-bnb-hit-700-or-900"]["taker_why"] != "详细选项里已排除这个市场"
-    assert "详细选项排除了 1 个市场（HSI）" in kbot.cmd_sim(None).text and kbot.sim_version()["sim_skip"] == ["HSI"] and "sim_skip" not in mbot.sim_version()
+    assert "详细选项排除了 1 个市场（HSI）" in kbot.cmd_sim(None).text and kbot.sim_version()["sim_skip"] == ["HSI"] and mbot.sim_version()["sim_skip"] == sorted(m.DEFAULT_SIM_SKIP)  # 1.135.0: unset, the US cards
     cat = kbot.sim_catalog(NOW)  # every market the bot prices, for the page's chips: the contract's daily card here, flagged when skipped
     assert {(r["kind"], r["key"], r["name"], r["skipped"]) for r in cat} >= {("close", "UNITREEUSDT", "宇树 UNITREE", False)}, cat
     assert len({(r["kind"], r["key"]) for r in cat}) == len(cat) and all(r["skipped"] == (r["key"].upper() in {"HSI"}) for r in cat), cat

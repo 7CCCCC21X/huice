@@ -180,7 +180,7 @@ async def run():
     bot = m.Bot(m.Config.from_env(ENV), store, fm, None)
     card = bot.updowns["UNITREE-15M"]
     assert isinstance(card, m.IndexUpDownMarket) and card.spec == spec and bot.updown_rolling["UNITREE-15M"] is W
-    assert bot.index_markets["UNITREEUSDT"] == [card] and set(bot.index_markets) == {"UNITREEUSDT", "SKHYNIXUSDT", "XAUUSDT", "CLUSDT", "ZHIPUUSDT"} and all(card not in v for v in bot.pair_markets.values())
+    assert bot.index_markets["UNITREEUSDT"] == [card] and set(bot.index_markets) == {"UNITREEUSDT", "SKHYNIXUSDT", "XAUUSDT", "CLUSDT", "ZHIPUUSDT", "MUUSDT", "SNDKUSDT", "AVGOUSDT", "SPCXUSDT", "NVDAUSDT", "GOOGLUSDT", "METAUSDT", "TSMUSDT", "AMZNUSDT", "QQQUSDT", "SPYUSDT", "MSFTUSDT"} and all(card not in v for v in bot.pair_markets.values())
     sk = bot.updowns["SKHYNIX-15M"]
     assert isinstance(sk, m.IndexUpDownMarket) and sk.exchange == "kr" and sk.spec == K.before(K.current(T0 + 5_000))  # its 10:45 window's end unread: settled first
     assert sk.point(sk.spec.start_ms) == "10:45（韩国时间 11:45）" and sk.spec.name == "SK 海力士 15分涨跌 10:45–11:00"
@@ -436,7 +436,7 @@ async def run():
     assert long_quiet.sim_quiet(mk.settle, T1 - 9 * 60_000) == ""  # SIM_QUIET_MINUTES would take most of the window: not applied here
     assert abs(long_quiet.sim_edge_bar(mk) - 0.06) < 1e-12 and long_quiet.sim_edge_bar(dataclasses_replace(mk, settle={"end": 1})) == long_quiet.config.sim_edge
     text = bot.sim_text()
-    assert "15 分钟涨跌（宇树、SK 海力士、BTC、ETH、BNB、黄金、原油、智谱，内测）：每次最多买 10 份（托底单也不例外），每个窗口两边持仓加挂单合计最多 100 份（不抵扣），每张卡未结算窗口的持仓加挂单合计不超过 $100，每个窗口最后 90 秒不下单、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
+    assert "15 分钟涨跌（宇树、SK 海力士、BTC、ETH、BNB、黄金、原油、智谱、美光、闪迪、博通、SPCX、英伟达、谷歌、Meta、台积电、亚马逊、纳指ETF、标普ETF、微软，内测）：每次最多买 10 份（托底单也不例外），每个窗口两边持仓加挂单合计最多 100 份（不抵扣），每张卡未结算窗口的持仓加挂单合计不超过 $100，每个窗口最后 90 秒不下单、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
     # no Telegram alert: a quarter-hour window is over before an alert confirmed over a minute is acted on by hand
     seen = []
     bot.edge_observe = lambda state, market, mk_, *a, **k: seen.append(market)
@@ -546,7 +546,7 @@ async def run():
     assert isinstance(btc, m.SpotWindowMarket) and btc.spec == bspec and btc.lead_mode == "off" and btc.GROUP == "crypto" and btc.TIE == D("0.0001")
     assert "BTCUSDT" not in bbot.index_markets and [c.spec.key for c in bbot.pair_markets[("spot", "BTCUSDT")]][:3] == ["BTC-2027", "BTC-DAY", "BTC-15M"]  # the touch card (1.132.0), then the price ladders
     assert "BTCUSDT" in bbot.binance_streams["spot"].symbols() and "btcusdt@aggTrade" in bbot.binance_streams["spot"].names()
-    assert "BTCUSDT" not in bbot.binance_streams["futures"].symbols() and set(bbot.index_markets) == {"UNITREEUSDT", "SKHYNIXUSDT", "XAUUSDT", "CLUSDT", "ZHIPUUSDT"}
+    assert "BTCUSDT" not in bbot.binance_streams["futures"].symbols() and set(bbot.index_markets) == {"UNITREEUSDT", "SKHYNIXUSDT", "XAUUSDT", "CLUSDT", "ZHIPUUSDT", "MUUSDT", "SNDKUSDT", "AVGOUSDT", "SPCXUSDT", "NVDAUSDT", "GOOGLUSDT", "METAUSDT", "TSMUSDT", "AMZNUSDT", "QQQUSDT", "SPYUSDT", "MSFTUSDT"}
     assert bbot.predict_targets(T0 + 5_000)["BTC-15M"] == bspec.slug and bspec.slug in bbot.predict.want_info
     closes, tick = {bspec.start_ms: "100000.00"}, ["100050.00"]
     calm_btc = [str(100000 * (1 + 0.0002 * (i % 2))) for i in range(241)]
