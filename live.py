@@ -957,6 +957,9 @@ class LiveBot(core.Bot):
     LIVE_REDEEM_READS = 40      # markets read a redeem round at most, the newest positions first (the rest the next round): never a flood on the rate limit the orders share
     LIVE_REDEEM_RETRY_SECONDS = 3600  # a position whose redeem failed (gas, a revert) is tried again after this long, not every look...
     LIVE_REDEEM_UNSENT_RETRY_SECONDS = 300  # ...one whose transaction never left (TxNotSent: not resolved on-chain yet, an RPC blip) after this long
+    LIVE_REDEEM_TICK_SECONDS = 5     # the automatic redeem's own timer (live_redeem_loop): rounds whatever the paper trader does
+    LIVE_REDEEM_NOTE_SECONDS = 3600  # a failed redeem reaches Telegram at most this often
+    REDEEM_REPORT_LINES = 6          # /live redeem check: the positions listed per kind (the rest counted)
     LIVE_REDEEM_MIN_BNB_WEI = 5 * 10 ** 14  # under 0.0005 BNB no redeem goes out (one costs about 0.0002): one note, not a failure per position
     LIVE_NOTE_SECONDS = 600     # the same failure is announced at most this often
     LIVE_PLACING_GRACE_MS = 120_000  # a record left in "placing" is reconciled by its hash after this long
@@ -987,6 +990,10 @@ class LiveBot(core.Bot):
         self.live_account_task: asyncio.Task | None = None  # the balances / approvals refresh, likewise
         self.live_redeem_failed: dict[str, float] = {}      # position key -> monotonic time its redeem failed
         self.live_redeem_lock = asyncio.Lock()               # one redeem round at a time (the command beside the automatic round)
+        self.live_redeem_last: dict = {}                     # the last round (automatic or /live redeem): when, what it found, or why it could not look
+        self.live_redeem_errors: dict[str, str] = {}         # position key -> why its last redeem failed (/live redeem check)
+        self.live_redeem_noted = -1e9                        # the last failed redeem told on Telegram (LIVE_REDEEM_NOTE_SECONDS)
+        self.live_redeem_loop_task: asyncio.Task | None = None
         self.live_gas_noted = -1e9
         self.live_step_ms: dict[str, int] = {}  # the last step's phases (预取 / 决策 / 下单 / 同步), for /diag
         self.live_fill_tasks: set = set()   # the fills reads of orders confirmed removed, beside the lane (live_fills_later)
@@ -1805,11 +1812,7 @@ class LiveBot(core.Bot):
             await self.live_late_fills(now_ms)  # 1.119.0: an order that ended with shares unfilled, against the account's positions
         except Exception as error:
             self.live_note_error(f"结束订单核对持仓失败：{core.clean_error(error) or type(error).__name__}")
-        if (self.config.live_auto_redeem and time.monotonic() - self.live_last_redeem >= self.LIVE_REDEEM_SECONDS
-                and (self.live_redeem_task is None or self.live_redeem_task.done())):
-            self.live_last_redeem = time.monotonic()
-            # beside the step: a round of chain calls (a dozen positions failing on gas took 25 s) never holds the next decision
-            self.live_redeem_task = asyncio.create_task(self.live_redeem_round(now_ms), name="live-redeem")
+        self.live_redeem_tick(now_ms)  # also on its own timer (live_redeem_loop): the step is not the only way a round starts
 
     LIVE_AUTH_RENEW_S = 900  # the sign-in token is renewed this long before it expires, in the background
 
@@ -1859,11 +1862,39 @@ class LiveBot(core.Bot):
                 "requotes": sum(1 for r in rows if r[4]), "parts": parts,
                 "flush": span([int(r[7]) for r in rows if r[7] is not None])}  # the wait for the writer before the request (1.111.1)
 
+    def live_redeem_tick(self, now_ms: int | None = None) -> None:
+        """An automatic redeem round started when one is due (LIVE_REDEEM_SECONDS since the last, sooner after a win:
+        live_redeem_soon) and none runs — beside the caller: a round of chain calls (a dozen positions failing on gas took
+        25 s) never holds a decision. Called by the trading step and by the redeem's own loop."""
+        if not self.config.live_auto_redeem or (self.config.live_mode == "off" and not self.live.ready):
+            return
+        if time.monotonic() - self.live_last_redeem < self.LIVE_REDEEM_SECONDS or (self.live_redeem_task is not None and not self.live_redeem_task.done()):
+            return
+        self.live_last_redeem = time.monotonic()
+        self.live_redeem_task = asyncio.create_task(self.live_redeem_round(self.market.now_ms() if now_ms is None else now_ms), name="live-redeem")
+
+    async def live_redeem_loop(self) -> None:
+        """The automatic redeem's own timer (1.131.4): it rode on the paper trader's step only, so with SIM=off (the
+        pre-open mode alone) or the step held up, nothing was ever redeemed."""
+        while not self.stopping.is_set():
+            try:
+                self.live_redeem_tick()
+            except Exception as error:
+                self.live_note_error(f"自动领取计时出错：{core.clean_error(error) or type(error).__name__}")
+            await self.wait(self.LIVE_REDEEM_TICK_SECONDS)
+
     async def live_redeem_round(self, now_ms: int) -> None:
         try:
+            if not self.live.ready:
+                await self.live_ensure_ready()  # signed in by the step otherwise: with the step off, here
+                if not self.live.ready:
+                    self.live_redeem_last = {"at": now_ms, "error": f"真实交易未就绪：{self.live.not_ready_why}"}
+                    return
             await self.live_redeem(now_ms)
         except Exception as error:
-            self.live_note_error(f"领取结算失败：{core.clean_error(error) or type(error).__name__}")
+            text = core.clean_error(error) or type(error).__name__
+            self.live_redeem_last = {"at": now_ms, "error": f"读取持仓失败：{text}"}
+            self.live_note_error(f"领取结算失败：{text}")
 
     def live_redeem_soon(self) -> None:
         """A real position just settled in the bot's favour (the pre-open mode's window, a record on Predict's final
@@ -2728,28 +2759,48 @@ class LiveBot(core.Bot):
             self.live_fail(tid, trade, f"吃单未成交（{st.get('cancel_why') or status or '不在盘口'}）", now_ms, retry=self.config.live_taker_retry)
 
     # --- redeeming resolved positions -------------------------------------------------------------------------------------
-    async def live_redeem(self, now_ms: int) -> list[str]:
-        """Positions on markets Predict has resolved: the winning outcome's shares are redeemed for USDT on-chain
-        (once per market and outcome); the lines say what was done. A position whose redeem failed waits
-        LIVE_REDEEM_RETRY_SECONDS; with no BNB for gas nothing is tried and the administrator hears once. A position
-        resolved against the bot is marked settled (``lost``) and never asked about again (1.131.3: each one cost a
-        market read every round, and the pre-open mode leaves one or more a filled window — hundreds a day against the
-        rate limit its orders and cancels share); a market is read once a round whatever outcomes are held, at most
-        LIVE_REDEEM_READS markets a round, the newest positions first (the rest the next round), and a rate limit ends
-        the round. One round at a time: the command and the automatic round never redeem one position twice."""
+    REDEEM_KINDS = {"redeemed": "领了", "claimable": "可领取", "failed": "领取失败", "waiting": "失败等重试", "fields": "缺字段",
+                    "kept": "已领仍列着", "open": "未结算", "lost": "输掉的", "unread": "没读到市场"}
+
+    def redeem_lock(self) -> asyncio.Lock:
         lock = getattr(self, "live_redeem_lock", None)
         if lock is None:
             lock = self.live_redeem_lock = asyncio.Lock()
-        async with lock:
-            return await self.live_redeem_pass(now_ms)
+        return lock
 
-    async def live_redeem_pass(self, now_ms: int) -> list[str]:
+    async def live_redeem(self, now_ms: int) -> list[str]:
+        """Positions on markets Predict has resolved: the winning outcome's shares are redeemed for USDT on-chain
+        (once per market and outcome); the lines say what was done. A position whose redeem failed waits
+        LIVE_REDEEM_RETRY_SECONDS; with no BNB for gas nothing is tried and the administrator hears once an hour. A
+        position resolved against the bot is marked settled (``lost``) and never asked about again (1.131.3: each one
+        cost a market read every round, and the pre-open mode leaves one or more a filled window — hundreds a day
+        against the rate limit its orders and cancels share); a market is read once a round whatever outcomes are held,
+        at most LIVE_REDEEM_READS markets a round, the newest positions first (the rest the next round), and a rate limit
+        ends the round. One round at a time: the command and the automatic round never redeem one position twice."""
+        async with self.redeem_lock():
+            done, _ = await self.live_redeem_pass(now_ms)
+            return done
+
+    async def live_redeem_pass(self, now_ms: int, dry_run: bool = False) -> tuple[list[str], list[dict]]:
+        """One look at the account's positions, the newest first: (the redeemed lines, each position judged). Kinds:
+        redeemed (now), claimable (resolved in its favour, not redeemed now: ``dry_run``, or no gas), failed (this
+        round), waiting (a failed redeem's back-off), lost, open (not resolved), unread (its market not read: the round's
+        cap, a failed read, a rate limit), fields (no index set on the position, no condition on the market), kept
+        (redeemed before, still listed). ``dry_run`` (/live redeem check): nothing sent, written or announced."""
         rows = await self.live.api.positions()
         self.live_positions = (rows, time.time())
-        done = []
+        done: list[str] = []
+        seen: list[dict] = []
         balance = self.live.balance
+        if not dry_run and (balance is None or len(balance) < 3 or time.time() - float(balance[2]) > self.LIVE_BALANCE_SECONDS):
+            with contextlib.suppress(Exception):  # the paper trader's step keeps it fresh; with that step off, here (1.131.4)
+                await self.live.refresh_balance()
+            balance = self.live.balance
         low_gas = balance is not None and int(balance[1]) < self.LIVE_REDEEM_MIN_BNB_WEI
         markets: dict[str, dict | None] = {}  # this round's reads, one per market (None: the read failed)
+        read_errors: dict[str, str] = {}
+        limited = False
+        errors = self.__dict__.setdefault("live_redeem_errors", {})
         for row in sorted(rows, key=lambda r: -self.position_time(r)):  # the newest first: a capped round reaches the fresh wins
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
             outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
@@ -2762,51 +2813,181 @@ class LiveBot(core.Bot):
                 continue
             index_set = int(outcome.get("indexSet") or 0)
             key = f"live:redeemed:{mid}:{index_set}"
-            if self.store.get(key) or time.monotonic() - self.live_redeem_failed.get(key, -1e9) < self.LIVE_REDEEM_RETRY_SECONDS:
+            entry = {"title": str(market.get("title") or market.get("question") or mid), "outcome": str(outcome.get("name") or index_set or "?"),
+                     "shares": from_wei(amount), "market_id": mid, "index_set": index_set}
+            mark = self.store.get(key)
+            if mark:
+                seen.append({**entry, "kind": "lost" if mark.get("lost") else "kept", "tx": str(mark.get("tx") or "")})
+                continue
+            failed_at = self.live_redeem_failed.get(key)
+            if failed_at is not None and time.monotonic() - failed_at < self.LIVE_REDEEM_RETRY_SECONDS:
+                seen.append({**entry, "kind": "waiting", "left": self.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - failed_at), "error": errors.get(key, "")})
+                continue
+            if not index_set:
+                seen.append({**entry, "kind": "fields", "error": "持仓没写 indexSet，分不出是哪一边"})
                 continue
             if mid not in markets:
-                if len(markets) >= self.LIVE_REDEEM_READS:
-                    continue  # the next round's
+                if limited or len(markets) >= self.LIVE_REDEEM_READS:
+                    seen.append({**entry, "kind": "unread", "error": "限流，这一轮不再读" if limited else "这一轮读满了，下一轮再看"})
+                    continue
                 try:
                     markets[mid] = await self.live.api.market(mid)
                 except Exception as error:
                     markets[mid] = None
-                    if getattr(error, "retry_after", 0) or http_status(error) == 429:
-                        break  # rate-limited: nothing more asked of Predict this round
-                    continue
+                    read_errors[mid] = core.clean_error(error) or type(error).__name__
+                    limited = bool(getattr(error, "retry_after", 0) or http_status(error) == 429)  # rate-limited: nothing more asked of Predict this round
             raw = markets[mid]
             if raw is None:
+                seen.append({**entry, "kind": "unread", "error": read_errors.get(mid, "")})
                 continue
             info = parse_market(raw, self.config.predict_fee_bps)
             resolved = core.predict_resolution(raw)
             if not core.PredictFeed.market_settled({"status": info.status}) or resolved is None:
+                seen.append({**entry, "kind": "open", "status": info.status or "?"})
                 continue
             won = resolved.get("split") or (resolved.get("index") is not None and index_set == int(resolved["index"]) + 1)
             if not won:
-                if resolved.get("index") is not None:  # resolved against it: worth nothing, never read again
-                    self.store.put(key, {"at": now_ms, "lost": True, "amount": str(amount), "title": str(market.get("title") or "")})
+                if resolved.get("index") is not None and not dry_run:  # resolved against it: worth nothing, never read again
+                    self.store.put(key, {"at": now_ms, "lost": True, "amount": str(amount), "title": entry["title"]})
+                seen.append({**entry, "kind": "lost"})
                 continue
+            entry["value"] = entry["shares"] * (0.5 if resolved.get("split") else 1.0)
             if not info.condition_id:
+                seen.append({**entry, "kind": "fields", "error": "市场没写 conditionId，领取交易填不出来"})
                 continue
-            if low_gas:
-                if time.monotonic() - self.live_gas_noted >= self.LIVE_REDEEM_RETRY_SECONDS:
-                    self.live_gas_noted = time.monotonic()
-                    self.live_note_error("⛽ 签名钱包的 BNB 不足 0.0005，有已结算的持仓等着领取：暂不自动领取，充值 BNB 后自动恢复")
-                return done
+            if dry_run or low_gas:
+                seen.append({**entry, "kind": "claimable"})
+                continue
             try:
                 tx = await self.live.chain.redeem(info.condition_id, index_set, amount, info.neg_risk, info.yield_bearing)
             except Exception as error:
                 unsent = isinstance(error, TxNotSent)  # never left (1.131.3): soon again — the chain may be a moment behind Predict's result
                 wait = self.LIVE_REDEEM_UNSENT_RETRY_SECONDS if unsent else self.LIVE_REDEEM_RETRY_SECONDS
+                text = core.clean_error(error) or type(error).__name__
                 self.live_redeem_failed[key] = time.monotonic() - self.LIVE_REDEEM_RETRY_SECONDS + wait
-                self.live_note_error(f"领取 {market.get('title') or mid} 失败：{core.clean_error(error) or type(error).__name__}"
-                                     + ("（交易没发出，5 分钟后再试）" if unsent else "（一小时后再试）"))
+                errors[key] = text
+                self.live_note_error(f"领取 {entry['title']} 失败：{text}" + ("（交易没发出，5 分钟后再试）" if unsent else "（一小时后再试）"))
+                seen.append({**entry, "kind": "failed", "error": text, "unsent": unsent})
                 continue
-            self.store.put(key, {"at": now_ms, "tx": tx, "amount": str(amount), "title": str(market.get("title") or "")})
-            line = f"💵 已领取 {market.get('title') or mid} {outcome.get('name') or ''} {from_wei(amount):g} 份：{tx}"
+            self.store.put(key, {"at": now_ms, "tx": tx, "amount": str(amount), "title": entry["title"]})
+            errors.pop(key, None)
+            line = f"💵 已领取 {entry['title']} {outcome.get('name') or ''} {from_wei(amount):g} 份：{tx}"
             done.append(line)
+            seen.append({**entry, "kind": "redeemed", "tx": tx})
             self.live_notify(line)
-        return done
+        if dry_run:
+            return done, seen
+        claimable = [s for s in seen if s["kind"] == "claimable"]
+        if low_gas and claimable and time.monotonic() - self.live_gas_noted >= self.LIVE_REDEEM_RETRY_SECONDS:
+            self.live_gas_noted = time.monotonic()
+            text = (f"⛽ 签名钱包的 BNB 不足 0.0005，{len(claimable)} 个已结算的持仓（约 ${sum(s['value'] for s in claimable):,.2f}）等着领取：暂不自动领取。"
+                    f"往 {self.live.wallet.signer} 转一点 BNB（BNB 链）后自动恢复")
+            self.live_note_error(text)
+            self.live_notify(text, key="redeem:gas")  # 1.131.4: told on Telegram, not only in the log
+        failed = [s for s in seen if s["kind"] == "failed"]
+        if failed and time.monotonic() - getattr(self, "live_redeem_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
+            self.live_redeem_noted = time.monotonic()
+            self.live_notify(f"⚠️ 自动领取：{len(failed)} 个已结算的持仓没领成（{failed[0]['title']}：{failed[0]['error']}），"
+                             f"{'5 分钟' if failed[0].get('unsent') else '一小时'}后自动再试。/live redeem check 查看原因", key="redeem:fail")
+        counts: dict[str, int] = {}
+        for s in seen:
+            counts[s["kind"]] = counts.get(s["kind"], 0) + 1
+        self.live_redeem_last = {"at": now_ms, "counts": counts, "low_gas": low_gas, "error": ""}
+        return done, seen
+
+    @classmethod
+    def live_redeem_summary(cls, last: dict) -> str:
+        """A round's findings in a line: the kinds of position it met, counted (or why it could not look)."""
+        if not last:
+            return "还没跑过"
+        if last.get("error"):
+            return str(last["error"])
+        counts = last.get("counts") or {}
+        text = "，".join(f"{label} {counts[k]}" for k, label in cls.REDEEM_KINDS.items() if counts.get(k))
+        return (f"持仓 {sum(counts.values())} 个" + (f"：{text}" if text else "")
+                + ("；签名钱包 BNB 不足，领取交易发不出去" if last.get("low_gas") and counts.get("claimable") else ""))
+
+    def live_redeem_status_line(self) -> str:
+        """/live: the automatic redeem in a line — on or off, the last round, whether one is running."""
+        if not self.config.live_auto_redeem:
+            return "自动领取：关（/live redeem 手动领取）"
+        last = getattr(self, "live_redeem_last", {}) or {}
+        task = getattr(self, "live_redeem_task", None)
+        when = f"上一轮 {max(0, int((self.market.now_ms() - int(last['at'])) / 60_000))} 分钟前：{self.live_redeem_summary(last)}" if last.get("at") else "本次启动后还没跑过"
+        return f"自动领取：开｜{when}" + ("｜正在领取" if task is not None and not task.done() else "") + "｜/live redeem check 查原因"
+
+    async def live_redeem_report(self, now_ms: int) -> str:
+        """/live redeem check, read-only (nothing sent, written or announced): the switches, the signing wallet's gas,
+        the last round, the account's positions by what the redeem makes of each (a dry run of live_redeem_pass), a
+        conclusion, the recent redeem problems (1.131.4)."""
+        c, wallet = self.config, self.live.wallet
+        if not self.live.ready:
+            await self.live_ensure_ready()
+        ready = self.live.ready
+        lines = [f"🔎 自动领取自检 {core.stamp(now_ms, seconds=False)}",
+                 f"开关：自动领取 {'开' if c.live_auto_redeem else '关'}｜LIVE={c.live_mode}｜" + ("已就绪" if ready else f"未就绪：{self.live.not_ready_why}"),
+                 self.live_redeem_status_line()]
+        try:
+            bnb = await self.live.chain.bnb_balance()
+        except Exception as error:
+            bnb = None
+            lines.append(f"签名钱包 {wallet.signer}（付 gas）：BNB 读取失败：{core.clean_error(error) or type(error).__name__}")
+        else:
+            lines.append(f"签名钱包 {wallet.signer}（付 gas）：BNB {from_wei(bnb):.5f}"
+                         + ("｜⛽ 不足 0.0005，领取交易发不出去" if bnb < self.LIVE_REDEEM_MIN_BNB_WEI else "｜够付 gas"))
+        if wallet.predict_account:
+            lines.append(f"持仓账户 {wallet.maker}（Predict 账户：领取由签名钱包经它的 Kernel 合约执行，领到的 USDT 进这个账户）")
+        if not ready:
+            lines.append("结论：真实交易未就绪，读不了持仓，也领不了：" + self.live.not_ready_why)
+            return "\n".join(lines)
+        async with self.redeem_lock():
+            _, seen = await self.live_redeem_pass(now_ms, dry_run=True)
+        n = lambda kind: sum(1 for s in seen if s["kind"] == kind)
+        value = sum(float(s.get("value") or 0) for s in seen if s["kind"] == "claimable")
+        lines.append(f"持仓 {len(seen)} 个：" + ("，".join(f"{label} {n(k)}" for k, label in self.REDEEM_KINDS.items() if n(k)) or "没有"))
+        listed = {"claimable": ("可领取", self.REDEEM_REPORT_LINES), "waiting": ("领取失败、等重试", self.REDEEM_REPORT_LINES),
+                  "fields": ("缺字段", self.REDEEM_REPORT_LINES), "kept": ("已发过领取交易、Predict 还列着", 3), "open": ("未结算", 3), "unread": ("这次没读到市场", 2)}
+        for kind, (label, cap) in listed.items():
+            items = [s for s in seen if s["kind"] == kind]
+            if not items:
+                continue
+            lines.append(f"{label}：")
+            for s in items[:cap]:
+                extra = {"claimable": f"，约 ${float(s.get('value') or 0):,.2f}",
+                         "waiting": f"：{s.get('error') or '?'}（{max(1, int(float(s.get('left') or 0) / 60))} 分钟后再试）",
+                         "fields": f"：{s.get('error')}", "kept": f"（交易 {s.get('tx', '')[:14]}…）",
+                         "open": f"（市场状态 {s.get('status')}）", "unread": f"：{s.get('error')}"}[kind]
+                lines.append(f"  · {s['title']} / {s['outcome']} {s['shares']:g} 份{extra}")
+            if len(items) > cap:
+                lines.append(f"  …另有 {len(items) - cap} 个")
+        low = bnb is not None and bnb < self.LIVE_REDEEM_MIN_BNB_WEI
+        waiting = [s for s in seen if s["kind"] == "waiting"]
+        reasons = []  # the gas first: without it neither the automatic round nor /live redeem can send anything
+        if (n("claimable") or waiting) and low:
+            reasons.append(f"签名钱包的 BNB 不够付 gas，领取交易发不出去：往 {wallet.signer} 转一点 BNB（BNB 链，比如 0.005），到账后下一轮自动领取")
+        if n("claimable") and not c.live_auto_redeem:
+            reasons.append(f"自动领取关着，{n('claimable')} 个可领取（约 ${value:,.2f}）不会自己领：控制台“高级”里打开“自动领取已结算持仓”，或发 /live redeem 手动领")
+        if reasons:
+            why = "；".join(reasons)
+        elif waiting:
+            why = f"链上领取失败：{waiting[0].get('error') or '见下方'}；到时自动再试，一直失败就把这条发我"
+        elif n("kept"):
+            why = "有持仓已经发过领取交易并上链，Predict 还列着：可能只是列表没更新；过 10 分钟还在，就把这条发我"
+        elif n("fields"):
+            why = "有已结算的持仓缺字段，没法领取：把这条发我"
+        elif n("claimable"):
+            why = f"有 {n('claimable')} 个可领取（约 ${value:,.2f}），下一轮自动领取会领；急用就发 /live redeem"
+        elif n("unread"):
+            why = "有市场这次没读到（限流或一轮读满），下一轮继续看"
+        elif n("open"):
+            why = "现在没有可领取的：赢的都领完了，剩下的还没结算，结算后自动领取"
+        else:
+            why = "现在没有可领取的：赢的都领完了，其余是输掉的"
+        lines.append("结论：" + why)
+        recent = [e for e in self.live_errors if "领取" in e or "⛽" in e][-3:]
+        if recent:
+            lines.append("最近的领取问题：\n" + "\n".join("  " + e for e in recent))
+        return "\n".join(lines)
 
     # --- telling the administrator ------------------------------------------------------------------------------------------
     def live_notify(self, text: str, key: str = "") -> None:
@@ -2839,6 +3020,8 @@ class LiveBot(core.Bot):
                     answer = f"/live {action} 失败：{core.clean_error(error) or type(error).__name__}"
                 await self.reply(req, answer if isinstance(answer, str) else getattr(answer, "text", str(answer)))
             asyncio.create_task(later(), name=f"live-{action}")
+            if action == "redeem" and words[1:2] == ["check"]:
+                return "领取自检中，结果随后发来"
             return {"check": "自检中，结果随后发来", "redeem": "领取中，结果随后发来", "fills": "持仓核对中，结果随后发来"}[action]
         return await self.live_action(action, req.args[1:], self.market.now_ms())
 
@@ -2865,10 +3048,18 @@ class LiveBot(core.Bot):
         if action == "mode":
             return await self.live_set_mode(args[0] if args else "")
         if action == "redeem":
+            if words[:1] == ["check"]:  # 1.131.4: why the resolved positions are (not) redeemed, read-only
+                return await self.live_redeem_report(now_ms)
             if not self.live.ready:
-                return f"未就绪：{self.live.not_ready_why}"
+                await self.live_ensure_ready()
+                if not self.live.ready:
+                    return f"未就绪：{self.live.not_ready_why}"
             lines = await self.live_redeem(now_ms)
-            return "\n".join(lines) if lines else "没有可领取的已结算持仓（或已全部领取）。"
+            if lines:
+                return "\n".join(lines)
+            last = self.live_redeem_last
+            head = "这次没有领取" if (last.get("counts") or {}).get("claimable") else "没有可领取的已结算持仓"
+            return f"{head}：{self.live_redeem_summary(last)}。/live redeem check 看原因"
         if action == "check":
             lines = await self.live_prepare()
             return "🔎 真实交易自检\n" + "\n".join(lines) + ("\n最近错误：\n" + "\n".join(self.live_errors[-5:]) if self.live_errors else "")
@@ -3345,6 +3536,7 @@ class LiveBot(core.Bot):
         failed_today = sum(int(t["opened"]) >= since and (t["live"].get("final") == "failed") for t in live)
         lines.append(f"持仓+挂单 ${exposure:,.2f} / ${self.config.live_max_open_usd:g}｜今日已结算盈亏 {money(self.live_daily_pnl(trades, now_ms))}"
                      f"（上限 −${self.config.live_max_daily_loss_usd:g}）｜挂单中 {resting}｜今日下单 {placed_today}｜失败 {failed_today}")
+        lines.append(self.live_redeem_status_line())
         stats = core.sim_stats(live)
         if stats["settled"]:
             lines.append(f"已结算 {stats['settled']} 笔：赢 {stats['wins']}｜输 {stats['losses']}｜平 {stats['ties']}"
@@ -3361,7 +3553,7 @@ class LiveBot(core.Bot):
             lines.append("\n最近错误：\n" + "\n".join(self.live_errors[-3:]))
         if last := (self.store.get("live:test") or {}).get("text"):
             lines.append("\n最近挂单测试：" + str(last).split("\n")[0].removeprefix("🧪 挂单测试 ") + "…（/live test 重跑）")
-        lines.append("\n/live mode off|pause|on｜pause｜resume｜cancel all｜redeem｜check｜orders｜positions｜test [市场] [份数] [价格¢]")
+        lines.append("\n/live mode off|pause|on｜pause｜resume｜cancel all｜redeem｜redeem check｜check｜orders｜positions｜test [市场] [份数] [价格¢]")
         if getattr(self, "preopen", None) is not None:
             lines.append("\n" + core.html.escape(self.preopen.status()) + "\n/preopen 查看预挂；紧急停止会撤销本模式订单")
         return "\n".join(lines)
@@ -3548,6 +3740,7 @@ class LiveBot(core.Bot):
         else:
             LOG.warning("LIVE=on：模拟交易的决定会真实下单。%s", "｜".join(lines))
             self.live_notify("💰 真实交易已启动\n" + "\n".join(lines), key="start")
+        self.live_redeem_loop_task = asyncio.create_task(self.live_redeem_loop(), name="live-redeem-loop")  # 1.131.4: whatever the paper trader does
         return await super().run()
 
 

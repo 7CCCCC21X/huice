@@ -692,11 +692,22 @@ async def run():
     bot.config = dataclasses.replace(bot.config, live_auto_redeem=False)
     bot.live_last_redeem = last
     assert "没有可领取" in await bot.cmd_live(req("redeem"))
+    # 1.131.4: /live redeem check — read-only: the switches, the gas, each position by what the redeem makes of it, a conclusion
+    report = await bot.cmd_live(req("redeem", "check"))
+    assert report.startswith("🔎 自动领取自检") and "签名钱包" in report and "｜够付 gas" in report, report
+    assert "持仓 3 个：" in report and "已领仍列着 1" in report and "未结算 1" in report and "输掉的 1" in report, report
+    assert "结论：有持仓已经发过领取交易并上链，Predict 还列着" in report and report.count("\n") < 30, report
     bot.live.chain.fail = "交易失败（已回滚）"
     fake.positions_rows.append({"id": "p4", "market": {"id": 101, "title": "恒生指数 10-05"}, "outcome": {"name": "Down", "indexSet": 2, "onChainId": "1012"},
                                 "amount": str(1 * WEI)})
     bot.store.delete_keys(["live:redeemed:101:2"])
+    sent, notify = [], bot.live_notify
+    bot.live_notify = lambda text, key="": sent.append((key, text))
     assert await bot.live_redeem(CLOSE + 72 * 60_000) == [] and "领取" in bot.live_errors[-1] and bot.store.get("live:redeemed:101:2") is None
+    bot.live_notify = notify
+    assert [k for k, _ in sent] == ["redeem:fail"] and "没领成" in sent[0][1] and "/live redeem check" in sent[0][1], sent  # 1.131.4: on Telegram, not only in the log
+    report = await bot.live_redeem_report(CLOSE + 72 * 60_000 + 5_000)
+    assert "领取失败、等重试：" in report and "结论：链上领取失败：交易失败（已回滚）" in report, report
     # 1.64.0: a failed position waits an hour; no BNB for gas: one note, no attempt; the auto-redeem runs beside the step
     n = len(bot.live_errors); bot.live.chain.fail = ""
     assert await bot.live_redeem(CLOSE + 72 * 60_000 + 10_000) == [] and len(bot.live_errors) == n and len(bot.live.chain.redeemed) == 1, "backed off"
@@ -711,7 +722,13 @@ async def run():
     bot.live_redeem_failed.clear()
     bot.live.chain.bnb = 10 ** 13
     await bot.live.refresh_balance()
+    sent, notify = [], bot.live_notify
+    bot.live_notify = lambda text, key="": sent.append((key, text))
     assert await bot.live_redeem(CLOSE + 72 * 60_000 + 20_000) == [] and len(bot.live.chain.redeemed) == 1 and "BNB 不足 0.0005" in bot.live_errors[-1]
+    bot.live_notify = notify
+    assert [k for k, _ in sent] == ["redeem:gas"] and bot.live.wallet.signer in sent[0][1], sent
+    report = await bot.live_redeem_report(CLOSE + 72 * 60_000 + 25_000)
+    assert "⛽ 不足 0.0005" in report and "可领取" in report and "结论：签名钱包的 BNB 不够付 gas" in report, report
     n = len(bot.live_errors)
     assert await bot.live_redeem(CLOSE + 72 * 60_000 + 30_000) == [] and len(bot.live_errors) == n, "said once an hour"
     bot.live.chain.bnb = 10 ** 17
@@ -722,6 +739,14 @@ async def run():
     assert bot.live_redeem_task is not None and len(bot.live.chain.redeemed) == 1, "the round runs beside the step"
     await bot.live_redeem_task
     assert len(bot.live.chain.redeemed) == 2 and bot.store.get("live:redeemed:101:2")["tx"] == "0xredeem"
+    # 1.131.4: the automatic redeem on its own timer — no trading step needed (SIM=off: the pre-open mode alone)
+    bot.live_last_redeem, before = -1e9, bot.live_redeem_task
+    loop = asyncio.create_task(bot.live_redeem_loop())
+    await asyncio.sleep(0); await asyncio.sleep(0)
+    assert bot.live_redeem_task is not before, "a round started by the redeem's own loop"
+    bot.stopping.set(); await loop; bot.stopping.clear()
+    await bot.live_redeem_task
+    assert "自动领取：开｜上一轮 0 分钟前：持仓" in bot.live_text(CLOSE + 72 * 60_000 + 40_000), bot.live_text(CLOSE + 72 * 60_000 + 40_000)
     bot.config = dataclasses.replace(bot.config, live_auto_redeem=False)
     # the sync step never stops the paper trader: an API failure is a line in /live
     fake.fail_open = "HTTP 500: down"

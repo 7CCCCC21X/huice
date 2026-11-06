@@ -49,7 +49,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.131.3"
+VERSION = "1.131.4"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -13743,7 +13743,7 @@ COMMANDS: tuple[Command, ...] = (
             "筛选词和 /journal 一样；1 / 5 / 30 分钟后盘口中间价 − 成交价、模型公平价的变化，持续为负 = 挂单被信息领先的对手吃掉"),
     Command("market", "看 Predict 对一张卡当前市场的说法：市场号、类别类型、结果名称、状态、起点价（startPrice）、详情里和价格有关的字段，以及卡片定价用的起点", "btc15分涨跌"),
     Command("sim", "模拟交易：净优势 ≥10¢ 时买 100 份，看长期是赚还是亏（只记账，不下单）"),
-    Command("live", "真实交易（LIVE=on）：钱包、余额、真实订单、持仓与风控；暂停/恢复/撤单/领取；fills 把账户持仓和记录逐项核对", "pause|resume|cancel all|redeem|check|fills",
+    Command("live", "真实交易（LIVE=on）：钱包、余额、真实订单、持仓与风控；暂停/恢复/撤单/领取；fills 把账户持仓和记录逐项核对", "pause|resume|cancel all|redeem|redeem check|check|fills",
             "LIVE=on 时模拟交易的每个决定都会在 Predict 真实下单；/live pause 停止开新仓，/live resume 恢复"),
     Command("preopen", "15 分钟市场开盘前双边预挂（PREOPEN_15M=on，真实交易）：状态；check 体检（限流、卡住的撤单、最近问题）；pause / resume 暂停恢复；probe 只读探测市场列表", "check|pause|resume|probe"),
     Command("diag", "逐个检测数据源（币安/交易所/上证/A50/恒指/KOSPI/HL/汇率），找出哪里出问题"),
