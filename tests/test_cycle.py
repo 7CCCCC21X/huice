@@ -15,7 +15,10 @@ class FakeMarket:
         return {s: {"symbol": s, "price": self.price, "time": self.now_ms()} for s in self.config.symbols}
 
 async def run():
-    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "SYMBOLS": "UNITREEUSDT", "BASELINE_MODE": "manual", "MIN_ALERT_GAP_SECONDS": "0"})
+    # AUCTION_ALERT off: this suite runs on the real clock, and in the first two minutes of a closing auction (Beijing 14:20 KRX,
+    # 14:57 SSE, 16:00 HKEX, weekdays) the cycle sends its reminder first — two Railway builds failed on it (11-06 14:20, 16:01)
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "SYMBOLS": "UNITREEUSDT", "BASELINE_MODE": "manual", "MIN_ALERT_GAP_SECONDS": "0",
+                             "AUCTION_ALERT": "off"})
     store = m.Store(":memory:"); tg = FakeTelegram(); bot = m.Bot(cfg, store, FakeMarket(cfg), tg)
     today = m.beijing_day()
     store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
