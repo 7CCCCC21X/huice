@@ -6,7 +6,7 @@
 
 | 项目 | 行为 |
 | --- | --- |
-| 标的 | `PREOPEN_MARKETS` 里的卡：默认只挂 BTC（`btc`）；`all` = 三张（BTC-15M、SKHYNIX-15M、UNITREE-15M），或逗号列表 |
+| 标的 | `PREOPEN_MARKETS` 里的卡：默认只挂 BTC（`btc`）；`eth`、`bnb`、`skhynix`、`unitree`，或逗号列表；`all` = 五张（BTC-15M、ETH-15M、BNB-15M、SKHYNIX-15M、UNITREE-15M） |
 | 日期 | 不限当天：提前范围内的任何一天（跨午夜的场次也挂） |
 | 范围 | 只挂 `PREOPEN_AHEAD_MINUTES`（默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场）分钟内开始的场次，最近的先；股票市场遵守配置的交易日、假期和特殊时段 |
 | 新单截止 | 距场次开始不足 `PREOPEN_ENTRY_SECONDS`（默认 180）秒不再新挂；到期前不足 1 分钟的不再发送 |
@@ -39,7 +39,7 @@
 ```env
 PREOPEN_15M=on
 PREOPEN_POLL_SECONDS=5
-PREOPEN_MARKETS=btc          # 默认只挂 BTC；all = 三张都挂，或 btc,skhynix 这样的列表
+PREOPEN_MARKETS=btc          # 默认只挂 BTC；all = 五张都挂，或 btc,eth,bnb 这样的列表
 PREOPEN_SHARES=10            # 每边份数（1～500），默认 10
 PREOPEN_PRICE_CENTS=49       # 每边价格（1～50¢）
 PREOPEN_LEVELS=              # 第 2 档起的价格x份数，如 48x20,47x40；空 = 只挂第一档

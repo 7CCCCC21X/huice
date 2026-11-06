@@ -937,7 +937,7 @@ async def november():
         market = FakeMarket()
         bot = m.Bot(cfg, m.Store(":memory:"), market, None)
         assert list(bot.ranges) == [s.key for s in LIVE] and list(bot.touches) == ["SOL", "ETH"]  # 1.101.1: BNB 先触 decided, taken off; 1.112.3: STRC over
-        assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY", "UNITREE-15M", "SKHYNIX-15M", "BTC-15M"] and not bot.flips and not bot.caps  # 1.97.0: the daily up/down cards; 1.102.0 / 1.103.0 / 1.109.0: the 15-minute ones
+        assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY", "UNITREE-15M", "SKHYNIX-15M", "BTC-15M", "ETH-15M", "BNB-15M"] and not bot.flips and not bot.caps  # 1.97.0: the daily up/down cards; 1.102.0 / 1.103.0 / 1.109.0: the 15-minute ones
         targets = bot.predict_targets(MID)
         assert all(targets[s.key] == s.slug and s.key in bot.predict.ladder_keys for s in NOV) and not any(k.endswith("-HIT-10") for k in targets)
         # BNB 先触 700/900 (BNB fell to $700 first; Predict's book was gone, the card showed its HTTP 400): no book asked for, no
@@ -957,6 +957,7 @@ async def november():
         items = [(i["group"], i["name"]) for i in bot.odds_payload()["items"] if i["group"] in {"crypto", "levels", "ladder"}]
         assert items == [("crypto", "SOL 先触 60/140"), ("crypto", "ETH 先触 1k/3k"),
                          ("crypto", "BTC 11-05 涨跌"), ("crypto", "ETH 11-05 涨跌"), ("crypto", "BNB 11-05 涨跌"), ("crypto", "BTC 15分涨跌 16:00–16:15"),  # 1.109.0: in 加密
+                         ("crypto", "ETH 15分涨跌 16:00–16:15"), ("crypto", "BNB 15分涨跌 16:00–16:15"),  # 1.129.1
                          ("levels", "BTC 11月价格"), ("levels", "ETH 11月价格"), ("levels", "SOL 11月价格"), ("levels", "HYPE 11月价格"),
                          ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格")], items
         # the price streams follow: HYPEUSDT on futures for its ladder; no HYPE / SOL on Hyperliquid (the flip is gone)

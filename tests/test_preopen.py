@@ -89,7 +89,7 @@ class Api:
 def controller(markets=None, **env):
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:",
                              "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "LIVE_MAX_OPEN_USD": "7000",
-                             "PREOPEN_MARKETS": "all", "PREOPEN_SHARES": "50", "PREOPEN_AHEAD_MINUTES": "60", **env})  # the tests' figures: the three cards, 50 a side, an hour ahead
+                             "PREOPEN_MARKETS": "btc,skhynix,unitree", "PREOPEN_SHARES": "50", "PREOPEN_AHEAD_MINUTES": "60", **env})  # the tests' figures: three cards, 50 a side, an hour ahead
     clock = types.SimpleNamespace(ms=NOW)
     wallet = types.SimpleNamespace(maker="0x" + "1" * 40,
         sign_order=lambda order, *flags: ("0x" + hashlib.sha256(json.dumps(order, sort_keys=True).encode()).hexdigest(), "0xsignature"))
@@ -118,7 +118,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl, api, clock = controller()
         for stem in ("btc", "unitree", "skhynix"):
             self.assertIsNotNone(p.candidate(market(stem), NOW, ctl.owner.config, ctl.settings))
-        for row in (market("eth"), market(at=NOW + 120000), market(at=NOW - 900000), market(at=NOW + 86400000),
+        for row in (market("sol"), market(at=NOW + 120000), market(at=NOW - 900000), market(at=NOW + 86400000),
                     market(status="CANCEL_ONLY"), market(status="CLOSED")):
             self.assertIsNone(p.candidate(row, NOW, ctl.owner.config, ctl.settings))
         row = market(); row["question"] = "10:00AM-10:15AM ET"
@@ -126,7 +126,10 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p.candidate_problem(market(at=NOW), NOW, ctl.owner.config, ctl.settings), "已开始或不足 3 分钟")
         self.assertEqual(p.candidate_problem(market(at=NOW + 120000), NOW, ctl.owner.config, ctl.settings), "链接里的时间不是整刻钟")
         self.assertEqual(p.candidate_problem(market(at=NOW + 2 * 3600_000), NOW, ctl.owner.config, ctl.settings), "开始还在 60 分钟之外（之后再扫）")
-        self.assertEqual(p.candidate_problem(market("eth"), NOW, ctl.owner.config, ctl.settings), "不是三张 15 分钟卡的链接")
+        self.assertEqual(p.candidate_problem(market("sol"), NOW, ctl.owner.config, ctl.settings), "不是 15 分钟卡的链接")
+        self.assertEqual(p.candidate_problem(market("eth"), NOW, ctl.owner.config, ctl.settings), "不在 PREOPEN_MARKETS 里")  # 1.129.1: a card, not quoted by these settings
+        for stem in ("eth", "bnb"):
+            self.assertIsNotNone(p.candidate(market(stem), NOW, ctl.owner.config, dataclasses.replace(ctl.settings, markets=frozenset({"ETH-15M", "BNB-15M"}))))
         self.assertEqual(p.candidate_problem(market(status="CLOSED"), NOW, ctl.owner.config, ctl.settings), "交易状态 CLOSED")
         await self.finish(ctl)
 
@@ -160,7 +163,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((order["makerAmount"], order["takerAmount"], api.sent[0]["data"]["pricePerShare"]), (str(L.to_wei("4.5")), str(L.to_wei(10)), str(L.to_wei(".45"))))
         self.assertEqual(ctl.risk(), 9.)
         await self.finish(ctl)
-        for bad in ({"PREOPEN_SHARES": "1"}, {"PREOPEN_PRICE_CENTS": "51"}, {"PREOPEN_MARKETS": "eth"}, {"PREOPEN_AHEAD_MINUTES": "2"}):
+        for bad in ({"PREOPEN_SHARES": "1"}, {"PREOPEN_PRICE_CENTS": "51"}, {"PREOPEN_MARKETS": "sol"}, {"PREOPEN_AHEAD_MINUTES": "2"}):
             with self.assertRaises(ValueError):
                 controller(**bad)
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_SHARES": "20"})
@@ -173,7 +176,8 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         # the defaults are the trial: BTC alone, 10 shares a side (4.9U); "all" or a list widens it
         on = lambda **e: p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", **e}))
         self.assertEqual((on().shares, on().markets, on().side_usd, on().pair_usd, on().ahead_minutes), (10, frozenset({"BTC-15M"}), 4.9, 9.8, 1440))
-        self.assertEqual(on(PREOPEN_MARKETS="all").markets, frozenset({"BTC-15M", "SKHYNIX-15M", "UNITREE-15M"}))
+        self.assertEqual(on(PREOPEN_MARKETS="all").markets, frozenset({"BTC-15M", "ETH-15M", "BNB-15M", "SKHYNIX-15M", "UNITREE-15M"}))
+        self.assertEqual(on(PREOPEN_MARKETS="btc,eth,bnb").markets, frozenset({"BTC-15M", "ETH-15M", "BNB-15M"}))
         self.assertEqual(on(PREOPEN_MARKETS="btc, skhynix").markets, frozenset({"BTC-15M", "SKHYNIX-15M"}))
         self.assertEqual(on(PREOPEN_MARKETS="").markets, frozenset({"BTC-15M"}))
 
@@ -701,13 +705,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         await self.finish(ctl)
 
     async def test_probe_reports_each_coming_window(self):
-        ctl, api, _ = controller([market(), market(at=NOW + 15 * 60_000, mid=5, status="CLOSED"), market("eth", mid=6)])
+        ctl, api, _ = controller([market(), market(at=NOW + 15 * 60_000, mid=5, status="CLOSED"), market("sol", mid=6)])
         lines = await p.probe(api, ctl.owner.config, ctl.settings, NOW)
         text = "\n".join(lines)
         self.assertIn("btc-updown-15m-1793930400（10:00）：会挂；状态 REGISTERED / 交易状态 MATCHING_NOT_ENABLED；缺字段：question", text)  # the fixture states no question
         self.assertIn("btc-updown-15m-1793927700（09:15）：不挂：交易状态 CLOSED", text)
         self.assertGreaterEqual(text.count("：还没发布"), 6)  # the other BTC quarters, 海力士's and 宇树's
-        self.assertNotIn("eth", text)
+        self.assertNotIn("sol", text)
         self.assertIn("UNITREE-15M 连续 4 个刻钟没发布或读不到，更晚的不再问", text)  # the whole day is scanned, each card's list ending at four unlisted in a row
         async def broken(method, path, **kw): raise m.RemoteError("HTTP 403: 访问被拒绝")
         api.call = broken

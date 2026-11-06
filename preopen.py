@@ -212,7 +212,7 @@ def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings
         if core.Bot.window_title_problem(checker, spec):
             return "问题里的时间段和链接对不上"
         return ""
-    return "不是三张 15 分钟卡的链接"
+    return "不是 15 分钟卡的链接"
 
 
 def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dict | None:

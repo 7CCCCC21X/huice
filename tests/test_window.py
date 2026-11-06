@@ -436,7 +436,7 @@ async def run():
     assert long_quiet.sim_quiet(mk.settle, T1 - 9 * 60_000) == ""  # SIM_QUIET_MINUTES would take most of the window: not applied here
     assert abs(long_quiet.sim_edge_bar(mk) - 0.06) < 1e-12 and long_quiet.sim_edge_bar(dataclasses_replace(mk, settle={"end": 1})) == long_quiet.config.sim_edge
     text = bot.sim_text()
-    assert "15 分钟涨跌（宇树、SK 海力士、BTC，内测）：每次最多买 10 份（托底单也不例外），每个窗口两边持仓加挂单合计最多 100 份（不抵扣），每张卡未结算窗口的持仓加挂单合计不超过 $100，每个窗口最后 90 秒不下单、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
+    assert "15 分钟涨跌（宇树、SK 海力士、BTC、ETH、BNB，内测）：每次最多买 10 份（托底单也不例外），每个窗口两边持仓加挂单合计最多 100 份（不抵扣），每张卡未结算窗口的持仓加挂单合计不超过 $100，每个窗口最后 90 秒不下单、撤掉挂单（SIM_CRYPTO_15M_*）" in text, text
     # no Telegram alert: a quarter-hour window is over before an alert confirmed over a minute is acted on by hand
     seen = []
     bot.edge_observe = lambda state, market, mk_, *a, **k: seen.append(market)
