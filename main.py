@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.141.1"
+VERSION = "1.142.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -550,7 +550,7 @@ class PreopenSettings:
         cap = float(e.get("PREOPEN_MAX_OPEN_USD", "0"))  # 0 = no cap (1.132.3: Predict locks no USDT for a resting order; the balance check stands)
         cents, shares, ahead = int(e.get("PREOPEN_PRICE_CENTS", "49")), int(e.get("PREOPEN_SHARES", "10")), int(e.get("PREOPEN_AHEAD_MINUTES", "1440"))
         cancel, expiry, entry = int(e.get("PREOPEN_CANCEL_SECONDS", "20")), int(e.get("PREOPEN_EXPIRY_SECONDS", "10")), int(e.get("PREOPEN_ENTRY_SECONDS", "180"))
-        stems = {r.short.lower(): r.key for r in WINDOW_UPDOWN_MARKETS}  # btc, eth…; btc5 for the 5-minute card (1.137.0)
+        stems = {r.short.lower(): r.key for r in preopen_cards()}  # btc, eth…; btc5 for the 5-minute card (1.137.0); btc1h / btc1d the hourly and daily (1.142.0)
         keys = frozenset(stems.values())
         wanted = [w.strip() for w in str(e.get("PREOPEN_MARKETS", "btc")).split(",") if w.strip()] or ["btc"]
         markets = (keys if any(w.lower() == "all" for w in wanted) else frozenset() if any(w.lower() == "none" for w in wanted)
@@ -664,7 +664,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_ORPHAN_CANCEL", "自动撤掉无记录的挂单", "开 = 账户上本机器人没有记录、却挂在本机器人做过的市场上的挂单（丢失跟踪的单：重启、改设置或撤单没撤成留下的，成交了也没人记账），连续 2 分钟还在就自动撤掉并通知；没做过的市场上的挂单当作手动单，只报不撤。关 = 只报不撤，/live cancel account 手动撤"),
     ("PREOPEN_15M", "开盘前预挂（15 分钟市场）", "开 = 15 分钟场次一发布就在涨跌两边各挂一张 post-only 买单，开场前撤掉（PREOPEN.md）；需要 LIVE=on。改动即时生效：开就启动，关就撤单停下，改参数先撤单再按新参数重启。预挂的预留计入持仓+挂单上限，当日盈亏计入日亏损停机线"),
     ("PREOPEN_EXCLUSIVE", "预挂时原策略暂停开新仓", "开 = 本模式真实运行时普通模型策略不开新仓（原策略也在交易同一批 15 分钟市场时建议开）；关 = 两边同时跑，额度和日亏损合并计算"),
-    ("PREOPEN_MARKETS", "预挂哪几张卡", "点亮要挂的卡，可多选，全选 = all（默认只挂 BTC）；BTC 5分、ETH 5分、BNB 5分 是每 5 分钟一场的卡（1.137.0，只给预挂用）；“一键全关”= none：一张都不挂、已挂的预挂单撤掉，本模式仍开着，再点亮一张就恢复；和“做哪些市场”互不影响：那边排除 15 分钟卡只管原策略，预挂只认这里"),
+    ("PREOPEN_MARKETS", "预挂哪几张卡", "点亮要挂的卡，可多选，全选 = all（默认只挂 BTC）；BTC 5分、ETH 5分、BNB 5分 是每 5 分钟一场的卡（1.137.0，只给预挂用）；BTC 小时、ETH 小时、BNB 小时 是每小时一场（bitcoin-up-or-down-<日期>-<几点>-et，那一小时开始前撤单），BTC 日、ETH 日、BNB 日 是每天一场（<币>-up-or-down-on-<日期>，前一天 12:00 ET 开始，开始前撤单）（1.142.0，只给预挂用）；“一键全关”= none：一张都不挂、已挂的预挂单撤掉，本模式仍开着，再点亮一张就恢复；和“做哪些市场”互不影响：那边排除 15 分钟卡只管原策略，预挂只认这里"),
     ("PREOPEN_WEEKEND", "周末也挂", "开 = 周末的场次照挂；关 = 周末不挂：北京时间周六 00:00 到周一 08:00 开始的场次不挂（周日晚到周一早上是币圈最薄的时段），周五起就不挂周六的场次，周末里已挂的按“设置不同”撤掉（不算再报价次数），周一 08:00 起恢复。股票卡周末本来没有场次，这项只影响 BTC、ETH、BNB 这些周末也有场次的卡"),
     ("PREOPEN_SHARES", "预挂每边份数", "1～500：每场每边各挂这么多份（默认 10），每边不少于 $1"),
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
@@ -7451,6 +7451,29 @@ DAILY_UPDOWN_MARKETS: tuple[DailyUpDownSpec, ...] = (
 )
 
 
+def window_title_text(question: str, spec: "UpDownSpec") -> str:
+    """A 15-minute market's question names its time range ("… 10:00PM-10:15PM ET"): when it does, it must start where the
+    slug's time was read as the start (WindowUpDownSpec), or nothing is suggested. "" when it agrees or says no time."""
+    found = re.search(r"(\d{1,2}):(\d{2})\s*([AP]M)?\s*[-–—~至到]\s*(\d{1,2}):(\d{2})\s*([AP]M)?\s*(?:ET|EST|EDT)\b", question, re.I)
+    if not found:
+        return ""
+    h1, m1, half1, h2, m2, half2 = (int(found.group(1)), int(found.group(2)), (found.group(3) or "").upper(),
+                                    int(found.group(4)), int(found.group(5)), (found.group(6) or "").upper())
+    wall = lambda h, m, half: ((h % 12 + (12 if half == "PM" else 0)) if half else h) * 60 + m  # minutes of the day
+    inherited = not half1 and bool(half2)  # "10:00-10:15PM": the half of the day written once, for both
+    if inherited:
+        half1 = half2
+    start, end = wall(h1, m1, half1), wall(h2, m2, half2)
+    if inherited and start >= end:  # "11:45-12:00PM" (an hour before noon), "11:45-12:00AM" (before midnight): the other half
+        half1 = "AM" if half1 == "PM" else "PM"
+        start = wall(h1, m1, half1)
+    at = spec.start_ms + 60_000
+    et = dt.datetime.fromtimestamp(at / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(at))))
+    if start == et.hour * 60 + et.minute:
+        return ""
+    return (f"Predict 市场写的时间段（{found.group(0)}）和按链接推算的窗口（{et:%H:%M} ET 起）对不上，请核实；暂不给建议")
+
+
 @dataclass(frozen=True)
 class WindowUpDownSpec:
     """A "<coin> Up or Down 15m" market, a new one every 15 minutes (unitree-updown-15m-<window start, Unix seconds>):
@@ -7545,6 +7568,37 @@ class WindowUpDownSpec:
         """What a position's record carries to mark its market for the beta limits (sim_beta): the window's length."""
         return {"window": f"{self.minutes}m"}
 
+    # --- what the pre-open mode asks of a card (1.142.0: the hourly and daily cards below answer the same) ----------------------
+    @property
+    def cycle_ms(self) -> int:
+        """How often Predict lists one more window of the card: one a window."""
+        return self.window_ms
+
+    def slug_of(self, start_ms: int) -> str:
+        return f"{self.prefix}{start_ms // 1000}"
+
+    def start_of(self, slug: str) -> int | None:
+        """The start a slug of this card names (Unix seconds after the prefix); None for another card's slug."""
+        suffix = slug.removeprefix(self.prefix)
+        return int(suffix) * 1000 if slug.startswith(self.prefix) and suffix.isdigit() else None
+
+    def on_grid(self, start_ms: int) -> bool:
+        return start_ms % self.window_ms == 0
+
+    def first_start(self, ms: int) -> int:
+        """The first window start at or after ``ms`` on the card's grid (whether its market exists: ``exists``)."""
+        return -(-ms // self.window_ms) * self.window_ms
+
+    def next_start(self, start_ms: int) -> int:
+        return start_ms + self.window_ms
+
+    def end_of(self, start_ms: int) -> int:
+        return start_ms + self.window_ms
+
+    def title_problem(self, question: str, start_ms: int) -> str:
+        """Why a market's question disagrees with the slug's window (window_title_text); "" when it agrees or names no time."""
+        return window_title_text(question, self.window_spec(start_ms))
+
 
 WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
     # "宇树科技 (UNITREE) 涨或跌 15分" (unitree-updown-15m-1793761200: 11-04 11:00–11:15 Beijing, 11-03 22:00–22:15 ET): "Up
@@ -7598,6 +7652,197 @@ WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
     WindowUpDownSpec("BNB-5M", "bnb", "BNBUSDT", "BNB", minutes=5, venue="spot", model=False),
 )
 DEFAULT_SIM_SKIP = tuple(spec.key for spec in WINDOW_UPDOWN_MARKETS if not spec.model)  # SIM_SKIP unset: these are left out of the model trader's markets (the page's 详细选项 restores one)
+
+
+# --- the pre-open mode's hourly and daily cards (1.142.0) ---------------------------------------------------------------------------
+# They answer what the pre-open mode asks of a window card (WindowUpDownSpec's "what the pre-open mode asks" methods): the slug
+# for a start and back, the grid of starts, the window's name and end, how often one is listed, whether a market's question
+# agrees with the slug. The pre-open mode's alone: the model trader prices no hourly card, and its daily cards are DailyUpDownSpec.
+RANGE_ET = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*([AP]M)?\s*[-–—~至到]\s*(\d{1,2})(?::(\d{2}))?\s*([AP]M)\s*(?:ET|EST|EDT)\b", re.I)
+TIME_ET = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*([AP]M)\s*(?:ET|EST|EDT)\b", re.I)
+MONTH_DAY = re.compile(r"\b(" + "|".join(MONTHS) + r")\s+(\d{1,2})\b", re.I)
+
+
+def et_clock(ms: int) -> dt.datetime:
+    """An instant on the US Eastern wall clock."""
+    return dt.datetime.fromtimestamp(ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(ms))))
+
+
+@dataclass(frozen=True)
+class HourlyUpDownSpec:
+    """A "<coin> Up or Down - <date>, <hour> ET" market (bitcoin-up-or-down-november-7-2026-2am-et): the hour from <hour> ET
+    on <date>, Up when the price at its end is above the one at its start. Round the clock, one an hour; the slug names the
+    hour's start on the ET wall clock ("12am" midnight, "12pm" noon), as these markets do. A market whose question names
+    another date or hour is not quoted (title_problem): the start the mode cancels before is the slug's."""
+    key: str
+    stem: str          # the slug's coin: bitcoin, ethereum, bnb
+    symbol: str
+    coin: str
+    short: str         # PREOPEN_MARKETS's and the control page's name: btc1h
+    exchange: str = ""
+    limit_pct: float = 0.0
+    minutes: int = 60
+    model: bool = False
+
+    @property
+    def window_ms(self) -> int:
+        return self.minutes * 60_000
+
+    @property
+    def cycle_ms(self) -> int:
+        return self.window_ms
+
+    def slug_of(self, start_ms: int) -> str:
+        at = et_clock(start_ms)
+        return f"{self.stem}-up-or-down-{MONTHS[at.month - 1]}-{at.day}-{at.year}-{at.hour % 12 or 12}{'am' if at.hour < 12 else 'pm'}-et"
+
+    def start_of(self, slug: str) -> int | None:
+        found = re.fullmatch(re.escape(self.stem) + r"-up-or-down-([a-z]+)-(\d{1,2})-(\d{4})-(\d{1,2})(am|pm)-et", slug)
+        if not found or found.group(1) not in MONTHS or not 1 <= int(found.group(4)) <= 12:
+            return None
+        hour = int(found.group(4)) % 12 + (12 if found.group(5) == "pm" else 0)
+        try:
+            day = dt.date(int(found.group(3)), MONTHS.index(found.group(1)) + 1, int(found.group(2)))
+        except ValueError:
+            return None
+        for offset in (-4, -5):  # the date's own offset (on a switch day, the one that names the slug back)
+            ms = et_ms(day.year, day.month, day.day, hour, 0, offset)
+            if self.slug_of(ms) == slug:
+                return ms
+        return None
+
+    def on_grid(self, start_ms: int) -> bool:
+        return start_ms % self.window_ms == 0
+
+    def first_start(self, ms: int) -> int:
+        return -(-ms // self.window_ms) * self.window_ms
+
+    def next_start(self, start_ms: int) -> int:
+        return start_ms + self.window_ms
+
+    def end_of(self, start_ms: int) -> int:
+        return start_ms + self.window_ms
+
+    def exists(self, start_ms: int, holidays: frozenset = frozenset()) -> bool:
+        return self.on_grid(start_ms)
+
+    def window_spec(self, start_ms: int) -> UpDownSpec:
+        hm = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING).strftime("%H:%M")
+        end = self.end_of(start_ms)
+        return UpDownSpec(self.key, self.slug_of(start_ms), self.symbol, f"{self.coin} 小时涨跌 {hm(start_ms)}–{hm(end)}", start_ms - 60_000, end - 60_000)
+
+    def title_problem(self, question: str, start_ms: int) -> str:
+        """The question's date and hour ("… November 7, 2AM ET", "2-3AM ET"), when it names them, must be the slug's."""
+        at = et_clock(start_ms)
+        day = MONTH_DAY.search(question)
+        if day and (MONTHS.index(day.group(1).lower()) + 1, int(day.group(2))) != (at.month, at.day):
+            return f"Predict 市场写的日期（{day.group(0)}）和链接（{at:%m-%d} ET）对不上"
+        found = RANGE_ET.search(question)
+        if found:
+            h1, m1, half1, h2, half2 = int(found.group(1)), int(found.group(2) or 0), (found.group(3) or "").upper(), int(found.group(4)), found.group(6).upper()
+            wall = lambda h, half: h % 12 + (12 if half == "PM" else 0)
+            if not half1:  # "2-3AM ET": the half of the day written once, for both
+                half1 = half2
+                if wall(h1, half1) >= wall(h2, half2):  # "11-12PM": the hour before noon
+                    half1 = "AM" if half1 == "PM" else "PM"
+        else:
+            found = TIME_ET.search(question)
+            if not found:
+                return ""
+            h1, m1, half1 = int(found.group(1)), int(found.group(2) or 0), found.group(3).upper()
+        if (h1 % 12 + (12 if half1 == "PM" else 0), m1) == (at.hour, at.minute):
+            return ""
+        return f"Predict 市场写的时间（{found.group(0)}）和按链接推算的这一小时（{at:%H:%M} ET 起）对不上"
+
+
+@dataclass(frozen=True)
+class DayWindowSpec:
+    """A "<coin> Up or Down on <date>" market (bitcoin-up-or-down-on-november-7-2026) as the pre-open mode sees it: a window
+    from 12:00 ET the day before <date> — the first of its two 1-minute candles (DailyUpDownSpec has the rules) — to 12:00 ET
+    on <date>, one a day; quoted before that first candle. A market whose question names another date is not quoted."""
+    key: str
+    stem: str
+    symbol: str
+    coin: str
+    short: str         # PREOPEN_MARKETS's and the control page's name: btc1d
+    exchange: str = ""
+    limit_pct: float = 0.0
+    hour: int = 12     # the candles' wall time, ET
+    minutes: int = 1440
+    model: bool = False
+
+    @property
+    def window_ms(self) -> int:
+        return self.minutes * 60_000
+
+    @property
+    def cycle_ms(self) -> int:
+        return self.window_ms
+
+    def day_of(self, start_ms: int) -> dt.date:
+        """The date the market is named for: the day after its window starts (ET)."""
+        return et_date(start_ms) + dt.timedelta(days=1)
+
+    def slug_of(self, start_ms: int) -> str:
+        return predict_slug(self.stem, self.day_of(start_ms))
+
+    def start_of(self, slug: str) -> int | None:
+        found = re.fullmatch(re.escape(self.stem) + r"-up-or-down-on-([a-z]+)-(\d{1,2})-(\d{4})", slug)
+        if not found or found.group(1) not in MONTHS:
+            return None
+        try:
+            day = dt.date(int(found.group(3)), MONTHS.index(found.group(1)) + 1, int(found.group(2)))
+        except ValueError:
+            return None
+        return et_wall_ms(day - dt.timedelta(days=1), self.hour, 0)
+
+    def on_grid(self, start_ms: int) -> bool:
+        return start_ms == et_wall_ms(et_date(start_ms), self.hour, 0)
+
+    def first_start(self, ms: int) -> int:
+        day = et_date(ms)
+        start = et_wall_ms(day, self.hour, 0)
+        return start if start >= ms else et_wall_ms(day + dt.timedelta(days=1), self.hour, 0)
+
+    def next_start(self, start_ms: int) -> int:
+        return et_wall_ms(et_date(start_ms) + dt.timedelta(days=1), self.hour, 0)
+
+    def end_of(self, start_ms: int) -> int:
+        return self.next_start(start_ms)
+
+    def exists(self, start_ms: int, holidays: frozenset = frozenset()) -> bool:
+        return self.on_grid(start_ms)
+
+    def window_spec(self, start_ms: int) -> UpDownSpec:
+        return UpDownSpec(self.key, self.slug_of(start_ms), self.symbol, f"{self.coin} 日涨跌 {self.day_of(start_ms):%m-%d}", start_ms, self.end_of(start_ms))
+
+    def title_problem(self, question: str, start_ms: int) -> str:
+        """The question's date ("… on November 7?"), when it names one, must be the slug's."""
+        day = self.day_of(start_ms)
+        found = MONTH_DAY.search(question)
+        if not found or (MONTHS.index(found.group(1).lower()) + 1, int(found.group(2))) == (day.month, day.day):
+            return ""
+        return f"Predict 市场写的日期（{found.group(0)}）和链接（{day:%m-%d}）对不上"
+
+
+HOURLY_UPDOWN_MARKETS: tuple[HourlyUpDownSpec, ...] = (
+    # "Bitcoin Up or Down - November 7, 2AM ET" (bitcoin-up-or-down-november-7-2026-2am-et), ETH (ethereum-…) and BNB (bnb-…) alike
+    HourlyUpDownSpec("BTC-1H", "bitcoin", "BTCUSDT", "BTC", "btc1h"),
+    HourlyUpDownSpec("ETH-1H", "ethereum", "ETHUSDT", "ETH", "eth1h"),
+    HourlyUpDownSpec("BNB-1H", "bnb", "BNBUSDT", "BNB", "bnb1h"),
+)
+DAY_WINDOW_MARKETS: tuple[DayWindowSpec, ...] = (
+    # "Bitcoin Up or Down on November 7?" (bitcoin-up-or-down-on-november-7-2026): the model trader's BTC-DAY card's markets
+    DayWindowSpec("BTC-1D", "bitcoin", "BTCUSDT", "BTC", "btc1d"),
+    DayWindowSpec("ETH-1D", "ethereum", "ETHUSDT", "ETH", "eth1d"),
+    DayWindowSpec("BNB-1D", "bnb", "BNBUSDT", "BNB", "bnb1d"),
+)
+
+
+def preopen_cards() -> tuple:
+    """Every card the pre-open mode can quote, in the control page's order: the 15- and 5-minute windows, then the hourly and
+    daily BTC / ETH / BNB markets (1.142.0). Read at each use: a suite that swaps a list out sees its own."""
+    return (*WINDOW_UPDOWN_MARKETS, *HOURLY_UPDOWN_MARKETS, *DAY_WINDOW_MARKETS)
 
 
 def updown_odds(price: float, line: float, sigma: float, years: float, drift: float = -0.5,
@@ -10017,7 +10262,7 @@ SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": 
 CONTROL_FORMS: dict[str, dict] = {
     "LIVE": {"kind": "choice", "group": "策略", "options": [["off", "off 只记账"], ["pause", "pause 登录不开仓"], ["on", "on 真实下单"]]},
     "PREOPEN_15M": {"kind": "choice", "group": "预挂", "options": [["off", "off 关"], ["on", "on 开（需要 LIVE=on）"]]},
-    "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "none": "none", "options": [["btc", "BTC"], ["eth", "ETH"], ["bnb", "BNB"], ["btc5", "BTC 5分"], ["eth5", "ETH 5分"], ["bnb5", "BNB 5分"], ["xau", "黄金"], ["cl", "原油"], ["skhynix", "SK 海力士"], ["unitree", "宇树"], ["zhipu", "智谱"], ["mu", "美光"], ["sndk", "闪迪"], ["avgo", "博通"], ["spcx", "SPCX"], ["nvda", "英伟达"], ["googl", "谷歌"], ["meta", "Meta"], ["tsm", "台积电"], ["amzn", "亚马逊"], ["qqq", "纳指ETF"], ["spy", "标普ETF"], ["msft", "微软"]]},  # 1.130.7: pick the cards one by one; 1.134.0: 黄金、原油、智谱; 1.135.0: 美股 12 张; 1.136.0: "none" = the page's 一键全关
+    "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "none": "none", "options": [["btc", "BTC"], ["eth", "ETH"], ["bnb", "BNB"], ["btc5", "BTC 5分"], ["eth5", "ETH 5分"], ["bnb5", "BNB 5分"], ["btc1h", "BTC 小时"], ["eth1h", "ETH 小时"], ["bnb1h", "BNB 小时"], ["btc1d", "BTC 日"], ["eth1d", "ETH 日"], ["bnb1d", "BNB 日"], ["xau", "黄金"], ["cl", "原油"], ["skhynix", "SK 海力士"], ["unitree", "宇树"], ["zhipu", "智谱"], ["mu", "美光"], ["sndk", "闪迪"], ["avgo", "博通"], ["spcx", "SPCX"], ["nvda", "英伟达"], ["googl", "谷歌"], ["meta", "Meta"], ["tsm", "台积电"], ["amzn", "亚马逊"], ["qqq", "纳指ETF"], ["spy", "标普ETF"], ["msft", "微软"]]},  # 1.130.7: pick the cards one by one; 1.134.0: 黄金、原油、智谱; 1.135.0: 美股 12 张; 1.136.0: "none" = the page's 一键全关
     "PREOPEN_WEEKEND": {"kind": "choice", "group": "预挂", "options": [["on", "on 周末照挂"], ["off", "off 周末不挂"]]},
     "PREOPEN_EXCLUSIVE": {"kind": "choice", "group": "预挂", "options": [["off", "off 两边同时跑"], ["on", "on 预挂时原策略不开新仓"]]},
     "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
@@ -16546,26 +16791,8 @@ class Bot:
 
     def window_title_problem(self, spec: UpDownSpec) -> str:
         """A 15-minute market's question names its time range ("… 10:00PM-10:15PM ET"): when it does, it must start where
-        the slug's time was read as the start (WindowUpDownSpec), or nothing is suggested. "" when it agrees or says no time."""
-        question = str((self.predict.info.get(spec.slug) or {}).get("question") or "")
-        found = re.search(r"(\d{1,2}):(\d{2})\s*([AP]M)?\s*[-–—~至到]\s*(\d{1,2}):(\d{2})\s*([AP]M)?\s*(?:ET|EST|EDT)\b", question, re.I)
-        if not found:
-            return ""
-        h1, m1, half1, h2, m2, half2 = (int(found.group(1)), int(found.group(2)), (found.group(3) or "").upper(),
-                                        int(found.group(4)), int(found.group(5)), (found.group(6) or "").upper())
-        wall = lambda h, m, half: ((h % 12 + (12 if half == "PM" else 0)) if half else h) * 60 + m  # minutes of the day
-        inherited = not half1 and bool(half2)  # "10:00-10:15PM": the half of the day written once, for both
-        if inherited:
-            half1 = half2
-        start, end = wall(h1, m1, half1), wall(h2, m2, half2)
-        if inherited and start >= end:  # "11:45-12:00PM" (an hour before noon), "11:45-12:00AM" (before midnight): the other half
-            half1 = "AM" if half1 == "PM" else "PM"
-            start = wall(h1, m1, half1)
-        at = spec.start_ms + 60_000
-        et = dt.datetime.fromtimestamp(at / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(at))))
-        if start == et.hour * 60 + et.minute:
-            return ""
-        return (f"Predict 市场写的时间段（{found.group(0)}）和按链接推算的窗口（{et:%H:%M} ET 起）对不上，请核实；暂不给建议")
+        the slug's time was read as the start (WindowUpDownSpec), or nothing is suggested (window_title_text)."""
+        return window_title_text(str((self.predict.info.get(spec.slug) or {}).get("question") or ""), spec)
 
     def updown_payload(self, mkt: "UpDownMarket", now_ms: int) -> dict:
         """Web card for a period up/down market: the usual 涨/跌 card, measured from the starting candle's close (a
@@ -20698,8 +20925,8 @@ class Bot:
                   "PREOPEN_LEVELS": ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.levels[1:]),
                   "PREOPEN_DEEP_AHEAD_MINUTES": str(c.preopen.deep_ahead_minutes if c.preopen.deep_ahead_minutes != c.preopen.ahead_minutes else 0),
                   "PREOPEN_LIMIT_GAP_PCT": f"{c.preopen.limit_gap_pct:g}", "PREOPEN_OPEN_QUIET_MINUTES": str(c.preopen.open_quiet_minutes),
-                  "PREOPEN_MARKETS": ("all" if c.preopen.markets >= {r.key for r in WINDOW_UPDOWN_MARKETS} else "none" if not c.preopen.markets
-                                      else ",".join(r.short for r in WINDOW_UPDOWN_MARKETS if r.key in c.preopen.markets)),
+                  "PREOPEN_MARKETS": ("all" if c.preopen.markets >= {r.key for r in preopen_cards()} else "none" if not c.preopen.markets
+                                      else ",".join(r.short for r in preopen_cards() if r.key in c.preopen.markets)),
                   "PREOPEN_WEEKEND": flag(c.preopen.weekend),
                   "PREOPEN_AHEAD_MINUTES": str(c.preopen.ahead_minutes), "PREOPEN_CANCEL_SECONDS": str(c.preopen.cancel_seconds),
                   "PREOPEN_EXPIRY_SECONDS": str(c.preopen.expiry_seconds), "PREOPEN_ENTRY_SECONDS": str(c.preopen.entry_seconds),

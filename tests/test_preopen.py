@@ -138,7 +138,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p.candidate_problem(market(at=NOW), NOW, ctl.owner.config, ctl.settings), "已开始或不足 3 分钟")
         self.assertEqual(p.candidate_problem(market(at=NOW + 120000), NOW, ctl.owner.config, ctl.settings), "链接里的时间不在场次边界上")
         self.assertEqual(p.candidate_problem(market(at=NOW + 2 * 3600_000), NOW, ctl.owner.config, ctl.settings), "开始还在 60 分钟之外（之后再扫）")
-        self.assertEqual(p.candidate_problem(market("sol"), NOW, ctl.owner.config, ctl.settings), "不是涨跌卡（15 分钟、5 分钟）的链接")
+        self.assertEqual(p.candidate_problem(market("sol"), NOW, ctl.owner.config, ctl.settings), "不是涨跌卡（15 分钟、5 分钟、小时、日）的链接")
         self.assertEqual(p.candidate_problem(market("eth"), NOW, ctl.owner.config, ctl.settings), "不在 PREOPEN_MARKETS 里")  # 1.129.1: a card, not quoted by these settings
         for stem in ("eth", "bnb"):
             self.assertIsNotNone(p.candidate(market(stem), NOW, ctl.owner.config, dataclasses.replace(ctl.settings, markets=frozenset({"ETH-15M", "BNB-15M"}))))
@@ -188,7 +188,8 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         # the defaults are the trial: BTC alone, 10 shares a side (4.9U); "all" or a list widens it
         on = lambda **e: p.Settings.from_config(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "STATE_DB": ":memory:", **e}))
         self.assertEqual((on().shares, on().markets, on().side_usd, on().pair_usd, on().ahead_minutes), (10, frozenset({"BTC-15M"}), 4.9, 9.8, 1440))
-        self.assertEqual(on(PREOPEN_MARKETS="all").markets, frozenset({"BTC-15M", "ETH-15M", "BNB-15M", "XAU-15M", "CL-15M", "SKHYNIX-15M", "UNITREE-15M", "ZHIPU-15M", *m.DEFAULT_SIM_SKIP}))
+        self.assertEqual(on(PREOPEN_MARKETS="all").markets, frozenset({"BTC-15M", "ETH-15M", "BNB-15M", "XAU-15M", "CL-15M", "SKHYNIX-15M", "UNITREE-15M", "ZHIPU-15M", *m.DEFAULT_SIM_SKIP,
+                                                                       "BTC-1H", "ETH-1H", "BNB-1H", "BTC-1D", "ETH-1D", "BNB-1D"}))  # 1.142.0: the hourly and daily cards
         self.assertEqual(set(m.DEFAULT_SIM_SKIP), {"MU-15M", "SNDK-15M", "AVGO-15M", "SPCX-15M", "NVDA-15M", "GOOGL-15M", "META-15M", "TSM-15M", "AMZN-15M", "QQQ-15M", "SPY-15M", "MSFT-15M",
                                                    "BTC-5M", "ETH-5M", "BNB-5M"}, "1.135.0: the twelve US cards, the pre-open mode's alone by default; 1.137.0: the 5-minute cards too")
         self.assertEqual(on(PREOPEN_MARKETS="nvda,spy").markets, frozenset({"NVDA-15M", "SPY-15M"}))
@@ -864,7 +865,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         c = p.candidate(market(at=NOW + 10 * 60_000, mid=7, minutes=5), NOW, ctl.owner.config, ctl.settings)
         self.assertEqual((c["key"], c["slug"], c["name"]), ("BTC-5M", f"btc-updown-5m-{(NOW + 10 * 60_000) // 1000}", "BTC 5分涨跌 09:10–09:15"))
         self.assertEqual(p.candidate_problem(market(at=NOW + 7 * 60_000, mid=8, minutes=5), NOW, ctl.owner.config, ctl.settings), "链接里的时间不在场次边界上")
-        self.assertEqual(p.candidate_problem({"categorySlug": "btc-updown-3m-1793986800"}, NOW, ctl.owner.config, ctl.settings), "不是涨跌卡（15 分钟、5 分钟）的链接")
+        self.assertEqual(p.candidate_problem({"categorySlug": "btc-updown-3m-1793986800"}, NOW, ctl.owner.config, ctl.settings), "不是涨跌卡（15 分钟、5 分钟、小时、日）的链接")
         only15, _, _ = controller(PREOPEN_MARKETS="btc")
         self.assertEqual(p.candidate_problem(market(at=NOW + 10 * 60_000, minutes=5), NOW, only15.owner.config, only15.settings), "不在 PREOPEN_MARKETS 里")
         await self.finish(only15)
@@ -874,6 +875,61 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("BTC-5M 上次", ctl.status())
         ctl.listed_at.clear()
         self.assertIn("BTC-5M", m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_MARKETS": "all"}).preopen.markets)
+        await self.finish(ctl)
+
+    async def test_hourly_and_daily_cards_are_quoted_before_their_start(self):
+        """1.142.0: btc1h / eth1h / bnb1h name the hourly markets ("<coin> Up or Down - <date>, <hour> ET": the hour from <hour> ET)
+        and btc1d / eth1d / bnb1d the daily ones ("<coin> Up or Down on <date>": from 12:00 ET the day before) — quoted like the
+        windows, before the start, and settled after the end. NOW is 11-06 09:00 Beijing, 11-05 20:00 ET (EST)."""
+        ctl, api, clock = controller(PREOPEN_MARKETS="btc1h,eth1d", PREOPEN_AHEAD_MINUTES="1440")
+        self.assertEqual(ctl.settings.markets, frozenset({"BTC-1H", "ETH-1D"}))
+        hour = next(r for r in m.HOURLY_UPDOWN_MARKETS if r.key == "BTC-1H")
+        day = next(r for r in m.DAY_WINDOW_MARKETS if r.key == "ETH-1D")
+        two_am, noon, next_noon = m.et_ms(2026, 11, 6, 2, 0, -5), m.et_ms(2026, 11, 6, 12, 0, -5), m.et_ms(2026, 11, 7, 12, 0, -5)
+        self.assertEqual((hour.slug_of(two_am), hour.start_of("bitcoin-up-or-down-november-6-2026-2am-et")), ("bitcoin-up-or-down-november-6-2026-2am-et", two_am))
+        self.assertEqual([hour.slug_of(m.et_ms(2026, 11, 7, h, 0, -5)).rsplit("-", 2)[1] for h in (0, 11, 12, 23)], ["12am", "11am", "12pm", "11pm"])
+        self.assertIsNone(hour.start_of("bitcoin-up-or-down-on-november-7-2026"))
+        self.assertIsNone(day.start_of("ethereum-up-or-down-november-7-2026-2am-et"))
+        self.assertEqual((day.start_of("ethereum-up-or-down-on-november-7-2026"), day.slug_of(noon), day.end_of(noon)), (noon, "ethereum-up-or-down-on-november-7-2026", next_noon))
+        starts = p.window_starts(NOW, ctl.owner.config, ctl.settings)
+        hours = [s for r, s in starts if r.key == "BTC-1H"]
+        self.assertEqual((len(hours), hours[0], hours[1] - hours[0]), (24, NOW + 3600_000, 3600_000))  # 10:00 Beijing (21:00 ET) the first past the entry seconds
+        self.assertEqual([s for r, s in starts if r.key == "ETH-1D"], [noon])  # the window of the market "on November 7"
+        self.assertEqual((p.cycle_ms("BTC-1H"), p.cycle_ms("ETH-1D")), (3600_000, 86_400_000))
+        # an hour listed: quoted, withdrawn before 2AM ET, settled after 3AM ET; a question naming another hour or date: not quoted
+        hourly = {**market(mid=31), "categorySlug": "bitcoin-up-or-down-november-6-2026-2am-et", "question": "Bitcoin Up or Down - November 6, 2AM ET"}
+        c = p.candidate(hourly, NOW, ctl.owner.config, ctl.settings)
+        self.assertEqual((c["key"], c["start_ms"], c["end_ms"], c["cancel_ms"], c["name"]), ("BTC-1H", two_am, two_am + 3600_000, two_am - 20_000, "BTC 小时涨跌 15:00–16:00"))
+        for question, why in (("Bitcoin Up or Down - November 6, 3AM ET", "问题里的时间段和链接对不上"), ("Bitcoin Up or Down - November 7, 2AM ET", "问题里的时间段和链接对不上"),
+                              ("Bitcoin Up or Down - November 6, 2-3AM ET", ""), ("Bitcoin Up or Down - November 6, 2:00AM-3:00AM ET", ""), ("比特币 涨或跌", "")):
+            self.assertEqual(p.candidate_problem({**hourly, "question": question}, NOW, ctl.owner.config, ctl.settings), why, question)
+        daily = {**market(mid=32), "categorySlug": "ethereum-up-or-down-on-november-7-2026", "question": "Ethereum Up or Down on November 7?"}
+        c2 = p.candidate(daily, NOW, ctl.owner.config, ctl.settings)
+        self.assertEqual((c2["key"], c2["start_ms"], c2["end_ms"], c2["cancel_ms"], c2["name"]), ("ETH-1D", noon, next_noon, noon - 20_000, "ETH 日涨跌 11-07"))
+        self.assertEqual(p.candidate_problem({**daily, "question": "Ethereum Up or Down on November 8?"}, NOW, ctl.owner.config, ctl.settings), "问题里的时间段和链接对不上")
+        self.assertEqual(p.candidate_problem({**daily, "categorySlug": "bnb-up-or-down-on-november-7-2026"}, NOW, ctl.owner.config, ctl.settings), "不在 PREOPEN_MARKETS 里")
+        self.assertEqual(p.candidate_problem({**daily, "categorySlug": "ethereum-up-or-down-on-november-9-2026"}, NOW, ctl.owner.config, ctl.settings), "开始还在 1440 分钟之外（之后再扫）")
+        # placed: the pair carries its end, and its result is read only after it (not a quarter hour after the start)
+        api.markets["31"] = hourly
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        self.assertEqual((pair["end_ms"], pair["phase"], p.settle_from(pair)), (two_am + 3600_000, "active", two_am + 3600_000))
+        self.assertEqual(p.settle_from({"start_ms": two_am}), two_am + 15 * 60_000, "a record from before kept no end: a quarter hour on, as then")
+        pair.update(phase="closed")
+        clock.ms = two_am + 20 * 60_000  # 20 minutes into the hour: a quarter-hour window's result would be read by now
+        reads = []
+        real = api.market
+
+        async def market_read(mid):
+            reads.append(mid)
+            return await real(mid)
+        api.market = market_read
+        await ctl.settle_pair(pair)
+        self.assertEqual(reads, [], "the hour is not over: no result asked for")
+        ctl.listed_at["BTC-1H"] = NOW
+        self.assertIn("小时卡每小时、日卡每天", ctl.status())
+        cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_MARKETS": "all"})
+        self.assertTrue({"BTC-1H", "ETH-1H", "BNB-1H", "BTC-1D", "ETH-1D", "BNB-1D"} <= cfg.preopen.markets)
         await self.finish(ctl)
 
     async def test_all_cards_off_and_weekends_off(self):
@@ -1034,7 +1090,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         stuck = {**pair, "slug": "btc-updown-15m-stuck", "name": "BTC 15分涨跌 08:00–08:15", "phase": "closing", "accounted": False, "cancel_ms": clock.ms - 20 * 60_000,
                  "reason": "到时撤单", "orders": {"up": {"state": "unknown", "hash": "0xs", "filled": 0.0}, "down": {"state": "removed", "hash": "0xt", "id": "9", "filled": 0.0}}}
         ctl.ledger.save(stuck)
-        filled = {**stuck, "slug": "btc-updown-15m-filled", "start_ms": clock.ms - 20 * 60_000, "cancel_ms": clock.ms - 20 * 60_000 - 20_000,
+        filled = {**stuck, "slug": "btc-updown-15m-filled", "start_ms": clock.ms - 20 * 60_000, "end_ms": clock.ms - 5 * 60_000, "cancel_ms": clock.ms - 20 * 60_000 - 20_000,
                   "orders": {"up": {"state": "final", "hash": "0xf", "id": "8", "filled": 10.0}, "down": {"state": "final", "hash": "0xg", "id": "7", "filled": 0.0}}}
         ctl.ledger.save(filled)
         self.assertEqual([p["slug"] for p in ctl.stuck_pairs(clock.ms)], ["btc-updown-15m-stuck"], "a fill waits for the result: not stuck 20 minutes past the start")

@@ -215,15 +215,13 @@ def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings
     starting within PREOPEN_AHEAD_MINUTES (any day) and not within PREOPEN's entry seconds, registered, visible, open or
     awaiting matching, with no maker fee, with an id, a condition and a question that agrees with the slug's time."""
     slug = str(market.get("categorySlug") or market.get("slug") or "")
-    for rolling in core.WINDOW_UPDOWN_MARKETS:
-        prefix = rolling.prefix  # btc-updown-15m-, btc-updown-5m- (1.137.0)
-        suffix = slug.removeprefix(prefix)
-        if not slug.startswith(prefix) or not suffix.isdigit():
+    for rolling in core.preopen_cards():  # 1.142.0: the hourly and daily cards too, each reading its own slugs
+        start = rolling.start_of(slug)
+        if start is None:
             continue
         if rolling.key not in settings.markets:
             return "不在 PREOPEN_MARKETS 里"
-        start = int(suffix) * 1000
-        if start % rolling.window_ms:
+        if not rolling.on_grid(start):
             return "链接里的时间不在场次边界上"
         if start - now_ms < settings.entry_seconds * 1000:
             return "已开始或不足 3 分钟"
@@ -240,12 +238,10 @@ def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings
             return f"挂单费率 {market.get('makerFeeBps')} bps"
         if not market.get("id") or not market.get("conditionId"):
             return "缺少 id 或 conditionId"
-        spec = rolling.window_spec(start)
-        checker = SimpleNamespace(predict=SimpleNamespace(info={slug: {"question": str(market.get("question") or market.get("title") or "")}}))
-        if core.Bot.window_title_problem(checker, spec):
+        if rolling.title_problem(str(market.get("question") or market.get("title") or ""), start):
             return "问题里的时间段和链接对不上"
         return ""
-    return "不是涨跌卡（15 分钟、5 分钟）的链接"
+    return "不是涨跌卡（15 分钟、5 分钟、小时、日）的链接"
 
 
 def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dict | None:
@@ -253,10 +249,9 @@ def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dic
     if candidate_problem(market, now_ms, config, settings):
         return None
     slug = str(market.get("categorySlug") or market.get("slug") or "")
-    rolling = next(r for r in core.WINDOW_UPDOWN_MARKETS if slug.startswith(r.prefix))
-    start = int(slug.removeprefix(rolling.prefix)) * 1000
+    rolling, start = next((r, s) for r in core.preopen_cards() if (s := r.start_of(slug)) is not None)
     spec = rolling.window_spec(start)
-    return {"slug": slug, "key": rolling.key, "market_id": str(market["id"]), "start_ms": start,
+    return {"slug": slug, "key": rolling.key, "market_id": str(market["id"]), "start_ms": start, "end_ms": rolling.end_of(start),  # 1.142.0: settled after the end
             "cancel_ms": start - settings.cancel_seconds * 1000, "expires": start // 1000 - settings.expiry_seconds,
             "day": dt.datetime.fromtimestamp(start / 1000, core.BEIJING).date().isoformat(), "name": spec.name}
 
@@ -289,20 +284,26 @@ def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[An
     out = []
     quiet_ms = int(getattr(settings, "open_quiet_minutes", 0) or 0) * 60_000
     weekend = getattr(settings, "weekend", True)
-    for rolling in core.WINDOW_UPDOWN_MARKETS:
+    for rolling in core.preopen_cards():
         if rolling.key not in settings.markets:
             continue
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
-        start = -(-(now_ms + settings.entry_seconds * 1000) // rolling.window_ms) * rolling.window_ms
+        start = rolling.first_start(now_ms + settings.entry_seconds * 1000)
         while start <= now_ms + settings.ahead_minutes * 60_000:
             if rolling.exists(start, holidays) and not session_opening(rolling, start, holidays, quiet_ms) and (weekend or not on_weekend(start)):
                 out.append((rolling, start))
-            start += rolling.window_ms
+            start = rolling.next_start(start)  # a quarter hour, five minutes, an hour, a day (noon ET to noon ET: 23 or 25 hours over a switch)
     return sorted(out, key=lambda rs: (rs[1], rs[0].key))
 
 
 def window_slug(rolling: Any, start_ms: int) -> str:
-    return f"{rolling.prefix}{start_ms // 1000}"
+    return rolling.slug_of(start_ms)
+
+
+def settle_from(pair: dict) -> int:
+    """When a pair's window is over and its result may be read: its end (1.142.0: an hour or a day after the start for the
+    hourly and daily cards); a record from before kept no end — a quarter hour after its start, as then."""
+    return int(pair.get("end_ms") or 0) or int(pair["start_ms"]) + 15 * 60_000
 
 
 def hms(ms: int) -> str:
@@ -641,8 +642,8 @@ LISTING_CYCLE_MS = 15 * 60_000  # Predict lists one more window of a card every 
 
 def cycle_ms(key: str) -> int:
     """How often Predict lists one more window of a card: its window length (a 5-minute card's every five minutes, 1.137.0)."""
-    card = next((r for r in core.WINDOW_UPDOWN_MARKETS if r.key == key), None)
-    return int(card.window_ms) if card is not None else LISTING_CYCLE_MS
+    card = next((r for r in core.preopen_cards() if r.key == key), None)
+    return int(card.cycle_ms) if card is not None else LISTING_CYCLE_MS
 LISTING_EARLY_MS, LISTING_LATE_MS = 30_000, 120_000  # ...and the discovery polls fast from this long before that moment until this long after it (or the listing)
 FAST_POLL_S = 0.5               # the fast poll's cadence (the queue position: the bid goes in within a second of the listing; 1.133.0: was 1 s)
 LISTING_PROBE_S = 2.0           # ...and each card's next listing is probed this often the rest of the time (was the poll setting, 5 s); the older windows keep the poll's pace
@@ -808,7 +809,7 @@ class Controller:
         """The withdrawn pairs not cleared STUCK_MS past their cancel time: a cancel or a read that keeps failing, an order in doubt."""
         def late(p: dict) -> bool:  # a pair with a fill waits for the result (FILL_SETTLE_MS past the start); one without should clear in minutes
             filled = any(float(o.get("filled") or 0) > 0 for o in p["orders"].values())
-            return now_ms > (int(p.get("start_ms") or 0) + FILL_SETTLE_MS if filled else int(p.get("cancel_ms") or 0) + STUCK_MS)
+            return now_ms > (settle_from(p) + FILL_SETTLE_MS - 15 * 60_000 if filled else int(p.get("cancel_ms") or 0) + STUCK_MS)
         return [p for p in self.ledger.rows.values() if not p.get("accounted") and p["phase"] != "active" and late(p)]
 
     def check_stuck(self, now_ms: int) -> None:
@@ -984,7 +985,7 @@ class Controller:
         if now_ms - self.card_checked_ms < CARD_CHECK_MS:
             return
         self.card_checked_ms = now_ms
-        for rolling in core.WINDOW_UPDOWN_MARKETS:
+        for rolling in core.preopen_cards():
             if rolling.key not in self.settings.markets or not getattr(rolling, "limit_pct", 0):
                 continue
             why = self.card_hold(rolling)
@@ -1105,7 +1106,7 @@ class Controller:
         import live
         if pair.get("key") not in self.settings.markets or self.now() >= pair["start_ms"]:
             return False
-        rolling = next((r for r in core.WINDOW_UPDOWN_MARKETS if r.key == pair["key"]), None)
+        rolling = next((r for r in core.preopen_cards() if r.key == pair["key"]), None)
         if rolling is None or session_opening(rolling, int(pair["start_ms"]), self.owner.config.holidays.get(rolling.exchange, frozenset()),
                                               int(self.settings.open_quiet_minutes) * 60_000):
             return False  # 1.135.1: a stock card's first window after a session open, quoted before the rule (or with it off): withdrawn
@@ -1239,9 +1240,9 @@ class Controller:
                 self.awaiting.pop(key)  # nothing beyond the known listing in the range: nothing to wait for
         # the cards whose next windows start together are listed together (11-06: BNB, BTC and ETH at 19:31:44 alike): one of them, the
         # pass's sentinel, is probed; the rest are read the moment it is seen listed — a fifth of the probes, no later a find (1.134.1)
-        groups: dict[int, list[str]] = {}
+        groups: dict[tuple[int, int], list[str]] = {}
         for key, items in per_card.items():
-            groups.setdefault(items[0][1], []).append(key)
+            groups.setdefault((items[0][0].cycle_ms, items[0][1]), []).append(key)  # 1.142.0: a quarter hour's listing says nothing of an hour's
         self.probe_turn += 1
         leaders: dict[str, list[str]] = {}  # sentinel -> the cards that follow it (a full scan, once a minute, reads every card itself)
         for keys in groups.values():
@@ -1322,7 +1323,7 @@ class Controller:
         self.listed_until_ms = max(self.listed_until_ms, start)
         if known_before.get(rolling.key) and start > known_before[rolling.key]:
             if self.listed_at.get(rolling.key):
-                self.listing_deltas.append(self.now() - (self.listed_at[rolling.key] + rolling.window_ms))
+                self.listing_deltas.append(self.now() - (self.listed_at[rolling.key] + rolling.cycle_ms))
             self.listed_at[rolling.key] = self.now()
         self.listed_by_card[rolling.key] = max(self.listed_by_card.get(rolling.key, 0), start)
 
@@ -1606,7 +1607,7 @@ class Controller:
     async def settle_pair(self, pair: dict) -> None:
         """Official resolution + fresh final fills; never settle on a local candle."""
         import live
-        if pair.get("accounted") or self.now() < pair["start_ms"] + 15 * 60_000:
+        if pair.get("accounted") or self.now() < settle_from(pair):
             return
         if self.now() - int(pair.get("settle_checked") or 0) < 60_000:
             return
@@ -1989,7 +1990,7 @@ class Controller:
                                 except Exception as error:
                                     self.error = core.clean_error(error)
                         self.settling[key] = asyncio.create_task(monitor(), name=key)
-                if pair.get("accounted") or self.now() < pair["start_ms"] + 15 * 60_000:
+                if pair.get("accounted") or self.now() < settle_from(pair):
                     continue
                 key = "settle:" + pair["slug"]
                 if key in self.settling and not self.settling[key].done():
@@ -2159,7 +2160,7 @@ class Controller:
                 + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：不计入预挂限额，也不挡预挂"
                    + ("；其中挂在本机器人市场上的，原策略 2 分钟后自动撤掉（LIVE_ORPHAN_CANCEL）" if getattr(self.owner.config, "live_orphan_cancel", True) else "") if self.unmanaged else "")
                 + ("\n股票卡暂停：" + "；".join(self.card_holds.values()) if self.card_holds else "")
-                + ("\n发布节奏（每张卡一场一次：15 分钟卡每刻钟、5 分钟卡每 5 分钟；预计前后每秒扫一次）：" + "；".join(f"{key} 上次 {hms(at)}，下次预计 {hms(at + cycle_ms(key))}" for key, at in sorted(self.listed_at.items()))
+                + ("\n发布节奏（每张卡一场一次：15 分钟卡每刻钟、5 分钟卡每 5 分钟、小时卡每小时、日卡每天；预计前后每秒扫一次）：" + "；".join(f"{key} 上次 {hms(at)}，下次预计 {hms(at + cycle_ms(key))}" for key, at in sorted(self.listed_at.items()))
                    if self.listed_at else "")
                 + (f"\n没挂的已发布场次：" + "；".join(f"{k.rsplit('-', 1)[-1]} {v}" for k, v in list(self.skipped.items())[-3:]) if self.skipped else "")
                 + (f"\n不再报价：{len(spent)} 档失败满 {MAX_ATTEMPTS} 次（单边没确认、一边被撤或过期），如 {named(spent)}" if spent else "")
