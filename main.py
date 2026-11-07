@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.139.0"
+VERSION = "1.139.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -494,6 +494,7 @@ BASELINE_MODES = {
 # saved as the variable's text (control:env), re-read through Config.from_env on top of the environment (the same
 # validation and wording as at start-up), and applied at once; it survives restarts until cleared.
 PREOPEN_MIN_SIDE_USD = 1.0  # Predict refuses an order worth under about a dollar (live.MIN_ORDER_USD): a pre-open side must reach it
+PREOPEN_MAX_LEVELS = 8  # PREOPEN_LEVELS: the first level and up to seven deeper ones a side (1.139.1: 5 — 49/48/47/46 and 43, 40 did not fit)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -570,9 +571,9 @@ class PreopenSettings:
         open_quiet = int(e.get("PREOPEN_OPEN_QUIET_MINUTES", "15") or 0)
         if not 0 <= open_quiet <= 120:
             raise ValueError("PREOPEN_OPEN_QUIET_MINUTES 0～120（0 = 开盘、午后第一场也挂）")
-        if (len(levels) > 5 or any(not 1 <= c <= 50 or not 1 <= s <= 500 or c * s / 100 < PREOPEN_MIN_SIDE_USD for c, s in levels)
+        if (len(levels) > PREOPEN_MAX_LEVELS or any(not 1 <= c <= 50 or not 1 <= s <= 500 or c * s / 100 < PREOPEN_MIN_SIDE_USD for c, s in levels)
                 or any(levels[i][0] <= levels[i + 1][0] for i in range(len(levels) - 1)) or not 3 <= deep <= ahead):
-            raise ValueError(f"PREOPEN_LEVELS 至多 5 档，每档价格 1～50¢、份数 1～500、每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格要比第一档低、逐档递减；"
+            raise ValueError(f"PREOPEN_LEVELS 连第一档至多 {PREOPEN_MAX_LEVELS} 档，每档价格 1～50¢、份数 1～500、每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格要比第一档低、逐档递减；"
                              "PREOPEN_DEEP_AHEAD_MINUTES 3～PREOPEN_AHEAD_MINUTES（0 = 和第一档一样）")
         if (not 1 <= poll <= 60 or not 0 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
                 or not 3 <= ahead <= 1440 or not markets <= keys or float(price * shares) < PREOPEN_MIN_SIDE_USD
@@ -667,7 +668,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_WEEKEND", "周末也挂", "开 = 周六、周日（北京时间）开始的场次照挂；关 = 周末不挂：周五起就不挂周六、周日开始的场次，周末里已挂的按“设置不同”撤掉（不算再报价次数），周一 00:00 起恢复。股票卡周末本来没有场次，这项只影响 BTC、ETH、BNB 这些周末也有场次的卡"),
     ("PREOPEN_SHARES", "预挂每边份数", "1～500：每场每边各挂这么多份（默认 10），每边不少于 $1"),
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
-    ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 4 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
+    ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 7 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
     ("PREOPEN_DEEP_AHEAD_MINUTES", "第 2 档起只挂几分钟内开始的场次", "3～提前范围：第一档按“只挂几分钟内开始的场次”挂（排队靠前），更深的档位离开场这么近才挂，少占资金；0 = 和第一档一样"),
     ("PREOPEN_OPEN_QUIET_MINUTES", "股票卡开盘后几分钟内开始的场次不挂", "0～120：海力士、宇树、智谱每个交易时段（开盘、午后）开始后这么多分钟内开始的场次不挂。集合竞价的参考价（韩交所 08:30 起、港交所 09:00 起、上交所 09:15 起）和午休里的消息（A50 期货午休照常交易）在指数动之前就已公开，这几场的方向不是五五开，49¢ 的买单正好给知道方向的人接。默认 15 = 跳过开盘和午后的第一场；0 = 都挂"),
     ("PREOPEN_LIMIT_GAP_PCT", "股票卡距涨跌停不足几 % 时不挂", "0～20：海力士、宇树（智谱在港交所没有涨跌停，只看临停）的交易所现价离当日涨停或跌停（按前收盘价算：科创板 ±20%、韩交所 ±30%）不到这么多时不新挂、撤掉已挂的；交易时段里成交时间 3 分钟没动（临停、VI）同样处理；0 = 不管（默认 2）"),
@@ -10021,7 +10022,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_EXCLUSIVE": {"kind": "choice", "group": "预挂", "options": [["off", "off 两边同时跑"], ["on", "on 预挂时原策略不开新仓"]]},
     "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
     "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},
-    "PREOPEN_LEVELS": {"kind": "text", "group": "预挂", "presets": ["", "48x20", "48x20,47x40", "48x10,47x10", "47x40", "48x10,47x20,46x40"], "unit": "", "empty": "只挂第一档"},
+    "PREOPEN_LEVELS": {"kind": "text", "group": "预挂", "presets": ["", "48x20", "48x20,47x40", "48x10,47x10", "47x40", "48x10,47x20,46x40", "48x10,47x20,46x40,43x40,40x40"], "unit": "", "empty": "只挂第一档"},
     "PREOPEN_DEEP_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "60", "120", "240", "1440"], "unit": "分钟", "zero": "和第一档一样"},
     "PREOPEN_LIMIT_GAP_PCT": {"kind": "number", "group": "预挂", "presets": ["0", "1", "2", "3", "5"], "unit": "%", "zero": "不管涨跌停"},
     "PREOPEN_OPEN_QUIET_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "15", "30", "60"], "unit": "分钟", "zero": "开盘第一场也挂"},

@@ -1408,7 +1408,8 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         s = on(PREOPEN_LEVELS="48x20, 47×40", PREOPEN_DEEP_AHEAD_MINUTES="120")
         self.assertEqual((s.levels, s.deep_ahead_minutes, s.price, s.shares), (((m.D("0.49"), m.D("10")), (m.D("0.48"), m.D("20")), (m.D("0.47"), m.D("40"))), 120, m.D("0.49"), m.D("10")))
         self.assertEqual((on().levels, on().deep_ahead_minutes, on(PREOPEN_LEVELS="48x20").deep_ahead_minutes), (((m.D("0.49"), m.D("10")),), 1440, 1440))
-        for bad in ("49x10", "48x20,48x10", "abc", "48x20,47x20,46x20,45x20,44x20", "48x1", "60x5"):
+        self.assertEqual(len(on(PREOPEN_LEVELS="48x10,47x20,46x40,43x40,40x40").levels), 6, "1.139.1: up to eight levels")
+        for bad in ("49x10", "48x20,48x10", "abc", "48x20,47x20,46x20,45x20,44x20,43x20,42x20,41x20", "48x1", "60x5"):
             with self.assertRaises(ValueError, msg=bad):
                 on(PREOPEN_LEVELS=bad)
         with self.assertRaises(ValueError):
