@@ -986,6 +986,8 @@ class LiveBot(core.Bot):
     #                                 3; 1.138.2: 1 — under the pre-open mode's thousands of orders the model's older ones are never on the first pages, the
     #                                 two more pages cost 0.6 s a step for nothing: they are read by their hash in rotation)
     LIVE_TRACK_READS = 6            # resting maker orders the bounded list did not show, read by their hash a step at most, the longest unread first (1.137.2)
+    LIVE_MARKET_READS = 10          # the step's open-order read by market (1.139.0): at most this many markets a step, else the bounded read
+    LIVE_MARKET_PAGES = 4           # ...and at most this many pages a market once Predict is known to filter (a market holds a few of our orders)
     LIVE_TRACK_READ_MS = 15_000     # ...each at most this often: its fills are seen within this, not every step at two reads at a time
     LIVE_ORPHAN_GRACE_MS = 120_000  # an unrecorded open order on one of this bot's markets is withdrawn once seen so for this long (LIVE_ORPHAN_CANCEL)
     LIVE_ORPHAN_EVERY_MS = 60_000   # ...looked for this often
@@ -1040,6 +1042,7 @@ class LiveBot(core.Bot):
         self.live_open_ids_at = 0
         self.live_full_at_ms = -10 ** 15  # when this bot last read the whole open list itself (a step reads a few pages otherwise: 1.137.1)
         self.live_full_cut = False  # that read came cut at the page cap: while the pre-open mode runs, its snapshot stands for the account instead (1.137.2)
+        self.live_market_filter: bool | None = None  # whether Predict's open-order list honours marketId (1.139.0): None until a read shows it either way
         self.live_whole: tuple[set, set, int] = (set(), set(), 0)  # the last whole view of the account's open orders: ids, hashes, when read (live_counts_miss)
         self.live_requote_looked: set[str] = set()  # order ids of confirmed cancels whose slot live_requote_freed has looked at (live_cancel_fills, 1.138.0)
         self.live_track_reads: dict[str, int] = {}  # record id -> when its order was last read by its hash in the sync (the rotation, 1.137.2)
@@ -2028,8 +2031,17 @@ class LiveBot(core.Bot):
         bounded = (self.live_snapshot_fresh(now_ms) or now_ms - self.live_full_at_ms < self.LIVE_IDLE_LIST_MS
                    or (self.live_full_cut and getattr(self, "preopen", None) is not None))  # 1.137.2: a cut full read tells nothing the snapshot will not
         listing = time.monotonic()
+        # 1.139.0: only the markets the model trader has orders on (the index and contract cards), when Predict filters the list by market —
+        # every one of those orders seen every step; the pre-open mode's thousands on other markets never read here
+        order_markets = sorted({str(t.get("market_id") or (t["live"].get("want") or {}).get("market_id") or "") for t in active.values()} - {""})
+        by_market = bounded and self.live_market_filter is not False and 0 < len(order_markets) <= self.LIVE_MARKET_READS
         try:
-            open_rows = await (self.live.api.orders("OPEN", stop_ids=wanted, max_pages=self.LIVE_STEP_PAGES) if bounded else self.live.api.orders("OPEN"))
+            open_rows = await self.live_orders_by_market(order_markets) if by_market else None
+            if open_rows is None:
+                by_market = False
+                open_rows = await (self.live.api.orders("OPEN", stop_ids=wanted, max_pages=self.LIVE_STEP_PAGES) if bounded else self.live.api.orders("OPEN"))
+            else:
+                self.live.api.orders_complete = False  # the chosen markets' lists, whole each — never the whole account (live_full_list: the snapshot)
         except Exception:
             self.live_sync_failed_ms = now_ms  # a failure after the last success: no new order until a read succeeds (live_send_hold)
             await self.live_cancel_blind(active, now_ms)  # the cancels need no list: a list that cannot be read must not keep an order resting
@@ -2096,6 +2108,7 @@ class LiveBot(core.Bot):
         await asyncio.gather(*(one(tid, trade) for tid, trade in list(active.items()) if tid not in later))
         page = int(getattr(self.live.api, "ORDERS_PAGE", 50) or 50)
         self.live_sync_detail = {"pages": -(-len(open_rows) // page) if open_rows else 1, "bounded": bounded, "list_s": list_s,
+                                 "markets": len(order_markets) if by_market else 0, "filter": self.live_market_filter,
                                  "reads": reads, "later": len(later), "work_s": time.monotonic() - working, "records": len(active)}
         await self.live_orphan_sweep(now_ms)
 
@@ -2125,6 +2138,41 @@ class LiveBot(core.Bot):
         if preopen is not None:
             parts.append(("预挂", sum(1 for t in getattr(preopen, "limited_at", ()) if preopen.now() - t <= core.DAY_MS)))
         return "、".join(f"{name} {n} 次" for name, n in parts)
+
+    @staticmethod
+    def row_market_id(row: dict) -> str:
+        """The market an open-order row is on, as the row states it ("" when it does not)."""
+        market = row.get("market") if isinstance(row.get("market"), dict) else {}
+        return str(market.get("id") or row.get("marketId") or row.get("market_id") or "")
+
+    async def live_orders_by_market(self, markets: list[str]) -> list[dict] | None:
+        """The open orders of ``markets`` only — GET /orders?marketId=… for each, side by side — or None when Predict does not filter by
+        market (1.139.0). Whether it does is learnt from the answers: every row on the market asked for, and at least one row seen, says
+        it does; a row on another market (the parameter ignored: the account's whole list), or one that does not say its market, says
+        it does not — then the bounded read is used for good. Until it is known, each market is read one page deep (an ignored parameter
+        must not page through the pre-open mode's thousands)."""
+        api = self.live.api
+        pages = self.LIVE_MARKET_PAGES if self.live_market_filter else 1
+
+        async def one(mid: str) -> list[dict]:
+            query = {"status": "OPEN", "marketId": mid}
+            if hasattr(api, "paged"):
+                rows, _ = await api.paged("/orders", query, max_pages=pages)  # (paged: no shared completeness flag between the parallel reads)
+                return rows
+            return await api.orders("OPEN", marketId=mid)
+        answers = await asyncio.gather(*(one(mid) for mid in markets))
+        seen = False
+        for mid, rows in zip(markets, answers):
+            for row in rows:
+                if self.row_market_id(row) != mid:
+                    if self.live_market_filter is not False:  # not an error: /diag says it (同步内：Predict 按市场过滤：不支持)
+                        LOG.info("Predict 挂单列表不按市场过滤（或不注明市场），同步改回按页读")
+                    self.live_market_filter = False
+                    return None
+                seen = True
+        if seen and not self.live_market_filter:
+            self.live_market_filter = True
+        return [row for rows in answers for row in rows]
 
     def live_full_list(self, open_rows: list[dict], now_ms: int) -> tuple[list[dict] | None, int]:
         """Every open order of the account and when that list was read: this step's read when it came whole, else the

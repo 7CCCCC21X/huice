@@ -2794,6 +2794,46 @@ async def missed_orders_fixes():
     trades9, changed9 = {}, []
     bot9.sim_quote(both, trades9, NOW, changed9)
     assert sorted(k.rsplit("|", 2)[1] for k, _ in changed9) == ["down", "up"], changed9
+    # 1.139.0: the step's open-order read by market — only the markets with the model's orders, when Predict filters by marketId;
+    # an ignored parameter (rows of other markets) or rows that do not name their market: back to the bounded read for good
+    bot10 = make_bot(SIM_WAYS="maker")
+    asked = []
+    rows_by_market = {"101": [{"id": "1", "marketId": "101", "status": "OPEN", "amount": "1", "amountFilled": "0", "order": {"hash": "0xa"}}],
+                      "202": [{"id": "2", "market": {"id": "202"}, "status": "OPEN", "amount": "1", "amountFilled": "0", "order": {"hash": "0xb"}}]}
+    async def paged(path, query, stop_ids=None, max_pages=None):
+        asked.append((query.get("marketId"), max_pages))
+        return list(rows_by_market.get(query.get("marketId"), [])), True
+    bot10.live.api.paged = paged
+    got = await bot10.live_orders_by_market(["101", "202"])
+    assert [r["id"] for r in got] == ["1", "2"] and bot10.live_market_filter is True and asked == [("101", 1), ("202", 1)], (got, asked)
+    asked.clear()
+    await bot10.live_orders_by_market(["101"])
+    assert asked == [("101", bot10.LIVE_MARKET_PAGES)], "known to filter: a few pages a market"
+    rows_by_market["101"].append({"id": "9", "marketId": "999", "status": "OPEN", "amount": "1", "amountFilled": "0", "order": {"hash": "0xz"}})
+    assert await bot10.live_orders_by_market(["101"]) is None and bot10.live_market_filter is False, "another market's row: not filtered"
+    # the sync itself: the pre-open snapshot fresh (bounded), one market with a resting order — read by market, found there, no hash read
+    bot12 = make_bot(SIM_WAYS="maker")
+    await bot12.live_prepare(); await bot12.live_prefetch(NOW)
+    rec12 = {"item": "恒生指数", "label": "挂涨", "market": HSI_SLUG, "market_id": "101", "maker": True, "status": "resting", "order": 1.0, "shares": 0.0,
+             "price": 0.4, "side": "up", "fills": [], "live": {"state": "open", "order_id": "1", "hash": "0xa", "events": [], "placed_at": NOW}}
+    bot12.sim_save([(f"{HSI_SLUG}|up|挂", rec12)])
+    bot12.live.api.paged = paged
+    hashed = []
+    async def no_hash(oid, hash_=""):
+        hashed.append(oid)
+        return None
+    bot12.live.api.order = no_hash
+    bot12.preopen = types.SimpleNamespace(account_rows=[], account_at=NOW, unmanaged_rows=lambda rows: rows, request_rate=lambda: None, limited_at=(), now=lambda: NOW)
+    rows_by_market["101"] = rows_by_market["101"][:1]
+    await bot12.live_sync_orders({f"{HSI_SLUG}|up|挂": rec12}, NOW)
+    assert bot12.live_sync_detail["markets"] == 1 and bot12.live_sync_detail["filter"] is True and not hashed, (bot12.live_sync_detail, hashed)
+    assert bot12.live.api.orders_complete is False, "a market's list is never the whole account"
+    bot12.preopen = None
+    bot11 = make_bot(SIM_WAYS="maker")
+    async def unnamed(path, query, stop_ids=None, max_pages=None):
+        return [{"id": "5", "status": "OPEN"}], True
+    bot11.live.api.paged = unnamed
+    assert await bot11.live_orders_by_market(["101"]) is None and bot11.live_market_filter is False, "a row that does not name its market: unverifiable"
     # a refusal that is not about the size is said as itself
     assert m.same_refusal("等它结束，3 秒后再试", "等它结束，4 秒后再试") and not m.same_refusal("单笔 $10 超过", "单笔 $20 超过")
     print("MISSED_ORDERS_FIXES_OK")
