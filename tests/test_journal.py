@@ -7,6 +7,7 @@ import asyncio, csv, io, json, os, sys, urllib.parse, urllib.request, datetime a
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP, except to 127.0.0.1)
 import main as m
+import math
 D = m.D
 BJ = lambda mo, d, h, mi=0: int(dt.datetime(2026, mo, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
 NOW = BJ(10, 5, 10, 0)
@@ -258,9 +259,71 @@ async def run():
     page = m.JOURNAL_PAGE
     for want in ('id="a-versions"', 'id="a-windows"', 'id="sumfilt"', 'id="anafilt"', "journal.json?analysis=1&", "清除筛选", "按设置版本",
                  'id="a-preopen"', "function preopenSection(", "开盘前预挂",
-                 'id="unrecbox"', "function unrecorded("):  # 1.128.0: the pre-open mode's section; 1.130.3: the positions beyond the records
+                 'id="unrecbox"', "function unrecorded(",
+                 'id="a-ev"', "function evSection(", "function evChart(", "模型 EV 对实际盈亏"):  # 1.128.0: the pre-open mode's section; 1.130.3: the positions beyond the records; 1.140.0: the EV timeline
         assert want in page, want
     assert data["analysis"]["preopen"] is None  # the paper bot has no pre-open mode: the section stays hidden
+    # --- 1.140.0: 模型 EV 对实际盈亏 — the poker tracker's all-in EV line over the settled bets, with the model's own ±2σ band ---------
+    ev = data["analysis"]["ev"]
+    settled = [t for t in trades.values() if t["status"] == "settled" and float(t.get("shares") or 0) > 0]
+    assert ev["total"]["bets"] == len(settled) == 4 and ev["total"]["verdict"] == "样本不足" and not ev["total"]["flag"], ev["total"]
+    assert [d["label"] for d in ev["days"]] == ["10-04 周日", "10-05 周一"] and abs(ev["total"]["pnl"] - sum((t["payout"] - t["price"]) * t["shares"] for t in settled)) < 1e-9
+    assert abs(ev["total"]["ev"] - sum(t["edge"] * t["shares"] for t in settled)) < 1e-9 and [g["name"] for g in ev["strategies"]] == ["原策略挂单", "原策略吃单"]
+    assert ev["cards"][0]["name"] in {"恒生指数", "KOSPI"} and (ev["days_span"], ev["window_days"], ev["min_bets"], ev["flag_z"]) == (30, 7, 30, 2.0)
+    flt_ev = bot.journal_analysis({"card": "恒生指数"})["analysis"]["ev"]  # the filter: the model's records of that card only (the pre-open fills, had there been any, stay out)
+    assert flt_ev["total"]["bets"] == sum(1 for t in settled if m.card_of(t) == "恒生指数") and [g["name"] for g in flt_ev["cards"]] == ["恒生指数"]
+
+    def bet(i, payout, maker=True, fair=0.6, price=0.5, shares=10.0, days_ago=0):
+        return {"market": f"m{i}", "kind": "updown", "key": "BTC-15M", "item": "BTC 15分涨跌 10:00–10:15", "side": "up", "maker": maker, "status": "settled",
+                "shares": shares, "order": shares, "price": price, "payout": payout, "edge": fair - price, "fair": fair,
+                "opened": NOW - days_ago * 86_400_000 + i * 60_000, "settle": {"start": NOW, "end": NOW + 900_000, "window": "15m"}}
+    lost = [bet(i, 0.0) for i in range(40)]
+    tl = m.sim_ev_timeline(m.sim_ev_bets(lost + [bet(99, 1.0, days_ago=40), {**bet(98, 1.0), "status": "filled"}, bet(97, 1.0, shares=0)]), NOW)
+    t = tl["total"]  # the 40 losers; the one 40 days old, the open one and the one without a fill are no bets
+    assert (t["bets"], round(t["ev"], 6), round(t["pnl"], 6), t["verdict"], t["flag"]) == (40, 40.0, -200.0, "激进", True), t
+    assert abs(t["sigma"] - math.sqrt(40 * 100 * 0.24)) < 1e-9 and abs(t["z"] - (-240 / math.sqrt(960))) < 1e-6
+    assert len(tl["days"]) == 1 and tl["days"][0]["label"] == "10-05 周一" and tl["days"][0]["cum_pnl"] == -200.0 and tl["recent"]["bets"] == 40 and tl["recent"]["flag"]
+    assert [(g["name"], g["bets"]) for g in tl["strategies"]] == [("原策略挂单", 40)] and [(g["name"], g["bets"]) for g in tl["cards"]] == [("BTC 15分涨跌", 40)]
+    fair = m.sim_ev_timeline(m.sim_ev_bets([bet(i, 1.0 if i % 10 < 6 else 0.0, maker=i % 2 == 0, days_ago=i % 3) for i in range(60)]), NOW)
+    assert fair["total"]["verdict"] == "相符" and not fair["total"]["flag"] and [d["label"] for d in fair["days"]] == ["10-03 周六", "10-04 周日", "10-05 周一"], fair["days"]
+    assert abs(fair["total"]["pnl"] - fair["total"]["ev"]) < 1e-9 and [g["name"] for g in fair["strategies"]] == ["原策略挂单", "原策略吃单"]  # 60% paid at fair 60¢: as claimed
+    assert fair["days"][-1]["cum_pnl"] == fair["total"]["pnl"] and fair["days"][-1]["sigma"] == fair["total"]["sigma"]
+    few = m.sim_ev_timeline(m.sim_ev_bets(lost[:10]), NOW)
+    assert few["total"]["verdict"] == "样本不足" and not few["total"]["flag"] and few["recent"]["z"] < -2  # the figure stands, the verdict waits for 30 bets
+    lucky = m.sim_ev_timeline(m.sim_ev_bets([bet(i, 1.0) for i in range(40)]), NOW)
+    assert lucky["total"]["verdict"] == "保守" and not lucky["total"]["flag"]
+    assert m.sim_ev_timeline([], NOW) == {"days": [], "total": m.ev_group("全部", []), "recent": m.ev_group("近 7 天", []), "strategies": [], "cards": [],
+                                          "days_span": 30, "window_days": 7, "min_bets": 30, "flag_z": 2.0}
+    assert m.ev_bet(NOW, "预挂", "BTC 15分涨跌", 0.49, 10, 0.5, 0.1, 5.1)["var"] == 25.0 and m.ev_bet(NOW, "x", "y", 0.99, 10, 1.2, 0, 0)["fair"] == 0.99
+    # the hourly check: 30+ settled bets in the last 7 days falling 2σ short of the model's claim → one notice a day, to the subscribed chats
+    cfg2 = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
+    evbot = m.Bot(cfg2, m.Store(":memory:"), FM(NOW), None)
+    for i, t in enumerate(lost):
+        evbot.store.put(f"sim:m{i}|up|挂", {**t, "slug": f"m{i}", "label": "挂涨", "settled": NOW + 900_000})
+    notices = []
+    evbot.sim_notify = lambda text: notices.append(text)
+    said = evbot.sim_ev_check(NOW)
+    assert "把优势看高了" in said and "40 笔已结算，模型预期 +$40.00，实际 −$200.00，偏离 −7.7σ" in said and notices == [said] and evbot.store.get("ev_notice")["at"] == NOW, said
+    evbot.sim_ev_checked = -1e9
+    assert evbot.sim_ev_check(NOW + 3600_000) == "" and len(notices) == 1  # once a day
+    evbot.sim_ev_checked = -1e9
+    assert evbot.sim_ev_check(NOW + 25 * 3600_000) != "" and len(notices) == 2
+    assert evbot.sim_ev_check(NOW + 26 * 3600_000) == "" and len(notices) == 2  # hourly: not even computed
+    line = evbot.sim_ev_line()
+    assert line.startswith("⚠️ 模型 EV 对实际（近 7 天，含预挂）：40 笔｜预期 +$40.00｜实际 −$200.00｜偏离 −7.7σ → 激进"), line
+    assert "偏离 −7.7σ → 激进" in evbot.sim_text() and m.Bot(cfg2, m.Store(":memory:"), FM(NOW), None).sim_ev_line() == ""
+    assert "📐 模型 EV 对实际（近 7 天，含预挂）：4 笔｜" in bot.sim_text() and "（不足 30 笔）" in bot.sim_text()
+    # the notice goes out through the deliveries, to the active subscriptions only (the real sim_notify)
+    evbot2 = m.Bot(cfg2, m.Store(":memory:"), FM(NOW), object())
+    told = []
+
+    async def tell2(chat, thread, text, **kw):
+        told.append((chat, thread, text))
+        return True
+    evbot2.tell = tell2
+    evbot2.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}, "2:0": {"chat": 2, "thread": 0, "active": False}})
+    evbot2.sim_notify("hello"); await evbot2.drain_deliveries()
+    assert told == [(1, 0, "hello")] and evbot2.sim_seq == 1
     # the daily report: once per day and subscription, from SIM_DAILY_REPORT (16:30) on, within six hours of it
     sent = []
 

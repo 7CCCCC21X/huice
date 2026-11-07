@@ -549,6 +549,24 @@ def review_side(name: str, side: str, qs: list[dict]) -> dict:
             "pnl": round(sum(pnls), 4)}
 
 
+def ev_bets(rows: list[dict]) -> list[dict]:
+    """The mode's settled fills as bets for the review page's 模型 EV 对实际盈亏 (core.sim_ev_timeline, 1.140.0): each filled side
+    of an accounted pair is one coin-flip bet at the pair's price — EV = (0.5 − price) × filled, P&L the side's own (side_pnl),
+    the variance filled² / 4. A pair without a sent order, an unsettled one or a side whose result is not kept is no bet."""
+    out = []
+    for pair in rows:
+        if not any(o.get("state") not in NEVER_PLACED for o in (pair.get("orders") or {}).values()):
+            continue
+        q = quote_of(pair)
+        if not q["settled"]:
+            continue
+        for side in ("up", "down"):
+            filled, pnl = q[f"filled_{side}"], q["side_pnl"][side]
+            if filled > 0 and pnl is not None:
+                out.append(core.ev_bet(q["start_ms"], "预挂", q["card"], q["price"], filled, 0.5, (0.5 - q["price"]) * filled, pnl))
+    return out
+
+
 def review(rows: list[dict], now_ms: int) -> dict:
     """The review page's 开盘前预挂 section (journal.json analysis.preopen): what this mode's quotes made — the totals, by the
     window's day, card, start hour (Beijing) and side, and the windows that filled, newest first. A record is a pair

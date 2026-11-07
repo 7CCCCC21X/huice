@@ -1292,6 +1292,11 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((up["name"], up["records"], up["filled_windows"], up["filled"], up["settled"], up["wins"], up["pnl"]), ("涨", 4, 2, 12.0, 1, 1, 5.1))
             weekend, weekday = r["weekly"]  # 1.139.2: 11-06 is a Friday — every window a weekday's
             self.assertEqual((weekend["name"], weekend["records"], weekday["name"], weekday["records"], weekday["pnl"]), ("周末（周六 00:00 到周一 08:00）", 0, "工作日", 4, 5.1))
+            bets = p.ev_bets(list(ctl.ledger.rows.values()))  # 1.140.0: the settled fills as coin-flip bets for the EV timeline — the won pair's up side only
+            self.assertEqual([(b["strategy"], b["card"], b["day"], b["shares"], round(b["ev"], 6), round(b["pnl"], 6), b["var"], b["fair"]) for b in bets],
+                             [("预挂", "BTC 15分涨跌", "2026-11-06", 10.0, 0.1, 5.1, 25.0, 0.5)])
+            ev = m.sim_ev_timeline(bets, NOW)
+            self.assertEqual((ev["total"]["bets"], ev["strategies"][0]["name"], ev["total"]["verdict"], round(ev["days"][0]["cum_pnl"], 6)), (1, "预挂", "样本不足", 5.1))
             self.assertEqual((down["records"], down["filled"], down["volume"], down["settled"]), (4, 3.0, 1.47, 0))
             self.assertEqual([(x["name"], x["status"], x["pnl"], x["attempt"]) for x in r["recent"]],
                              [("宇树 15分涨跌 13:00–13:15", "待结算", None, 1), ("BTC 15分涨跌 10:00–10:15", "已结算", 5.1, 0)])
