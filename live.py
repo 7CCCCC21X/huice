@@ -4139,7 +4139,7 @@ class LiveBot(core.Bot):
             if not result["ok"]:
                 return "❌ " + result["message"]
             await self.preopen_apply()
-            return (result["message"] + "\n" + ("周末不挂：北京时间周六、周日开始的场次不挂，已挂的撤掉，周一 00:00 起恢复" if req.args[1].lower() == "off"
+            return (result["message"] + "\n" + ("周末不挂：北京时间周六 00:00 到周一 08:00 开始的场次不挂，已挂的撤掉，周一 08:00 起恢复" if req.args[1].lower() == "off"
                                                  else "周末照挂") + ("\n" + self.preopen.status() if self.preopen is not None else ""))
         if action in {"on", "off"}:  # saved on the control page's record and applied at once, as the page would
             result = self.control_set({"PREOPEN_15M": action})

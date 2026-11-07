@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.139.1"
+VERSION = "1.139.2"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -517,7 +517,7 @@ class PreopenSettings:
     open_quiet_minutes: int = 15  # PREOPEN_OPEN_QUIET_MINUTES: a stock card's windows starting within this of a session segment's open (the day's, the afternoon's) are not quoted — the auction's indicative price, the break's news (1.135.1); 0 = all
     markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = every 15-minute card
     exclusive: bool = False    # PREOPEN_EXCLUSIVE: on = the model trader opens nothing while this mode runs for real (off: both run, jointly capped)
-    weekend: bool = True       # PREOPEN_WEEKEND: off = no window starting on a Saturday or Sunday (Beijing time) is quoted, resting ones withdrawn (1.136.0)
+    weekend: bool = True       # PREOPEN_WEEKEND: off = no window starting Saturday 00:00 to Monday 08:00 (Beijing time) is quoted, resting ones withdrawn (1.136.0; 1.139.2)
     db: str = ""
 
     @property
@@ -665,7 +665,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_15M", "开盘前预挂（15 分钟市场）", "开 = 15 分钟场次一发布就在涨跌两边各挂一张 post-only 买单，开场前撤掉（PREOPEN.md）；需要 LIVE=on。改动即时生效：开就启动，关就撤单停下，改参数先撤单再按新参数重启。预挂的预留计入持仓+挂单上限，当日盈亏计入日亏损停机线"),
     ("PREOPEN_EXCLUSIVE", "预挂时原策略暂停开新仓", "开 = 本模式真实运行时普通模型策略不开新仓（原策略也在交易同一批 15 分钟市场时建议开）；关 = 两边同时跑，额度和日亏损合并计算"),
     ("PREOPEN_MARKETS", "预挂哪几张卡", "点亮要挂的卡，可多选，全选 = all（默认只挂 BTC）；BTC 5分、ETH 5分、BNB 5分 是每 5 分钟一场的卡（1.137.0，只给预挂用）；“一键全关”= none：一张都不挂、已挂的预挂单撤掉，本模式仍开着，再点亮一张就恢复；和“做哪些市场”互不影响：那边排除 15 分钟卡只管原策略，预挂只认这里"),
-    ("PREOPEN_WEEKEND", "周末也挂", "开 = 周六、周日（北京时间）开始的场次照挂；关 = 周末不挂：周五起就不挂周六、周日开始的场次，周末里已挂的按“设置不同”撤掉（不算再报价次数），周一 00:00 起恢复。股票卡周末本来没有场次，这项只影响 BTC、ETH、BNB 这些周末也有场次的卡"),
+    ("PREOPEN_WEEKEND", "周末也挂", "开 = 周末的场次照挂；关 = 周末不挂：北京时间周六 00:00 到周一 08:00 开始的场次不挂（周日晚到周一早上是币圈最薄的时段），周五起就不挂周六的场次，周末里已挂的按“设置不同”撤掉（不算再报价次数），周一 08:00 起恢复。股票卡周末本来没有场次，这项只影响 BTC、ETH、BNB 这些周末也有场次的卡"),
     ("PREOPEN_SHARES", "预挂每边份数", "1～500：每场每边各挂这么多份（默认 10），每边不少于 $1"),
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
     ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 7 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
@@ -12668,6 +12668,7 @@ function preopenSection(po){  // 开盘前预挂 (1.128.0): the mode's own ledge
   el.append(d,$("div","sub","按日期"),poTable(po.days||[]),$("div","sub","按标的"),poTable(po.cards||[]));
   if((po.levels||[]).length>1)el.append($("div","sub","按价格档位（每档一条记录）"),poTable(po.levels));
   el.append($("div","sub","按开始时间"),poTable(po.hours||[]));
+  if((po.weekly||[]).length)el.append($("div","sub","周末 vs 工作日（按场次开始时间；周末 = 北京时间周六 00:00 到周一 08:00，和“周末也挂”的开关同一区间）"),poTable(po.weekly));
   el.append($("div","sub","按方向（一场的涨、跌是两张单）"),table(["方向","挂出","有成交","成交份数","成交额","已结算","盈亏"],(po.sides||[]).map(r=>[r.name,r.records,r.filled_windows||"—",num(r.filled),usd(r.volume),poWl(r),r.settled?poPn(r.pnl):"—"])));
   if((po.recent||[]).length){const res=x=>x==="up"?"涨":x==="down"?"跌":x==="split"?"平":"未出";
     el.append($("div","sub","有成交的场次（最近 "+po.recent.length+" 场，新的在前）"),table(["开始","场次","涨成交","跌成交","价格","成交额","结果","盈亏","状态","挂上时距开场","撤单确认","第几次报价"],

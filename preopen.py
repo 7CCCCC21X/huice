@@ -255,9 +255,14 @@ def session_opening(rolling: Any, start_ms: int, holidays: frozenset, quiet_ms: 
     return any(seg_open <= start_ms < seg_open + quiet_ms for seg_open, _ in core.session_segments(rolling.exchange, day, holidays))
 
 
+WEEKEND_END_HOUR = 8  # the weekend runs to Monday this o'clock Beijing (1.139.2: Sunday evening in the US to the Asian open is crypto's thinnest stretch)
+
+
 def on_weekend(ms: int) -> bool:
-    """Whether the moment falls on a Saturday or Sunday, Beijing time (PREOPEN_WEEKEND=off: no such window is quoted, 1.136.0)."""
-    return dt.datetime.fromtimestamp(ms / 1000, core.BEIJING).weekday() >= 5
+    """Whether the moment falls in the weekend — Saturday 00:00 to Monday WEEKEND_END_HOUR, Beijing time (PREOPEN_WEEKEND=off: no
+    window starting then is quoted, 1.136.0; 1.139.2: to Monday 08:00, was Monday 00:00)."""
+    at = dt.datetime.fromtimestamp(ms / 1000, core.BEIJING)
+    return at.weekday() >= 5 or (at.weekday() == 0 and at.hour < WEEKEND_END_HOUR)
 
 
 def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[Any, int]]:
@@ -574,6 +579,9 @@ def review(rows: list[dict], now_ms: int) -> dict:
             "levels": [review_summary(levels[k][0]["level_name"], levels[k]) for k in sorted(levels, reverse=True)],  # the highest bid first
             "hours": [review_summary(f"{card} {hour:02d} 时开始".strip(), hours[(card, hour)]) for card, hour in sorted(hours)],
             "sides": [review_side(name, side, qs) for side, name in (("up", "涨"), ("down", "跌"))],
+            # 1.139.2: the weekend's windows against the weekdays' — the weekend as PREOPEN_WEEKEND draws it (on_weekend)
+            "weekly": [review_summary(f"周末（周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00）", [q for q in qs if on_weekend(q["start_ms"])]),
+                       review_summary("工作日", [q for q in qs if not on_weekend(q["start_ms"])])],
             "recent": [{k: q[k] for k in shown} for q in recent]}
 
 
@@ -1919,7 +1927,7 @@ class Controller:
                 f"撤单：开场前 {self.settings.cancel_seconds} 秒发出，之后到开场前 {self.settings.expiry_seconds} 秒到期为止每 {SPRINT_MS // 1000} 秒催一次；"
                 f"不足 {self.settings.entry_seconds} 秒不再新挂"
                 + (f"；股票卡开盘、午后头 {self.settings.open_quiet_minutes} 分钟内开始的场次不挂" if self.settings.open_quiet_minutes else "")
-                + ("；周末不挂（北京时间周六、周日开始的场次）" if not self.settings.weekend else "") + "\n"
+                + (f"；周末不挂（北京时间周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00 开始的场次）" if not self.settings.weekend else "") + "\n"
                 f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清），"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
@@ -1933,7 +1941,7 @@ class Controller:
                    if any(0 <= self.now() - t <= LISTING_LATE_MS for t in self.awaiting.values()) else "") + "）"
                 + f"\n最近问题：{self.error or '无'}"
                 + (f"\n暂不新挂：{why}" if why and state == "运行" else "")
-                + ("\n周末不挂：现在是周末，不挂新场次，周一 00:00（北京时间）起恢复" if not self.settings.weekend and on_weekend(self.now()) else "")
+                + (f"\n周末不挂：现在是周末，不挂新场次，周一 {WEEKEND_END_HOUR:02d}:00（北京时间）起恢复" if not self.settings.weekend and on_weekend(self.now()) else "")
                 + (f"\n账户另有 {self.unmanaged} 笔本程序没记录的挂单（手工挂的或旧版本留下的）：不计入预挂限额，也不挡预挂"
                    + ("；其中挂在本机器人市场上的，原策略 2 分钟后自动撤掉（LIVE_ORPHAN_CANCEL）" if getattr(self.owner.config, "live_orphan_cancel", True) else "") if self.unmanaged else "")
                 + ("\n股票卡暂停：" + "；".join(self.card_holds.values()) if self.card_holds else "")

@@ -891,12 +891,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "PREOPEN_MARKETS": "nope"})
         sat = NOW + 15 * 3600_000  # Saturday 00:00 Beijing
-        self.assertEqual([p.on_weekend(t) for t in (NOW, sat - 1, sat, sat + 47 * 3600_000, sat + 48 * 3600_000)], [False, False, True, True, False])
+        self.assertEqual([p.on_weekend(t) for t in (NOW, sat - 1, sat, sat + 47 * 3600_000, sat + 48 * 3600_000, sat + 56 * 3600_000 - 1, sat + 56 * 3600_000)],
+                         [False, False, True, True, True, True, False], "1.139.2: to Monday 08:00 Beijing")
         ctl, api, clock = controller(PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="1440", PREOPEN_WEEKEND="off")
         self.assertFalse(ctl.settings.weekend)
         starts = [s for _, s in p.window_starts(NOW, ctl.owner.config, ctl.settings)]
         self.assertEqual((max(starts), sat in starts), (sat - 15 * 60_000, False), "Friday's last window is the last")
-        self.assertIn("周末不挂（北京时间周六、周日开始的场次）", ctl.status())
+        self.assertIn("周末不挂（北京时间周六 00:00 到周一 08:00 开始的场次）", ctl.status())
         clock.ms = sat + 3600_000
         self.assertEqual(p.window_starts(clock.ms, ctl.owner.config, ctl.settings), [])
         self.assertIn("周末不挂：现在是周末", ctl.status())
@@ -1289,6 +1290,8 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([d["name"] for d in r["hours"]], ["BTC 15分涨跌 10 时开始", "宇树 15分涨跌 13 时开始"])
             up, down = r["sides"]
             self.assertEqual((up["name"], up["records"], up["filled_windows"], up["filled"], up["settled"], up["wins"], up["pnl"]), ("涨", 4, 2, 12.0, 1, 1, 5.1))
+            weekend, weekday = r["weekly"]  # 1.139.2: 11-06 is a Friday — every window a weekday's
+            self.assertEqual((weekend["name"], weekend["records"], weekday["name"], weekday["records"], weekday["pnl"]), ("周末（周六 00:00 到周一 08:00）", 0, "工作日", 4, 5.1))
             self.assertEqual((down["records"], down["filled"], down["volume"], down["settled"]), (4, 3.0, 1.47, 0))
             self.assertEqual([(x["name"], x["status"], x["pnl"], x["attempt"]) for x in r["recent"]],
                              [("宇树 15分涨跌 13:00–13:15", "待结算", None, 1), ("BTC 15分涨跌 10:00–10:15", "已结算", 5.1, 0)])
