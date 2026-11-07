@@ -81,6 +81,11 @@ STUCK_MS = 15 * 60_000    # a withdrawn pair not cleared this long past its canc
 LISTING_FIELDS = ("id", "conditionId", "status", "tradingStatus", "question", "outcomes")  # the details' fields the discovery reads
 LISTING_FULL_FIELDS = (*LISTING_FIELDS, "feeRateBps", "isNegRisk", "isYieldBearing")  # ...and what the order itself needs: a category answer carrying them all is placed on without the details read (1.133.0)
 MAX_ATTEMPTS = 3       # a window's quotes that ended by its own failure, at most (a pair withdrawn before the start is quoted again under a new salt)
+BULK_MIN_IDS = 40        # more orders than this to withdraw at once (a pause, a settings change, the mode off) go in batches that wait out a rate limit (1.141.0)
+BULK_WORKERS = 4         # ...holding at most this many of the cancel client's requests (live.PredictApi.PARALLEL: one left for a window at its cancel time)
+STOP_CANCEL_S = 600      # a controller that crashed withdraws for this long at most on its way out (was 12 s for any stop: a book of thousands mostly stayed)
+FINALS_WAIT_MS = 30 * 60_000  # winding down: once nothing can rest, the withdrawn orders' final fills are read this long at most (the rest at the next start)
+MAY_REST = {"open", "placing", "unknown", "prepared"}  # order states that may be on the book: sent, or being sent, for all we know
 FREE_REASONS = ("设置不同", "预挂模式停止", "到时撤单或真实交易暂停", "距涨停", "距跌停", "临停")  # withdrawals that were not the window's doing (counts_against)
 MISS_STOP = 4          # discover: a card's coming windows are asked in start order; this many unlisted in a row end the card's full scan
 FULL_SCAN_MS = 60_000  # a full scan (up to MISS_STOP unlisted per card) this often; between them each card's first unlisted window alone is asked every poll
@@ -119,6 +124,16 @@ class Ledger:
         with self.conn:
             self.conn.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body", (row["slug"], body))
         self.rows[row["slug"]] = row
+
+    def save_many(self, rows: list[dict]) -> None:
+        """Several records in one transaction (1.141.0: a batch withdrawal touches thousands — one commit, not one each)."""
+        if not rows:
+            return
+        with self.conn:
+            self.conn.executemany("INSERT INTO pairs VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body",
+                                  [(row["slug"], json.dumps(row, ensure_ascii=False)) for row in rows])
+        for row in rows:
+            self.rows[row["slug"]] = row
 
     def delete(self, slug: str) -> None:
         """A pair none of whose orders was ever sent (the rate limiter refused the first request): no record, so a later
@@ -401,6 +416,22 @@ def cards_today(rows: list[dict], now_ms: int) -> list[dict]:
                     "expected": round(sum((0.5 - q["price"]) * q["filled"] for q in settled), 4), "avg_fair": 0.5 if settled else None,
                     "hit": (r["wins"] + 0.5 * r["ties"]) / r["settled"] if r["settled"] else None})
     return sorted(out, key=lambda x: (-x["records"], x["name"]))
+
+
+def removable_ids(pair: dict) -> list[str]:
+    """The pair's orders a removal can still withdraw (1.141.0): sent — an id — and not ended."""
+    return [str(o["id"]) for o in (pair.get("orders") or {}).values() if o.get("id") and o.get("state") not in TERMINAL]
+
+
+def resting_orders(pair: dict, now_ms: int) -> int:
+    """The pair's orders that may be on the book now (1.141.0): in a state that may rest, the signed expiry still ahead; none
+    for an accounted pair."""
+    if pair.get("accounted"):
+        return 0
+    end = int(pair.get("expires") or 0) * 1000 or int(pair.get("start_ms") or 0)
+    if now_ms >= end:
+        return 0
+    return sum(1 for o in (pair.get("orders") or {}).values() if o.get("state") in MAY_REST)
 
 
 def counts_against(pair: dict) -> bool:
@@ -725,6 +756,15 @@ class Controller:
         self.api.ORDERS_PAGE = self.cancel_api.ORDERS_PAGE = int(getattr(owner.config, "live_orders_page", 50) or 50)  # LIVE_ORDERS_PAGE: fewer pages a snapshot (1.136.1)
         self.settling: dict[str, asyncio.Task] = {}
         self.settle_gate = asyncio.Semaphore(2)
+        self.reconcile_gate = asyncio.Semaphore(2)  # the withdrawn pairs' final reads (launch_reconcile) have their own two: thousands of them never starve the monitors and settlements (1.141.0)
+        self.bulk_slugs: set[str] = set()  # pairs a batch withdrawal holds: the loop leaves them to it (1.141.0)
+        self.bulk_task: asyncio.Task | None = None  # the closing pairs' withdrawal in batches (a settings change: many at once), beside the loop
+        self.bulk_progress: dict = {}  # the batch withdrawal under way (live.remove_in_batches), for the status
+        self.bulk_last: dict = {}  # ...and the last one's figures
+        self.winding = ""  # why the mode winds down (switched off with orders out): every order withdrawn, the final fills read, then it stops itself
+        self.winding_since = 0
+        self.rest_clear_ms = 0  # winding down: since when nothing of this mode can rest on the book (the final reads have FINALS_WAIT_MS)
+        self._remove_limit: Any = None  # the measured batch when the owner keeps none (the tests' owner)
 
     def now(self) -> int:
         return self.owner.market.now_ms()
@@ -800,6 +840,7 @@ class Controller:
         lines.append(f"撤单后超过 {STUCK_MS // 60_000} 分钟未结清：{len(stuck)} 场"
                      + ("：" + "；".join(f"{p.get('name') or p['slug']}（{'/'.join(o['state'] for o in p['orders'].values())}，{p.get('reason') or '?'}）" for p in stuck[:5]) if stuck else ""))
         lines.append(f"状态未知的订单：{len(unknown)} 张" + ("：" + "；".join(f"{p.get('name') or p['slug']} {s}" for p, s in unknown[:5]) if unknown else ""))
+        lines.append(self.bulk_line())
         lines.append("最近 10 分钟的问题：" + ("；".join(f"{hms(t)} {e}" for t, e in recent[-5:]) if recent else "无"))
         return "\n".join(lines)
 
@@ -807,10 +848,13 @@ class Controller:
         return self.owner.stopping.is_set() or self.stop.is_set()
 
     def withdrawing(self) -> str:
-        """An operator's stop, which withdraws the resting pairs: the mode paused, real trading off, paused or killed, the
-        day's loss cap reached. Not the process or the mode stopping (on_stop decides what stays on the book), and not the
-        account not verified yet at a start (1.128.3: that withdrew every pair just taken over, and re-quoted them)."""
+        """An operator's stop, which withdraws the resting pairs: the mode switched off (winding down, 1.141.0) or paused, real
+        trading off, paused or killed, the day's loss cap reached. Not the process or the mode stopping (on_stop decides
+        what stays on the book), and not the account not verified yet at a start (1.128.3: that withdrew every pair just
+        taken over, and re-quoted them)."""
         c = self.owner.config
+        if self.winding:
+            return self.winding
         if self.manual_pause:
             return "本模式已手动暂停（/preopen resume 恢复）"
         if c.live_mode != "on" or not c.live_allowed:
@@ -1119,8 +1163,10 @@ class Controller:
         if self.owner.stopping.is_set() or self.keep_on_stop:
             LOG.info("开盘前预挂：%d 场挂单留在簿上（签名到期兜底，重启后接管）", resting)
             return
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(self.cancel_all("预挂模式停止，撤销预挂单", free=True), timeout=12)
+        if not resting and not any(removable_ids(p) for p in self.ledger.rows.values() if p["phase"] != "closed"):
+            return  # nothing left to withdraw (a wind-down that finished)
+        with contextlib.suppress(Exception):  # 1.141.0: in batches, a rate limit waited out (was cut after 12 s: a book of thousands mostly stayed)
+            await self.cancel_all("预挂模式停止，撤销预挂单", free=True, deadline_s=STOP_CANCEL_S)
 
     async def discover(self, probe_only: bool = False) -> None:
         """One discovery pass: first each card's next listing (the windows beyond the latest known listed, concurrently across
@@ -1474,7 +1520,7 @@ class Controller:
         return (now >= pair["cancel_ms"] and now < pair["expires"] * 1000
                 and any(o["state"] in {"open", "placing", "unknown"} for o in pair["orders"].values()))
 
-    def bookkeep(self, pair: dict) -> None:
+    def bookkeep(self, pair: dict, save: bool = True) -> None:
         """A closing or unverified pair's next try: SPRINT_MS on in the last stretch (in_sprint), else RETRY_MS after this one,
         doubling to RETRY_MAX_MS; closed once nothing is left to cancel; accounted (its money released) once every order is
         verified and nothing filled."""
@@ -1488,7 +1534,8 @@ class Controller:
         if (not pair.get("accounted") and all(order_verified(o) for o in pair["orders"].values())
                 and all(float(o.get("filled") or 0) <= 0 for o in pair["orders"].values())):
             pair.update(accounted=True, accounted_day=dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat(), pnl=0.0)
-        self.ledger.save(pair)
+        if save:
+            self.ledger.save(pair)
 
     async def read_final(self, order: dict, pair: dict) -> None:
         """An order's own record, for its final fills: final → "final"; none, past the give-up — never placed (no id) or
@@ -1613,47 +1660,152 @@ class Controller:
         if rejected:
             await self.cancel_many([pair], "一边未成交即结束，撤掉另一边")
 
-    async def cancel_all(self, reason: str, free: bool = False) -> None:
-        await self.cancel_many([p for p in list(self.ledger.rows.values()) if p["phase"] != "closed"], reason, free)
+    async def cancel_all(self, reason: str, free: bool = False, deadline_s: float | None = None) -> None:
+        await self.cancel_many([p for p in list(self.ledger.rows.values()) if p["phase"] != "closed"], reason, free, deadline_s)
 
-    async def cancel_many(self, pairs: list[dict], reason: str, free: bool = False) -> None:
+    async def withdraw_all(self, reason: str) -> str:
+        """An operator's withdrawal of this mode's orders (the pause, /live cancel, the emergency stop), the pause already set
+        by the caller (1.141.0): a few withdrawn here and now; a book of more than BULK_MIN_IDS left to the cancellation
+        loop, which withdraws it in batches — the command answers at once instead of minutes later. The reply's line."""
+        n = sum(len(removable_ids(p)) for p in self.ledger.rows.values() if p["phase"] != "closed")
+        if n <= BULK_MIN_IDS or not self.alive:
+            await self.cancel_all(reason)
+            return ""
+        return f"正在分批撤 {n} 张预挂单（{self.remove_limit().text()}），/preopen 看进度"
+
+    async def cancel_many(self, pairs: list[dict], reason: str, free: bool = False, deadline_s: float | None = None) -> None:
         """Bulk removals first; slow hash/fill reads never queue known IDs behind them. ``free``: a withdrawal that was not
-        the window's doing — it does not count against its MAX_ATTEMPTS (counts_against)."""
-        by_id: dict[str, tuple[dict, dict]] = {}
+        the window's doing — it does not count against its MAX_ATTEMPTS (counts_against). 1.141.0: the removals in batches
+        at Predict's measured size (remove_pairs), a rate limit waited out when there are many."""
         for pair in pairs:
             pair.update(phase="closing", reason=reason, **({"free": True} if free else {}))
             for order in pair["orders"].values():
                 if order["state"] == "prepared":
                     order["state"] = "not_sent"
-                elif order["state"] not in TERMINAL and order.get("id"):
+        self.ledger.save_many(pairs)
+        await self.remove_pairs(pairs, deadline_s=deadline_s)
+
+    def remove_limit(self) -> Any:
+        """Predict's measured removal batch (live.RemoveLimit): the owner's, kept in its store across restarts; else this controller's own."""
+        get = getattr(self.owner, "live_remove_limit", None)
+        if callable(get):
+            return get()
+        if self._remove_limit is None:
+            import live
+            self._remove_limit = live.RemoveLimit()
+        return self._remove_limit
+
+    async def remove_pairs(self, pairs: list[dict], patient: bool | None = None, deadline_s: float | None = None) -> dict:
+        """The pairs' resting orders withdrawn in batches (live.remove_in_batches, 1.141.0), the soonest window first; then each
+        pair booked (bookkeep) and its final fills read (launch_reconcile). ``patient`` — when there are more than
+        BULK_MIN_IDS, unless told — waits out a rate limit and leaves a pair whose order could not be sent to the loop,
+        which takes it on in batches again once its retry is due; the few (a window at its cancel time) get one try each,
+        their retry the per-window path's, as before."""
+        import live
+        pairs = sorted(pairs, key=lambda p: (int(p.get("cancel_ms") or p.get("start_ms") or 0), str(p.get("slug") or "")))
+        by_id: dict[str, tuple[dict, dict]] = {}
+        for pair in pairs:
+            for order in pair["orders"].values():
+                if order.get("id") and order["state"] not in TERMINAL:
                     by_id[str(order["id"])] = pair, order
-            self.ledger.save(pair)
-        ids = list(by_id)
+        patient = len(by_id) > BULK_MIN_IDS if patient is None else patient
         for pair, _ in by_id.values():
             pair.setdefault("cancel_sent_ms", self.now())  # the round trip and the lead on the start: /preopen shows them (the cancel time's evidence)
-        async def batch(chunk: list[str]) -> None:
-            result = await self.cancel_api.remove_orders(chunk)
-            for oid in result["removed"]:
+
+        def answered(removed: list[str], noop: list[str]) -> None:
+            touched: dict[str, dict] = {}
+            for oid in removed:
                 if oid in by_id:
                     pair, order = by_id[oid]
                     order["state"] = "removed"
                     pair.setdefault("cancel_done_ms", self.now())
-                    self.ledger.save(pair)
-        results = await asyncio.gather(*(batch(ids[n:n + 20]) for n in range(0, len(ids), 20)), return_exceptions=True)
-        for error in results:
-            if isinstance(error, BaseException):
-                self.error = core.clean_error(error)
+                    touched[pair["slug"]] = pair
+            self.ledger.save_many(list(touched.values()))
+        slugs = {p["slug"] for p in pairs}
+        self.bulk_slugs |= slugs
+        limit = self.remove_limit()
+        result: dict = {"removed": [], "noop": [], "unanswered": [], "failed": [], "left": [], "errors": [], "requests": 0, "limited": 0, "seconds": 0.0}
+        progress: dict | None = {} if patient and by_id else None
+        if progress is not None:
+            self.bulk_progress = progress  # the status shows the latest one under way
+        try:
+            if by_id:
+                result = await live.remove_in_batches(
+                    self.cancel_api, list(by_id), limit, workers=BULK_WORKERS, patient=patient,
+                    deadline=time.monotonic() + deadline_s if deadline_s else None, stop=self.owner.stopping.is_set,
+                    on_answer=answered, progress=progress, now_ms=self.now)
+        finally:
+            self.bulk_slugs -= slugs
+            save = getattr(self.owner, "live_remove_saved", None)
+            if callable(save):
+                with contextlib.suppress(Exception):
+                    save(limit)
+            if progress is not None and self.bulk_progress is progress:
+                self.bulk_progress = {}
+        if progress is not None:  # done (a withdrawal cut short by the controller's stop leaves no figures)
+            self.bulk_last = {"at": self.now(), "orders": len(by_id), "removed": len(result["removed"]),
+                              "quiet": len(result["noop"]) + len(result["unanswered"]), "missed": len(result["failed"]) + len(result["left"]),
+                              "requests": result["requests"], "limited": result["limited"], "seconds": result["seconds"]}
+        if result["errors"]:
+            self.error = result["errors"][-1]
+        unsent = set(result["failed"]) | set(result["left"])
         for pair in pairs:
-            self.bookkeep(pair)  # closed once nothing is left to cancel; the next try RETRY_MS on, doubling (not every half second)
-            if not pair.get("accounted") and pair["slug"] not in self.cancelling:
-                self.launch_reconcile(pair)  # the removed orders' final fills, the unknown ones' hashes: the reservation ends on what they show
+            self.bookkeep(pair, save=False)  # closed once nothing is left to cancel; the next try RETRY_MS on, doubling (not every half second)
+        self.ledger.save_many(pairs)
+        for pair in pairs:
+            if pair.get("accounted") or pair["slug"] in self.cancelling:
+                continue
+            if patient and any(str(o.get("id") or "") in unsent for o in pair["orders"].values()):
+                continue  # not sent: the loop takes it on in batches again once its retry is due
+            self.launch_reconcile(pair)  # the removed orders' final fills, the unknown ones' hashes: the reservation ends on what they show
+        return result
+
+    def wind_down(self, reason: str) -> None:
+        """The mode switched off with orders out (1.141.0): nothing new goes out, every resting order is withdrawn in
+        batches until none is left — a rate limit waited out, not cut after 12 seconds as before — their final fills are
+        read, then the controller stops itself (the owner clears it: LiveBot.preopen_apply)."""
+        if not self.winding:
+            self.winding, self.winding_since, self.rest_clear_ms = reason, self.now(), 0
+            LOG.info("开盘前预挂：%s，撤单收尾中", reason)
+
+    def wound_up(self, now_ms: int) -> bool:
+        """Winding down: done once no order of this mode can be on the book (withdrawn, ended, or past its signed expiry) and
+        every withdrawn one's final fills are read — or FINALS_WAIT_MS after nothing could rest (the rest read at the next
+        start)."""
+        if self.bulk_task is not None and not self.bulk_task.done():
+            return False
+        rows = [p for p in self.ledger.rows.values() if not p.get("accounted")]
+        if any(p["phase"] == "active" or resting_orders(p, now_ms) for p in rows):
+            self.rest_clear_ms = 0
+            return False
+        self.rest_clear_ms = self.rest_clear_ms or now_ms
+        unread = any(not order_verified(o) for p in rows for o in p["orders"].values())
+        reading = any(key.startswith("cancel:") and not task.done() for key, task in self.settling.items())
+        return not (unread or reading) or now_ms - self.rest_clear_ms >= FINALS_WAIT_MS
+
+    def bulk_line(self) -> str:
+        """The batch withdrawals, for the status: the one under way (how far), else the last one; the measured batch."""
+        pr, last, now = self.bulk_progress, self.bulk_last, self.now()
+        parts = []
+        if pr.get("total"):
+            took = time.monotonic() - float(pr.get("started") or time.monotonic())
+            parts.append(f"正在分批撤：已撤 {pr.get('removed', 0)} / {pr['total']} 张" + (f"（{pr['noop']} 张已不在簿上）" if pr.get("noop") else "")
+                         + f"，{pr.get('requests', 0)} 个请求、同时 {pr.get('workers', 0)} 个，{took:.0f} 秒"
+                         + (f"，限流 {pr['limited']} 次（等冷却结束接着撤）" if pr.get("limited") else ""))
+        elif last:
+            parts.append(f"上次分批撤 {last['orders']} 张（{when(last['at'], now)}）：撤掉 {last['removed']} 张" + (f"、{last['quiet']} 张已不在簿上" if last.get("quiet") else "")
+                         + f"，{last['seconds']:.0f} 秒、{last['requests']} 个请求" + (f"、限流 {last['limited']} 次" if last.get("limited") else "")
+                         + (f"；{last['missed']} 张没撤成，稍后接着撤" if last.get("missed") else ""))
+        if self.winding:
+            parts.append(f"还可能挂着 {sum(resting_orders(p, now) for p in self.ledger.rows.values())} 张")
+        return "批量撤单：" + self.remove_limit().text() + ("；" + "；".join(parts) if parts else "")
 
     def launch_reconcile(self, pair: dict) -> None:
         key = "cancel:" + pair["slug"]
         if key in self.settling and not self.settling[key].done():
             return
         async def reconcile() -> None:
-            async with self.settle_gate:
+            async with self.reconcile_gate:
                 try:
                     await self.cancel_pair(pair, pair.get("reason") or "撤单状态核对")
                 except asyncio.CancelledError:
@@ -1780,10 +1932,24 @@ class Controller:
                 active = [p for p in due if p["phase"] == "active"]
                 if active:
                     await self.cancel_many(active, "到时撤单或真实交易暂停", free=True)
-                for pair in due:
-                    if pair["phase"] != "active" and pair["slug"] not in self.cancelling:
-                        self.bookkeep(pair)  # the next try is booked now: a read that hangs does not make the loop ask again meanwhile
-                        self.launch_reconcile(pair)
+                stale = [p for p in due if p["phase"] != "active" and p["slug"] not in self.cancelling and p["slug"] not in self.bulk_slugs]
+                heavy = [p for p in stale if removable_ids(p)]
+                if sum(len(removable_ids(p)) for p in heavy) > BULK_MIN_IDS:
+                    # 1.141.0: many closing pairs with orders out (a settings change withdrew them, a batch left them): in batches,
+                    # beside this loop — the windows at their cancel time go on being withdrawn on time meanwhile
+                    if self.bulk_task is None or self.bulk_task.done():
+                        self.bulk_task = asyncio.create_task(self.remove_pairs(heavy, patient=True), name="preopen-bulk")
+                    held = {p["slug"] for p in heavy}  # the running batch's turn ends first: these wait for the next
+                    stale = [p for p in stale if p["slug"] not in held]
+                for pair in stale:
+                    self.bookkeep(pair)  # the next try is booked now: a read that hangs does not make the loop ask again meanwhile
+                    self.launch_reconcile(pair)
+            if self.winding and self.wound_up(now):
+                unread = sum(1 for p in self.ledger.rows.values() if not p.get("accounted") and any(not order_verified(o) for o in p["orders"].values()))
+                self.notify(f"✅ 开盘前预挂已关闭：本模式的挂单已全部撤完" + (f"（{unread} 场的成交还没核对完，下次开启时接着核对）" if unread else ""), key="preopen:wound")
+                LOG.info("开盘前预挂收尾完成：%s", self.winding)
+                self.stop.set()
+                return
             for pair in list(self.ledger.rows.values()):
                 if pair["phase"] == "active" and now - int(pair.get("checked_ms") or 0) >= MONITOR_MS and now - int(pair.get("created_ms") or 0) >= 10_000:
                     key = "monitor:" + pair["slug"]  # (a look due: not a task for every active pair twice a second)
@@ -1829,9 +1995,10 @@ class Controller:
                     if job.done() and not job.cancelled() and job.exception():
                         raise job.exception()
             finally:
-                for job in [*stops, *jobs]:
+                bulk = [self.bulk_task] if self.bulk_task is not None else []
+                for job in [*stops, *jobs, *bulk]:
                     job.cancel()
-                await asyncio.gather(*stops, *jobs, return_exceptions=True)
+                await asyncio.gather(*stops, *jobs, *bulk, return_exceptions=True)
                 await self.on_stop()
                 for task in self.settling.values():
                     task.cancel()
@@ -1931,14 +2098,17 @@ class Controller:
         windows_left, pairs_left, usd_left = self.unplaced()
         named = lambda ps: "、".join(str(p.get("name") or window_of(p)) + (f" 第 {int(p['level']) + 1} 档" if p.get("level") else "") for p in ps[:3]) + ("…" if len(ps) > 3 else "")
         why = (self.hold() or self.budget_problem()) if self.alive else ""
-        state = "已停止" if not self.alive else f"暂停，{why}" if self.blocked() else "运行"
+        state = ("已停止" if not self.alive else f"收尾中（{self.winding}）：不再新挂，挂着的单分批撤完、成交核对完就自动停止" if self.winding
+                 else f"暂停，{why}" if self.blocked() else "运行")
+        bulk = self.bulk_line()
+        busy = bool(self.winding or self.bulk_progress.get("total"))  # under way: right under the state line, else at the end
         until = lambda ms: f"{when(ms, self.now())}（开场前 {(ms - self.now()) / 60_000:.0f} 分钟）" if ms > self.now() else "还没见到已发布的场次"
         reach = lambda key: (f"{key} 发布到 {until(self.listed_by_card[key])}" if self.listed_by_card.get(key, 0) > self.now() else f"{key} 还没见到已发布的场次") \
             + (f"，挂到 {hms(quoted_to[key])}" if quoted_to.get(key) else "")
         listed = ("没选卡：不挂新场次（控制台“预挂哪几张卡”一键全关；再点亮一张就恢复）" if not self.settings.markets
                   else "已发布到 " + until(self.listed_until_ms) + (f"，挂到 {hms(max(quoted_to.values()))}" if quoted_to else "") if len(self.settings.markets) == 1
                   else "各卡：" + "；".join(reach(key) for key in sorted(self.settings.markets)))
-        return (f"开盘前自动预挂：{state}\n"
+        return (f"开盘前自动预挂：{state}\n" + (bulk + "\n" if busy else "") +
                 f"{' / '.join(sorted(self.settings.markets)) or '没选卡'}：两边各 {levels_text(self.settings)}；"
                 f"扫描 {self.settings.poll:g} 秒，"
                 + ("挂 24 小时内已发布的全部场次" if self.settings.ahead_minutes >= 1440 else f"只挂 {self.settings.ahead_minutes} 分钟内开始的场次") + "\n"
@@ -1968,4 +2138,4 @@ class Controller:
                 + (f"\n没挂的已发布场次：" + "；".join(f"{k.rsplit('-', 1)[-1]} {v}" for k, v in list(self.skipped.items())[-3:]) if self.skipped else "")
                 + (f"\n不再报价：{len(spent)} 档失败满 {MAX_ATTEMPTS} 次（单边没确认、一边被撤或过期），如 {named(spent)}" if spent else "")
                 + (f"\n不再报价：{len(refused)} 档被 Predict 拒绝（post-only 会吃单等），如 {named(refused)}" if refused else "") + "\n"
-                f"实测：{self.timing_line()}")
+                f"实测：{self.timing_line()}" + ("" if busy else "\n" + bulk))

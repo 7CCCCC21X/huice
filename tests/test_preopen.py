@@ -1081,8 +1081,11 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, owner):
                 self.owner, self.settings, self.alive, self.stop, self.error = owner, owner.config.preopen, True, asyncio.Event(), ""
                 self.ledger = types.SimpleNamespace(close=lambda: None)
-                self.ran, self.ended = asyncio.Event(), False
+                self.ran, self.ended, self.winding = asyncio.Event(), False, ""
                 FakeCtl.made.append(self)
+            def wind_down(self, reason):  # 1.141.0: switched off — its orders withdrawn until none is left; this one has none, so it ends at once
+                self.winding = reason
+                self.stop.set()
             async def run(self):
                 self.ran.set()
                 try:
@@ -1107,8 +1110,14 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first.keep_on_stop, "a settings change leaves the orders on the book for the next controller")
         second = bot.preopen
         bot.config = m.Config.from_env({**env, "PREOPEN_15M": "off"})
+        bot.market = types.SimpleNamespace(now_ms=lambda: NOW)
         await bot.preopen_apply()
-        self.assertTrue(second.ended and bot.preopen is None and bot.preopen_task is None and not bot.preopen_active(), "off: stopped")
+        self.assertEqual(second.winding, "预挂模式已关闭")  # winding down: its orders withdrawn, then it stops itself
+        for _ in range(100):
+            if bot.preopen is None:
+                break
+            await asyncio.sleep(0.01)
+        self.assertTrue(second.ended and bot.preopen is None and bot.preopen_task is None and not bot.preopen_active(), "off: wound down, cleared")
         self.assertFalse(second.keep_on_stop, "off: withdrawn")
         await bot.preopen_apply()
         self.assertIsNone(bot.preopen)
@@ -1592,6 +1601,251 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             api.gate.release()
             with self.assertRaises(p.NotSent): await task
         self.assertEqual(sent, [])
+
+    # --- 1.141.0: withdrawing a book of thousands -----------------------------------------------------------------------------
+    async def book_of(self, ctl, api, n, phase="active"):
+        """``n`` pairs like a placed one, each with two open orders of its own on the fake book (closing: as a settings change leaves them)."""
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        proto = copy.deepcopy(ctl.ledger.rows[c["slug"]])
+        ctl.ledger.delete(c["slug"])
+        api.rows.clear()
+        pairs = []
+        for k in range(n):
+            pair = copy.deepcopy(proto)
+            pair.update(slug=f"{proto['slug']}#{k}", phase=phase, **({"retry_ms": 0, "reason": "设置不同，撤掉后重新报价", "free": True} if phase == "closing" else {}))
+            for side, order in pair["orders"].items():
+                oid, digest = f"{k}{side[0]}", f"0x{k:04d}{side}"
+                order.update(id=oid, hash=digest, state="open", filled=0.0)
+                order.pop("api_hash", None)
+                api.rows[digest] = {"id": oid, "order": {"hash": digest}, "amount": "50", "amountFilled": "0", "status": "OPEN"}
+            ctl.ledger.save(pair)
+            pairs.append(pair)
+        api.removed.clear()
+        return pairs
+
+    def count_removals(self, api):
+        sizes = []
+        real = api.remove_orders
+
+        async def counted(ids):
+            sizes.append(len(ids))
+            return await real(ids)
+        api.remove_orders = counted
+        return sizes
+
+    async def test_bulk_removal_grows_its_batch_and_measures_predicts_ceiling(self):
+        ids = [str(i) for i in range(1000)]
+        api, limit = BulkApi(), L.RemoveLimit()
+        r = await L.remove_in_batches(api, ids, limit, workers=4)
+        self.assertEqual((sorted(r["removed"], key=int), r["failed"], r["left"], r["limited"]), (ids, [], [], 0))
+        self.assertLessEqual(len(api.calls), 16, f"doubling from 20 while answered whole (four at a time: a round a size), not fifty requests of twenty: {[len(c) for c in api.calls]}")
+        self.assertTrue(limit.ok >= 160 and limit.cap == 0 and api.most <= 4 and limit.changed, (limit.as_dict(), api.most))
+        # Predict refuses more than 50 ids a request: the 80 that failed went through as two 40s — the size, measured
+        api, limit = BulkApi(cap=50), L.RemoveLimit()
+        r = await L.remove_in_batches(api, ids[:600], limit, workers=4)
+        self.assertEqual((len(r["removed"]), r["failed"], (limit.ok, limit.cap, limit.size())), (600, [], (40, 80, 40)))
+        # Predict answers only the first 30 of a request: the tail left out goes again, and its going through measures the 30
+        api, limit = BulkApi(take=30), L.RemoveLimit()
+        r = await L.remove_in_batches(api, ids[:300], limit, workers=1)
+        self.assertEqual((len(r["removed"]), r["unanswered"], (limit.ok, limit.cap, limit.size())), (300, [], (30, 40, 30)))
+        self.assertEqual([len(c) for c in api.calls[:4]], [20, 40, 10, 30])
+        # an id Predict will not take is found alone and given up — the content, not the size: no ceiling from it
+        api, limit = BulkApi(bad={"7"}), L.RemoveLimit()
+        r = await L.remove_in_batches(api, ids[:40], limit, workers=1)
+        self.assertEqual((r["failed"], len(r["removed"]), limit.cap), (["7"], 39, 0))
+        self.assertIn("HTTP 400", r["errors"][-1])
+        # a big batch that times out is split; both halves through: that size is the ceiling
+        api, limit = BulkApi(timeout_over=50), L.RemoveLimit(ok=40)
+        r = await L.remove_in_batches(api, ids[:80], limit, workers=1)
+        self.assertEqual((len(r["removed"]), [len(c) for c in api.calls], limit.cap), (80, [80, 40, 40], 80))
+        # answered "noop": counted apart, nothing sent again
+        api = BulkApi(gone={"1", "2"})
+        r = await L.remove_in_batches(api, ids[:10], L.RemoveLimit(), workers=1)
+        self.assertEqual((sorted(r["noop"]), len(r["removed"]), len(api.calls)), (["1", "2"], 8, 1))
+
+    async def test_bulk_removal_waits_out_a_rate_limit_and_stops_when_told(self):
+        ids = [str(i) for i in range(100)]
+        api = BulkApi(limit_on={2})  # the second request answered with a 429: waited out, sent again, the rest at half the pace
+        progress = {}
+        r = await L.remove_in_batches(api, ids, L.RemoveLimit(), workers=4, progress=progress)
+        self.assertEqual((len(r["removed"]), r["left"], r["failed"], r["limited"]), (100, [], [], 1))
+        self.assertEqual((progress["removed"], progress["limited"], progress["workers"]), (100, 1, 2))
+        # one try only (a window's own orders): the rate limit ends it at once, the rest left to the caller's retry
+        api = BulkApi(limit_on={1})
+        r = await L.remove_in_batches(api, ids[:30], L.RemoveLimit(), workers=1, patient=False)
+        self.assertEqual((r["removed"], r["left"], r["limited"], len(api.calls)), ([], ids[:30], 1, 1))
+        self.assertIn("429", r["errors"][-1])
+        api = BulkApi()
+        api.blocked_until = time.monotonic() + 30  # a cooldown another client began: one try sends nothing into it
+        r = await L.remove_in_batches(api, ids[:30], L.RemoveLimit(), workers=1, patient=False)
+        self.assertEqual((r["left"], api.calls), (ids[:30], []))
+        self.assertIn("限流冷却中", r["errors"][-1])
+        # the deadline and the stop: what was not sent is left, never lost
+        api = BulkApi(slow=0.05)
+        r = await L.remove_in_batches(api, ids, L.RemoveLimit(), workers=1, deadline=time.monotonic() + 0.08)
+        self.assertTrue(r["removed"] and r["left"] and len(r["removed"]) + len(r["left"]) == 100, (len(r["removed"]), len(r["left"])))
+        r = await L.remove_in_batches(BulkApi(), ids, L.RemoveLimit(), stop=lambda: True)
+        self.assertEqual((r["removed"], r["left"]), ([], ids))
+        # the batch measured is the bot's, kept in its store across restarts
+        bot = L.LiveBot.__new__(L.LiveBot)
+        bot.store = m.Store(":memory:")
+        lim = bot.live_remove_limit()
+        lim.note_ok(80, NOW)
+        bot.live_remove_saved(lim)
+        again = L.LiveBot.__new__(L.LiveBot)
+        again.store = bot.store
+        self.assertEqual((again.live_remove_limit().as_dict(), again.live_remove_limit().size()), ({"ok": 80, "cap": 0, "at": NOW}, 160))
+        self.assertIn("每批 160 张（实测一次 80 张全部应答", again.live_remove_limit().text())
+        self.assertEqual(L.RemoveLimit(ok=90, cap=80).as_dict()["ok"], 79, "a stored record that contradicts itself: under the cap")
+
+    async def test_a_settings_change_withdraws_a_big_book_in_batches(self):
+        ctl, api, clock = controller()
+        pairs = await self.book_of(ctl, api, 40, phase="closing")  # 80 orders the new settings no longer describe (adopt marks them so)
+        sizes = self.count_removals(api)
+        task = asyncio.create_task(ctl.cancellation_loop())
+        try:
+            await self.until(lambda: all(o["state"] == "final" for pr in pairs for o in pr["orders"].values()))
+        finally:
+            ctl.stop.set()
+            await asyncio.gather(task, return_exceptions=True)
+            if ctl.bulk_task is not None:
+                await asyncio.gather(ctl.bulk_task, return_exceptions=True)
+        self.assertEqual(len(api.removed), 80)
+        self.assertLessEqual(len(sizes), 4, f"in batches, not one request an order: {sizes}")
+        self.assertEqual((ctl.bulk_last["orders"], ctl.bulk_last["removed"], ctl.bulk_last["missed"]), (80, 80, 0))
+        self.assertTrue(all(pr["accounted"] for pr in pairs), "removed, the final fills read: released")
+        self.assertIn("上次分批撤 80 张", ctl.status())
+        await self.finish(ctl)
+
+    async def test_switching_off_winds_down_until_nothing_rests(self):
+        ctl, api, clock = controller()
+        pairs = await self.book_of(ctl, api, 30)  # 60 orders resting
+        sizes = self.count_removals(api)
+        ctl.wind_down("预挂模式已关闭")
+        self.assertEqual((ctl.withdrawing(), ctl.blocked()), ("预挂模式已关闭", "预挂模式已关闭"))
+        self.assertTrue(ctl.status().startswith("开盘前自动预挂：收尾中（预挂模式已关闭）：不再新挂"), ctl.status())
+        self.assertIn("还可能挂着 60 张", ctl.status())
+        task = asyncio.create_task(ctl.cancellation_loop())
+        await asyncio.wait_for(ctl.stop.wait(), 5)  # wound up: it stops itself
+        await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(all(pr["accounted"] for pr in pairs) and len(api.removed) == 60 and len(sizes) <= 4, sizes)
+        self.assertEqual(ctl.bulk_last["removed"], 60)
+        self.assertEqual(await ctl.withdraw_all("x"), "")  # nothing left
+        await self.finish(ctl)
+
+    async def test_a_rate_limit_mid_withdrawal_is_waited_out_not_left_to_one_order_at_a_time(self):
+        ctl, api, clock = controller()
+        pairs = await self.book_of(ctl, api, 40)
+        calls = {"n": 0}
+        real = api.remove_orders
+
+        async def limited(ids):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                api.blocked_until = time.monotonic() + 0.1
+                raise m.RemoteError("HTTP 429: too many requests", 1)
+            return await real(ids)
+        api.remove_orders = limited
+        await ctl.cancel_all("test", free=True)
+        self.assertTrue(all(o["state"] in {"removed", "final"} for pr in pairs for o in pr["orders"].values()))
+        self.assertEqual((ctl.bulk_last["limited"], ctl.bulk_last["missed"], ctl.bulk_last["removed"]), (1, 0, 80))
+        self.assertLessEqual(calls["n"], 8)
+        await self.finish(ctl)
+
+    async def test_an_operators_withdrawal_of_thousands_answers_at_once(self):
+        ctl, api, clock = controller()
+        await self.book_of(ctl, api, 30)
+        line = await ctl.withdraw_all("管理员暂停开盘前模式")
+        self.assertTrue(line.startswith("正在分批撤 60 张预挂单（每批 20 张") and api.removed == [], line)  # the loop takes them, in batches
+        few, fapi, _ = controller()
+        await self.book_of(few, fapi, 1)
+        self.assertEqual((await few.withdraw_all("x"), sorted(fapi.removed)), ("", ["0d", "0u"]))  # a few: here and now
+        self.assertIn("批量撤单：每批 20 张（还没有实测", few.check())
+        await self.finish(ctl)
+        await self.finish(few)
+
+    async def test_a_mode_off_with_orders_left_starts_a_wind_down(self):
+        """Switched off with orders out: the controller winds down (it does not stop at once with a 12-second withdrawal),
+        and is cleared once it stopped itself; the mode off at a start with orders still resting in its records: one is
+        started just to wind them down."""
+        class FakeCtl:
+            def __init__(self, owner):
+                self.owner, self.settings, self.alive, self.stop, self.error = owner, owner.config.preopen, True, asyncio.Event(), ""
+                self.ledger, self.winding, self.ended = types.SimpleNamespace(close=lambda: None), "", False
+            def wind_down(self, reason):
+                self.winding = reason
+            async def run(self):
+                try:
+                    await self.stop.wait()
+                finally:
+                    self.ended, self.alive = True, False
+            def status(self): return "fake"
+        with tempfile.TemporaryDirectory() as folder:
+            env = {"TELEGRAM_BOT_TOKEN": "offline", "STATE_DB": str(Path(folder) / "s.sqlite3"), "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64}
+            bot = L.LiveBot.__new__(L.LiveBot)
+            bot.config, bot.stopping = m.Config.from_env({**env, "PREOPEN_15M": "on"}), asyncio.Event()
+            bot.market = types.SimpleNamespace(now_ms=lambda: NOW)
+            bot.preopen, bot.preopen_task, bot.preopen_factory, bot.preopen_lock = None, None, FakeCtl, asyncio.Lock()
+            await bot.preopen_apply()
+            first = bot.preopen
+            bot.config = m.Config.from_env({**env, "PREOPEN_15M": "off"})
+            await bot.preopen_apply()
+            self.assertTrue(bot.preopen is first and first.winding == "预挂模式已关闭" and not first.ended, "off: winding down, not cut short")
+            await bot.preopen_apply()
+            self.assertIs(bot.preopen, first, "asked again while winding down: left to finish")
+            first.stop.set()  # wound up: it stops itself, and is cleared
+            for _ in range(100):
+                if bot.preopen is None:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(bot.preopen is None and first.ended and not bot.preopen_active())
+            # the mode off at a start, its records holding an order that may rest: a controller just to wind it down
+            ledger = p.Ledger(bot.config.preopen.db)
+            ledger.save({"slug": "w1", "key": "BTC-15M", "phase": "closing", "start_ms": NOW + 3600_000, "expires": (NOW + 3590_000) // 1000,
+                         "orders": {"up": {"id": "1", "hash": "0xh", "state": "open", "filled": 0.0}}})
+            ledger.save({"slug": "w0", "key": "BTC-15M", "phase": "closing", "start_ms": NOW - 3600_000, "expires": (NOW - 3610_000) // 1000,
+                         "orders": {"up": {"id": "2", "hash": "0xg", "state": "open", "filled": 0.0}}})  # expired: rests nowhere
+            ledger.close()
+            self.assertEqual(bot.preopen_leftovers(), 1)
+            await bot.preopen_apply()
+            self.assertEqual(bot.preopen.winding, "预挂模式关着，但上次还有挂单没撤完")
+            bot.config = m.Config.from_env({**env, "PREOPEN_15M": "on"})  # switched back on while winding down: a fresh controller takes the records over
+            winding = bot.preopen
+            await bot.preopen_apply()
+            self.assertTrue(winding.ended and bot.preopen is not winding and not bot.preopen.winding and winding.keep_on_stop)
+            await bot.preopen_stop("test")
+
+
+class BulkApi:
+    """Predict's removal endpoint for the batch tests (1.141.0): ``cap`` — more ids than this refused whole (HTTP 400);
+    ``take`` — only the first so many of a request answered; ``bad`` — a request with one of these refused whole;
+    ``limit_on`` — these requests (by count) answered with a 429; ``gone`` — answered "noop"; ``timeout_over`` — a bigger
+    request times out; ``slow`` — seconds an answer takes."""
+    def __init__(self, cap=0, take=0, bad=(), limit_on=(), gone=(), slow=0.0, timeout_over=0):
+        self.cap, self.take, self.bad, self.limit_on, self.gone, self.slow, self.timeout_over = cap, take, set(bad), set(limit_on), set(gone), slow, timeout_over
+        self.calls, self.blocked_until, self.inflight, self.most = [], 0.0, 0, 0
+
+    async def remove_orders(self, ids):
+        self.calls.append(list(ids))
+        nth = len(self.calls)  # this request's place, before the others' arrive
+        self.inflight += 1
+        self.most = max(self.most, self.inflight)
+        try:
+            await asyncio.sleep(self.slow)
+            if nth in self.limit_on:
+                self.blocked_until = time.monotonic() + 0.05
+                raise m.RemoteError("HTTP 429: too many requests", 1)
+            if self.cap and len(ids) > self.cap:
+                raise m.RemoteError("HTTP 400: too many ids")
+            if self.timeout_over and len(ids) > self.timeout_over:
+                raise m.RemoteError("网络错误 (TimeoutError)")
+            if any(i in self.bad for i in ids):
+                raise m.RemoteError("HTTP 400: order not cancellable")
+            answered = ids[:self.take] if self.take else ids
+            return {"removed": [i for i in answered if i not in self.gone], "noop": [i for i in answered if i in self.gone]}
+        finally:
+            self.inflight -= 1
 
 
 if __name__ == "__main__":

@@ -280,6 +280,252 @@ class OrderRejected(core.RemoteError):
     other failure after the request went out (a 5xx, a timeout, an answer without an order id) leaves it unknown."""
 
 
+# --- withdrawing many orders in one go (1.141.0) -------------------------------------------------------------------------------
+REMOVE_START = 20      # ids in one POST /orders/remove at first: what the pre-open mode always sent (1.124.0 to 1.140.0)
+REMOVE_MAX = 500       # ...doubled while Predict answers every id of a batch, up to this many (Predict's own ceiling is measured: RemoveLimit)
+REMOVE_TRIES = 3       # a batch failing this often (a timeout, a server error, ids its answer leaves out; a rate limit never counts): given up
+REMOVE_RETRY_S = 1.0   # ...sent again this long after such a failure, doubling
+
+
+class RemoveLimit:
+    """How many order ids Predict takes in one removal request, as measured on this account (1.141.0): ``ok``, the most a
+    request was answered for whole; ``cap``, the fewest it refused or timed out on whole, or answered only the head of —
+    counted only once the halves (or the tail left out) then went through, so the size was the problem and not an id
+    (0: none yet). The next batch: the best size seen, under the cap; with no cap, twice the best size seen, from
+    REMOVE_START up to REMOVE_MAX. One for every client on the key, kept in the bot's store (LiveBot.live_remove_limit)."""
+
+    def __init__(self, ok: int = 0, cap: int = 0, at: int = 0):
+        self.ok, self.cap, self.at = max(0, int(ok or 0)), max(0, int(cap or 0)), int(at or 0)
+        if self.cap and self.ok >= self.cap:
+            self.ok = self.cap - 1
+        self.changed = False
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "RemoveLimit":
+        data = data if isinstance(data, dict) else {}
+        try:
+            return cls(data.get("ok", 0), data.get("cap", 0), data.get("at", 0))
+        except (TypeError, ValueError):
+            return cls()
+
+    def as_dict(self) -> dict:
+        return {"ok": self.ok, "cap": self.cap, "at": self.at}
+
+    def size(self) -> int:
+        if self.cap:
+            return max(1, min(self.ok or max(1, self.cap // 2), self.cap - 1))
+        return min(REMOVE_MAX, self.ok * 2 if self.ok >= REMOVE_START else REMOVE_START)
+
+    def note_ok(self, n: int, now_ms: int) -> None:
+        """A request of ``n`` ids answered for whole (at or over the cap: a passing exception, not counted)."""
+        if n > self.ok and (not self.cap or n < self.cap):
+            self.ok, self.at, self.changed = int(n), int(now_ms), True
+
+    def note_cap(self, n: int, now_ms: int) -> None:
+        """``n`` ids in one request were too many."""
+        if n > 1 and (not self.cap or n < self.cap):
+            self.cap, self.at, self.changed = int(n), int(now_ms), True
+            self.ok = min(self.ok, self.cap - 1)
+
+    def text(self) -> str:
+        """The status's words: the batch now, and what it rests on."""
+        seen = ([f"实测一次 {self.ok} 张全部应答"] if self.ok >= REMOVE_START or self.cap else []) + ([f"一次 {self.cap} 张太多"] if self.cap else [])
+        return f"每批 {self.size()} 张（{'，'.join(seen) or '还没有实测'}；从 {REMOVE_START} 张起，全部应答就翻倍，最多 {REMOVE_MAX} 张）"
+
+
+def remove_failure(error: BaseException) -> str:
+    """What a failed removal request means: "limited" — a 429, or a cooldown the client is in (begun by any client on the
+    key): waited out; "refused" — Predict answered with a refusal (too many ids, or one it will not take); "transient" — a
+    timeout, a network or server error."""
+    status = http_status(error)
+    if status == 429 or getattr(error, "retry_after", 0):
+        return "limited"
+    if 400 <= status < 500 or "不是已确认成功" in str(error) or "撤单被拒绝" in str(error):
+        return "refused"
+    return "transient"
+
+
+async def remove_in_batches(api: Any, ids: list, limit: RemoveLimit, *, workers: int = 4, patient: bool = True,
+                            deadline: float | None = None, stop: Any = None, on_answer: Any = None,
+                            progress: dict | None = None, now_ms: Any = None) -> dict:
+    """``ids`` withdrawn (POST /orders/remove) in batches of ``limit.size()``, in the order given (the soonest first), at most
+    ``workers`` requests at a time — the client's other slots stay free (an order, a window at its cancel time); each
+    answer handed to ``on_answer(removed, noop)`` as it comes (1.141.0).
+
+    ``patient`` (a book of hundreds or thousands: a pause, a settings change, the mode switched off): a rate limit — a 429,
+    or a cooldown another client on the key began — is waited out and the batch sent again, the rest going with half as
+    many requests at a time; a batch Predict refuses whole, or times out on while bigger than REMOVE_START, is split in two
+    and each half sent (both going through: the size was the problem — ``limit.cap``; an id Predict will not take ends up
+    alone and is given up); the ids an answer leaves out of both its lists are sent again (only a tail left out, then going
+    through: Predict took no more than the head — measured the same way); any other failure is tried REMOVE_TRIES times.
+    Impatient (a window's own few orders, the orphan sweep): one try each, whatever happens, and nothing sent into a
+    cooldown — the caller's own retry takes the rest on, as before 1.141.0. The batch grows while answered whole
+    (RemoveLimit). Nothing more is sent past ``deadline`` (time.monotonic) or once ``stop()`` says so.
+
+    Returns the ids — removed; noop (Predict: nothing to remove); unanswered (left out of every answer); failed (their
+    request failed every try, or Predict refused them alone); left (never sent: the deadline, the stop, an impatient rate
+    limit) — with the requests made, the rate limits met, the seconds taken, the biggest batch answered whole and the
+    last errors."""
+    clock = now_ms or (lambda: int(time.time() * 1000))
+    pending = collections.deque(dict.fromkeys(str(i) for i in ids))
+    front: collections.deque = collections.deque()  # batches that go before new ones: a retry, a split's halves, a tail left out
+    out: dict[str, Any] = {"removed": [], "noop": [], "unanswered": [], "failed": [], "left": [], "requests": 0, "limited": 0,
+                           "seconds": 0.0, "biggest": 0, "errors": []}
+    state = {"allowed": max(1, int(workers)), "cooled": 0.0, "halted": False, "busy": 0}
+    started = time.monotonic()
+    if progress is not None:
+        progress.clear()
+        progress.update(total=len(pending), removed=0, noop=0, failed=0, requests=0, limited=0, size=limit.size(),
+                        workers=state["allowed"], started=started)
+
+    def note() -> None:
+        if progress is not None:
+            progress.update(removed=len(out["removed"]), noop=len(out["noop"]) + len(out["unanswered"]), failed=len(out["failed"]),
+                            requests=out["requests"], limited=out["limited"], size=limit.size(), workers=state["allowed"])
+
+    def family_done(fam: dict | None, whole: bool) -> None:
+        """A split's half (or a tail left out) answered: once all of them are, the size they came from was too big if every one went through whole."""
+        if fam is None:
+            return
+        fam["left"] -= 1
+        fam["whole"] = fam["whole"] and whole
+        if fam["left"] <= 0 and fam["whole"]:
+            limit.note_cap(fam["n"], clock())
+            if fam.get("k"):
+                limit.note_ok(fam["k"], clock())
+
+    def halted() -> bool:
+        return state["halted"] or (deadline is not None and time.monotonic() >= deadline) or bool(stop is not None and stop())
+
+    def take() -> dict | None:
+        if front:
+            return front.popleft()
+        if not pending:
+            return None
+        return {"ids": [pending.popleft() for _ in range(min(limit.size(), len(pending)))], "tries": 0, "fam": None}
+
+    def give_up(batch: dict, key: str, why: str) -> None:
+        out[key].extend(batch["ids"])
+        family_done(batch["fam"], False)
+        if why:
+            out["errors"] = [*out["errors"][-4:], why]
+
+    def cooldown(error: BaseException | None) -> None:
+        """A rate limit met: counted, and the requests at a time halved — once a cooldown."""
+        until = float(getattr(api, "blocked_until", 0.0) or 0.0)
+        if until > state["cooled"] + 0.5 or (not until and error is not None):
+            state["cooled"] = until or time.monotonic()
+            state["allowed"] = max(1, state["allowed"] // 2)
+            out["limited"] += 1
+
+    async def wait(seconds: float) -> None:
+        """A pause that counts as work in hand: the other workers wait for what it may send back, they do not end."""
+        state["busy"] += 1
+        try:
+            await asyncio.sleep(max(0.0, seconds if deadline is None else min(seconds, deadline - time.monotonic())))
+        finally:
+            state["busy"] -= 1
+
+    def answered(batch: dict, answer: Any) -> None:
+        data = answer if isinstance(answer, dict) else {}
+        said_removed = {str(x) for x in data.get("removed") or []}
+        said_noop = {str(x) for x in data.get("noop") or []} - said_removed
+        removed = [i for i in batch["ids"] if i in said_removed]
+        noop = [i for i in batch["ids"] if i in said_noop]
+        out["removed"] += removed
+        out["noop"] += noop
+        if on_answer is not None and (removed or noop):
+            on_answer(removed, noop)
+        missing = [i for i in batch["ids"] if i not in said_removed and i not in said_noop]
+        if not missing:
+            limit.note_ok(len(batch["ids"]), clock())
+            out["biggest"] = max(out["biggest"], len(batch["ids"]))
+            family_done(batch["fam"], True)
+            return
+        family_done(batch["fam"], False)
+        head = len(batch["ids"]) - len(missing)
+        if not patient:
+            out["unanswered"] += missing
+        elif head and missing == batch["ids"][head:] and len(missing) >= max(2, len(batch["ids"]) // 4):
+            # only the head answered: Predict may take no more than that many at a time — the tail goes again, and its going
+            # through whole is the proof (an id simply not on the book anywhere in the list would not make a clean tail)
+            front.appendleft({"ids": missing, "tries": batch["tries"], "fam": {"n": len(batch["ids"]), "left": 1, "whole": True, "k": head}})
+        elif batch["tries"] + 1 >= REMOVE_TRIES:
+            out["unanswered"] += missing
+        else:
+            front.append({"ids": missing, "tries": batch["tries"] + 1, "fam": None})
+
+    async def failed(batch: dict, error: BaseException) -> None:
+        kind, why = remove_failure(error), core.clean_error(error) or type(error).__name__
+        if kind == "limited":
+            front.appendleft(batch)  # sent again once the cooldown is over: not a try
+            cooldown(error)
+            if not patient:
+                state["halted"] = True
+                out["errors"] = [*out["errors"][-4:], why]
+                return
+            await wait(max(float(getattr(api, "blocked_until", 0.0) or 0.0) - time.monotonic(), 0.05) + 0.05)
+        elif not patient:
+            give_up(batch, "failed", why)
+        elif len(batch["ids"]) > 1 and (kind == "refused" or len(batch["ids"]) > REMOVE_START):
+            family_done(batch["fam"], False)  # the halves are a family of their own: this batch is not whole
+            half, fam = len(batch["ids"]) // 2, {"n": len(batch["ids"]), "left": 2, "whole": True}
+            front.appendleft({"ids": batch["ids"][half:], "tries": 0, "fam": fam})
+            front.appendleft({"ids": batch["ids"][:half], "tries": 0, "fam": fam})
+        elif kind == "refused" or batch["tries"] + 1 >= REMOVE_TRIES:
+            give_up(batch, "failed", why)
+        else:
+            await wait(REMOVE_RETRY_S * 2 ** batch["tries"])
+            front.append({**batch, "tries": batch["tries"] + 1})
+
+    async def worker(index: int) -> None:
+        while not halted() and index < state["allowed"]:
+            cool = float(getattr(api, "blocked_until", 0.0) or 0.0) - time.monotonic()
+            if cool > 0:  # a cooldown on the key (any client's 429): nothing is sent into it
+                if not patient:
+                    state["halted"] = True
+                    out["errors"] = [*out["errors"][-4:], f"Predict 接口限流冷却中（{int(cool) + 1} 秒后重试）"]
+                    return
+                cooldown(None)
+                await wait(cool + 0.05)
+                continue
+            batch = take()
+            if batch is None:
+                if state["busy"] or front:  # an answer still to come may send a batch back (a retry, a split's halves)
+                    await asyncio.sleep(0.02)
+                    continue
+                return
+            state["busy"] += 1
+            out["requests"] += 1
+            try:
+                answer, error = await api.remove_orders(batch["ids"]), None
+            except asyncio.CancelledError:
+                front.appendleft(batch)
+                raise
+            except Exception as exc:  # judged below: a rate limit, a refusal, a timeout
+                answer, error = None, exc
+            finally:
+                state["busy"] -= 1
+            if error is None:
+                answered(batch, answer)
+            else:
+                await failed(batch, error)
+            note()
+
+    if pending:
+        tasks = [asyncio.create_task(worker(i), name=f"remove-{i}") for i in range(state["allowed"])]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    out["left"] = [i for batch in front for i in batch["ids"]] + list(pending)
+    out["seconds"] = time.monotonic() - started
+    note()
+    return out
+
+
 class PredictApi:
     """Signed-in requests to Predict's REST API. The API key goes in x-api-key on every request; the JWT from the
     sign-in flow (GET /v1/auth/message → sign → POST /v1/auth) in Authorization, renewed before it expires or after a
@@ -423,8 +669,10 @@ class PredictApi:
         return {"order_id": order_id, "hash": str(data.get("orderHash") or data.get("hash") or ""), "code": data.get("code")}
 
     async def remove_orders(self, ids: list[str]) -> dict:
-        """POST /v1/orders/remove -> {"removed": [...], "noop": [...]}."""
-        answer = await self.authed("POST", "/orders/remove", {"data": {"ids": [str(i) for i in ids]}}, priority=True)
+        """POST /v1/orders/remove -> {"removed": [...], "noop": [...]}. A batch of hundreds (remove_in_batches, 1.141.0) gets
+        more time than an order: a second per hundred ids beyond the first."""
+        timeout = API_TIMEOUT + max(0, len(ids) - REMOVE_START) // 100
+        answer = await self.authed("POST", "/orders/remove", {"data": {"ids": [str(i) for i in ids]}}, timeout=timeout, priority=True)
         data = answer.get("data") if isinstance(answer, dict) and isinstance(answer.get("data"), dict) else answer
         if not isinstance(answer, dict) or answer.get("success") is False:
             raise core.RemoteError("撤单被拒绝：" + (core.http_error_text(answer) if isinstance(answer, dict) else "")
@@ -2234,6 +2482,22 @@ class LiveBot(core.Bot):
         ids, tokens = known or self.live_known_markets()
         return ids.get(mid, "") if mid and mid in ids else tokens.get(token, "") if token else ""
 
+    def live_remove_limit(self) -> RemoveLimit:
+        """Predict's measured removal batch (RemoveLimit, 1.141.0): one for every client on the key, kept in the store."""
+        limit = getattr(self, "_remove_limit", None)
+        if limit is None:
+            store = getattr(self, "store", None)
+            limit = self._remove_limit = RemoveLimit.from_dict(store.get("predict_remove_limit") if store is not None else None)
+        return limit
+
+    def live_remove_saved(self, limit: RemoveLimit) -> None:
+        """The measured batch written back once it changed."""
+        store = getattr(self, "store", None)
+        if limit.changed and store is not None:
+            limit.changed = False
+            with contextlib.suppress(Exception):
+                store.put("predict_remove_limit", limit.as_dict())
+
     async def live_orphan_sweep(self, now_ms: int) -> None:
         """The account's unrecorded open orders on this bot's own markets, seen so for LIVE_ORPHAN_GRACE_MS, are
         withdrawn (LIVE_ORPHAN_CANCEL, 1.136.2): a record lost or wrongly ended leaves its order resting as one nobody
@@ -2250,12 +2514,15 @@ class LiveBot(core.Bot):
             return
         from preopen import order_brief
         ids = list(due)[:50]
-        try:
-            result = await self.live.api.remove_orders(ids)
-        except Exception as error:
-            self.live_note_error(f"撤无记录挂单失败：{core.clean_error(error) or type(error).__name__}")
+        limit = self.live_remove_limit()
+        result = await remove_in_batches(self.live.api, ids, limit, workers=2, patient=False, stop=self.stopping.is_set)  # 1.141.0: at the measured batch size
+        self.live_remove_saved(limit)
+        unsent = set(result["failed"]) | set(result["left"])  # the request failed or never went: asked again at the next sweep
+        if unsent and not (result["removed"] or result["noop"] or result["unanswered"]):
+            self.live_note_error("撤无记录挂单失败：" + (result["errors"][-1] if result["errors"] else "接口限流冷却中，下一轮再撤"))
             return
-        removed = [i for i in ids if i in set(result.get("removed") or [])]
+        ids = [i for i in ids if i not in unsent]
+        removed = [i for i in ids if i in set(result["removed"])]
         noop = [i for i in ids if i not in removed]
         for i in ids:  # answered either way: not asked for again now (a noop is gone, or seen again on the next list and timed afresh)
             self.live_unknown_first.pop(i, None)
@@ -3726,8 +3993,8 @@ class LiveBot(core.Bot):
             first = await self.live_action("pause", ["紧急停止"], now_ms)
             second = await self.live_cancel_command(["all"], now_ms)
             if getattr(self, "preopen", None) is not None:
-                await self.preopen.cancel_all("紧急停止")
-                second += "\n" + self.preopen.status()
+                line = await self.preopen.withdraw_all("紧急停止")
+                second += (f"\n{line}" if line else "") + "\n" + self.preopen.status()
             text = f"{first}\n{second}"
         elif action in {"resume", "redeem", "check", "orders", "positions"}:
             text = await self.live_action(action, [], now_ms)
@@ -3746,9 +4013,9 @@ class LiveBot(core.Bot):
                 if matches and words[0] not in {"all", "account"}:
                     await preopen.cancel_many(matches, "管理员撤单")
                     return "已请求撤销该场双边预挂单，预挂模式已暂停。\n" + preopen.status()
-                await preopen.cancel_all("管理员撤单")
+                line = await preopen.withdraw_all("管理员撤单")  # 1.141.0: thousands go in batches from the mode's own loop
                 result = await self._live_cancel_command(words, now_ms)
-                return result + "\n已请求撤销预挂单，预挂模式已暂停。\n" + preopen.status()
+                return result + "\n已请求撤销预挂单，预挂模式已暂停。" + (f"\n{line}" if line else "") + "\n" + preopen.status()
         return await self._live_cancel_command(words, now_ms)
 
     async def _live_cancel_command(self, words: list[str], now_ms: int) -> str:
@@ -3774,13 +4041,16 @@ class LiveBot(core.Bot):
             return "没有真实挂单可撤。"
         problems = []
         if extra:
-            try:
-                result = await self.live.api.remove_orders(extra)
-                self.live_unknown_open = [u for u in self.live_unknown_open if u["id"] not in set(result["removed"])]
-                extra_text = f"账户上无记录的挂单 {len(extra)} 张：Predict 确认撤掉 {len(result['removed'])} 张" + (
-                    f"，{len(result['noop'])} 张称无需撤" if result["noop"] else "")
-            except Exception as error:
-                extra_text = f"账户上无记录的挂单 {len(extra)} 张：撤单请求失败（{core.clean_error(error)}）"
+            limit = self.live_remove_limit()
+            result = await remove_in_batches(self.live.api, extra, limit, workers=3, patient=True, deadline=time.monotonic() + 60,
+                                             stop=self.stopping.is_set)  # 1.141.0: was one request for them all
+            self.live_remove_saved(limit)
+            self.live_unknown_open = [u for u in self.live_unknown_open if u["id"] not in set(result["removed"])]
+            quiet = len(result["noop"]) + len(result["unanswered"])
+            missed = len(result["failed"]) + len(result["left"])
+            extra_text = (f"账户上无记录的挂单 {len(extra)} 张：Predict 确认撤掉 {len(result['removed'])} 张" + (f"，{quiet} 张称无需撤" if quiet else "")
+                          + (f"，{missed} 张没撤成（{result['errors'][-1] if result['errors'] else '一分钟内没撤完'}），再发一次 /live cancel account" if missed else ""))
+            if missed:
                 problems.append(extra_text)
         list_error = ""
         try:
@@ -4030,19 +4300,51 @@ class LiveBot(core.Bot):
 
     async def preopen_apply(self) -> None:
         """The pre-open mode as PREOPEN_15M and the PREOPEN_* settings say now (the environment, the control page's saved
-        values over it): started when on and not running, stopped when off (its orders withdrawn), restarted when its
-        settings changed — the orders stay on the book, the new controller takes over those the settings still describe
-        and withdraws the rest — or when it crashed."""
+        values over it): started when on and not running; restarted when its settings changed — the orders stay on the
+        book, the new controller takes over those the settings still describe and withdraws the rest (in batches) — or
+        when it crashed. Switched off, it winds down (1.141.0): nothing new, every order withdrawn in batches until none is
+        left and the final fills read, then it stops itself and is cleared here (the stop used to withdraw for 12 seconds
+        and leave the rest of a book of thousands resting). Off, but with orders its records say may rest (a restart in the
+        middle of that, an older version's cut): one is started just to wind them down."""
         async with self.preopen_lock:
             want = self.config.preopen
-            if self.preopen is not None and (not want.enabled or self.preopen.settings != want or not self.preopen.alive):
-                await self.preopen_stop("设置改变" if want.enabled else "PREOPEN_15M=off", keep=want.enabled)
-            if want.enabled and self.preopen is None and not self.stopping.is_set():
-                self.preopen_start()
+            cur = self.preopen
+            if cur is not None and not cur.alive:  # crashed, or wound up: cleared (started afresh below when on)
+                await self.preopen_stop("已停止")
+                cur = None
+            if cur is not None:
+                if getattr(cur, "winding", ""):
+                    if want.enabled:  # switched back on while winding down: the new controller takes the records over
+                        await self.preopen_stop("重新开启", keep=True)
+                elif not want.enabled:  # 1.141.0: switched off — every order withdrawn in batches until none is left, then it stops itself
+                    cur.wind_down("预挂模式已关闭")
+                elif cur.settings != want:
+                    await self.preopen_stop("设置改变", keep=want.enabled)
+            if self.preopen is None and not self.stopping.is_set():
+                if want.enabled:
+                    self.preopen_start()
+                elif self.preopen_leftovers():  # off, yet its records hold orders that may rest: withdrawn all the same
+                    self.preopen_start(wind_down="预挂模式关着，但上次还有挂单没撤完")
 
-    def preopen_start(self) -> None:
+    def preopen_leftovers(self) -> int:
+        """Orders the pre-open mode's records say may still rest while the mode is off (1.141.0) — a stop in the middle of a
+        withdrawal, a crash, an older version's 12-second cut: a controller is started to wind them down."""
+        from preopen import read_rows, resting_orders
+        try:
+            rows = read_rows(self.config.preopen.db)
+        except Exception as error:
+            LOG.warning("预挂记录读取失败：%s", core.clean_error(error) or type(error).__name__)
+            return 0
+        if not rows:
+            return 0
+        now = self.market.now_ms()
+        return sum(resting_orders(p, now) for p in rows)
+
+    def preopen_start(self, wind_down: str = "") -> None:
         from preopen import Controller
         preopen = self.preopen = (self.preopen_factory or Controller)(self)
+        if wind_down:  # nothing new goes out: the orders still resting are withdrawn, then it stops itself
+            preopen.wind_down(wind_down)
         task = self.preopen_task = asyncio.create_task(preopen.run(), name="preopen")
 
         def finished(t: asyncio.Task) -> None:
@@ -4053,6 +4355,8 @@ class LiveBot(core.Bot):
                 preopen.error, preopen.alive = f"预挂模式已停止：{text}", False
                 self.live_note_error(f"开盘前预挂模式异常停止：{text}")
                 self.live_notify(f"⚠️ 开盘前预挂模式异常停止：{text}（本模式的挂单已撤，重启后恢复）", key="preopen:crash")
+            elif not t.cancelled() and getattr(preopen, "winding", "") and self.preopen is preopen and not self.stopping.is_set():
+                asyncio.get_running_loop().create_task(self.preopen_apply(), name="preopen-apply")  # wound up: cleared (or started afresh)
         task.add_done_callback(finished)
         LOG.info("开盘前预挂模式启动：%s", "、".join(sorted(preopen.settings.markets)))
 
@@ -4084,7 +4388,7 @@ class LiveBot(core.Bot):
         """Whether the running mode holds the model trader back (PREOPEN_EXCLUSIVE=on, 1.125.0: off by default — the two run
         side by side, the mode's reservation in the model's exposure cap, its day's P&L in the loss stop, its fills known
         to the positions reconciliation)."""
-        return self.preopen_active() and bool(self.config.preopen.exclusive)
+        return self.preopen_active() and bool(self.config.preopen.exclusive) and not getattr(self.preopen, "winding", "")
 
     def preopen_risk(self) -> float:
         """The money the running pre-open mode may have tied up (Controller.risk). Shown; since 1.132.1 not counted against
@@ -4176,8 +4480,8 @@ class LiveBot(core.Bot):
             return self.preopen.check()
         if action in {"pause", "resume"}:
             self.preopen.manual_pause = self.preopen.ledger.pause(action == "pause")
-            if action == "pause":
-                await self.preopen.cancel_all("管理员暂停开盘前模式")
+            if action == "pause" and (line := await self.preopen.withdraw_all("管理员暂停开盘前模式")):
+                return line + "\n" + self.preopen.status()
         elif action:
             return "用法：/preopen｜/preopen check｜/preopen on｜/preopen off｜/preopen pause｜/preopen resume｜/preopen probe"
         return self.preopen.status()
