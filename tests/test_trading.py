@@ -591,7 +591,7 @@ async def run():
     assert bot.live_daily_pnl(trades, CLOSE + 61 * 60_000) < -50 and bot.live_killed().startswith("今日已结算亏损")
     assert "今日停止开新仓" in bot.live_room(trades, mk, "up", 0.58, 100) and bot.store.get("live:killed")["day"] == "2026-10-05"
     down_t = trades["down|down|吃#1"]  # its taker order had waited too long: cancelled, nothing filled, the attempt kept
-    assert down_t["live"]["final"] == "failed" and ("remove", [down_t["live"]["order_id"]]) in fake.calls and "down|down|吃" not in trades
+    assert down_t["live"]["final"] == "failed" and ("remove", [down_t["live"]["order_id"]]) in fake.calls and "down|down|吃" not in trades, (down_t["live"].get("final"), down_t["live"].get("state"), [e["what"] for e in down_t["live"]["events"]][-4:], sorted(k for k in trades if k.startswith("down")))
     assert bot.live_killed() and not m.beijing_day((CLOSE + 25 * 3_600_000) / 1000) == "2026-10-05"
     bot.market.now = CLOSE + 25 * 3_600_000
     assert bot.live_killed() == ""  # the next day trades again
@@ -1021,7 +1021,9 @@ async def run():
     mfake.fail_open = "HTTP 500: boom"
     await step(mbot, NOW + 40_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 40_000))
     trades = mbot.sim_trades()
-    assert mtid not in trades and trades[f"{mtid}#2"]["live"]["state"] == "done" and ("remove", ["102"]) in mfake.calls, trades[f"{mtid}#2"]["live"]
+    assert trades[f"{mtid}#2"]["live"]["state"] == "done" and ("remove", ["102"]) in mfake.calls, trades[f"{mtid}#2"]["live"]
+    # 1.138.1: the confirmed slot is looked at again although the read failed; the failed read itself holds the new order (live_send_hold)
+    assert mtid not in trades or trades[mtid]["live"].get("requote_of") == f"{mtid}#2", trades.get(mtid)
     assert trades[f"{mtid}#2"]["live"]["cancel_confirmed"] and mbot.live_reserved(trades[f"{mtid}#2"]) == 0 and any("同步真实订单失败" in e for e in mbot.live_errors), mbot.live_errors[-2:]
     mfake.fail_open = None
     await step(mbot, NOW + 50_000, hsi(0.70, [("0.57", "300"), ("0.53", "200")], [("0.58", "400")], NOW + 50_000))
@@ -2781,8 +2783,10 @@ async def missed_orders_fixes():
     world["markets"] = [hsi(0.72, [("0.55", "300")], [("0.58", "400")], NOW)]
     bot8.fair_sig_at = -1e9; bot8.note_job("恒指期货", NOW)
     assert moved == [{"HSI"}] and bot8.sim_wake, moved
-    bot8.fair_sig_at = -1e9; world["markets"] = [hsi(0.74, [("0.55", "300")], [("0.58", "400")], NOW)]; bot8.note_job("行情推送", NOW)
+    bot8.fair_sig_at = -1e9; world["markets"] = [hsi(0.74, [("0.55", "300")], [("0.58", "400")], NOW)]; bot8.note_job("行情推送", NOW, looked={"HSI"})
     assert moved == [{"HSI"}], "a push's own keys: looked at by price_looks already"
+    bot8.fair_sig_at = -1e9; world["markets"] = [hsi(0.76, [("0.55", "300")], [("0.58", "400")], NOW)]; bot8.note_job("行情推送", NOW, looked={"BTC-15M"})
+    assert moved == [{"HSI"}, {"HSI"}], "1.138.1: a push's job no longer swallows another key's move (a REST proxy's) into the signature"
     # both sides placeable: both quoted in one look (the second waited for the next look)
     bot9 = make_bot(SIM_WAYS="maker", SIM_MAKER_SPREAD_CENTS="50")
     await bot9.live_prepare(); await bot9.live_prefetch(NOW)

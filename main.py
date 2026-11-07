@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.138.0"
+VERSION = "1.138.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -10142,6 +10142,19 @@ def sim_position(trade: Mapping) -> bool:
     return bool(trade.get("maker")) and trade.get("status") == "filled" and float(trade.get("shares") or 0) > 1e-9 and not trade.get("final")
 
 
+def own_on_book(trade: Mapping, book: Any) -> float:
+    """Our own unfilled shares a real resting order adds to the book's level at its price — 0 until Predict can have it there:
+    not while pending or in flight (placing), and not on a book read before Predict's answer (1.138.0 / 1.138.1: a decision not
+    yet sent was taken out of the level it would join, so a 跟买1 on a thin 买1 saw the 买1 "gone" and was voided or withdrawn)."""
+    st = trade.get("live") if isinstance(trade.get("live"), Mapping) else None
+    if st is None or st.get("state") in ("pending", "placing"):
+        return 0.0
+    answered = int(st.get("answered_at") or 0)
+    if answered and book is not None and int(getattr(book, "fetched_ms", 0) or 0) < answered:
+        return 0.0
+    return max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0)
+
+
 def same_refusal(a: str, b: str) -> bool:
     """Whether two refusal texts say the same thing, whatever their countdown ("N 秒后再试"): a refusal the size does not change."""
     norm = lambda s: re.sub(r"\d+ 秒", "N 秒", str(s or ""))
@@ -11768,9 +11781,15 @@ function book(p,key){
   if(p.error)w.append($("div","warn small",(has?"刷新失败，显示上次盘口：":"")+p.error));
   const v=bookView(p);
   if(v.edges.length){w.append(chips(key,v,{...ctxOf(p),hot:hotByCard[key]??HOT}));if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}  // framed = suggested, grey = not big enough
+  const ml=makerLine(p.maker);if(ml)w.append(ml);
   const tl=takerLine(p.taker);if(tl)w.append(tl);
   const wr=whyRow(p);if(wr)w.append(wr);
   return w}
+function makerLine(m){  // 挂单: what the trader itself rests here or would rest now, under its own rules (1.138.1) — not the chips' frame, which is the viewer's bar on the raw 买1
+  if(!m||!m.text||m.state==="off"&&!/^不挂单/.test(m.text))return null;
+  const d=$("div","tk "+(m.state==="resting"?"held":m.state)),icon=m.state==="ready"?"✅ ":m.state==="resting"?"📌 ":m.state==="blocked"?"⛔ ":"⏸ ";
+  d.append(icon+"挂单："+m.text.replace(/^不挂单：/,"不挂（")+(/^不挂单：/.test(m.text)?"）":""));
+  d.title="机器人自己的挂单判断：按它的门槛（盘后另有门槛）、跟价规则、份数和额度算；卡片上方的红框是按你在本页设的门槛和试算金额算的，两者不同时以这一行为准";return d}
 function takerLine(t){  // 距吃单: how far the trader itself (its own bar, cap, size and fee, not the viewer's amount) is from taking this book
   if(!t||t.state==="off")return null;
   const d=$("div","tk "+t.state),icon=t.state==="ready"?"✅ ":t.state==="near"?"📏 ":t.state==="blocked"?"⛔ ":"⏸ ";
@@ -11989,6 +12008,7 @@ function rowNote(r,L,it){  // one line about a ladder level itself, above its fo
   d.append($("b","",r.label),$("span","",parts.length?"："+parts.join(" · "):""));
   if(r.points_active!==undefined){const point=r.points_note||"积分状态暂缺",why=r.maker_note||r.points_why;d.append($("div","",point+(r.points_active===true&&r.points_rate!=null?" · "+qty(r.points_rate)+" PP/小时":"")));
     if(r.points_ok===false&&why&&why!==point)d.append($("div","warn",why))}
+  const ml=makerLine(r.maker);if(ml)d.append(ml);
   const tl=takerLine(r.taker);if(tl)d.append(tl);
   const wr=whyRow(r);if(wr)d.append(wr);  // each level is a market of its own: its own 为什么挂 / 不挂单
   if(r.error)d.append($("span","warn","⚠️ "+r.error));
@@ -16201,11 +16221,18 @@ class Bot:
             except Exception as error:  # the cards stand without it
                 self.log_limited("taker-gap", f"距吃单计算失败：{clean_error(error) or type(error).__name__}")
                 gaps = {}
-            for item in items:  # each priced book block says how far the trader is from taking it (距吃单)
+            try:
+                makers = self.sim_maker_lines(now_ms)
+            except Exception as error:  # the cards stand without it
+                self.log_limited("maker-line", f"挂单判断计算失败：{clean_error(error) or type(error).__name__}")
+                makers = {}
+            for item in items:  # each priced book block says how far the trader is from taking it (距吃单), and what it rests (1.138.1)
                 ladder = item.get("ladder") if isinstance(item.get("ladder"), dict) else {}
                 for block in [item.get("predict"), *(ladder.get("rows") or [])]:
                     if isinstance(block, dict) and str(block.get("market_id") or "") in gaps:
                         block["taker"] = gaps[str(block["market_id"])]
+                    if isinstance(block, dict) and str(block.get("market_id") or "") in makers:
+                        block["maker"] = makers[str(block["market_id"])]
             near = self.sim_near(gaps)
             items.append(self.safe_card("模拟交易", "SIM", "sim", lambda: {"name": "模拟交易", "symbol": "SIM", "group": "sim",
                                                                           "kind": "sim", "sim": self.sim_report(public=True), "near": near}))
@@ -17317,6 +17344,8 @@ class Bot:
                 taker_why = f"卡片暂不建议（{mk.hold}）"
             elif mk.book.stale(now_ms):
                 taker_why = "盘口过期"
+            elif book_crossed(mk.book):
+                taker_why = "盘口交叉（买价高过卖价），这一刻的快照不可信"
             elif closed := self.sim_taker_closed(mk):
                 taker_why = closed
             else:
@@ -17434,7 +17463,7 @@ class Bot:
         place = "击穿单" if b.sweep else "买1 之上 1¢" if b.front else f"跟买{b.level}"
         return place + (f"，排在 {b.size:g} 份之后" if b.size > 0 and not b.front else "")
 
-    def sim_why(self, mk: SimMarket, trades: dict[str, dict], now_ms: int) -> dict:
+    def sim_why(self, mk: SimMarket, trades: dict[str, dict], now_ms: int, taker: bool = True) -> dict:
         """Why the trader rests or takes what it does on this market now, each side apart, for the odds page's card (why.json):
         the resting order a side has (and why it goes next look, when it does), else the order it would place and what
         stops it — the gates of both sides, the depth, the bar and the card's error, the caps (sim_maker_pick) — and the
@@ -17452,7 +17481,7 @@ class Bot:
             rest = trades.get(f"{mk.market}|{side}|挂")
             if rest is not None and rest.get("status") == "resting":
                 price = float(rest.get("price") or 0)
-                own_left = max(float(rest.get("order") or 0) - float(rest.get("shares") or 0), 0.0) if isinstance(rest.get("live"), dict) else 0.0
+                own_left = own_on_book(rest, mk.book)  # 1.138.1: an unsent order's shares are not in the book (the decision's rule, sim_requote_reason)
                 top = maker_level(mk.book, side, SIM_MAKER_FRONT_MIN, own_left, price)  # the best bid of anyone else
                 place = ("托底单" if rest.get("floor") else "击穿单" if rest.get("sweep") else
                          (f"低价单，买1 已到 {cents(top[0])}" if top is not None and top[0] > price + 1e-9 else "买1 之上 1¢") if rest.get("deep")
@@ -17468,7 +17497,8 @@ class Bot:
                     word = "等待发送" if live_st["state"] == "pending" else "发送中"
                     why_wait = str(live_st.get("last_error") or "") if live_st["state"] == "pending" else ""
                     rows.append({"side": side, "label": label, "state": "resting", "short": f"{label} {word} {cents(price)}",
-                                 "text": own + f"{word}：{cents(price)}×{float(rest.get('order') or 0):g} 份（{place}），还没挂到 Predict 上"
+                                 "text": own + f"{word}：{cents(price)}×{float(rest.get('order') or 0):g} 份（{place}），"
+                                         + ("还没挂到 Predict 上" if live_st["state"] == "pending" else "Predict 还没确认")
                                          + (f"；{why_wait}" if why_wait else "") + (f"；发出前若{leave}则不发" if leave else "")})
                     continue
                 rows.append({"side": side, "label": label, "state": "resting", "short": f"{label} 挂单中 {cents(price)}",
@@ -17504,13 +17534,16 @@ class Bot:
                 rows.append({"side": side, "label": label, "state": "ready", "short": f"{label} 可挂 {cents(cand.price)}",
                              "text": own + f"可挂 {cents(cand.price)}×{count:g} 份（{self.maker_place_text(cand)}，净优势 {cents(cand.edge)}），"
                                            "下一轮挂出"})
+        maker_state = ("off" if gate else next((st for st in ("ready", "blocked", "resting") if any(r["state"] == st for r in rows)), "wait"))
+        if not taker:  # the card face's maker line (sim_maker_lines): the taker part is drawn from sim_taker_gaps
+            return {"maker": {"text": f"不挂单：{gate}" if gate else "；".join(r["short"] for r in rows), "state": maker_state}}
         gap = self.sim_taker_gap(mk, trades, now_ms)
         takers = [{"side": s["side"], "label": s["label"],
                    "text": s["block"] or (f"卖1 {cents(s['ask'])}，封顶 {cents(s['cap'])}{s['capped']}"
                                           + (f"，可买 {s['got']:g} 份" if s["got"] else f"，差 {cents(s['gap'])}" if s.get("gap") is not None else ""))}
                   for s in gap.get("sides") or []]
         return {"item": mk.item, "market": mk.market,
-                "maker": {"text": f"不挂单：{gate}" if gate else "；".join(r["short"] for r in rows), "sides": rows},
+                "maker": {"text": f"不挂单：{gate}" if gate else "；".join(r["short"] for r in rows), "sides": rows, "state": maker_state},
                 "taker": {"text": gap.get("text", ""), "state": gap.get("state", ""), "sides": takers if gap.get("state") != "off" else []}}
 
     def why_payload(self) -> dict:
@@ -17527,6 +17560,18 @@ class Bot:
                 out[str(mk.book.market_id)] = {"item": mk.item, "market": mk.market, "error": clean_error(error) or type(error).__name__}
         return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）",
                 "enabled": self.config.sim and self.config.predict, "ways": sim_scope(self.config)[0], "markets": out}
+
+    def sim_maker_lines(self, now_ms: int) -> dict[str, dict]:
+        """Every market the trader prices, by Predict market id: its maker verdict in a line (sim_why's maker part) — the card face
+        shows it beside 距吃单 (1.138.1: the red frame on a chip is the viewer's bar on the raw 买1, and the trader's own verdict, under
+        its after-hours rules, depth and caps, was only in the folded 为什么挂 / 不挂单 row: a framed chip read as "over the threshold, no order")."""
+        trades, out = self.sim_trades(), {}
+        for mk in self.sim_markets(now_ms):
+            if mk.book.market_id in (None, "") or mk.kind not in self.config.sim_markets or self.config.sim_ways == "taker":
+                continue
+            with contextlib.suppress(Exception):  # one market's failure leaves the others' lines
+                out[str(mk.book.market_id)] = self.sim_why(mk, trades, now_ms, taker=False)["maker"]
+        return out
 
     def sim_taker_gaps(self, now_ms: int) -> dict[str, dict]:
         """Every market the trader prices, by Predict market id: how far each is from a taker buy (sim_taker_gap)."""
@@ -17937,10 +17982,7 @@ class Bot:
             # our own unfilled shares, taken out of the level they rest at — only once Predict has the order on its book (1.138.0: a
             # decision not yet sent, or in flight, was subtracted from a level it is not in, so a 跟买1 joining a thin 买1 saw the 买1
             # "gone" and was voided at the send, or withdrawn by the express lane before it ever reached Predict)
-            live_st = trade.get("live") if isinstance(trade.get("live"), dict) else None
-            on_book = live_st is not None and (live_st.get("state") not in ("pending", "placing")
-                                               or (live_st.get("state") == "placing" and mk.book.fetched_ms >= int(live_st.get("sent_at") or 10 ** 15)))
-            own = max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0) if on_book else 0.0
+            own = own_on_book(trade, mk.book)
             level = maker_level(mk.book, side, max(c.sim_maker_min_bid, SIM_MAKER_FRONT_MIN) if deep_order else c.sim_maker_min_bid, own, price)
             if level is None:
                 if floor_order:
@@ -17979,7 +18021,8 @@ class Bot:
                     move = (target, f"买1 移到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
             key = f"{trade.get('market')}|{side}"
             if move is None:
-                self.sim_follow_since.pop(key, None)
+                if not self.sim_follow_readonly:
+                    self.sim_follow_since.pop(key, None)
                 return ""
             return move[1] if self.sim_follow_settled(key, move[0], now_ms, mk.key) else ""
         return ""
@@ -21340,7 +21383,7 @@ class Bot:
         markets = self.sim_markets(now_ms)
         return tuple(sorted((mk.market, round(mk.fair_up, 3)) for mk in markets)), {mk.market: mk.key for mk in markets}
 
-    def note_job(self, name: str, now_ms: int) -> None:
+    def note_job(self, name: str, now_ms: int, looked: Any = ()) -> None:
         """A reference feed just refreshed (reference_loop): when a fair price moved, the trader looks now — the books of
         the last round are at most a few seconds old — instead of at its next timer or book round; and the keys whose fair
         price moved go to the express lane at once (priced). 1.138.0: a proxy read by REST — the HSI night futures, the A50,
@@ -21361,7 +21404,8 @@ class Bot:
             moved = {keys[market] for market, fair in sig if before.get(market) != fair and market in keys}
             first = self.fair_sig is None
             self.fair_sig, self.sim_wake = sig, True
-            if moved and not first and name != "行情推送":  # a push's own keys were looked at by price_looks already
+            moved -= set(looked)  # a push's own keys were looked at by price_looks already (1.138.1: the rest — a REST proxy's move the
+            if moved and not first:  # push's look came after — go to the lane too; they were swallowed into the signature)
                 self.priced(moved)
 
     PRICE_LOOK_DELAY = 0.1  # pushes gathered this long before the keys they move are looked at (a busy pair ticks many times a second; 1.111.0: 0.1, was 0.2)
@@ -21434,7 +21478,7 @@ class Bot:
         for key in sorted(keys):
             if key in self.predict.books or key in self.predict.ladders:
                 self.predict.updated(key)
-        self.note_job("行情推送", self.market.now_ms())
+        self.note_job("行情推送", self.market.now_ms(), looked=keys)
 
     def predict_hot_keys(self, now_ms: int) -> set[str]:
         """The item keys the orderbook feed refreshes every round (predict_hot)."""
@@ -21460,6 +21504,10 @@ class Bot:
                 rows.add(str(mk.book.market_id))
                 continue
             if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk):
+                continue
+            if book_crossed(mk.book):  # 1.138.1: read again every round until it uncrosses (the taker gap now says "wait" for it)
+                hot.add(mk.key)
+                rows.add(str(mk.book.market_id))
                 continue
             gap = self.sim_taker_gap(mk, trades, now_ms)
             if (gap["state"] in {"ready", "blocked"} or (gap["state"] == "near" and gap["gap"] is not None and gap["gap"] <= self.PREDICT_HOT_GAP)

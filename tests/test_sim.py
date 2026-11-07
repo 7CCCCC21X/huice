@@ -1326,6 +1326,10 @@ async def taker_gap():
     assert [(n["item"], n["state"], n["short"]) for n in gbot.sim_near(gaps)] == [("恒生指数", "near", "吃涨 差 3.0¢")]
     card = next(i for i in gbot.odds_payload()["items"] if i["name"] == "模拟交易")
     assert card["near"][0]["short"] == "吃涨 差 3.0¢" and card["near"][0]["text"] == g["text"]
+    # 1.138.1: the card face's maker line — the trader's own verdict (sim_why's maker part), beside 距吃单
+    lines = gbot.sim_maker_lines(NOW)
+    assert list(lines) == ["101"] and lines["101"]["state"] in {"ready", "blocked", "wait", "resting"} and lines["101"]["text"], lines
+    assert lines["101"] == {k: v for k, v in gbot.sim_why(world["markets"][0], gbot.sim_trades(), NOW)["maker"].items() if k in ("text", "state")}
     assert "📏 距吃单最近：恒生指数 吃涨 差 3.0¢" in gbot.cmd_sim(None).text
     # the ask falls to the cap: buyable now; bought (every side once under LEGACY), the other side is the nearer one
     world["markets"] = [hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW)]
