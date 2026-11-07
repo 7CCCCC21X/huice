@@ -284,8 +284,9 @@ class PredictApi:
     """Signed-in requests to Predict's REST API. The API key goes in x-api-key on every request; the JWT from the
     sign-in flow (GET /v1/auth/message → sign → POST /v1/auth) in Authorization, renewed before it expires or after a
     401. A 429 pauses every request for its retry-after."""
-    PARALLEL = 4           # requests in flight at most (1.112.1: 4, was 3 — a cancel and its re-quote go side by side)
-    READ_PARALLEL = 2      # ...of which the reads may hold this many: two slots always stay free for an order or a cancel
+    PARALLEL = 5           # requests in flight at most (1.112.1: 4, was 3 — a cancel and its re-quote go side by side; 1.138.2: 5)
+    READ_PARALLEL = 3      # ...of which the reads may hold this many: two slots always stay free for an order or a cancel (1.138.2: 3 — the
+    #                        sync's per-order reads, six a step, two at a time, were half its second)
     BACKOFF_SECONDS = 20
 
     def __init__(self, base: str, api_key: str, wallet: Wallet | None):
@@ -981,7 +982,9 @@ class LiveBot(core.Bot):
     LIVE_PLACING_GRACE_MS = 120_000  # a record left in "placing" is reconciled by its hash after this long
     LIVE_IDLE_LIST_MS = 60_000      # the open-order list is re-read this often even with nothing in flight (orders this bot did not place)
     LIVE_SNAPSHOT_MAX_AGE_MS = 600_000  # the pre-open mode's account snapshot stands in for a cut read of the open list while younger than this (1.136.2)
-    LIVE_STEP_PAGES = 3             # a step's own read of the open list: the pages until every active record's order is seen, this many at most (1.137.1)
+    LIVE_STEP_PAGES = 1             # a step's own read of the open list: the pages until every active record's order is seen, this many at most (1.137.1:
+    #                                 3; 1.138.2: 1 — under the pre-open mode's thousands of orders the model's older ones are never on the first pages, the
+    #                                 two more pages cost 0.6 s a step for nothing: they are read by their hash in rotation)
     LIVE_TRACK_READS = 6            # resting maker orders the bounded list did not show, read by their hash a step at most, the longest unread first (1.137.2)
     LIVE_TRACK_READ_MS = 15_000     # ...each at most this often: its fills are seen within this, not every step at two reads at a time
     LIVE_ORPHAN_GRACE_MS = 120_000  # an unrecorded open order on one of this bot's markets is withdrawn once seen so for this long (LIVE_ORPHAN_CANCEL)
@@ -4083,6 +4086,13 @@ class LiveBot(core.Bot):
 
     async def cmd_preopen(self, req: core.Request) -> str:
         action = req.args[0].lower() if req.args else ""
+        if action == "weekend" and len(req.args) > 1 and req.args[1].lower() in {"on", "off"}:  # 1.138.2: PREOPEN_WEEKEND from Telegram
+            result = self.control_set({"PREOPEN_WEEKEND": req.args[1].lower()})
+            if not result["ok"]:
+                return "❌ " + result["message"]
+            await self.preopen_apply()
+            return (result["message"] + "\n" + ("周末不挂：北京时间周六、周日开始的场次不挂，已挂的撤掉，周一 00:00 起恢复" if req.args[1].lower() == "off"
+                                                 else "周末照挂") + ("\n" + self.preopen.status() if self.preopen is not None else ""))
         if action in {"on", "off"}:  # saved on the control page's record and applied at once, as the page would
             result = self.control_set({"PREOPEN_15M": action})
             if not result["ok"]:

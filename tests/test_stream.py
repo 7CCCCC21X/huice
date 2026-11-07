@@ -81,6 +81,19 @@ async def run():
     assert book.bids == ((D("0.81"), D("110.5")), (D("0.80"), D("400"))) and book.asks == ((D("0.85"), D("12")),), book
     assert book.fetched_ms >= NOW and book.slug == HSI_SLUG and book.fee_bps == 200 and book.market_id == "7" and book.title == "HSI up?"
     assert seen == ["HSI"] and stream.books == 1 and stream.live == {"7"} and feed.book_asked["HSI"] > 0 and stream.versions["7"] == 5 and "HSI" in stream.pushed
+    # 1.138.2: a market pushing on this connection, its book fresh, is not re-read by the hot REST round (the cold round checks it)
+    read = []
+    async def fake_timed(key, slug, rows=None):
+        read.append(key)
+        return 1
+    orig_timed, feed.refresh_timed = feed.refresh_timed, fake_timed
+    feed.refreshed = -1e9
+    for k in ("HSI", "BTC", "BTC-HIT-10"):
+        feed.key_refreshed[k] = time.monotonic()  # not cold-due: nothing read beside the round
+    await feed.refresh({"HSI": HSI_SLUG, "BTC": "will-btc-hit-70000-or-90000-first", "BTC-HIT-10": "what-price-will-bitcoin-hit-in-october-2026"},
+                       hot={"HSI", "BTC", "BTC-HIT-10"})
+    assert read == ["BTC", "BTC-HIT-10"], read
+    feed.refresh_timed = orig_timed
     # an older version is dropped; the same version with other levels is an update all the same (1.104.4: the version does
     # not count every change); a one-sided message replaces that side only; object levels are read too
     ws.push({"type": "M", "topic": "predictOrderbook/7", "data": {"version": 4, "bids": [["0.5", "1"]], "asks": [["0.6", "1"]]}})

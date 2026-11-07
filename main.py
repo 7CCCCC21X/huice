@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.138.1"
+VERSION = "1.138.2"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -6033,7 +6033,14 @@ class PredictFeed:
                 table.pop(slug, None)
         now = time.monotonic()
         cold = getattr(self.config, "predict_cold_poll", 0) or 0
-        due = {key: slug for key, slug in targets.items() if hot is None or key in hot or (key not in self.books and key not in self.ladders)}
+        wall = int(time.time() * 1000)
+
+        def pushing(key: str) -> bool:  # PREDICT_PUSH_FRESH_MS: the stream keeps this book current (repeats restart its age, refresh_age)
+            book = self.books.get(key)
+            return (hot is not None and key not in self.ladder_keys and book is not None and bool(self.stream.connected_at)
+                    and str(book.market_id) in self.stream.live and 0 <= wall - int(book.fetched_ms or 0) <= PREDICT_PUSH_FRESH_MS)
+        due = {key: slug for key, slug in targets.items()
+               if (hot is None or key in hot or (key not in self.books and key not in self.ladders)) and not pushing(key)}
         cold_due = {key: slug for key, slug in targets.items() if key not in due and now - self.key_refreshed.get(key, -1e9) >= cold}
         read = await asyncio.gather(*(self.refresh_timed(key, slug, hot_rows if hot is not None else None) for key, slug in due.items()))
         for key in due:
@@ -6063,6 +6070,9 @@ PREDICT_WS_BACKOFF = (2.0, 300.0)           # the wait before a new connection: 
 PREDICT_WS_MAX_TOPICS = 80                  # subscriptions at once: the single markets first, then the hot ladder levels
 PREDICT_WS_RETRY_TOPIC_SECONDS = 300.0      # a topic the server refused (invalid_topic) is asked for again after this long
 PREDICT_WS_SYNC_SECONDS = 30.0              # the subscriptions are brought in step with the wants at least this often
+PREDICT_PUSH_FRESH_MS = 5_000               # a single market pushing on this connection whose book is this fresh is not re-read by the hot REST round:
+#                                             the cold round reads it every PREDICT_COLD_POLL_SECONDS as a check (1.138.2: the hot round re-read every
+#                                             pushed market every few seconds — 9.8 requests a second, 402 reads in six minutes and none differing)
 
 
 async def ws_connect(url: str, headers: dict[str, str]) -> Any:

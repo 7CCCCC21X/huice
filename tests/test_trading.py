@@ -2120,7 +2120,7 @@ async def latency():
     diag = "\n".join(bot.diag_state(NOW))
     assert "下单链路（最近 2 笔真实订单）：盘口→决策 中位 0.0s / 最长 0.0s、决策→发出 中位 0.0s / 最长 0.0s（其中落盘等待 中位 0.0s / 最长 0.0s）、发出→订单号 中位 0.0s" in diag, diag  # 1.111.1: the flush wait shown
     api = L.PredictApi("https://x.test/v1", "k", None)
-    assert api.gate._value == 4 and api.read_gate._value == 2  # the reads' own gate: two slots stay free for an order or a cancel (1.112.1)
+    assert api.gate._value == 5 and api.read_gate._value == 3  # the reads' own gate: two slots stay free for an order or a cancel (1.112.1; 1.138.2: 5 and 3)
     assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).live_orders_page == 50 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "LIVE_ORDERS_PAGE": "100"}).live_orders_page == 100
     assert L.PredictApi.ORDERS_PAGE == 50  # (the bot's own api here is a fake; a real one takes config.live_orders_page: Live.__init__)
     print("LATENCY_OK")
