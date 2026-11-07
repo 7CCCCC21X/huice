@@ -84,6 +84,8 @@ MAX_ATTEMPTS = 3       # a window's quotes that ended by its own failure, at mos
 BULK_MIN_IDS = 40        # more orders than this to withdraw at once (a pause, a settings change, the mode off) go in batches that wait out a rate limit (1.141.0)
 BULK_WORKERS = 4         # ...holding at most this many of the cancel client's requests (live.PredictApi.PARALLEL: one left for a window at its cancel time)
 STOP_CANCEL_S = 600      # a controller that crashed withdraws for this long at most on its way out (was 12 s for any stop: a book of thousands mostly stayed)
+DEAD_WITHDRAW_S = 30     # a crashed controller's withdrawal from an operator's command: this long at most, the command waiting (1.141.1)
+BULK_REFUSED_MAX = 2     # a pair whose batch withdrawal stopped on a refusal of the request this often goes to the per-pair path (an id of its own Predict will not take)
 FINALS_WAIT_MS = 30 * 60_000  # winding down: once nothing can rest, the withdrawn orders' final fills are read this long at most (the rest at the next start)
 MAY_REST = {"open", "placing", "unknown", "prepared"}  # order states that may be on the book: sent, or being sent, for all we know
 FREE_REASONS = ("设置不同", "预挂模式停止", "到时撤单或真实交易暂停", "距涨停", "距跌停", "临停")  # withdrawals that were not the window's doing (counts_against)
@@ -753,6 +755,10 @@ class Controller:
         # A separate request gate leaves cancellation capacity available even when
         # placement requests are queued or their HTTP responses are slow.
         self.cancel_api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, None, shared)
+        # 1.141.1: the batch withdrawals have a client of their own: a window's cancel at its cancel time and the final reads keep
+        # the cancel client's slots (four batches of hundreds held them for seconds)
+        self.bulk_api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, None, shared)
+        self.cancel_made = self.cancel_api  # the batches go through bulk_api while the cancel client is this one (the tests put their own in)
         self.api.ORDERS_PAGE = self.cancel_api.ORDERS_PAGE = int(getattr(owner.config, "live_orders_page", 50) or 50)  # LIVE_ORDERS_PAGE: fewer pages a snapshot (1.136.1)
         self.settling: dict[str, asyncio.Task] = {}
         self.settle_gate = asyncio.Semaphore(2)
@@ -1668,9 +1674,14 @@ class Controller:
         by the caller (1.141.0): a few withdrawn here and now; a book of more than BULK_MIN_IDS left to the cancellation
         loop, which withdraws it in batches — the command answers at once instead of minutes later. The reply's line."""
         n = sum(len(removable_ids(p)) for p in self.ledger.rows.values() if p["phase"] != "closed")
-        if n <= BULK_MIN_IDS or not self.alive:
+        if n <= BULK_MIN_IDS:
             await self.cancel_all(reason)
             return ""
+        if not self.alive:  # 1.141.1: no loop to leave them to — here, for DEAD_WITHDRAW_S at most (the command waits)
+            await self.cancel_all(reason, deadline_s=DEAD_WITHDRAW_S)
+            left = sum(len(removable_ids(p)) for p in self.ledger.rows.values() if p["phase"] != "closed")
+            return (f"预挂模式已停止：{DEAD_WITHDRAW_S} 秒内撤了 {n - left} 张，还有 {left} 张没撤成（各自到期前仍挂着；重新打开预挂会接着撤，或再发一次）"
+                    if left else f"预挂模式已停止：{n} 张预挂单已撤")
         return f"正在分批撤 {n} 张预挂单（{self.remove_limit().text()}），/preopen 看进度"
 
     async def cancel_many(self, pairs: list[dict], reason: str, free: bool = False, deadline_s: float | None = None) -> None:
@@ -1684,6 +1695,10 @@ class Controller:
                     order["state"] = "not_sent"
         self.ledger.save_many(pairs)
         await self.remove_pairs(pairs, deadline_s=deadline_s)
+
+    def bulk_client(self) -> Any:
+        """The client the batch withdrawals use: their own (bulk_api), unless the cancel client was put in from outside (the tests)."""
+        return self.bulk_api if self.cancel_api is self.cancel_made else self.cancel_api
 
     def remove_limit(self) -> Any:
         """Predict's measured removal batch (live.RemoveLimit): the owner's, kept in its store across restarts; else this controller's own."""
@@ -1731,7 +1746,7 @@ class Controller:
         try:
             if by_id:
                 result = await live.remove_in_batches(
-                    self.cancel_api, list(by_id), limit, workers=BULK_WORKERS, patient=patient,
+                    self.bulk_client() if patient else self.cancel_api, list(by_id), limit, workers=BULK_WORKERS, patient=patient,
                     deadline=time.monotonic() + deadline_s if deadline_s else None, stop=self.owner.stopping.is_set,
                     on_answer=answered, progress=progress, now_ms=self.now)
         finally:
@@ -1748,8 +1763,10 @@ class Controller:
                               "requests": result["requests"], "limited": result["limited"], "seconds": result["seconds"]}
         if result["errors"]:
             self.error = result["errors"][-1]
-        unsent = set(result["failed"]) | set(result["left"])
+        unsent = set(result["left"])  # never sent: the loop takes them on in batches again; a failed one goes to the per-pair path
         for pair in pairs:
+            if result.get("halted") == "refused" and any(str(o.get("id") or "") in unsent for o in pair["orders"].values()):
+                pair["bulk_refused"] = int(pair.get("bulk_refused") or 0) + 1  # BULK_REFUSED_MAX of these: one order at a time from then on
             self.bookkeep(pair, save=False)  # closed once nothing is left to cancel; the next try RETRY_MS on, doubling (not every half second)
         self.ledger.save_many(pairs)
         for pair in pairs:
@@ -1919,7 +1936,10 @@ class Controller:
         while not self.stopped():
             self.unpark()
             now = self.now()
-            calls = int(getattr(self.api, "calls", 0) or 0) + (int(getattr(self.cancel_api, "calls", 0) or 0) if self.cancel_api is not self.api else 0)
+            def count(client: Any) -> int:  # a fake's calls are a list
+                made = getattr(client, "calls", 0)
+                return len(made) if isinstance(made, list) else int(made or 0)
+            calls = sum(count(client) for client in {id(x): x for x in (self.api, self.cancel_api, self.bulk_client())}.values())
             if not self.rate_samples or now - self.rate_samples[-1][0] >= 500:
                 self.rate_samples.append((now, calls))
             await self.check_cards(now)
@@ -1932,8 +1952,14 @@ class Controller:
                 active = [p for p in due if p["phase"] == "active"]
                 if active:
                     await self.cancel_many(active, "到时撤单或真实交易暂停", free=True)
-                stale = [p for p in due if p["phase"] != "active" and p["slug"] not in self.cancelling and p["slug"] not in self.bulk_slugs]
-                heavy = [p for p in stale if removable_ids(p)]
+                # 1.141.1: a window in its last stretch (past its cancel time, before its signed expiry) with an order still out is
+                # removed from here, one try every SPRINT_MS — never queued behind the final reads a big withdrawal left
+                sprint = [p for p in due if p["phase"] != "active" and p["slug"] not in self.bulk_slugs and self.in_sprint(p) and removable_ids(p)]
+                if sprint:
+                    await self.remove_pairs(sprint, patient=False)
+                done = {p["slug"] for p in sprint}
+                stale = [p for p in due if p["phase"] != "active" and p["slug"] not in done and p["slug"] not in self.cancelling and p["slug"] not in self.bulk_slugs]
+                heavy = [p for p in stale if removable_ids(p) and int(p.get("bulk_refused") or 0) < BULK_REFUSED_MAX]
                 if sum(len(removable_ids(p)) for p in heavy) > BULK_MIN_IDS:
                     # 1.141.0: many closing pairs with orders out (a settings change withdrew them, a batch left them): in batches,
                     # beside this loop — the windows at their cancel time go on being withdrawn on time meanwhile

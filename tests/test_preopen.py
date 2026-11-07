@@ -1644,21 +1644,25 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         # Predict refuses more than 50 ids a request: the 80 that failed went through as two 40s — the size, measured
         api, limit = BulkApi(cap=50), L.RemoveLimit()
         r = await L.remove_in_batches(api, ids[:600], limit, workers=4)
-        self.assertEqual((len(r["removed"]), r["failed"], (limit.ok, limit.cap, limit.size())), (600, [], (40, 80, 40)))
+        self.assertEqual((len(r["removed"]), r["failed"], (limit.ok, limit.cap, limit.soft, limit.size())), (600, [], (40, 0, 80, 40)))
+        limit.soft_at = 0  # an hour on, 80 is tried again — and a second withdrawal finding the same makes it the ceiling (1.141.1)
+        r = await L.remove_in_batches(BulkApi(cap=50), ids[:600], limit, workers=4)
+        self.assertEqual((len(r["removed"]), limit.cap, limit.size()), (600, 80, 40))
+        self.assertIn("一次 80 张太多", limit.text())
         # Predict answers only the first 30 of a request: the tail left out goes again, and its going through measures the 30
         api, limit = BulkApi(take=30), L.RemoveLimit()
         r = await L.remove_in_batches(api, ids[:300], limit, workers=1)
-        self.assertEqual((len(r["removed"]), r["unanswered"], (limit.ok, limit.cap, limit.size())), (300, [], (30, 40, 30)))
+        self.assertEqual((len(r["removed"]), r["unanswered"], (limit.ok, limit.cap, limit.soft, limit.size())), (300, [], (30, 0, 40, 30)))
         self.assertEqual([len(c) for c in api.calls[:4]], [20, 40, 10, 30])
         # an id Predict will not take is found alone and given up — the content, not the size: no ceiling from it
         api, limit = BulkApi(bad={"7"}), L.RemoveLimit()
         r = await L.remove_in_batches(api, ids[:40], limit, workers=1)
-        self.assertEqual((r["failed"], len(r["removed"]), limit.cap), (["7"], 39, 0))
+        self.assertEqual((r["failed"], len(r["removed"]), limit.cap, limit.soft, r["halted"]), (["7"], 39, 0, 0, ""))
         self.assertIn("HTTP 400", r["errors"][-1])
         # a big batch that times out is split; both halves through: that size is the ceiling
         api, limit = BulkApi(timeout_over=50), L.RemoveLimit(ok=40)
         r = await L.remove_in_batches(api, ids[:80], limit, workers=1)
-        self.assertEqual((len(r["removed"]), [len(c) for c in api.calls], limit.cap), (80, [80, 40, 40], 80))
+        self.assertEqual((len(r["removed"]), [len(c) for c in api.calls], limit.cap, limit.soft), (80, [80, 40, 40], 0, 80))
         # answered "noop": counted apart, nothing sent again
         api = BulkApi(gone={"1", "2"})
         r = await L.remove_in_batches(api, ids[:10], L.RemoveLimit(), workers=1)
@@ -1698,6 +1702,88 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((again.live_remove_limit().as_dict(), again.live_remove_limit().size()), ({"ok": 80, "cap": 0, "at": NOW}, 160))
         self.assertIn("每批 160 张（实测一次 80 张全部应答", again.live_remove_limit().text())
         self.assertEqual(L.RemoveLimit(ok=90, cap=80).as_dict()["ok"], 79, "a stored record that contradicts itself: under the cap")
+
+    async def test_bulk_removal_stops_on_a_refusal_of_the_request_itself(self):
+        """1.141.1 (the review): an account-wide refusal used to be split down to single ids — 1,170 requests for 600 ids."""
+        ids = [str(i) for i in range(600)]
+        api = BulkApi(refuse_all="HTTP 403: forbidden")
+        r = await L.remove_in_batches(api, ids, L.RemoveLimit(), workers=4)
+        self.assertEqual((r["halted"], len(r["left"]), r["failed"], r["removed"]), ("systemic", 600, [], []))
+        self.assertLessEqual(len(api.calls), 4, [len(c) for c in api.calls])
+        api = BulkApi(refuse_all="HTTP 400: bad request")  # not a status that says so: both halves of a split refused is the proof
+        r = await L.remove_in_batches(api, ids, L.RemoveLimit(), workers=4)
+        self.assertEqual((r["halted"], len(r["left"]) + len(r["failed"]), r["removed"]), ("refused", 600, []))
+        self.assertLessEqual(len(api.calls), 12, [len(c) for c in api.calls])
+        api = BulkApi(refuse_all="HTTP 403: forbidden")
+        r = await L.remove_in_batches(api, ids[:10], L.RemoveLimit(), workers=1, patient=False)
+        self.assertEqual((r["halted"], r["left"], len(api.calls)), ("systemic", ids[:10], 1))
+        # one refusal of a batch of 20, fine after: not the size — no ceiling, and the batch goes on growing
+        api, limit = BulkApi(refuse_first=1), L.RemoveLimit()
+        r = await L.remove_in_batches(api, ids[:200], limit, workers=1)
+        self.assertEqual((len(r["removed"]), limit.cap, limit.soft), (200, 0, 0))
+        self.assertGreaterEqual(limit.size(), 40)
+        # a ceiling a day old lapses: Predict may take more by now
+        old = L.RemoveLimit(ok=40, cap=80, at=NOW - 2 * 86_400_000)
+        old.refresh(NOW)
+        self.assertEqual((old.cap, old.size(), old.changed), (0, 80, True))
+
+    async def test_a_window_in_its_last_seconds_is_retried_from_the_loop_not_behind_queued_reads(self):
+        """1.141.1 (the review): a failed cancel at the cancel time was retried only through the reconcile queue, behind every
+        final read a big withdrawal had left there — its second try went out after the order's signed expiry."""
+        ctl, api, clock = controller()
+        pair = (await self.book_of(ctl, api, 1))[0]
+        pair.update(phase="closing", reason="到时撤单或真实交易暂停", free=True)  # its first try failed
+        clock.ms = pair["cancel_ms"] + 1_000  # the last stretch: past the cancel time, before the signed expiry
+        ctl.ledger.save(pair)
+        await ctl.reconcile_gate.acquire()
+        await ctl.reconcile_gate.acquire()  # the final reads of a big withdrawal, ahead in the queue
+        ctl.launch_reconcile(pair)  # its own reconcile queued behind them
+        task = asyncio.create_task(ctl.cancellation_loop())
+        try:
+            await self.until(lambda: {"0u", "0d"} <= set(api.removed), timeout=2)
+        finally:
+            ctl.stop.set()
+            await asyncio.gather(task, return_exceptions=True)
+            ctl.reconcile_gate.release()
+            ctl.reconcile_gate.release()
+        await self.finish(ctl)
+
+    async def test_a_crashed_controllers_withdrawal_has_a_deadline_and_the_account_cancel_leaves_the_modes_orders(self):
+        ctl, api, clock = controller()
+        await self.book_of(ctl, api, 100)  # 200 orders, a controller that crashed: no loop to leave them to
+        ctl.alive = False
+        quick = api.remove_orders
+
+        async def slow(ids):
+            await asyncio.sleep(0.5)
+            return await quick(ids)
+        api.remove_orders = slow
+        with patch.object(p, "DEAD_WITHDRAW_S", 0.2):
+            started = time.monotonic()
+            line = await ctl.withdraw_all("紧急停止")
+        self.assertLess(time.monotonic() - started, 2, "the command waits the deadline, not the whole book")
+        self.assertTrue(line.startswith("预挂模式已停止：0.2 秒内撤了 80 张，还有 120 张没撤成"), line)
+        await self.finish(ctl)
+        # /live cancel account: the mode's own orders are its loop's (in batches) — the account's other ones alone go from here
+        ctl, api, _ = controller()
+        await self.book_of(ctl, api, 2)
+
+        class LiveApi:
+            def __init__(self):
+                self.removed, self.blocked_until = [], 0.0
+            async def orders(self, status="OPEN"):
+                return [{"id": "0u", "order": {"hash": "0x0000up"}}, {"id": "x1", "order": {"hash": "0x0001down"}},  # the mode's, by id and by hash
+                        {"id": "999", "order": {"hash": "0xforeign"}}]
+            async def remove_orders(self, ids):
+                self.removed.extend(ids)
+                return {"removed": list(ids), "noop": []}
+        bot = L.LiveBot.__new__(L.LiveBot)
+        bot.preopen, bot.sim_trades, bot.stopping, bot.store = ctl, (lambda: {}), asyncio.Event(), m.Store(":memory:")
+        bot.live, bot.live_unknown_open = types.SimpleNamespace(ready=True, api=LiveApi()), []
+        text = await bot._live_cancel_command(["account"], NOW)
+        self.assertEqual(bot.live.api.removed, ["999"])
+        self.assertIn("账户上无记录的挂单 1 张：Predict 确认撤掉 1 张", text)
+        await self.finish(ctl)
 
     async def test_a_settings_change_withdraws_a_big_book_in_batches(self):
         ctl, api, clock = controller()
@@ -1822,8 +1908,9 @@ class BulkApi:
     ``take`` — only the first so many of a request answered; ``bad`` — a request with one of these refused whole;
     ``limit_on`` — these requests (by count) answered with a 429; ``gone`` — answered "noop"; ``timeout_over`` — a bigger
     request times out; ``slow`` — seconds an answer takes."""
-    def __init__(self, cap=0, take=0, bad=(), limit_on=(), gone=(), slow=0.0, timeout_over=0):
+    def __init__(self, cap=0, take=0, bad=(), limit_on=(), gone=(), slow=0.0, timeout_over=0, refuse_all="", refuse_first=0):
         self.cap, self.take, self.bad, self.limit_on, self.gone, self.slow, self.timeout_over = cap, take, set(bad), set(limit_on), set(gone), slow, timeout_over
+        self.refuse_all, self.refuse_first = refuse_all, refuse_first  # every request refused with this text; the first n refused (HTTP 400)
         self.calls, self.blocked_until, self.inflight, self.most = [], 0.0, 0, 0
 
     async def remove_orders(self, ids):
@@ -1833,6 +1920,10 @@ class BulkApi:
         self.most = max(self.most, self.inflight)
         try:
             await asyncio.sleep(self.slow)
+            if self.refuse_all:
+                raise m.RemoteError(self.refuse_all)
+            if nth <= self.refuse_first:
+                raise m.RemoteError("HTTP 400: transient")
             if nth in self.limit_on:
                 self.blocked_until = time.monotonic() + 0.05
                 raise m.RemoteError("HTTP 429: too many requests", 1)

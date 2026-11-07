@@ -285,19 +285,27 @@ REMOVE_START = 20      # ids in one POST /orders/remove at first: what the pre-o
 REMOVE_MAX = 500       # ...doubled while Predict answers every id of a batch, up to this many (Predict's own ceiling is measured: RemoveLimit)
 REMOVE_TRIES = 3       # a batch failing this often (a timeout, a server error, ids its answer leaves out; a rate limit never counts): given up
 REMOVE_RETRY_S = 1.0   # ...sent again this long after such a failure, doubling
+REMOVE_CAP_DAYS = 1    # a measured ceiling lapses after this long: Predict may take more by then (1.141.1)
+REMOVE_SOFT_MS = 3_600_000  # a size that failed in one withdrawal is avoided this long in the process; a second withdrawal finding the same makes it the ceiling
+SYSTEMIC_STATUSES = {401, 403, 404, 405}  # a removal refused with these: the sign-in, the access or the endpoint — every batch would be; the withdrawal stops at once
+REMOVE_RUNS = [0]      # withdrawals so far in this process (remove_in_batches): a ceiling needs two of them to agree
 
 
 class RemoveLimit:
     """How many order ids Predict takes in one removal request, as measured on this account (1.141.0): ``ok``, the most a
-    request was answered for whole; ``cap``, the fewest it refused or timed out on whole, or answered only the head of —
-    counted only once the halves (or the tail left out) then went through, so the size was the problem and not an id
-    (0: none yet). The next batch: the best size seen, under the cap; with no cap, twice the best size seen, from
-    REMOVE_START up to REMOVE_MAX. One for every client on the key, kept in the bot's store (LiveBot.live_remove_limit)."""
+    request was answered for whole; ``cap``, the ceiling — a size two withdrawals each found too many (a request of it
+    refused or timed out on whole, its halves then through; or only its head answered, the tail then through). 1.141.1: one
+    withdrawal's finding only keeps the size out of this process for REMOVE_SOFT_MS (``soft``); a refusal never lowers the
+    batch to REMOVE_START or under (Predict took 20 for months: a one-off refusal said nothing about the size); the ceiling
+    lapses after REMOVE_CAP_DAYS. The next batch: the best size seen under the ceiling; with none, twice the best size seen,
+    from REMOVE_START up to REMOVE_MAX. One for every client on the key, kept in the bot's store (LiveBot.live_remove_limit)."""
 
     def __init__(self, ok: int = 0, cap: int = 0, at: int = 0):
         self.ok, self.cap, self.at = max(0, int(ok or 0)), max(0, int(cap or 0)), int(at or 0)
         if self.cap and self.ok >= self.cap:
             self.ok = self.cap - 1
+        self.soft, self.soft_at = 0, 0  # a size one withdrawal found too many: avoided in this process for REMOVE_SOFT_MS (not kept)
+        self.strikes: dict[int, set] = {}  # size -> the withdrawals that found it too many: two make it the ceiling
         self.changed = False
 
     @classmethod
@@ -311,35 +319,60 @@ class RemoveLimit:
     def as_dict(self) -> dict:
         return {"ok": self.ok, "cap": self.cap, "at": self.at}
 
+    def refresh(self, now_ms: int) -> None:
+        """At a withdrawal's start: a ceiling REMOVE_CAP_DAYS old lapses (Predict may take more by now), and a size avoided
+        after one withdrawal found it too many is tried again REMOVE_SOFT_MS on."""
+        if self.cap and now_ms - self.at >= REMOVE_CAP_DAYS * 86_400_000:
+            self.cap, self.at, self.changed = 0, int(now_ms), True
+            self.strikes.clear()
+        if self.soft and now_ms - self.soft_at >= REMOVE_SOFT_MS:
+            self.soft = 0
+
     def size(self) -> int:
-        if self.cap:
-            return max(1, min(self.ok or max(1, self.cap // 2), self.cap - 1))
+        ceiling = min([x for x in (self.cap, self.soft) if x], default=0)
+        if ceiling:
+            return max(1, min(self.ok if 0 < self.ok < ceiling else ceiling // 2, ceiling - 1))
         return min(REMOVE_MAX, self.ok * 2 if self.ok >= REMOVE_START else REMOVE_START)
 
     def note_ok(self, n: int, now_ms: int) -> None:
-        """A request of ``n`` ids answered for whole (at or over the cap: a passing exception, not counted)."""
+        """A request of ``n`` ids answered for whole (at or over the ceiling: a passing exception, not counted; at or over a
+        size avoided after one withdrawal: that one was the exception)."""
+        if self.soft and n >= self.soft:
+            self.soft = 0
         if n > self.ok and (not self.cap or n < self.cap):
             self.ok, self.at, self.changed = int(n), int(now_ms), True
 
-    def note_cap(self, n: int, now_ms: int) -> None:
-        """``n`` ids in one request were too many."""
-        if n > 1 and (not self.cap or n < self.cap):
+    def note_cap(self, n: int, now_ms: int, run: int, proven: bool = False) -> None:
+        """``n`` ids in one request looked like too many in withdrawal ``run`` — a request of them refused or timed out on
+        whole, its halves then through; ``proven``: only its head answered, the tail then through (a pattern no blip makes).
+        A refusal at REMOVE_START or under is not believed. Avoided at once in this process (soft); the ceiling once a second
+        withdrawal finds the same."""
+        if n <= 1 or (n <= REMOVE_START and not proven):
+            return
+        self.soft, self.soft_at = min(self.soft or n, n), int(now_ms)
+        runs = self.strikes.setdefault(int(n), set())
+        runs.add(run)
+        if len(runs) >= 2 and (not self.cap or n < self.cap):
             self.cap, self.at, self.changed = int(n), int(now_ms), True
             self.ok = min(self.ok, self.cap - 1)
 
     def text(self) -> str:
         """The status's words: the batch now, and what it rests on."""
-        seen = ([f"实测一次 {self.ok} 张全部应答"] if self.ok >= REMOVE_START or self.cap else []) + ([f"一次 {self.cap} 张太多"] if self.cap else [])
+        seen = (([f"实测一次 {self.ok} 张全部应答"] if self.ok >= REMOVE_START or self.cap or self.soft else []) + ([f"一次 {self.cap} 张太多"] if self.cap else [])
+                + ([f"{self.soft} 张一批刚失败过，暂时不用"] if self.soft and self.soft != self.cap else []))
         return f"每批 {self.size()} 张（{'，'.join(seen) or '还没有实测'}；从 {REMOVE_START} 张起，全部应答就翻倍，最多 {REMOVE_MAX} 张）"
 
 
 def remove_failure(error: BaseException) -> str:
     """What a failed removal request means: "limited" — a 429, or a cooldown the client is in (begun by any client on the
-    key): waited out; "refused" — Predict answered with a refusal (too many ids, or one it will not take); "transient" — a
-    timeout, a network or server error."""
+    key): waited out; "systemic" — the sign-in, the access or the endpoint (SYSTEMIC_STATUSES): every batch would be
+    refused, the withdrawal stops (1.141.1); "refused" — Predict answered with a refusal (too many ids, or one it will not
+    take); "transient" — a timeout, a network or server error."""
     status = http_status(error)
     if status == 429 or getattr(error, "retry_after", 0):
         return "limited"
+    if status in SYSTEMIC_STATUSES:
+        return "systemic"
     if 400 <= status < 500 or "不是已确认成功" in str(error) or "撤单被拒绝" in str(error):
         return "refused"
     return "transient"
@@ -362,15 +395,23 @@ async def remove_in_batches(api: Any, ids: list, limit: RemoveLimit, *, workers:
     cooldown — the caller's own retry takes the rest on, as before 1.141.0. The batch grows while answered whole
     (RemoveLimit). Nothing more is sent past ``deadline`` (time.monotonic) or once ``stop()`` says so.
 
+    1.141.1: a refusal of the request itself — SYSTEMIC_STATUSES, or both halves of a split refused whole (neither one id
+    nor the size: the request) — stops the withdrawal at once, the rest left for the caller's next try; it used to split
+    down to single ids, two requests an id every retry.
+
     Returns the ids — removed; noop (Predict: nothing to remove); unanswered (left out of every answer); failed (their
-    request failed every try, or Predict refused them alone); left (never sent: the deadline, the stop, an impatient rate
-    limit) — with the requests made, the rate limits met, the seconds taken, the biggest batch answered whole and the
+    request failed every try, or Predict refused them alone); left (never sent: the deadline, the stop, a rate limit when
+    impatient, a refusal of the request itself) — with why it stopped early (``halted``: "limited", "systemic",
+    "refused" or ""), the requests made, the rate limits met, the seconds taken, the biggest batch answered whole and the
     last errors."""
     clock = now_ms or (lambda: int(time.time() * 1000))
+    limit.refresh(clock())
+    REMOVE_RUNS[0] += 1
+    run = REMOVE_RUNS[0]
     pending = collections.deque(dict.fromkeys(str(i) for i in ids))
     front: collections.deque = collections.deque()  # batches that go before new ones: a retry, a split's halves, a tail left out
     out: dict[str, Any] = {"removed": [], "noop": [], "unanswered": [], "failed": [], "left": [], "requests": 0, "limited": 0,
-                           "seconds": 0.0, "biggest": 0, "errors": []}
+                           "seconds": 0.0, "biggest": 0, "errors": [], "halted": ""}
     state = {"allowed": max(1, int(workers)), "cooled": 0.0, "halted": False, "busy": 0}
     started = time.monotonic()
     if progress is not None:
@@ -390,7 +431,7 @@ async def remove_in_batches(api: Any, ids: list, limit: RemoveLimit, *, workers:
         fam["left"] -= 1
         fam["whole"] = fam["whole"] and whole
         if fam["left"] <= 0 and fam["whole"]:
-            limit.note_cap(fam["n"], clock())
+            limit.note_cap(fam["n"], clock(), run, proven=bool(fam.get("k")))
             if fam.get("k"):
                 limit.note_ok(fam["k"], clock())
 
@@ -455,23 +496,40 @@ async def remove_in_batches(api: Any, ids: list, limit: RemoveLimit, *, workers:
         else:
             front.append({"ids": missing, "tries": batch["tries"] + 1, "fam": None})
 
+    def stop_here(batch: dict, why: str, cause: str) -> None:
+        """The withdrawal stops: this batch and every one not sent yet are left for the caller's next try."""
+        front.appendleft(batch)
+        state["halted"], out["halted"] = True, cause
+        out["errors"] = [*out["errors"][-4:], why]
+
     async def failed(batch: dict, error: BaseException) -> None:
         kind, why = remove_failure(error), core.clean_error(error) or type(error).__name__
+        fam = batch["fam"]
         if kind == "limited":
-            front.appendleft(batch)  # sent again once the cooldown is over: not a try
             cooldown(error)
             if not patient:
-                state["halted"] = True
-                out["errors"] = [*out["errors"][-4:], why]
+                stop_here(batch, why, "limited")
                 return
+            front.appendleft(batch)  # sent again once the cooldown is over: not a try
             await wait(max(float(getattr(api, "blocked_until", 0.0) or 0.0) - time.monotonic(), 0.05) + 0.05)
-        elif not patient:
+            return
+        if kind == "systemic":  # the sign-in, the access, the endpoint: every batch would be refused
+            stop_here(batch, why, "systemic")
+            return
+        if kind == "refused" and fam is not None:
+            fam["refused"] = fam.get("refused", 0) + 1
+            if fam["refused"] >= 2:  # both halves refused whole: neither one id nor the size — the request itself
+                stop_here(batch, why, "refused")
+                return
+        if not patient:
             give_up(batch, "failed", why)
         elif len(batch["ids"]) > 1 and (kind == "refused" or len(batch["ids"]) > REMOVE_START):
             family_done(batch["fam"], False)  # the halves are a family of their own: this batch is not whole
             half, fam = len(batch["ids"]) // 2, {"n": len(batch["ids"]), "left": 2, "whole": True}
-            front.appendleft({"ids": batch["ids"][half:], "tries": 0, "fam": fam})
-            front.appendleft({"ids": batch["ids"][:half], "tries": 0, "fam": fam})
+            # queued behind the halves already waiting (breadth first, 1.141.1): a split's two halves go out side by side, so a
+            # refusal of every request shows as both refused within a round — not after a worker has drilled down to single ids
+            front.append({"ids": batch["ids"][:half], "tries": 0, "fam": fam})
+            front.append({"ids": batch["ids"][half:], "tries": 0, "fam": fam})
         elif kind == "refused" or batch["tries"] + 1 >= REMOVE_TRIES:
             give_up(batch, "failed", why)
         else:
@@ -4013,8 +4071,8 @@ class LiveBot(core.Bot):
                 if matches and words[0] not in {"all", "account"}:
                     await preopen.cancel_many(matches, "管理员撤单")
                     return "已请求撤销该场双边预挂单，预挂模式已暂停。\n" + preopen.status()
+                result = await self._live_cancel_command(words, now_ms)  # 1.141.1: the model trader's own few first
                 line = await preopen.withdraw_all("管理员撤单")  # 1.141.0: thousands go in batches from the mode's own loop
-                result = await self._live_cancel_command(words, now_ms)
                 return result + "\n已请求撤销预挂单，预挂模式已暂停。" + (f"\n{line}" if line else "") + "\n" + preopen.status()
         return await self._live_cancel_command(words, now_ms)
 
@@ -4029,7 +4087,10 @@ class LiveBot(core.Bot):
             if not self.live.ready:
                 return f"❌ 未就绪：{self.live.not_ready_why}"
             known = {str(t["live"].get("order_id")) for t in trades.values() if isinstance(t.get("live"), dict)}
-            extra = [str(r.get("id")) for r in await self.live.api.orders("OPEN") if str(r.get("id")) not in known]
+            preopen = getattr(self, "preopen", None)  # 1.141.1: the pre-open mode's own orders are its loop's to withdraw (in batches), not sent twice
+            pre_ids, pre_hashes = preopen.known() if preopen is not None else (set(), set())
+            extra = [str(r.get("id")) for r in await self.live.api.orders("OPEN")
+                     if str(r.get("id")) not in known and str(r.get("id")) not in pre_ids and (order_hash_of(r) or "-") not in pre_hashes]
         elif words[0] != "all":
             targets = {tid: t for tid, t in targets.items() if str(t["live"].get("order_id")) == words[0]}
             if not targets:
