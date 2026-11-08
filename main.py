@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.144.2"
+VERSION = "1.145.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -14317,6 +14317,106 @@ async def run_probe(group: str, name: str, fetch: Any, check: Any) -> ProbeResul
                            f"内容异常：{clean_error(error) or type(error).__name__}｜返回：{raw_snippet(raw)}")
 
 
+SPEED_ROUND_SECONDS = 30   # /speed (1.145.0): each index source asked this long
+SPEED_PACE = 1.0           # ...once a second by default (/speed 0.5: twice a second; 0.5–5)
+SPEED_STOP_FAILS = 3       # a source failing this many times running is left alone (a 403 / 429: at once) — the IP must not get banned
+
+
+def speed_rounds(sources: list[tuple]) -> list[list[tuple]]:
+    """The sources ((feed, name, url, ...) tuples) in rounds, no website twice in a round: each one is asked once a pace
+    at most — what the bot would do at that cadence — not four times over (Sina serves four of the feeds)."""
+    rounds: list[list[tuple]] = []
+    for source in sources:
+        host = SourceHealth.host(source[2])
+        target = next((r for r in rounds if all(SourceHealth.host(x[2]) != host for x in r)), None)
+        if target is None:
+            target = []
+            rounds.append(target)
+        target.append(source)
+    return rounds
+
+
+def speed_stats(samples: list[dict]) -> dict:
+    """One source's /speed samples ({ok, ms, at, last, q} or {ok: False, ms, at, error}) summed up: the answers and the
+    failures; the request time (median, nine in ten within, the longest); the changes (a new figure or quote time from
+    one answer to the next); the source's own step (the median gap between successive quote times, else between the
+    changes seen); how far its quote time trails the clock (only when it carries seconds)."""
+    ok = [x for x in samples if x["ok"]]
+    times = sorted(x["ms"] for x in ok)
+    changes, seen, steps, prev = 0, [], [], None
+    for x in ok:
+        key = (x["last"], x["q"])
+        if prev is not None and key != prev:
+            changes += 1
+            seen.append(x["at"])
+            if x["q"] and prev[1] and x["q"] > prev[1]:
+                steps.append(x["q"] - prev[1])
+        prev = key
+    step = median(steps) if steps else median([b - a for a, b in zip(seen, seen[1:])]) if len(seen) > 1 else None
+    timed = [x for x in ok if x["q"]]
+    lag = median([x["at"] - x["q"] for x in timed]) if any(x["q"] % 60_000 for x in timed) else None  # whole minutes: no lag to read
+    failed = [x for x in samples if not x["ok"]]
+    return {"n": len(samples), "ok": len(ok), "errors": len(failed), "error": failed[0]["error"] if failed else "",
+            "median_ms": median(times), "p90_ms": times[max(0, math.ceil(0.9 * len(times)) - 1)] if times else None,
+            "max_ms": times[-1] if times else None, "changes": changes, "step_ms": step, "lag_ms": lag}
+
+
+def speed_text(feeds: list[dict], pace: float, seconds: float, now_ms: int, rounds: int) -> str:
+    """The /speed report: a feed a section — its market trading or not, the cadence it is read at now, each source's
+    figures — and what reading it every second would give: the bot's loop waits a second after each read, so a read
+    every second comes about every (request + 1) seconds; a new figure is seen, on average, half a period after it."""
+    secs = lambda ms: f"{ms / 1000:.1f}" if ms < 10_000 else f"{ms / 1000:.0f}"
+    lines = [f"⏱️ 指数查价测速 v{VERSION}｜{stamp(now_ms)}（北京时间）",
+             f"每个源每 {pace:g} 秒查一次、各 {seconds:g} 秒；同一网站一次只测一个源，共 {rounds} 轮约 {rounds * seconds:g} 秒；"
+             f"连续失败 {SPEED_STOP_FAILS} 次或被拒（403/429）就停下那个源"]
+    if feeds and not any(f["open"] for f in feeds):
+        lines.append("⚠️ 现在都休市：只测得出请求耗时和会不会被拒，指数多久一变要开盘时再测（北京时间：KOSPI 8:00–14:30、"
+                     "上证 9:30–15:00、恒指 9:30–16:10、恒指期货夜市 17:15–次日 3:00）")
+    if not feeds:
+        lines.append("没有在用的指数数据源（SSE_INDEX、HSI_FUTURES、KOSPI_INDEX 都关着，或者 SOURCES_OFF 关掉了全部源）")
+    for f in feeds:
+        lines.append(f"\n【{f['feed']}】{'交易中' if f['open'] else '休市'}｜现在每 {f['now_s']} 秒查一次")
+        clean = None
+        for src in f["sources"]:
+            st, stop = src["stats"], src["stopped"]
+            if not st["ok"]:
+                lines.append(f"❌ {src['name']}：{st['n']} 次全失败｜{brief_error(st['error'], 80)}" + (f"｜已停：{stop}" if stop else ""))
+                continue
+            text = (f"{'✅' if not st['errors'] and not stop else '⚠️'} {src['name']}：{st['ok']}/{st['n']} 次成功｜请求 中位 {secs(st['median_ms'])} 秒、"
+                    f"九成在 {secs(st['p90_ms'])} 秒内、最长 {secs(st['max_ms'])} 秒")
+            if st["errors"]:
+                text += f"｜失败 {st['errors']} 次：{brief_error(st['error'], 60)}"
+            if stop:
+                text += f"｜已停：{stop}"
+            if f["open"]:
+                text += f"｜数值变了 {st['changes']} 次" + (f"，约 {secs(st['step_ms'])} 秒一变" if st["step_ms"] else "")
+                if st["lag_ms"] is not None:
+                    text += f"，报价时间比现在晚 {secs(max(0, st['lag_ms']))} 秒"
+            else:
+                text += "｜休市，数值不动"
+            lines.append(text)
+            if clean is None and not st["errors"] and not stop:
+                clean = st
+        if clean is None:
+            first = next((x["stats"]["error"] for x in f["sources"] if x["stats"]["error"]), "") or "没有可用的源"
+            lines.append(f"👉 每 {pace:g} 秒查会出错（{brief_error(first, 60)}），先保持现在的每 {f['now_s']} 秒")
+            continue
+        period = clean["median_ms"] / 1000 + 1.0          # a read every second: the request, then the loop's one-second wait
+        before = max(f["now_s"] + 0.5, period)            # now: the cadence, met on the loop's next one-second tick
+        gain = (before - period) / 2
+        if clean["p90_ms"] > 1500:
+            lines.append(f"👉 请求本身就慢（九成在 {secs(clean['p90_ms'])} 秒内）：每秒查也只能约 {period:.1f} 秒一次")
+        elif gain < 0.3:
+            lines.append(f"👉 现在的每 {f['now_s']} 秒已经接近最快，改了也早不了多少")
+        else:
+            lines.append(f"👉 可以改成每 1 秒查：实际约 {period:.1f} 秒一次（请求 {secs(clean['median_ms'])} 秒 + 循环间隔 1 秒），"
+                         f"平均早约 {gain:.1f} 秒看到新数值" + ("" if f["open"] else "（开盘后再测一次确认数值多久一变）")
+                         + (f"；数据源本身约 {secs(clean['step_ms'])} 秒才变一次，多数请求拿到的数不变" if f["open"] and clean["step_ms"]
+                            and clean["step_ms"] >= 2000 * period else ""))
+    lines.append("\n把这份结果发给我，按它改查价间隔。")
+    return "\n".join(lines)
+
+
 def eastmoney_fields(raw: bytes, keys: tuple[str, ...]) -> str:
     """'f57=CN00Y f86=09-26 05:14' from a push2 answer, so a rejected code or missing time is visible."""
     try:
@@ -14625,6 +14725,8 @@ COMMANDS: tuple[Command, ...] = (
             "LIVE=on 时模拟交易的每个决定都会在 Predict 真实下单；/live pause 停止开新仓，/live resume 恢复"),
     Command("preopen", "15 分钟市场开盘前双边预挂（PREOPEN_15M=on，真实交易）：状态；check 体检（限流、卡住的撤单、最近问题）；pause / resume 暂停恢复；probe 只读探测市场列表", "check|pause|resume|probe"),
     Command("diag", "逐个检测数据源（币安/交易所/上证/A50/恒指/KOSPI/HL/汇率），找出哪里出问题"),
+    Command("speed", "指数查价测速（开盘时用）：每个指数数据源每秒查一次、各 30 秒，看请求要多久、指数多久一变、会不会被拒，给出最快能多久查一次", "0.5",
+            "不带参数每 1 秒查一次；/speed 0.5 每 0.5 秒（0.5～5）。同一网站一次只测一个源，连续失败 3 次或被拒就停下，不会把服务器 IP 弄进黑名单"),
     Command("test", "发送测试消息，不代表行情正常"),
     Command("id", "查看你的用户 ID、聊天 ID、话题 ID"),
     Command("help", "显示说明"),
@@ -14933,6 +15035,7 @@ class Bot:
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
         self.reference_pool: ThreadPoolExecutor | None = None
         self.diag_pool: ThreadPoolExecutor | None = None  # /diag's probes run here, not on the feeds' pool
+        self.speed_pool: ThreadPoolExecutor | None = None  # /speed's requests (1.145.0), likewise
         self.reference_state: dict[str, dict] = {}  # per background feed: last success, last error, duration
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
         self.close_print_why: dict[str, str] = {}  # symbol -> why today's closing print could not be noted (note_live_close)
@@ -14974,7 +15077,7 @@ class Bot:
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
-            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib, "/samples": self.cmd_samples,
+            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/speed": self.cmd_speed, "/calib": self.cmd_calib, "/samples": self.cmd_samples,
             "/journal": self.cmd_journal, "/summary": self.cmd_summary, "/markout": self.cmd_markout, "/market": self.cmd_market,
             "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live, "/preopen": self.cmd_preopen,
         }
@@ -22251,6 +22354,114 @@ class Bot:
             else:
                 lines.extend(f"{'✅' if r.ok else '❌'} {r.name}（{r.ms} ms）：{r.detail}" for r in rs)
         return "\n".join(lines)
+
+    def speed_feeds(self, now_ms: int) -> list[dict]:
+        """The index feeds /speed times, each with its sources switched on (SOURCES_OFF left out): whether its market
+        trades now, the cadence it is read at while it does, and per source (name, url, headers, parse: raw -> (figure,
+        the source's quote time in ms, 0 when it gives none))."""
+        def figures(parse: Any) -> Any:
+            def read(name: str, raw: bytes) -> tuple[D, int]:
+                q = parse(name, raw, self.market.now_ms())
+                return q.last, int(q.quoted_ms or 0)
+            return read
+
+        def listed(sources: Any, parse: Any) -> list[tuple]:
+            read = figures(parse)
+            return [(name, url, extra, lambda raw, name=name: read(name, raw)) for name, url, extra in SOURCE_HEALTH.enabled(sources)]
+
+        feeds = []
+        if self.config.sse_index:
+            feeds.append({"feed": "上证实时", "open": bool(stock_live_window("sh", now_ms, self.cn.holidays)), "now_s": CnIndex.SESSION_SECONDS,
+                          "sources": listed(CnIndex.SSE_SOURCES, parse_cn_index)})
+            feeds.append({"feed": "A50实时", "open": a50_session(now_ms) != "休市", "now_s": CnIndex.SESSION_SECONDS,
+                          "sources": listed(CnIndex.A50_SOURCES, CnIndex.parse_a50)})
+        if self.config.hsi_futures:
+            holidays = self.hsi.holidays
+            feeds.append({"feed": "恒指现货", "open": self.hsi.cash_open(now_ms), "now_s": IndexFutures.SPOT_SECONDS,
+                          "sources": listed(IndexFutures.SPOT_SOURCES, IndexFutures.parse_spot_quote)})
+            feeds.append({"feed": "恒指期货", "open": hk_futures_session(now_ms, holidays) != "休市", "now_s": IndexFutures.SESSION_SECONDS,
+                          "sources": listed(IndexFutures.FUTURES_SOURCES, lambda n, r, t: IndexFutures.parse_futures(n, r, t, holidays))})
+        if self.config.kospi_index:
+            trading = bool(stock_live_window("kr", now_ms, self.kospi.holidays))
+            feeds.append({"feed": "KOSPI", "open": trading, "now_s": KospiIndex.SESSION_SECONDS, "sources": listed(KospiIndex.SOURCES, KospiIndex.parse)})
+            feeds.append({"feed": "KOSPI200", "open": trading, "now_s": KospiIndex.SESSION_SECONDS, "sources": listed(KospiIndex.SOURCES_200, KospiIndex.parse)})
+        return [f for f in feeds if f["sources"]]
+
+    async def speed_probe(self, url: str, extra: dict, parse: Any, seconds: float, pace: float) -> tuple[list[dict], str]:
+        """One source asked every ``pace`` seconds for ``seconds`` (an answer slower than that: the next asked right after
+        it), outside the feeds' own source health: the samples, and why it was left alone early ("" when it ran its time)."""
+        samples: list[dict] = []
+        fails, started = 0, time.monotonic()
+        while time.monotonic() - started < seconds:
+            asked = time.monotonic()
+            try:
+                raw = await asyncio.wait_for(fetch_source(url, extra, record=False), SOURCE_TIMEOUT + 2)
+                took = int((time.monotonic() - asked) * 1000)
+                last, quoted = parse(raw)
+                samples.append({"ok": True, "ms": took, "at": self.market.now_ms(), "last": float(last), "q": int(quoted or 0)})
+                fails = 0
+            except Exception as error:
+                samples.append({"ok": False, "ms": int((time.monotonic() - asked) * 1000), "at": self.market.now_ms(),
+                                "error": clean_error(error) or type(error).__name__})
+                fails += 1
+                hit = re.match(r"HTTP (\d{3})", str(error))
+                status = int(hit.group(1)) if hit else 0
+                if status in (403, 429):
+                    return samples, f"被拒（HTTP {status}）"
+                if fails >= SPEED_STOP_FAILS:
+                    return samples, f"连续失败 {fails} 次"
+            await asyncio.sleep(max(0.0, pace - (time.monotonic() - asked)))
+        return samples, ""
+
+    async def speed_test(self, pace: float, seconds: float) -> tuple[list[dict], int]:
+        """/speed: every index source asked once a ``pace`` for ``seconds``, in rounds no website appears twice in
+        (speed_rounds), on its own threads; (the feeds with each source's speed_stats, the rounds run)."""
+        feeds = self.speed_feeds(self.market.now_ms())
+        flat = [(f["feed"], name, url, extra, parse) for f in feeds for name, url, extra, parse in f["sources"]]
+        rounds = speed_rounds(flat)
+        if self.speed_pool is None:
+            self.speed_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="speed")
+        token = HTTP_POOL.set(self.speed_pool)
+        done: dict[tuple[str, str], tuple[list[dict], str]] = {}
+        try:
+            for batch in rounds:
+                answers = await asyncio.gather(*(self.speed_probe(url, extra, parse, seconds, pace) for _, _, url, extra, parse in batch))
+                done.update({(feed, name): answer for (feed, name, *_), answer in zip(batch, answers)})
+        finally:
+            HTTP_POOL.reset(token)
+        return [{**f, "sources": [{"name": name, "stats": speed_stats(done[(f["feed"], name)][0]), "stopped": done[(f["feed"], name)][1]}
+                                  for name, *_ in f["sources"]]} for f in feeds], len(rounds)
+
+    async def cmd_speed(self, req: Request) -> str:
+        """/speed [pace]: the index feeds timed (speed_test) beside the command poll — about two minutes — the report
+        following as its own message, as /diag's does."""
+        usage = "用法：/speed（每 1 秒查一次）或 /speed 0.5（每 0.5 秒查一次，0.5～5）"
+        try:
+            pace = float(req.args[0]) if req.args else SPEED_PACE
+        except ValueError:
+            return usage
+        if not 0.5 <= pace <= 5:
+            return usage
+        key = f"speed:{req.sub_id}"
+        if self.delivering(key):
+            return "⏱️ 上一轮测速仍在进行，结果稍后发到这里。"
+        feeds = self.speed_feeds(self.market.now_ms())
+        rounds = len(speed_rounds([(f["feed"], name, url) for f in feeds for name, url, *_ in f["sources"]]))
+        note = (f"⏱️ 正在测指数查价速度：每个源每 {pace:g} 秒查一次、各 {SPEED_ROUND_SECONDS} 秒，共 {rounds} 轮约 {rounds * SPEED_ROUND_SECONDS} 秒；"
+                "结果稍后发到这里…")
+
+        async def report() -> str:
+            seconds = SPEED_ROUND_SECONDS
+            tested, ran = await self.speed_test(pace, seconds)
+            return speed_text(tested, pace, seconds, self.market.now_ms(), ran)
+
+        if self.reference_tasks:
+            async def deliver_report() -> None:
+                await self.tell(req.chat, req.thread, await report())
+            self.deliver(key, deliver_report)
+            return note
+        await self.tell(req.chat, req.thread, note)
+        return await report()
 
     async def cmd_diag(self, req: Request) -> str:
         """Probe every source. With the background loops running the probes run beside the command poll (they can
