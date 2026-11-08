@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.142.0"
+VERSION = "1.143.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -7845,6 +7845,99 @@ def preopen_cards() -> tuple:
     return (*WINDOW_UPDOWN_MARKETS, *HOURLY_UPDOWN_MARKETS, *DAY_WINDOW_MARKETS)
 
 
+# --- the review page's 市场涨跌统计 (1.143.0): each window's up or down by Binance's 1-minute candles -------------------------------
+TALLY_CHUNK_MS = 1000 * 60_000  # candles read 1,000 minutes a request, the chunks aligned on the epoch: a closed chunk is kept, never read again
+TALLY_MAX_DAYS = 31             # the longest range asked for at once
+TALLY_FRESH_S = 60              # the chunk still filling (now inside it) is read again this long after
+TALLY_RETRY_S = 30              # a chunk whose read failed is not asked for again sooner
+TALLY_KEEP_CHUNKS = 600         # chunks kept in memory (about 400 days of one pair)
+
+
+def tally_card(key: str) -> Any:
+    """The card a key names among the pre-open mode's (preopen_cards: the 15- and 5-minute windows, the hourly and daily markets)."""
+    return next((c for c in preopen_cards() if c.key == key), None)
+
+
+def tally_name(card: Any) -> str:
+    """The card's name on the page: BTC 5分, 宇树 15分, BTC 小时, BTC 日."""
+    if isinstance(card, HourlyUpDownSpec):
+        return f"{card.coin} 小时"
+    if isinstance(card, DayWindowSpec):
+        return f"{card.coin} 日"
+    return f"{card.coin} {card.minutes}分"
+
+
+def tally_source(card: Any) -> tuple[str, str]:
+    """Where a card's windows are measured: ("spot", pair) — Binance spot's 1-minute candles, as the BTC / ETH / BNB cards read
+    them; ("index", pair) — Binance futures' index candles, as the other window cards (黄金, 原油, the stocks) read theirs."""
+    return ("index" if getattr(card, "venue", "spot") == "futures" else "spot", card.symbol)
+
+
+def tally_tie(card: Any) -> float:
+    """How close (relative) an end may come to its start and be left as 平或待定: the card's own band — Predict settles a window on
+    Chainlink's report, not on the candle; a daily market settles on the candles themselves: an exact tie only."""
+    if isinstance(card, DayWindowSpec):
+        return 0.0
+    return float(IndexUpDownMarket.TIE if getattr(card, "venue", "spot") == "futures" else SpotWindowMarket.TIE)
+
+
+def tally_windows(card: Any, from_ms: int, to_ms: int, now_ms: int, holidays: frozenset = frozenset()) -> list[tuple[int, int, int, int]]:
+    """The card's windows that start in [from_ms, to_ms) and are over by now (their end candle closed): (start, end, the start
+    candle's open, the end candle's open) — a window card's boundary is the close of the candle ending there, a daily market's
+    the noon-ET candle itself (each card's window_spec says which)."""
+    out = []
+    start = card.first_start(from_ms)
+    while start < to_ms:
+        if card.exists(start, holidays):
+            spec = card.window_spec(start)
+            if spec.end_ms + 60_000 > now_ms:
+                break
+            out.append((start, card.end_of(start), spec.start_ms, spec.end_ms))
+        start = card.next_start(start)
+    return out
+
+
+def tally_rows(windows: list, closes: Mapping[int, float], tie: float) -> list[dict]:
+    """Each window by the candle closes: u (the end above the start), d (below), f (within ``tie`` of it: 平或待定), x (a candle
+    missing) — with its start, end and the two closes."""
+    rows = []
+    for start, end, a_ms, b_ms in windows:
+        a, b = closes.get(a_ms), closes.get(b_ms)
+        r = "x" if a is None or b is None else "f" if b == a or abs(b - a) <= a * tie else "u" if b > a else "d"
+        rows.append({"s": start, "e": end, "a": a, "b": b, "r": r})
+    return rows
+
+
+def tally_summary(rows: list[dict], official: Mapping[int, str]) -> dict:
+    """The counts; the longest runs of ups and of downs (a tie or a gap ends a run); the hours the windows start in (Beijing,
+    the days of a range together); and the windows whose Predict result the bot holds (``official``: start -> u / d / s)
+    against the candles' — each such row carries it ("o")."""
+    names = {"u": "up", "d": "down", "f": "flat", "x": "missing"}
+    counts = {"total": len(rows), "up": 0, "down": 0, "flat": 0, "missing": 0}
+    best: dict[str, dict] = {"up": {"n": 0}, "down": {"n": 0}}
+    hours: dict[int, dict] = {}
+    run, agree, bad = None, 0, []
+    for r in rows:
+        counts[names[r["r"]]] += 1
+        h = dt.datetime.fromtimestamp(r["s"] / 1000, BEIJING).hour
+        hours.setdefault(h, {"h": h, "up": 0, "down": 0, "flat": 0, "missing": 0})[names[r["r"]]] += 1
+        if r["r"] in ("u", "d"):
+            run = {**run, "n": run["n"] + 1, "to": r["e"]} if run and run["k"] == r["r"] else {"k": r["r"], "n": 1, "from": r["s"], "to": r["e"]}
+            if run["n"] > best[names[run["k"]]]["n"]:
+                best[names[run["k"]]] = {"n": run["n"], "from": run["from"], "to": run["to"]}
+        else:
+            run = None
+        o = official.get(r["s"])
+        if o:
+            r["o"] = o
+            if r["r"] in ("u", "d"):
+                if o == r["r"]:
+                    agree += 1
+                else:
+                    bad.append({"s": r["s"], "r": r["r"], "o": o})
+    return {"counts": counts, "streaks": best, "hours": [hours[h] for h in sorted(hours)], "checks": {"n": agree + len(bad), "agree": agree, "bad": bad}}
+
+
 def updown_odds(price: float, line: float, sigma: float, years: float, drift: float = -0.5,
                 tick: float = 0.01) -> tuple[float, float, float, float]:
     """(up, flat, down, z) for a close `years` from now against `line`: log-normal with annual σ, its log mean moved by
@@ -12687,6 +12780,7 @@ dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .note{font-size:12.5px;background:var(--chip);border-radius:10px;padding:8px 10px;border-left:3px solid var(--warn)}.note.bad{border-left-color:var(--hot)}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 .evchart{width:100%;height:auto;display:block;margin:6px 0 2px;background:var(--chip);border-radius:10px}.evchart .grid{stroke:var(--line2)}.evchart .zero{stroke:var(--faint);stroke-dasharray:3 3}.evchart text{font-size:10px;fill:var(--faint)}.evchart .band{fill:var(--best-soft);opacity:.35}.evchart .ev{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4}.evchart .pnl{fill:none;stroke:var(--best);stroke-width:2}.evchart circle.pnl{fill:var(--best)}.evchart circle.ev{fill:var(--muted)}
+.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
@@ -12695,6 +12789,10 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <div class="body" id="unrecbody"></div><p class="small mut" id="unrecnote" hidden>按最近一次读到的 Predict 持仓，减去记录和开盘前预挂的份数；多出来的多半是没有记录的挂单成交了（手动单、丢失跟踪的单）。每分钟一次的持仓核对会把它补记到同一方向最近结束的订单上，没有这样的订单就留在这里；/live fills 给出逐项对照。</p></section>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
 <div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>今日按市场 <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。开盘前预挂（49¢ 两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的时间算今天，下单时预期按五五开算。</p><p class="small mut">按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
+<section class="box" id="tallybox"><div class="hd" id="tallyhd"><h2>市场涨跌统计</h2><span class="sum" id="tallysum"></span><button type="button" class="lnk" id="foldtally">收起</button></div>
+<div class="body" id="tallybody"><div class="tbar"><select id="tcard" aria-label="市场"></select><button type="button" class="tq" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><span class="tcust"><input type="date" id="tfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="tto" aria-label="结束日期"><button type="button" id="tgo">查看</button></span></div>
+<div id="tally"></div>
+<p class="small mut">每一场按币安 1 分钟 K 线算：结束时的价格高于开始为涨、低于为跌，和机器人自己预结算同一个口径；开始和结束相差不到一个价位的记“平或待定”，留给 Predict 的官方结果；只算已经结束的场次。Predict 按 Chainlink 的价格结算，偶尔和 K 线不同：有官方结果的场次（预挂有成交的、原策略交易过的）单独核对，不一致的圆点带黄圈。按北京时间的日期查，以前的任何一天都能查，一次最多 31 天。把鼠标停在圆点上（手机上长按）看那一场的时间和价格。</p></div></section>
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="anaref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
 <div class="note fline" id="anafilt" hidden></div><div class="small mut" id="anaat"></div>
@@ -13193,6 +13291,50 @@ document.addEventListener("visibilitychange",()=>{if(document.visibilityState===
 const THEMES={auto:["◐","自动"],light:["☀","浅色"],dark:["☾","深色"]};let theme="auto";try{const t=JSON.parse(localStorage.getItem("theme"));if(typeof t==="string"&&Object.prototype.hasOwnProperty.call(THEMES,t))theme=t}catch(e){}
 function applyTheme(){const r=document.documentElement;if(theme==="auto")delete r.dataset.theme;else r.dataset.theme=theme;const b=document.getElementById("theme");b.textContent=THEMES[theme][0]+" "+THEMES[theme][1];b.title="主题："+THEMES[theme][1]+"（点击切换）"}
 document.getElementById("theme").addEventListener("click",()=>{const ks=Object.keys(THEMES);theme=ks[(ks.indexOf(theme)+1)%ks.length];try{localStorage.setItem("theme",JSON.stringify(theme))}catch(e){}applyTheme()});applyTheme();
+let tallyOpen=true,tallyKey="BTC-5M",tallyFrom="",tallyTo="",tallyRng="today",tallySeq=0;  // 市场涨跌统计 (1.143.0)
+try{tallyOpen=localStorage.getItem("jrntally")!=="0";tallyKey=localStorage.getItem("jrntallykey")||tallyKey}catch(e){}
+const tallyWord=r=>({u:"涨",d:"跌",f:"平或待定",x:"没数据",s:"平（50/50）"})[r]||r;
+function tallyAt(ms,j){const d=new Date(ms);return (j.from!==j.to||j.cycle_ms>=86400e3?MDF.format(d).replace("/","-")+" ":"")+HMF.format(d)}
+function tallyDots(j){  // a dot a window, red up, green down, grey a tie, hollow no candle; a row an hour (the 5- and 15-minute cards), a day (the hourly ones) or the whole range (the daily ones)
+  const box=$("div","tdots"),cyc=j.cycle_ms,multi=j.from!==j.to;let key=null,cells=null;
+  (j.windows||[]).forEach(w=>{const d=new Date(w.s),k=cyc<3600e3?(multi?MDF.format(d).replace("/","-")+" ":"")+HMF.format(d).slice(0,2)+" 时":cyc<86400e3?MDF.format(d).replace("/","-"):"按天";
+    if(k!==key){key=k;const row=$("div","trow");row.append($("span","tl",k));cells=$("span","tcells");row.append(cells);box.append(row)}
+    const off=!!w.o&&(w.r==="u"||w.r==="d")&&w.o!==w.r,dot=$("span","tdot "+w.r+(off?" bad":""));
+    dot.title=tallyAt(w.s,j)+"–"+HMF.format(new Date(w.e))+" "+tallyWord(w.r)+(w.a!=null&&w.b!=null?"："+w.a+" → "+w.b:"")+(w.o?"；Predict 官方 "+tallyWord(w.o):"");
+    cells.append(dot)});
+  if(key===null)box.append($("p","small mut","这段时间还没有结束的场次"));
+  return box}
+function tallyRender(j){const el=document.getElementById("tally"),c=j.counts||{};el.replaceChildren();
+  const dec=(c.up||0)+(c.down||0),rate=dec?Math.round(c.up*100/dec)+"%":"—";
+  const top=$("div","tsum");top.append($("b","",j.name)," · 统计区间 "+j.range+"（北京时间，只算已经结束的场次）");el.append(top);
+  const line=$("p","small","");line.append("已结束 "+c.total+" 场：",$("b","tcu","涨 "+c.up+" 局")," · ",$("b","tcd","跌 "+c.down+" 局")," · 平或待定 "+c.flat+" 局"+(c.missing?" · 没数据 "+c.missing+" 局":"")+" · 涨占 "+rate);el.append(line);
+  const st=j.streaks||{},run=(x,w)=>x&&x.n?w+" "+x.n+" 局（"+tallyAt(x.from,j)+"–"+tallyAt(x.to,j)+"）":w+" —";
+  el.append($("p","small mut",run(st.up,"最长连涨")+" · "+run(st.down,"最长连跌")));
+  const ck=j.checks||{},bad=ck.bad||[];
+  el.append($("p","small mut",ck.n?"与 Predict 官方结果核对 "+ck.n+" 场：一致 "+ck.agree+(bad.length?" · 不一致 "+bad.length+" 场（"+bad.slice(0,5).map(b=>tallyAt(b.s,j)+" K 线"+tallyWord(b.r)+"、官方"+tallyWord(b.o)).join("；")+(bad.length>5?"…":"")+"）":""):"这段时间没有能核对的官方结果（只有预挂有成交、原策略交易过的场次有）"));
+  if((j.errors||[]).length)el.append($("p","small mut","有一部分 K 线没读到（"+j.errors[0]+"），那些场次记没数据，稍后再看"));
+  el.append(tallyDots(j));
+  const lg=$("p","small mut tlegend","");[["u","涨"],["d","跌"],["f","平或待定"],["x","没数据"]].forEach(([k,w])=>lg.append($("span","tdot "+k),w));lg.append($("span","tdot u bad"),"和官方结果不一致");el.append(lg);
+  if((j.hours||[]).length>1)el.append($("div","sub",j.from!==j.to?"按小时（北京时间，几天里同一小时合在一起）":"按小时（北京时间）"),
+    table(["开始","涨","跌","平或待定","没数据","涨占比"],j.hours.map(h=>{const n=h.up+h.down;return [String(h.h).padStart(2,"0")+":00",h.up,h.down,h.flat||"—",h.missing||"—",n?Math.round(h.up*100/n)+"%":"—"]})));
+  el.append($("p","small mut","数据：币安"+(j.source||"").replace("币安","")+"；"+(j.tie?"开始和结束相差不到 "+(j.tie*100).toFixed(2)+"% 记平或待定":"只有完全相同才记平")));
+  document.getElementById("tallysum").textContent=j.name+" 涨 "+c.up+" · 跌 "+c.down+(c.flat?" · 平 "+c.flat:"")}
+async function tallyLoad(tries){const my=++tallySeq,el=document.getElementById("tally");if(!tries)el.replaceChildren($("p","small mut","读取中…"));
+  const q=tallyRng?"&range="+tallyRng:"&from="+tallyFrom+"&to="+tallyTo;
+  try{const key=ctlKey();const r=await fetch(base+"/journal.json?tally="+encodeURIComponent(tallyKey)+q,{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
+    if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();if(my!==tallySeq)return;
+    const sel=document.getElementById("tcard");if(!sel.options.length)(j.cards||[]).forEach(c=>{const o=document.createElement("option");o.value=c.key;o.textContent=c.name;sel.append(o)});
+    sel.value=j.key;tallyKey=j.key;document.getElementById("tfrom").value=j.from;document.getElementById("tto").value=j.to;document.getElementById("tto").max=j.today;document.getElementById("tfrom").max=j.today;
+    if(!j.ready){el.replaceChildren($("p","small mut",j.message||"读取中…"));if((tries||0)<40)setTimeout(()=>{if(my===tallySeq)tallyLoad((tries||0)+1)},1000);return}
+    tallyRender(j)}
+  catch(e){if(my===tallySeq)el.replaceChildren($("p","small mut","读取失败："+(e.message||e)))}}
+document.getElementById("tcard").addEventListener("change",e=>{tallyKey=e.target.value;try{localStorage.setItem("jrntallykey",tallyKey)}catch(err){}tallyLoad(0)});
+document.querySelectorAll("#tallybody .tq").forEach(b=>b.addEventListener("click",()=>{tallyRng=b.dataset.r;tallyLoad(0)}));
+document.getElementById("tgo").addEventListener("click",()=>{const f=document.getElementById("tfrom").value,t=document.getElementById("tto").value;if(!f)return;tallyRng="";tallyFrom=f;tallyTo=t||f;tallyLoad(0)});
+document.getElementById("tallyhd").addEventListener("click",()=>{tallyOpen=!tallyOpen;try{localStorage.setItem("jrntally",tallyOpen?"1":"0")}catch(e){}
+  document.getElementById("tallybody").hidden=!tallyOpen;document.getElementById("foldtally").textContent=tallyOpen?"收起":"展开";if(tallyOpen&&!document.querySelector("#tally .tdots"))tallyLoad(0)});
+document.getElementById("tallybody").hidden=!tallyOpen;document.getElementById("foldtally").textContent=tallyOpen?"收起":"展开";
+if(tallyOpen)tallyLoad(0);
 load();setInterval(load,60000);
 </script></body></html>"""
 
@@ -13677,6 +13819,10 @@ class WebServer:
             if row is None:
                 return 404, ctype, json.dumps({"ok": False, "message": "没有这笔记录"}, ensure_ascii=False).encode("utf-8")
             return 200, ctype, json.dumps({"version": VERSION, "trade": row}, ensure_ascii=False, default=str).encode("utf-8")
+        if (params.get("tally") or [""])[0].strip():  # 1.143.0: 市场涨跌统计 — not cached: it turns ready within seconds of the candles' read
+            arg = lambda key: (params.get(key) or [""])[0].strip()
+            payload = self.bot.tally_payload(arg("tally"), arg("from"), arg("to"), arg("range"))
+            return 200, ctype, json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
         if flag("analysis"):  # the daily summary and the analysis over the page's filter (1.107.0)
             flt = journal_filter_of(params)
             name = "journal.json?analysis" + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
@@ -14550,6 +14696,11 @@ class Bot:
         self.sim_pruned_at = -1e9                # monotonic time of the last sim_prune
         self.sim_ev_checked = -1e9               # monotonic time of the last EV check (sim_ev_check, 1.140.0)
         self.sim_seq = 0                         # the model trader's notices (sim_notify), one delivery key each
+        self.tally_cache: dict[tuple, tuple[float, dict[int, float]]] = {}  # (spot | index, pair, chunk) -> (monotonic read, open ms -> close): 市场涨跌统计 (1.143.0)
+        self.tally_tasks: dict[tuple, asyncio.Task] = {}  # ...the chunks being read
+        self.tally_failed: dict[tuple, float] = {}  # ...when a chunk's read last failed (TALLY_RETRY_S), and why
+        self.tally_errors: dict[tuple, str] = {}
+        self.tally_gate = asyncio.Semaphore(3)  # ...three reads at a time
         self.sim_report_cache: dict[tuple, dict] = {}  # the last sim_report per arguments, while the records stand
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
         self.reference_pool: ThreadPoolExecutor | None = None
@@ -19700,6 +19851,126 @@ class Bot:
             async def send(sub: dict = sub, text: str = text) -> None:
                 await self.tell(sub["chat"], sub["thread"], text)
             self.deliver(f"sim:{self.sim_seq}:{sub_id}", send)
+
+    def tally_payload(self, key: str, frm: str = "", to: str = "", rng: str = "") -> dict:
+        """journal.json?tally=<card>&from=<date>&to=<date> (or &range=today | yesterday | 7d) — the review page's 市场涨跌统计
+        (1.143.0): every window of the card that started on those days (Beijing) and is over, up or down by Binance's 1-minute
+        candles (tally_rows: the bot's own pre-settlement), with the counts, the longest runs, the hours, Predict's own result
+        where the bot holds one (tally_official) and the time the figures cover. Past days as well as today (Binance keeps
+        the candles), TALLY_MAX_DAYS at most. The candles come from a background read (tally_fetch) the first time: "ready"
+        false until then — the page asks again a second on."""
+        now_ms = self.market.now_ms()
+        card = tally_card(key) or tally_card("BTC-5M") or preopen_cards()[0]
+        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+        try:
+            d0 = dt.date.fromisoformat(frm[:10]) if frm else today
+            d1 = dt.date.fromisoformat(to[:10]) if to else d0
+        except ValueError:
+            d0 = d1 = today
+        if rng in {"today", "yesterday", "7d"}:
+            d1 = today - dt.timedelta(days=1) if rng == "yesterday" else today
+            d0 = d1 - dt.timedelta(days=6) if rng == "7d" else d1
+        d1 = min(d1, today)
+        d0 = min(d0, d1)
+        if (d1 - d0).days >= TALLY_MAX_DAYS:
+            d0 = d1 - dt.timedelta(days=TALLY_MAX_DAYS - 1)
+        day_ms = lambda d: int(dt.datetime(d.year, d.month, d.day, tzinfo=BEIJING).timestamp() * 1000)
+        from_ms, to_ms = day_ms(d0), day_ms(d1 + dt.timedelta(days=1))
+        holidays = self.config.holidays.get(card.exchange, frozenset()) if card.exchange else frozenset()
+        windows = tally_windows(card, from_ms, to_ms, now_ms, holidays)
+        source, symbol = tally_source(card)
+        needed = sorted({ms // TALLY_CHUNK_MS * TALLY_CHUNK_MS for w in windows for ms in w[2:]})
+        closes: dict[int, float] = {}
+        unread, stale = [], []
+        for chunk in needed:
+            entry = self.tally_cache.get((source, symbol, chunk))
+            if entry is None:
+                unread.append(chunk)
+                continue
+            closes.update(entry[1])
+            if chunk + TALLY_CHUNK_MS > now_ms - 120_000 and time.monotonic() - entry[0] >= TALLY_FRESH_S:
+                stale.append(chunk)  # still filling: read again in the background, shown as it stands meanwhile
+        self.tally_fetch(source, symbol, unread + stale)
+        errors = sorted({self.tally_errors[(source, symbol, c)] for c in needed if (source, symbol, c) in self.tally_errors})
+        waiting = [c for c in unread if (source, symbol, c) not in self.tally_errors]
+        base = {"version": VERSION, "key": card.key, "name": tally_name(card), "from": d0.isoformat(), "to": d1.isoformat(), "today": today.isoformat(),
+                "cycle_ms": card.cycle_ms, "cards": [{"key": c.key, "name": tally_name(c)} for c in preopen_cards()]}
+        if waiting:
+            return {**base, "ready": False, "message": f"正在读币安 1 分钟 K 线（{len(waiting)} 段，每段 1000 分钟）…"}
+        rows = tally_rows(windows, closes, tally_tie(card))
+        summary = tally_summary(rows, self.tally_official(card, {w[0] for w in windows}))
+        at = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING)
+        if not rows:
+            label = f"{d0:%m-%d}" + (f" 到 {d1:%m-%d}" if d1 != d0 else "") + " 还没有结束的场次"
+        elif at(rows[0]["s"]).date() == at(rows[-1]["e"]).date():
+            label = f"{at(rows[0]['s']):%m-%d %H:%M}–{at(rows[-1]['e']):%H:%M}"
+        else:
+            label = f"{at(rows[0]['s']):%m-%d %H:%M} 到 {at(rows[-1]['e']):%m-%d %H:%M}"
+        return {**base, "ready": True, "range": label, "windows": rows, **summary, "errors": errors[:3], "tie": tally_tie(card),
+                "source": "币安现货 1 分钟 K 线" if source == "spot" else "币安合约指数 1 分钟 K 线"}
+
+    def tally_fetch(self, source: str, symbol: str, chunks: list[int]) -> None:
+        """The candle chunks read in the background, three at a time (tally_gate): one not read yet, one still filling; one
+        whose read failed waits TALLY_RETRY_S. Nothing without a running loop."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        for chunk in chunks:
+            k = (source, symbol, chunk)
+            task = self.tally_tasks.get(k)
+            if task is not None and not task.done():
+                continue
+            if time.monotonic() - self.tally_failed.get(k, -1e9) < TALLY_RETRY_S:
+                continue
+            self.tally_tasks[k] = loop.create_task(self.tally_read(k), name=f"tally:{symbol}:{chunk}")
+        self.tally_tasks = {k: t for k, t in self.tally_tasks.items() if not t.done()}
+
+    async def tally_read(self, k: tuple) -> None:
+        """One chunk of 1,000 one-minute candles from its start: Binance spot's klines, or futures' indexPriceKlines; the
+        closed candles' closes kept (the oldest chunks dropped past TALLY_KEEP_CHUNKS)."""
+        source, symbol, chunk = k
+        async with self.tally_gate:
+            try:
+                if source == "index":
+                    rows = await self.binance_futures("indexPriceKlines", pair=symbol, interval="1m", startTime=chunk, limit=1000)
+                else:
+                    rows = await binance_spot("klines", symbol=symbol, interval="1m", startTime=chunk, limit=1000)
+            except Exception as error:
+                self.tally_failed[k] = time.monotonic()
+                self.tally_errors[k] = f"读币安 K 线失败：{clean_error(error) or type(error).__name__}"
+                return
+        now_ms = self.market.now_ms()
+        closes = {}
+        for r in rows or []:
+            with contextlib.suppress(TypeError, ValueError, IndexError):
+                if chunk <= int(r[0]) < chunk + TALLY_CHUNK_MS and int(r[6]) < now_ms:
+                    closes[int(r[0])] = float(r[4])
+        self.tally_cache.pop(k, None)
+        self.tally_cache[k] = (time.monotonic(), closes)
+        self.tally_failed.pop(k, None)
+        self.tally_errors.pop(k, None)
+        while len(self.tally_cache) > TALLY_KEEP_CHUNKS:
+            self.tally_cache.pop(next(iter(self.tally_cache)))
+
+    def tally_official(self, card: Any, starts: set) -> dict[int, str]:
+        """Window start -> Predict's own result ("u" / "d" / "s": 50-50) where the bot holds it: the pre-open mode's settled
+        windows (its ledger keeps the result) and the model trader's records Predict confirmed or corrected."""
+        from preopen import window_of
+        out: dict[int, str] = {}
+        for pair in self.preopen_rows():
+            start = card.start_of(window_of(pair))
+            if start in starts and pair.get("result") in {"up", "down", "split"}:
+                out[start] = {"up": "u", "down": "d", "split": "s"}[pair["result"]]
+        for t in self.sim_trades().values():
+            if t.get("status") != "settled" or t.get("confirm") not in {"confirmed", "mismatch"}:
+                continue
+            start = card.start_of(str(t.get("slug") or ""))
+            if start not in starts or start in out:
+                continue
+            payout = float(t.get("payout") or 0)
+            out[start] = "s" if 0 < payout < 1 else "u" if (payout >= 1) == (str(t.get("side") or "") == "up") else "d"
+        return out
 
     def summary_rows(self, values: list[dict], marks: Mapping, flt: Mapping | None = None) -> list[dict]:
         """The daily summary (sim_summary) with the pre-open mode's quotes counted in (merge_preopen_summary) when the page
