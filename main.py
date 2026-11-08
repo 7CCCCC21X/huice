@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.145.0"
+VERSION = "1.145.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -8454,6 +8454,8 @@ class IndexUpDownMarket(UpDownMarket):
     TIE = D("0.0005")            # an end this close to the start (relative) is left to Predict: Chainlink's report may differ
 
     SIGMA_ROWS = 1500            # candles read for σ when the trading minutes are a subset (the previous session's reach back a day)
+    SIGMA_BACK_DAYS = 10         # ...and when those hold too few of them (a Monday, the day after a holiday), the sessions before are
+    #                              looked for this far back (1.145.1: China's golden week closes the Shanghai market nine days)
 
     VENUE = "futures"            # the Binance venue the price comes from (Bot: the mark price stream's index / the spot trades)
     WORD = "指数"                 # the price, as the card's messages name it (指数价 / 现货价)
@@ -8483,6 +8485,7 @@ class IndexUpDownMarket(UpDownMarket):
         self.shape_ms = 0         # when it was last read, or last tried (SHAPE_SECONDS / SHAPE_RETRY_SECONDS)
         self.shape_factor = 1.0   # the shape's factor in the σ in hand (minute_vol_shaped)
         self.shape_error = ""     # why the last read of the shape failed (the one in hand stands)
+        self.sigma_back: tuple[tuple[int, int], list] | None = None  # (first, last) open of the earlier sessions' minutes σ reads, their candles (sigma_rows, 1.145.1)
         self.index_ms = 0  # the newest index's own time (the push's event time, the read's)
         self.lead: IndexQuote | None = None  # the exchange's realtime quote now (Bot.refresh_updown: note_lead), None when it has none
         self.strike: D | None = None  # the start price Predict shows for the window (Bot.refresh_updown): the line when it agrees with the candle (line_used)
@@ -8577,8 +8580,10 @@ class IndexUpDownMarket(UpDownMarket):
         return self.carry(IndexUpDownMarket(self.store, spec, self.futures, self.exchange, self.trading, self.shape))
 
     def carry(self, mkt: "IndexUpDownMarket") -> "IndexUpDownMarket":
-        """The next window's market with this one's shape of the day and when it was read (one read an hour, not one a window)."""
+        """The next window's market with this one's shape of the day and when it was read (one read an hour, not one a window),
+        and the earlier sessions' candles σ reads on a Monday morning (history: read once, not once a window)."""
         mkt.shape_ms = self.shape_ms
+        mkt.sigma_back = self.sigma_back
         return mkt
 
     def shape_tz(self) -> dt.tzinfo:
@@ -8670,10 +8675,47 @@ class IndexUpDownMarket(UpDownMarket):
         previous session. 1.121.0: the level they show is put on the shape of the day (read_shape, minute_vol_shaped)."""
         if self.shape is None or now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:
             await self.read_shape(now_ms)  # the usual volatility of the window's quarter hour, which the level below is put on
-        rows = await self.candles("1m", self.SIGMA_ROWS if self.trading else self.SIGMA_MINUTES + 2)
+        rows = await self.sigma_rows()
         self.sigma, self.shape_factor = minute_vol_shaped(rows, now_ms, self.SIGMA_MINUTES, self.trading, shape=self.shape,
                                                           at_ms=self.spec.start_ms + 60_000)
         self.sigma_ms = now_ms
+
+    async def sigma_rows(self) -> list:
+        """The 1-minute candles σ is read from. Round the clock: the last SIGMA_MINUTES + 2. Following a session: the last
+        SIGMA_ROWS — a day back, yesterday's session in it — and, when a full page of them holds fewer than SIGMA_MINUTES of
+        the session's minutes (a Monday: the day back is the weekend; the day after a holiday), the last SIGMA_MINUTES + 1
+        minutes of the sessions before, read once and kept (history: sigma_back), so the open is priced as any other day's
+        is: the last four hours of trading, yesterday's tail in them, the open's own minutes as a floor from its tenth.
+        Until 1.145.1 such a morning had no σ until MINUTE_VOL_MIN minutes of its own session were in (指数 1 分钟 K 线不足):
+        each session card's first two windows of the week unpriced. A short page (an index with no older history) stands."""
+        if not self.trading:
+            return await self.candles("1m", self.SIGMA_MINUTES + 2)
+        rows = [r for r in await self.candles("1m", self.SIGMA_ROWS) or [] if isinstance(r, list) and len(r) > 6]
+        if len(rows) < self.SIGMA_ROWS or sum(1 for r in rows if self.trading(int(r[0]))) >= self.SIGMA_MINUTES:
+            return rows
+        oldest = int(rows[0][0])
+        block = self.sigma_block(oldest)
+        if block is None:
+            return rows
+        if self.sigma_back is None or self.sigma_back[0] != block:
+            first, last = block
+            older = await self.get("indexPriceKlines", pair=self.spec.symbol, interval="1m", endTime=last + 59_999,
+                                   limit=min(self.SIGMA_ROWS, (last - first) // 60_000 + 1))
+            self.sigma_back = (block, [r for r in older or [] if isinstance(r, list) and len(r) > 6])
+        return [r for r in self.sigma_back[1] if int(r[0]) < oldest] + rows
+
+    def sigma_block(self, before_ms: int) -> tuple[int, int] | None:
+        """(first, last) open time of the last SIGMA_MINUTES + 1 session minutes before ``before_ms`` — the sessions before a
+        weekend or a holiday — within SIGMA_BACK_DAYS; fewer there: those; none: None."""
+        first = last = None
+        found, minute = 0, before_ms // 60_000 * 60_000 - 60_000
+        floor = before_ms - self.SIGMA_BACK_DAYS * DAY_MS
+        while minute >= floor and found <= self.SIGMA_MINUTES:
+            if self.trading(minute):
+                last = minute if last is None else last
+                first, found = minute, found + 1
+            minute -= 60_000
+        return (first, last) if found else None
 
     def odds(self, now_ms: int) -> UpDownOdds | str:
         spec = self.spec
