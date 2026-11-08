@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.144.1"
+VERSION = "1.144.2"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -425,7 +425,7 @@ def parse_ws_urls(spec: str, name: str) -> tuple[str, ...]:
                 url = url[:-len(tail)].rstrip("/")
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme not in ("wss", "ws") or not parsed.netloc or parsed.username or parsed.query or parsed.fragment:
-            raise ValueError(f"{name} 应为逗号分隔的 wss:// 地址（不带账号、查询参数），如 wss://fstream.binance.com")
+            raise ValueError(f"{name} 应为逗号分隔的 wss:// 地址（不带账号、查询参数），如 wss://fstream.binance.com/market")
         out.append(url)
     return tuple(out)
 
@@ -742,7 +742,7 @@ class Config:
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
     hl_refresh: int = 10  # HL_REFRESH_SECONDS: how often the Hyperliquid quotes (the KR200 after-hours proxy among them) are read
     binance_ws: bool = True  # BINANCE_WS: Binance's trade streams beside the REST reads (BinanceStream: the contracts, the crypto cards' pairs); off = REST only
-    binance_ws_url: tuple[str, ...] = ()  # BINANCE_WS_URL: the futures stream's server(s) in place of wss://fstream.binance.com (a relay, another host)
+    binance_ws_url: tuple[str, ...] = ()  # BINANCE_WS_URL: the futures stream's server(s) in place of wss://fstream.binance.com/market (a relay, another host)
     hl_ws: bool = True       # HL_WS: Hyperliquid's context stream beside the REST reads (HyperliquidStream); off = REST only
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
@@ -6424,7 +6424,22 @@ class PredictStream:
 
 
 # --- Binance's and Hyperliquid's streams: the prices pushed as they trade (1.87.0) ----------------------------------------
-BINANCE_WS_FUTURES = ("wss://fstream.binance.com",)
+# 1.144.2: Binance split the USDⓈ-M futures streams by path and retired the bare /ws and /stream on 2026-04-23 — a connection
+# without a routed path is sent the /public feeds alone (book tickers, depth): markPrice and aggTrade come on /market only.
+# The bot kept connecting to wss://fstream.binance.com/ws, had its SUBSCRIBE acknowledged and never heard a price (/diag: 合约
+# 推送 "连上了却没有行情", read as a region Binance does not serve) — every contract was priced by REST meanwhile.
+BINANCE_WS_FUTURES = ("wss://fstream.binance.com/market",)
+BINANCE_FUTURES_WS_HOST = "fstream.binance.com"
+
+
+def binance_futures_route(url: str) -> str:
+    """A futures stream root as Binance routes it since 2026-04-23: Binance's own host without a path goes to /market (where
+    markPrice and aggTrade are pushed); a routed path, another host (a relay) stay as written."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.hostname == BINANCE_FUTURES_WS_HOST and parsed.path in ("", "/"):
+        return url.rstrip("/") + "/market"
+    return url
+
 BINANCE_WS_SPOT = ("wss://data-stream.binance.vision", "wss://stream.binance.com:9443")  # market data only; the next host after a failure
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 PRICE_WS_BACKOFF = (2.0, 300.0)  # the wait before a new connection: doubled per failure within these bounds
@@ -6686,8 +6701,8 @@ class BinanceStream(PushStream):
 
     def bases(self) -> tuple[str, ...]:
         """The servers tried in turn (roots: the endpoint is appended)."""
-        if self.venue == "futures":
-            return tuple(getattr(self.bot.config, "binance_ws_url", ()) or ()) or BINANCE_WS_FUTURES
+        if self.venue == "futures":  # 1.144.2: Binance's own host routed to /market (binance_futures_route)
+            return tuple(dict.fromkeys(binance_futures_route(u) for u in (tuple(getattr(self.bot.config, "binance_ws_url", ()) or ()) or BINANCE_WS_FUTURES)))
         return BINANCE_WS_SPOT
 
     def urls(self) -> list[str]:
@@ -6818,7 +6833,8 @@ class BinanceStream(PushStream):
         mute = ((self.connected and self.pushed == 0 and now - self.connected_at >= 30)
                 or (not self.connected and self.connects > 0 and self.last_session[2] == 0 and self.last_session[0] >= 30))
         if mute and self.venue == "futures":  # (1.104.1: a Railway host connected, subscribed and heard nothing, five times over)
-            text += "；连上了却没有行情：币安合约推送可能不对这个部署地区开放（REST 正常）——合约报价照旧按 REST 采样，15 分钟指数价窗口前后每秒读一次"
+            text += ("；连上了却没有行情：2026-04-23 起币安合约的 markPrice、aggTrade 只从 /market 路径推送（自定义 BINANCE_WS_URL 时核对路径），"
+                     "路径对了仍没有就是这个部署地区收不到推送（REST 正常）——合约报价照旧按 REST 采样，15 分钟指数价窗口前后每秒读一次")
         return text
 
     def rows(self, symbols: Any) -> dict[str, dict] | None:
@@ -8634,9 +8650,10 @@ class IndexUpDownMarket(UpDownMarket):
 
     def cadence(self, now_ms: int) -> tuple[int, int]:
         """(seconds between index reads, between σ reads): the near ones from WINDOW_LEAD_MS before the window, the idle ones
-        otherwise. A push every second (markPrice@1s) defers the index read; where the futures stream is mute (a region
-        Binance does not serve it in: it connects and sends nothing) the read is what prices the card — and, like a push,
-        wakes the express lane when it moves the index (Bot.refresh_updown)."""
+        otherwise. A push every second (markPrice@1s) defers the index read; where the futures stream is mute (it connects
+        and sends nothing: the bare /ws Binance retired on 2026-04-23 — 1.144.2 connects to /market — or a region it does
+        not serve) the read is what prices the card — and, like a push, wakes the express lane when it moves the index
+        (Bot.refresh_updown)."""
         near = now_ms >= self.spec.start_ms + 60_000 - WINDOW_LEAD_MS
         return (self.PRICE_SECONDS, self.VOL_SECONDS) if near else (self.PRICE_IDLE_SECONDS, self.VOL_IDLE_SECONDS)
 

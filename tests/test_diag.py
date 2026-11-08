@@ -65,7 +65,7 @@ async def run():
     assert groups == {"币安", "币安推送", "交易所收盘·UNITREE", "上证实时", "上证日K", "A50实时", "A50锚点", "Hyperliquid", "汇率", "Predict"}, groups  # 1.112.3: no 美股触及 group, no US stock card listed
     # the stream probes (1.89.2): the futures server in use, spot's main host, spot's data host; offline no connection is made
     streams = [r for r in results if r.group == "币安推送"]
-    assert [r.name for r in streams] == ["合约 fstream.binance.com", "现货主站 stream.binance.com", "现货数据站 data-stream.binance.vision"], [r.name for r in streams]
+    assert [r.name for r in streams] == ["合约 fstream.binance.com/market", "现货主站 stream.binance.com", "现货数据站 data-stream.binance.vision"], [r.name for r in streams]
     assert all(not r.ok and r.detail.startswith("请求失败：") for r in streams), streams
     gql = by[("Predict", "GraphQL")]  # Predict itself is probed (1.61.0): offline it fails like any other request; no book yet, so no orderbook probe
     assert not gql.ok and gql.detail.startswith("请求失败：") and ("Predict", "REST") not in by, gql

@@ -62,7 +62,7 @@ async def run():
     assert market.stream is fut and fut.enabled and spot.enabled and hl.enabled
     # what each connection subscribes to: the contract with its mark price and HYPE's ladder on futures, the crypto cards' pairs on spot
     assert fut.symbols() == ["UNITREEUSDT", "HYPEUSDT"], fut.symbols()
-    assert fut.urls() == ["wss://fstream.binance.com/ws", "wss://fstream.binance.com/stream?streams=unitreeusdt@aggTrade/hypeusdt@aggTrade/unitreeusdt@markPrice@1s/hypeusdt@markPrice@1s"]
+    assert fut.urls() == ["wss://fstream.binance.com/market/ws", "wss://fstream.binance.com/market/stream?streams=unitreeusdt@aggTrade/hypeusdt@aggTrade/unitreeusdt@markPrice@1s/hypeusdt@markPrice@1s"]
     assert spot.symbols() == ["BNBUSDT", "SOLUSDT", "BTCUSDT", "ETHUSDT", "ZECUSDT"], spot.symbols()
     assert len(spot.urls()) == 4 and spot.urls()[0] == "wss://data-stream.binance.vision/stream?streams=bnbusdt@aggTrade/solusdt@aggTrade/btcusdt@aggTrade/ethusdt@aggTrade/zecusdt@aggTrade" \
         and spot.urls()[1].startswith("wss://stream.binance.com:9443/stream?streams=") and spot.urls()[2:] == ["wss://data-stream.binance.vision/ws", "wss://stream.binance.com:9443/ws"]
@@ -90,9 +90,9 @@ async def run():
     # futures is on the raw endpoint: the streams are subscribed once connected, then the server is asked which it registered;
     # spot is on the combined endpoint (the names in the address): asked at once. The answers are no price and not dropped (1.89.0)
     names4 = ["unitreeusdt@aggTrade", "hypeusdt@aggTrade", "unitreeusdt@markPrice@1s", "hypeusdt@markPrice@1s"]
-    assert fut.NAME == "币安合约推送" and spot.NAME == "币安现货推送" and fut.url == "wss://fstream.binance.com/ws" and wsf.sent == [{"method": "SUBSCRIBE", "params": names4, "id": 1}] \
+    assert fut.NAME == "币安合约推送" and spot.NAME == "币安现货推送" and fut.url == "wss://fstream.binance.com/market/ws" and wsf.sent == [{"method": "SUBSCRIBE", "params": names4, "id": 1}] \
         and wss.sent == [{"method": "LIST_SUBSCRIPTIONS", "id": 1}], (wsf.sent, wss.sent)
-    assert fut.registered is None and "wss://fstream.binance.com/ws）" in fut.line() and "订阅清单未回；最近推送：HYPEUSDT 从未、UNITREEUSDT 从未" in fut.line(), fut.line()
+    assert fut.registered is None and "wss://fstream.binance.com/market/ws）" in fut.line() and "订阅清单未回；最近推送：HYPEUSDT 从未、UNITREEUSDT 从未" in fut.line(), fut.line()
     wsf.push({"result": None, "id": 1})
     await asyncio.sleep(0.02)
     assert wsf.sent[1] == {"method": "LIST_SUBSCRIPTIONS", "id": 2} and fut.registered is None
@@ -209,7 +209,7 @@ async def run():
     await asyncio.sleep(0.02)
     assert not fut.connected and fut.rows(["UNITREEUSDT"]) is None
     line = fut.line()
-    assert __import__("re").search(r"^未连接（上次断开：gone；上次连接 wss://fstream.binance.com/ws \d 秒、收到 \d+ 帧、4 次行情；0 秒后重连）；丢弃 3 帧；"
+    assert __import__("re").search(r"^未连接（上次断开：gone；上次连接 wss://fstream.binance.com/market/ws \d 秒、收到 \d+ 帧、4 次行情；0 秒后重连）；丢弃 3 帧；"
                                    r"上次清单：服务器登记 4/4 个流（第 1 次连接）；最近推送：", line), line
     calls = market.calls
     await market.prices()
@@ -218,7 +218,7 @@ async def run():
     assert fut.connected and fut.connects == 2 and "gone" in fut.closed_why and fut.backoff == 0.05 and fut.host_index == 0, "it delivered: the same address again"
     m.PRICE_WS_STEADY_SECONDS = 0.0
     wsf2 = conns[-1]
-    assert wsf2 is not wsf and wsf2.url == "wss://fstream.binance.com/ws" and wsf2.sent == [{"method": "SUBSCRIBE", "params": names4, "id": 3}] \
+    assert wsf2 is not wsf and wsf2.url == "wss://fstream.binance.com/market/ws" and wsf2.sent == [{"method": "SUBSCRIBE", "params": names4, "id": 3}] \
         and fut.asked == {3: "SUBSCRIBE"} and "订阅清单未回（第 1 次连接时服务器登记 4/4 个流）" in fut.line(), (wsf2.sent, fut.line())
     # the raw endpoint's payloads come bare
     wsf2.push({"e": "aggTrade", "E": NOW + 40, "s": "UNITREEUSDT", "p": "71.5", "T": NOW + 40})
@@ -262,7 +262,7 @@ async def run():
         ws = FakeWs(url); mconns.append(ws); return ws
     mute.connect, mute.backoff = mconnect, 0.04
     stop3 = asyncio.Event(); run3 = asyncio.create_task(mute.run(stop3)); await asyncio.sleep(0.05)
-    assert mconns[0].url == "wss://fstream.binance.com/ws" and mconns[0].sent[0]["method"] == "SUBSCRIBE"
+    assert mconns[0].url == "wss://fstream.binance.com/market/ws" and mconns[0].sent[0]["method"] == "SUBSCRIBE"
     mconns[0].push({"stream": "unitreeusdt@markPrice@1s", "data": {"e": "markPriceUpdate", "E": NOW, "s": "UNITREEUSDT", "p": "70.7"}})
     mconns[0].push(ConnectionError("gone"))
     await asyncio.sleep(0.1)
@@ -271,17 +271,23 @@ async def run():
     await asyncio.sleep(0.1)
     assert mute.backoff == 0.02 and len(mconns) == 3 and mute.last_session[1:] == (0, 0), (mute.backoff, len(mconns))
     # a mute connection moves to the next address: the combined endpoint, the names in the address, the list asked at once
-    assert mconns[2].url.startswith("wss://fstream.binance.com/stream?streams=unitreeusdt@aggTrade/") and mconns[2].sent == [{"method": "LIST_SUBSCRIPTIONS", "id": mute.request_id}], mconns[2].sent
+    assert mconns[2].url.startswith("wss://fstream.binance.com/market/stream?streams=unitreeusdt@aggTrade/") and mconns[2].sent == [{"method": "LIST_SUBSCRIPTIONS", "id": mute.request_id}], mconns[2].sent
     mconns[2].push(ConnectionError("gone"))
     await asyncio.sleep(0.1)
-    assert len(mconns) == 4 and mconns[3].url == "wss://fstream.binance.com/ws", "round again"
+    assert len(mconns) == 4 and mconns[3].url == "wss://fstream.binance.com/market/ws", "round again"
     stop3.set(); await asyncio.wait_for(run3, 2)
     # BINANCE_WS_URL: the futures stream's address(es), the query appended; the spot addresses stay
     relay = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BINANCE_WS_URL": " wss://relay.example/stream/ , wss://fstream.binance.com/ws, ws://10.0.0.5:8080/relay"})
     assert relay.binance_ws_url == ("wss://relay.example", "wss://fstream.binance.com", "ws://10.0.0.5:8080/relay")
+    # 1.144.2: Binance's own host without a path is routed to /market (markPrice, aggTrade since 2026-04-23); a routed path, a relay stay
+    assert [m.binance_futures_route(u) for u in ("wss://fstream.binance.com", "wss://fstream.binance.com/", "wss://fstream.binance.com:443",
+                                                  "wss://fstream.binance.com/market", "wss://fstream.binance.com/public", "wss://relay.example", "ws://10.0.0.5:8080/relay")] == [
+        "wss://fstream.binance.com/market", "wss://fstream.binance.com/market", "wss://fstream.binance.com:443/market",
+        "wss://fstream.binance.com/market", "wss://fstream.binance.com/public", "wss://relay.example", "ws://10.0.0.5:8080/relay"]
+    assert m.BINANCE_WS_FUTURES == ("wss://fstream.binance.com/market",)
     rbot = m.Bot(relay, m.Store(":memory:"), FakeMarket(relay), None)
     rurls = rbot.binance_streams["futures"].urls()
-    assert rurls[:3] == ["wss://relay.example/ws", "wss://fstream.binance.com/ws", "ws://10.0.0.5:8080/relay/ws"] and len(rurls) == 6 \
+    assert rurls[:3] == ["wss://relay.example/ws", "wss://fstream.binance.com/market/ws", "ws://10.0.0.5:8080/relay/ws"] and len(rurls) == 6 \
         and rurls[3].startswith("wss://relay.example/stream?streams=unitreeusdt@aggTrade/") and rurls[5].startswith("ws://10.0.0.5:8080/relay/stream?streams=") \
         and rbot.binance_streams["spot"].urls()[0].startswith("wss://data-stream.binance.vision/"), rurls
     assert cfg.binance_ws_url == () and fut.bases() == m.BINANCE_WS_FUTURES
@@ -323,8 +329,8 @@ async def run():
     except m.RemoteError as error:
         assert str(error).endswith("无答复，0 秒内收到 0 帧、没有任何行情"), error
     probes = [p for p in bot.diag_probes(NOW) if p[0] == "币安推送"]
-    assert [p[1] for p in probes] == ["合约 fstream.binance.com", "现货主站 stream.binance.com", "现货数据站 data-stream.binance.vision"] and all(p[3] is m.stream_probe_detail for p in probes)
-    assert [p[1] for p in rbot.diag_probes(NOW) if p[0] == "币安推送"][:3] == ["合约 relay.example", "合约 fstream.binance.com", "合约 10.0.0.5:8080/relay"]
+    assert [p[1] for p in probes] == ["合约 fstream.binance.com/market", "现货主站 stream.binance.com", "现货数据站 data-stream.binance.vision"] and all(p[3] is m.stream_probe_detail for p in probes)
+    assert [p[1] for p in rbot.diag_probes(NOW) if p[0] == "币安推送"][:3] == ["合约 relay.example", "合约 fstream.binance.com/market", "合约 10.0.0.5:8080/relay"]
     assert not [p for p in obot.diag_probes(NOW) if p[0] == "币安推送"], "BINANCE_WS=off: no stream probe"
     # a bot without the streams' attributes (the tests' stubs) still samples: prices() reads REST
     bare = FakeMarket(on)
