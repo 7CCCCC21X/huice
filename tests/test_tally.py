@@ -39,14 +39,22 @@ def close_at(open_ms: int, base: float = 100.0) -> float:
     return BOUNDS[k] if not rest and 0 <= k < len(BOUNDS) else base
 
 
-def candles(start: int, limit: int, now: int) -> list:
+def close_near(open_ms: int) -> float:
+    """BNB's candles (1.144.1): the day's boundaries 600.00 and 600.03 in turn — every window up or down by 0.005%, inside the
+    0.01% band (a close call each), the other closes 600."""
+    end = open_ms + 60_000
+    k, rest = divmod(end - DAY0, 300_000)
+    return 600.0 + 0.03 * (k % 2) if not rest and 0 <= k <= 120 else 600.0
+
+
+def candles(start: int, limit: int, now: int, close=close_at) -> list:
     """Binance's answer: the candles from ``start``, the one still open included (its close time ahead of now)."""
     out = []
     for i in range(limit):
         o = start + i * 60_000
         if o > now:
             break
-        out.append([o, "0", "0", "0", str(close_at(o)), "0", o + 59_999, "0", 0, "0", "0", "0"])
+        out.append([o, "0", "0", "0", str(close(o)), "0", o + 59_999, "0", 0, "0", "0", "0"])
     return out
 
 
@@ -76,7 +84,15 @@ def ledger(fills: list) -> list[dict]:
 
 
 def unit_checks():
-    """跟随还是反转 and 预挂成交的那一边 (1.144.0) on rows and fills made by hand."""
+    """跟随还是反转 and 预挂成交的那一边 (1.144.0) on rows and fills made by hand; the close calls (1.144.1)."""
+    # 1.144.1: a move inside the band is up or down all the same, marked a close call; an exact tie alone is flat
+    near = m.tally_rows([(0, 5, 10, 20), (5, 10, 20, 30), (10, 15, 30, 40), (15, 20, 40, 50), (20, 25, 50, 60)],
+                        {10: 100.0, 20: 100.005, 30: 100.005, 40: 99.99, 50: 99.99}, 0.0001)
+    assert [(r["r"], r.get("n", 0)) for r in near] == [("u", 1), ("f", 0), ("d", 0), ("f", 0), ("x", 0)], near  # +0.005%: near; −0.015%: not
+    assert m.tally_rows([(0, 5, 10, 20)], {10: 100.0, 20: 100.004}, 0.0)[0] == {"s": 0, "e": 5, "a": 100.0, "b": 100.004, "r": "u"}  # a daily card: no band
+    seen = m.tally_summary(near, {0: "d", 10: "d"})  # Predict saw the close call the other way; the clear one alike
+    assert seen["counts"] == {"total": 5, "up": 1, "down": 1, "flat": 2, "missing": 1, "near": 1}, seen["counts"]
+    assert seen["checks"] == {"n": 2, "agree": 1, "bad": [{"s": 0, "r": "u", "o": "d", "n": 1}], "near": {"n": 1, "agree": 0}}, seen["checks"]
     rows = day_rows()
     f = m.tally_follow(rows)
     # pairs: 5 ups after ups, an up into a down, 4 downs after downs (the tie breaks the chain), then 107 turns; p = 60/119
@@ -125,7 +141,7 @@ async def run():
         calls.append((path, params["symbol"], params["startTime"], params["limit"]))
         if params["symbol"] in broken:
             raise m.RemoteError("HTTP 500: boom")
-        return candles(params["startTime"], params["limit"], bot.market.now)
+        return candles(params["startTime"], params["limit"], bot.market.now, close_near if params["symbol"] == "BNBUSDT" else close_at)
     m.binance_spot = spot
 
     async def settle():
@@ -137,12 +153,12 @@ async def run():
     await settle()
     assert {c[:2] for c in calls} == {("klines", "BTCUSDT")} and all(c[3] == 1000 for c in calls) and all(c[2] % m.TALLY_CHUNK_MS == 0 for c in calls), calls
     p = bot.tally_payload("BTC-5M", "2026-11-08", "2026-11-08")
-    assert p["ready"] and p["counts"] == {"total": 120, "up": 60, "down": 59, "flat": 1, "missing": 0}, p["counts"]
+    assert p["ready"] and p["counts"] == {"total": 120, "up": 60, "down": 59, "flat": 1, "missing": 0, "near": 0}, p["counts"]
     assert p["range"] == "11-08 00:00–10:00" and (p["from"], p["to"], p["today"]) == ("2026-11-08", "2026-11-08", "2026-11-08"), p["range"]
     assert p["streaks"]["up"] == {"n": 6, "from": DAY0, "to": DAY0 + 30 * 60_000} and p["streaks"]["down"] == {"n": 5, "from": DAY0 + 30 * 60_000, "to": DAY0 + 55 * 60_000}
     assert [w["r"] for w in p["windows"][:13]] == ["u"] * 6 + ["d"] * 5 + ["f", "u"] and p["windows"][0]["a"] == 100.0 and p["windows"][0]["b"] == 101.0
     assert [(h["h"], h["up"], h["down"], h["flat"]) for h in p["hours"][:2]] == [(0, 6, 5, 1), (1, 6, 6, 0)] and len(p["hours"]) == 10
-    assert p["checks"] == {"n": 0, "agree": 0, "bad": []} and p["source"] == "币安现货 1 分钟 K 线" and p["tie"] == float(m.SpotWindowMarket.TIE)
+    assert p["checks"] == {"n": 0, "agree": 0, "bad": [], "near": {"n": 0, "agree": 0}} and p["source"] == "币安现货 1 分钟 K 线" and p["tie"] == float(m.SpotWindowMarket.TIE)
     assert p["days"] == [{"d": "2026-11-08", "label": "11-08 周日", "total": 120, "up": 60, "down": 59, "flat": 1, "missing": 0, "best_up": 6, "best_down": 5}], p["days"]  # 1.143.1
     asked = len(calls)
     assert bot.tally_payload("BTC-5M", "2026-11-08", "2026-11-08")["ready"] and len(calls) == asked, "kept: a second look reads nothing"
@@ -164,7 +180,7 @@ async def run():
                                               "settled": start + 600_000, "confirm": "confirmed" if i != 1 else "mismatch"})
     bot.store.put("sim:w3|up|挂", {**bot.store.get("sim:w0|up|挂"), "market": "w3", "slug": f"btc-updown-5m-{(DAY0 + 300_000) // 1000}", "confirm": ""})  # pre-settled only: not Predict's
     p = bot.tally_payload("BTC-5M", "2026-11-08", "2026-11-08")
-    assert p["checks"] == {"n": 2, "agree": 1, "bad": [{"s": DAY0 + 6 * 300_000, "r": "d", "o": "u"}]}, p["checks"]
+    assert p["checks"] == {"n": 2, "agree": 1, "bad": [{"s": DAY0 + 6 * 300_000, "r": "d", "o": "u"}], "near": {"n": 0, "agree": 0}}, p["checks"]
     assert [(w.get("o"), w["r"]) for w in p["windows"] if w.get("o")] == [("u", "u"), ("u", "d"), ("s", "f")]
     # 1.144.0: 跟随还是反转 over the day's windows; 预挂成交的那一边 from the pre-open ledger (none on this bot until it has one)
     assert p["follow"] == m.tally_follow(day_rows()) and p["fills"]["windows"] == 0, (p["follow"], p["fills"])
@@ -192,6 +208,12 @@ async def run():
     assert two["range"] == "11-07 00:00 到 11-08 10:00" and two["counts"]["total"] == 408
     assert bot.tally_payload("nope")["key"] == "BTC-5M" and bot.tally_payload("BTC-5M", "bad", "date")["from"] == "2026-11-08"
     await settle()
+    # 1.144.1: BNB's every window moved 0.005% — up or down all the same (it was 平或待定), each a close call
+    assert bot.tally_payload("BNB-5M", "2026-11-08", "2026-11-08")["ready"] is False
+    await settle()
+    bnb = bot.tally_payload("BNB-5M", "2026-11-08", "2026-11-08")
+    assert bnb["counts"] == {"total": 120, "up": 60, "down": 60, "flat": 0, "missing": 0, "near": 120}, bnb["counts"]
+    assert all(w.get("n") == 1 for w in bnb["windows"]) and bnb["follow"]["pairs"] == 119 and bnb["follow"]["same"] == 0
     # a gap: the candles of a chunk not read (the read failed) — those windows 没数据, the reason said, the page not held
     broken.add("ETHUSDT")
     assert bot.tally_payload("ETH-5M", "2026-11-08", "2026-11-08")["ready"] is False
@@ -255,7 +277,7 @@ async def browser_check(bot):
             assert await page.locator("#tally .tdots .tdot").count() == 120
             assert await page.locator("#tally .tdots .tdot.bad").count() == 1 and await page.locator("#tally .tdots .trow").count() == 10
             text = await page.locator("#tally").inner_text()
-            for want in ("统计区间 11-08 00:00–10:00", "已结束 120 场", "涨 60 局", "跌 59 局", "平或待定 1 局", "涨占 50%", "最长连涨 6 局（00:00–00:30）",
+            for want in ("统计区间 11-08 00:00–10:00", "已结束 120 场", "涨 60 局", "跌 59 局", "平 1 局", "涨占 50%", "最长连涨 6 局（00:00–00:30）",
                          "最长连跌 5 局（00:30–00:55）", "与 Predict 官方结果核对 2 场：一致 1 · 不一致 1 场（00:30 K 线跌、官方涨）", "按小时"):
                 assert want in text, (want, text)
             assert await page.locator("#tcard option").count() == len(m.preopen_cards()) and await page.input_value("#tcard") == "BTC-5M"
@@ -278,6 +300,17 @@ async def browser_check(bot):
             await page.locator("#tally .tdays tr.pick").nth(5).click()  # 11-07
             await page.locator("#tally .tdots .tdot.f").nth(287).wait_for()
             assert await page.locator("#tally .tdots .tdot").count() == 288 and "11-07 周六" in await page.locator("#tally .tdays tr.on").inner_text()
+            assert "开始和结束完全一样才记平；涨跌不到 0.01% 的照涨跌算，画浅色" in text and "涨跌不到 0.01%" in await page.inner_text("#tally .tlegend")  # 1.144.1
+            assert await page.locator("#tally .tdots .tdot.n").count() == 0 and "浅色圆点" not in text
+            await page.select_option("#tcard", "BNB-5M")  # 1.144.1: every window a close call — up or down, drawn light
+            await page.click("#tallybody .tq[data-r='today']")
+            await page.locator("#tally .tdots .tdot.n").nth(119).wait_for()
+            bnb = await page.locator("#tally").inner_text()
+            assert "已结束 120 场" in bnb and "涨 60 局" in bnb and "跌 60 局" in bnb and "平 0 局" in bnb, bnb
+            assert "其中 120 场涨跌不到 0.01%（浅色圆点）：Predict 按 Chainlink 的价格结算，差距这么小时官方结果偶尔会和 K 线相反" in bnb, bnb
+            await page.locator("#tally .tdots .tdot").nth(0).click()
+            assert "00:00–00:05 涨：600 → 600.03（+0.005%），涨跌不到 0.01%，官方结果可能相反；机器人手里没有这一场的官方结果" in await page.inner_text("#tdetail")
+            assert await page.evaluate("getComputedStyle(document.querySelector('#tally .tdots .tdot.n')).opacity") == "0.42"
             await page.select_option("#tcard", "ETH-5M")  # the gap: every dot hollow, the reason said
             await page.locator("#tally .tdots .tdot.x").nth(119).wait_for()  # (the page's CSP refuses wait_for_function's string)
             assert "有一部分 K 线没读到" in await page.locator("#tally").inner_text()

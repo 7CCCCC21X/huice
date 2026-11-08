@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.144.0"
+VERSION = "1.144.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -7874,8 +7874,9 @@ def tally_source(card: Any) -> tuple[str, str]:
 
 
 def tally_tie(card: Any) -> float:
-    """How close (relative) an end may come to its start and be left as 平或待定: the card's own band — Predict settles a window on
-    Chainlink's report, not on the candle; a daily market settles on the candles themselves: an exact tie only."""
+    """How close (relative) an end may come to its start and be a close call (tally_rows "n"): the card's own band, the one its
+    pre-settlement leaves to Predict — Predict settles a window on Chainlink's report, not on the candle; a daily market
+    settles on the candles themselves: none."""
     if isinstance(card, DayWindowSpec):
         return 0.0
     return float(IndexUpDownMarket.TIE if getattr(card, "venue", "spot") == "futures" else SpotWindowMarket.TIE)
@@ -7898,22 +7899,28 @@ def tally_windows(card: Any, from_ms: int, to_ms: int, now_ms: int, holidays: fr
 
 
 def tally_rows(windows: list, closes: Mapping[int, float], tie: float) -> list[dict]:
-    """Each window by the candle closes: u (the end above the start), d (below), f (within ``tie`` of it: 平或待定), x (a candle
-    missing) — with its start, end and the two closes."""
+    """Each window by the candle closes: u (the end above the start), d (below), f (exactly level), x (a candle missing) —
+    with its start, end and the two closes. A move within ``tie`` of the start is still up or down, marked "n" (a close
+    call: Chainlink's price, which Predict settles on, may see it the other way). Until 1.144.1 such a window was f
+    (平或待定) — the band the bot's own pre-settlement leaves to Predict, some $10 on BTC: one 5-minute window in six."""
     rows = []
     for start, end, a_ms, b_ms in windows:
         a, b = closes.get(a_ms), closes.get(b_ms)
-        r = "x" if a is None or b is None else "f" if b == a or abs(b - a) <= a * tie else "u" if b > a else "d"
-        rows.append({"s": start, "e": end, "a": a, "b": b, "r": r})
+        row = {"s": start, "e": end, "a": a, "b": b, "r": "x" if a is None or b is None else "u" if b > a else "d" if b < a else "f"}
+        if row["r"] in ("u", "d") and abs(b - a) <= a * tie:
+            row["n"] = 1
+        rows.append(row)
     return rows
 
 
 def tally_summary(rows: list[dict], official: Mapping[int, str]) -> dict:
-    """The counts; the longest runs of ups and of downs (a tie or a gap ends a run); the hours the windows start in (Beijing,
-    the days of a range together); the days (Beijing: each day's counts and its own longest runs, 1.143.1); and the windows
-    whose Predict result the bot holds (``official``: start -> u / d / s) against the candles' — each such row carries it ("o")."""
+    """The counts (the close calls among the ups and downs apart, 1.144.1); the longest runs of ups and of downs (a tie or a
+    gap ends a run); the hours the windows start in (Beijing, the days of a range together); the days (Beijing: each day's
+    counts and its own longest runs, 1.143.1); and the windows whose Predict result the bot holds (``official``: start ->
+    u / d / s) against the candles' — each such row carries it ("o"); the close calls' own agreement apart ("near")."""
     names = {"u": "up", "d": "down", "f": "flat", "x": "missing"}
-    counts = {"total": len(rows), "up": 0, "down": 0, "flat": 0, "missing": 0}
+    counts = {"total": len(rows), "up": 0, "down": 0, "flat": 0, "missing": 0, "near": 0}
+    near = {"n": 0, "agree": 0}
     best: dict[str, dict] = {"up": {"n": 0}, "down": {"n": 0}}
     hours: dict[int, dict] = {}
     days: dict[str, dict] = {}
@@ -7921,6 +7928,7 @@ def tally_summary(rows: list[dict], official: Mapping[int, str]) -> dict:
     run, agree, bad = None, 0, []
     for r in rows:
         counts[names[r["r"]]] += 1
+        counts["near"] += r.get("n", 0)
         at = dt.datetime.fromtimestamp(r["s"] / 1000, BEIJING)
         h = at.hour
         hours.setdefault(h, {"h": h, "up": 0, "down": 0, "flat": 0, "missing": 0})[names[r["r"]]] += 1
@@ -7943,12 +7951,15 @@ def tally_summary(rows: list[dict], official: Mapping[int, str]) -> dict:
         if o:
             r["o"] = o
             if r["r"] in ("u", "d"):
+                if r.get("n"):
+                    near["n"] += 1
+                    near["agree"] += int(o == r["r"])
                 if o == r["r"]:
                     agree += 1
                 else:
-                    bad.append({"s": r["s"], "r": r["r"], "o": o})
+                    bad.append({"s": r["s"], "r": r["r"], "o": o, **({"n": 1} if r.get("n") else {})})
     return {"counts": counts, "streaks": best, "hours": [hours[h] for h in sorted(hours)], "days": [days[d] for d in sorted(days)],
-            "checks": {"n": agree + len(bad), "agree": agree, "bad": bad}}
+            "checks": {"n": agree + len(bad), "agree": agree, "bad": bad, "near": near}}
 
 
 TALLY_MIN_PAIRS = 30   # 跟随还是反转: fewer adjacent pairs than this, no reading (1.144.0)
@@ -12922,7 +12933,7 @@ dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .note{font-size:12.5px;background:var(--chip);border-radius:10px;padding:8px 10px;border-left:3px solid var(--warn)}.note.bad{border-left-color:var(--hot)}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 .evchart{width:100%;height:auto;display:block;margin:6px 0 2px;background:var(--chip);border-radius:10px}.evchart .grid{stroke:var(--line2)}.evchart .zero{stroke:var(--faint);stroke-dasharray:3 3}.evchart text{font-size:10px;fill:var(--faint)}.evchart .band{fill:var(--best-soft);opacity:.35}.evchart .ev{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4}.evchart .pnl{fill:none;stroke:var(--best);stroke-width:2}.evchart circle.pnl{fill:var(--best)}.evchart circle.ev{fill:var(--muted)}
-.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
+.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.n{opacity:.42}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
@@ -12934,7 +12945,7 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <section class="box" id="tallybox"><div class="hd" id="tallyhd"><h2>市场涨跌统计</h2><span class="sum" id="tallysum"></span><button type="button" class="lnk" id="foldtally">收起</button></div>
 <div class="body" id="tallybody"><div class="tbar"><select id="tcard" aria-label="市场"></select><button type="button" class="tq" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><span class="tcust"><input type="date" id="tfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="tto" aria-label="结束日期"><button type="button" id="tgo">查看</button></span></div>
 <div id="tally"></div>
-<p class="small mut">每一场按币安 1 分钟 K 线算：结束时的价格高于开始为涨、低于为跌，和机器人自己预结算同一个口径；开始和结束相差不到一个价位的记“平或待定”，留给 Predict 的官方结果；只算已经结束的场次。Predict 按 Chainlink 的价格结算，偶尔和 K 线不同：有官方结果的场次（预挂有成交的、原策略交易过的）单独核对，不一致的圆点带黄圈。按北京时间的日期查，以前的任何一天都能查，一次最多 31 天；查几天时上面是按日期的表，每天涨几局、跌几局，点一天看那天的每一场。点圆点看那一场的时间、起止价和官方结果。</p></div></section>
+<p class="small mut">每一场按币安 1 分钟 K 线算：结束时的价格高于开始为涨、低于为跌，完全一样才记平；涨跌很小的（BTC/ETH/BNB 不到 0.01%，黄金、原油、股票不到 0.05%）照样算涨跌，圆点画浅一点——Predict 按 Chainlink 的价格结算，差距这么小时官方结果偶尔会相反；只算已经结束的场次。Predict 按 Chainlink 的价格结算，偶尔和 K 线不同：有官方结果的场次（预挂有成交的、原策略交易过的）单独核对，不一致的圆点带黄圈。按北京时间的日期查，以前的任何一天都能查，一次最多 31 天；查几天时上面是按日期的表，每天涨几局、跌几局，点一天看那天的每一场。点圆点看那一场的时间、起止价和官方结果。</p></div></section>
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="anaref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
 <div class="note fline" id="anafilt" hidden></div><div class="small mut" id="anaat"></div>
@@ -13443,25 +13454,27 @@ document.getElementById("theme").addEventListener("click",()=>{const ks=Object.k
 let tallyOpen=true,tallyKey="BTC-5M",tallyFrom="",tallyTo="",tallyRng="today",tallySeq=0,tallyDay="",tallyLast=null,tallyOnly=false;  // 市场涨跌统计 (1.143.0; the day picked, 1.143.1)
 const bjDate=ms=>DAYF.format(new Date(ms)).replace(/\//g,"-");
 try{tallyOpen=localStorage.getItem("jrntally")!=="0";tallyKey=localStorage.getItem("jrntallykey")||tallyKey}catch(e){}
-const tallyWord=r=>({u:"涨",d:"跌",f:"平或待定",x:"没数据",s:"平（50/50）"})[r]||r;
+const tallyWord=r=>({u:"涨",d:"跌",f:"平",x:"没数据",s:"平（50/50）"})[r]||r;
+const tallyNear=j=>"涨跌不到 "+(+(j.tie*100).toFixed(4))+"%";  // a close call (1.144.1): within the card's band, Chainlink may see it the other way
 function tallyAt(ms,j){const d=new Date(ms);return (j.from!==j.to||j.cycle_ms>=86400e3?MDF.format(d).replace("/","-")+" ":"")+HMF.format(d)}
 function tallyShow(w,j,dot){  // a dot tapped: the window's time, the two prices and the move, Predict's own result
   document.querySelectorAll("#tally .tdot.sel").forEach(x=>x.classList.remove("sel"));if(dot)dot.classList.add("sel");
   const el=document.getElementById("tdetail");if(!el)return;el.hidden=false;
   const pct=w.a!=null&&w.b!=null&&w.a?((w.b-w.a)/w.a*100):null,off=!!w.o&&(w.r==="u"||w.r==="d")&&w.o!==w.r;
   el.textContent=tallyAt(w.s,j)+"–"+HMF.format(new Date(w.e))+" "+tallyWord(w.r)+(w.a!=null&&w.b!=null?"："+w.a+" → "+w.b+"（"+(pct>=0?"+":"")+pct.toFixed(3)+"%）":"：K 线没读到")
+    +(w.n?"，"+tallyNear(j)+"，官方结果可能相反":"")
     +(w.o?"；Predict 官方 "+tallyWord(w.o)+(off?"（和 K 线不一致）":"（一致）"):"；机器人手里没有这一场的官方结果")}
 function tallyDots(j,ws){  // a dot a window, red up, green down, grey a tie, hollow no candle; a row an hour (the 5- and 15-minute cards), a day (the hourly ones) or the whole range (the daily ones)
   const box=$("div","tdots"+(tallyOnly?" only":"")),cyc=j.cycle_ms;let key=null,cells=null;
   (ws||j.windows||[]).forEach(w=>{const d=new Date(w.s),k=cyc<3600e3?HMF.format(d).slice(0,2)+" 时":cyc<86400e3?MDF.format(d).replace("/","-"):"按天";
     if(k!==key){key=k;const row=$("div","trow");row.append($("span","tl",k));cells=$("span","tcells");row.append(cells);box.append(row)}
-    const off=!!w.o&&(w.r==="u"||w.r==="d")&&w.o!==w.r,dot=$("span","tdot "+w.r+(off?" bad":""));
-    dot.title=tallyAt(w.s,j)+"–"+HMF.format(new Date(w.e))+" "+tallyWord(w.r)+(w.a!=null&&w.b!=null?"："+w.a+" → "+w.b:"")+(w.o?"；Predict 官方 "+tallyWord(w.o):"");
+    const off=!!w.o&&(w.r==="u"||w.r==="d")&&w.o!==w.r,dot=$("span","tdot "+w.r+(w.n?" n":"")+(off?" bad":""));
+    dot.title=tallyAt(w.s,j)+"–"+HMF.format(new Date(w.e))+" "+tallyWord(w.r)+(w.a!=null&&w.b!=null?"："+w.a+" → "+w.b:"")+(w.n?"（"+tallyNear(j)+"）":"")+(w.o?"；Predict 官方 "+tallyWord(w.o):"");
     dot.addEventListener("click",()=>tallyShow(w,j,dot));cells.append(dot)});
   if(key===null)box.append($("p","small mut","这段时间还没有结束的场次"));
   return box}
 function tallyDays(j){  // 按日期 (1.143.1): a row a day — its counts, its share of ups, its own longest runs; a row tapped shows that day's dots
-  const w=table(["日期","场次","涨","跌","平","涨占比","连涨/跌"],j.days.map(d=>{const n=d.up+d.down;  // short heads: a phone's width (平 = 平或待定, 连涨/跌 = the day's longest runs)
+  const w=table(["日期","场次","涨","跌","平","涨占比","连涨/跌"],j.days.map(d=>{const n=d.up+d.down;  // short heads: a phone's width (平 = an exact tie, 连涨/跌 = the day's longest runs)
     return [d.label,d.total,d.up,d.down,(d.flat||0)+(d.missing?" · 缺 "+d.missing:""),n?Math.round(d.up*100/n)+"%":"—",d.best_up+"/"+d.best_down]}));
   w.classList.add("tdays");
   w.querySelectorAll("tr").forEach((tr,i)=>{if(!i)return;const d=j.days[i-1];if(j.cycle_ms>=86400e3)return;tr.classList.add("pick");if(d.d===tallyDay)tr.classList.add("on");
@@ -13496,22 +13509,25 @@ function tallyRender(j){const el=document.getElementById("tally"),c=j.counts||{}
   const multi=j.from!==j.to,days=j.days||[];if(multi&&!days.some(d=>d.d===tallyDay))tallyDay=days.length?days[days.length-1].d:"";
   const dec=(c.up||0)+(c.down||0),rate=dec?Math.round(c.up*100/dec)+"%":"—";
   const top=$("div","tsum");top.append($("b","",j.name)," · 统计区间 "+j.range+"（北京时间，只算已经结束的场次）");el.append(top);
-  const line=$("p","small","");line.append("已结束 "+c.total+" 场：",$("b","tcu","涨 "+c.up+" 局")," · ",$("b","tcd","跌 "+c.down+" 局")," · 平或待定 "+c.flat+" 局"+(c.missing?" · 没数据 "+c.missing+" 局":"")+" · 涨占 "+rate);el.append(line);
+  const line=$("p","small","");line.append("已结束 "+c.total+" 场：",$("b","tcu","涨 "+c.up+" 局")," · ",$("b","tcd","跌 "+c.down+" 局")," · 平 "+c.flat+" 局"+(c.missing?" · 没数据 "+c.missing+" 局":"")+" · 涨占 "+rate);el.append(line);
+  const nk=(j.checks||{}).near||{};  // 1.144.1: the close calls — counted up or down by the candles, drawn light; Predict's own result where the bot holds it
+  if(c.near)el.append($("p","small mut","其中 "+c.near+" 场"+tallyNear(j)+"（浅色圆点）：Predict 按 Chainlink 的价格结算，差距这么小时官方结果偶尔会和 K 线相反"
+    +(nk.n?"；有官方结果的 "+nk.n+" 场里一致 "+nk.agree+" 场":"")));
   const st=j.streaks||{},run=(x,w)=>x&&x.n?w+" "+x.n+" 局（"+tallyAt(x.from,j)+"–"+tallyAt(x.to,j)+"）":w+" —";
   el.append($("p","small mut",run(st.up,"最长连涨")+" · "+run(st.down,"最长连跌")));
   const ck=j.checks||{},bad=ck.bad||[];
-  el.append($("p","small mut",ck.n?"与 Predict 官方结果核对 "+ck.n+" 场：一致 "+ck.agree+(bad.length?" · 不一致 "+bad.length+" 场（"+bad.slice(0,5).map(b=>tallyAt(b.s,j)+" K 线"+tallyWord(b.r)+"、官方"+tallyWord(b.o)).join("；")+(bad.length>5?"…":"")+"）":""):"这段时间没有能核对的官方结果（只有预挂有成交、原策略交易过的场次有）"));
+  el.append($("p","small mut",ck.n?"与 Predict 官方结果核对 "+ck.n+" 场：一致 "+ck.agree+(bad.length?" · 不一致 "+bad.length+" 场（"+bad.slice(0,5).map(b=>tallyAt(b.s,j)+" K 线"+tallyWord(b.r)+(b.n?"（差距很小）":"")+"、官方"+tallyWord(b.o)).join("；")+(bad.length>5?"…":"")+"）":""):"这段时间没有能核对的官方结果（只有预挂有成交、原策略交易过的场次有）"));
   if((j.errors||[]).length)el.append($("p","small mut","有一部分 K 线没读到（"+j.errors[0]+"），那些场次记没数据，稍后再看"));
   if(multi&&days.length)el.append($("div","sub",j.cycle_ms<86400e3?"按日期（北京时间；点一天，下面换成那天的每一场）":"按日期（北京时间）"),tallyDays(j));
   const pick=multi&&j.cycle_ms<86400e3,ws=pick?(j.windows||[]).filter(w=>bjDate(w.s)===tallyDay):j.windows;
   if(pick&&tallyDay)el.append($("div","sub",tallyDay.slice(5)+" 的每一场"));
   if(bad.length){const t=$("button","lnk",tallyOnly?"显示全部场次":"只看和官方不一致的");t.type="button";t.addEventListener("click",()=>{tallyOnly=!tallyOnly;tallyRender(tallyLast)});el.append(t)}
   el.append(tallyDots(j,ws));const det=$("div","tdet");det.id="tdetail";det.hidden=true;el.append(det);
-  const lg=$("p","small mut tlegend","");[["u","涨"],["d","跌"],["f","平或待定"],["x","没数据"]].forEach(([k,w])=>lg.append($("span","tdot "+k),w));lg.append($("span","tdot u bad"),"和官方结果不一致");el.append(lg);
+  const lg=$("p","small mut tlegend","");[["u","涨"],["d","跌"],["f","平"],["x","没数据"]].forEach(([k,w])=>lg.append($("span","tdot "+k),w));if(j.tie)lg.append($("span","tdot u n"),tallyNear(j));lg.append($("span","tdot u bad"),"和官方结果不一致");el.append(lg);
   if((j.hours||[]).length>1)el.append($("div","sub",j.from!==j.to?"按小时（北京时间，几天里同一小时合在一起）":"按小时（北京时间）"),
     table(["开始","涨","跌","平","没数据","涨占比"],j.hours.map(h=>{const n=h.up+h.down;return [String(h.h).padStart(2,"0")+":00",h.up,h.down,h.flat||"—",h.missing||"—",n?Math.round(h.up*100/n)+"%":"—"]})));
   el.append(...tallyFollow(j),...tallyFills(j));  // 1.144.0
-  el.append($("p","small mut","数据：币安"+(j.source||"").replace("币安","")+"；"+(j.tie?"开始和结束相差不到 "+(j.tie*100).toFixed(2)+"% 记平或待定":"只有完全相同才记平")));
+  el.append($("p","small mut","数据：币安"+(j.source||"").replace("币安","")+"；"+(j.tie?"开始和结束完全一样才记平；"+tallyNear(j)+" 的照涨跌算，画浅色":"只有完全相同才记平")));
   document.getElementById("tallysum").textContent=j.name+" 涨 "+c.up+" · 跌 "+c.down+(c.flat?" · 平 "+c.flat:"")}
 async function tallyLoad(tries){const my=++tallySeq,el=document.getElementById("tally");if(!tries)el.replaceChildren($("p","small mut","读取中…"));
   const q=tallyRng?"&range="+tallyRng:"&from="+tallyFrom+"&to="+tallyTo;
