@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.143.0"
+VERSION = "1.143.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -7910,17 +7910,29 @@ def tally_rows(windows: list, closes: Mapping[int, float], tie: float) -> list[d
 
 def tally_summary(rows: list[dict], official: Mapping[int, str]) -> dict:
     """The counts; the longest runs of ups and of downs (a tie or a gap ends a run); the hours the windows start in (Beijing,
-    the days of a range together); and the windows whose Predict result the bot holds (``official``: start -> u / d / s)
-    against the candles' — each such row carries it ("o")."""
+    the days of a range together); the days (Beijing: each day's counts and its own longest runs, 1.143.1); and the windows
+    whose Predict result the bot holds (``official``: start -> u / d / s) against the candles' — each such row carries it ("o")."""
     names = {"u": "up", "d": "down", "f": "flat", "x": "missing"}
     counts = {"total": len(rows), "up": 0, "down": 0, "flat": 0, "missing": 0}
     best: dict[str, dict] = {"up": {"n": 0}, "down": {"n": 0}}
     hours: dict[int, dict] = {}
+    days: dict[str, dict] = {}
+    runs: dict[str, tuple[str, int] | None] = {}  # day -> the run going on within it (kind, length)
     run, agree, bad = None, 0, []
     for r in rows:
         counts[names[r["r"]]] += 1
-        h = dt.datetime.fromtimestamp(r["s"] / 1000, BEIJING).hour
+        at = dt.datetime.fromtimestamp(r["s"] / 1000, BEIJING)
+        h = at.hour
         hours.setdefault(h, {"h": h, "up": 0, "down": 0, "flat": 0, "missing": 0})[names[r["r"]]] += 1
+        d = days.setdefault(at.date().isoformat(), {"d": at.date().isoformat(), "label": f"{at:%m-%d} {WEEKDAYS[at.weekday()]}", "total": 0,
+                                                    "up": 0, "down": 0, "flat": 0, "missing": 0, "best_up": 0, "best_down": 0})
+        d["total"] += 1
+        d[names[r["r"]]] += 1
+        prev = runs.get(d["d"])
+        runs[d["d"]] = ((r["r"], prev[1] + 1) if prev and prev[0] == r["r"] else (r["r"], 1)) if r["r"] in ("u", "d") else None
+        if runs[d["d"]]:
+            side = "best_up" if r["r"] == "u" else "best_down"
+            d[side] = max(d[side], runs[d["d"]][1])
         if r["r"] in ("u", "d"):
             run = {**run, "n": run["n"] + 1, "to": r["e"]} if run and run["k"] == r["r"] else {"k": r["r"], "n": 1, "from": r["s"], "to": r["e"]}
             if run["n"] > best[names[run["k"]]]["n"]:
@@ -7935,7 +7947,8 @@ def tally_summary(rows: list[dict], official: Mapping[int, str]) -> dict:
                     agree += 1
                 else:
                     bad.append({"s": r["s"], "r": r["r"], "o": o})
-    return {"counts": counts, "streaks": best, "hours": [hours[h] for h in sorted(hours)], "checks": {"n": agree + len(bad), "agree": agree, "bad": bad}}
+    return {"counts": counts, "streaks": best, "hours": [hours[h] for h in sorted(hours)], "days": [days[d] for d in sorted(days)],
+            "checks": {"n": agree + len(bad), "agree": agree, "bad": bad}}
 
 
 def updown_odds(price: float, line: float, sigma: float, years: float, drift: float = -0.5,
@@ -12780,7 +12793,7 @@ dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .note{font-size:12.5px;background:var(--chip);border-radius:10px;padding:8px 10px;border-left:3px solid var(--warn)}.note.bad{border-left-color:var(--hot)}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 .evchart{width:100%;height:auto;display:block;margin:6px 0 2px;background:var(--chip);border-radius:10px}.evchart .grid{stroke:var(--line2)}.evchart .zero{stroke:var(--faint);stroke-dasharray:3 3}.evchart text{font-size:10px;fill:var(--faint)}.evchart .band{fill:var(--best-soft);opacity:.35}.evchart .ev{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4}.evchart .pnl{fill:none;stroke:var(--best);stroke-width:2}.evchart circle.pnl{fill:var(--best)}.evchart circle.ev{fill:var(--muted)}
-.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}
+.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
@@ -12790,9 +12803,9 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
 <div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>今日按市场 <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。开盘前预挂（49¢ 两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的时间算今天，下单时预期按五五开算。</p><p class="small mut">按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
 <section class="box" id="tallybox"><div class="hd" id="tallyhd"><h2>市场涨跌统计</h2><span class="sum" id="tallysum"></span><button type="button" class="lnk" id="foldtally">收起</button></div>
-<div class="body" id="tallybody"><div class="tbar"><select id="tcard" aria-label="市场"></select><button type="button" class="tq" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><span class="tcust"><input type="date" id="tfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="tto" aria-label="结束日期"><button type="button" id="tgo">查看</button></span></div>
+<div class="body" id="tallybody"><div class="tbar"><select id="tcard" aria-label="市场"></select><button type="button" class="tq" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><span class="tcust"><input type="date" id="tfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="tto" aria-label="结束日期"><button type="button" id="tgo">查看</button></span></div>
 <div id="tally"></div>
-<p class="small mut">每一场按币安 1 分钟 K 线算：结束时的价格高于开始为涨、低于为跌，和机器人自己预结算同一个口径；开始和结束相差不到一个价位的记“平或待定”，留给 Predict 的官方结果；只算已经结束的场次。Predict 按 Chainlink 的价格结算，偶尔和 K 线不同：有官方结果的场次（预挂有成交的、原策略交易过的）单独核对，不一致的圆点带黄圈。按北京时间的日期查，以前的任何一天都能查，一次最多 31 天。把鼠标停在圆点上（手机上长按）看那一场的时间和价格。</p></div></section>
+<p class="small mut">每一场按币安 1 分钟 K 线算：结束时的价格高于开始为涨、低于为跌，和机器人自己预结算同一个口径；开始和结束相差不到一个价位的记“平或待定”，留给 Predict 的官方结果；只算已经结束的场次。Predict 按 Chainlink 的价格结算，偶尔和 K 线不同：有官方结果的场次（预挂有成交的、原策略交易过的）单独核对，不一致的圆点带黄圈。按北京时间的日期查，以前的任何一天都能查，一次最多 31 天；查几天时上面是按日期的表，每天涨几局、跌几局，点一天看那天的每一场。点圆点看那一场的时间、起止价和官方结果。</p></div></section>
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="anaref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
 <div class="note fline" id="anafilt" hidden></div><div class="small mut" id="anaat"></div>
@@ -13012,7 +13025,9 @@ function cardsTable(ct){  // 今日按市场: anaTable's lines, each opening the
   if(cardOpen&&!ct.some(r=>r.name===cardOpen))cardOpen="";
   const w=anaTable(ct);[...w.querySelectorAll("tr")].slice(1).forEach((tr,i)=>{const r=ct[i],open=r.name===cardOpen;
     if(r.preopen){tr.className="dayrow";tr.title="开盘前预挂模式今天开始的场次：每一场的明细在下面“开盘前预挂”一节";tr.firstChild.textContent="▸ "+r.name;  // 1.131.5
-      tr.addEventListener("click",()=>{const h=document.getElementById("h-preopen");if(h&&!h.hidden)h.scrollIntoView({block:"start"})});return}
+      tr.addEventListener("click",()=>{if(!anaOpen){anaOpen=true;try{localStorage.setItem("jrnana","1")}catch(e){}  // 1.143.1: folded, the scroll went nowhere
+          document.getElementById("anabody").hidden=false;document.getElementById("foldana").textContent="收起"}
+        const h=document.getElementById("h-preopen");if(h&&!h.hidden)h.scrollIntoView({block:"start"})});return}
     tr.className="dayrow"+(open?" open":"");tr.title=open?"收起这个市场今天的记录":"点开看这个市场今天的每一笔：已结算的盈亏和确认状态、持仓、挂单";
     tr.firstChild.textContent=(open?"▾ ":"▸ ")+r.name;tr.addEventListener("click",()=>{cardOpen=open?"":r.name;summary()})});
   return w}
@@ -13205,18 +13220,20 @@ function risk(){  // the open positions by the event that settles them (ten mark
   if(bl.length){parts.push($("div","sub","组上限拦下的买入（最近一周）"));
     parts.push(table(["时间","市场","方向","价格","原因"],bl.map(b=>[when(b.at),b.item,b.label,cent(b.price),b.why])))}
   el.replaceChildren(...parts)}
-function filters(){  // one row of chips with counts; a chip nobody matches is not shown, 全部 clears every filter
+function filters(){  // one row of chips with counts; a chip nobody matches is not shown; 全部 is the status's own, 清除筛选 clears them all (1.143.1)
   const ts=data.trades,cnt=fn=>ts.filter(fn).length,parts=[];
   const chip=(key,t,n,on,fn)=>{const b=$("button","chip"+(on?" on":""));b.type="button";b.dataset.f=key;b.append(t,$("span","n",String(n)));b.addEventListener("click",fn);return b};
   const counts=STATES.map(([k,t,fn])=>[k,t,cnt(fn)]);
   if(!counts.some(([k,,n])=>k===stateF&&n))stateF="all";
-  counts.forEach(([k,t,n])=>{if(k==="all"||n)parts.push(chip(k,t,n,stateF===k,()=>{stateF=k;if(k==="all")wayF=kindF=cardF="all";shown=PAGE;render()}))});
+  counts.forEach(([k,t,n])=>{if(k==="all"||n)parts.push(chip(k,t,n,stateF===k,()=>{stateF=k;shown=PAGE;render()}))});
   const mk=cnt(t=>t.maker),tk=ts.length-mk;if(!(mk&&tk))wayF="all";
   if(mk&&tk)parts.push($("i","sep"),...[["maker","挂单",mk],["taker","吃单",tk]].map(([k,t,n])=>chip(k,t,n,wayF===k,()=>{wayF=wayF===k?"all":k;shown=PAGE;render()})));
   const kinds=Object.entries(KINDS).map(([k,t])=>[k,t,cnt(x=>x.kind===k)]).filter(x=>x[2]);if(!kinds.some(([k])=>k===kindF))kindF="all";
   if(kinds.length>1)parts.push($("i","sep"),...kinds.map(([k,t,n])=>chip("k:"+k,t,n,kindF===k,()=>{kindF=kindF===k?"all":k;shown=PAGE;render()})));
   const cards=[...new Set(ts.map(x=>x.card).filter(Boolean))].map(c=>[c,cnt(x=>x.card===c)]).sort((a,b)=>b[1]-a[1]);if(!cards.some(([c])=>c===cardF))cardF="all";
   if(cards.length>1)parts.push($("i","sep"),...cards.map(([c,n])=>chip("c:"+c,c,n,cardF===c,()=>{cardF=cardF===c?"all":c;shown=PAGE;render()})));  // 1.105.1: one chip per card
+  if(stateF!=="all"||wayF!=="all"||kindF!=="all"||cardF!=="all"){const b=$("button","lnk","清除筛选");b.type="button";b.id="fclear";
+    b.addEventListener("click",()=>{stateF=wayF=kindF=cardF="all";shown=PAGE;render()});parts.push(b)}
   document.getElementById("filters").replaceChildren(...parts)}
 function dayLine(items){  // one line over some rows: fills, the settled P&L, what is open (a day's heading in the list; a card's records under 今日按市场)
   const done=items.filter(t=>t.pnl!=null),pnl=done.reduce((a,t)=>a+t.pnl,0),filled=items.filter(t=>t.shares>0);
@@ -13230,7 +13247,8 @@ function dayLine(items){  // one line over some rows: fills, the settled P&L, wh
 function dayHead(ms,items){const h=$("div","day");h.append($("b","dn",dayName(ms)),dayLine(items));return h}  // the day's line over the rows shown (a card's, when one is chosen)
 function more(n){const el=document.getElementById("more");el.replaceChildren();
   if(shown<n){const b=$("button","btn","再显示 "+Math.min(PAGE,n-shown)+" 笔（还有 "+(n-shown)+" 笔）");b.type="button";b.addEventListener("click",()=>{shown+=PAGE;render()});el.append(b)}
-  else if(data.more>0&&!allLoaded){const b=$("button","btn","载入更早的 "+data.more+" 笔");b.type="button";b.addEventListener("click",()=>{allLoaded=true;b.disabled=true;b.textContent="载入中…";if(load.busy)load.again=true;else load()});el.append(b)}
+  else if(data.more>0&&!allLoaded){const b=$("button","btn",load.moreFailed?"载入失败（"+load.moreFailed+"），点这里重试":"载入更早的 "+data.more+" 笔");b.type="button";
+    b.addEventListener("click",()=>{load.more=true;load.moreFailed="";b.disabled=true;b.textContent="载入中…";if(load.busy)load.again=true;else load()});el.append(b)}  // 1.143.1: done once loaded
   el.hidden=!el.childNodes.length}
 function foot(){document.getElementById("foot").textContent=data.live?"真实订单的成交、撤单与结算以 Predict 的记录为准（点开一笔看订单事件）；标“模拟”的是只记账的模拟交易，其挂单成交按盘口快照推定。"
   :"只记账，不会向 Predict 下单。挂单的成交是按盘口快照推定的（推定成交），不代表真实成交。"}
@@ -13258,15 +13276,17 @@ function askKey(msg){const k=prompt(msg+"\n这是实盘账户的交易记录，�
 async function load(){  // the list: light rows, the open trades and the last few hundred finished ones (all of them once asked for)
   if(dead||load.busy||load.keyBad)return;load.busy=true;let again=false;
   const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),20000);
-  try{const key=ctlKey();const r=await fetch(base+"/journal.json"+(allLoaded?"?all=1":""),{cache:"no-store",headers:key?{"X-Control-Key":key}:{},signal:ctl.signal});
+  const wantAll=allLoaded||!!load.more;
+  try{const key=ctlKey();const r=await fetch(base+"/journal.json"+(wantAll?"?all=1":""),{cache:"no-store",headers:key?{"X-Control-Key":key}:{},signal:ctl.signal});
     if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}if(r.status===403&&askKey(j.message||"需要控制口令"))again=true;throw new Error(j.message||("HTTP "+r.status))}
     if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();
-    if(openId&&!allLoaded&&j.more>0&&!j.trades.some(t=>t.id===openId)){allLoaded=true;again=true}  // a link to an older trade: the whole list
-    else{data=j;okAt=Date.now();if(filterKey())loadAna();  // the filter's tables refreshed with the list
+    if(openId&&!wantAll&&j.more>0&&!j.trades.some(t=>t.id===openId)){allLoaded=true;again=true}  // a link to an older trade: the whole list
+    else{if(load.more){allLoaded=true;load.more=false}data=j;okAt=Date.now();if(filterKey())loadAna();  // the filter's tables refreshed with the list
       document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"+(data.more>0?"（更早的 "+data.more+" 笔可载入）":"")));
       render();if(openId&&details[openId])loadDetail(openId);
       const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}}
   catch(e){const hms=okAt?clock(okAt):"";
+    if(load.more){load.more=false;load.moreFailed=e.name==="AbortError"?"20 秒没有回应":(e.message||"读取失败");if(data)render()}  // the button again, saying why
     if(e.message==="HTTP 404")dead=true;
     document.getElementById("meta").replaceChildren($("span","bad","⚠️ 读取失败："+(dead?"链接已失效，请在 Telegram 重新发送 /web；本页不再自动刷新":e.name==="AbortError"?"20 秒没有回应":e.message)+
       (okAt?"；下面显示的是 "+hms+" 的旧数据":"")))}
@@ -13291,20 +13311,35 @@ document.addEventListener("visibilitychange",()=>{if(document.visibilityState===
 const THEMES={auto:["◐","自动"],light:["☀","浅色"],dark:["☾","深色"]};let theme="auto";try{const t=JSON.parse(localStorage.getItem("theme"));if(typeof t==="string"&&Object.prototype.hasOwnProperty.call(THEMES,t))theme=t}catch(e){}
 function applyTheme(){const r=document.documentElement;if(theme==="auto")delete r.dataset.theme;else r.dataset.theme=theme;const b=document.getElementById("theme");b.textContent=THEMES[theme][0]+" "+THEMES[theme][1];b.title="主题："+THEMES[theme][1]+"（点击切换）"}
 document.getElementById("theme").addEventListener("click",()=>{const ks=Object.keys(THEMES);theme=ks[(ks.indexOf(theme)+1)%ks.length];try{localStorage.setItem("theme",JSON.stringify(theme))}catch(e){}applyTheme()});applyTheme();
-let tallyOpen=true,tallyKey="BTC-5M",tallyFrom="",tallyTo="",tallyRng="today",tallySeq=0;  // 市场涨跌统计 (1.143.0)
+let tallyOpen=true,tallyKey="BTC-5M",tallyFrom="",tallyTo="",tallyRng="today",tallySeq=0,tallyDay="",tallyLast=null,tallyOnly=false;  // 市场涨跌统计 (1.143.0; the day picked, 1.143.1)
+const bjDate=ms=>DAYF.format(new Date(ms)).replace(/\//g,"-");
 try{tallyOpen=localStorage.getItem("jrntally")!=="0";tallyKey=localStorage.getItem("jrntallykey")||tallyKey}catch(e){}
 const tallyWord=r=>({u:"涨",d:"跌",f:"平或待定",x:"没数据",s:"平（50/50）"})[r]||r;
 function tallyAt(ms,j){const d=new Date(ms);return (j.from!==j.to||j.cycle_ms>=86400e3?MDF.format(d).replace("/","-")+" ":"")+HMF.format(d)}
-function tallyDots(j){  // a dot a window, red up, green down, grey a tie, hollow no candle; a row an hour (the 5- and 15-minute cards), a day (the hourly ones) or the whole range (the daily ones)
-  const box=$("div","tdots"),cyc=j.cycle_ms,multi=j.from!==j.to;let key=null,cells=null;
-  (j.windows||[]).forEach(w=>{const d=new Date(w.s),k=cyc<3600e3?(multi?MDF.format(d).replace("/","-")+" ":"")+HMF.format(d).slice(0,2)+" 时":cyc<86400e3?MDF.format(d).replace("/","-"):"按天";
+function tallyShow(w,j,dot){  // a dot tapped: the window's time, the two prices and the move, Predict's own result
+  document.querySelectorAll("#tally .tdot.sel").forEach(x=>x.classList.remove("sel"));if(dot)dot.classList.add("sel");
+  const el=document.getElementById("tdetail");if(!el)return;el.hidden=false;
+  const pct=w.a!=null&&w.b!=null&&w.a?((w.b-w.a)/w.a*100):null,off=!!w.o&&(w.r==="u"||w.r==="d")&&w.o!==w.r;
+  el.textContent=tallyAt(w.s,j)+"–"+HMF.format(new Date(w.e))+" "+tallyWord(w.r)+(w.a!=null&&w.b!=null?"："+w.a+" → "+w.b+"（"+(pct>=0?"+":"")+pct.toFixed(3)+"%）":"：K 线没读到")
+    +(w.o?"；Predict 官方 "+tallyWord(w.o)+(off?"（和 K 线不一致）":"（一致）"):"；机器人手里没有这一场的官方结果")}
+function tallyDots(j,ws){  // a dot a window, red up, green down, grey a tie, hollow no candle; a row an hour (the 5- and 15-minute cards), a day (the hourly ones) or the whole range (the daily ones)
+  const box=$("div","tdots"+(tallyOnly?" only":"")),cyc=j.cycle_ms;let key=null,cells=null;
+  (ws||j.windows||[]).forEach(w=>{const d=new Date(w.s),k=cyc<3600e3?HMF.format(d).slice(0,2)+" 时":cyc<86400e3?MDF.format(d).replace("/","-"):"按天";
     if(k!==key){key=k;const row=$("div","trow");row.append($("span","tl",k));cells=$("span","tcells");row.append(cells);box.append(row)}
     const off=!!w.o&&(w.r==="u"||w.r==="d")&&w.o!==w.r,dot=$("span","tdot "+w.r+(off?" bad":""));
     dot.title=tallyAt(w.s,j)+"–"+HMF.format(new Date(w.e))+" "+tallyWord(w.r)+(w.a!=null&&w.b!=null?"："+w.a+" → "+w.b:"")+(w.o?"；Predict 官方 "+tallyWord(w.o):"");
-    cells.append(dot)});
+    dot.addEventListener("click",()=>tallyShow(w,j,dot));cells.append(dot)});
   if(key===null)box.append($("p","small mut","这段时间还没有结束的场次"));
   return box}
-function tallyRender(j){const el=document.getElementById("tally"),c=j.counts||{};el.replaceChildren();
+function tallyDays(j){  // 按日期 (1.143.1): a row a day — its counts, its share of ups, its own longest runs; a row tapped shows that day's dots
+  const w=table(["日期","场次","涨","跌","平","涨占比","连涨/跌"],j.days.map(d=>{const n=d.up+d.down;  // short heads: a phone's width (平 = 平或待定, 连涨/跌 = the day's longest runs)
+    return [d.label,d.total,d.up,d.down,(d.flat||0)+(d.missing?" · 缺 "+d.missing:""),n?Math.round(d.up*100/n)+"%":"—",d.best_up+"/"+d.best_down]}));
+  w.classList.add("tdays");
+  w.querySelectorAll("tr").forEach((tr,i)=>{if(!i)return;const d=j.days[i-1];if(j.cycle_ms>=86400e3)return;tr.classList.add("pick");if(d.d===tallyDay)tr.classList.add("on");
+    tr.addEventListener("click",()=>{tallyDay=d.d;tallyRender(tallyLast)})});
+  return w}
+function tallyRender(j){const el=document.getElementById("tally"),c=j.counts||{};el.replaceChildren();tallyLast=j;
+  const multi=j.from!==j.to,days=j.days||[];if(multi&&!days.some(d=>d.d===tallyDay))tallyDay=days.length?days[days.length-1].d:"";
   const dec=(c.up||0)+(c.down||0),rate=dec?Math.round(c.up*100/dec)+"%":"—";
   const top=$("div","tsum");top.append($("b","",j.name)," · 统计区间 "+j.range+"（北京时间，只算已经结束的场次）");el.append(top);
   const line=$("p","small","");line.append("已结束 "+c.total+" 场：",$("b","tcu","涨 "+c.up+" 局")," · ",$("b","tcd","跌 "+c.down+" 局")," · 平或待定 "+c.flat+" 局"+(c.missing?" · 没数据 "+c.missing+" 局":"")+" · 涨占 "+rate);el.append(line);
@@ -13313,10 +13348,14 @@ function tallyRender(j){const el=document.getElementById("tally"),c=j.counts||{}
   const ck=j.checks||{},bad=ck.bad||[];
   el.append($("p","small mut",ck.n?"与 Predict 官方结果核对 "+ck.n+" 场：一致 "+ck.agree+(bad.length?" · 不一致 "+bad.length+" 场（"+bad.slice(0,5).map(b=>tallyAt(b.s,j)+" K 线"+tallyWord(b.r)+"、官方"+tallyWord(b.o)).join("；")+(bad.length>5?"…":"")+"）":""):"这段时间没有能核对的官方结果（只有预挂有成交、原策略交易过的场次有）"));
   if((j.errors||[]).length)el.append($("p","small mut","有一部分 K 线没读到（"+j.errors[0]+"），那些场次记没数据，稍后再看"));
-  el.append(tallyDots(j));
+  if(multi&&days.length)el.append($("div","sub",j.cycle_ms<86400e3?"按日期（北京时间；点一天，下面换成那天的每一场）":"按日期（北京时间）"),tallyDays(j));
+  const pick=multi&&j.cycle_ms<86400e3,ws=pick?(j.windows||[]).filter(w=>bjDate(w.s)===tallyDay):j.windows;
+  if(pick&&tallyDay)el.append($("div","sub",tallyDay.slice(5)+" 的每一场"));
+  if(bad.length){const t=$("button","lnk",tallyOnly?"显示全部场次":"只看和官方不一致的");t.type="button";t.addEventListener("click",()=>{tallyOnly=!tallyOnly;tallyRender(tallyLast)});el.append(t)}
+  el.append(tallyDots(j,ws));const det=$("div","tdet");det.id="tdetail";det.hidden=true;el.append(det);
   const lg=$("p","small mut tlegend","");[["u","涨"],["d","跌"],["f","平或待定"],["x","没数据"]].forEach(([k,w])=>lg.append($("span","tdot "+k),w));lg.append($("span","tdot u bad"),"和官方结果不一致");el.append(lg);
   if((j.hours||[]).length>1)el.append($("div","sub",j.from!==j.to?"按小时（北京时间，几天里同一小时合在一起）":"按小时（北京时间）"),
-    table(["开始","涨","跌","平或待定","没数据","涨占比"],j.hours.map(h=>{const n=h.up+h.down;return [String(h.h).padStart(2,"0")+":00",h.up,h.down,h.flat||"—",h.missing||"—",n?Math.round(h.up*100/n)+"%":"—"]})));
+    table(["开始","涨","跌","平","没数据","涨占比"],j.hours.map(h=>{const n=h.up+h.down;return [String(h.h).padStart(2,"0")+":00",h.up,h.down,h.flat||"—",h.missing||"—",n?Math.round(h.up*100/n)+"%":"—"]})));
   el.append($("p","small mut","数据：币安"+(j.source||"").replace("币安","")+"；"+(j.tie?"开始和结束相差不到 "+(j.tie*100).toFixed(2)+"% 记平或待定":"只有完全相同才记平")));
   document.getElementById("tallysum").textContent=j.name+" 涨 "+c.up+" · 跌 "+c.down+(c.flat?" · 平 "+c.flat:"")}
 async function tallyLoad(tries){const my=++tallySeq,el=document.getElementById("tally");if(!tries)el.replaceChildren($("p","small mut","读取中…"));
@@ -13324,6 +13363,7 @@ async function tallyLoad(tries){const my=++tallySeq,el=document.getElementById("
   try{const key=ctlKey();const r=await fetch(base+"/journal.json?tally="+encodeURIComponent(tallyKey)+q,{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
     if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();if(my!==tallySeq)return;
     const sel=document.getElementById("tcard");if(!sel.options.length)(j.cards||[]).forEach(c=>{const o=document.createElement("option");o.value=c.key;o.textContent=c.name;sel.append(o)});
+    if(j.key!==tallyKey||j.from!==(tallyLast||{}).from||j.to!==(tallyLast||{}).to)tallyDay="";
     sel.value=j.key;tallyKey=j.key;document.getElementById("tfrom").value=j.from;document.getElementById("tto").value=j.to;document.getElementById("tto").max=j.today;document.getElementById("tfrom").max=j.today;
     if(!j.ready){el.replaceChildren($("p","small mut",j.message||"读取中…"));if((tries||0)<40)setTimeout(()=>{if(my===tallySeq)tallyLoad((tries||0)+1)},1000);return}
     tallyRender(j)}
@@ -19867,9 +19907,9 @@ class Bot:
             d1 = dt.date.fromisoformat(to[:10]) if to else d0
         except ValueError:
             d0 = d1 = today
-        if rng in {"today", "yesterday", "7d"}:
+        if rng in {"today", "yesterday", "7d", "30d"}:
             d1 = today - dt.timedelta(days=1) if rng == "yesterday" else today
-            d0 = d1 - dt.timedelta(days=6) if rng == "7d" else d1
+            d0 = d1 - dt.timedelta(days={"7d": 6, "30d": 29}.get(rng, 0))
         d1 = min(d1, today)
         d0 = min(d0, d1)
         if (d1 - d0).days >= TALLY_MAX_DAYS:

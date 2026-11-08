@@ -259,7 +259,7 @@ async def run():
     page = m.JOURNAL_PAGE
     for want in ('id="a-versions"', 'id="a-windows"', 'id="sumfilt"', 'id="anafilt"', "journal.json?analysis=1&", "清除筛选", "按设置版本",
                  'id="a-preopen"', "function preopenSection(", "开盘前预挂",
-                 'id="unrecbox"', "function unrecorded(",
+                 'id="unrecbox"', "function unrecorded(", 'anaOpen=true;try{localStorage.setItem("jrnana","1")}',  # 1.143.1: a pre-open row opens 复盘分析 before scrolling to it
                  'id="a-ev"', "function evSection(", "function evChart(", "模型 EV 对实际盈亏"):  # 1.128.0: the pre-open mode's section; 1.130.3: the positions beyond the records; 1.140.0: the EV timeline
         assert want in page, want
     assert data["analysis"]["preopen"] is None  # the paper bot has no pre-open mode: the section stays hidden
@@ -505,7 +505,14 @@ async def browser_check(bot, data):
         assert not errors, errors
         # three rows at first (the resting order and the last two finished ones), every one on request, by day
         assert await page.locator("#list .tr").count() == 3 and "更早的 3 笔可载入" in await page.inner_text("#meta")
+        # 1.143.1: a failed read of the earlier ones says so on the button, which tries again (it used to stay at 载入中…)
+        fail_all = lambda url: url.endswith("journal.json?all=1")
+        await page.route(fail_all, lambda route: route.abort())
         await page.click("#more button:has-text('载入更早的 3 笔')")
+        await page.locator("#more button:has-text('点这里重试')").wait_for()
+        assert await page.locator("#list .tr").count() == 3 and await page.is_enabled("#more button")
+        await page.unroute(fail_all)
+        await page.click("#more button:has-text('点这里重试')")
         await page.wait_for_selector("#list .tr >> nth=5")
         assert await page.locator("#list .tr").count() == 6 and await page.locator("#list .day").count() == 2  # 10-05, and the old record's 10-04
         # filters: by how the result stands, by way of trading; a chip nobody matches is not shown; 全部 clears them all
@@ -523,6 +530,14 @@ async def browser_check(bot, data):
         assert await page.locator("#list .tr").count() == 2
         await page.click("#filters [data-f=taker]")  # the same chip again: off
         assert await page.locator("#list .tr").count() == 6
+        # 1.143.1: 全部 is the status chip's own — a market picked stays picked; 清除筛选 clears them all
+        await page.click("#filters [data-f='c:KOSPI']")
+        await page.click("#filters [data-f=done]")
+        assert await page.locator("#list .tr").count() == 1
+        await page.click("#filters [data-f=all]")
+        assert await page.locator("#list .tr").count() == 2 and await page.locator("#filters [data-f='c:KOSPI'].on").count() == 1
+        await page.click("#fclear")
+        assert await page.locator("#list .tr").count() == 6 and await page.locator("#fclear").count() == 0
         # 1.118.1: the search box — every word must appear in a row's market, side, order id, price, count, state or note
         await page.fill("#q", "KOSPI")
         assert await page.locator("#list .tr").count() == 2 and await page.inner_text("#qn") == "匹配 2 笔"

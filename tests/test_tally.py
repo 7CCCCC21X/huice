@@ -76,6 +76,7 @@ async def run():
     assert [w["r"] for w in p["windows"][:13]] == ["u"] * 6 + ["d"] * 5 + ["f", "u"] and p["windows"][0]["a"] == 100.0 and p["windows"][0]["b"] == 101.0
     assert [(h["h"], h["up"], h["down"], h["flat"]) for h in p["hours"][:2]] == [(0, 6, 5, 1), (1, 6, 6, 0)] and len(p["hours"]) == 10
     assert p["checks"] == {"n": 0, "agree": 0, "bad": []} and p["source"] == "币安现货 1 分钟 K 线" and p["tie"] == float(m.SpotWindowMarket.TIE)
+    assert p["days"] == [{"d": "2026-11-08", "label": "11-08 周日", "total": 120, "up": 60, "down": 59, "flat": 1, "missing": 0, "best_up": 6, "best_down": 5}], p["days"]  # 1.143.1
     asked = len(calls)
     assert bot.tally_payload("BTC-5M", "2026-11-08", "2026-11-08")["ready"] and len(calls) == asked, "kept: a second look reads nothing"
     # the chunk still filling is read again a minute on, the answer shown as it stood meanwhile
@@ -104,6 +105,11 @@ async def run():
     assert (wide["from"], wide["to"]) == ("2026-10-09", "2026-11-08")
     assert (bot.tally_payload("BTC-5M", rng="yesterday")["from"], bot.tally_payload("BTC-5M", rng="yesterday")["to"]) == ("2026-11-07", "2026-11-07")
     assert (bot.tally_payload("BTC-5M", rng="7d")["from"], bot.tally_payload("BTC-5M", rng="7d")["to"]) == ("2026-11-02", "2026-11-08")
+    assert (bot.tally_payload("BTC-5M", rng="30d")["from"], bot.tally_payload("BTC-5M", rng="30d")["to"]) == ("2026-10-10", "2026-11-08")  # 1.143.1
+    await settle()
+    two = bot.tally_payload("BTC-5M", "2026-11-07", "2026-11-08")  # a row a day: 11-07's every window flat here (the candles' base price), 11-08's as above
+    assert two["ready"] and [(d["d"], d["total"], d["up"], d["down"], d["flat"]) for d in two["days"]] == [("2026-11-07", 288, 0, 0, 288), ("2026-11-08", 120, 60, 59, 1)], two["days"]
+    assert two["range"] == "11-07 00:00 到 11-08 10:00" and two["counts"]["total"] == 408
     assert bot.tally_payload("nope")["key"] == "BTC-5M" and bot.tally_payload("BTC-5M", "bad", "date")["from"] == "2026-11-08"
     await settle()
     # a gap: the candles of a chunk not read (the read failed) — those windows 没数据, the reason said, the page not held
@@ -173,6 +179,19 @@ async def browser_check(bot):
                          "最长连跌 5 局（00:30–00:55）", "与 Predict 官方结果核对 2 场：一致 1 · 不一致 1 场（00:30 K 线跌、官方涨）", "按小时"):
                 assert want in text, (want, text)
             assert await page.locator("#tcard option").count() == len(m.preopen_cards()) and await page.input_value("#tcard") == "BTC-5M"
+            # 1.143.1: a dot tapped says its window; only the mismatches on request; a range of days: a row a day, the dots of the day picked
+            await page.locator("#tally .tdots .tdot").nth(6).click()
+            assert "00:30–00:35 跌：106 → 105（-0.943%）；Predict 官方 涨（和 K 线不一致）" in await page.inner_text("#tdetail"), await page.inner_text("#tdetail")
+            await page.click("#tally button:has-text('只看和官方不一致的')")
+            assert await page.locator("#tally .tdots.only").count() == 1
+            await page.click("#tally button:has-text('显示全部场次')")
+            await page.click("#tallybody .tq[data-r='7d']")
+            await page.locator("#tally .tdays tr.pick").nth(6).wait_for()
+            assert await page.locator("#tally .tdays tr.pick").count() == 7 and "11-08 周日" in await page.locator("#tally .tdays tr.on").inner_text()
+            assert await page.locator("#tally .tdots .tdot").count() == 120 and "11-08 的每一场" in await page.locator("#tally").inner_text()
+            await page.locator("#tally .tdays tr.pick").nth(5).click()  # 11-07
+            await page.locator("#tally .tdots .tdot.f").nth(287).wait_for()
+            assert await page.locator("#tally .tdots .tdot").count() == 288 and "11-07 周六" in await page.locator("#tally .tdays tr.on").inner_text()
             await page.select_option("#tcard", "ETH-5M")  # the gap: every dot hollow, the reason said
             await page.locator("#tally .tdots .tdot.x").nth(119).wait_for()  # (the page's CSP refuses wait_for_function's string)
             assert "有一部分 K 线没读到" in await page.locator("#tally").inner_text()
