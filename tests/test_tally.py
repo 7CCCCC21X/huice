@@ -1,5 +1,6 @@
 """Offline checks of the review page's 市场涨跌统计 (1.143.0): each window's up or down by Binance's 1-minute candles —
-the counts, the runs, the hours, the ties and gaps, Predict's own results against the candles', the range, the page.
+the counts, the runs, the hours, the ties and gaps, Predict's own results against the candles', the range, the page; 跟随还是反转
+and 预挂成交的那一边 (1.144.0).
 
 Run: python tests/test_tally.py
 """
@@ -49,7 +50,73 @@ def candles(start: int, limit: int, now: int) -> list:
     return out
 
 
+def day_rows() -> list[dict]:
+    """The synthetic day's windows as tally_rows gives them (a 5-minute step each): 6 up, 5 down, a tie, then up and down in turn."""
+    return [{"s": DAY0 + i * 300_000, "e": DAY0 + (i + 1) * 300_000, "r": "u" if s > 0 else "d" if s < 0 else "f"} for i, s in enumerate(STEPS)]
+
+
+# 预挂 fills for the day (1.144.0): (the window's index, up filled, down filled, price, Predict's result kept): the up side filled where the
+# candles went down 20 times and up 5 times, the down side where they went up 15 times and down 5 times — 10 wins of 45, adverse selection
+FILLS = ([(i, 10, 0, 0.49, "") for i in range(13, 52, 2)] + [(i, 10, 0, 0.49, "") for i in (12, 14, 16, 18, 20)]
+         + [(i, 0, 10, 0.49, "") for i in range(52, 81, 2)] + [(i, 0, 10, 0.49, "") for i in (81, 83, 85, 87, 89)]
+         + [(i, 10, 0, 0.48, "") for i in (13, 15, 17)]                                 # a deeper level in windows already counted: the window once, the level apart
+         + [(100, 10, 5, 0.49, ""), (101, 10, 10, 0.49, ""), (103, 3, 10, 0.49, ""), (105, 10, 2, 0.49, "")]  # both sides: hedged, the larger side 2 of 3
+         + [(11, 10, 0, 0.49, "")])                                                     # the tie: no result yet
+
+
+def ledger(fills: list) -> list[dict]:
+    """Pre-open ledger records as quote_of reads them: BTC-5M windows of the day, the price, the shares filled a side, the result kept."""
+    out = []
+    for n, (k, up, down, price, result) in enumerate(fills):
+        start = DAY0 + k * 300_000
+        out.append({"key": f"BTC-5M-{n}", "name": "BTC 5分涨跌 测试", "slug": f"btc-updown-5m-{start // 1000}" + ("#1" if price != 0.49 else "") + "@1",
+                    "price": price, "shares": 10.0, "start_ms": start, "phase": "done", "accounted": bool(result), "result": result, "attempt": 1,
+                    "orders": {side: {"state": "filled" if got else "cancelled", "filled": got} for side, got in (("up", up), ("down", down))}})
+    return out
+
+
+def unit_checks():
+    """跟随还是反转 and 预挂成交的那一边 (1.144.0) on rows and fills made by hand."""
+    rows = day_rows()
+    f = m.tally_follow(rows)
+    # pairs: 5 ups after ups, an up into a down, 4 downs after downs (the tie breaks the chain), then 107 turns; p = 60/119
+    assert (f["pairs"], f["same"], f["after_up"], f["after_down"], f["expected"], f["z"]) == (117, 9, {"n": 60, "up": 5}, {"n": 57, "down": 4}, 58.5, -9.16), f
+    assert [(r["k"], r["len"], r["n"], r["same"]) for r in f["runs"]] == [("u", 1, 55, 1), ("u", 2, 1, 1), ("u", 3, 1, 1), ("u", 4, 3, 2),
+                                                                           ("d", 1, 54, 1), ("d", 2, 1, 1), ("d", 3, 1, 1), ("d", 4, 1, 1)], f["runs"]
+    assert f["verdict"] == "偏反转（明显，超过 3σ）：涨跌容易交替" and f["p"] == round(60 / 119, 4)
+    # a gap (the next starts later than the last ended: a closed market) or a missing candle breaks the chain, and the run restarts
+    gap = [{"s": 0, "e": 5, "r": "u"}, {"s": 5, "e": 10, "r": "u"}, {"s": 20, "e": 25, "r": "u"}, {"s": 25, "e": 30, "r": "x"}, {"s": 30, "e": 35, "r": "u"}, {"s": 35, "e": 40, "r": "u"}]
+    g = m.tally_follow(gap)
+    assert (g["pairs"], g["same"], g["z"]) == (2, 2, None) and [(r["k"], r["len"], r["n"]) for r in g["runs"] if r["n"]] == [("u", 1, 2)], g  # p = 1: no spread to test against
+    assert g["verdict"] == f"样本太少（不到 {m.TALLY_MIN_PAIRS} 对），先别下结论"
+    assert m.tally_follow([])["pairs"] == 0 and m.tally_follow([])["z"] is None
+    # streaky sequences read as following, a fair coin as nothing: 40 ups then 40 downs; up, up, down, down … (a pair in turn)
+    streak = [{"s": i, "e": i + 1, "r": "u" if i < 40 else "d"} for i in range(80)]
+    assert m.tally_follow(streak)["verdict"].startswith("偏跟随（明显，超过 3σ）：涨了容易接着涨") and m.tally_follow(streak)["z"] > 3
+    pairs = [{"s": i, "e": i + 1, "r": "u" if i // 2 % 2 == 0 else "d"} for i in range(80)]  # same and turn in turn: half the pairs the same
+    assert abs(m.tally_follow(pairs)["z"]) < 2 and m.tally_follow(pairs)["verdict"] == "像抛硬币，看不出跟随或反转"
+    assert m.tally_reading(2.4, 50, 30, "对", ("偏跟随", "x"), ("偏反转", "y"), "e") == "偏跟随（有一点，2σ 到 3σ，可能是运气，换个时间段再看）：x"
+    assert m.tally_reading(-2.4, 50, 30, "对", ("偏跟随", "x"), ("偏反转", "y"), "e").startswith("偏反转（有一点") and m.tally_reading(1.9, 50, 30, "对", ("a", "b"), ("c", "d"), "e") == "e"
+    # the fills: one-sided windows by their side, a window's levels together, Predict's result over the candles', the hedged ones apart
+    fills = [{"s": DAY0 + k * 300_000, "up": up, "down": down, "price": price, "result": res} for k, up, down, price, res in FILLS]
+    fills += [{"s": DAY0 + 107 * 300_000, "up": 0, "down": 10, "price": 0.49, "result": "s"},   # Predict settled 50-50: not a win, not a loss
+              {"s": DAY0 + 500 * 300_000, "up": 10, "down": 0, "price": 0.49, "result": ""}]   # not one of the range's windows
+    x = m.tally_fills(rows, fills)
+    assert x["windows"] == 51 and x["up"] == {"n": 26, "decided": 25, "won": 5, "expected": 12.6} and x["down"] == {"n": 21, "decided": 20, "won": 5, "expected": 9.9}, x
+    assert x["one"]["decided"] == 45 and x["one"]["won"] == 10 and x["one"]["expected"] == 22.5 and x["one"]["z"] == -3.73, x["one"]
+    assert x["one"]["verdict"] == "有逆向选择（明显，超过 3σ）：成交那边赢得比随机少，被吃掉的多是要输的那边"
+    assert x["both"] == {"n": 4, "uneven": 3, "heavy_won": 2} and (x["split"], x["unknown"], x["kline"]) == (1, 1, 45) and x["price"] == 0.4894, x
+    assert x["levels"] == [{"price": 0.49, "n": 45, "won": 10, "expected": 22.5}, {"price": 0.48, "n": 3, "won": 0, "expected": 1.5}], x["levels"]
+    # Predict's result where the ledger keeps one: an up fill the candles call down, Predict up — a win; too few to read
+    few = m.tally_fills(rows, [{"s": DAY0 + 13 * 300_000, "up": 10, "down": 0, "price": 0.49, "result": "u"}, {"s": DAY0 + 13 * 300_000, "up": 0, "down": 0, "price": 0.48, "result": ""}])
+    assert (few["windows"], few["up"]["won"], few["kline"], few["one"]["z"] is not None) == (1, 1, 0, True), few
+    assert few["one"]["verdict"] == f"样本太少（不到 {m.TALLY_MIN_FILLS} 场），先别下结论" and few["levels"] == [{"price": 0.49, "n": 1, "won": 1, "expected": 0.5}]
+    assert m.tally_fills(rows, [])["windows"] == 0 and m.tally_fills(rows, [])["price"] is None and m.tally_fills([], [])["one"]["z"] is None
+    assert len(ledger(FILLS)) == len(FILLS)
+
+
 async def run():
+    unit_checks()
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
     bot = m.Bot(cfg, m.Store(":memory:"), FM(NOW), None)
     calls, broken = [], set()
@@ -99,6 +166,19 @@ async def run():
     p = bot.tally_payload("BTC-5M", "2026-11-08", "2026-11-08")
     assert p["checks"] == {"n": 2, "agree": 1, "bad": [{"s": DAY0 + 6 * 300_000, "r": "d", "o": "u"}]}, p["checks"]
     assert [(w.get("o"), w["r"]) for w in p["windows"] if w.get("o")] == [("u", "u"), ("u", "d"), ("s", "f")]
+    # 1.144.0: 跟随还是反转 over the day's windows; 预挂成交的那一边 from the pre-open ledger (none on this bot until it has one)
+    assert p["follow"] == m.tally_follow(day_rows()) and p["fills"]["windows"] == 0, (p["follow"], p["fills"])
+    rows = ledger(FILLS)
+    bot.preopen_rows = lambda: rows
+    p = bot.tally_payload("BTC-5M", "2026-11-08", "2026-11-08")
+    assert (p["fills"]["windows"], p["fills"]["one"]["won"], p["fills"]["one"]["decided"], p["fills"]["one"]["z"]) == (50, 10, 45, -3.73), p["fills"]
+    assert p["fills"]["both"] == {"n": 4, "uneven": 3, "heavy_won": 2} and p["fills"]["unknown"] == 1 and p["checks"]["n"] == 2  # no result kept: nothing official
+    assert bot.tally_fill_rows(m.tally_card("ETH-5M"), {DAY0 + k * 300_000 for k in range(120)}) == []  # another card's windows: none of these
+    kept = ledger([(13, 10, 0, 0.49, "up"), (14, 0, 0, 0.49, ""), (15, 0, 10, 0.49, "split")])  # the result the ledger keeps reaches the stat; an unfilled record is none
+    bot.preopen_rows = lambda: kept
+    assert bot.tally_fill_rows(m.tally_card("BTC-5M"), {DAY0 + k * 300_000 for k in range(120)}) == [
+        {"s": DAY0 + 13 * 300_000, "up": 10.0, "down": 0.0, "price": 0.49, "result": "u"}, {"s": DAY0 + 15 * 300_000, "up": 0.0, "down": 10.0, "price": 0.49, "result": "s"}]
+    bot.preopen_rows = lambda: rows
     # the range: a future day is today; more than TALLY_MAX_DAYS days are cut to the last ones; yesterday and the last 7 days
     assert (bot.tally_payload("BTC-5M", "2026-12-01", "2026-12-05")["from"], bot.tally_payload("BTC-5M", "2026-12-01", "2026-12-05")["to"]) == ("2026-11-08", "2026-11-08")
     wide = bot.tally_payload("BTC-5M", "2026-09-01", "2026-11-08")
@@ -179,6 +259,12 @@ async def browser_check(bot):
                          "最长连跌 5 局（00:30–00:55）", "与 Predict 官方结果核对 2 场：一致 1 · 不一致 1 场（00:30 K 线跌、官方涨）", "按小时"):
                 assert want in text, (want, text)
             assert await page.locator("#tcard option").count() == len(m.preopen_cards()) and await page.input_value("#tcard") == "BTC-5M"
+            for want in ("跟随还是反转", "上一场涨之后，下一场涨 5/60（8%）· 上一场跌之后，下一场跌 4/57（7%）", "同向 9 次、反向 108 次；这段涨占 50%，如果每场互不相干，同向该有 58.5 次，实际偏离 −9.2σ → 偏反转（明显，超过 3σ）：涨跌容易交替",
+                         "连涨 4 场以上", "预挂成交的那一边", "只成交一边、分出结果的 45 场里，成交那边赢 10 场；随机成交该赢 22.5 场，实际偏离 −3.7σ → 有逆向选择（明显，超过 3σ）",
+                         "这些成交均价 48.9¢：成交那边赢的占比要高过 48.9% 才赚钱", "45 场还没有官方结果，按 K 线算", "另有 1 场结果还没定，没算进去",
+                         "两边都成交的 4 场两边对冲，不算输赢（其中两边不一样多的 3 场，多的那边赢 2 场）", "按价格档"):  # 1.144.0
+                assert want in text, (want, text)
+            assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll with the new tables"
             # 1.143.1: a dot tapped says its window; only the mismatches on request; a range of days: a row a day, the dots of the day picked
             await page.locator("#tally .tdots .tdot").nth(6).click()
             assert "00:30–00:35 跌：106 → 105（-0.943%）；Predict 官方 涨（和 K 线不一致）" in await page.inner_text("#tdetail"), await page.inner_text("#tdetail")

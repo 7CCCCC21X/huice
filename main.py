@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.143.1"
+VERSION = "1.144.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -7951,6 +7951,135 @@ def tally_summary(rows: list[dict], official: Mapping[int, str]) -> dict:
             "checks": {"n": agree + len(bad), "agree": agree, "bad": bad}}
 
 
+TALLY_MIN_PAIRS = 30   # 跟随还是反转: fewer adjacent pairs than this, no reading (1.144.0)
+TALLY_MIN_FILLS = 20   # 预挂成交的那一边: fewer one-sided windows with a result than this, no reading (1.144.0)
+
+
+def tally_reading(z: float | None, n: int, least: int, unit: str, above: tuple[str, str], below: tuple[str, str], even: str) -> str:
+    """A z-score as the page reads it (1.144.0): under ``least`` samples nothing is said; within 2σ, ``even``; 2σ to 3σ a lean
+    that may well be luck (a page looked at over many cards and ranges turns some up by chance); 3σ and beyond, clear.
+    ``above`` / ``below``: (the lean, what it means) for z > 0 / z < 0."""
+    if z is None or n < least:
+        return f"样本太少（不到 {least} {unit}），先别下结论"
+    if abs(z) < 2:
+        return even
+    head, tail = above if z > 0 else below
+    return f"{head}（{'明显，超过 3σ' if abs(z) >= 3 else '有一点，2σ 到 3σ，可能是运气，换个时间段再看'}）：{tail}"
+
+
+def tally_base(rows: list[dict]) -> float:
+    """The share of ups among the windows that went up or down (0.5 with none)."""
+    ups = sum(1 for r in rows if r["r"] == "u")
+    decided = ups + sum(1 for r in rows if r["r"] == "d")
+    return ups / decided if decided else 0.5
+
+
+def tally_follow(rows: list[dict]) -> dict:
+    """跟随还是反转 (1.144.0): each window against the one right before it — the two adjacent (the later starts where the
+    earlier ended) and both up or down; a tie, a missing candle or a closed market between breaks the chain. After an up,
+    how often up again; after a down, how often down again; the same by the run going on before (1, 2, 3, 4+ in a row);
+    and all of it against independence: with this range's share of ups p, a window follows an up with p and a down with
+    1 − p whatever came before, so the follows over N pairs come to N_up·p + N_down·(1 − p), give or take √(N·p·(1 − p))."""
+    p = tally_base(rows)
+    after = {"u": [0, 0], "d": [0, 0]}                                # the earlier one's side -> [pairs, the later the same]
+    runs = {(k, n): [0, 0] for k in "ud" for n in range(1, 5)}        # (side, the run ending at the earlier one, 4 = 4+) -> [pairs, same]
+    prev, run = None, 0
+    for r in rows:
+        linked = prev is not None and prev["r"] in ("u", "d") and r["s"] == prev["e"]
+        if linked and r["r"] in ("u", "d"):
+            same = int(r["r"] == prev["r"])
+            for cell in (after[prev["r"]], runs[(prev["r"], min(run, 4))]):
+                cell[0] += 1
+                cell[1] += same
+        run = (run + 1 if linked and r["r"] == prev["r"] else 1) if r["r"] in ("u", "d") else 0
+        prev = r
+    n, same = after["u"][0] + after["d"][0], after["u"][1] + after["d"][1]
+    expected = after["u"][0] * p + after["d"][0] * (1 - p)
+    var = n * p * (1 - p)
+    z = round((same - expected) / math.sqrt(var), 2) if var > 0 else None
+    return {"pairs": n, "same": same, "expected": round(expected, 1), "p": round(p, 4), "z": z,
+            "after_up": {"n": after["u"][0], "up": after["u"][1]}, "after_down": {"n": after["d"][0], "down": after["d"][1]},
+            "runs": [{"k": k, "len": length, "n": v[0], "same": v[1]} for (k, length), v in runs.items()],
+            "verdict": tally_reading(z, n, TALLY_MIN_PAIRS, "对", ("偏跟随", "涨了容易接着涨、跌了容易接着跌"), ("偏反转", "涨跌容易交替"),
+                                     "像抛硬币，看不出跟随或反转")}
+
+
+def tally_fills(rows: list[dict], fills: list[dict]) -> dict:
+    """预挂成交的那一边 (1.144.0): the pre-open mode's fills in the range's windows of the card (``fills``: a ledger record each,
+    {s: the window's start, up, down: the shares filled, price, result: Predict's u / d / s or ""}). A window's records
+    (its levels, its attempts) together: filled on the up side only, the down side only, or both. The one-sided ones: how
+    often the filled side won — Predict's result where the ledger holds it, else the candles' (tally_rows) — against fills
+    taken at random, which win with this range's share of ups p on the up side and 1 − p on the down side: fewer wins
+    than that is adverse selection (the takers knew). By price level, each record on its own; the one-sided fills' mean
+    price — the share a side must win to pay. Both sides filled: hedged, not a bet (the larger side's wins noted)."""
+    p = tally_base(rows)
+    by_start = {r["s"]: r for r in rows}
+    windows: dict[int, dict] = {}
+    records = []
+    for f in fills:
+        if f["s"] not in by_start or f["up"] + f["down"] <= 0:
+            continue
+        w = windows.setdefault(f["s"], {"up": 0.0, "down": 0.0, "cost": 0.0, "result": ""})
+        w["up"] += f["up"]
+        w["down"] += f["down"]
+        w["cost"] += (f["up"] + f["down"]) * f["price"]
+        w["result"] = w["result"] or (f["result"] if f["result"] in ("u", "d", "s") else "")
+        records.append(f)
+
+    def outcome(s: int) -> str:  # u / d / s, or "" while neither Predict nor the candles say
+        r = windows[s]["result"] or by_start[s]["r"]
+        return r if r in ("u", "d", "s") else ""
+
+    sides = {k: {"n": 0, "decided": 0, "won": 0} for k in "ud"}
+    both = {"n": 0, "uneven": 0, "heavy_won": 0}
+    split = unknown = kline = 0
+    shares = cost = 0.0
+    for s, w in windows.items():
+        o = outcome(s)
+        if w["up"] > 0 and w["down"] > 0:
+            both["n"] += 1
+            if abs(w["up"] - w["down"]) > 1e-9 and o in ("u", "d"):
+                both["uneven"] += 1
+                both["heavy_won"] += int(o == ("u" if w["up"] > w["down"] else "d"))
+            continue
+        side = "u" if w["up"] > 0 else "d"
+        sides[side]["n"] += 1
+        if o == "s":
+            split += 1
+        elif not o:
+            unknown += 1
+        else:
+            sides[side]["decided"] += 1
+            sides[side]["won"] += int(o == side)
+            kline += int(not w["result"])
+            shares += w["up"] + w["down"]
+            cost += w["cost"]
+    levels: dict[float, dict] = {}
+    for f in records:
+        o = outcome(f["s"])
+        if (f["up"] > 0) == (f["down"] > 0) or o not in ("u", "d"):
+            continue
+        side = "u" if f["up"] > 0 else "d"
+        level = levels.setdefault(round(f["price"], 4), {"price": round(f["price"], 4), "n": 0, "won": 0, "expected": 0.0})
+        level["n"] += 1
+        level["won"] += int(o == side)
+        level["expected"] += p if side == "u" else 1 - p
+    decided = sides["u"]["decided"] + sides["d"]["decided"]
+    won = sides["u"]["won"] + sides["d"]["won"]
+    expected = sides["u"]["decided"] * p + sides["d"]["decided"] * (1 - p)
+    var = decided * p * (1 - p)
+    z = round((won - expected) / math.sqrt(var), 2) if var > 0 else None
+    return {"windows": len(windows), "p": round(p, 4),
+            "up": {**sides["u"], "expected": round(sides["u"]["decided"] * p, 1)},
+            "down": {**sides["d"], "expected": round(sides["d"]["decided"] * (1 - p), 1)},
+            "one": {"decided": decided, "won": won, "expected": round(expected, 1), "z": z,
+                    "verdict": tally_reading(z, decided, TALLY_MIN_FILLS, "场", ("成交那边赢得比随机多", "被吃的多是要赢的那边"),
+                                             ("有逆向选择", "成交那边赢得比随机少，被吃掉的多是要输的那边"), "和随机成交差不多，看不出逆向选择")},
+            "both": both, "split": split, "unknown": unknown, "kline": kline,
+            "price": round(cost / shares, 4) if shares > 0 else None,
+            "levels": [{**lv, "expected": round(lv["expected"], 1)} for _, lv in sorted(levels.items(), reverse=True)]}
+
+
 def updown_odds(price: float, line: float, sigma: float, years: float, drift: float = -0.5,
                 tick: float = 0.01) -> tuple[float, float, float, float]:
     """(up, flat, down, z) for a close `years` from now against `line`: log-normal with annual σ, its log mean moved by
@@ -13338,6 +13467,31 @@ function tallyDays(j){  // 按日期 (1.143.1): a row a day — its counts, its 
   w.querySelectorAll("tr").forEach((tr,i)=>{if(!i)return;const d=j.days[i-1];if(j.cycle_ms>=86400e3)return;tr.classList.add("pick");if(d.d===tallyDay)tr.classList.add("on");
     tr.addEventListener("click",()=>{tallyDay=d.d;tallyRender(tallyLast)})});
   return w}
+const tallyZ=z=>(z>=0?"+":"−")+Math.abs(z).toFixed(1)+"σ",tallyPc=(a,b)=>b?Math.round(a*100/b)+"%":"—";
+function tallyFollow(j){  // 跟随还是反转 (1.144.0): each window against the one right before it, against windows that know nothing of each other
+  const f=j.follow,out=[$("div","sub","跟随还是反转（相邻两场都分出涨跌才算；平、没数据、休市都会把相邻断开）")];
+  if(!f||!f.pairs){out.push($("p","small mut","这段时间还没有相邻两场都分出涨跌的"));return out}
+  const au=f.after_up,ad=f.after_down,q=Math.round(f.p*100);
+  out.push($("p","small","上一场涨之后，下一场涨 "+au.up+"/"+au.n+"（"+tallyPc(au.up,au.n)+"）· 上一场跌之后，下一场跌 "+ad.down+"/"+ad.n+"（"+tallyPc(ad.down,ad.n)+"）"));
+  out.push($("p","small mut","同向 "+f.same+" 次、反向 "+(f.pairs-f.same)+" 次；这段涨占 "+q+"%，如果每场互不相干，同向该有 "+f.expected+" 次"+(f.z!=null?"，实际偏离 "+tallyZ(f.z):"")+" → "+f.verdict));
+  out.push(table(["前面","次数","同向","占比","随机该占"],f.runs.filter(r=>r.n).map(r=>[(r.k==="u"?"连涨 ":"连跌 ")+r.len+(r.len>=4?" 场以上":" 场"),r.n,r.same,tallyPc(r.same,r.n),(r.k==="u"?q:100-q)+"%"])));
+  return out}
+function tallyFills(j){  // 预挂成交的那一边 (1.144.0): how often the side the pre-open got filled on won, against fills taken at random
+  const f=j.fills,out=[$("div","sub","预挂成交的那一边（本卡这段时间；结果先用 Predict 官方的，还没有的按 K 线）")];
+  if(!f||!f.windows){out.push($("p","small mut","这段时间本卡的预挂没有成交（开着预挂、有成交的场次才有这一项）"));return out}
+  const o=f.one,q=Math.round(f.p*100);
+  out.push(table(["成交","场次","那边赢","赢占比","随机该赢"],[["只成交涨",f.up.decided,f.up.won,tallyPc(f.up.won,f.up.decided),q+"%"],
+    ["只成交跌",f.down.decided,f.down.won,tallyPc(f.down.won,f.down.decided),(100-q)+"%"],["只一边合计",o.decided,o.won,tallyPc(o.won,o.decided),tallyPc(o.expected,o.decided)],
+    ["两边都成交",f.both.n,"—","—","—"]]));
+  out.push($("p","small",(o.decided?"只成交一边、分出结果的 "+o.decided+" 场里，成交那边赢 "+o.won+" 场；随机成交该赢 "+o.expected+" 场"+(o.z!=null?"，实际偏离 "+tallyZ(o.z):"")+" → ":"")+o.verdict));
+  if(f.price!=null){const c=(f.price*100).toFixed(1);out.push($("p","small mut","这些成交均价 "+c+"¢：成交那边赢的占比要高过 "+c+"% 才赚钱"))}
+  const notes=[];if(f.kline)notes.push(f.kline+" 场还没有官方结果，按 K 线算");
+  if(f.split||f.unknown)notes.push("另有"+(f.split?" "+f.split+" 场官方 50/50":"")+(f.split&&f.unknown?"、":"")+(f.unknown?" "+f.unknown+" 场结果还没定":"")+"，没算进去");
+  if(f.both.n)notes.push("两边都成交的 "+f.both.n+" 场两边对冲，不算输赢"+(f.both.uneven?"（其中两边不一样多的 "+f.both.uneven+" 场，多的那边赢 "+f.both.heavy_won+" 场）":""));
+  if(notes.length)out.push($("p","small mut",notes.join("；")));
+  if((f.levels||[]).length>1)out.push($("div","sub","按价格档（每档的挂单各算各的，只算只成交一边的）"),
+    table(["档位","次数","那边赢","赢占比","随机该赢"],f.levels.map(l=>[(l.price*100).toFixed(1).replace(/\.0$/,"")+"¢",l.n,l.won,tallyPc(l.won,l.n),tallyPc(l.expected,l.n)])));
+  return out}
 function tallyRender(j){const el=document.getElementById("tally"),c=j.counts||{};el.replaceChildren();tallyLast=j;
   const multi=j.from!==j.to,days=j.days||[];if(multi&&!days.some(d=>d.d===tallyDay))tallyDay=days.length?days[days.length-1].d:"";
   const dec=(c.up||0)+(c.down||0),rate=dec?Math.round(c.up*100/dec)+"%":"—";
@@ -13356,6 +13510,7 @@ function tallyRender(j){const el=document.getElementById("tally"),c=j.counts||{}
   const lg=$("p","small mut tlegend","");[["u","涨"],["d","跌"],["f","平或待定"],["x","没数据"]].forEach(([k,w])=>lg.append($("span","tdot "+k),w));lg.append($("span","tdot u bad"),"和官方结果不一致");el.append(lg);
   if((j.hours||[]).length>1)el.append($("div","sub",j.from!==j.to?"按小时（北京时间，几天里同一小时合在一起）":"按小时（北京时间）"),
     table(["开始","涨","跌","平","没数据","涨占比"],j.hours.map(h=>{const n=h.up+h.down;return [String(h.h).padStart(2,"0")+":00",h.up,h.down,h.flat||"—",h.missing||"—",n?Math.round(h.up*100/n)+"%":"—"]})));
+  el.append(...tallyFollow(j),...tallyFills(j));  // 1.144.0
   el.append($("p","small mut","数据：币安"+(j.source||"").replace("币安","")+"；"+(j.tie?"开始和结束相差不到 "+(j.tie*100).toFixed(2)+"% 记平或待定":"只有完全相同才记平")));
   document.getElementById("tallysum").textContent=j.name+" 涨 "+c.up+" · 跌 "+c.down+(c.flat?" · 平 "+c.flat:"")}
 async function tallyLoad(tries){const my=++tallySeq,el=document.getElementById("tally");if(!tries)el.replaceChildren($("p","small mut","读取中…"));
@@ -19896,7 +20051,8 @@ class Bot:
         """journal.json?tally=<card>&from=<date>&to=<date> (or &range=today | yesterday | 7d) — the review page's 市场涨跌统计
         (1.143.0): every window of the card that started on those days (Beijing) and is over, up or down by Binance's 1-minute
         candles (tally_rows: the bot's own pre-settlement), with the counts, the longest runs, the hours, Predict's own result
-        where the bot holds one (tally_official) and the time the figures cover. Past days as well as today (Binance keeps
+        where the bot holds one (tally_official), the time the figures cover; 跟随还是反转 (tally_follow) and the pre-open
+        mode's filled side against chance (tally_fills), 1.144.0. Past days as well as today (Binance keeps
         the candles), TALLY_MAX_DAYS at most. The candles come from a background read (tally_fetch) the first time: "ready"
         false until then — the page asks again a second on."""
         now_ms = self.market.now_ms()
@@ -19947,7 +20103,9 @@ class Bot:
         else:
             label = f"{at(rows[0]['s']):%m-%d %H:%M} 到 {at(rows[-1]['e']):%m-%d %H:%M}"
         return {**base, "ready": True, "range": label, "windows": rows, **summary, "errors": errors[:3], "tie": tally_tie(card),
-                "source": "币安现货 1 分钟 K 线" if source == "spot" else "币安合约指数 1 分钟 K 线"}
+                "source": "币安现货 1 分钟 K 线" if source == "spot" else "币安合约指数 1 分钟 K 线",
+                "follow": tally_follow(rows),                                                    # 1.144.0: 跟随还是反转
+                "fills": tally_fills(rows, self.tally_fill_rows(card, {w[0] for w in windows}))}  # 1.144.0: 预挂成交的那一边
 
     def tally_fetch(self, source: str, symbol: str, chunks: list[int]) -> None:
         """The candle chunks read in the background, three at a time (tally_gate): one not read yet, one still filling; one
@@ -19992,6 +20150,21 @@ class Bot:
         self.tally_errors.pop(k, None)
         while len(self.tally_cache) > TALLY_KEEP_CHUNKS:
             self.tally_cache.pop(next(iter(self.tally_cache)))
+
+    def tally_fill_rows(self, card: Any, starts: set) -> list[dict]:
+        """The pre-open mode's ledger records with a fill in the card's windows starting at ``starts`` (tally_fills): the window's
+        start, the shares filled a side, the price, Predict's result where the record keeps it (u / d / s, else "")."""
+        from preopen import quote_of, window_of
+        out = []
+        for pair in self.preopen_rows():
+            start = card.start_of(window_of(pair))
+            if start not in starts:
+                continue
+            q = quote_of(pair)
+            if q["filled"] > 0:
+                out.append({"s": start, "up": q["filled_up"], "down": q["filled_down"], "price": q["price"],
+                            "result": {"up": "u", "down": "d", "split": "s"}.get(q["result"], "")})
+        return out
 
     def tally_official(self, card: Any, starts: set) -> dict[int, str]:
         """Window start -> Predict's own result ("u" / "d" / "s": 50-50) where the bot holds it: the pre-open mode's settled
