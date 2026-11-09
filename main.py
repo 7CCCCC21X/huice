@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.145.2"
+VERSION = "1.145.3"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -8325,6 +8325,34 @@ SHAPE_PRIOR = 8                  # a slot's variance is pooled with its two neig
 SHAPE_FACTOR_BOUNDS = (0.4, 2.5)  # the factor the shape puts on the recent level (the window's usual σ over the recent minutes' usual) stays within this
 
 
+FLAT_RUN = 10   # 1.145.3: this many 1-minute candles in a row closing where the one before closed is a round-the-clock index standing
+                # still while its market is shut (gold and oil from Friday's close to Sunday evening, and an hour every day)
+
+
+def flat_minutes(rows: list, run: int = FLAT_RUN) -> set[int]:
+    """The open times of the 1-minute candles (Binance klines, in time order) that close where the minute before closed, in
+    stretches of ``run`` or more: a round-the-clock index standing still while its market is shut. σ leaves them out (the
+    keep of minute_returns) as a session card leaves its night out — 1.145.3: their zero returns made the hours after a
+    reopen look calm, the first windows after the weekend priced on a fraction of the market's σ."""
+    out: set[int] = set()
+    stretch: list[int] = []
+    prev = None
+    for r in rows:
+        if not (isinstance(r, list) and len(r) > 6):
+            continue
+        o, c = int(r[0]), float(r[4])
+        if prev is not None and o - prev[0] == 60_000 and c == prev[1]:
+            stretch.append(o)
+        else:
+            if len(stretch) >= run:
+                out.update(stretch)
+            stretch = []
+        prev = (o, c)
+    if len(stretch) >= run:
+        out.update(stretch)
+    return out
+
+
 def minute_returns(rows: list, now_ms: int, keep: Any = None) -> list[tuple[int, float]]:
     """(open_ms, log return) of a price's finished 1-minute candles (Binance klines), neighbouring minutes only — not the
     jump over a lunch break or a night; with ``keep`` (open_ms -> bool: a session's minutes) those candles alone."""
@@ -8492,6 +8520,7 @@ class IndexUpDownMarket(UpDownMarket):
         self.shape_factor = 1.0   # the shape's factor in the σ in hand (minute_vol_shaped)
         self.shape_error = ""     # why the last read of the shape failed (the one in hand stands)
         self.sigma_back: tuple[tuple[int, int], list] | None = None  # (first, last) open of the earlier sessions' minutes σ reads, their candles (sigma_rows, 1.145.1)
+        self.flat_back: tuple[int, list] | None = None  # round the clock: (the page start it was read for, the live minutes before the shut) (live_rows, 1.145.3)
         self.index_ms = 0  # the newest index's own time (the push's event time, the read's)
         self.lead: IndexQuote | None = None  # the exchange's realtime quote now (Bot.refresh_updown: note_lead), None when it has none
         self.strike: D | None = None  # the start price Predict shows for the window (Bot.refresh_updown): the line when it agrees with the candle (line_used)
@@ -8589,7 +8618,7 @@ class IndexUpDownMarket(UpDownMarket):
         """The next window's market with this one's shape of the day and when it was read (one read an hour, not one a window),
         and the earlier sessions' candles σ reads on a Monday morning (history: read once, not once a window)."""
         mkt.shape_ms = self.shape_ms
-        mkt.sigma_back = self.sigma_back
+        mkt.sigma_back, mkt.flat_back = self.sigma_back, self.flat_back
         return mkt
 
     def shape_tz(self) -> dt.tzinfo:
@@ -8681,13 +8710,14 @@ class IndexUpDownMarket(UpDownMarket):
         previous session. 1.121.0: the level they show is put on the shape of the day (read_shape, minute_vol_shaped)."""
         if self.shape is None or now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:
             await self.read_shape(now_ms)  # the usual volatility of the window's quarter hour, which the level below is put on
-        rows = await self.sigma_rows()
-        self.sigma, self.shape_factor = minute_vol_shaped(rows, now_ms, self.SIGMA_MINUTES, self.trading, shape=self.shape,
+        rows, keep = await self.sigma_rows()
+        self.sigma, self.shape_factor = minute_vol_shaped(rows, now_ms, self.SIGMA_MINUTES, keep, shape=self.shape,
                                                           at_ms=self.spec.start_ms + 60_000)
         self.sigma_ms = now_ms
 
-    async def sigma_rows(self) -> list:
-        """The 1-minute candles σ is read from. Round the clock: the last SIGMA_MINUTES + 2. Following a session: the last
+    async def sigma_rows(self) -> tuple[list, Any]:
+        """(the 1-minute candles σ is read from, the minutes it counts: open_ms -> bool, None for all). Round the clock: the last
+        SIGMA_MINUTES + 2, every one counted — unless a stretch of them stood still (live_rows). Following a session: the last
         SIGMA_ROWS — a day back, yesterday's session in it — and, when a full page of them holds fewer than SIGMA_MINUTES of
         the session's minutes (a Monday: the day back is the weekend; the day after a holiday), the last SIGMA_MINUTES + 1
         minutes of the sessions before, read once and kept (history: sigma_back), so the open is priced as any other day's
@@ -8695,20 +8725,61 @@ class IndexUpDownMarket(UpDownMarket):
         Until 1.145.1 such a morning had no σ until MINUTE_VOL_MIN minutes of its own session were in (指数 1 分钟 K 线不足):
         each session card's first two windows of the week unpriced. A short page (an index with no older history) stands."""
         if not self.trading:
-            return await self.candles("1m", self.SIGMA_MINUTES + 2)
+            rows = [r for r in await self.candles("1m", self.SIGMA_MINUTES + 2) or [] if isinstance(r, list) and len(r) > 6]
+            return await self.live_rows() if flat_minutes(rows) else (rows, None)
         rows = [r for r in await self.candles("1m", self.SIGMA_ROWS) or [] if isinstance(r, list) and len(r) > 6]
         if len(rows) < self.SIGMA_ROWS or sum(1 for r in rows if self.trading(int(r[0]))) >= self.SIGMA_MINUTES:
-            return rows
+            return rows, self.trading
         oldest = int(rows[0][0])
         block = self.sigma_block(oldest)
         if block is None:
-            return rows
+            return rows, self.trading
         if self.sigma_back is None or self.sigma_back[0] != block:
             first, last = block
             older = await self.get("indexPriceKlines", pair=self.spec.symbol, interval="1m", endTime=last + 59_999,
                                    limit=min(self.SIGMA_ROWS, (last - first) // 60_000 + 1))
             self.sigma_back = (block, [r for r in older or [] if isinstance(r, list) and len(r) > 6])
-        return [r for r in self.sigma_back[1] if int(r[0]) < oldest] + rows
+        return [r for r in self.sigma_back[1] if int(r[0]) < oldest] + rows, self.trading
+
+    async def live_rows(self) -> tuple[list, Any]:
+        """Round the clock, when the last four hours hold a stretch of the index standing still (flat_minutes: its market
+        shut — gold's and oil's hour a day, their weekend): the last SIGMA_ROWS candles (a day back: the daily hour well
+        behind it) and, when those still hold too few live minutes and begin inside the shut (a weekend, a holiday), the
+        market's last live hours before it, read back once and kept (flat_back: for the page starts within a day of the
+        one it was read for); σ counts the live minutes alone. 1.145.3: the still minutes' zero returns made the hours
+        after a reopen look calm."""
+        rows = [r for r in await self.candles("1m", self.SIGMA_ROWS) or [] if isinstance(r, list) and len(r) > 6]
+        flats = flat_minutes(rows)
+        if len(rows) < self.SIGMA_ROWS or len(rows) - len(flats) > self.SIGMA_MINUTES:
+            return rows, (lambda o, flats=flats: o not in flats)
+        oldest = int(rows[0][0])
+        kept = self.flat_back
+        if kept is None or not 0 <= oldest - kept[0] <= self.SIGMA_ROWS * 60_000 or int(rows[1][0]) not in flats:
+            self.flat_back = (oldest, await self.live_before(oldest))
+        rows = [r for r in self.flat_back[1] if int(r[0]) < oldest] + rows
+        flats = flat_minutes(rows)
+        return rows, (lambda o, flats=flats: o not in flats)
+
+    async def live_before(self, before_ms: int) -> list:
+        """The candles of the index's last SIGMA_MINUTES + 1 live minutes before ``before_ms`` (from the first of them on, still
+        stretches among them included), read back a page (SIGMA_ROWS) at a time to SIGMA_BACK_DAYS; fewer found: those."""
+        got: list = []
+        end, floor = before_ms - 1, before_ms - self.SIGMA_BACK_DAYS * DAY_MS
+        while end > floor:
+            page = [r for r in await self.get("indexPriceKlines", pair=self.spec.symbol, interval="1m", endTime=end, limit=self.SIGMA_ROWS) or []
+                    if isinstance(r, list) and len(r) > 6 and int(r[0]) <= end]
+            if not page:
+                break
+            got = page + got
+            if len(got) - len(flat_minutes(got)) > self.SIGMA_MINUTES:
+                break
+            end = int(page[0][0]) - 1
+        flats = flat_minutes(got)
+        live = [int(r[0]) for r in got if int(r[0]) not in flats]
+        if not live:
+            return []
+        first, last = live[max(0, len(live) - self.SIGMA_MINUTES - 1)], live[-1]
+        return [r for r in got if first <= int(r[0]) <= last]
 
     def sigma_block(self, before_ms: int) -> tuple[int, int] | None:
         """(first, last) open time of the last SIGMA_MINUTES + 1 session minutes before ``before_ms`` — the sessions before a
