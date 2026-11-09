@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.145.3"
+VERSION = "1.146.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -6690,7 +6690,7 @@ class BinanceStream(PushStream):
         out = list(c.symbols) if self.venue == "futures" else []
         if c.touch:
             if self.venue == "spot":
-                out += [spec.symbol for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *DAILY_UPDOWN_MARKETS)]
+                out += [spec.symbol for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *DAILY_UPDOWN_MARKETS) if not getattr(spec, "stock", False)]  # (a US stock's touch market: Yahoo)
                 out += [spec.symbol for spec in WINDOW_UPDOWN_MARKETS if spec.venue == "spot"]  # BTC 15分涨跌: the pair's trades
             else:  # a 15-minute card's pair: its mark price stream carries the index that settles it (field i)
                 out += [spec.symbol for spec in WINDOW_UPDOWN_MARKETS if spec.venue == "futures"]
@@ -6964,6 +6964,7 @@ class TouchSpec:
     deadline_ms: int = TOUCH_DEADLINE_MS
     et_offset: int = -5  # US Eastern offset at the deadline, for its label
     fixed_start: bool = False  # the rules name the window start: it wins over Predict's creation time
+    stock: bool = False  # a US stock's market (StockTouchMarket, 1.146.0): the regular session's prices alone, read from Yahoo
 
     def label(self, value: D) -> str:
         """$70,000 -> 70k, $3,000 -> 3k, $900 -> 900: short enough for the edge chips."""
@@ -6987,6 +6988,11 @@ TOUCH_MARKETS = (
     # "between the creation of this market and May 5th 2027 at 11:59 PM ET" (EDT): Binance BNB/USDT 1-minute High / Low, neither
     # hit → 50/50; the window opens at the creation Predict gives. Its own key: BNB 700/900 (decided 11-04) stays "BNB" in TOUCH_SETTLED (1.132.2)
     TouchSpec("BNB-2027", "will-bnb-hit-600-or-800-first", "BNBUSDT", D("600"), D("800"), 0, et_ms(2027, 5, 5, 23, 59, -4), -4),
+    # 1.146.0: "between market creation and April 30th, 2027 at 11:59 PM ET" (EDT): Pyth's NVDA/USD 1-minute candles of the regular
+    # session (9:30 AM – 4:00 PM ET; pre-market and after-hours prices do not count), the Low at or below $160 or the High at or
+    # above $210 first; neither by then: 50/50; split-adjusted (the lines too). Read from Yahoo (StockTouchMarket)
+    TouchSpec("NVDA-2027", "will-nvidia-nvda-stock-hit-160-or-210-first", "NVDA", D("160"), D("210"), 0,
+              et_ms(2027, 4, 30, 23, 59, -4), -4, stock=True),
 )
 # Touch markets no longer listed: no card, no book, no trading. Kept only so that a trade bought on one is still settled
 # on Predict's result, whose outcome names ("$700" / "$900") are read against the market's two lines (touch_spec).
@@ -7179,6 +7185,12 @@ class TouchMarket:
     PRICE_STALE_MS = 5 * 60_000     # a spot price older than this prices nothing
     SIGMA_STALE_MS = 24 * 3600_000  # σ not re-measured for a day: shown, not advised on
     SCAN_STALE_MS = 3 * 3600_000    # the path check must reach this close to now before advice is given
+    SOURCE = "币安现货"              # the price's source, as the card and the records name it (StockTouchMarket: Yahoo)
+    PRICE_WORD = "现货"
+    FEED = "币安"
+    GROUP = "crypto"                # the page's section
+    SIGMA_NOTE = "30 日小时收盘年化"
+    MODEL_NOTE = "双边界首达，连续路径、固定波动率、零漂移；公平价 = P(先触该边) + ½·P(都没碰到)"
 
     def __init__(self, store: "Store", spec: TouchSpec):
         self.store, self.spec = store, spec
@@ -7337,8 +7349,14 @@ class TouchMarket:
         if now_ms - self.priced_ms > self.PRICE_STALE_MS:
             why = f"：{brief_error(self.error, 60)}" if self.error else ""
             return f"币安价格停在 {stamp(self.priced_ms, seconds=False)}（{(now_ms - self.priced_ms) // 60_000} 分钟未更新{why}），暂停概率"
-        return first_touch(float(self.price), float(self.spec.low), float(self.spec.high), self.sigma, 0.0,
-                           max(0.0, (self.spec.deadline_ms - max(now_ms, self.start_ms)) / YEAR_MS))
+        return first_touch(float(self.price), float(self.spec.low), float(self.spec.high), self.sigma, 0.0, self.remaining_years(now_ms))
+
+    def remaining_years(self, now_ms: int) -> float:
+        """The time left for a line to be reached, in the years σ is annualised over: round the clock here."""
+        return max(0.0, (self.spec.deadline_ms - max(now_ms, self.start_ms)) / YEAR_MS)
+
+    def left_text(self, now_ms: int) -> str:
+        return f"{max(0.0, (self.spec.deadline_ms - now_ms) / YEAR_MS) * 365:.1f} 天"
 
     def model_swing(self, now_ms: int) -> float:
         """How far the fair "high first" price moves with σ ×/÷ 1.25 (σ is a 30-day estimate), or with a driftless log
@@ -7347,7 +7365,7 @@ class TouchMarket:
         odds = self.odds(now_ms)
         if not isinstance(odds, TouchOdds) or self.history.get("kind") in {"low", "high"}:
             return 0.0
-        years = max(0.0, (self.spec.deadline_ms - max(now_ms, self.start_ms)) / YEAR_MS)
+        years = self.remaining_years(now_ms)
         spot, low, high = float(self.price), float(self.spec.low), float(self.spec.high)
         variants = [(self.sigma * MODEL_SIGMA_ERROR, 0.0), (self.sigma / MODEL_SIGMA_ERROR, 0.0),
                     (self.sigma, (LOG_DRIFT_VARIANT + 0.5) * self.sigma * self.sigma)]
@@ -10573,6 +10591,173 @@ class StockRangeMarket(RangeMarket):
         return ""
 
 
+class StockTouchMarket(TouchMarket):
+    """A US stock's "which price first" market (TouchSpec with stock=True; NVIDIA $160 / $210, 1.146.0). Pyth's 1-minute
+    candles of the regular session settle it: the first Low at or below the lower line, or High at or above the higher,
+    from the market's creation to the deadline; pre-market and after-hours prices do not count; neither by then, 50/50.
+    Yahoo's chart feed stands in for Pyth, as it does for TradingView on the hit markets (StockRangeMarket, whose readers
+    this card borrows): the same session's consolidated prints — a touch by a few cents is worth checking on Pyth.
+    Time passes in sessions: σ from daily closes, annualised over 252 sessions, the time left the trading time left.
+    The path: the finished sessions' daily High / Low (a session reaching both lines, or the creation's own day reaching
+    one, cannot be ordered from it: a manual check) and the running session's minutes as they come. Advice only while
+    the regular session runs: between sessions the last trade is the price, but the stock trades on after hours — a
+    quote on the close is a free option for whoever saw the after-hours move (the fair price moves some 3.7¢ a 1% move
+    between the lines), and a held card's resting orders are withdrawn after SIM_NO_ODDS_WITHDRAW_MINUTES."""
+    PRICE_SECONDS = StockRangeMarket.PRICE_SECONDS
+    CLOSED_PRICE_SECONDS = StockRangeMarket.CLOSED_PRICE_SECONDS
+    CLOSE_PRINT_MS = StockRangeMarket.CLOSE_PRINT_MS
+    SESSION_QUOTE_STALE_MS = StockRangeMarket.SESSION_QUOTE_STALE_MS
+    SCAN_SECONDS = 300                  # daily bars: σ and the finished sessions' extremes from one request
+    SIGMA_STALE_MS = 3 * 24 * 3600_000  # a long weekend changes nothing: the daily bars are re-read every five minutes anyway
+    MINUTES_STALE_MS = 5 * 60_000       # in the session, the path's live end (today's minutes) must be this fresh to advise
+    VOL_DAYS = StockRangeMarket.VOL_DAYS
+    PRICE_WORD = "股价"
+    FEED = "Yahoo"
+    GROUP = "contract"
+    SIGMA_NOTE = f"{StockRangeMarket.VOL_DAYS} 个交易日收盘、按 {US_TRADING_DAYS} 个交易日年化"
+    MODEL_NOTE = ("双边界首达，连续路径、固定波动率、零漂移，时间只按美股常规交易时段算（盘前盘后不算）；"
+                  "公平价 = P(先触该边) + ½·P(都没碰到)")
+
+    chart = StockRangeMarket.chart                  # Yahoo's chart, either host
+    price_seconds = StockRangeMarket.price_seconds  # 30 s in the session (and while the close may be corrected), 2 minutes between
+    daily_sigma = StockRangeMarket.daily_sigma
+    session_share = StockRangeMarket.session_share
+    price_stale = StockRangeMarket.price_stale
+
+    def __init__(self, store: "Store", spec: TouchSpec):
+        super().__init__(store, spec)
+        self.fetched_ms = 0      # when the price was last read (the trade itself may be hours old between sessions)
+        self.share: tuple[float, int] | None = None  # (in-session share of the daily variance, days)
+        self.minutes_ms = 0      # when the running session's minutes were last read (the path's live end)
+        self.failures = {"price": "", "scan": ""}
+
+    @property
+    def SOURCE(self) -> str:  # noqa: N802 — the class attribute it stands for elsewhere
+        return f"Yahoo 行情（NASDAQ:{self.spec.symbol}，代 Pyth）"
+
+    async def refresh(self, now_ms: int) -> None:
+        mono, why = time.monotonic(), lambda error: clean_error(error) or type(error).__name__
+        if mono - self.times["price"] >= self.price_seconds(now_ms):
+            self.times["price"] = mono
+            try:
+                meta, bars = await self.chart(interval="1m", range="1d", includePrePost="false")
+                if meta["price"] is None:
+                    raise RemoteError("Yahoo 没有返回 regularMarketPrice")
+                self.price, self.priced_ms, self.fetched_ms = D(f"{meta['price']:.4f}"), meta["time_ms"] or now_ms, now_ms
+                self.scan_minutes(bars, now_ms)
+                self.failures["price"] = ""
+            except Exception as error:
+                self.failures["price"] = f"价格：{why(error)}"
+        if mono - self.times["scan"] >= self.SCAN_SECONDS:
+            self.times["scan"] = mono
+            try:
+                _, bars = await self.chart(interval="1d", range="1y")
+                self.sigma, self.sigma_ms = self.daily_sigma(bars, now_ms), now_ms
+                self.share = self.session_share(bars, now_ms)
+                self.scan_days(bars, now_ms)
+                self.failures["scan"] = ""
+            except Exception as error:
+                self.times["scan"] = mono - self.SCAN_SECONDS + 60  # again in a minute
+                self.failures["scan"] = f"日 K：{why(error)}"
+        self.error = "；".join(text for text in self.failures.values() if text)
+
+    def save(self, record: dict) -> None:
+        self.store.put(f"touch:{self.spec.slug}", {**record, "start": self.start_ms})
+
+    def scan_days(self, bars: list, now_ms: int) -> None:
+        """The finished sessions of the window from its daily bars, oldest first: the first to reach a line decides — one
+        reaching both, or the creation's own day reaching one (the bar holds the minutes before the creation too), is
+        put to a manual check. Persisted; "through" reaches the start of today once every session before it is read."""
+        hist = self.history
+        if not self.start_ms or hist.get("kind") in {"low", "high", "ambiguous"}:
+            return
+        today, first, last = et_date(now_ms), et_date(self.start_ms), et_date(self.spec.deadline_ms)
+        low, high = float(self.spec.low), float(self.spec.high)
+        done = [b for b in bars if first <= et_date(b[0]) <= last and et_date(b[0]) < today and b[2] is not None and b[3] is not None]
+        for opened, _, hi, lo, _ in done:
+            hit_low, hit_high = lo <= low, hi >= high
+            if hit_low or hit_high:
+                kind = "ambiguous" if (hit_low and hit_high) or et_date(opened) == first else "low" if hit_low else "high"
+                self.save({"kind": kind, "time": opened, "hi": hi, "lo": lo, "daily": True})
+                return
+        need = max((d for d in (first + dt.timedelta(days=i) for i in range((min(last, today - dt.timedelta(days=1)) - first).days + 1))
+                    if us_session(d)), default=None)  # the last session before today the window needs read
+        through = int(hist.get("through") or self.start_ms)
+        if need is None or (done and et_date(done[-1][0]) >= need):
+            through = max(through, min(et_wall_ms(today, 0, 0), self.window_end))
+        self.save({"kind": "clear", "through": through})
+
+    def scan_minutes(self, bars: list, now_ms: int) -> None:
+        """The latest session's 1-minute bars (Yahoo's regular session): the first minute inside the window to reach a line
+        decides at once — a minute reaching both, or the creation's own minute, cannot be ordered (a manual check)."""
+        self.minutes_ms = now_ms
+        if not self.start_ms or self.history.get("kind") in {"low", "high", "ambiguous"}:
+            return
+        low, high = float(self.spec.low), float(self.spec.high)
+        for opened, _, hi, lo, _ in bars:
+            if opened + 60_000 <= self.start_ms or opened > self.spec.deadline_ms or hi is None or lo is None:
+                continue
+            hit_low, hit_high = lo <= low, hi >= high
+            if hit_low or hit_high:
+                kind = "ambiguous" if (hit_low and hit_high) or opened < self.start_ms else "low" if hit_low else "high"
+                self.save({"kind": kind, "time": opened, "hi": hi, "lo": lo})
+                return
+
+    def odds(self, now_ms: int) -> TouchOdds | str:
+        kind = self.history.get("kind")
+        if kind == "low":
+            return TouchOdds(1.0, 0.0, 0.0)
+        if kind == "high":
+            return TouchOdds(0.0, 1.0, 0.0)
+        if self.price is None or self.sigma is None:
+            return f"等待 Yahoo 行情（{brief_error(self.error, 60)}）" if self.error else "等待 Yahoo 行情"
+        if self.price_stale(now_ms):
+            why = f"：{brief_error(self.error, 60)}" if self.error else ""
+            return f"Yahoo 行情停在 {stamp(self.priced_ms, seconds=False)}{why}，暂停概率"
+        return first_touch(float(self.price), float(self.spec.low), float(self.spec.high), self.sigma, 0.0, self.remaining_years(now_ms))
+
+    def remaining_years(self, now_ms: int) -> float:
+        """The trading time left (us_trading_years): the running session's rest at its share of the daily variance."""
+        return us_trading_years(max(now_ms, self.start_ms), self.window_end, self.share[0] if self.share else 1.0)
+
+    def left_text(self, now_ms: int) -> str:
+        return f"{self.remaining_years(now_ms) * US_TRADING_DAYS:.1f} 个交易日（{max(0.0, (self.spec.deadline_ms - now_ms) / DAY_MS):.0f} 天）"
+
+    def advice_problem(self, now_ms: int) -> str:
+        hist, kind = self.history, self.history.get("kind")
+        if kind == "ambiguous":
+            return ("创建当天或同一个交易日碰到了线（日 K 分不出先后），需人工到 Pyth 核对；暂不给建议" if hist.get("daily")
+                    else "开盘以来有一分钟同时碰到两条线（或就在创建那一分钟），需人工到 Pyth 核对；暂不给建议")
+        if kind in {"low", "high"}:
+            return ""
+        if not self.start_ms:
+            return "开盘时间未知，无法核验此前是否已触线；暂不给建议"
+        if kind != "clear":
+            return "开盘以来是否触线尚未核验；暂不给建议"
+        today = min(et_wall_ms(et_date(now_ms), 0, 0), self.window_end)
+        if int(hist.get("through") or 0) < today:
+            return f"触线核验停在 {stamp(int(hist.get('through') or 0), seconds=False)}（日 K 未读到）；暂不给建议"
+        state, opens = us_session_state(now_ms)
+        if state != "交易中":
+            return ("美股休市中：盘前盘后的价格不算数，但会影响开盘价，按收盘价报价会被知道盘后行情的人吃掉；"
+                    + (f"北京时间 {stamp(opens, seconds=False)} 开盘后恢复" if opens else "开盘后恢复") + "；暂不给建议")
+        if now_ms - self.minutes_ms > self.MINUTES_STALE_MS:
+            return "今天的 1 分钟 K 超过 5 分钟没读到；暂不给建议"
+        if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
+            return "波动率超过三天未更新；暂不给建议"
+        return ""
+
+    def status(self) -> str:
+        hist, kind = self.history, self.history.get("kind")
+        if kind in {"low", "high"} and hist.get("daily"):
+            line = int(self.spec.low if kind == "low" else self.spec.high)
+            return f"已于 {et_date(int(hist['time'])):%m-%d}（美东）先触及 ${line}（日 K：高 {hist['hi']:g}·低 {hist['lo']:g}）"
+        if kind == "ambiguous" and hist.get("daily"):
+            return (f"需人工核对：{et_date(int(hist['time'])):%m-%d}（美东）这个交易日碰到了线（高 {hist['hi']:g}·低 {hist['lo']:g}），"
+                    "日 K 分不出是不是在创建之前、或两条线谁先，到 Pyth 看 1 分钟 K")
+        return super().status()
+
+
 def range_market(store: "Store", spec: RangeSpec, futures: Any, config: "Config") -> RangeMarket:
     """The market object for a price-ladder spec: a Binance pair, or a US stock read from Yahoo."""
     if spec.venue == "nasdaq":
@@ -12780,9 +12965,9 @@ function card(it,g){
     sm.append($("span","rd",t.coin),$("span","v",t.price),$("span","rd","距"+lb[1]),$("span","v",sg(t.to_low)),$("span","rd","距"+lb[0]),$("span","v",sg(t.to_high)));det.append(sm);
     const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
     row("截止",it.close_label);row("先 "+lb[0],(t.p_high*100).toFixed(2)+"%");row("先 "+lb[1],(t.p_low*100).toFixed(2)+"%");row("都没碰到",(t.p_none*100).toFixed(2)+"%（各算一半）");
-    row("σ","30 日小时收盘年化 "+(t.sigma*100).toFixed(1)+"%｜剩 "+(t.years*365).toFixed(1)+" 天");row("开盘以来",t.status);
-    row("模型","双边界首达，连续路径、固定波动率、零漂移；公平价 = P(先触该边) + ½·P(都没碰到)");
-    det.append(dl);c.append(det);if(t.error)c.append($("div","warn small","⚠️ 币安刷新失败："+t.error));
+    row("σ",(t.sigma_note||"30 日小时收盘年化")+" "+(t.sigma*100).toFixed(1)+"%｜剩 "+(t.left||(t.years*365).toFixed(1)+" 天"));row("开盘以来",t.status);
+    row("模型",t.model||"双边界首达，连续路径、固定波动率、零漂移；公平价 = P(先触该边) + ½·P(都没碰到)");
+    det.append(dl);c.append(det);if(t.error)c.append($("div","warn small","⚠️ "+(t.feed||"币安")+"刷新失败："+t.error));
     if(t.status.startsWith("需人工核对"))c.append($("div","warn small","⚠️ "+t.status));
     else if(t.hold)c.append($("div","warn small","⚠️ "+t.hold));
     tail(c,it);return c}
@@ -15083,7 +15268,7 @@ class Bot:
                           "&fields1=f1&fields2=f51,f52,f53&secid=100.HSI"),
             ("yahoo", yahoo_url("^HSI"))), config.holidays.get("hk", frozenset()))
         self.hsi.dated_close = lambda day: self.hsi_daily.daily.get(day)  # checks the cash index belongs to the right day
-        self.touches = {spec.key: TouchMarket(store, spec) for spec in TOUCH_MARKETS}
+        self.touches = {spec.key: (StockTouchMarket if spec.stock else TouchMarket)(store, spec) for spec in TOUCH_MARKETS}
         self.updowns = {spec.key: UpDownMarket(store, spec) for spec in UPDOWN_MARKETS}
         # the daily up/down cards (1.97.0): one market object per coin, aimed at the next day's market as each day ends
         self.updown_daily = {spec.key: spec for spec in DAILY_UPDOWN_MARKETS}
@@ -15108,6 +15293,8 @@ class Bot:
         self.pair_markets: dict[tuple[str, str], list] = {}  # (venue, pair) -> the cards priced from it (BinanceStream)
         self.index_markets: dict[str, list] = {}  # futures pair -> the 15-minute cards its index prices (markPrice field i)
         for card in (*self.touches.values(), *self.updowns.values()):
+            if isinstance(card, StockTouchMarket):
+                continue  # a US stock's touch market (1.146.0): Yahoo's prices, nothing on Binance
             if isinstance(card, IndexUpDownMarket) and card.VENUE == "futures":  # a spot window (BTC 15分涨跌) is priced by its pair's trades
                 self.index_markets.setdefault(card.spec.symbol, []).append(card)
                 ticker = config.tickers.get(card.spec.symbol)  # LEAD_QUOTE: the stock's exchange quote (StockMarket.live_quote) leads the index
@@ -17192,7 +17379,7 @@ class Bot:
                 **self.odds_numbers(title, name, odds),
             })
         if self.config.touch:  # one broken card must not take the whole page down with it
-            items.extend(self.safe_card(f"{t.spec.symbol.removesuffix('USDT')} 先触", t.spec.key, "crypto", self.touch_payload, t, now_ms)
+            items.extend(self.safe_card(f"{t.spec.symbol.removesuffix('USDT')} 先触", t.spec.key, t.GROUP, self.touch_payload, t, now_ms)
                          for t in self.touches.values())
             items.extend(self.safe_card(u.spec.name, u.spec.key, u.GROUP if isinstance(u, IndexUpDownMarket) else "crypto",
                                         self.updown_payload, u, now_ms) for u in self.updowns.values())
@@ -17282,7 +17469,7 @@ class Bot:
         """Web card for a first-touch market: 涨 = the high barrier first, 跌 = the low one first."""
         spec = touch.spec
         low, high = spec.label(spec.low), spec.label(spec.high)
-        base = {"name": f"{spec.symbol.removesuffix('USDT')} 先触 {low}/{high}", "symbol": spec.symbol, "group": "crypto",
+        base = {"name": f"{spec.symbol.removesuffix('USDT')} 先触 {low}/{high}", "symbol": spec.symbol, "group": touch.GROUP,
                 "labels": [f"${high}", f"${low}"], "close_ms": spec.deadline_ms, "close_label": spec.close_label()}
         out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
         book, why = self.touch_book(spec)
@@ -17305,13 +17492,14 @@ class Bot:
             return {**base, "missing": odds}
         price = touch.price
         years = max(0.0, (spec.deadline_ms - now_ms) / YEAR_MS)
-        return {**base, "quote_ms": touch.priced_ms, "source": "币安现货", "fair_up": odds.fair_upper, "fair_down": odds.fair_lower, "up": odds.upper, "flat": odds.none,
+        return {**base, "quote_ms": touch.priced_ms, "source": touch.SOURCE, "fair_up": odds.fair_upper, "fair_down": odds.fair_lower, "up": odds.upper, "flat": odds.none,
                 "down": odds.lower, "touch": {
                     "coin": spec.symbol.removesuffix("USDT"),
                     "price": f"{price:,.2f}" if price is not None else "—",
                     "to_low": float(percent(spec.low, price)) if price else 0.0,
                     "to_high": float(percent(spec.high, price)) if price else 0.0,
                     "sigma": touch.sigma or 0.0, "years": years, "status": touch.status(),
+                    "sigma_note": touch.SIGMA_NOTE, "left": touch.left_text(now_ms), "feed": touch.FEED, "model": touch.MODEL_NOTE,  # 1.146.0
                     "p_low": odds.lower, "p_high": odds.upper, "p_none": odds.none,
                     "error": touch.error, "hold": hold}}
 
@@ -17630,9 +17818,9 @@ class Bot:
             spec = touch.spec
             return {"basis": {"price": float(touch.price or 0), "low": float(spec.low), "high": float(spec.high),
                               "sigma": touch.sigma, "sigma_ms": touch.sigma_ms, "deadline_ms": spec.deadline_ms,
-                              "years": max(0.0, (spec.deadline_ms - max(now_ms, touch.start_ms)) / YEAR_MS),
+                              "years": touch.remaining_years(now_ms),
                               "path": touch.status(), "start_ms": touch.start_ms},
-                    "sources": [price_evidence("现货", "币安现货", spec.symbol, "最新价", touch.price, touch.priced_ms,
+                    "sources": [price_evidence(touch.PRICE_WORD, touch.SOURCE, spec.symbol, "最新价", touch.price, touch.priced_ms,
                                                touch.priced_ms)], "proxy": None}
         if kind == "updown" and isinstance(parts["mkt"], IndexUpDownMarket):
             mkt = parts["mkt"]
@@ -22144,6 +22332,19 @@ class Bot:
                 url = YAHOO_CHART[0] + urllib.parse.quote(rm.spec.symbol) + "?" + urllib.parse.urlencode(
                     {"interval": "1m", "range": "1d", "includePrePost": "false"})
                 probes.append((f"美股触及·{rm.spec.symbol}", "Yahoo 1 分钟 K", get(url, {}), check_chart))
+            for touch in self.touches.values():  # 1.146.0: a US stock's first-touch market reads the same feed
+                if not isinstance(touch, StockTouchMarket):
+                    continue
+                def check_touch(raw: bytes, touch=touch) -> str:
+                    meta, bars = parse_yahoo_chart(raw)
+                    if meta["price"] is None:
+                        raise ValueError("没有 regularMarketPrice")
+                    state, opens = us_session_state(now_ms)
+                    return (f"{touch.spec.symbol} {meta['price']:,.2f}（成交 {when(meta['time_ms'])}；最近一个交易日 {len(bars)} 根 1 分钟 K；{state}"
+                            + (f"，北京时间 {stamp(opens, seconds=False)} 开盘" if opens else "") + f"）｜线 ${touch.spec.low:g} / ${touch.spec.high:g}")
+                url = YAHOO_CHART[0] + urllib.parse.quote(touch.spec.symbol) + "?" + urllib.parse.urlencode(
+                    {"interval": "1m", "range": "1d", "includePrePost": "false"})
+                probes.append((f"美股先触·{touch.spec.symbol}", "Yahoo 1 分钟 K", get(url, {}), check_touch))
 
         if self.config.sse_index:
             for name, url, extra in CnIndex.SSE_SOURCES:

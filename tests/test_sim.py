@@ -2353,7 +2353,7 @@ async def settled_touch():
     with retired.live():
         rbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0", "SIM_MAKER_FLOOR_SHARES": "0",
                                         "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY}), m.Store(":memory:"), FM(now), None)
-        assert "BNB" not in rbot.touches and list(rbot.touches) == ["SOL", "ETH", "BTC-2027", "BNB-2027"]  # 1.132.0 / 1.132.2: the new BTC 70k/90k and BNB 600/800 under their own keys
+        assert "BNB" not in rbot.touches and list(rbot.touches) == ["SOL", "ETH", "BTC-2027", "BNB-2027", "NVDA-2027"]  # 1.146.0: NVIDIA 160/210; 1.132.0 / 1.132.2: the new BTC 70k/90k and BNB 600/800 under their own keys
         spec = m.touch_spec("BNB")
         assert (spec.slug, spec.low, spec.high, spec.deadline_ms) == ("will-bnb-hit-700-or-900", D("700"), D("900"), m.TOUCH_DEADLINE_MS)
         base = {"v": 2, "fills": [], "revisions": [], "order": 100.0, "maker": False, "fair": 0.6, "edge": 0.12, "price": 0.48,

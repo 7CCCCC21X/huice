@@ -62,7 +62,7 @@ async def run():
     results = await bot.diagnose()
     by = {(r.group, r.name.split(" ")[0]): r for r in results}
     groups = {r.group for r in results}
-    assert groups == {"币安", "币安推送", "交易所收盘·UNITREE", "上证实时", "上证日K", "A50实时", "A50锚点", "Hyperliquid", "汇率", "Predict"}, groups  # 1.112.3: no 美股触及 group, no US stock card listed
+    assert groups == {"币安", "币安推送", "交易所收盘·UNITREE", "上证实时", "上证日K", "A50实时", "A50锚点", "Hyperliquid", "汇率", "Predict", "美股先触·NVDA"}, groups  # 1.112.3: no 美股触及 group; 1.146.0: NVIDIA 先触 160/210 reads Yahoo
     # the stream probes (1.89.2): the futures server in use, spot's main host, spot's data host; offline no connection is made
     streams = [r for r in results if r.group == "币安推送"]
     assert [r.name for r in streams] == ["合约 fstream.binance.com/market", "现货主站 stream.binance.com", "现货数据站 data-stream.binance.vision"], [r.name for r in streams]
@@ -92,7 +92,7 @@ async def run():
 
     # report: groups that lost every source are called out first
     text = m.Bot.diag_text(results, bot.diag_state(NOW), "T")
-    assert "🚨 整组全部失败（该数据当前拿不到）：币安推送、交易所收盘·UNITREE、Hyperliquid、Predict、汇率" in text, text
+    assert "🚨 整组全部失败（该数据当前拿不到）：币安推送、交易所收盘·UNITREE、美股先触·NVDA、Hyperliquid、Predict、汇率" in text, text  # (offline here: Yahoo too)
     partial = [l for l in text.splitlines() if l.startswith("⚠️ 其余失败的源")][0]
     assert partial == ("⚠️ 其余失败的源（同组有别的源顶上）：上证实时·新浪、上证实时·东方财富、上证日K·东方财富日K、"
                        "上证日K·新浪日K、上证日K·Yahoo日K、"

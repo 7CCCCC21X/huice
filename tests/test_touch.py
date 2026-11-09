@@ -7,7 +7,7 @@ retired.install()
 D = m.D
 BNB, SOL, BTC, ETH = m.TOUCH_MARKETS
 # 1.132.0: BTC 先触 70k/90k to May 2027, under its own key — the earlier one (to 10-25) stays "BTC" for the trades bought on it
-assert [s.key for s in retired.LIVE["TOUCH_MARKETS"]] == ["SOL", "ETH", "BTC-2027", "BNB-2027"]
+assert [s.key for s in retired.LIVE["TOUCH_MARKETS"]] == ["SOL", "ETH", "BTC-2027", "BNB-2027", "NVDA-2027"]  # 1.146.0
 # 1.132.2: BNB 先触 600/800 to May 2027, from the market's creation (Predict's time), under its own key: the decided 700/900 stays "BNB"
 NEW_BNB = retired.LIVE["TOUCH_MARKETS"][3]
 assert NEW_BNB.slug == "will-bnb-hit-600-or-800-first" and NEW_BNB.symbol == "BNBUSDT" and (NEW_BNB.low, NEW_BNB.high) == (D("600"), D("800"))

@@ -936,7 +936,7 @@ async def november():
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
         market = FakeMarket()
         bot = m.Bot(cfg, m.Store(":memory:"), market, None)
-        assert list(bot.ranges) == [s.key for s in LIVE] and list(bot.touches) == ["SOL", "ETH", "BTC-2027", "BNB-2027"]  # 1.101.1: BNB 先触 decided, taken off; 1.112.3: STRC over; 1.132.0: BTC 70k/90k to May 2027; 1.132.2: BNB 600/800
+        assert list(bot.ranges) == [s.key for s in LIVE] and list(bot.touches) == ["SOL", "ETH", "BTC-2027", "BNB-2027", "NVDA-2027"]  # 1.146.0: NVIDIA 160/210; 1.101.1: BNB 先触 decided, taken off; 1.112.3: STRC over; 1.132.0: BTC 70k/90k to May 2027; 1.132.2: BNB 600/800
         assert list(bot.updowns) == ["BTC-DAY", "ETH-DAY", "BNB-DAY", "UNITREE-15M", "SKHYNIX-15M", "BTC-15M", "ETH-15M", "BNB-15M", "XAU-15M", "CL-15M", "ZHIPU-15M", "MU-15M", "SNDK-15M", "AVGO-15M", "SPCX-15M", "NVDA-15M", "GOOGL-15M", "META-15M", "TSM-15M", "AMZN-15M", "QQQ-15M", "SPY-15M", "MSFT-15M", "BTC-5M", "ETH-5M", "BNB-5M"] and list(bot.flips) == ["HYPE-SOL-12"] and not bot.caps  # 1.97.0: the daily up/down cards; 1.102.0 / 1.103.0 / 1.109.0: the 15-minute ones; 1.132.0: HYPE 反超 SOL by December
         targets = bot.predict_targets(MID)
         assert all(targets[s.key] == s.slug and s.key in bot.predict.ladder_keys for s in NOV) and not any(k.endswith("-HIT-10") for k in targets)
