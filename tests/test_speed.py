@@ -48,9 +48,10 @@ def unit_checks():
     st = m.speed_stats(samples)
     assert (st["n"], st["ok"], st["errors"], st["error"], st["changes"], st["step_ms"], st["lag_ms"]) == (13, 12, 1, "请求超时", 3, 3000, 3000), st
     assert (st["median_ms"], st["p90_ms"], st["max_ms"]) == (155.0, 200, 210), st  # the failed request's 8 s is no answer time
-    # quote times in whole minutes: no lag read off them; without quote times the step comes from the changes seen
+    # quote times in whole minutes (Tencent's Composite, 1.145.2): no lag read off them, the minute turning over is no change, and the
+    # step comes from the figure's own changes — three seconds, not "约 60 秒一变"; without quote times likewise
     whole = [{**x, "q": BJ(11, 9, 10, 0) + (i // 6) * 60_000} for i, x in enumerate(samples) if x["ok"]]
-    assert m.speed_stats(whole)["lag_ms"] is None and m.speed_stats(whole)["step_ms"] == 60_000
+    assert (m.speed_stats(whole)["lag_ms"], m.speed_stats(whole)["changes"], m.speed_stats(whole)["step_ms"]) == (None, 3, 3000), m.speed_stats(whole)
     bare = [{"ok": True, "ms": 50, "at": i * 1000, "last": float(i // 4), "q": 0} for i in range(13)]
     assert m.speed_stats(bare)["changes"] == 3 and m.speed_stats(bare)["step_ms"] == 4000 and m.speed_stats(bare)["lag_ms"] is None
     empty = m.speed_stats([{"ok": False, "ms": 10, "at": 0, "error": "HTTP 403: 访问被拒绝"}])
@@ -81,6 +82,20 @@ def unit_checks():
     assert "⚠️ 现在都休市：只测得出请求耗时和会不会被拒" in shut and "【上证实时】休市｜现在每 5 秒查一次" in shut and "｜休市，数值不动" in shut, shut
     assert "（开盘后再测一次确认数值多久一变）" in shut and "数值变了" not in shut
     assert "没有在用的指数数据源" in m.speed_text([], 1.0, 30, SUN, 0)
+    # 1.145.2: a delayed feed (Tencent's Hong Kong index, 15 minutes behind) and one that never moves while its market trades are said so,
+    # and the advice rests on the fresh source after them
+    late = {**clean, "lag_ms": 905_000}
+    still = {**clean, "changes": 0, "step_ms": None, "lag_ms": 118_000}
+    stuck = {**clean, "changes": 0, "step_ms": None, "lag_ms": None}
+    hk = m.speed_text([{"feed": "恒指现货", "open": True, "now_s": 3, "sources": [{"name": "腾讯", "stats": late, "stopped": ""},
+                                                                              {"name": "新浪", "stats": {**clean, "lag_ms": 1400}, "stopped": ""}]},
+                       {"feed": "恒指期货", "open": True, "now_s": 10, "sources": [{"name": "etnet", "stats": paged, "stopped": ""},
+                                                                               {"name": "新浪CFD", "stats": still, "stopped": ""}]},
+                       {"feed": "KOSPI", "open": True, "now_s": 10, "sources": [{"name": "Naver", "stats": stuck, "stopped": ""}]}], 0.5, 30, MON, 4)
+    for want in ("报价时间比现在晚 905 秒｜⚠️ 落后约 15 分钟（延迟行情），不按它定间隔", "👉 可以改成每 1 秒查：实际约 1.3 秒一次（请求 0.3 秒 + 循环间隔 1 秒），平均早约 1.1 秒看到新数值",
+                 "✅ 新浪CFD：30/30 次成功", "数值变了 0 次，报价时间比现在晚 118 秒｜⚠️ 落后约 2 分钟（延迟行情），不按它定间隔",
+                 "数值变了 0 次｜⚠️ 交易中却一直没变，不按它定间隔", "👉 这一路没有又新鲜又在动的源，先保持现在的每 10 秒"):
+        assert want in hk, (want, hk)
 
 
 async def run():
@@ -91,9 +106,9 @@ async def run():
     m.SOURCE_HEALTH.off = frozenset({"eastmoney"})  # SOURCES_OFF=eastmoney, as the deployment has it
     # the feeds the bot reads: their sources switched on, whether each market trades, the cadence it is read at now
     feeds = bot.speed_feeds(MON)
-    assert [(f["feed"], [s[0] for s in f["sources"]], f["now_s"]) for f in feeds] == [
-        ("上证实时", ["腾讯", "新浪"], 5), ("A50实时", ["新浪CFD"], 5), ("恒指现货", ["腾讯", "新浪"], 3), ("恒指期货", ["etnet", "新浪CFD"], 10),
-        ("KOSPI", ["Naver"], 10), ("KOSPI200", ["Naver"], 10)], feeds
+    assert [(f["feed"], [s[0] for s in f["sources"]], f["now_s"]) for f in feeds] == [  # 1.145.2: the cadences /speed showed, Sina first for Hong Kong
+        ("上证实时", ["腾讯", "新浪"], 1), ("A50实时", ["新浪CFD"], 1), ("恒指现货", ["新浪", "腾讯"], 1), ("恒指期货", ["etnet", "新浪CFD"], 2),
+        ("KOSPI", ["Naver"], 1), ("KOSPI200", ["Naver"], 1)], feeds
     opened = {f["feed"]: f["open"] for f in feeds}
     assert opened["上证实时"] and opened["恒指现货"] and opened["恒指期货"] and opened["KOSPI"] and opened["KOSPI200"], opened
     assert not any(f["open"] for f in bot.speed_feeds(SUN))

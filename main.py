@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.145.1"
+VERSION = "1.145.2"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -2822,19 +2822,23 @@ class IndexFutures:
     """Hang Seng Index futures (main contract, incl. the 17:15-03:00 after-hours session) with the
     cash index for the 高水/低水 basis. Eastmoney first, Sina as fallback; read-only, best effort."""
     REFRESH_SECONDS = 60   # between sessions
-    SESSION_SECONDS = 10   # while the cash index or a futures session trades (etnet is a scraped page, not a feed: not faster)
+    SESSION_SECONDS = 2    # while the cash index or a futures session trades — 1.145.2 (/speed 11-09: etnet answers in 0.4 s and
+    #                        moves every ~4.6 s; 10 s before): not 1 s, etnet is a scraped page and the futures' only live source
+    #                        (Sina's CFD sat two minutes behind, unmoved): not to be pushed into a block
     EM = "https://push2.eastmoney.com/api/qt/stock/get?fltt=2&invt=2&fields=f43,f44,f45,f46,f57,f58,f60,f86&secid="
     # etnet is the HKEX-designated free real-time site the user checks against; Sina hf_HSI is a CFD,
     # not the HKEX contract (it prints decimals), so it is only a last-resort, clearly labelled fallback.
     FUTURES_SOURCES = (("etnet", "https://www.etnet.com.hk/www/tc/futures/index.php", {"Referer": "https://www.etnet.com.hk/"}),
                        ("东方财富", EM + "134.HSI_M", {"Referer": "https://quote.eastmoney.com/"}),
                        ("新浪CFD", "https://hq.sinajs.cn/list=hf_HSI", {"Referer": "https://finance.sina.com.cn/"}))
+    # 1.145.2: Sina before Tencent — Tencent's Hong Kong index is a delayed feed, 15 minutes behind the clock (905 s, /speed 11-09):
+    # spot_problem turned it down every round, a wasted request before Sina's, which moves every second, 1.4 s behind
     SPOT_SOURCES = (("东方财富", EM + "100.HSI", {"Referer": "https://quote.eastmoney.com/"}),
-                    ("腾讯", "https://qt.gtimg.cn/q=hkHSI", {"Referer": "https://gu.qq.com/"}),
-                    ("新浪", "https://hq.sinajs.cn/list=rt_hkHSI", {"Referer": "https://finance.sina.com.cn/"}))
+                    ("新浪", "https://hq.sinajs.cn/list=rt_hkHSI", {"Referer": "https://finance.sina.com.cn/"}),
+                    ("腾讯", "https://qt.gtimg.cn/q=hkHSI", {"Referer": "https://gu.qq.com/"}))
     # Sina's 5-minute bars of the same hf_HSI record the CFD quote comes from: its 16:10 price when no print was recorded
     CFD_FIVE_MINUTES = "https://gu.sina.cn/ft/api/jsonp.php/var%20_HSI_5=/GlobalService.getMink?symbol=HSI&type=5"
-    SPOT_SECONDS = 3         # the cash index alone, between the futures page's refreshes, while the cash session runs
+    SPOT_SECONDS = 1         # the cash index alone, between the futures page's refreshes, while the cash session runs (1.145.2: 3 s before)
     SPOT_RETRY_SECONDS = 27  # ... but 30 seconds after a round in which no timed feed answered with a current figure
 
     def __init__(self, enabled: bool = True, holidays: frozenset = frozenset()):
@@ -3697,7 +3701,8 @@ class CnIndex:
     Sina, Yahoo 000001.SS): a realtime "last price" says nothing reliable about which session it closed.
     """
     REFRESH_SECONDS = 60      # between sessions
-    SESSION_SECONDS = 5       # while Shanghai trades (its own index) or an A50 session runs (the after-hours proxy)
+    SESSION_SECONDS = 1       # while Shanghai trades (its own index) or an A50 session runs (the after-hours proxy) — 1.145.2 (/speed 11-09:
+    #                           Tencent and Sina answer in 0.3 s, the Composite moves every ~3 s; 5 s before)
     DAILY_SECONDS = 600       # re-read the daily bars this often once the expected close is confirmed
     PENDING_SECONDS = 60      # ...and this often while the close the calendar expects is not confirmed yet
     STALE_MS = 10 * 60_000    # an A50 quote older than this is not used for new probabilities (the Composite: index_stale_ms)
@@ -4055,7 +4060,8 @@ def dated_ref(daily: dict[dt.date, D], day: dt.date, live: D | None) -> tuple[D 
 class KospiIndex:
     """KOSPI composite index: Naver's realtime index feed first, Eastmoney (100.KS11) as fallback."""
     REFRESH_SECONDS = 60   # between sessions
-    SESSION_SECONDS = 10   # while the KRX regular session runs (to 15 minutes after the close)
+    SESSION_SECONDS = 1    # while the KRX regular session runs (to 15 minutes after the close) — 1.145.2 (/speed 11-09: Naver moves
+    #                        every second, 1.3 s behind the clock, answers in 0.3 s; 10 s before)
     SOURCES = (("Naver", "https://polling.finance.naver.com/api/realtime/domestic/index/KOSPI",
                 {"Referer": "https://finance.naver.com/"}),
                ("东方财富", IndexFutures.EM + "100.KS11", {"Referer": "https://quote.eastmoney.com/"}))
@@ -14380,23 +14386,25 @@ def speed_rounds(sources: list[tuple]) -> list[list[tuple]]:
 
 def speed_stats(samples: list[dict]) -> dict:
     """One source's /speed samples ({ok, ms, at, last, q} or {ok: False, ms, at, error}) summed up: the answers and the
-    failures; the request time (median, nine in ten within, the longest); the changes (a new figure or quote time from
-    one answer to the next); the source's own step (the median gap between successive quote times, else between the
-    changes seen); how far its quote time trails the clock (only when it carries seconds)."""
+    failures; the request time (median, nine in ten within, the longest); the changes (a new figure — or a new quote time,
+    when it carries seconds — from one answer to the next); the source's own step (the median gap between successive
+    quote times when they carry seconds, else between the changes seen); how far its quote time trails the clock (only
+    when it carries seconds). 1.145.2: Tencent stamps the Composite in whole minutes — the first /speed read "约 60 秒一变"
+    off them for a figure that moved every three seconds."""
     ok = [x for x in samples if x["ok"]]
     times = sorted(x["ms"] for x in ok)
+    timed = [x for x in ok if x["q"]]
+    seconds = any(x["q"] % 60_000 for x in timed)  # quote times with seconds
     changes, seen, steps, prev = 0, [], [], None
     for x in ok:
-        key = (x["last"], x["q"])
-        if prev is not None and key != prev:
+        if prev is not None and (x["last"] != prev["last"] or (seconds and x["q"] != prev["q"])):
             changes += 1
             seen.append(x["at"])
-            if x["q"] and prev[1] and x["q"] > prev[1]:
-                steps.append(x["q"] - prev[1])
-        prev = key
+            if seconds and x["q"] and prev["q"] and x["q"] > prev["q"]:
+                steps.append(x["q"] - prev["q"])
+        prev = x
     step = median(steps) if steps else median([b - a for a, b in zip(seen, seen[1:])]) if len(seen) > 1 else None
-    timed = [x for x in ok if x["q"]]
-    lag = median([x["at"] - x["q"] for x in timed]) if any(x["q"] % 60_000 for x in timed) else None  # whole minutes: no lag to read
+    lag = median([x["at"] - x["q"] for x in timed]) if seconds else None
     failed = [x for x in samples if not x["ok"]]
     return {"n": len(samples), "ok": len(ok), "errors": len(failed), "error": failed[0]["error"] if failed else "",
             "median_ms": median(times), "p90_ms": times[max(0, math.ceil(0.9 * len(times)) - 1)] if times else None,
@@ -14430,18 +14438,25 @@ def speed_text(feeds: list[dict], pace: float, seconds: float, now_ms: int, roun
                 text += f"｜失败 {st['errors']} 次：{brief_error(st['error'], 60)}"
             if stop:
                 text += f"｜已停：{stop}"
+            delayed = st["lag_ms"] is not None and st["lag_ms"] >= 60_000      # a delayed feed (Tencent's Hong Kong index: 15 minutes)
+            still = f["open"] and st["changes"] == 0 and st["ok"] >= 10        # trading, and not a move in all its answers
             if f["open"]:
                 text += f"｜数值变了 {st['changes']} 次" + (f"，约 {secs(st['step_ms'])} 秒一变" if st["step_ms"] else "")
                 if st["lag_ms"] is not None:
                     text += f"，报价时间比现在晚 {secs(max(0, st['lag_ms']))} 秒"
+                if delayed:
+                    text += f"｜⚠️ 落后约 {round(st['lag_ms'] / 60_000)} 分钟（延迟行情），不按它定间隔"
+                elif still:
+                    text += "｜⚠️ 交易中却一直没变，不按它定间隔"
             else:
                 text += "｜休市，数值不动"
             lines.append(text)
-            if clean is None and not st["errors"] and not stop:
+            if clean is None and not st["errors"] and not stop and not delayed and not still:
                 clean = st
         if clean is None:
-            first = next((x["stats"]["error"] for x in f["sources"] if x["stats"]["error"]), "") or "没有可用的源"
-            lines.append(f"👉 每 {pace:g} 秒查会出错（{brief_error(first, 60)}），先保持现在的每 {f['now_s']} 秒")
+            first = next((x["stats"]["error"] for x in f["sources"] if x["stats"]["error"]), "")
+            lines.append(f"👉 每 {pace:g} 秒查会出错（{brief_error(first, 60)}），先保持现在的每 {f['now_s']} 秒" if first
+                         else f"👉 这一路没有又新鲜又在动的源，先保持现在的每 {f['now_s']} 秒")
             continue
         period = clean["median_ms"] / 1000 + 1.0          # a read every second: the request, then the loop's one-second wait
         before = max(f["now_s"] + 0.5, period)            # now: the cadence, met on the loop's next one-second tick
