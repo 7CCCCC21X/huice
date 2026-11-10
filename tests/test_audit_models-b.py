@@ -146,4 +146,51 @@ async def _shape_retry():
 
 _asyncio.run(_shape_retry())
 
+# MOD-BOOK-DISPUTES: book_disputes judged max(best bid, best ask) >= 90c as "the market agrees", so a thin book bid
+# 20c / offered 95c let a ZEC level listed after the category's window low show 已触及 and settle a paper Yes as a win.
+import time as _time
+_bk = lambda bids, asks: m.PredictBook("K", "s", "M", "t", tuple((_D(p), _D("300")) for p in bids),
+                                       tuple((_D(p), _D("300")) for p in asks), 0, 0)
+assert m.book_disputes(_bk(["0.20"], ["0.95"])) is True  # the far ask no longer "agrees"
+assert m.book_disputes(_bk(["0.95"], ["0.97"])) is False
+assert m.book_disputes(_bk([], ["0.95"])) is False and m.book_disputes(_bk([], ["0.50"])) is True  # no bid: the ask decides
+assert m.book_disputes(_bk([], [])) is False and m.book_disputes(None) is False  # no quotes: nothing disputed
+
+def _zec_scenario():
+    utc = lambda *a: int(_dt.datetime(*a, tzinfo=_dt.timezone.utc).timestamp() * 1000)
+    NOW, CAT0, LATER, LOW_AT, H = utc(2026, 11, 10, 12), utc(2026, 10, 1), utc(2026, 11, 5), utc(2026, 10, 3), 3_600_000
+
+    class FM:
+        def now_ms(self): return NOW
+        async def prices(self): return {}
+        async def get(self, path, **params): return {}
+
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "SIM_MARKETS": "all", "PROBABILITY": "off"})
+    bot = m.Bot(cfg, m.Store(":memory:"), FM(), None)
+    rm = bot.ranges["ZEC-HIT-2027"]
+    spec = rm.spec
+    rules = ('Resolves "Yes" if any Binance 1 minute candle for ZEC/USDT from the creation of this market has a final '
+             '"Low" price equal to or lower than the price in the title.')
+    meta = lambda created, title: ({"outcomes": ["Yes", "No"], "created_ms": created, "rules": rules,
+                                    "question": f"Will Zcash dip to {title}?", "status": "OPEN", "trading_status": "OPEN"},
+                                   _time.monotonic())
+    bot.predict.market_meta["A"] = meta(CAT0, "$300")
+    bot.predict.market_meta["B"] = meta(LATER, "$400")
+    book_a = m.PredictBook("ZEC-HIT-2027", spec.slug, "A", "↓ 300", ((_D("0.10"), _D("300")),), ((_D("0.14"), _D("300")),), NOW, 0)
+    book_b = m.PredictBook("ZEC-HIT-2027", spec.slug, "B", "↓ 400", ((_D("0.20"), _D("300")),), ((_D("0.95"), _D("300")),), NOW, 0)
+    rows = [m.LadderRow(_D("300"), "A", "↓ 300", book_a, "", "Will Zcash dip to $300?"),
+            m.LadderRow(_D("400"), "B", "↓ 400", book_b, "", "Will Zcash dip to $400?")]
+    bot.predict.ladders["ZEC-HIT-2027"] = rows
+    rm.learn(rows, bot.predict.market_meta)
+    bot.store.put(f"range:{spec.slug}", {"start": rm.start_ms, "through": NOW - NOW % H, "open": 450.0, "high": 610.0,
+                                         "high_at": CAT0, "low": 380.0, "low_at": LOW_AT})
+    rm.price, rm.priced_ms, rm.sigma, rm.sigma_ms, rm.scanned_ms = _D("520"), NOW, 1.1, NOW, NOW
+    trade = {"kind": "range", "key": "ZEC-HIT-2027", "market": f"{spec.slug}#B",
+             "settle": {"target": "400", "dir": "down", "end": rm.end_ms}}
+    assert bot.sim_result(trade, NOW) is None  # Predict's own result settles it, not a pre-listing low
+    rb = next(r for r in bot.range_payload(rm, NOW)["ladder"]["rows"] if r["label"] == "↓ $400")
+    assert not rb["touched"] and "请核实" in (rb["error"] or ""), rb
+
+_zec_scenario()
+
 print("AUDIT_MODELS_B_OK")

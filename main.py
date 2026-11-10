@@ -10136,7 +10136,12 @@ def book_disputes(book: "PredictBook | None") -> bool:
     with no quotes at all (often a market already settled) disputes nothing."""
     if book is None or not (book.bids or book.asks):
         return False
-    return max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0) < 0.9
+    # 1.150.0: judged on the best bid. A thin book bid 20¢ / offered 95¢ used to "agree" through its far ask, so a
+    # level our data alone calls reached (e.g. a ZEC level listed after the category's window low was printed) showed
+    # ✓ 已触及 and settled a paper Yes as a win. The bid is what someone will actually pay for Yes, so it alone says
+    # whether the market believes the touch; only a book with no bid at all is judged by its ask. Disputing more only
+    # holds a level as "请核实" and waits for Predict's own result: it never trades more.
+    return float((book.bids or book.asks)[0][0]) < 0.9
 
 
 def book_decided(book: "PredictBook | None") -> str:
@@ -19586,8 +19591,8 @@ class Bot:
                 "RESOLVED" in str(meta.get("status", "")).upper() and now_ms < int(s["end"]))
             if reached:
                 book = self.predict.yes_book(row)[0] if row else None
-                top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=1.0) if book else 1.0
-                if top >= 0.9:  # the book agrees, or is gone: reached (an open disagreement waits)
+                # 1.150.0: the same rule as the range ladder (best bid, see book_disputes), not max(bid, ask)
+                if not book_disputes(book):  # the book agrees, or is gone: reached (an open disagreement waits)
                     return 1.0, f"{usd_short(target)} 已触及（按机器人数据，以 {cap.spec.settle} 为准）", proof
                 return None
             if now_ms > int(s["end"]) + self.SIM_SETTLE_MS and not cap.coverage():
