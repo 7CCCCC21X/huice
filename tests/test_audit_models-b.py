@@ -246,6 +246,61 @@ _odds = _fm.odds(_now)
 assert isinstance(_odds, str) and "价格停在" in _odds, _odds  # REST down too: the frozen leg holds the odds after 5 min
 
 
+# --- MOD-FLIP-LEG fix-up: with one leg silent and allMids FAILING (a Hyperliquid 429), the next push of the live coin must
+# not wind the read timer back to the silent leg's old push time: allMids is retried once per PRICE_SECONDS, not on
+# every 1-second refresh tick (REFERENCE_TICK) --------------------------------------------------------------------------
+def _flip_leg_cadence(mids_fail: bool) -> tuple[m.FlipMarket, int, int]:
+    import asyncio as _asyncio, dataclasses as _dc, time as _time
+
+    class _Clock:
+        mono = 1_000.0
+
+        def monotonic(self):
+            return self.mono
+
+        def __getattr__(self, name):
+            return getattr(_time, name)
+    clock, real_time = _Clock(), m.time
+    spec = _dc.replace(m.FLIP_MARKETS[0], start_ms=m.et_ms(2026, 11, 1, 0, 0, -4))
+    fm = m.FlipMarket(m.Store(":memory:"), spec)
+    fm.sigma, fm.sigma_ms = 0.9, 0
+    asked: list[str] = []
+
+    async def info(payload):
+        asked.append(payload["type"])
+        if payload["type"] == "allMids":
+            if mids_fail:
+                raise ValueError("429 Too Many Requests")
+            return {spec.coin: "41.0", spec.other: "120.0"}
+        return []
+    fm.info = info
+    m.time = clock
+    seconds = 330  # past PRICE_STALE_MS (5 min) so the stale hold can be checked too
+    try:
+        t0 = 1_794_000_000_000
+        fm.push_mid(spec.coin, m.D("40.0"), t0)
+        fm.push_mid(spec.other, m.D("160.0"), t0)
+        now = t0
+        for k in range(1, seconds + 1):  # the first coin pushes every second, refresh runs every second
+            now, clock.mono = t0 + k * 1_000, 1_000.0 + k
+            fm.push_mid(spec.coin, m.D("40.0"), now)
+            fm.times["vol"] = fm.times["scan"] = clock.mono
+            _asyncio.run(fm.refresh(now))
+    finally:
+        m.time = real_time
+    return fm, asked.count("allMids"), now
+
+_most = 330 // m.FlipMarket.PRICE_SECONDS + 1
+for _fail in (True, False):
+    _fm, _reads, _now = _flip_leg_cadence(mids_fail=_fail)
+    assert 1 <= _reads <= _most, (_fail, _reads, _most)  # ~11 reads in 330 s, not ~300
+    if _fail:
+        _odds = _fm.odds(_now)
+        assert isinstance(_odds, str) and "价格停在" in _odds, _odds  # the stale hold still trips on the silent leg
+    else:
+        assert _fm.prices[_fm.spec.other] == m.D("120.0"), _fm.prices
+
+
 # --- MOD-HYPE-MARKPRICE: with HYPEUSDT in SYMBOLS, a markPriceUpdate frame re-sends the merged row (the LAST aggTrade's
 # price and time); it must not stamp the futures ladder's price "now" nor defer its 30-second REST read ---------------
 def _hype_markprice() -> None:

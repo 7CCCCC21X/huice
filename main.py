@@ -9106,13 +9106,19 @@ class FlipMarket:
         read timer take the older of the two: one coin's pushes must not keep a silent leg's mid looking live (its
         subscription refused or stalled while the shared socket stays busy with the other coin), nor defer the allMids
         read for ever. A silent leg now ages the read timer, so allMids is re-read every PRICE_SECONDS and refreshes
-        both legs; if that read fails too, priced_ms ages past PRICE_STALE_MS and odds() holds."""
+        both legs; if that read fails too, priced_ms ages past PRICE_STALE_MS and odds() holds.
+
+        The read timer only ever moves forward here: refresh() stamps it when it starts an allMids read, and a FAILED
+        read leaves the silent leg's push time old, so taking the plain minimum would wind the timer back on the very
+        next push and retry allMids on every 1-second refresh tick (a Hyperliquid 429 kept going, starving the HL
+        quotes and the KOSPI/KR200 proxy on the same info endpoint). With max() a failing read is retried once per
+        PRICE_SECONDS, as with no pushes at all; priced_ms still takes the older leg, so the stale hold is unchanged."""
         self.prices = {**self.prices, coin: mid}
         self.pushed = {**self.pushed, coin: (now_ms, time.monotonic())}
         pair = (self.spec.coin, self.spec.other)
         if all(c in self.prices and c in self.pushed for c in pair):
             self.priced_ms = min(self.pushed[c][0] for c in pair)
-            self.times["price"] = min(self.pushed[c][1] for c in pair)
+            self.times["price"] = max(self.times["price"], min(self.pushed[c][1] for c in pair))
 
     async def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict]:
         rows = await self.info({"type": "candleSnapshot", "req": {"coin": coin, "interval": interval,
