@@ -20284,7 +20284,11 @@ class Bot:
         blocked = {k: v for k, v in (record.get("blocked") or {}).items()
                    if isinstance(v, dict) and now_ms - int(v.get("at") or 0) <= self.SIM_BLOCK_KEEP_MS}
         old = blocked.get(tid)
-        if old and now_ms - int(old.get("at") or 0) < self.SIM_BLOCK_NOTE_MS and old.get("why") == why:
+        # 1.150.0: a live back-off or API cooldown names its countdown ("N 秒后再试"), which changes every second; the same
+        # refusal is the same whatever its countdown (same_refusal), else every refused look rewrote simblock:<driver> (a DB
+        # write) and bumped the "simblock" generation that keys sim_report's cache. Inside the window the stored text keeps
+        # the countdown of its first write; its "at" says when that was.
+        if old and now_ms - int(old.get("at") or 0) < self.SIM_BLOCK_NOTE_MS and same_refusal(old.get("why"), why):
             return
         blocked[tid] = {"at": now_ms, "market": mk.market, "item": mk.item, "label": label, "price": price, "why": why,
                         "first": int((old or {}).get("first") or now_ms), "kind": mk.kind, "key": mk.key,  # (the filter's card and kind: 1.107.0)

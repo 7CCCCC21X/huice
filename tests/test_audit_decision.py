@@ -122,4 +122,22 @@ assert sbot.sim_taker_self_cap(m.TradeMap({"a": own_up}), x, "up", 0.59) == 0.59
 # a 跌 maker at 45¢ rests as an ask at 55¢: the 涨 taker stays under 55¢
 assert sbot.sim_taker_self_cap(m.TradeMap({"a": {**own_up, "side": "down", "price": 0.45}}), x, "up", 0.70) == 0.54
 
+# --- SIM-BLOCK-NOTE-WRITES: a refusal whose countdown ticks ("N 秒后再试") is noted once per window, not on every look ----------
+bmk = self_mk([("0.60", "50")])
+btid = f"{SELF}|up|吃"
+writes = lambda: sbot.store.touched.get("simblock", 0)
+w0 = writes()
+sbot.sim_note_block(btid, bmk, "吃涨", 0.40, "下单失败：HTTP 400，120 秒后再试", NOW)
+sbot.sim_note_block(btid, bmk, "吃涨", 0.40, "下单失败：HTTP 400，119 秒后再试", NOW + 1000)
+sbot.sim_note_block(btid, bmk, "吃涨", 0.40, "Predict 接口限流冷却中（118 秒后重试）", NOW + 1500)
+assert writes() - w0 == 2, ("the countdown alone made a new record", writes() - w0)  # before the fix: 3
+sbot.sim_note_block(btid, bmk, "吃涨", 0.40, "Predict 接口限流冷却中（90 秒后重试）", NOW + 30_000)
+assert writes() - w0 == 2, writes() - w0
+sbot.sim_note_block(btid, bmk, "吃涨", 0.40, "收涨时这组仓位合计将亏 $350.00，超过组上限 $300", NOW + 31_000)
+assert writes() - w0 == 3, "a different refusal is still noted at once"
+sbot.sim_note_block(btid, bmk, "吃涨", 0.40, "收涨时这组仓位合计将亏 $350.00，超过组上限 $300", NOW + 31_000 + sbot.SIM_BLOCK_NOTE_MS)
+assert writes() - w0 == 4, "the same refusal is noted again once the window has passed"
+(rec,) = [b for b in sbot.sim_blocks() if b["id"] == btid]
+assert rec["first"] == NOW and rec["why"].startswith("收涨时"), rec
+
 print("AUDIT_DECISION_OK")
