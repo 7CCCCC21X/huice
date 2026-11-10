@@ -986,7 +986,12 @@ class Controller:
             return
         self.card_checked_ms = now_ms
         for rolling in core.preopen_cards():
-            if rolling.key not in self.settings.markets or not getattr(rolling, "limit_pct", 0):
+            # Audit PRE-ZHIPU-HALT: a card is passed over only when it has no exchange (the round-the-clock cards: nothing to
+            # judge). 1.130.0 passed over the cards without a daily price limit, which then meant the same thing; 1.134.0 added
+            # 智谱 (HKEX 2513: no daily limit, the halt rule alone — card_hold judges it so, PREOPEN.md promises it) but left
+            # this filter as it was, so 智谱 was never held: its resting 49¢ bids stayed up, and new ones went out, through a
+            # halt — the informed-flow case the guard exists for. card_hold itself skips the limit part when limit_pct is 0.
+            if rolling.key not in self.settings.markets or not getattr(rolling, "exchange", ""):
                 continue
             why = self.card_hold(rolling)
             if why:
