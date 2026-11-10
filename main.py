@@ -6256,8 +6256,10 @@ class PredictStream:
     round. The REST rounds go on unchanged: the stream is an accelerator, never the only source. Between the two the
     later read wins, as between two REST reads (book_asked): a REST answer asked for before the last push is dropped,
     one asked for after it replaces the pushed book and is compared with it (note_rest: a steady difference would be a
-    stream missing changes, shown in /diag). While the connection lives (its heartbeat echoed) every pushed book is as
-    current as it was, so its age restarts at each heartbeat and a quiet market's book is not stale for being quiet.
+    stream missing changes, shown in /diag). While the connection lives (its heartbeat echoed) every pushed book whose
+    topic still brings frames (heard within PREDICT_WS_SILENT_SECONDS) is as current as it was, so its age restarts at
+    each heartbeat and a quiet market's book is not stale for being quiet; a topic gone silent on a live connection gets
+    no such restart, and its book ages as a REST book whose reads fail does (touch, 1.149.x).
     Protocol (dev.predict.fun): JSON text frames; the client sends {"method": "subscribe" | "unsubscribe", "requestId":
     n, "params": [topic]}, answered by {"type": "R", "requestId": n, "success": bool, "error": {"code", "message"}};
     the server pushes {"type": "M", "topic", "data"}, a book as {"version", "marketId", "updateTimestampMs", "bids",
@@ -6274,6 +6276,8 @@ class PredictStream:
         self.versions: dict[str, int] = {}                # market id -> the last version applied (an older push is dropped)
         self.refused: dict[str, tuple[str, float]] = {}   # market id -> (the server's error, when): asked for again later
         self.live: set[str] = set()                       # market ids pushed at least once on this connection (their books are current)
+        self.heard: dict[str, float] = {}                 # market id -> monotonic time its topic last brought its book, a change or a re-send:
+        #                                                   the heartbeat restarts the age of a pushed book only while this is recent (touch)
         self.pushed: set[str] = set()                     # item keys whose stored (single) book is a push: a REST read replacing it is compared
         self.wake = asyncio.Event()                       # the wants changed: the subscriptions are brought in step
         self.request_id = 0
@@ -6335,7 +6339,7 @@ class PredictStream:
                 continue
             since = time.monotonic()
             self.ws, self.connected_at, self.last_frame, self.connects = ws, since, since, self.connects + 1
-            self.subscribed.clear(); self.pending.clear(); self.versions.clear(); self.live.clear(); self.pushed.clear()
+            self.subscribed.clear(); self.pending.clear(); self.versions.clear(); self.live.clear(); self.pushed.clear(); self.heard.clear()
             self.wake.set()
             LOG.info("Predict 推送已连接（第 %d 次），订阅 %d 个市场", self.connects, len(self.wanted))
             why = ""
@@ -6415,6 +6419,7 @@ class PredictStream:
             self.subscribed.pop(mid, None)
             self.versions.pop(mid, None)
             self.live.discard(mid)
+            self.heard.pop(mid, None)
 
     async def request(self, ws: Any, method: str, mid: str) -> None:
         self.request_id += 1
@@ -6492,6 +6497,7 @@ class PredictStream:
             # decide, not the version (1.104.4): with the version deciding, 7,427 pushes in six minutes were read as repeats
             # while the REST read found the book changed under them — the version does not count every change
             self.repeated += 1
+            self.heard[mid] = asked  # the topic still brings this market's book (touch)
             self.refresh_age(key, level, mid)
             return
         stamp = data.get("updateTimestampMs")
@@ -6509,6 +6515,7 @@ class PredictStream:
             feed.errors.pop(key, None)
             self.pushed.add(key)
         self.live.add(mid)
+        self.heard[mid] = asked
         self.books += 1
         feed.updated(key)
 
@@ -6532,16 +6539,25 @@ class PredictStream:
                 feed.books[key] = dataclasses.replace(book, fetched_ms=now_ms)
 
     def touch(self) -> None:
-        """The heartbeat says the connection lives: every book pushed on it is as current as it was, so its age restarts
-        (a market nobody traded on for two minutes is not stale for it, PREDICT_STALE_MS)."""
-        feed, now_ms = self.feed, int(time.time() * 1000)
+        """The heartbeat says the connection lives: every book pushed on it whose topic still brings frames is as current
+        as it was, so its age restarts (a market nobody traded on for two minutes is not stale for it, PREDICT_STALE_MS).
+        1.149.x (audit FEED-HEARTBEAT-FRESH): the heartbeat is the connection's, not the topic's. Restarting every book
+        ever pushed on the connection kept a topic gone quiet on a live connection (a subscription the server dropped, a
+        market paused) at age 0 for ever: with its REST reads failing as well (a 429 cool-down, "Market is closed") the
+        stale guard, the express lane's skip, the send-time re-check and the resting orders' 盘口断流 withdrawal all took
+        levels ten minutes old as current. A live topic re-sends its book every second or so (1.104.1, refresh_age), so
+        a market heard from within PREDICT_WS_SILENT_SECONDS (the connection's own silence limit, three heartbeats) is
+        restarted as before; a quiet one ages from its last restart and is stale PREDICT_STALE_MS later (at most 45 + 90
+        s after its last frame), and the hot REST round reads it again (pushing: its age is past PREDICT_PUSH_FRESH_MS)."""
+        feed, now_ms, mono = self.feed, int(time.time() * 1000), time.monotonic()
+        alive = {mid for mid, at in self.heard.items() if mid in self.live and mono - at <= PREDICT_WS_SILENT_SECONDS}
         for key, book in list(feed.books.items()):
-            if book.market_id in self.live:
+            if book.market_id in alive:
                 feed.books[key] = dataclasses.replace(book, fetched_ms=now_ms)
         for key, rows in list(feed.ladder_rows.items()):
             touched = False
             for mid, row in list(rows.items()):
-                if mid in self.live and row.book is not None:
+                if mid in alive and row.book is not None:
                     rows[mid] = dataclasses.replace(row, book=dataclasses.replace(row.book, fetched_ms=now_ms))
                     touched = True
             if touched:

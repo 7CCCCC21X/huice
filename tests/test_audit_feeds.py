@@ -323,4 +323,129 @@ def feed_etnet_closed_block() -> None:
 
 feed_etnet_closed_block()
 
+
+# FEED-HEARTBEAT-FRESH: PredictStream.touch() restarted, at every heartbeat (every 15 s), the age of every book ever
+# pushed on the connection, whether or not its topic still brought frames. A topic gone quiet on a live connection (a
+# subscription the server dropped, a market paused) whose REST reads fail as well (a 429 cool-down, "Market is closed")
+# then kept its last levels at age 0 for ever: the stale guard (PREDICT_STALE_MS), the express lane's skip and the
+# 盘口断流 withdrawal never tripped. A topic that keeps re-sending its book (the server does every second or so), and one
+# quiet for less than PREDICT_WS_SILENT_SECONDS, must still be restarted by the heartbeat.
+async def feed_heartbeat_fresh() -> None:
+    import json
+    D, real_time, real_blocking = m.D, m.time, m.predict_blocking
+
+    class Clock:  # main's wall and monotonic clocks moved together: three minutes of a connection in no time
+        def __init__(self):
+            self.wall, self.mono = float(int(real_time.time())), float(int(real_time.monotonic()))
+
+        def time(self):
+            return self.wall
+
+        def monotonic(self):
+            return self.mono
+
+        def advance(self, seconds):
+            self.wall += seconds
+            self.mono += seconds
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+    class Ws:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, text):
+            self.sent.append(json.loads(text))
+
+    def frame(mid: str, bid: str, ask: str) -> str:  # the topic's book; the same levels again are a re-send
+        return json.dumps({"type": "M", "topic": "predictOrderbook/" + mid,
+                           "data": {"version": 3, "bids": [[bid, "100"]], "asks": [[ask, "100"]]}})
+
+    beat = lambda t: json.dumps({"type": "M", "topic": "heartbeat", "data": t})
+    rest: list[str] = []
+
+    async def closed(fn, url, *args):  # every REST request fails (the transport under the real fetch)
+        rest.append(url)
+        raise m.RemoteError("HTTP 400: Market is closed")
+
+    clock = Clock()
+    now = lambda: int(clock.wall * 1000)
+    m.time, m.predict_blocking = clock, closed
+    try:
+        # (1) two single markets on one live connection, their REST reads failing: HSI's topic brings its snapshot and
+        # goes quiet, KOSPI's re-sends its book every second; the real hot round every 10 s, the heartbeat every 15 s
+        feed = m.PredictFeed(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_API_KEY": "k1"}))
+        targets: dict[str, str] = {}
+        for key, mid in (("HSI", "7"), ("KOSPI", "9")):
+            slug = f"{key.lower()}-up-or-down-on-november-10-2026"
+            market = {"id": mid, "conditionId": "c" + mid, "title": f"{key} up?"}
+            feed.books[key] = m.PredictBook(key, slug, mid, market["title"], ((D("0.80"), D("100")),), ((D("0.85"), D("100")),), now(), 200)
+            feed.markets[slug], feed.fees[mid], feed.strikes[slug] = (market, clock.mono), (200, clock.mono), (None, clock.mono)
+            targets[key] = slug
+        stream, ws = feed.stream, Ws()
+        stream.ws, stream.connected_at, stream.last_frame = ws, clock.mono, clock.mono
+        stream.subscribed = {"7": ("HSI", False), "9": ("KOSPI", False)}
+        await stream.handle(ws, frame("7", "0.81", "0.84"))
+        await stream.handle(ws, frame("9", "0.81", "0.84"))
+        assert stream.live == {"7", "9"} and feed.books["HSI"].bids == ((D("0.81"), D("100")),)
+        first_stale = None
+        for t in range(1, 181):
+            clock.advance(1)
+            await stream.handle(ws, frame("9", "0.81", "0.84"))
+            if t % 15 == 0:
+                stream.last_frame = clock.mono
+                await stream.handle(ws, beat(t))
+                if t == 30:  # quiet for less than PREDICT_WS_SILENT_SECONDS: restarted by the heartbeat as before
+                    assert feed.books["HSI"].fetched_ms == now(), (now() - feed.books["HSI"].fetched_ms) / 1000
+            if t % 10 == 0:
+                await feed.refresh(targets, force=True, hot=set(targets))
+                if feed.cold_task is not None:
+                    await feed.cold_task
+            if first_stale is None and feed.books["HSI"].stale(now()):
+                first_stale = t
+        hsi, kospi = feed.books["HSI"], feed.books["KOSPI"]
+        assert rest and "Market is closed" in feed.errors.get("HSI", ""), (len(rest), feed.errors)
+        assert stream.heartbeats == 12 and hsi.bids == ((D("0.81"), D("100")),), (stream.heartbeats, hsi)
+        assert hsi.stale(now()), \
+            f"a book whose topic went quiet three minutes ago is re-stamped by every heartbeat: age {(now() - hsi.fetched_ms) / 1000:.0f} s"
+        # it ages from its last restart: stale at most PREDICT_WS_SILENT_SECONDS + PREDICT_STALE_MS after its last frame
+        assert first_stale is not None and first_stale <= m.PREDICT_WS_SILENT_SECONDS + m.PREDICT_STALE_MS / 1000 + 1, first_stale
+        assert kospi.fetched_ms == now() and not kospi.stale(now()), "a topic that re-sends its book stays fresh"
+
+        # (2) a ladder's levels, the same: level 41's topic goes quiet, level 42's re-sends; nothing else reads them
+        feed = m.PredictFeed(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_API_KEY": "k1"}))
+        key, slug = "BTC-HIT-11", "what-price-will-bitcoin-hit-in-november-2026"
+        feed.ladder_keys.add(key)
+        feed.ladder_rows[key] = {
+            mid: m.LadderRow(D(target), mid, f"BTC ↑ ${target}",
+                             m.PredictBook(key, slug, mid, "BTC", ((D("0.10"), D("50")),), ((D("0.20"), D("50")),), now(), 200))
+            for mid, target in (("41", "90000"), ("42", "95000"))}
+        feed.ladder_publish(key)
+        stream, ws = feed.stream, Ws()
+        stream.ws, stream.connected_at, stream.last_frame = ws, clock.mono, clock.mono
+        stream.subscribed = {"41": (key, True), "42": (key, True)}
+        await stream.handle(ws, frame("41", "0.12", "0.19"))
+        await stream.handle(ws, frame("42", "0.12", "0.19"))
+        assert stream.live == {"41", "42"}
+        for t in range(1, 181):
+            clock.advance(1)
+            await stream.handle(ws, frame("42", "0.12", "0.19"))
+            if t % 15 == 0:
+                await stream.handle(ws, beat(t))
+        rows, published = feed.ladder_rows[key], {row.market_id: row for row in feed.ladders[key]}
+        assert rows["41"].book.stale(now()) and published["41"].book.stale(now()), \
+            f"a ladder level whose topic went quiet is re-stamped by every heartbeat: age {(now() - rows['41'].book.fetched_ms) / 1000:.0f} s"
+        assert rows["41"].book.bids == ((D("0.12"), D("100")),)  # the levels are kept, only their age is honest
+        assert not rows["42"].book.stale(now()) and not published["42"].book.stale(now())
+        # a market let go is forgotten with the rest of its state (a new connection starts with none, run)
+        stream.want({"42": (key, True)})
+        await stream.sync(ws)
+        assert ws.sent[-1]["method"] == "unsubscribe" and "41" not in stream.heard and "41" not in stream.live and "42" in stream.heard, stream.heard
+    finally:
+        m.time, m.predict_blocking = real_time, real_blocking
+
+
+asyncio.run(feed_heartbeat_fresh())
+
 print("AUDIT_FEEDS_OK")
