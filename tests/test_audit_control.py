@@ -224,4 +224,31 @@ async def ctrl_report_midnight():
 
 
 asyncio.run(ctrl_report_midnight())
+
+
+def ctrl_want_info():
+    """CTRL-WANT-INFO: a rolled card's old slug leaves predict.want_info (it is never a target again); the set does not grow
+    by one slug per roll for ever."""
+    import datetime as dt
+    env = {**base, "SYMBOLS": "BTCUSDT", "SIM_MARKETS": "all"}
+    t0 = int(dt.datetime(2026, 11, 4, 0, 0, tzinfo=m.BEIJING).timestamp() * 1000)
+    bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(t0), None)
+    assert bot.updown_rolling, "no rolling cards"
+    start = len(bot.predict.want_info)
+    key = next(k for k, d in bot.updown_rolling.items() if isinstance(d, m.WindowUpDownSpec))
+    mkt, daily = bot.updowns[key], bot.updown_rolling[key]
+    old = mkt.spec.slug
+    assert old in bot.predict.want_info
+    bot.updown_roll(mkt.spec.end_ms + 60_000 + daily.ROLL_WAIT_MS + 1)
+    assert mkt.spec.slug != old, "the card did not roll"
+    assert mkt.spec.slug in bot.predict.want_info and old not in bot.predict.want_info
+    now = t0
+    for _ in range(24 * 60):  # a simulated day, a roll check every minute
+        now += 60_000
+        bot.updown_roll(now)
+    assert len(bot.predict.want_info) <= start + len(bot.updown_rolling), (len(bot.predict.want_info), start)
+    assert {mk.spec.slug for mk in bot.updowns.values()} <= bot.predict.want_info
+
+
+ctrl_want_info()
 print("AUDIT_CONTROL_OK")

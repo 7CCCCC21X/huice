@@ -23305,6 +23305,11 @@ class Bot:
             if final is not None and spec.start_ms == old.end_ms and mkt.close_of("start") is None:
                 # the new market's line is the very candle that just settled the old one: kept at once, not read again
                 self.store.put(f"updown:{spec.slug}:start", {"open": spec.start_ms, "close": str(final), "read_ms": now_ms, "from": old.slug})
+            # the market just over is never a target again (mkt.spec moved on, predict_targets reads only the current slug;
+            # its outcome info is pruned from predict.info already): its slug would otherwise stay in want_info for ever,
+            # one per roll — ~2,500 a day with every 15-minute card on. Dropped here, at the roll, not by pruning
+            # want_info to the targets: a 15-minute card's next slug is not a target until WINDOW_LEAD_MS before its window
+            self.predict.want_info.discard(old.slug)
             self.predict.want_info.add(spec.slug)
             if isinstance(daily, WindowUpDownSpec) and (pruned := self.updown_prune(daily, now_ms)):
                 LOG.info("%s：清掉 %d 条 %d 天前的窗口价格记录", key, pruned, self.UPDOWN_KEEP_MS // DAY_MS)
