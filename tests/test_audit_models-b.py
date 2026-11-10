@@ -410,4 +410,52 @@ def _range_scan_empty():
 
 _range_scan_empty()
 
+# --- MOD-CAP-FIRST-HOUR: a cap window opening mid-hour reads that hour's minute bars again on every scan until the hour
+# is over; a first scan inside that hour no longer marks it read and loses a spike later in it ------------------------
+def _cap_first_hour():
+    import asyncio as _asyncio
+    import retired  # the retired cap specs (fixtures only; main's market lists are left alone)
+    spec = next(s for s in retired.CAP_MARKETS if s.key == "NIULAI")
+    H = 3600
+    start_s = spec.start_ms // 1000
+    assert start_s % H, start_s  # the fixture's window opens mid-hour
+    first_hour = start_s - start_s % H
+    spike = first_hour + 50 * 60  # 0.9 USD inside the window, after the first scan
+    now = [start_s + 600]
+    cap = m.CapMarket(m.Store(":memory:"), spec)
+    cap.pool = "0xPOOL"
+
+    async def get(url, payload=None):
+        q = dict(p.split("=") for p in url.split("?")[1].split("&"))
+        before, limit = int(q["before_timestamp"]), int(q["limit"])
+        if "/ohlcv/minute" in url:
+            rows = [[first_hour + i * 60, 0.1, 0.9 if first_hour + i * 60 == spike else 0.1, 0.1, 0.1, 1] for i in range(60)]
+            rows = [r for r in rows if r[0] <= now[0]]  # only minutes that exist by then
+        else:  # the opening hour's hourly bar carries the spike too but starts before the window: it must stay out
+            rows = [[t, 0.1, 0.9 if t == first_hour else 0.12, 0.1, 0.1, 5] for t in range(first_hour - 10 * H, now[0], H)]
+        return {"data": {"attributes": {"ohlcv_list": [r for r in rows if r[0] < before][-limit:][::-1]}}}
+    cap.get = get
+    _asyncio.run(cap.scan(now[0] * 1000))
+    assert "first" not in cap.history, cap.history  # the opening hour is still running: read again next scan
+    assert cap.coverage() != "", cap.coverage()
+    now[0] = first_hour + 3 * H + 120
+    _asyncio.run(cap.scan(now[0] * 1000))
+    assert cap.history["first"] == "done" and cap.history["bar_high"] >= 0.9, cap.history
+    assert cap.history["bar_at"] == spike, cap.history
+
+    # the hourly bar of the opening hour is still left out: no minute spike, no 0.9
+    now[0] = first_hour + 3 * H + 120
+    cap2 = m.CapMarket(m.Store(":memory:"), spec)
+    cap2.pool = "0xPOOL"
+
+    async def flat(url, payload=None):
+        if "/ohlcv/minute" in url:
+            return {"data": {"attributes": {"ohlcv_list": []}}}
+        return await get(url, payload)
+    cap2.get = flat
+    _asyncio.run(cap2.scan(now[0] * 1000))
+    assert cap2.history["first"] == "skipped" and cap2.history["bar_high"] < 0.9, cap2.history
+
+_cap_first_hour()
+
 print("AUDIT_MODELS_B_OK")

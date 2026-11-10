@@ -9752,15 +9752,22 @@ class CapMarket:
         hist["pool"] = pool
         hist.setdefault("through", start_hour)
         if start_s % 3600 and "first" not in hist:
-            # the window opens mid-hour: that hour counts only from the opening minute
+            # the window opens mid-hour: that hour counts only from the opening minute. While that hour is still running
+            # its later minutes do not exist yet: keep the high of the minutes there are and read them again on the next
+            # scan; only once the hour is over is it marked done/skipped for good. (Marking it on the first scan lost a
+            # spike later in that hour for good: that hour's hourly bar is left out on purpose, it starts before the
+            # window.) A high read from a minute that is still running was still reached, so it may be kept.
+            over = now_s >= start_hour
             try:
-                bars = [b for b in await self.ohlcv("minute", start_s - start_s % 3600 + 3600, 60) if b[0] >= start_s]
-                hist["first"] = "done" if bars else "skipped"
+                bars = [b for b in await self.ohlcv("minute", start_hour, 60) if b[0] >= start_s]
                 for bar in bars:
                     if bar[2] > hist["bar_high"]:
                         hist["bar_high"], hist["bar_at"] = bar[2], bar[0]
+                if over:
+                    hist["first"] = "done" if bars else "skipped"
             except Exception:
-                hist["first"] = "skipped"
+                if over:
+                    hist["first"] = "skipped"
         rows: list[tuple[int, float, float, float, float]] = []
         before, floor, known = end_s, int(hist["through"]), int(hist.get("bars_from") or 1 << 62)
         for _ in range(10):  # 1000 hours per page, newest first
