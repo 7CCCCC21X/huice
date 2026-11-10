@@ -2597,15 +2597,17 @@ class LiveBot(core.Bot):
         return preopen is not None and getattr(preopen, "account_rows", None) is not None and bool(at) and 0 <= now_ms - at <= self.LIVE_SNAPSHOT_MAX_AGE_MS
 
     def live_known_markets(self) -> tuple[dict[str, str], dict[str, str]]:
-        """(market id -> name, outcome token -> name) of every market this bot trades or traded for real: the markets
-        priced for its orders, its records, the pre-open mode's windows."""
+        """(market id -> name, outcome token -> name) of every market this bot trades or traded for real: its records,
+        the pre-open mode's windows.
+
+        1.150.x: not the market-details cache (self.live.markets) any more: live_prefetch reads it for any card whose
+        suggestion is merely near the bar, and /live test for its test market, so a market the bot only priced counted as
+        its own for the rest of the run and the operator's manual order there was withdrawn by the orphan sweep, against
+        the documented promise that only the markets the bot 做过 are swept. Every real order has a record before it is
+        sent (the "pending" record carries market_id and want.token) and sim_prune keeps any record whose order may still
+        rest, so the records and the ledger still cover the lost-tracking case the sweep exists for."""
         ids: dict[str, str] = {}
         tokens: dict[str, str] = {}
-        for mid, info in getattr(self.live, "markets", {}).items():
-            ids[str(mid)] = str(mid)
-            for o in getattr(info, "outcomes", None) or []:
-                if o.get("token"):
-                    tokens[str(o["token"])] = str(mid)
         for t in self.sim_trades().values():
             st = t.get("live")
             if not isinstance(st, dict):

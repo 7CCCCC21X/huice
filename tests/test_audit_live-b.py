@@ -424,4 +424,25 @@ async def live_pnl_display():
 
 
 asyncio.run(live_pnl_display())
+async def live_orphan_known():
+    """LIVE-ORPHAN-KNOWN: a market the bot only priced (live_prefetch / /live test read its details into the cache, no order,
+    no record) is not one of its own markets: the operator's manual order resting there is only reported as an unrecorded
+    order, never withdrawn by the orphan sweep (it was withdrawn after LIVE_ORPHAN_GRACE_MS)."""
+    WEI = 10 ** 18
+    bot = make_bot(SIM_WAYS="taker")
+    await bot.live_prepare()
+    fake = bot.live.api
+    await bot.live.market("101")  # what live_prefetch does for a card near the bar: details cached, nothing placed
+    assert "101" in bot.live.markets and not any(isinstance(t.get("live"), dict) for t in bot.sim_trades().values())
+    fake.open["900"] = {"id": "900", "status": "OPEN", "amount": str(50 * WEI), "amountFilled": "0", "market": {"id": "101"},
+                        "order": {"hash": "0xmanual", "side": 0, "tokenId": "1011", "makerAmount": str(20 * WEI), "takerAmount": str(50 * WEI)}}
+    assert bot.live_market_of(fake.open["900"]) == "", bot.live_known_markets()
+    for t in (NOW + 60_000, NOW + 130_000, NOW + 200_000, NOW + 330_000):  # well past the grace and the sweep interval
+        await step(bot, t, hsi(0.70, [("0.50", "100")], [("0.95", "100")], t))
+    assert not any(k == "remove" and "900" in ids for k, ids in fake.calls), fake.calls
+    assert "900" in fake.open and not any(o.get("id") == "900" for o in bot.live_orphans), bot.live_orphans
+    assert [u["id"] for u in bot.live_unknown_open] == ["900"], bot.live_unknown_open  # still reported
+
+
+asyncio.run(live_orphan_known())
 print("AUDIT_LIVE_B_OK")
