@@ -1365,6 +1365,8 @@ class LiveBot(core.Bot):
         self.live_noted: dict[str, float] = {}
         self.live_misses: dict[str, int] = {}
         self.live_seq = 0
+        self.live_note_buffer: dict[str, list[str]] = {}  # sub id -> unkeyed live notices waiting for that chat's one batch message (live_notify)
+        self.live_note_dropped: dict[str, int] = {}       # sub id -> notices dropped from a full buffer since its last batch
         self.live_last_sync = 0.0
         self.live_last_redeem = -1e9
         self.live_last_balance = -1e9
@@ -3796,9 +3798,19 @@ class LiveBot(core.Bot):
         return "\n".join(lines)
 
     # --- telling the administrator ------------------------------------------------------------------------------------------
+    LIVE_NOTE_BUFFER = 50   # unkeyed notices held per chat for its next batch message; beyond it the oldest are dropped (and counted)
+
     def live_notify(self, text: str, key: str = "") -> None:
         """A line to every active subscription (the administrator's chats); a keyed notice repeats at most every
-        LIVE_NOTE_SECONDS."""
+        LIVE_NOTE_SECONDS.
+
+        1.150.0 (audit LIVE-NOTIFY-PRIORITY): the unkeyed notices (📤 each placement, ✅ each fill, 💵, ℹ️ …) are coalesced
+        per chat: each one joins that chat's buffer, and one batch delivery per chat sends everything buffered as ONE message, then whatever
+        arrived while that message waited in Telegram's per-chat queue (about one message per 1.1 s), until the buffer
+        is empty. They used to be one message each: a maker re-quoting every few seconds over a few slots, plus fills,
+        outran that rate, the queue grew without bound, and a keyed critical alert (🛑 kill switch, ❓ unknown order,
+        ⚠️ …) waited behind every notice already queued — minutes late. Now a critical alert waits behind at most one
+        live batch message. Keyed notices keep their own delivery each, as before."""
         if not self.config.live_notify or self.telegram is None:
             return
         if key:
@@ -3808,11 +3820,33 @@ class LiveBot(core.Bot):
         for sub_id, sub in self.subscriptions().items():
             if not sub.get("active"):
                 continue
+            if not key:
+                buffer = self.live_note_buffer.setdefault(sub_id, [])
+                buffer.append(text)
+                if len(buffer) > self.LIVE_NOTE_BUFFER:
+                    over = len(buffer) - self.LIVE_NOTE_BUFFER
+                    del buffer[:over]
+                    self.live_note_dropped[sub_id] = self.live_note_dropped.get(sub_id, 0) + over
+                # one batch per chat at a time: while it is in flight this does nothing, and the batch takes this line too
+                async def batch(sub_id: str = sub_id, sub: dict = sub) -> None:
+                    await self.live_note_batch(sub_id, sub)
+                self.deliver(f"live:batch:{sub_id}", batch)
+                continue
             self.live_seq += 1
 
             async def send(sub: dict = sub, text: str = text) -> None:
                 await self.tell(sub["chat"], sub["thread"], text)
             self.deliver(f"live:{self.live_seq}:{sub_id}", send)
+
+    async def live_note_batch(self, sub_id: str, sub: dict) -> None:
+        """live_notify's batch delivery for one chat: send the buffered notices as one message, and again for those
+        that arrived while it waited in the send queue, until none are left (no await between the last check and the
+        end, so a notice is never left behind in the buffer without a batch on its way)."""
+        while lines := self.live_note_buffer.pop(sub_id, []):
+            dropped = self.live_note_dropped.pop(sub_id, 0)
+            if dropped:
+                lines = [f"（另有 {dropped} 条较早的真实交易通知未单独发送）", *lines]
+            await self.tell(sub["chat"], sub["thread"], "\n\n".join(lines))
 
     # --- commands and texts -------------------------------------------------------------------------------------------------
     async def cmd_live(self, req: core.Request) -> Any:

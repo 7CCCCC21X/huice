@@ -228,4 +228,55 @@ async def live_auth_singleflight():
 
 
 asyncio.run(live_auth_singleflight())
+
+async def live_notify_priority():
+    """LIVE-NOTIFY-PRIORITY: the unkeyed per-order / per-fill notices (📤 ✅ 💵 ℹ️) were one Telegram message each, and
+    Telegram paces a chat at about one message per 1.1 s: a burst of them queued every critical keyed alert (🛑 kill switch,
+    ❓ unknown order …) behind all of them. Now they are coalesced per chat into one batch message at a time, so the kill alert
+    goes out among the first messages and nothing is lost."""
+    class SlowTelegram:  # one message at a time per chat, each takes a while (Telegram.paced's per-chat lock and gap)
+        def __init__(self):
+            self.sent, self.lock = [], asyncio.Lock()
+        async def send(self, chat, thread, text, reply_markup=None, parse_mode=None):
+            async with self.lock:
+                await asyncio.sleep(0.01)
+                self.sent.append((chat, thread, text))
+    bot = make_bot()
+    bot.telegram = tg = SlowTelegram()
+    bot.store.put("subscriptions", {"7:0": {"chat": 7, "thread": 0, "active": True},
+                                    "8:0": {"chat": 8, "thread": 0, "active": False}})
+    assert bot.config.live_notify
+    for k in range(50):
+        bot.live_notify(f"📤 order {k}")
+        await asyncio.sleep(0)
+    bot.live_notify("🛑 KILL switch", key="kill")
+    await bot.drain_deliveries()
+    texts = [t for chat, _, t in tg.sent]
+    assert all(chat == 7 for chat, _, _ in tg.sent), tg.sent  # an inactive subscription gets nothing
+    kill_at = next(i for i, t in enumerate(texts) if "KILL" in t)
+    assert kill_at < 3, (kill_at, len(texts))
+    assert len(texts) <= 5, len(texts)  # far fewer than 51 messages
+    joined = "\n\n".join(t for t in texts if "KILL" not in t)
+    assert all(f"📤 order {k}" in joined for k in range(50)), joined  # every notice still delivered, in order
+    assert joined.index("📤 order 3") < joined.index("📤 order 49")
+    assert not bot.live_note_buffer, bot.live_note_buffer
+    # a notice after the batch finished starts a new one
+    bot.live_notify("✅ filled 9")
+    await bot.drain_deliveries()
+    assert tg.sent[-1][2] == "✅ filled 9", tg.sent[-1]
+    # a flood beyond the buffer's cap keeps the newest and says how many were left out
+    tg.sent.clear()
+    bot.telegram = tg
+    for k in range(bot.LIVE_NOTE_BUFFER + 30):
+        bot.live_notify(f"📤 flood {k}")  # no yield: all of them land before the batch takes the buffer
+    await bot.drain_deliveries()
+    assert len(tg.sent) == 1 and "另有 30 条" in tg.sent[0][2] and "📤 flood 79" in tg.sent[0][2] and "📤 flood 29\n" not in tg.sent[0][2], tg.sent
+    # a keyed notice is still deduplicated for LIVE_NOTE_SECONDS
+    tg.sent.clear()
+    bot.live_notify("🛑 KILL switch", key="kill")
+    await bot.drain_deliveries()
+    assert not tg.sent, tg.sent
+
+
+asyncio.run(live_notify_priority())
 print("AUDIT_LIVE_B_OK")
