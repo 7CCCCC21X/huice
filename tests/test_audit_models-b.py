@@ -49,4 +49,25 @@ assert abs(shown - 0.144) < 1e-9 and abs(shown - 0.220) > 0.05, shown
 shown0, expected0 = fit_walkforward(1.0)  # no strike: ref == ref_raw, the line is what it always was
 assert abs(shown0 - round(expected0, 3)) < 1e-9, (shown0, expected0)
 
+# --- MOD-YAHOO-SORT: parse_yahoo_daily keeps one bar per date (the later stamp), so Yahoo's live duplicate of today
+# with a null open no longer raises TypeError, and two numeric opens no longer order the copies by open --------------
+import datetime as _dt, json as _json
+from decimal import Decimal as _D
+
+
+def yahoo_chart(opens: list) -> bytes:
+    kst = _dt.timezone(_dt.timedelta(hours=9))
+    stamps = [int(_dt.datetime(2026, 11, d, h, mi, tzinfo=kst).timestamp()) for d, h, mi in ((9, 9, 0), (10, 9, 0), (10, 15, 30))]
+    return _json.dumps({"chart": {"result": [{"meta": {"gmtoffset": 32400}, "timestamp": stamps,
+                        "indicators": {"quote": [{"open": opens, "close": [4005, 4020, 4021.5]}]}}]}}).encode()
+
+
+bars = m.parse_yahoo_daily(yahoo_chart([4000, 4010, None]))
+assert [b[0] for b in bars] == [_dt.date(2026, 11, 9), _dt.date(2026, 11, 10)], bars
+assert bars[1][2] == _D("4021.50") and bars[1][1] == _D("4010"), bars
+bars = m.parse_yahoo_daily(yahoo_chart([4000, 4012, 4011]))
+assert len(bars) == 2 and bars[1][2] == _D("4021.50") and bars[1][1] == _D("4011"), bars
+bars = m.parse_yahoo_daily(yahoo_chart([4000, None, 4010]))
+assert len(bars) == 2 and bars[1] == (_dt.date(2026, 11, 10), _D("4010"), _D("4021.50")), bars
+
 print("AUDIT_MODELS_B_OK")

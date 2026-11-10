@@ -1980,17 +1980,28 @@ def parse_yahoo_daily(raw: bytes) -> list[tuple[dt.date, D | None, D]]:
         stamps, closes, opens = result["timestamp"], quote["close"], quote.get("open") or []
     except (ValueError, KeyError, IndexError, TypeError):
         raise ValueError("Yahoo 日 K 返回格式异常") from None
-    bars = []
-    for i, ts in enumerate(stamps):
+    # 1.150.0: one bar per exchange-local date, keyed by date and filled in timestamp order. Yahoo sometimes returns
+    # today's live price as a second row with the same date (often with no open). Sorting the whole (date, open, close)
+    # tuples then compared the opens of the two copies: a None against a Decimal raised TypeError (the source failed
+    # for that cycle), and two numeric opens ordered the copies by open, so merge_closes could keep the older close.
+    # The later stamp now wins; when it has no open, the earlier copy's open (the session open) is kept.
+    by_day: dict[dt.date, tuple[dt.date, D | None, D]] = {}
+    try:
+        order = sorted(range(len(stamps)), key=lambda i: int(stamps[i]))
+    except (ValueError, TypeError):
+        raise ValueError("Yahoo 日 K 返回格式异常") from None
+    for i in order:
         close = closes[i] if i < len(closes) else None
         if close is None:
             continue
-        day = dt.datetime.fromtimestamp(int(ts) + offset, dt.timezone.utc).date()
-        bars.append((day, _open_price(str(opens[i])) if i < len(opens) and opens[i] is not None else None,
-                     D(str(close)).quantize(D("0.01"))))
-    if not bars:
+        day = dt.datetime.fromtimestamp(int(stamps[i]) + offset, dt.timezone.utc).date()
+        opened = _open_price(str(opens[i])) if i < len(opens) and opens[i] is not None else None
+        if opened is None and day in by_day:
+            opened = by_day[day][1]
+        by_day[day] = (day, opened, D(str(close)).quantize(D("0.01")))
+    if not by_day:
         raise ValueError("Yahoo 日 K 没有返回任何交易日")
-    return sorted(bars)
+    return sorted(by_day.values(), key=lambda bar: bar[0])
 
 
 def _open_price(text: str) -> D | None:
@@ -4046,7 +4057,7 @@ class DailyCloses:
         for rank, (kind, url) in enumerate(self.sources):
             try:
                 raw = await fetch_source(url, self.REFERERS.get(kind))
-                bars = finished_bars(sorted(self.parse(kind, self.market, raw)), self.market, now_ms)
+                bars = finished_bars(sorted(self.parse(kind, self.market, raw), key=lambda bar: bar[0]), self.market, now_ms)
                 if not bars:
                     raise ValueError("日 K 为空")
             except Exception as error:
