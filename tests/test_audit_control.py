@@ -94,4 +94,31 @@ async def ctrl_no_control_key():
 
 
 asyncio.run(ctrl_no_control_key())
+
+
+def ctrl_ladder_hot():
+    # CTRL-LADDER-HOT: on price/market-cap ladder cards the action cell's red mark compared the edge with the bare global bar
+    # (HOT) while the card frame, the 机会条 and the opened chips use the most specific bar set (level/card/section/global).
+    # With any override the two disagreed (red cell on an unframed card, or a framed card whose cell is not red).
+    src = open(m.__file__, encoding="utf-8").read()
+    start = src.index("function priceLadderBook(")
+    body = src[start:src.index("\nfunction ", start + 10)]
+    act = body[body.index("const action=maker=>"):]
+    act = act[:act.index("const line=")]
+    assert 'e.edge>=HOT)a.classList.add("hot")' not in body, "ladder cell still uses the global bar"
+    assert 'if(e.edge>=hotFor(it,r.label))a.classList.add("hot")' in act, "ladder cell must use the per-level bar"
+    # the resolver it now shares with the frame: a 20c level bar over a 10c global bar keeps a 15c edge un-red
+    import shutil, subprocess
+    node = shutil.which("node")
+    if node:
+        i = src.index("function hotCentsFor(")
+        res = src[i:src.index("function setHot(", i)]
+        js = ("const favKey=it=>it.key,hotCents=10,hotMap={'row:A#L1':20,'card:B':5};" + res +
+              "const a={key:'A',group:'levels'},b={key:'B',group:'levels'};"
+              "console.log(JSON.stringify([0.15>=hotFor(a,'L1'),0.15>=hotFor(a,'L2'),0.07>=hotFor(b,'L1')]))")
+        out = subprocess.run([node, "-e", js], capture_output=True, text=True, check=True).stdout.strip()
+        assert json.loads(out) == [False, True, True], out
+
+
+ctrl_ladder_hot()
 print("AUDIT_CONTROL_OK")

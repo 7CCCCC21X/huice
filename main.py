@@ -12986,7 +12986,9 @@ function priceLadderBook(c,it,L,live){
         if(maker&&!eligible){a.append($("span","pa","—"));a.title=r.bids==null&&r.asks==null?r.error||"Predict 暂无盘口":r.maker_note||r.points_note||"积分状态确认后才提示挂单优势";return a}
         if(!e){const nobook=r.bids==null&&r.asks==null;a.append($("span","pa",r.error?"⚠ 请核实":r.stale?"盘口过期":nobook?"—":r.fair==null?"模型暂缺":"暂无报价"));
           a.title=r.error||r.hold||(r.stale?"盘口过期，等待新盘口":nobook?"Predict 暂无盘口":r.fair==null?"模型价暂缺，等待行情或 σ":"等待有效盘口");return a}
-        if(ok){a.classList.add("pos");if(e.edge>=HOT)a.classList.add("hot")}
+        // 1.x (audit CTRL-LADDER-HOT): the red mark uses the same most-specific bar (level/card/section/global) as the card
+        // frame and the 机会条 above, so a red cell always means a framed card and a framed card always shows its red cell
+        if(ok){a.classList.add("pos");if(e.edge>=hotFor(it,r.label))a.classList.add("hot")}
         const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)),$("span","pv",sg(e.edge)));a.append(line);
         const tk=!maker&&r.taker&&(r.taker.state==="near"||r.taker.state==="ready")?r.taker:null;  // 距吃单, the trader's own distance
         if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(ok&&!maker&&e.short)a.append($("span","pwhy","深度不足"));
