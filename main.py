@@ -21564,22 +21564,30 @@ class Bot:
                and not self.store.get(f"{day_key}:{sub_id}") and not self.delivering(f"{day_key}:{sub_id}")]
         if not due:
             return
-        text = self.daily_report_text(now_ms)
+        # The review page's link carries the private page token, which (with WEB_CONTROL_KEY unset) opens control.json
+        # and the journal, real orders included. /web calls it private ("请勿转发"), so the unprompted daily push carries
+        # it only to the admin's private chat; group topics get the same report without it. /web and /sim still answer
+        # with the link wherever the admin types them. Each variant is built at most once per call.
+        texts: dict[bool, str] = {}
         for sub_id, sub in due:
             key = f"{day_key}:{sub_id}"
+            private = bool(self.config.admin_id) and (sub["chat"], sub["thread"]) == (self.config.admin_id, 0)
+            if private not in texts:
+                texts[private] = self.daily_report_text(now_ms, link=private)
+            text = texts[private]
             if not text:
                 self.store.put(key, {"skipped": now_ms})  # nothing to say today: the day is done for this subscription
                 continue
 
-            async def send(sub: dict = sub, key: str = key) -> None:
+            async def send(sub: dict = sub, key: str = key, text: str = text) -> None:
                 if await self.tell(sub["chat"], sub["thread"], text, html_mode=True):
                     self.store.put(key, self.market.now_ms())
             self.deliver(key, send)
 
-    def daily_report_text(self, now_ms: int) -> str:
+    def daily_report_text(self, now_ms: int, link: bool = True) -> str:
         """The day's trading for Telegram (bold sentinels; send as HTML): what was ordered today and how it filled, the
         underlyings with the most records, what settled today and its P&L, the open positions with their unrealized P&L
-        at the books' middles, the lifetime, the resting orders' fill rate, and the review page's link. "" when there
+        at the books' middles, the lifetime, the resting orders' fill rate, and (link) the review page's link. "" when there
         is nothing to say: no record opened or settled today, no position held, no order resting."""
         trades = list(self.sim_trades().values())
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
@@ -21619,7 +21627,7 @@ class Bot:
                     + (f"｜收益率 {lifetime['roi'] * 100:+.1f}%" if lifetime["cost"] else ""))
         if makers["fill_rate"] is not None:
             body.append(f"挂单成交率 {makers['fill_rate'] * 100:.0f}%（{makers['placed']} 笔挂单；已结束的里有成交的占比）")
-        if self.config.web_port and self.web_token:
+        if link and self.config.web_port and self.web_token:  # link=False: a group copy (the token is private; daily_report)
             body.append(f"复盘页：{self.web_url()}/journal")
         title = "交易日报" if self.sim_has_real() else "模拟交易日报"
         return "\n".join([f"📒 {bold(title)} {today:%m-%d} {WEEKDAYS[today.weekday()]}", *tree(body)])

@@ -147,4 +147,40 @@ def ctrl_mcsv():
 
 
 ctrl_mcsv()
+
+async def ctrl_report_token():
+    # CTRL-REPORT-TOKEN: the daily report put 复盘页：<web_base>/p/<token>/journal into every subscription, group topics
+    # included, though the token is private (/web: 请勿转发) and, with WEB_CONTROL_KEY unset, opens control.json and the
+    # journal. Now only the admin's private chat gets the link; groups get the same report without it.
+    import datetime as dt
+    now = int(dt.datetime(2026, 11, 10, 17, 0, tzinfo=m.BEIJING).timestamp() * 1000)
+    cfg = m.Config.from_env({**base, "ADMIN_USER_ID": "42", "WEB_BASE_URL": "https://x.example"})
+    assert cfg.sim and cfg.predict and cfg.sim_daily_report and not cfg.web_control_key
+    bot = m.Bot(cfg, m.Store(":memory:"), FM(now), None)
+    bot.web_token = "SECRETTOKEN1234567890"
+    bot.sim_trades = lambda: {"a": {"status": "settled", "opened": now - 3_600_000, "settled": now - 60_000, "price": .4,
+                                    "shares": 10, "payout": 1, "edge": .1, "maker": True, "item": "BTC"}}
+    sent = {}
+
+    async def tell(chat, thread, text, **kw):
+        sent[(chat, thread)] = text
+        return True
+    bot.tell = tell
+    bot.store.put("subscriptions", {"-100123:7": {"chat": -100123, "thread": 7, "active": True},
+                                    "42:0": {"chat": 42, "thread": 0, "active": True}})
+    await bot.daily_report(now)
+    await bot.drain_deliveries()
+    group, admin = sent[(-100123, 7)], sent[(42, 0)]
+    assert bot.web_token not in group and "复盘页" not in group, group
+    assert f"复盘页：https://x.example/p/{bot.web_token}/journal" in admin, admin
+    for text in (group, admin):
+        assert "交易日报" in text and "今天结算 1 笔" in text, text
+    # the group copy ends its tree cleanly (the link was the last item, so the previous line now carries the corner)
+    assert group.splitlines()[-1].lstrip().startswith("└"), group
+    # every subscription is recorded as delivered for the day
+    day = "simreport:2026-11-10"
+    assert bot.store.get(f"{day}:-100123:7") and bot.store.get(f"{day}:42:0")
+
+
+asyncio.run(ctrl_report_token())
 print("AUDIT_CONTROL_OK")
