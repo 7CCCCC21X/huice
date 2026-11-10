@@ -1149,7 +1149,11 @@ class LiveTrader:
 
     async def refresh_approvals(self) -> None:
         try:
-            keys = ["CTF_EXCHANGE", "NEG_RISK_CTF_EXCHANGE"]
+            # 1.150.0 (audit LIVE-YIELD-ALLOWANCE): the yield-bearing twins too. Orders on a yield-bearing market are signed
+            # for YIELD_BEARING_*_EXCHANGE (exchange_key), and live_room's gate only refuses a key it has read: with just the
+            # two standard keys an account lacking the yield-bearing allowance sent orders Predict / the chain then rejected,
+            # over and over, while the page said approvals were fine.
+            keys = [exchange_key(neg, yb) for yb in (False, True) for neg in (False, True)]
             found = await asyncio.gather(*(self.chain.allowance(k) for k in keys))
             self.approvals = {k: v >= 10 ** 20 for k, v in zip(keys, found)}  # ≥ 100 USDT of allowance counts as set
             self.approvals_at, self.approvals_mono, self.approvals_error = time.time(), time.monotonic(), ""
@@ -1169,6 +1173,14 @@ class LiveTrader:
     def usd(self) -> float | None:
         return from_wei(self.balance[0]) if self.balance else None
 
+    def approvals_ok(self) -> tuple[bool, bool]:
+        """(standard track, yield-bearing track) USDT allowances in place. 1.150.0: shown apart, so an account that never
+        trades yield-bearing markets is not painted red for them (live_room refuses those markets on its own), while a
+        missing yield-bearing allowance is no longer hidden behind a green ✓."""
+        a = self.approvals
+        return (bool(a.get("CTF_EXCHANGE")) and bool(a.get("NEG_RISK_CTF_EXCHANGE")),
+                bool(a.get("YIELD_BEARING_CTF_EXCHANGE")) and bool(a.get("YIELD_BEARING_NEG_RISK_CTF_EXCHANGE")))
+
     def summary_lines(self) -> list[str]:
         c = self.config
         lines = [f"钱包：{self.wallet.kind}｜下单账户 {short_addr(self.wallet.maker)}"
@@ -1185,9 +1197,12 @@ class LiveTrader:
         else:
             lines.append(f"余额：未读到（{self.balance_error or '尚未读取'}）")
         if self.approvals:
+            std_ok, yb_ok = self.approvals_ok()
             lines.append("授权：交易所 USDT 额度 " + ("✓" if self.approvals.get("CTF_EXCHANGE") else "✗")
                          + "｜多结果交易所 " + ("✓" if self.approvals.get("NEG_RISK_CTF_EXCHANGE") else "✗")
-                         + ("" if all(self.approvals.values()) else "（python main.py --approve，或在网站交易一次）"))
+                         + "｜收益型 " + ("✓" if yb_ok else "✗")
+                         + ("" if std_ok else "（python main.py --approve，或在网站交易一次）")
+                         + ("" if yb_ok or not std_ok else "（收益型市场不会真实下单，直到运行 python main.py --approve）"))
         else:
             lines.append(f"授权：未读到（{self.approvals_error or '尚未读取'}）")
         lines.append(f"风控：单笔 ≤${c.live_max_order_usd:g}｜持仓+挂单 ≤${c.live_max_open_usd:g}｜日亏损 ≤${c.live_max_daily_loss_usd:g}"
@@ -1218,10 +1233,13 @@ class LiveTrader:
         else:
             rows.append({"k": "余额", "v": f"未读到（{self.balance_error or '尚未读取'}）", "tone": "warn"})
         if self.approvals:
-            ok = all(self.approvals.values())
+            ok, yb_ok = self.approvals_ok()
             rows.append({"k": "授权", "v": "交易所 USDT 额度 " + ("✓" if self.approvals.get("CTF_EXCHANGE") else "✗")
                          + "，多结果交易所 " + ("✓" if self.approvals.get("NEG_RISK_CTF_EXCHANGE") else "✗")
-                         + ("" if ok else "（python main.py --approve，或在网站交易一次）"), "tone": "ok" if ok else "bad"})
+                         + "，收益型交易所 " + ("✓" if yb_ok else "✗")
+                         + ("" if ok else "（python main.py --approve，或在网站交易一次）")
+                         + ("" if yb_ok or not ok else "（收益型市场不会真实下单，直到运行 python main.py --approve）"),
+                         "tone": "bad" if not ok else "ok" if yb_ok else "warn"})
         else:
             rows.append({"k": "授权", "v": f"未读到（{self.approvals_error or '尚未读取'}）", "tone": "warn"})
         rows.append({"k": "风控", "v": f"单笔 ≤${c.live_max_order_usd:g}，持仓+挂单 ≤${c.live_max_open_usd:g}，日亏损 "
@@ -1494,7 +1512,7 @@ class LiveBot(core.Bot):
             return f"结果名称无法确认方向，不下真实单（{assumed}）"  # a guessed side is a paper matter, never a real order
         key = exchange_key(info.neg_risk, info.yield_bearing)
         if self.live.approvals and key in self.live.approvals and not self.live.approvals[key]:
-            return f"未授权{'多结果' if info.neg_risk else ''}交易所使用 USDT（python main.py --approve）"
+            return f"未授权{'收益型' if info.yield_bearing else ''}{'多结果' if info.neg_risk else ''}交易所使用 USDT（python main.py --approve）"
         return ""
 
     def sim_taker_limit(self, q: dict) -> float:
@@ -4611,17 +4629,20 @@ async def live_check(config: core.Config) -> int:
                 ok = False
                 print(f"FAIL {name}: {core.clean_error(error) or type(error).__name__}")
     try:
-        for label, done in await trader.chain.check_approvals(False):
-            print(f"{'OK' if done else 'MISSING'} 授权 {label}")
+        for yb in (False, True):  # 1.150.0: both tracks; yield-bearing markets settle on their own exchanges
+            for label, done in await trader.chain.check_approvals(yb):
+                print(f"{'OK' if done else 'MISSING'} 授权 {label}")
     except Exception as error:
         ok = False
         print(f"FAIL 授权读取: {core.clean_error(error) or type(error).__name__}")
     return 0 if ok else 1
 
 
-async def live_approve(config: core.Config, yield_bearing: bool = False) -> int:
+async def live_approve(config: core.Config, yield_bearing: bool | None = None) -> int:
     """Send the approvals the exchange needs (USDT allowance, outcome-token operator), one transaction each, from the
-    signing wallet (gas in BNB). Idempotent: what is in place is skipped."""
+    signing wallet (gas in BNB). Idempotent: what is in place is skipped. 1.150.0: both tracks by default (None) — the
+    standard and the yield-bearing exchanges — since the bot trades yield-bearing markets too and `--approve` had no
+    way to set those; True / False still does just one track."""
     trader = LiveTrader(config)
     print(f"下单账户 {trader.wallet.maker}（{trader.wallet.kind}）；gas 由 {trader.wallet.signer} 支付；{CHAIN_NAMES.get(config.live_chain)}")
     try:
@@ -4633,7 +4654,9 @@ async def live_approve(config: core.Config, yield_bearing: bool = False) -> int:
     except Exception as error:
         print(f"FAIL 读取 BNB 余额: {core.clean_error(error) or type(error).__name__}")
         return 1
-    results = await trader.chain.set_approvals(yield_bearing, log=print)
+    results = []
+    for yb in ((False, True) if yield_bearing is None else (yield_bearing,)):
+        results += await trader.chain.set_approvals(yb, log=print)
     for label, outcome in results:
         print(f"{label}：{outcome}")
     return 0 if all(not outcome.startswith("失败") for _, outcome in results) else 1

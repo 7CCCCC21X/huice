@@ -78,4 +78,54 @@ async def live_4xx_filled():
 
 
 asyncio.run(live_4xx_filled())
+
+async def live_yield_allowance():
+    """LIVE-YIELD-ALLOWANCE: the yield-bearing exchanges' USDT allowances are read, gate live_room, show on the page, and
+    --approve sets them. Before: only the two standard keys were read, so an order signed for YIELD_BEARING_CTF_EXCHANGE
+    passed the gate with no allowance, and the page showed every approval ✓."""
+    import live as L
+    class YieldlessChain(T["FakeChain"]):
+        async def allowance(self, key, owner=None): return 0 if key.startswith("YIELD") else self.allow
+    bot = make_bot(SIM_WAYS="taker")
+    bot.live.chain = YieldlessChain()
+    await bot.live_prepare()
+    assert bot.live.approvals == {"CTF_EXCHANGE": True, "NEG_RISK_CTF_EXCHANGE": True,
+                                  "YIELD_BEARING_CTF_EXCHANGE": False, "YIELD_BEARING_NEG_RISK_CTF_EXCHANGE": False}, bot.live.approvals
+    mk = hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)
+    # a standard market still passes; the same market flagged yield-bearing is refused, naming the track
+    await bot.live_prefetch(NOW)
+    assert bot.live_room({}, mk, "up", 0.58, 100) == ""
+    bot.live.markets["101"].yield_bearing = True
+    r = bot.live_room({}, mk, "up", 0.58, 100)
+    assert r.startswith("未授权收益型交易所使用 USDT"), r
+    # the page: the standard track stays ok, the yield-bearing one shows ✗ with a warn tone (not bad: not every account trades it)
+    row = [x for x in bot.live.summary_info() if x["k"] == "授权"][0]
+    assert "收益型交易所 ✗" in row["v"] and "交易所 USDT 额度 ✓" in row["v"] and row["tone"] == "warn", row
+    line = [x for x in bot.live.summary_lines() if x.startswith("授权")][0]
+    assert "收益型 ✗" in line and "收益型市场不会真实下单" in line, line
+    bot.live.chain = T["FakeChain"]()
+    await bot.live.refresh_approvals()
+    row = [x for x in bot.live.summary_info() if x["k"] == "授权"][0]
+    assert row["tone"] == "ok" and "收益型交易所 ✓" in row["v"], row
+    # --approve sets both tracks (and --live-check reads both)
+    calls = []
+    class ApproveChain:
+        async def bnb_balance(self, owner=None): return 10 ** 17
+        async def set_approvals(self, yb=False, log=None):
+            calls.append(("set", yb)); return [("x", "已授权")]
+        async def check_approvals(self, yb=False):
+            calls.append(("check", yb)); return [("x", True)]
+    real_trader = L.LiveTrader
+    class FakeTrader(real_trader):
+        def __init__(self, config):
+            super().__init__(config); self.chain = ApproveChain()
+    L.LiveTrader = FakeTrader
+    try:
+        assert await L.live_approve(bot.config) == 0
+        assert [c for c in calls if c[0] == "set"] == [("set", False), ("set", True)], calls
+    finally:
+        L.LiveTrader = real_trader
+
+
+asyncio.run(live_yield_allowance())
 print("AUDIT_LIVE_B_OK")
