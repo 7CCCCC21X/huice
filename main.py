@@ -19101,6 +19101,31 @@ class Bot:
         limit = self.sim_after_hours_price(mk)
         return min(cap, limit) if limit is not None and cap > 0 else cap
 
+    @staticmethod
+    def sim_taker_self_cap(trades: dict[str, dict], mk: SimMarket, side: str, cap: float) -> float:
+        """1.150.0 (audit SIM-SELF-MATCH): the taker cap of ``side`` kept a cent under our own real resting buy of the other
+        side. A 跌 bought at 1 − b is our own 涨 bid at b (and a 涨 at 1 − d is our own 跌 bid at d, an ask at 1 − d on the
+        book): side_levels counts that order as someone's liquidity, and the real taker is a LIMIT order at the cap
+        (sim_taker_limit), so whenever 1 − b ≤ cap it would match ourselves — a complete set for $1 plus the taker fee
+        instead of the trade the edge was about. It happens when the fair price jumps past a stale maker of the other side
+        before that maker is withdrawn: in the step the taker is decided (and sent in sim_after_decide) before the step's
+        cancels, and in the express lane the cancel runs beside the placement while the book still shows the order.
+        Counted conservatively: any order not finished at Predict (pending, placing, open, cancelling, unknown — a pending
+        one may be sent first), and a finished one whose cancel Predict confirmed after the book was read (the book may
+        still show it). Paper records have no "live" state and are not counted: paper trading is unchanged. Only lowers
+        the cap: the taker buys less or nothing, never more."""
+        other = "down" if side == "up" else "up"
+        for t in trades_of_market(trades, mk.market):
+            st = t.get("live")
+            if t.get("side") != other or not t.get("maker") or not isinstance(st, dict):
+                continue
+            if max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0) <= 1e-9:
+                continue  # nothing of it left to rest
+            done = int(st.get("cancel_done_ms") or 0)
+            if st.get("state") not in (None, "done") or (done and int(getattr(mk.book, "fetched_ms", 0) or 0) <= done):
+                cap = min(cap, round(1 - float(t.get("price") or 0) - 0.01, 6))  # Predict's cent tick: strictly under our level
+        return cap
+
     def sim_deep_book(self, mk: SimMarket) -> bool:
         """Whether this market's book is quoted on under the deep-bid mode (SIM_MAKER_DEEP_CENTS, on the chosen markets
         when SIM_MAKER_DEEP_MARKETS names them): wide or one-sided, where no ordinary resting order goes (sim_maker_block:
@@ -19954,6 +19979,7 @@ class Bot:
             # hours the after-hours bar, never over the after-hours price limit): every ask at or under it is bought, up
             # to SIM_SHARES; nothing above it, however much is wanted
             cap = self.sim_taker_cap(mk, side, bps)
+            cap = self.sim_taker_self_cap(trades, mk, side, cap)  # never at or through our own live resting buy of the other side
             # what this side may still take (SIM_TAKER_MAX_SHARES), 0 with an order in flight; the count asked for is every
             # ask under the cap (SIM_TAKER_SWEEP_SHARES) or the per-buy count
             room, _ = self.sim_taker_room(trades, mk, side, self.sim_taker_want(mk, side, cap))

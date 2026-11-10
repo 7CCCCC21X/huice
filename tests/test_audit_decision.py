@@ -69,4 +69,57 @@ old = {"order": 10.0, "shares": 4.0, "live": {"state": "open", "answered_at": L}
 assert m.own_on_book(old, m.PredictBook("HSI", "hsi-slug", "101", "t", [], [], L + 1, None)) == 6.0
 assert m.own_on_book(old, m.PredictBook("HSI", "hsi-slug", "101", "t", [], [], L - 1, None)) == 0.0
 
+# --- SIM-SELF-MATCH: a taker never buys one side at or through our own live resting buy of the other side -------------------------
+# Our real 涨 maker rests at 60¢ × 50 and the fair price fell to 30¢: the 跌 side's "liquidity" at 40¢ = 1 − 60¢ is our own bid.
+# The real taker is a LIMIT order at its cap, so a cap at or over 40¢ would match ourselves (a complete set plus the fee).
+from decimal import Decimal as D  # noqa: E402
+
+SELF = "hsi-self-match"
+
+
+class SelfFM:
+    def __init__(self, now): self.now, self.config = now, None
+    def now_ms(self): return self.now
+
+
+sbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_TAKER_HOLD_SECONDS": "0"}), m.Store(":memory:"), SelfFM(NOW), None)
+
+
+def self_mk(bids, at=NOW - 1000):
+    b = m.PredictBook("HSI", SELF, "1", "t", tuple((D(p), D(q)) for p, q in bids), ((D("0.62"), D("40")),), at, 200)
+    return m.SimMarket(SELF, "恒生指数", "close", "HSI", 0.30, b, 0.02, "", ("涨", "跌"),
+                       {"key": "HSI", "target": "2026-11-10", "line": 24600.0, "close_ms": NOW + 4 * 3600_000})
+
+
+own_up = {"v": 2, "market": SELF, "slug": SELF, "item": "恒生指数", "kind": "close", "key": "HSI", "side": "up", "label": "挂涨",
+          "maker": True, "status": "resting", "shares": 0.0, "order": 50.0, "price": 0.60, "fills": [], "revisions": [], "opened": NOW - 60_000,
+          "live": {"state": "open", "order_id": "9", "answered_ms": NOW - 50_000, "answered_at": NOW - 50_000}}
+
+
+def self_take(bids, rec):
+    changed = []
+    sbot.sim_take(self_mk(bids), m.TradeMap({f"{SELF}|up|挂": dict(rec)} if rec else {}), NOW, changed)
+    return [t for _, t in changed if not t["maker"]]
+
+
+# the only bid is ours: nothing to take (before the fix: 50 shares of 吃跌 at 40¢, all from our own order)
+assert self_take([("0.60", "50")], own_up) == [], self_take([("0.60", "50")], own_up)
+assert [t["label"] for t in self_take([("0.60", "50")], None)] == ["吃跌"]  # someone else's 60¢ bid: bought as before
+# someone's 62¢ bid above ours: only it is taken, the cap (the live LIMIT price) a cent under our level
+(tk,) = self_take([("0.62", "30"), ("0.60", "50")], own_up)
+assert tk["label"] == "吃跌" and tk["cap"] <= 0.39 + 1e-9 and tk["shares"] <= 30 + 1e-9, (tk["cap"], tk["shares"])
+# conservative on the order's state: in flight, cancelling and unknown count; a cancel Predict confirmed after the book was
+# read still counts (the book may show it), one confirmed before does not; a paper record (no "live") and a filled one never
+x = self_mk([("0.60", "50")])
+for state in ("pending", "placing", "open", "cancelling", "unknown"):
+    assert sbot.sim_taker_self_cap(m.TradeMap({"a": {**own_up, "live": {"state": state}}}), x, "down", 0.59) == 0.39, state
+done = lambda at: {**own_up, "status": "cancelled", "live": {"state": "done", "final": "cancelled", "cancel_done_ms": at}}
+assert sbot.sim_taker_self_cap(m.TradeMap({"a": done(x.book.fetched_ms + 1)}), x, "down", 0.59) == 0.39
+assert sbot.sim_taker_self_cap(m.TradeMap({"a": done(x.book.fetched_ms - 1)}), x, "down", 0.59) == 0.59
+assert sbot.sim_taker_self_cap(m.TradeMap({"a": {k: v for k, v in own_up.items() if k != "live"}}), x, "down", 0.59) == 0.59
+assert sbot.sim_taker_self_cap(m.TradeMap({"a": {**own_up, "shares": 50.0}}), x, "down", 0.59) == 0.59
+assert sbot.sim_taker_self_cap(m.TradeMap({"a": own_up}), x, "up", 0.59) == 0.59  # the same side is the maker logic's business
+# a 跌 maker at 45¢ rests as an ask at 55¢: the 涨 taker stays under 55¢
+assert sbot.sim_taker_self_cap(m.TradeMap({"a": {**own_up, "side": "down", "price": 0.45}}), x, "up", 0.70) == 0.54
+
 print("AUDIT_DECISION_OK")
