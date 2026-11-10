@@ -488,4 +488,43 @@ async def live_recheck_error():
 
 
 asyncio.run(live_recheck_error())
+
+def live_pool_threads():
+    """LIVE-POOL-THREADS: Predict's thread pool holds every request the gates above it let through at once (the feed's
+    PREDICT_PARALLEL + PredictApi.PARALLEL for each of up to four clients: the bot's own and pre-open's api / cancel_api /
+    bulk_api) — with 32 threads a bot order that had its client's priority slot waited in the pool queue behind reads."""
+    import time as _time
+    import live as _live
+    assert m.PREDICT_POOL_WORKERS >= m.PREDICT_PARALLEL + 4 * _live.PredictApi.PARALLEL, m.PREDICT_POOL_WORKERS
+
+    def fake_get(url, payload=None, timeout=15, headers=None):
+        _time.sleep(0.05 if url.endswith("/orders") else 0.8)
+        return b"{}"
+
+    async def run():
+        bot = _live.PredictApi("https://x.invalid", "k", None)
+        pre = [_live.PredictApi("https://x.invalid", "k", None) for _ in range(3)]
+        tasks = [asyncio.create_task(m.predict_blocking(fake_get, "https://x.invalid/feed")) for _ in range(m.PREDICT_PARALLEL)]
+        tasks += [asyncio.create_task(bot.call("GET", "/read")) for _ in range(_live.PredictApi.READ_PARALLEL)]
+        for p in pre:  # pre-open orders / cancels / batch withdrawals fill each client's whole gate
+            tasks += [asyncio.create_task(p.call("GET", "/read", priority=True)) for _ in range(_live.PredictApi.PARALLEL)]
+        await asyncio.sleep(0.1)
+        t0 = _time.monotonic()
+        await bot.call("POST", "/orders", {"x": 1}, priority=True)
+        took = _time.monotonic() - t0
+        await asyncio.gather(*tasks)
+        return took
+
+    saved_get, saved_pool = m._http_get, m._PREDICT_POOL
+    m._http_get, m._PREDICT_POOL = fake_get, None
+    try:
+        took = asyncio.run(run())
+    finally:
+        if m._PREDICT_POOL is not None:
+            m._PREDICT_POOL.shutdown(wait=True)
+        m._http_get, m._PREDICT_POOL = saved_get, saved_pool
+    assert took < 0.3, f"the bot's order waited {took:.2f}s in the Predict pool queue behind reads"
+
+
+live_pool_threads()
 print("AUDIT_LIVE_B_OK")

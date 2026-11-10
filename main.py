@@ -5038,10 +5038,15 @@ PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
 PREDICT_PARALLEL = 16           # Predict requests in flight at once, on Predict's own thread pool (predict_blocking): the
                                 # hot round (a dozen markets, each answer about a second) goes out in one batch
-PREDICT_POOL_WORKERS = 32       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
-                                # (1.138.0: 20 was the feed's 16 and the trader's 4; the pre-open mode's two clients add 8 — an order
-                                # or a cancel queued behind their reads)
-                                # feeds' pool, where a 502-ing scraper held threads for the 12-second timeout (a round took 60 s)
+PREDICT_POOL_WORKERS = 40       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
+                                # feeds' pool, where a 502-ing scraper held threads for the 12-second timeout (a round took 60 s).
+                                # It must hold every request the asyncio gates above it can let through at once, or an order or a
+                                # cancel that got its client's priority slot still waits in this pool's FIFO queue behind reads
+                                # holding every thread for up to their 8/12-second timeouts (1.138.0: 20 was the feed's 16 and the
+                                # trader's 4; the pre-open mode's two clients add 8 = 28). 1.150.0 (audit LIVE-POOL-THREADS): at least
+                                # PREDICT_PARALLEL (16) + live.PredictApi.PARALLEL (5, since 1.138.2) x 4 clients (the bot's own, and
+                                # the pre-open mode's api / cancel_api / bulk_api since 1.141.1) = 36, plus headroom — 32 left 4 short.
+                                # KEEPALIVE_PER_HOST is no cap here: it only bounds the idle connections kept.
 PREDICT_LADDER_PARALLEL = 8     # of those, at most this many may be ladder levels at once: a hot ladder's levels never
                                 # queue the daily cards' books behind them
 _PREDICT_POOL: ThreadPoolExecutor | None = None
