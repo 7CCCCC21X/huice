@@ -4985,9 +4985,18 @@ class VolBook:
             sigma = math.sqrt((n * own ** 2 + ALT_TODAY_WEIGHT * sigma ** 2) / (n + ALT_TODAY_WEIGHT))
         return sigma, n
 
-    def get(self, key: str, prior_key: str, intraday: bool = False) -> tuple[float, str]:
+    def factor(self, key: str, mode: str) -> float:
+        """The SIGMA_CALIB factor get puts on key's σ in this mode (盘中 / 盘后): the measured one, or 1 while no day stands
+        behind it or it is within 0.005 of 1. 1.150.0: one rule for get and record_predictions — a snapshot divides out the
+        factor its σ really carried, not a stored one get skipped."""
+        factor, days = self.calib.get((key, mode), (1.0, 0))
+        return factor if days and abs(factor - 1) > 0.005 else 1.0
+
+    def get(self, key: str, prior_key: str, intraday: bool = False, calibrated: bool = True) -> tuple[float, str]:
         """Daily close-to-close σ. intraday=True: only the in-session part (today's opening gap has happened) — the
-        share the bars show, or until they do the prior share (INTRADAY_SHARE_PRIOR), never the whole day's."""
+        share the bars show, or until they do the prior share (INTRADAY_SHARE_PRIOR), never the whole day's.
+        calibrated=False: without SIGMA_CALIB's factor — the day σ the closes give, which the move a day has already made
+        is measured against (big_move_widen, 1.150.0)."""
         if key in self.overrides:
             sigma, note = self.overrides[key], "PROB_VOL 手动设定"
         else:
@@ -5000,11 +5009,12 @@ class VolBook:
             else:
                 sigma = math.sqrt((n * est ** 2 + PRIOR_WEIGHT * prior ** 2) / (n + PRIOR_WEIGHT))
                 note = f"{source} {n} 日 {est * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
-        factor, days = self.calib.get((key, "盘中" if intraday else "盘后"), (1.0, 0))
+        mode = "盘中" if intraday else "盘后"
+        factor = self.factor(key, mode) if calibrated else 1.0
         calib_note = ""
-        if days and abs(factor - 1) > 0.005:  # SIGMA_CALIB (1.106.1): the snapshots' residuals said σ was off by this much
+        if factor != 1.0:  # SIGMA_CALIB (1.106.1): the snapshots' residuals said σ was off by this much
             sigma *= factor
-            calib_note = f"；按 {days} 日快照残差校准 ×{factor:.2f}"
+            calib_note = f"；按 {self.calib[(key, mode)][1]} 日快照残差校准 ×{factor:.2f}"
         note += calib_note
         body = self.bodies.get(key)
         if intraday and key not in self.overrides and body is not None:
@@ -5014,7 +5024,7 @@ class VolBook:
             # 盘中 residuals ran 1.59 while its day σ looked right)
             prior_in = PRIOR_VOL[prior_key] * math.sqrt(INTRADAY_SHARE_PRIOR.get(prior_key) or INTRADAY_SHARE_BOUNDS[1])
             sigma_in = math.sqrt((body[1] * body[0] ** 2 + PRIOR_WEIGHT * prior_in ** 2) / (body[1] + PRIOR_WEIGHT))
-            if days and abs(factor - 1) > 0.005:
+            if factor != 1.0:
                 sigma_in *= factor
             return sigma_in, (f"{self.estimates.get(key, (0.0, 0, ''))[2] or '日K'} {body[1]} 日开盘到收盘 {body[0] * 100:.2f}% 与盘中先验 "
                               f"{prior_in * 100:.2f}% 加权（盘中直接估，不按份额扣跳空）{calib_note}")
@@ -16837,8 +16847,12 @@ class Bot:
                 "ref_raw": float(raw.ref), "up_raw": raw.fair_up, "strike": float(shown.ref) if shown.ref != raw.ref else None,
                 "move": raw.move, "beta": raw.beta, "sigma": raw.sigma_daily * raw.widen, "widen": raw.widen, "R": raw.remaining, "proxy": raw.proxy_note,
                 "trend": trend,  # ln(effective / the snapshot before's), about half an hour: the direction the price had been going (1.120.2)
-                "calib": self.vols.calib.get((key, raw.mode), (1.0, 0))[0],  # the factor in that σ: the residuals are taken on the raw one
-                "sigma_raw": raw.sigma_daily * raw.widen / self.vols.calib.get((key, raw.mode), (1.0, 0))[0],
+                # the factor in that σ — the one VolBook.get applied (1.150.0: not a stored one within 0.005 of 1 it skipped) — and
+                # the σ without it: the residuals are taken on the raw one. Raw now also on a big-move day: the widen is measured
+                # against the day σ before the factor (sigma_day in the card builders), so dividing the factor out leaves the σ
+                # the card would price with SIGMA_CALIB off
+                "calib": self.vols.factor(key, raw.mode),
+                "sigma_raw": raw.sigma_daily * raw.widen / self.vols.factor(key, raw.mode),
                 "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else "",
                 **(self.sse_alt(raw, shown) if key == "SSE" else {})})
         if time.time() - self.pred_pruned > 86400:  # the snapshots are kept PRED_KEEP_DAYS, not forever
@@ -17015,7 +17029,12 @@ class Bot:
             return None
         holidays = self.config.holidays.get("sh", frozenset())
         sigma, sigma_note = self.vols.get("SSE", "SSE")
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen). 1.150.0: the closes' own, before
+        # SIGMA_CALIB's factor — the calibrated one cancelled the 盘后 factor out of a big move's σ ahead (|move|·√R/1.5 whatever
+        # it was) while the snapshot still divided it out (its "raw" σ not raw: the factor fed on itself), and carried the 盘后
+        # factor into the in-session card (a factor 1.4 took KOSPI's in-session widen on a −3% day from 1.43 to 1.02). The card
+        # keeps it as CloseOdds.sigma_day, so sim_against_move's "N 个日 σ" is this σ too, as on the stock cards
+        sigma_day = self.vols.get("SSE", "SSE", calibrated=False)[0]
         close = self.cn.close
         if self.cn.sse_session(now_ms)[0]:
             # the session runs: only today's own, fresh print prices it (never a frozen or yesterday's quote, and
@@ -17176,7 +17195,9 @@ class Bot:
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         close_date = dt.datetime.fromtimestamp(base_ms / 1000, tz).date()
         sigma, sigma_note = self.stock_sigma(symbol, ticker.market)
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen) — before any SIGMA_CALIB factor, as
+        # the index cards' (1.150.0; a stock card has none today: index_sigma_calibs measures the index cards alone)
+        sigma_day = self.vols.get(symbol, ticker.market, calibrated=False)[0]
         unit = "" if ticker.same_unit else ((ref.currency if ref else "") or info.currency)
         live, live_why = self.stocks.live_quote(symbol, now_ms)
         closed_today = close_date == dt.datetime.fromtimestamp(now_ms / 1000, tz).date() and base_ms <= now_ms
@@ -17336,7 +17357,8 @@ class Bot:
         holidays = self.hsi.holidays
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
         sigma, sigma_note = self.vols.get("HSI", "HSI")
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen) — before SIGMA_CALIB's factor (1.150.0, see sse_odds)
+        sigma_day = self.vols.get("HSI", "HSI", calibrated=False)[0]
         if self.hsi.cash_open(now_ms):
             # the cash session runs: only today's own, fresh index prices it (never yesterday's page or a frozen feed)
             why = self.hsi.spot_problem(q, now_ms) or self.hsi.spot_still(q, now_ms)
@@ -17386,7 +17408,8 @@ class Bot:
         if k is None:
             return "缺少 KOSPI"
         sigma, sigma_note = self.vols.get("KOSPI", "KOSPI")
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen) — before SIGMA_CALIB's factor (1.150.0, see sse_odds)
+        sigma_day = self.vols.get("KOSPI", "KOSPI", calibrated=False)[0]
         kst = dt.timezone(dt.timedelta(hours=9))
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
         holidays = self.config.holidays.get("kr", frozenset())
