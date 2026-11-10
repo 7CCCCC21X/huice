@@ -11221,7 +11221,13 @@ def market_driver(kind: str, key: str, settle: dict | None = None, item: str = "
     if kind == "ladder":
         spec = next((s for s in CAP_MARKETS if s.key == key), None)
         return key, spec.name if spec else (item.rsplit(" ", 1)[0] if item else key)
-    specs = {"touch": (*TOUCH_MARKETS, *TOUCH_SETTLED), "updown": (*UPDOWN_MARKETS, *DAILY_UPDOWN_MARKETS),
+    # 1.150.0: the 15- and 5-minute window cards (WINDOW_UPDOWN_MARKETS, kind "updown") are read from the same Binance pair
+    # as the pair's other cards (BTC-15M and BTC-5M from BTCUSDT, like BTC-DAY, the BTC touch and the BTC ladder), so a
+    # BTC move hits them all at once: their worst ends count in the pair's SIM_GROUP_USD group. They had been left out
+    # of this list when they were added, and each window card fell back to its own key ("BTC-15M"), a group (and cap) of
+    # its own beside the pair's. Every WindowUpDownSpec has .symbol, and no window key is also a daily or monthly key.
+    specs = {"touch": (*TOUCH_MARKETS, *TOUCH_SETTLED),
+             "updown": (*UPDOWN_MARKETS, *DAILY_UPDOWN_MARKETS, *WINDOW_UPDOWN_MARKETS),
              "range": (*RANGE_MARKETS, *STOCK_HIT_MARKETS)}.get(kind, ())
     spec = next((s for s in specs if s.key == key), None)
     symbol = spec.symbol if spec else key
