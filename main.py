@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.148.0"
+VERSION = "1.149.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -15145,7 +15145,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("edge", "优势提醒门槛：按栏目 / 市场 / 档位单独设置几¢才提醒", "恒指 4",
             "不带参数查看；/edge 6 改默认；/edge 价格阶梯 6、/edge 恒指 4、/edge BTC 2027前 150k 3；末尾 off 取消；/edge 清空"),
     Command("web", "获取概率网页链接（自动刷新）"),
-    Command("calib", "用已保存的预测快照和实际收盘给概率模型打分（Brier/校准/逐日向前拟合）"),
+    Command("calib", "给日涨跌卡（三个指数和个股）的概率模型打分（Brier/校准/逐日向前）；/calib all 看全部"),
     Command("samples", "导出模型样本 CSV：15 分钟 / 加密日涨跌每个市场在固定剩余时间记的公平价、盘口、σ 和结果"),
     Command("journal", "导出交易日记 CSV（一笔一行，和复盘页“导出 CSV”同一个文件）；可带筛选：市场名的一部分、挂 / 吃、类型名", "海力士 挂",
             "不带筛选是全部记录；/journal 海力士 吃 = SK 海力士 15 分钟的吃单"),
@@ -16874,12 +16874,20 @@ class Bot:
 
     PRED_FIELDS = frozenset({"key", "t", "target", "mode", "ref", "up", "move", "R", "beta", "sigma"})
 
-    def calibration_text(self) -> str:
+    def calibration_text(self, full: bool = True) -> str:
+        """/calib's report. full=False (1.149.0, plain /calib): the daily 涨跌 cards alone — the three indices and the
+        configured stock cards, each with its Predict market — without the all-market snapshots, the shadow samples and
+        the 15-minute windows (/calib all, and `--calib`, print everything)."""
         saved = [v for _, v in self.store.items("pred:") if isinstance(v, dict)]
         preds = [v for v in saved if self.PRED_FIELDS <= v.keys()]  # snapshots from before 1.14 lack the fit's inputs
         outcomes = {k.removeprefix("outcome:"): float(v) for k, v in self.store.items("outcome:")}
         skipped = f"（忽略 {len(saved) - len(preds)} 条旧格式快照）" if len(saved) > len(preds) else ""
-        return "\n".join([f"📐 概率模型回测（只评估，不会自动改参数）{skipped}"] + calibration_report(preds, outcomes) + self.mark_report() + self.shadow_report() + self.window_report())
+        if full:
+            return "\n".join([f"📐 概率模型回测（只评估，不会自动改参数）{skipped}"] + calibration_report(preds, outcomes) + self.mark_report() + self.shadow_report() + self.window_report())
+        daily = set(PREDICT_KEYS.values()) | set(self.config.symbols)
+        return "\n".join([f"📐 概率模型回测·日涨跌卡（只评估，不会自动改参数）{skipped}"]
+                         + calibration_report([p for p in preds if p.get("key") in daily], outcomes)
+                         + ["", "全市场快照、15 分钟窗口和影子样本等其余部分：/calib all"])
 
     def index_sigma_calibs(self) -> dict[tuple[str, str], tuple[float, int]]:
         """The σ factor of each index card and mode (盘中 / 盘后) from its scored snapshots (residual_factor), for
@@ -16895,7 +16903,8 @@ class Bot:
         return {key: residual_factor(rows) for key, rows in groups.items()}
 
     async def cmd_calib(self, req: Request) -> str:
-        return self.calibration_text()
+        """/calib: the daily 涨跌 cards (the indices and stock cards); /calib all: everything (1.149.0)."""
+        return self.calibration_text(full=bool(req.args) and req.args[0].strip().lower() in {"all", "全部", "full"})
 
     async def kospi_anchor(self, kospi: IndexQuote, hl: HlQuote) -> None:
         """HL KR200 at the KOSPI 15:30 close, from the same perp as the live proxy, persisted across restarts.

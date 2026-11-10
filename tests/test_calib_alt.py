@@ -115,4 +115,16 @@ bot.pred_last.clear()
 bot.record_predictions(now + 120_000)
 snap = max((v for _, v in store.items("pred:SSE:")), key=lambda v: v["t"])
 assert snap["mode"] == "盘后" and "up_alt" not in snap, snap  # after hours: the card's model only
+
+# --- 1.149.0: plain /calib shows the daily 涨跌 cards alone (the indices, the stock cards); /calib all shows everything -------------
+store.put("outcome:SSE:2026-11-10", 3020.0)
+store.put("pred:OTHER:1", dict(snap, key="OTHER", t=1))  # a key no daily card has (a retired stock card, say)
+short = bot.calibration_text(full=False)
+assert short.startswith("📐 概率模型回测·日涨跌卡") and "📐 SSE·盘中" in short and "OTHER" not in short, short
+assert short.endswith("全市场快照、15 分钟窗口和影子样本等其余部分：/calib all") and "全市场快照（" not in short, short
+whole = bot.calibration_text()
+assert "📐 OTHER·盘后" in whole and "其余部分" not in whole, whole
+req = lambda *args: m.Request("calib", list(args), 1, 0, 1)
+import asyncio
+assert asyncio.run(bot.cmd_calib(req())) == short and asyncio.run(bot.cmd_calib(req("all"))) == whole and asyncio.run(bot.cmd_calib(req("全部"))) == whole
 print("CALIB_ALT_OK")
