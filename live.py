@@ -35,6 +35,7 @@ import asyncio
 import base64
 import collections
 import contextlib
+import contextvars
 import dataclasses
 import datetime as dt
 import decimal
@@ -584,6 +585,19 @@ async def remove_in_batches(api: Any, ids: list, limit: RemoveLimit, *, workers:
     return out
 
 
+# 1.150.0 (audit LIVE-SEND-AFTER-PAUSE): the model trader's last check (live_send_gate) ran before create_order's own waits — a
+# slot of PredictApi.gate (busy with reads and cancels) — so an order held there went out after /live pause, the emergency stop or
+# LIVE=off had come meanwhile: a new position opened after the operator paused, or a taker filled before its withdrawal's cancel.
+# live_place_order sets this (task-local: it follows authed -> call -> gate -> send in the same task) to a function that judges
+# the order again; PredictApi.send runs it inside the slot, right before the request is handed to the transport, as the pre-open
+# mode's safe_api does with its before_send. Unset (every other caller) nothing changes.
+ORDER_SEND_CHECK: contextvars.ContextVar[Any] = contextvars.ContextVar("order_send_check", default=None)
+
+
+class SendRefused(core.RemoteError):
+    """A local gate refused the order inside the request slot, before its bytes were dispatched: nothing went out."""
+
+
 class PredictApi:
     """Signed-in requests to Predict's REST API. The API key goes in x-api-key on every request; the JWT from the
     sign-in flow (GET /v1/auth/message → sign → POST /v1/auth) in Authorization, renewed before it expires or after a
@@ -644,6 +658,8 @@ class PredictApi:
         # here too: nothing goes out into it — refused by the client (status 0, retry_after), so an order is deferred, not failed
         if (left := self.blocked_until - time.monotonic()) > 0:
             raise core.RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
+        if method == "POST" and path == "/orders" and (check := ORDER_SEND_CHECK.get()) is not None and (why := check()):
+            raise SendRefused(why)  # 1.150.0: judged again inside the slot (see ORDER_SEND_CHECK) — never sent
         try:
             return await core.predict_blocking(core._http_get, self.base + path, payload, timeout, self.headers())
         except core.RemoteError as error:
@@ -2146,12 +2162,39 @@ class LiveBot(core.Bot):
             # decisions, the sign-in, the signing and the save took before the request went out)
             st["sent_at"] = self.market.now_ms()
             sent = time.monotonic()
-            result = await self.live.api.create_order(body)
+
+            def still_sendable() -> str:
+                # 1.150.0 (audit LIVE-SEND-AFTER-PAUSE): run by PredictApi.send inside the request slot — the wait for it came after
+                # the check above, and a pause, the emergency stop, LIVE=off or a withdrawal set meanwhile let the order out
+                if trade.get("withdrawn") or st.get("state") != "placing":
+                    return "发出前已撤单"
+                return self.live_send_block(trade, self.sim_trades(), self.market.now_ms())
+
+            token = ORDER_SEND_CHECK.set(still_sendable)
+            try:
+                result = await self.live.api.create_order(body)
+            finally:
+                ORDER_SEND_CHECK.reset(token)
             took = time.monotonic() - sent
             st["answered_at"] = st["sent_at"] + int(took * 1000)
         except Exception as error:
             tid = st.get("rekeyed") or tid  # 1.138.0: withdrawn and moved (sim_rekey) while it waited: it lives there now — never saved back at the slot
             text = core.clean_error(error) or type(error).__name__
+            if isinstance(error, SendRefused):
+                # 1.150.0 (audit LIVE-SEND-AFTER-PAUSE): refused inside the request slot — nothing went out (it would otherwise read as
+                # "result unknown", status 0). Withdrawn meanwhile: finished unsent, nothing to cancel; else failed as the gate above fails it
+                for k in ("sent_at", "answered_at"):
+                    st.pop(k, None)
+                st["hash"] = ""
+                if trade.get("withdrawn") or st.get("state") == "cancelling":
+                    self.live_end_unsent(tid, trade, now_ms)
+                    return
+                st["state"] = "pending"
+                at_ms = self.market.now_ms()
+                own = text.startswith("决定已过时") or text == self.sim_quiet(trade.get("settle"), at_ms)
+                self.live_fail(tid, trade, f"未下单：{text}", now_ms, retry=0 if own else None)
+                self.sim_save([(st.get("rekeyed") or tid, trade)])
+                return
             definite = isinstance(error, OrderRejected) or 400 <= http_status(error) < 500
             # 1.122.0: an answer that the order already exists (a resend taken twice, a hash Predict holds) is Predict having it,
             # not a refusal: the record is "result unknown" and the sync adopts the order by its hash, nothing is freed

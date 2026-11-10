@@ -279,4 +279,77 @@ async def live_notify_priority():
 
 
 asyncio.run(live_notify_priority())
+async def live_send_after_pause():
+    """LIVE-SEND-AFTER-PAUSE: the last check (live_send_gate) ran before create_order's wait for a request slot; an order held
+    there (the client's five slots busy with three reads and two cancels) went out after /live pause, and after a withdrawal it
+    went out too (cancelled only once its answer came — a taker may have filled). Now it is judged again inside the slot: no
+    POST /orders reaches the transport, the record never gets an order id. The real PredictApi over a fake transport."""
+    import json as _json, threading, time as _time
+    L = T["L"]
+    tid = f"{HSI_SLUG}|up|吃"
+    real_get = m._http_get
+    for how in ("pause", "withdraw", "none"):
+        held = {"reads": threading.Event(), "writes": threading.Event()}
+        posts = []
+
+        def transport(url, payload=None, timeout=15, headers=None):
+            path = url.replace(L.API_BASES[56], "")
+            if path.startswith("/orders?"):
+                held["reads"].wait(5)
+                return _json.dumps({"success": True, "data": [], "cursor": None}).encode()
+            if path == "/orders/remove":
+                held["writes"].wait(5)
+                return _json.dumps({"success": True, "removed": [], "noop": payload["data"]["ids"]}).encode()
+            if path == "/orders":
+                posts.append(payload["data"]["order"]["hash"])
+                return _json.dumps({"success": True, "data": {"orderId": "555", "orderHash": payload["data"]["order"]["hash"]}}).encode()
+            raise AssertionError(path)
+
+        bot = make_bot(SIM_WAYS="taker")
+        await bot.live_prepare()
+        mk = hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)
+        T["world"]["markets"] = [mk]
+        await bot.live_prefetch(NOW)
+        async with bot.sim_lock:  # a decision (as the step / the express lane make it), not sent yet
+            trades, changed = bot.sim_trades(), []
+            bot.sim_take(mk, trades, NOW, changed)
+            bot.sim_save(changed)
+        assert bot.sim_trades()[tid]["live"]["state"] == "pending"
+        api = L.PredictApi(L.API_BASES[56], "k", bot.live.wallet)
+        api.jwt, api.jwt_exp = "jwt", int(_time.time()) + 3600
+        bot.live.api = api
+        m._http_get = transport
+        try:
+            busy = [asyncio.create_task(api.orders("OPEN")) for _ in range(3)] + [asyncio.create_task(api.remove_orders([str(i)])) for i in range(2)]
+            await asyncio.sleep(0.05)
+            place = asyncio.create_task(bot.live_place_pending(NOW))
+            await asyncio.sleep(0.2)
+            trade = bot.sim_trades()[tid]
+            assert trade["live"]["state"] == "placing" and not posts, (trade["live"]["state"], posts)  # past every gate, waiting for a slot
+            if how == "pause":
+                await bot.live_action("pause", ["测试暂停"], NOW)
+            elif how == "withdraw":
+                async with bot.sim_lock:
+                    bot.sim_withdraw(trade, "测试撤单", NOW)
+                    bot.sim_save([(tid, trade)])
+            held["reads"].set(); held["writes"].set()
+            await asyncio.gather(place, *busy)
+        finally:
+            m._http_get = real_get
+        rows = {k: v for k, v in bot.sim_trades().items() if k.startswith(tid)}
+        if how == "none":  # nothing changed meanwhile: sent as before
+            assert len(posts) == 1 and any(v["live"].get("order_id") == "555" and v["live"]["state"] == "open" for v in rows.values()), {k: v["live"]["state"] for k, v in rows.items()}
+            continue
+        assert not posts, (how, posts)
+        assert all(not v["live"].get("order_id") and v["live"]["state"] not in {"open", "placing", "cancelling", "unknown"} for v in rows.values()), \
+            {k: (v["live"]["state"], v["live"].get("order_id")) for k, v in rows.items()}
+        done = [v for v in rows.values() if v["live"]["state"] == "done"]
+        assert len(done) == 1 and not done[0]["live"]["hash"], {k: v["live"] for k, v in rows.items()}
+        if how == "pause":
+            assert done[0]["live"]["final"] == "failed" and "真实交易已暂停" in done[0]["note"], done[0]["live"]
+        else:
+            assert done[0]["live"]["final"] == "cancelled" and "这张单没有发出" in done[0]["live"]["events"][-1]["what"], done[0]["live"]
+
+
+asyncio.run(live_send_after_pause())
 print("AUDIT_LIVE_B_OK")
