@@ -4048,12 +4048,23 @@ class LiveBot(core.Bot):
         elif action == "release":
             text = await self.live_action("release", [str(data.get("id") or "")], now_ms)
         elif action == "stop":  # the emergency stop: no new orders, every resting order of the strategy asked to be withdrawn
-            first = await self.live_action("pause", ["紧急停止"], now_ms)
+            # Audit LIVE-STOP-OK: the stop's verdict is its cancels', not the pause's. The pause reply used to be the
+            # head of the message, and the generic check below only reads the head ("⏸ …", never a failure), so a stop whose
+            # cancels all failed (❌ HTTP 500, unsent requests, pre-open orders left behind) still came back ok=True and the page
+            # showed a green toast — during an emergency, the one moment it matters. The pause is still recorded the same way;
+            # its text ("已有挂单保留", which the stop contradicts) is replaced by the stop's own head line.
+            await self.live_action("pause", ["紧急停止"], now_ms)
+            first = "⛔ 紧急停止：已暂停开新仓，正在撤掉本策略的全部挂单（以 Predict 的确认为准）。/live resume 恢复。"
             second = await self.live_cancel_command(["all"], now_ms)
+            line = ""
             if getattr(self, "preopen", None) is not None:
                 line = await self.preopen.withdraw_all("紧急停止")
                 second += (f"\n{line}" if line else "") + "\n" + self.preopen.status()
             text = f"{first}\n{second}"
+            # "⏳" (sent, awaiting Predict's confirmation) and "没有真实挂单可撤。" are not failures; "❌"/"未就绪" and pre-open
+            # orders the stop could not withdraw ("没撤成") are
+            stop_failed = second.startswith(("❌", "未就绪")) or "没撤成" in line
+            return {"ok": not stop_failed, "message": text}
         elif action in {"resume", "redeem", "check", "orders", "positions"}:
             text = await self.live_action(action, [], now_ms)
         else:
