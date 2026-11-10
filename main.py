@@ -2928,7 +2928,20 @@ class IndexFutures:
         10 minutes (the lunch break aside); while the market is shut it must come from the session that ended last."""
         live = hk_futures_session(now_ms, self.holidays) in ("日市", "夜市")
         last_end = max(hk_session_end("日市", now_ms, self.holidays), hk_session_end("夜市", now_ms, self.holidays))
-        return quote_problem(q.quoted_ms, now_ms, live, last_end, self.LUNCH)
+        why = quote_problem(q.quoted_ms, now_ms, live, last_end, self.LUNCH)
+        if (not why and not live and not self.cash_open(now_ms) and q.source == "etnet"
+                and q.spot is not None and q.spot_source == q.source):
+            # 1.149.x (audit FEED-ETNET-CLOSED-BLOCK): etnet prints no time, and parse_etnet_futures dates the block
+            # of a finished session from the calendar (hk_session_end), not from the page — so while the market is
+            # shut a page left on ANY older session (e.g. Friday's, read on Tuesday 08:00) would pass as "the
+            # session that ended last" and the after-hours card would be priced from that old futures price against
+            # the latest 16:10 anchor. The page's own cash index tells its day: its 前收市 must be the dated close
+            # before the latest cash close (spot_problem's closed-market branch; it passes while that close is
+            # unknown). A refused etnet page only falls through to Eastmoney / the CFD.
+            spot_why = self.spot_problem(q, now_ms)
+            if spot_why:
+                why = f"etnet 页面不是最近交易日的（{spot_why}）"
+        return why
 
     def spot_problem(self, q: FuturesQuote, now_ms: int) -> str:
         """Why q's cash index cannot be used now ("" when it can). During the cash session it must be today's and

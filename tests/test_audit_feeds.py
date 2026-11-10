@@ -273,4 +273,54 @@ def feed_pool_post() -> None:
 
 feed_pool_post()
 
+
+# FEED-ETNET-CLOSED-BLOCK: etnet prints no time and a finished session's block is dated from the calendar, so while the
+# market is shut a page left on an older session (Friday's, read Tuesday 08:00) passed as "the session that ended last"
+# and, with Monday's dated close and a 16:10 anchor known, priced a warn-free after-hours card from Friday's futures
+def feed_etnet_closed_block() -> None:
+    import datetime as dt
+    D = m.D
+
+    def ms(d, h, mi):
+        return int(dt.datetime(2026, 9, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+
+    page = """<div><h3>恒生指數期貨(09/2026)</h3><span>日市</span><div>&#9660;24,522 -169 (-0.68%) 高水12</div>
+<div>最高: 24,643 最低: 24,265 前收市: 24,691 開市: 24,630</div><img alt="chart"></div>
+<div><h3>恒生指數期貨(09/2026)</h3><span>夜市</span><div>&#9660;24,501 -21 (-0.09%) 低水9</div>
+<div>最高: 24,582 最低: 24,451 前收市: 24,522 開市: 24,528</div><img alt="chart"></div>
+<div>未平倉 (到期日：29/09/2026)</div>
+<div>恒生指數現貨 &#9660;24,510.09 -251.04 (-1.01%) 最高: 24,537.14 最低: 24,275.56 前收市: 24,761.13 開市: 24,523.50</div>""".encode()
+    now = ms(29, 8, 0)  # Tuesday 08:00: shut; the session that ended last is Monday's night (Tue 03:00)
+    clock = {"now": now}
+
+    class _M:
+        def now_ms(self):
+            return clock["now"]
+
+    bot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "HK0625USDT", "KOSPI_INDEX": "off",
+                                   "SSE_INDEX": "off"}), m.Store(":memory:"), _M(), None)
+    hk = bot.hsi.holidays
+    bot.hsi_daily.daily[dt.date(2026, 9, 24)] = D("24761.13")
+    bot.hsi_daily.daily[dt.date(2026, 9, 25)] = D("24510.09")
+    # control: the same page on Saturday 18:30 is the current one (its cash 前收市 is the 09-24 close)
+    sat = ms(26, 18, 30)
+    qs = bot.hsi.dated(m.parse_etnet_futures(page, sat, hk), sat)
+    assert bot.hsi.futures_problem(qs, sat) == "", bot.hsi.futures_problem(qs, sat)
+    # Friday's page read on Tuesday 08:00: dated Tue 03:00 by the calendar, but its cash index is Friday's
+    q = bot.hsi.dated(m.parse_etnet_futures(page, now, hk), now)
+    assert q.quoted_ms == ms(29, 3, 0), m.stamp(q.quoted_ms)
+    why = bot.hsi.futures_problem(q, now)
+    assert why and "etnet" in why and "24,761.13" in why, why
+    # Monday closed 25,300 and the futures printed 25,310 at 16:10 (Eastmoney anchor, contract ""): the card must not
+    # be priced warn-free from Friday's 24,501
+    bot.hsi.quote = q
+    bot.hsi.families = {}
+    bot.hsi_daily.daily[dt.date(2026, 9, 28)] = D("25300")
+    bot.store.put("anchor:HSI", [ms(28, 16, 10), "25310", "16:10 现货收市时", "", ms(28, 16, 10) + 3000, ms(28, 16, 10)])
+    o = bot.hsi_odds(now)
+    assert isinstance(o, str) or o.warn or "24,501" not in o.proxy_note, o
+
+
+feed_etnet_closed_block()
+
 print("AUDIT_FEEDS_OK")
