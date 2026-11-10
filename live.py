@@ -3371,7 +3371,14 @@ class LiveBot(core.Bot):
                 row = await self.live.api.order(str(st.get("order_id") or ""), str(st.get("hash") or ""))
             except Exception as error:
                 st["last_error"] = core.clean_error(error) or type(error).__name__
-                return
+                # 1.15x.x (LIVE-RECHECK-ERROR): a hash read that keeps failing (success=false, a 4xx other than 404, a 5xx)
+                # must not hold the record past its signed expiry — it used to return here forever, so an order nothing can
+                # fill kept its reservation and its slot until /live release. Once the expiry plus the margin has passed the
+                # expiry backstop below decides, by the account's positions (still holding when they cannot be read, booking
+                # a surplus as filled). Before that an error is no evidence either way: wait, nothing is released on it.
+                deadline = self.live_order_deadline(trade)
+                if not deadline or now_ms < deadline + self.LIVE_UNKNOWN_MARGIN_MS:
+                    return
         if row is not None:
             st["order_id"] = str(row.get("id") or st.get("order_id") or "")
             st["events"].append({"at": now_ms, "what": f"找回了订单 #{st['order_id']}（{str(row.get('status') or '?')}）"})

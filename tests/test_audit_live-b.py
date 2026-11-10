@@ -445,4 +445,47 @@ async def live_orphan_known():
 
 
 asyncio.run(live_orphan_known())
+async def live_recheck_error():
+    """LIVE-RECHECK-ERROR: a hash read that keeps raising (success=false, a 4xx other than 404) no longer holds an unknown
+    record past its signed expiry. Before expiry + margin an error is no evidence (still unknown, still reserved); after it
+    the expiry backstop decides by the positions: empty → ended EXPIRED and freed; positions unreadable → still held."""
+    async def _none(*a, **k): return None
+    async def _empty(*a, **k): return []
+    async def _noop(ids): return {"removed": [], "noop": list(ids)}
+    async def _boom(*a, **k): raise m.RemoteError("Predict 接口返回 success=false：bad hash")
+    async def _pos_fail(): raise m.RemoteError("HTTP 500: boom")
+    tid = f"{HSI_SLUG}|up|挂"
+    mkt = lambda at: hsi(0.70, [("0.55", "300")], [("0.58", "400")], at)
+    for positions_fail in (False, True):
+        bot = make_bot(SIM_WAYS="maker")
+        await bot.live_prepare(); fake = bot.live.api
+        await bot.live_prefetch(NOW)
+        await step(bot, NOW, mkt(NOW))
+        fake.orders, fake.order, fake.remove_orders = _empty, _none, _noop
+        for at in (NOW + 10_000, NOW + 20_000, NOW + 30_000, NOW + 65_000):
+            await step(bot, at, mkt(at))
+        t = bot.sim_trades()[tid]
+        assert t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0, t["live"]["state"]
+        fake.order = _boom
+        fake.positions_rows = []
+        if positions_fail:
+            fake.positions = _pos_fail
+        deadline = bot.live_order_deadline(t)
+        assert deadline
+        # before expiry + margin: the error is no evidence — held, reserved
+        at = deadline + bot.LIVE_UNKNOWN_MARGIN_MS - 60_000
+        bot.market.now = at
+        await bot.live_recheck(tid, t, {}, {}, None, at)
+        assert t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0 and "success=false" in t["live"]["last_error"], t["live"]
+        # past it: nothing can fill any more, the positions decide
+        at = deadline + bot.LIVE_UNKNOWN_MARGIN_MS + 60_000
+        bot.market.now = at
+        await bot.live_recheck(tid, t, {}, {}, None, at)
+        if positions_fail:
+            assert t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0 and "持仓读取失败" in t["live"]["last_error"], t["live"]
+        else:
+            assert t["live"]["state"] == "done" and t["live"].get("final") == "expired" and t["live"].get("api_status") == "EXPIRED" and bot.live_reserved(t) == 0, t["live"]
+
+
+asyncio.run(live_recheck_error())
 print("AUDIT_LIVE_B_OK")
