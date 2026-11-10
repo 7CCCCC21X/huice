@@ -286,4 +286,58 @@ def _hype_markprice() -> None:
 
 _hype_markprice()
 
+
+# --- MOD-FLIP-VOL-RETRY: while σ is unknown a failing σ read (Hyperliquid 429/outage, too little history) must be retried
+# after a back-off (1 minute, as RangeMarket), not on every 1-second refresh of the reference loop -------------------------
+def _flip_vol_retry() -> None:
+    import asyncio as _asyncio, dataclasses as _dc, time as _time
+
+    class _Clock:  # main's view of the time module, with a monotonic clock the test moves one second per refresh
+        mono = 1_000.0
+
+        def monotonic(self):
+            return self.mono
+
+        def __getattr__(self, name):
+            return getattr(_time, name)
+    clock, real_time = _Clock(), m.time
+    spec = _dc.replace(m.FLIP_MARKETS[0], start_ms=m.et_ms(2026, 11, 1, 0, 0, -4))
+    fm = m.FlipMarket(m.Store(":memory:"), spec)
+    state = {"fail": True}
+    asked: list[str] = []
+    t0 = 1_794_000_000_000
+
+    async def info(payload):
+        asked.append(payload["type"])
+        if payload["type"] == "allMids":
+            return {spec.coin: "41.0", spec.other: "120.0"}
+        if state["fail"]:
+            raise m.RemoteError("HTTP 429: Too Many Requests")
+        req = payload["req"]
+        base = 40.0 if req["coin"] == spec.coin else 120.0  # far apart: the path scan never opens minute candles
+        first = req["startTime"] - req["startTime"] % m.HOUR_MS
+        wiggle = 0.002 if req["coin"] == spec.coin else 0.0  # only A moves: the ratio has a σ
+        return [{"t": t, "o": base, "h": base * 1.003, "l": base * 0.997, "c": base * (1 + wiggle * ((t // m.HOUR_MS) % 3 - 1))}
+                for t in range(first, req["endTime"], m.HOUR_MS)]
+    fm.info = info
+    m.time = clock
+    try:
+        for k in range(60):  # one minute of 1-second refreshes with every candleSnapshot rate-limited
+            _asyncio.run(fm.refresh(t0 + k * 1000))
+            clock.mono += 1.0
+        assert fm.sigma is None and "波动率" in fm.error and "429" in fm.error, (fm.sigma, fm.error)  # kept between retries
+        assert asked.count("candleSnapshot") <= 3, asked.count("candleSnapshot")  # was ~61: one σ read per refresh
+        state["fail"] = False  # Hyperliquid answers again: the back-off expires and σ is read
+        clock.mono += 61.0
+        _asyncio.run(fm.refresh(t0 + 121_000))
+        assert fm.sigma is not None and fm.sigma > 0 and fm.sigma_ms == t0 + 121_000 and not fm.error, (fm.sigma, fm.error)
+        n = asked.count("candleSnapshot")
+        clock.mono += 1.0
+        _asyncio.run(fm.refresh(t0 + 122_000))  # σ known: no new σ read for VOL_SECONDS
+        assert asked.count("candleSnapshot") == n, asked.count("candleSnapshot") - n
+    finally:
+        m.time = real_time
+
+_flip_vol_retry()
+
 print("AUDIT_MODELS_B_OK")

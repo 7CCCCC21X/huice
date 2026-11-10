@@ -9091,6 +9091,7 @@ class FlipMarket:
         self.priced_ms = 0
         self.sigma: float | None = None
         self.sigma_ms = 0
+        self.vol_error = ""  # the last σ read's failure, kept (and shown) until a read succeeds: reads are paced (refresh)
         self.error = ""
         self.times = {"price": -1e9, "vol": -1e9, "scan": -1e9}
 
@@ -9147,15 +9148,26 @@ class FlipMarket:
                 self.pushed = {c: (now_ms, mono) for c in prices}  # both legs read just now (push_mid's per-leg times)
             except Exception as error:
                 errors.append(clean_error(error) or type(error).__name__)
-        if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
+        # 1.150.0: no "or self.sigma is None" any more: times["vol"] starts at -1e9, so the first read still happens at once,
+        # and a failed read is paced by the back-off below instead of being repeated on every refresh (once a second)
+        if mono - self.times["vol"] >= self.VOL_SECONDS:
             self.times["vol"] = mono
             try:
                 first = now_ms - 32 * 24 * HOUR_MS
                 a = await self.candles(self.spec.coin, "1h", first, now_ms)
                 b = await self.candles(self.spec.other, "1h", first, now_ms)
                 self.sigma, self.sigma_ms = ratio_vol(a, b, now_ms), now_ms
+                self.vol_error = ""
             except Exception as error:
-                errors.append(f"波动率：{clean_error(error) or type(error).__name__}")
+                # back off as RangeMarket does: a failing read (a Hyperliquid 429 or outage, or too little common history)
+                # is tried again in 1 minute while σ is unknown, in 5 while an older σ is kept, not on every 1-second tick
+                # of the reference loop. Each candleSnapshot of ~768 hourly rows costs weight on the same info endpoint the
+                # Hyperliquid quotes and the KOSPI/KR200 proxy read, so retrying every second could keep a 429 going and
+                # starve those reads. A σ missing or stale meanwhile only holds the advice (odds() checks both).
+                self.times["vol"] = mono - self.VOL_SECONDS + (60 if self.sigma is None else 300)
+                self.vol_error = f"波动率：{clean_error(error) or type(error).__name__}"
+        if self.vol_error:
+            errors.append(self.vol_error)  # still shown between the paced retries (odds() gives it as the reason it waits)
         if mono - self.times["scan"] >= self.SCAN_SECONDS:
             self.times["scan"] = mono
             try:
