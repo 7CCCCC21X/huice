@@ -5604,11 +5604,17 @@ class PredictFeed:
         left = self.blocked_until - time.monotonic()
         if left > 0:
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
-        if url.startswith(PREDICT_REST):
-            self.calls += 1
-            if not self.rate_samples or time.monotonic() - self.rate_samples[-1][0] >= 1:
-                self.rate()  # sampled as the reads go, so /diag has a minute of them
         async with self.gate:
+            # 1.150.0: a cooldown that began while this request waited for its slot (another read's 429) is honoured here too,
+            # as live.py's send() does since 1.138.0: nothing queued behind the PREDICT_PARALLEL in flight goes out into it.
+            # Raised outside the try below, so the refusal itself does not push blocked_until further out; and counted only
+            # once it really goes out, so /diag's rate is the requests sent, not the ones refused
+            if (left := self.blocked_until - time.monotonic()) > 0:
+                raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
+            if url.startswith(PREDICT_REST):
+                self.calls += 1
+                if not self.rate_samples or time.monotonic() - self.rate_samples[-1][0] >= 1:
+                    self.rate()  # sampled as the reads go, so /diag has a minute of them
             try:
                 raw = await predict_blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
             except RemoteError as error:
