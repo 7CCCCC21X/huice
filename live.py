@@ -3326,6 +3326,33 @@ class LiveBot(core.Bot):
         bounds = [b for b in ((expires * 1000 if 0 < expires < FAR_FUTURE else 0), (end + 2 * 3600_000 if end else 0)) if b]
         return min(bounds) if bounds else 0
 
+    def live_unknown_suspects(self, trade: dict) -> list[dict]:
+        """The unrecorded open orders (live_unknown_open) that could be this unknown record's own order under a hash it
+        did not expect. 1.150.0: before, every one of them held the record's release — a manual order on a market this
+        bot never touched is never swept (live_orphan_sweep withdraws only on its markets), so it blocked every unknown
+        record until its expiry plus the margin (a daily maker: the close plus two hours), the 11-04 "blocked for a day"
+        case the 1.104.9 release was made for. The record's signed order names its market and outcome token, so an order
+        resting on another market and another token cannot be it. Kept as suspects: an order on the same market or the
+        same token, one that cannot be compared (its row, or the record, names neither the market nor the token on the
+        other's side: nothing says where it rests)."""
+        want = (trade.get("live") or {}).get("want") or {}
+        my_mid, my_token = str(want.get("market_id") or trade.get("market_id") or ""), str(want.get("token") or "")
+        if not my_mid and not my_token:
+            return list(self.live_unknown_open)
+
+        def could_be_this(u: dict) -> bool:
+            row = self.live_unrecorded_rows.get(u["id"]) or {}
+            market = row.get("market") if isinstance(row.get("market"), dict) else {}
+            order = row.get("order") if isinstance(row.get("order"), dict) else {}
+            mid = str(market.get("id") or row.get("marketId") or row.get("market_id") or "")
+            token = str(order.get("tokenId") or "")
+            same_market, same_token = (mid == my_mid if mid and my_mid else None), (token == my_token if token and my_token else None)
+            if same_market is None and same_token is None:
+                return True  # nothing to compare it by: it may be this one
+            return bool(same_market) or bool(same_token)
+
+        return [u for u in self.live_unknown_open if could_be_this(u)]
+
     async def live_recheck(self, tid: str, trade: dict, by_id: dict, by_hash: dict, mk: Any, now_ms: int) -> None:
         """An unknown record, every step: found on the list or by its hash, it is tracked again (or finished on a final
         word). Missing from LIVE_UNKNOWN_LOOKS complete open lists, unknown to the hash read and unknown for
@@ -3361,11 +3388,12 @@ class LiveBot(core.Bot):
         settled = (not expired and int(st.get("unknown_misses") or 0) >= self.LIVE_UNKNOWN_LOOKS and unknown_ms >= self.LIVE_UNKNOWN_SETTLE_MS)
         if not expired and not settled:
             return
-        if not expired and self.live_unknown_open:
+        suspects = self.live_unknown_suspects(trade)
+        if not expired and suspects:
             # an order on the account this bot has no record of may be this very one under a hash it did not expect: an
             # operator looks first (/live release, or /live cancel account), nothing is released on top of it
-            st["last_error"] = (f"连续 {st['unknown_misses']} 次完整列表没有它，但账户上还有 {len(self.live_unknown_open)} 张本机器人没有记录的挂单"
-                                f"（#{'、#'.join(u['id'] for u in self.live_unknown_open[:3])}）：可能就是这张，先核对；核对后 /live release 或 /live cancel account")
+            st["last_error"] = (f"连续 {st['unknown_misses']} 次完整列表没有它，但账户上还有 {len(suspects)} 张本机器人没有记录的挂单"
+                                f"（#{'、#'.join(u['id'] for u in suspects[:3])}）：可能就是这张，先核对；核对后 /live release 或 /live cancel account")
             return
         if not expired and now_ms - int(st.get("unexplained_at") or 0) < self.LIVE_UNEXPLAINED_EVERY_MS:
             return  # the positions are read for it once a minute at most

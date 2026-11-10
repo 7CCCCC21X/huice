@@ -352,4 +352,51 @@ async def live_send_after_pause():
 
 
 asyncio.run(live_send_after_pause())
+
+
+async def live_unknown_open_block():
+    """LIVE-UNKNOWN-OPEN-BLOCK: any unrecorded open order on the account held the 1.104.9 evidence release of every unknown
+    record — a manual order on a market this bot never touched (never swept) kept a daily maker's side blocked until the close
+    plus two hours. Now only an unrecorded order that could be this record's (same market, same token, or a row that says
+    neither) holds it; one on another market and another token does not."""
+    async def _none(*a, **k): return None
+    async def _empty(*a, **k): return []
+    async def _noop(ids): return {"removed": [], "noop": list(ids)}
+    tid = f"{HSI_SLUG}|up|挂"
+    mkt = lambda at: hsi(0.70, [("0.55", "300")], [("0.58", "400")], at)
+    for ghost in ("other", "same-market", "same-token", "blind"):
+        bot = make_bot(SIM_WAYS="maker")
+        await bot.live_prepare(); fake = bot.live.api
+        await bot.live_prefetch(NOW)
+        await step(bot, NOW, mkt(NOW))
+        fake.orders, fake.order, fake.remove_orders = _empty, _none, _noop
+        for at in (NOW + 10_000, NOW + 20_000, NOW + 30_000, NOW + 65_000):
+            await step(bot, at, mkt(at))
+        t = bot.sim_trades()[tid]
+        assert t["live"]["state"] == "unknown", (ghost, t["live"])
+        want = t["live"]["want"]
+        row = {"id": "777", "status": "OPEN", "amount": "1", "amountFilled": "0", "order": {"hash": "0xabc"}}
+        if ghost == "other":
+            row = {**row, "market": {"id": 999}, "order": {"hash": "0xabc", "tokenId": "99991"}}
+        elif ghost == "same-market":
+            row = {**row, "market": {"id": 101}, "order": {"hash": "0xabc", "tokenId": "99991"}}
+        elif ghost == "same-token":
+            row = {**row, "order": {"hash": "0xabc", "tokenId": str(want["token"])}}
+        async def ghost_list(status="OPEN", **params): return [dict(row)]
+        fake.orders = ghost_list
+        for k in range(1, 8):  # well past LIVE_UNKNOWN_LOOKS complete lists and LIVE_UNKNOWN_SETTLE_MS, long before the expiry
+            at = NOW + 65_000 + k * 60_000
+            await step(bot, at, mkt(at))
+        t = bot.sim_trades()[tid]
+        assert [u["id"] for u in bot.live_unknown_open] == ["777"], (ghost, bot.live_unknown_open)
+        if ghost == "other":  # cannot be this record's order: the evidence releases it, the side quotes again
+            first = bot.sim_trades().get(f"{tid}#1") or t
+            assert first["status"] == "cancelled" and first["live"]["state"] == "done", (ghost, first["live"], sorted(bot.sim_trades()))
+            assert any("按未成交结束，这一边可以再挂" in e["what"] for e in first["live"]["events"]), first["live"]["events"]
+        else:  # may be this very order: still held for an operator
+            assert t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0 and "没有记录的挂单（#777）" in t["live"]["last_error"], (ghost, t["live"])
+            assert f"{tid}#1" not in bot.sim_trades(), (ghost, sorted(bot.sim_trades()))
+
+
+asyncio.run(live_unknown_open_block())
 print("AUDIT_LIVE_B_OK")
