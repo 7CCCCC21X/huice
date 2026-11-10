@@ -279,4 +279,137 @@ def ctrl_edge_level():
 
 
 ctrl_edge_level()
+
+
+def ctrl_prune():
+    """CTRL-PRUNE: control_prune guessed the saved value to blame from the error text (cut to 280 characters) and gave up
+    when it named no saved key — a failed int(), the timing keys past the cut, an environment variable made invalid by the
+    saved PREOPEN_15M=on. control_config then fell back to the bare environment: the saved LIVE=off and the lowered
+    LIVE_MAX_* limits were gone (env LIVE=on traded for real again at $100 an order) and every later save, /live mode off
+    included, was refused. Where the text named several saved keys, valid ones were dropped instead, at start-up for good
+    and in a page save silently (已保存并生效). Now the culprit is found by trial and a save never drops what it did not send."""
+    import logging
+    logging.disable(logging.WARNING)  # the drops are logged as warnings: expected here
+    live = {**base, "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64, "PREDICT_API_KEY": "k", "STATE_DB": ":memory:",
+            "WEB_CONTROL_KEY": "control-key-123456"}
+    caps = {"LIVE": "off", "LIVE_MAX_ORDER_USD": "5", "LIVE_MAX_OPEN_USD": "50", "LIVE_MAX_DAILY_LOSS_USD": "20"}
+    risk = lambda c: (c.live_mode, c.live_max_order_usd, c.live_max_open_usd, c.live_max_daily_loss_usd)
+    # (a) saved on the page: LIVE=off, lower limits, the pre-open switch. Then one Railway variable makes the pre-open values
+    # invalid together and the service restarts (a new bot on the same store). Every one of these came up LIVE=on, $100.
+    for saved_extra, env_extra in (({"PREOPEN_ENTRY_SECONDS": "100"}, {"PREOPEN_CANCEL_SECONDS": "60"}),  # the rule's keys past the cut
+                                   ({}, {"PREOPEN_MARKETS": "btc,eht"}), ({}, {"PREOPEN_PRICE_CENTS": "49.5"}),  # int() names no key
+                                   ({}, {"PREOPEN_SHARES": "1"}), ({}, {"PREOPEN_LIMIT_GAP_PCT": "30"})):
+        store = m.Store(":memory:")
+        store.put("control:env", {**caps, "PREOPEN_15M": "on", **saved_extra})
+        env = {**live, **env_extra}
+        m.Config.from_env(env)  # the environment alone validates (the mode is off there): the process starts
+        bot = L.LiveBot(m.Config.from_env(env), store, FM(NOW), None)
+        c = bot.config
+        assert risk(c) == ("off", 5, 50, 20), (env_extra, risk(c))  # was ("on", 100, 500, 200): the environment's
+        assert bot.live.config.live_mode == "off" and not c.preopen.enabled, env_extra  # the trader's copy too; the mode stays off
+        assert store.get("control:env") == {**caps, **saved_extra}, store.get("control:env")  # only the switch dropped, and forgotten
+        assert [line.split("=")[0] for line in bot.control_dropped] == ["PREOPEN_15M"], bot.control_dropped
+        text = bot.control_dropped_text()
+        assert "PREOPEN_15M=on" in text and "真实交易模式 off" in text and "单笔上限 $5" in text and "/preopen on" in text, text
+        # (b) nothing is blocked afterwards: the mode switch and the limits save; switching the pre-open mode back on is
+        # refused while the conflict stands, and that refusal touches nothing else saved
+        assert bot.control_set({"LIVE": "pause"})["ok"] and bot.config.live_mode == "pause"
+        r = bot.control_set({"LIVE": "off", "LIVE_MAX_ORDER_USD": "4"})
+        assert r["ok"] and bot.config.live_mode == "off" and bot.config.live_max_order_usd == 4, r
+        r = bot.control_set({"PREOPEN_15M": "on"})
+        assert not r["ok"] and not bot.config.preopen.enabled and store.get("control:env") == {**caps, "LIVE_MAX_ORDER_USD": "4", **saved_extra}, r
+    # a failed int() names no key: saved while the mode was off, the environment switched it on — only that value goes
+    store = m.Store(":memory:")
+    store.put("control:env", {"LIVE": "pause", "LIVE_MAX_ORDER_USD": "10", "LIVE_MAX_OPEN_USD": "50", "LIVE_MAX_DAILY_LOSS_USD": "20",
+                              "PREOPEN_PRICE_CENTS": "49.5", "PREOPEN_SHARES": "20"})
+    c = m.Bot(m.Config.from_env({**live, "PREOPEN_15M": "on"}), store, FM(NOW), None).config
+    assert risk(c) == ("pause", 10, 50, 20), risk(c)
+    assert c.preopen.enabled and c.preopen.price == m.D("0.49") and c.preopen.shares == 20 and "PREOPEN_PRICE_CENTS" not in store.get("control:env")
+    # no operator action at all: a newer version tightens a pre-open bound under a saved value
+    store = m.Store(":memory:")
+    store.put("control:env", {"LIVE": "pause", "LIVE_MAX_ORDER_USD": "5", "PREOPEN_15M": "on", "PREOPEN_PRICE_CENTS": "10"})
+    old, m.PREOPEN_MIN_SIDE_USD = m.PREOPEN_MIN_SIDE_USD, 2.0
+    try:
+        c = m.Bot(m.Config.from_env(live), store, FM(NOW), None).config
+    finally:
+        m.PREOPEN_MIN_SIDE_USD = old
+    assert risk(c)[:2] == ("pause", 5) and not c.preopen.enabled, risk(c)
+    # (c) a page save that breaks the saved levels is refused: the levels and AHEAD are never dropped to let it through
+    # (it answered 已保存并生效：PREOPEN_PRICE_CENTS=45 with the deeper levels gone and AHEAD 30 -> 1440)
+    bot = m.Bot(m.Config.from_env(live), m.Store(":memory:"), FM(NOW), None)
+    assert bot.control_set({"PREOPEN_15M": "on", "PREOPEN_LEVELS": "48x20,47x40", "PREOPEN_AHEAD_MINUTES": "30", "PREOPEN_DEEP_AHEAD_MINUTES": "10"})["ok"]
+    saved = dict(bot.store.get("control:env"))
+    r = bot.control_set({"PREOPEN_PRICE_CENTS": "45"})
+    p = bot.config.preopen
+    assert not r["ok"] and "PREOPEN_LEVELS" in r["message"] and bot.store.get("control:env") == saved, r
+    assert p.ahead_minutes == 30 and len(p.levels) == 3 and p.price == m.D("0.49") and p.deep_ahead_minutes == 10
+    # a stale value saved while the mode was off: switching on is refused, the $ cap is never dropped on the way
+    bot = m.Bot(m.Config.from_env(live), m.Store(":memory:"), FM(NOW), None)
+    assert bot.control_set({"PREOPEN_MAX_OPEN_USD": "50"})["ok"]
+    bot.store.put("control:env", {**bot.store.get("control:env"), "PREOPEN_MARKETS": "btc,xyz"})  # a card name no longer listed
+    r = bot.control_set({"PREOPEN_15M": "on"})
+    assert not r["ok"] and not bot.config.preopen.enabled and bot.store.get("control:env") == {"PREOPEN_MAX_OPEN_USD": "50", "PREOPEN_MARKETS": "btc,xyz"}, r
+    # (d) the same at start-up with the switch saved: the other saved pre-open values stay (the $20 cap above all); the mode
+    # stays off rather than quoting with no cap (it came up on, cap 0 = none, 49¢, AHEAD 1440, those three deleted for good)
+    store = m.Store(":memory:")
+    values = {"PREOPEN_MAX_OPEN_USD": "20", "PREOPEN_PRICE_CENTS": "5", "PREOPEN_SHARES": "40", "PREOPEN_CANCEL_SECONDS": "60",
+              "PREOPEN_AHEAD_MINUTES": "30", "PREOPEN_MARKETS": "btc,oldcard"}
+    store.put("control:env", {"PREOPEN_15M": "on", **values})
+    bot = m.Bot(m.Config.from_env(live), store, FM(NOW), None)
+    assert not bot.config.preopen.enabled and store.get("control:env") == values, store.get("control:env")
+    # (e) a value that stopped validating since it was saved never blocks a save, /live mode off included; the answer names it
+    bot = m.Bot(m.Config.from_env({**live, "PREOPEN_CANCEL_SECONDS": "60"}), m.Store(":memory:"), FM(NOW), None)
+    bot.store.put("control:env", {"LIVE": "on", "PREOPEN_15M": "on", "PREOPEN_ENTRY_SECONDS": "100"})  # as an older version could leave it
+    r = bot.control_set({"LIVE": "off"})
+    assert r["ok"] and bot.config.live_mode == "off" and bot.store.get("control:env") == {"LIVE": "off", "PREOPEN_ENTRY_SECONDS": "100"}, r
+    assert "PREOPEN_15M 保存的值已失效" in r["message"] and "LIVE=off（原 on）" in r["message"], r
+    # the pinned case is unchanged: one stale value alone is dropped, the rest kept
+    store = m.Store(":memory:")
+    store.put("control:env", {"SIM_EDGE_CENTS": "12", "SIM_SECONDS": "2", "LIVE": "off"})
+    c = m.Bot(m.Config.from_env(live), store, FM(NOW), None).config
+    assert c.sim_edge == 0.12 and c.sim_seconds == 5 and c.live_mode == "off" and store.get("control:env") == {"SIM_EDGE_CENTS": "12", "LIVE": "off"}
+    logging.disable(logging.NOTSET)
+
+
+ctrl_prune()
+
+
+async def ctrl_prune_notice():
+    """CTRL-PRUNE: saved settings dropped at a start reach the administrator on Telegram (Railway's log was the only trace)."""
+    import time
+
+    class Market(m.Binance):
+        def now_ms(self): return int(time.time() * 1000)
+        async def sync_clock(self): pass
+        async def prices(self): return {"UNITREEUSDT": {"symbol": "UNITREEUSDT", "price": "73.13", "time": self.now_ms()}}
+        async def get(self, path, **p): return []
+
+    class Telegram:
+        def __init__(self): self.sent = []
+        async def call(self, method, payload=None, timeout=15):
+            if method == "getUpdates":
+                await asyncio.sleep(0.2)
+                return []
+            return {} if method in {"getWebhookInfo", "getMe"} else True
+        async def send(self, chat, thread, text, reply_markup=None, parse_mode=None): self.sent.append((chat, text))
+
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "SYMBOLS": "UNITREEUSDT", "BASELINE_MODE": "manual",
+                             "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SSE_INDEX": "off", "PREDICT": "off", "BNB_TOUCH": "off",
+                             "SIM": "off", "PROBABILITY": "off", "WEB": "off", "POLL_SECONDS": "3"})
+    store = m.Store(":memory:")
+    store.put("control:env", {"SIM_EDGE_CENTS": "12", "SIM_SECONDS": "2"})  # SIM_SECONDS under its bound (3) since it was saved
+    bot = m.Bot(cfg, store, Market(cfg), Telegram())
+    runner = asyncio.create_task(bot.run())
+    for _ in range(60):
+        await asyncio.sleep(0.05)
+        if bot.telegram.sent:
+            break
+    bot.stopping.set()
+    await asyncio.wait_for(runner, 10)
+    notes = [text for chat, text in bot.telegram.sent if chat == 42 and "网页控制台保存的设置" in text]
+    assert len(notes) == 1 and "SIM_SECONDS=2" in notes[0] and "SIM_EDGE_CENTS" not in notes[0], bot.telegram.sent
+    assert bot.config.sim_edge == 0.12 and store.get("control:env") == {"SIM_EDGE_CENTS": "12"}
+
+
+asyncio.run(ctrl_prune_notice())
 print("AUDIT_CONTROL_OK")

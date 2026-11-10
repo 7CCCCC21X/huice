@@ -15374,7 +15374,8 @@ def parse_close_entries(raw: str, now_ms: int, command: str = "/setclose") -> li
 
 class Bot:
     def __init__(self, config: Config, store: Store, market: Binance, telegram: Telegram):
-        config = self.control_config(config, store)  # the control page's saved changes, on top of the environment
+        # the control page's saved changes, on top of the environment; what no longer validates is dropped (run() says so)
+        config, self.control_dropped = self.control_config(config, store)
         self.config, self.store, self.market, self.telegram = config, store, market, telegram
         SOURCE_HEALTH.off = config.sources_off
         self.snapshots: dict[str, dict] = {}
@@ -21969,40 +21970,83 @@ class Bot:
         return f"{self.config.web_base}{path}" if self.config.web_base else path
 
     # --- the control page (/p/<token>/control): settings while running, the real-trading switches ------------------
+    CONTROL_RISK_KEYS = ("LIVE", "LIVE_MAX_ORDER_USD", "LIVE_MAX_OPEN_USD", "LIVE_MAX_DAILY_LOSS_USD")  # control_prune keeps these first
+
     @staticmethod
     def control_prune(env: Mapping[str, str], saved: Mapping[str, str]) -> tuple[Config, dict[str, str]]:
         """The configuration from the environment with the saved control settings on top. A saved value that no longer
-        validates (a bound tightened since it was saved) is dropped and the rest kept — never the whole page's settings
-        for one bad one, and never a save refused for a key the user did not touch. (config, dropped key -> why)."""
-        saved, dropped = dict(saved), {}
-        while True:
-            try:
-                return Config.from_env({**env, **saved}), dropped
-            except ValueError as error:
-                text = clean_error(error)
-                bad = next((k for k in sorted(saved, key=len, reverse=True) if k in text), None)  # the message names its key
-                if bad is None:
-                    raise
-                dropped[bad] = text
-                saved.pop(bad)
+        validates (a bound tightened since it was saved, an environment variable changed under it) is dropped and the rest
+        kept — never the whole page's settings for one bad one. (config, dropped key -> why); raises only when the
+        environment itself does not validate.
+
+        1.150.0 (audit CTRL-PRUNE): the bad value is found by trial, no longer guessed from the error's text. The guess took
+        the longest saved key named in the message cut to 280 characters, and gave up when none was: a failed int() names
+        no key, the pre-open checks name a dozen keys in one message (546 characters, the timing keys past the cut), and
+        when a saved PREOPEN_15M=on is what makes the pre-open values count, the bad one can be an environment variable no
+        saved key names. Giving up made the start-up fall back to the bare environment — the saved LIVE=off and the lowered
+        LIVE_MAX_* limits gone, env LIVE=on trading for real again; and where the message named several saved keys, valid
+        ones were dropped first (the pre-open $ cap, AHEAD, the deeper levels). Now the saved values are laid on the
+        environment (valid by itself: the process would not have started) one at a time, each kept when the result still
+        validates. LIVE and the LIVE_MAX_* limits go first, so they stand whenever they are valid on their own; PREOPEN_15M
+        goes last, so a pre-open conflict leaves the mode off (preopen_apply winds its leftover orders down) rather than
+        quoting on values nobody chose; passes repeat while one keeps something more, so a pair valid only together
+        (PREOPEN_CANCEL_SECONDS raised along with PREOPEN_ENTRY_SECONDS) is kept. A few milliseconds, and only when the
+        saved values as a whole fail."""
+        try:
+            return Config.from_env({**env, **saved}), {}
+        except ValueError:
+            pass  # one value or more no longer fits: rebuilt below
+        rank = lambda key: 0 if key in Bot.CONTROL_RISK_KEYS else 2 if key == "PREOPEN_15M" else 1
+        order = sorted(saved, key=rank)  # stable: the others in their saved order
+        config, kept, why = Config.from_env(dict(env)), {}, {}
+        grown = True
+        while grown:
+            grown = False
+            for key in order:
+                if key in kept:
+                    continue
+                try:
+                    config = Config.from_env({**env, **kept, key: saved[key]})
+                except ValueError as error:
+                    why[key] = clean_error(error)
+                    continue
+                kept[key], grown = saved[key], True
+        return config, {key: why[key] for key in order if key not in kept}
 
     @staticmethod
-    def control_config(config: Config, store: Store) -> Config:
+    def control_config(config: Config, store: Store) -> tuple[Config, list[str]]:
         """The configuration with the control page's saved changes (control:env) applied on top of the environment;
-        saved values that no longer validate are dropped (and forgotten) with a warning, never a crash at start-up."""
+        saved values that no longer validate are dropped (and forgotten) with a warning, never a crash at start-up. Also
+        the lines naming what was dropped: run() tells the administrator (1.150.0: Railway's log was the only trace)."""
         saved = store.get("control:env")
         if not isinstance(saved, dict) or not saved:
-            return config
+            return config, []
         kept = {k: str(v) for k, v in saved.items() if k in CONTROL_KEY_SET}
         try:
             applied, dropped = Bot.control_prune(config.env, kept)
         except ValueError as error:
-            LOG.warning("网页控制台保存的设置无效，已忽略：%s", clean_error(error))
-            return config
+            # Not reached: the environment validated a moment ago (config). Should it ever be, the saved values cannot be
+            # weighed, so none is applied — and nothing may come out looser than they were: no real order (at most pause)
+            why = clean_error(error)
+            LOG.warning("网页控制台保存的设置无法验证，已全部忽略，真实交易最多 pause：%s", why)
+            return (dataclasses.replace(config, live_mode="pause") if config.live_mode == "on" else config,
+                    [f"全部 {len(kept)} 项（无法验证，真实交易最多 pause）：{brief_error(why, 160)}"])
         if dropped:
             LOG.warning("网页控制台保存的设置里有无效项，已忽略：%s", "；".join(f"{k}：{why}" for k, why in dropped.items()))
             store.put("control:env", {k: v for k, v in kept.items() if k not in dropped})  # the page shows what is in force
-        return dataclasses.replace(applied, env=config.env)  # env stays the environment itself, never the merged values
+        return (dataclasses.replace(applied, env=config.env),  # env stays the environment itself, never the merged values
+                [f"{k}={brief_error(kept[k], 40)}：{brief_error(why, 160)}" for k, why in dropped.items()])
+
+    def control_dropped_text(self) -> str:
+        """The administrator's note on the saved control settings this start dropped (control_config), with what is in force."""
+        value = self.control_value
+        lines = ["⚠️ 网页控制台保存的设置这次启动时有无效项，已删除（改按环境变量或默认值），其余保存的设置照常生效：",
+                 *(f"• {line}" for line in self.control_dropped)]
+        if any(line.startswith("PREOPEN_15M=") for line in self.control_dropped):
+            lines.append("开盘前预挂模式因此没有开启，还挂着的预挂单会撤掉；改好上面说的设置后在控制台或用 /preopen on 重新开启。")
+        lines.append(f"现在：真实交易模式 {value('LIVE')}，单笔上限 ${value('LIVE_MAX_ORDER_USD')}，持仓+挂单上限 ${value('LIVE_MAX_OPEN_USD')}，"
+                     f"日亏损停机线 ${value('LIVE_MAX_DAILY_LOSS_USD')}。请在控制台核对。")
+        return "\n".join(lines)
 
     def apply_config(self, config: Config) -> None:
         """A changed configuration takes effect: every loop reads self.config at use."""
@@ -22128,8 +22172,14 @@ class Bot:
     def control_set(self, values: dict) -> dict:
         """Save the settings given, validated together like the environment. None clears a saved value (the environment's
         applies again); so does "" — except for a CONTROL_CLEARABLE setting the environment gives a value: there "" is
-        saved, the empty choice (every market, nothing left out, every source on) standing over the environment's."""
-        saved = {k: str(v) for k, v in (self.store.get("control:env") or {}).items() if k in CONTROL_KEY_SET}
+        saved, the empty choice (every market, nothing left out, every source on) standing over the environment's.
+        1.150.0 (CTRL-PRUNE): the request on top of the other saved values validates as a whole or nothing is saved — a
+        saved value the user did not send is never dropped to let it through (PREOPEN_PRICE_CENTS=45 under saved levels
+        48x20,47x40 answered 已保存并生效 while the levels and PREOPEN_AHEAD_MINUTES were deleted). Only a saved value that
+        had stopped validating before this request (the saved values pruned alone, as at start-up) is dropped on the way,
+        and the answer names it: a stale value never blocks a save, /live mode off included."""
+        before_saved = {k: str(v) for k, v in (self.store.get("control:env") or {}).items() if k in CONTROL_KEY_SET}
+        saved = dict(before_saved)
         if str(values.get("LIVE") or "").strip().lower() == "on" and not self.config.live_allowed:
             return {"ok": False, "message": "部署变量 LIVE_TRADING_ALLOWED=off 禁止真实下单（硬开关）：不能保存 LIVE=on"}
         changed = []
@@ -22155,18 +22205,22 @@ class Bot:
         if unknown:
             return {"ok": False, "message": "不能在网页上改的变量：" + "、".join(str(k)[:40] for k in unknown[:5])}
         try:
-            config, dropped = self.control_prune(self.config.env, saved)
+            _, stale = self.control_prune(self.config.env, before_saved)  # what had stopped validating before this request
         except ValueError as error:
             return {"ok": False, "message": clean_error(error)}
-        if any(k in values for k in dropped):
-            return {"ok": False, "message": "；".join(why for k, why in dropped.items() if k in values)}
-        for key in dropped:  # a saved value that stopped validating since: dropped, the save goes on
+        stale = {k: why for k, why in stale.items() if k not in values}  # a key the request sends is the request's to decide
+        for key in stale:  # a saved value that stopped validating since: dropped, the save goes on
             saved.pop(key, None)
+        try:
+            config = Config.from_env({**self.config.env, **saved})
+        except ValueError as error:
+            return {"ok": False, "message": clean_error(error)}
         config = dataclasses.replace(config, env=self.config.env)
         before = {key: self.control_value(key) for key, _, _ in CONTROL_KEYS}
         self.store.put("control:env", saved)
         self.apply_config(config)
         words = [f"{key}={self.control_value(key)}（原 {before[key]}）" for key in changed if self.control_value(key) != before[key]]
+        words += [f"{key} 保存的值已失效、已删除，现在 {self.control_value(key)}（{brief_error(why, 80)}）" for key, why in stale.items()]
         return {"ok": True, "message": ("已保存并生效：" + "；".join(words)) if words else "已保存，设置没有变化。"}
 
     async def live_control(self, action: str, data: dict) -> dict:
@@ -23538,6 +23592,8 @@ class Bot:
         await self.register_menu()
         if not self.config.admin_id:
             LOG.warning("ADMIN_USER_ID 尚未配置：只能使用 /id；没有任何自动订阅")
+        elif self.control_dropped:  # 1.150.0 (CTRL-PRUNE): saved settings dropped at this start reach the administrator, not only the log
+            self.deliver("notice:control-dropped", functools.partial(self.tell, self.config.admin_id, 0, self.control_dropped_text()))
         if warning := calendar_warning(self.config.holidays, dt.datetime.now(BEIJING).date()):
             LOG.warning("%s", warning)
         loop = asyncio.get_running_loop()
