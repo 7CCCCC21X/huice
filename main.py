@@ -16514,7 +16514,10 @@ class Bot:
                              r.get("left", ""), num(r.get("up")), num(r.get("mkt")), num(r.get("bid")), num(r.get("ask")), num(r.get("book_age")),
                              num(r.get("sigma")), num(r.get("tau")), num(st) if st else "", num(r.get("z")), num(r.get("price")), num(r.get("line")),
                              num(r.get("need")), r.get("hold", ""), r.get("note", ""), num(r.get("result")), num(r.get("final")), num(r.get("move")),
-                             num(r["move"] / st) if r.get("move") is not None and st > 0 else "",
+                             # realized_z is the residual /calib's 波动 lines and SIGMA_CALIB use (sample_z: the end
+                             # over the price at the sample, over the σ√τ of the sigma_sqrt_tau column) — the move from the
+                             # line over the σ√τ left overstated it by √(window / τ) and invited raising a σ that was right
+                             num(z) if r.get("move") is not None and (z := sample_z(r)) is not None else "",
                              num(r.get("up_index")), num(r.get("up_lead")), num(r.get("lead_gap")),
                              "" if r.get("lead_used") is None else int(bool(r.get("lead_used")))])
         return out.getvalue()
