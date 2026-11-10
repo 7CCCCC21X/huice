@@ -458,4 +458,38 @@ def _cap_first_hour():
 
 _cap_first_hour()
 
+# audit MOD-PREWINDOW: before a ladder's window opens (a next-month ladder added early) a level already beyond today's
+# price is not reached yet; the touch model must not price it as certain (1.0), which let the trader buy Yes near its cap.
+def _prewindow():
+    D = m.D
+    import dataclasses as _dc
+    import retired
+    dec = m.RangeSpec("BTC-HIT-12", "what-price-will-bitcoin-hit-in-december-2026", "BTCUSDT", "spot", "BTC 12月价格",
+                      m.et_ms(2026, 12, 1, 0, 0, -5), m.et_ms(2026, 12, 31, 23, 59, -5))
+    rm = m.RangeMarket(m.Store(":memory:"), dec)
+    now = m.et_ms(2026, 11, 25, 12, 0, -5)  # six days before the window opens
+    rm.price, rm.priced_ms, rm.sigma, rm.sigma_ms = D("94000"), now, 0.55, now
+    rm.fetched_ms = now
+    assert not rm.reached(D("95000"), "down")
+    assert rm.probability(D("95000"), "down", now) is None, rm.probability(D("95000"), "down", now)
+    assert rm.probability(D("90000"), "up", now) is None
+    far = rm.probability(D("90000"), "down", now)
+    assert isinstance(far, float) and 0 < far < 1, far
+    assert 0 < rm.probability(D("100000"), "up", now) < 1
+    # once the window is open the live price inside it is a touch: certain
+    inside = dec.start_ms + 1
+    rm.price, rm.priced_ms, rm.sigma_ms, rm.fetched_ms = D("94000"), inside, inside, inside
+    assert rm.reached(D("95000"), "down") and rm.probability(D("95000"), "down", inside) == 1.0
+    # the same for a market-cap ladder whose window has not opened yet
+    spec = next(s for s in retired.CAP_MARKETS if s.key == "NIULAI")
+    spec = _dc.replace(spec, start_ms=now + 6 * 86_400_000, end_ms=now + 36 * 86_400_000)
+    cap = m.CapMarket(m.Store(":memory:"), spec)
+    cap.price, cap.priced_ms, cap.sigma = D("1"), now, 2.0
+    cap.supply = D("1000000")
+    assert cap.input_problem(now) == "" and cap.cap == D("1000000")
+    assert cap.probability(D("900000"), now) is None
+    assert 0 < cap.probability(D("2000000"), now) < 1
+
+_prewindow()
+
 print("AUDIT_MODELS_B_OK")
