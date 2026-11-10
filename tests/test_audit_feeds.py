@@ -226,4 +226,51 @@ async def feed_spot_prev_zero() -> None:
 
 asyncio.run(feed_spot_prev_zero())
 
+
+# FEED-POOL-POST: a POST (an order or a cancel, idle limit 3 s) that finds the newest pooled connection too old gets a
+# fresh connection, but must not close the others that a GET may still reuse (idle limit 25 s): only those past it go
+def feed_pool_post() -> None:
+    closed: list[int] = []
+
+    class FakeConn:
+        made = 0
+
+        def __init__(self, *args, **kwargs):
+            FakeConn.made += 1
+            self.sock = None
+            self.n = 100 + FakeConn.made
+
+        def close(self):
+            closed.append(self.n)
+
+    class Pooled(FakeConn):
+        def __init__(self, n):
+            self.sock, self.n = None, n
+
+    host = "api.predict.fun"
+    real_conn = m.HTTPS_CONNECTION
+    m.HTTPS_CONNECTION = FakeConn
+    try:
+        m._POOL.pop((host, 443), None)
+        now = time.monotonic()
+        m._POOL[(host, 443)] = [(Pooled(0), now - 60)] + [(Pooled(i), now - 5) for i in range(1, 12)]
+        conn, reused = m._pool_take(host, 443, 10, m.KEEPALIVE_POST_IDLE_SECONDS)
+        assert not reused and isinstance(conn, FakeConn) and conn.n > 100, (conn, reused)
+        rows = m._POOL[(host, 443)]
+        assert len(rows) == 11, len(rows)
+        assert closed == [0], closed
+        assert [c.n for c, _ in rows] == list(range(1, 12)), [c.n for c, _ in rows]  # oldest first, as before
+        conn, reused = m._pool_take(host, 443, 10, m.KEEPALIVE_IDLE_SECONDS)
+        assert reused and conn.n == 11 and len(m._POOL[(host, 443)]) == 10, (conn.n, reused)
+        # a GET miss (every pooled connection past 25 s) still drops them all, as before
+        m._POOL[(host, 443)] = [(Pooled(i), now - 40) for i in range(20, 23)]
+        conn, reused = m._pool_take(host, 443, 10, m.KEEPALIVE_IDLE_SECONDS)
+        assert not reused and not m._POOL[(host, 443)] and closed[-3:] == [20, 21, 22], closed
+    finally:
+        m.HTTPS_CONNECTION = real_conn
+        m._POOL.pop((host, 443), None)
+
+
+feed_pool_post()
+
 print("AUDIT_FEEDS_OK")

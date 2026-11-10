@@ -1332,21 +1332,28 @@ HTTP_STATS = {"new": 0, "reused": 0, "retried": 0}  # connections opened / reuse
 
 
 def _pool_take(host: str, port: int, timeout: float, max_idle: float) -> tuple[Any, bool]:
-    """The most recently used pooled connection to host:port, when used within ``max_idle`` seconds (the older ones are
-    dropped with it: they are older still), else a new one. (connection, whether it came from the pool)."""
+    """The most recently used pooled connection to host:port, when used within ``max_idle`` seconds, else a new one.
+    On a miss only the pooled connections idle longer than KEEPALIVE_IDLE_SECONDS are dropped: the others stay for the
+    GETs. (connection, whether it came from the pool)."""
     with _POOL_LOCK:
-        rows = _POOL.get((host, port)) or []
-        while rows:
-            conn, last = rows.pop()
-            if time.monotonic() - last <= max_idle:
-                HTTP_STATS["reused"] += 1
-                if getattr(conn, "sock", None) is not None:
-                    conn.sock.settimeout(timeout)
-                return conn, True
-            conn.close()
-            for old, _ in rows:
-                old.close()
-            rows.clear()
+        rows = _POOL.get((host, port))
+        now = time.monotonic()
+        if rows and now - rows[-1][1] <= max_idle:
+            conn, _ = rows.pop()
+            HTTP_STATS["reused"] += 1
+            if getattr(conn, "sock", None) is not None:
+                conn.sock.settimeout(timeout)
+            return conn, True
+        # 1.150.0: a miss under the stricter POST limit (3 s: an order or a cancel to api.predict.fun, a Hyperliquid
+        # info read) used to close every pooled connection of the host, "they are older still". That holds only under
+        # the GET limit: connections idle 3-25 s are still good for a GET, and the next Predict book round had to open
+        # up to KEEPALIVE_PER_HOST of them anew (0.4-0.8 s each to a far host). The POST still gets a fresh connection;
+        # only those past the GET limit are dropped (rows stay oldest first: _pool_put appends).
+        if rows:
+            for old, last in rows:
+                if now - last > KEEPALIVE_IDLE_SECONDS:
+                    old.close()
+            rows[:] = [(old, last) for old, last in rows if now - last <= KEEPALIVE_IDLE_SECONDS]
         HTTP_STATS["new"] += 1
     return HTTPS_CONNECTION(host, port, timeout=timeout, context=SSL_CONTEXT), False
 
