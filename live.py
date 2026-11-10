@@ -1334,6 +1334,7 @@ class LiveBot(core.Bot):
         self.live_last_signin = -1e9
         self.live_positions: tuple[list[dict], float] = ([], 0.0)
         self.live_positions_cut = False  # the last positions read for a reconciliation came cut at the page cap
+        self.live_positions_busy = ""    # ...or left a surplus that cannot be told from the pre-open mode's shares: why (1.150.0)
         self.live_late_checked = -1e9    # when the ended orders were last set against the account's positions (live_late_fills)
         self.live_trim_seen: dict[tuple[str, int], tuple[float, int]] = {}  # outcome -> (the holding's shortfall seen, when): trimmed once it stands a minute
         self.live_errors: list[str] = []  # the latest failures, newest last, for /live
@@ -3279,7 +3280,8 @@ class LiveBot(core.Bot):
         head = (f"订单的有效期已过（{core.stamp(deadline, seconds=False)}）" if expired
                 else f"连续 {st['unknown_misses']} 次完整的开放订单列表里没有它、按哈希也查不到，状态未知已 {unknown_ms // 60_000} 分钟")
         if extra is None:
-            st["last_error"] = head + ("，但持仓列表没读全（超过分页上限）：下次再核对（额度照旧占用）" if self.live_positions_cut
+            st["last_error"] = head + (f"，但{self.live_positions_busy}（额度照旧占用）" if self.live_positions_busy
+                                       else "，但持仓列表没读全（超过分页上限）：下次再核对（额度照旧占用）" if self.live_positions_cut
                                        else "，但持仓读取失败：下次再核对（额度照旧占用）")
             return
         if extra > 1e-9:
@@ -3299,9 +3301,10 @@ class LiveBot(core.Bot):
 
     async def live_unexplained(self, trade: dict) -> float | None:
         """The shares the account holds on this record's outcome beyond what the other records explain (their filled
-        shares on the same market and outcome): what an order that cannot be found may have filled. None when the
-        positions cannot be read now, or not whole (live_positions_cut)."""
-        self.live_positions_cut = False
+        shares on the same market and outcome) and the pre-open mode's fills there: what an order that cannot be found may
+        have filled. None when the positions cannot be read now, or not whole (live_positions_cut), or when a surplus cannot
+        be told from the pre-open mode's shares (live_positions_busy says why)."""
+        self.live_positions_cut, self.live_positions_busy = False, ""
         want = trade["live"].get("want") or {}
         mid, index_set = str(want.get("market_id") or trade.get("market_id") or ""), int(want.get("index_set") or 0)
         if not mid or not index_set:
@@ -3309,6 +3312,11 @@ class LiveBot(core.Bot):
         try:
             rows = await self.live.api.positions()
         except Exception:
+            rows = None
+        # again after the read: the step rechecks its unknown records side by side, and another one's look may have set these
+        # meanwhile — live_recheck reads them for this record right after this returns (no await in between)
+        self.live_positions_cut, self.live_positions_busy = False, ""
+        if rows is None:
             return None
         self.live_positions = (rows, time.time())
         if not getattr(self.live.api, "positions_complete", True):
@@ -3322,14 +3330,44 @@ class LiveBot(core.Bot):
             if str(market.get("id") or row.get("marketId") or "") == mid and int(outcome.get("indexSet") or 0) == index_set:
                 with contextlib.suppress(ValueError, TypeError):
                     held += from_wei(int(str(row.get("amount") or "0")))
-        explained = 0.0
+        explained, across = 0.0, 0.0  # the other records' shares on this outcome, and on the market's other outcomes
         for other in self.sim_trades().values():
             if other is trade or not isinstance(other.get("live"), dict):
                 continue
             o_want = other["live"].get("want") or {}
-            if str(o_want.get("market_id") or other.get("market_id") or "") == mid and int(o_want.get("index_set") or 0) == index_set:
-                explained += float(other.get("shares") or 0)
-        return max(0.0, held - explained)
+            if str(o_want.get("market_id") or other.get("market_id") or "") == mid:
+                if int(o_want.get("index_set") or 0) == index_set:
+                    explained += float(other.get("shares") or 0)
+                else:
+                    across += float(other.get("shares") or 0)
+        extra = max(0.0, held - explained)
+        if extra <= 1e-9:
+            return extra  # nothing beyond the records: whatever else the account holds there, this order filled nothing
+        # 1.150.0: the pre-open mode's shares are not this order's fill (PREOPEN.md: its fills are never booked onto the model
+        # trader's orders; live_recorded_by_outcome, live_late_fills and /live fills count them as recorded). Before, they stayed
+        # in this surplus: an order lost on an outcome where that mode held 10 shares was booked "filled 10" at its limit, the
+        # same shares then in the model's records and in the mode's ledger — exposure, the P&L and the loss stop counting them
+        # twice. A surplus is now attributed only once the pre-open mode's part of it is known for certain:
+        # - an order of that mode on this outcome whose fills are not read yet (preopen_unverified): the surplus may be its fill;
+        # - its read fills here are taken off only when nothing on the market's other side could have merged with them: Predict
+        #   merges the two sides of a market into USDT (1.104.11), so a pair of it filled both ways — or against a record's shares
+        #   on the other side — is no longer on the account, and taking its fills off would hide this order's own fill.
+        # Either way the record waits, reserved: for the ledger to read the order, else for Predict's word or an operator
+        # (/live release) — never a guess in either direction. Without the mode's fills or orders here nothing changes.
+        busy, po = self.preopen_unverified(), self.preopen_filled()
+        if (mid, index_set) in busy:
+            self.live_positions_busy = "这一边有开盘前预挂订单的成交还没读完，多出的份数可能是它的：读完再核对"
+            return None
+        theirs = float(po.get((mid, index_set), 0.0))
+        if theirs <= 1e-9:
+            return extra
+        other_side = (across > 1e-9 or any(m_id == mid and j != index_set and shares > 1e-9 for (m_id, j), shares in po.items())
+                      or any(m_id == mid and j != index_set for m_id, j in busy))  # anything its fills here may have merged with
+        if other_side:
+            self.live_positions_busy = (f"开盘前预挂在这一边成交了 {theirs:g} 份，这个市场另一边也有份数，Predict 会把两边的份额合并成 USDT，"
+                                        "分不清多出的份数是谁的：请在 Predict 核对，确认这张单不存在后 /live release")
+            return None
+        return max(0.0, extra - theirs)
 
     def prunable(self, trade: dict) -> bool:
         """A live record that filled nothing is pruned only once a complete open list read after it ended did not show
