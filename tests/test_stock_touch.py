@@ -117,6 +117,30 @@ async def run():
     for want_js in ('(t.sigma_note||"30 日小时收盘年化")', '(t.left||(t.years*365).toFixed(1)+" 天")', '(t.feed||"币安")+"刷新失败："', 't.model||"双边界首达'):
         assert want_js in m.WEB_PAGE, want_js
 
+    # --- 1.147.0: Binance's futures index (NVDAUSDT, the 15-minute card's) is the live price in the session, Yahoo the check ---------
+    assert card.yahoo == (D("185.2000"), NOW - 20_000) and not card.index_live
+    assert card.note_index(D("185.6"), NOW - 500, NOW) and card.price == D("185.6") and card.index_live and card.priced_ms == NOW - 500
+    assert card.SOURCE == "币安合约 NVDAUSDT 指数价（交易时段每秒更新，Yahoo 核对）" and bot.touch_payload(card, NOW)["source"] == card.SOURCE
+    assert not card.note_index(D("200"), NOW, NOW) and card.price == D("185.6")            # 8% off Yahoo's trade: another instrument
+    assert not card.note_index(D("185.7"), NOW - 16_000, NOW)                               # older than 15 s
+    assert not card.note_index(D("185.7"), NOW - 1_000, NOW)                                # older than the one in hand
+    assert not card.note_index(D("185.7"), ET(11, 10, 17, 0), ET(11, 10, 17, 0))            # after the close: no
+    card.times["price"] = -1e9
+    await card.refresh(NOW + 1_000)  # Yahoo's read in between: the live index stands, Yahoo kept as the check
+    assert card.price == D("185.6") and card.index_live and card.yahoo[0] == D("185.2000")
+    bot.price_dirty.clear()
+    bot.price_pushed("futures", "NVDAUSDT", {"symbol": "NVDAUSDT", "indexPrice": "185.90", "markTime": NOW + 2_000, "markPrice": "185.95"})
+    assert card.price == D("185.90") and "NVDA-2027" in bot.price_dirty  # the push: the card moves, the express lane looks
+    nvda15 = bot.updowns["NVDA-15M"]
+    nvda15.index_ms, nvda15.price = NOW + 3_000, D("186.0")
+    await bot.refresh_touch(NOW + 3_500)  # without the push: the index the 15-minute card read, each touch round
+    assert card.price == D("186.0") and card.index_live
+    odds = card.odds(NOW + 3_500)
+    assert isinstance(odds, m.TouchOdds) and abs(odds.fair_upper - m.first_touch(186.0, 160.0, 210.0, card.sigma, 0.0, card.remaining_years(NOW + 3_500)).fair_upper) < 1e-12
+    card.times["price"] = -1e9
+    await card.refresh(NOW + 30_000)  # the index gone quiet for over 15 s: Yahoo's trade again
+    assert card.price == D("185.2000") and not card.index_live and card.SOURCE.startswith("Yahoo")
+
     # --- after the close: the last trade stands, the odds too, but no advice until the next open ------------------------------------
     evening = ET(11, 10, 17, 0)
     card.fetched_ms = evening  # read two minutes ago, as between sessions it is (the trade itself the close's)

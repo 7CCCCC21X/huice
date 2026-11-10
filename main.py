@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.146.0"
+VERSION = "1.147.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -10630,10 +10630,30 @@ class StockTouchMarket(TouchMarket):
         self.share: tuple[float, int] | None = None  # (in-session share of the daily variance, days)
         self.minutes_ms = 0      # when the running session's minutes were last read (the path's live end)
         self.failures = {"price": "", "scan": ""}
+        self.yahoo: tuple[D, int] | None = None  # (Yahoo's last trade, its time): the check on the index, the price when it is not live
+        self.index_live = False  # the price in hand is Binance's futures index (note_index), not Yahoo's trade
+
+    INDEX_STALE_MS = 15_000      # 1.147.0: Binance's index older than this is not live: Yahoo's trade prices the card
+    INDEX_MAX_GAP = 0.02         # ...nor an index further than this (ln) from Yahoo's trade: another instrument, a bad print
 
     @property
     def SOURCE(self) -> str:  # noqa: N802 — the class attribute it stands for elsewhere
+        if self.index_live:
+            return f"币安合约 {self.spec.symbol}USDT 指数价（交易时段每秒更新，Yahoo 核对）"
         return f"Yahoo 行情（NASDAQ:{self.spec.symbol}，代 Pyth）"
+
+    def note_index(self, price: D | None, at_ms: int, now_ms: int) -> bool:
+        """Binance's futures index of the stock (the 15-minute card's: pushed every second, read every second without the
+        push), 1.147.0: while the regular session runs, fresh and within INDEX_MAX_GAP of Yahoo's trade, it is the price —
+        Yahoo's 30-second reads lagged the stock by up to half a minute, a few cents of fair price between the lines.
+        True when it moved the price (the express lane looks then)."""
+        if (price is None or not price > 0 or self.yahoo is None or us_session_state(now_ms)[0] != "交易中"
+                or now_ms - at_ms > self.INDEX_STALE_MS or at_ms <= (self.priced_ms if self.index_live else 0)
+                or abs(math.log(float(price) / float(self.yahoo[0]))) > self.INDEX_MAX_GAP):
+            return False
+        moved = price != self.price
+        self.price, self.priced_ms, self.index_live = price, min(at_ms, now_ms), True
+        return moved
 
     async def refresh(self, now_ms: int) -> None:
         mono, why = time.monotonic(), lambda error: clean_error(error) or type(error).__name__
@@ -10643,7 +10663,10 @@ class StockTouchMarket(TouchMarket):
                 meta, bars = await self.chart(interval="1m", range="1d", includePrePost="false")
                 if meta["price"] is None:
                     raise RemoteError("Yahoo 没有返回 regularMarketPrice")
-                self.price, self.priced_ms, self.fetched_ms = D(f"{meta['price']:.4f}"), meta["time_ms"] or now_ms, now_ms
+                trade, traded = D(f"{meta['price']:.4f}"), meta["time_ms"] or now_ms
+                self.yahoo, self.fetched_ms = (trade, traded), now_ms
+                if not (self.index_live and now_ms - self.priced_ms <= self.INDEX_STALE_MS and us_session_state(now_ms)[0] == "交易中"):
+                    self.price, self.priced_ms, self.index_live = trade, traded, False  # the index not live: Yahoo's trade
                 self.scan_minutes(bars, now_ms)
                 self.failures["price"] = ""
             except Exception as error:
@@ -22916,6 +22939,10 @@ class Bot:
                 with contextlib.suppress(ValueError, TypeError):
                     if card.push_index(number(row["indexPrice"], symbol), int(row["markTime"]), now_ms):
                         keys.append(card.spec.key)
+            for touch in self.stock_touches(symbol):  # 1.147.0: a US stock's first-touch card takes the same index in the session
+                with contextlib.suppress(ValueError, TypeError):
+                    if touch.note_index(number(row["indexPrice"], symbol), int(row["markTime"]), now_ms):
+                        keys.append(touch.spec.key)
         cards = self.pair_markets.get((venue, symbol), ())
         if cards and row.get("price") is not None:
             try:
@@ -23169,7 +23196,15 @@ class Bot:
         return mkt.at(dataclasses.replace(mkt.spec, slug=slug, start_ms=int(s["start"]), end_ms=int(s["end"]),
                                           name=str(trade.get("item") or mkt.spec.name)))  # the card's own kind (an index window too)
 
+    def stock_touches(self, pair: str) -> list:
+        """The US stocks' first-touch cards whose Binance futures index is ``pair`` (NVDA's: NVDAUSDT)."""
+        return [t for t in self.touches.values() if isinstance(t, StockTouchMarket) and f"{t.spec.symbol}USDT" == pair]
+
     async def refresh_touch(self, now_ms: int) -> Refreshed:
+        for pair, cards in self.index_markets.items():  # 1.147.0: the index as the 15-minute cards hold it (read every second without the push)
+            for touch in self.stock_touches(pair):
+                fresh = max(cards, key=lambda c: c.index_ms)
+                touch.note_index(fresh.price, fresh.index_ms, now_ms)
         for touch in self.touches.values():
             created = touch.spec.created_ms if touch.spec.fixed_start else (
                 (self.predict.info.get(touch.spec.slug) or {}).get("created_ms") or touch.spec.created_ms)
