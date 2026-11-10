@@ -193,4 +193,56 @@ def _zec_scenario():
 
 _zec_scenario()
 
+
+# --- MOD-FLIP-LEG: one coin's pushes must not keep the pair "fresh" nor defer the allMids read while the other leg is
+# silent (its subscription refused/stalled): the pair is as fresh as its older leg --------------------------------------
+def _flip_leg_scenario(mids_fail: bool) -> tuple[m.FlipMarket, list[str], int]:
+    import asyncio as _asyncio, dataclasses as _dc, time as _time
+
+    class _Clock:  # main's view of the time module, with a monotonic clock the test moves (one simulated minute a step)
+        mono = 1_000.0
+
+        def monotonic(self):
+            return self.mono
+
+        def __getattr__(self, name):
+            return getattr(_time, name)
+    clock, real_time = _Clock(), m.time
+    spec = _dc.replace(m.FLIP_MARKETS[0], start_ms=m.et_ms(2026, 11, 1, 0, 0, -4))
+    fm = m.FlipMarket(m.Store(":memory:"), spec)
+    fm.sigma, fm.sigma_ms = 0.9, 0
+    asked: list[str] = []
+
+    async def info(payload):
+        asked.append(payload["type"])
+        if payload["type"] == "allMids":
+            if mids_fail:
+                raise ValueError("allMids down")
+            return {spec.coin: "41.0", spec.other: "120.0"}  # the silent leg really trades at 120 now
+        return []
+    fm.info = info
+    m.time = clock
+    try:
+        t0 = 1_794_000_000_000
+        fm.push_mid(spec.coin, m.D("40.0"), t0)
+        fm.push_mid(spec.other, m.D("160.0"), t0)  # the other leg's last push: 160, then its channel goes quiet
+        assert fm.priced_ms == t0
+        now = t0
+        for k in range(1, 7):  # six minutes of pushes from the first coin only
+            now, clock.mono = t0 + k * 60_000, 1_000.0 + k * 60
+            fm.push_mid(spec.coin, m.D("40.0"), now)
+            fm.times["vol"] = fm.times["scan"] = clock.mono  # isolate the price read
+            _asyncio.run(fm.refresh(now))
+    finally:
+        m.time = real_time
+    return fm, asked, now
+
+_fm, _asked, _now = _flip_leg_scenario(mids_fail=False)
+assert _asked.count("allMids") >= 1, _asked  # the silent leg ages the read timer: allMids re-read
+assert _fm.prices[_fm.spec.other] == m.D("120.0") and _now - _fm.priced_ms < 60_000, (_fm.prices, _now - _fm.priced_ms)
+_fm, _asked, _now = _flip_leg_scenario(mids_fail=True)
+assert _asked.count("allMids") >= 1, _asked
+_odds = _fm.odds(_now)
+assert isinstance(_odds, str) and "价格停在" in _odds, _odds  # REST down too: the frozen leg holds the odds after 5 min
+
 print("AUDIT_MODELS_B_OK")

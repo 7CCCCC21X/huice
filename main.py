@@ -9087,6 +9087,7 @@ class FlipMarket:
     def __init__(self, store: "Store", spec: FlipSpec):
         self.store, self.spec = store, spec
         self.prices: dict[str, D] = {}
+        self.pushed: dict[str, tuple[int, float]] = {}  # coin -> (now_ms, monotonic) of its last push or allMids read
         self.priced_ms = 0
         self.sigma: float | None = None
         self.sigma_ms = 0
@@ -9098,10 +9099,19 @@ class FlipMarket:
 
     def push_mid(self, coin: str, mid: D, now_ms: int) -> None:
         """One coin's mid pushed in (HyperliquidStream): the pair is priced once both coins have one, the 30-second read
-        deferred by as long."""
+        deferred by as long.
+
+        1.150.0: the pair is only as fresh as its OLDER leg. Each coin keeps its own push time, and priced_ms and the
+        read timer take the older of the two: one coin's pushes must not keep a silent leg's mid looking live (its
+        subscription refused or stalled while the shared socket stays busy with the other coin), nor defer the allMids
+        read for ever. A silent leg now ages the read timer, so allMids is re-read every PRICE_SECONDS and refreshes
+        both legs; if that read fails too, priced_ms ages past PRICE_STALE_MS and odds() holds."""
         self.prices = {**self.prices, coin: mid}
-        if all(c in self.prices for c in (self.spec.coin, self.spec.other)):
-            self.priced_ms, self.times["price"] = now_ms, time.monotonic()
+        self.pushed = {**self.pushed, coin: (now_ms, time.monotonic())}
+        pair = (self.spec.coin, self.spec.other)
+        if all(c in self.prices and c in self.pushed for c in pair):
+            self.priced_ms = min(self.pushed[c][0] for c in pair)
+            self.times["price"] = min(self.pushed[c][1] for c in pair)
 
     async def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict]:
         rows = await self.info({"type": "candleSnapshot", "req": {"coin": coin, "interval": interval,
@@ -9134,6 +9144,7 @@ class FlipMarket:
                         raise ValueError(f"Hyperliquid 没有 {coin} 的报价")
                     prices[coin] = number(mids[coin], f"{coin} 价格")
                 self.prices, self.priced_ms = prices, now_ms
+                self.pushed = {c: (now_ms, mono) for c in prices}  # both legs read just now (push_mid's per-leg times)
             except Exception as error:
                 errors.append(clean_error(error) or type(error).__name__)
         if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
