@@ -597,6 +597,7 @@ class PredictApi:
         self.base, self.api_key, self.wallet = base.rstrip("/"), api_key, wallet
         self.jwt, self.jwt_exp, self.jwt_at = "", 0, 0.0
         self.auth_error = ""
+        self._auth_lock: tuple[Any, asyncio.Lock] | None = None  # (loop, lock): the sign-in runs once at a time (see auth_lock)
         self.gate = asyncio.Semaphore(self.PARALLEL)
         self.read_gate = asyncio.Semaphore(max(1, min(self.READ_PARALLEL, self.PARALLEL - 1)))  # the reads leave slots: an order or a cancel never queues behind them
         self.writes_inflight = 0  # orders and cancels on their way (call: priority): the shutdown drain waits for their answers
@@ -656,22 +657,52 @@ class PredictApi:
         """A request that needs the sign-in: signs in first when the token is missing or about to expire, once more
         after a 401."""
         await self.ensure_auth()
+        used = self.jwt  # the token this request goes out with (a renewal while it waits for its slot is fine: it then carries the newer one)
         try:
             return await self.call(method, path, payload, timeout, priority)
         except core.RemoteError as error:
             if http_status(error) != 401 or not self.wallet:
                 raise
-            self.jwt = ""
+            # 1.150.0 (audit LIVE-AUTH-SINGLEFLIGHT): only the token that was refused is dropped. Several requests in flight share
+            # one token: on its 401 each of them used to blank self.jwt — wiping the fresh token another one had just signed in for
+            # — and sign in again on its own (N × GET /auth/message + POST /auth on the key's shared rate limit, and, should a new
+            # sign-in revoke the older tokens, their retries refusing each other). Now the first clears it, the sign-in runs once
+            # under auth_lock, and the others retry with its token.
+            if self.jwt == used:
+                self.jwt = ""
             await self.ensure_auth()
             return await self.call(method, path, payload, timeout, priority)
 
+    def fresh(self) -> bool:
+        """A token that is there and not about to expire (five minutes' margin)."""
+        return bool(self.jwt) and (not self.jwt_exp or time.time() < self.jwt_exp - 300)
+
+    @property
+    def auth_lock(self) -> asyncio.Lock:
+        """The lock that makes the sign-in single-flight, one per event loop (a client reused across asyncio.run calls — the
+        tests — never meets a lock bound to a closed loop)."""
+        loop = asyncio.get_running_loop()
+        if self._auth_lock is None or self._auth_lock[0] is not loop:
+            self._auth_lock = (loop, asyncio.Lock())
+        return self._auth_lock[1]
+
     async def ensure_auth(self) -> None:
-        if self.jwt and (not self.jwt_exp or time.time() < self.jwt_exp - 300):
+        if self.fresh():
             return
-        await self.authenticate()
+        async with self.auth_lock:
+            if self.fresh():  # 1.150.0: signed in by the caller ahead in the queue — its token serves this one too
+                return
+            await self._sign_in()
 
     async def authenticate(self) -> str:
-        """The sign-in flow: a message to sign, its signature, a JWT. Raises (and records why) when it fails."""
+        """A sign-in now (the background renewal, /control): single-flight with ensure_auth's — it waits for one already
+        running, then signs in itself (the caller asked for a new token, not just a fresh one)."""
+        async with self.auth_lock:
+            return await self._sign_in()
+
+    async def _sign_in(self) -> str:
+        """The sign-in flow: a message to sign, its signature, a JWT. Raises (and records why) when it fails. Callers hold
+        auth_lock (ensure_auth, authenticate)."""
         if self.wallet is None:
             raise core.RemoteError("没有签名钱包，无法登录 Predict")
         try:

@@ -172,4 +172,60 @@ async def live_double_rekey():
 
 
 asyncio.run(live_double_rekey())
+
+
+async def live_auth_singleflight():
+    """LIVE-AUTH-SINGLEFLIGHT: the sign-in is single-flight — concurrent callers that find no fresh token sign in once, and
+    concurrent requests refused with a 401 on a shared token sign in once again and all succeed (each used to blank the token,
+    whoever had just obtained it, and sign in on its own)."""
+    import live as L, base64, json as J
+
+    def token(n):
+        return "x." + base64.urlsafe_b64encode(J.dumps({"exp": 1800000000, "n": n}).encode()).decode().rstrip("=") + ".y"
+
+    class StubWallet:
+        maker = "0x8fd379246834eac74B8419FfdA202CF8051F7A03"
+        def sign_text(self, message): return "sig:" + message
+
+    def make(revoke_old: bool):
+        api = L.PredictApi(m.PREDICT_REST, "key-1", StubWallet())
+        st = {"signins": 0, "valid": set(), "no_auth": 0, "orders": 0}
+
+        async def send(method, path, payload, timeout):
+            auth = api.headers().get("Authorization", "")  # read as the request leaves, like PredictApi.send
+            await asyncio.sleep(0.01)  # in flight long enough for the others to join
+            if path == "/auth/message":
+                return J.dumps({"success": True, "data": {"message": "Sign in\nNonce: 1"}}).encode()
+            if path == "/auth":
+                st["signins"] += 1
+                new = token(st["signins"])
+                st["valid"] = {new} if revoke_old else st["valid"] | {new}
+                return J.dumps({"success": True, "data": {"token": new}}).encode()
+            if not auth:
+                st["no_auth"] += 1
+            if auth.removeprefix("Bearer ") not in st["valid"]:
+                raise m.RemoteError("HTTP 401: expired")
+            st["orders"] += 1
+            return J.dumps({"success": True, "data": {"ok": True}}).encode()
+        api.send = send
+        return api, st
+
+    # cold start: five concurrent ensure_auth → one sign-in
+    api, st = make(False)
+    await asyncio.gather(*(api.ensure_auth() for _ in range(5)))
+    assert st["signins"] == 1 and api.jwt == token(1), st
+    # a token the server refuses, shared by five requests in flight → one re-sign-in, all five succeed
+    for revoke_old in (False, True):
+        api, st = make(revoke_old)
+        api.jwt, api.jwt_exp = "stale", 1800000000
+        out = await asyncio.gather(*(api.authed("POST", "/orders", {}, priority=True) for _ in range(5)), return_exceptions=True)
+        assert all(isinstance(r, dict) and r.get("success") for r in out), (revoke_old, out, st)
+        assert st["signins"] == 1 and st["orders"] == 5 and st["no_auth"] == 0, (revoke_old, st)
+    # authenticate() (the background renewal) still signs in itself, queued behind a sign-in already running
+    api, st = make(False)
+    await asyncio.gather(api.ensure_auth(), api.authenticate())
+    assert st["signins"] == 2 and api.jwt == token(2), st
+
+
+asyncio.run(live_auth_singleflight())
 print("AUDIT_LIVE_B_OK")
