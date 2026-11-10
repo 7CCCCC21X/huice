@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.147.0"
+VERSION = "1.148.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -3736,6 +3736,7 @@ class CnIndex:
     def __init__(self, enabled: bool = True, holidays: frozenset = frozenset()):
         self.enabled = enabled
         self.holidays = holidays
+        self.minutes: dict[int, float] = {}  # today's session: the Composite's price each minute (note_minute, 1.148.0)
         self.quote: IndexQuote | None = None
         self.a50: IndexQuote | None = None
         self.close: DailyClose | None = None
@@ -3806,6 +3807,19 @@ class CnIndex:
         live = stock_live_window("sh", now_ms, self.holidays) or a50_session(now_ms) != "休市"
         return self.SESSION_SECONDS if live else self.REFRESH_SECONDS
 
+    def note_minute(self, now_ms: int) -> None:
+        """The Composite's price at each minute of today's continuous trading as the bot reads it (today_vol: /calib's
+        alternative σ, 1.148.0); yesterday's are dropped. Not the lunch break nor the closing auction (from 14:57): the index
+        stands still there, and those zero moves would read as a calm day."""
+        if self.quote is None or self.error or not self.sse_session(now_ms)[0] or self.live_stale(now_ms):
+            return
+        local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+        if self.LUNCH[0] <= local.time() < self.LUNCH[1] or local.time() >= closing_auction_start("sh", local.date()):
+            return
+        if self.minutes and dt.datetime.fromtimestamp(max(self.minutes) / 1000, BEIJING).date() != local.date():
+            self.minutes = {}
+        self.minutes[now_ms // 60_000 * 60_000] = float(self.quote.last)
+
     def close_due(self, now_ms: int) -> bool:
         """The first refresh after the 15:00 close is not left to the cadence: the Composite's closing print stands
         in for the daily bar, and the first A50 print after the close is the anchor when no dated bar can be had."""
@@ -3823,6 +3837,7 @@ class CnIndex:
         quote, _, self.error = await pick_quote(self.SSE_SOURCES, lambda n, r: parse_cn_index(n, r, now_ms),
                                                 lambda q: self.sse_problem(q, now_ms))
         self.quote = newer(quote, self.quote) if self.error else quote
+        self.note_minute(now_ms)
         a50, skipped, self.a50_error = await pick_quote(self.A50_SOURCES, lambda n, r: self.parse_a50(n, r, now_ms),
                                                         lambda q: self.a50_problem(q, now_ms))
         self.a50 = newer(a50, self.a50) if self.a50_error else a50
@@ -4567,6 +4582,15 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
         baseline = market_baseline_line(done)
         if baseline:
             lines.append(baseline)
+        alt = [r for r in done if r.get("up_alt") is not None]
+        if alt:  # 1.148.0: the alternative in-session σ, scored on the same snapshots as the card's
+            a, c = scores([float(r["up_alt"]) for r in alt], [r["hit"] for r in alt]), scores([r["up"] for r in alt], [r["hit"] for r in alt])
+            lines.append(f"  改进 σ（开盘到收盘按 {ALT_HALF_LIFE} 日半衰期加权 + 当天已走的分钟波动；只评估，卡片未用）：{len(alt)} 条/{len({r['target'] for r in alt})} 日｜"
+                         f"Brier {a[0]:.3f} / 对数损失 {a[1]:.3f}｜同样本现行 {c[0]:.3f} / {c[1]:.3f}"
+                         + ("｜改进 σ 更准" if a[0] < c[0] else "｜还没有更准"))
+        for line in (blend_line(done), blend_line(alt, "up_alt", "改进 σ") if alt else ""):
+            if line:
+                lines.append(line)
         bins = []
         for lo in (0.0, 0.2, 0.4, 0.6, 0.8):
             sel = [r for r in done if lo <= r["up"] < lo + 0.2 or (lo == 0.8 and r["up"] == 1.0)]
@@ -4804,6 +4828,60 @@ def body_vol(opens: list[D | None], closes: list[D]) -> tuple[float, int] | None
     return math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)), len(rets)
 
 
+ALT_HALF_LIFE = 12      # 1.148.0 (/calib only): the in-session σ's days weigh half every this many sessions back
+ALT_TODAY_WEIGHT = 120  # ...and today's own minutes count against it as much as this many minutes of it
+SSE_SESSION_MINUTES = 240
+
+
+def body_vol_ewma(opens: list[D | None], closes: list[D], half_life: float = ALT_HALF_LIFE) -> tuple[float, float] | None:
+    """The in-session σ as body_vol, the days weighted to halve every ``half_life`` back (zero mean): (σ, the weights'
+    effective day count); None under INTRADAY_SHARE_MIN_DAYS days. 1.148.0: the plain average of tens of days lagged a
+    livelier market — SSE's 盘中 residuals asked 1.14% a day of a σ priced at 0.75%."""
+    rets = [math.log(float(c / o)) for o, c in zip(opens, closes) if o and c and o > 0 and c > 0]
+    if len(rets) < INTRADAY_SHARE_MIN_DAYS:
+        return None
+    ws = [0.5 ** ((len(rets) - 1 - i) / half_life) for i in range(len(rets))]
+    return math.sqrt(sum(w * r * r for w, r in zip(ws, rets)) / sum(ws)), sum(ws) ** 2 / sum(w * w for w in ws)
+
+
+def today_vol(minutes: Mapping[int, float], session_minutes: int = SSE_SESSION_MINUTES) -> tuple[float, int]:
+    """Today's own in-session σ (a day's worth) from the index's price at each minute the bot saw: the RMS of the returns
+    between neighbouring minutes (not over the lunch break) times √(the session's minutes); (σ, the returns)."""
+    keys = sorted(minutes)
+    rets = [math.log(minutes[b] / minutes[a]) for a, b in zip(keys, keys[1:]) if b - a == 60_000 and minutes[a] > 0 and minutes[b] > 0]
+    if not rets:
+        return 0.0, 0
+    return math.sqrt(sum(r * r for r in rets) / len(rets) * session_minutes), len(rets)
+
+
+BLEND_MIN_DAYS = 5   # the model / market blend is first scored once this many target days came before
+BLEND_GRID = [i / 10 for i in range(11)]  # the model's share tried (0 = the market's middle alone, 1 = the model alone)
+
+
+def blend_weight(rows: list[dict], key: str = "up") -> float:
+    """The model's share in w·model + (1 − w)·market with the least Brier over ``rows`` (each with mkt and hit)."""
+    return min(BLEND_GRID, key=lambda w: (sum((w * float(r[key]) + (1 - w) * float(r["mkt"]) - r["hit"]) ** 2 for r in rows), -w))
+
+
+def blend_line(rows: list[dict], key: str = "up", label: str = "现行模型") -> str:
+    """1.148.0 (/calib): the model blended with Predict's middle, walked forward by target day — each day priced with the share
+    the days before it chose — against the model and the market alone on the same rows. "" without enough days."""
+    both = [r for r in rows if r.get("mkt") is not None and r.get(key) is not None]
+    days = sorted({r["target"] for r in both})
+    if len(days) <= BLEND_MIN_DAYS:
+        return ""
+    test = [r for r in both if r["target"] in set(days[BLEND_MIN_DAYS:])]
+    weights = {day: blend_weight([r for r in both if r["target"] < day], key) for day in days[BLEND_MIN_DAYS:]}
+    blend = brier_scores([weights[r["target"]] * float(r[key]) + (1 - weights[r["target"]]) * float(r["mkt"]) for r in test], [r["hit"] for r in test])
+    alone = brier_scores([float(r[key]) for r in test], [r["hit"] for r in test])
+    market = brier_scores([float(r["mkt"]) for r in test], [r["hit"] for r in test])
+    now_w = blend_weight(both, key)
+    best = min((blend[0], "加权"), (alone[0], label), (market[0], "盘口"))[1]
+    return (f"  {label}与盘口加权（逐日向前，{len(test)} 条/{len(days) - BLEND_MIN_DAYS} 日；每天的权重只用之前的日子拟合）："
+            f"Brier {blend[0]:.3f} / 对数损失 {blend[1]:.3f}｜{label}单独 {alone[0]:.3f} / {alone[1]:.3f}｜盘口单独 {market[0]:.3f} / {market[1]:.3f}"
+            f"｜按全部日子拟合的模型权重 {now_w:.1f}（1 = 只用模型，0 = 只用盘口）｜{best}最准")
+
+
 def intraday_share(opens: list[D | None], closes: list[D]) -> tuple[float, int] | None:
     """Share of close-to-close variance that happens open→close: Σ ln(C/O)² / (Σ ln(O/C₋₁)² + Σ ln(C/O)²).
 
@@ -4838,6 +4916,7 @@ class VolBook:
         self.refreshed: dict[str, float] = {}
         self.errors: dict[str, str] = {}                         # key -> why the last read of its bars failed (the figures in hand stand)
         self.calib: dict[tuple[str, str], tuple[float, int]] = {}  # (key, 盘中 / 盘后) -> (the σ factor, the days behind it): Bot.index_sigma_calibs
+        self.bodies_ewma: dict[str, tuple[float, float]] = {}  # key -> the EWMA open→close σ, its effective days (body_vol_ewma; /calib's alternative, 1.148.0)
 
     def due(self, key: str) -> bool:
         return key not in self.overrides and time.monotonic() - self.refreshed.get(key, -1e9) >= self.REFRESH_SECONDS
@@ -4858,6 +4937,11 @@ class VolBook:
             self.bodies.pop(key, None)
         else:
             self.bodies[key] = body
+        ewma = body_vol_ewma(opens, closes) if opens else None
+        if ewma is None:
+            self.bodies_ewma.pop(key, None)
+        else:
+            self.bodies_ewma[key] = ewma
         if save and self.store is not None:
             self.store.put(f"vol:{key}", {"closes": [str(c) for c in closes], "source": source, "at": time.time(),
                                           "opens": [str(o) if o is not None else None for o in opens] if opens else None})
@@ -4886,6 +4970,20 @@ class VolBook:
         """A read of the bars failed: the reason kept for the σ note, the next try in VOL_RETRY_SECONDS."""
         self.errors[key] = why
         self.refreshed[key] = time.monotonic() - self.REFRESH_SECONDS + VOL_RETRY_SECONDS
+
+    def alt_intraday(self, key: str, prior_key: str, minutes: Mapping[int, float] | None = None) -> tuple[float, int] | None:
+        """1.148.0, scored by /calib only (the card prices with get): the in-session σ from the EWMA of the sessions' open→close
+        returns (blended with the prior's in-session part as get blends its plain one), and today's own minutes counted in
+        as ALT_TODAY_WEIGHT minutes of it weigh — (σ, today's returns). None before the bars carry ten opens."""
+        ewma = self.bodies_ewma.get(key)
+        if ewma is None or key in self.overrides:
+            return None
+        prior_in = PRIOR_VOL[prior_key] * math.sqrt(INTRADAY_SHARE_PRIOR.get(prior_key) or INTRADAY_SHARE_BOUNDS[1])
+        sigma = math.sqrt((ewma[1] * ewma[0] ** 2 + PRIOR_WEIGHT * prior_in ** 2) / (ewma[1] + PRIOR_WEIGHT))
+        own, n = today_vol(minutes or {})
+        if n >= 10:
+            sigma = math.sqrt((n * own ** 2 + ALT_TODAY_WEIGHT * sigma ** 2) / (n + ALT_TODAY_WEIGHT))
+        return sigma, n
 
     def get(self, key: str, prior_key: str, intraday: bool = False) -> tuple[float, str]:
         """Daily close-to-close σ. intraday=True: only the in-session part (today's opening gap has happened) — the
@@ -16697,6 +16795,18 @@ class Bot:
                 lines.append("  " + baseline.strip())
         return lines
 
+    def sse_alt(self, raw: CloseOdds, shown: CloseOdds) -> dict:
+        """1.148.0: what the alternative in-session σ (Vols.alt_intraday: EWMA days, today's minutes) would have shown — the
+        same price, reference and time left — kept on the SSE 盘中 snapshot for /calib to score beside the card's. {} after
+        hours or before the bars allow it."""
+        if raw.mode != "盘中":
+            return {}
+        alt = self.vols.alt_intraday("SSE", "SSE", getattr(self.cn, "minutes", {}))
+        if alt is None:
+            return {}
+        odds = close_odds(raw.name, shown.ref, shown.effective, alt[0], raw.remaining, raw.target, raw.tick, "", "", "", widen=raw.widen)
+        return {"sigma_alt": alt[0] * raw.widen, "up_alt": odds.fair_up, "today_n": alt[1]}
+
     def record_predictions(self, now_ms: int) -> None:
         """Save what each index card showed (every 30 min) and each official close as it becomes known, so the model
         can later be scored against real outcomes (/calib). The score uses the odds as displayed – against the
@@ -16729,7 +16839,8 @@ class Bot:
                 "trend": trend,  # ln(effective / the snapshot before's), about half an hour: the direction the price had been going (1.120.2)
                 "calib": self.vols.calib.get((key, raw.mode), (1.0, 0))[0],  # the factor in that σ: the residuals are taken on the raw one
                 "sigma_raw": raw.sigma_daily * raw.widen / self.vols.calib.get((key, raw.mode), (1.0, 0))[0],
-                "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else ""})
+                "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else "",
+                **(self.sse_alt(raw, shown) if key == "SSE" else {})})
         if time.time() - self.pred_pruned > 86400:  # the snapshots are kept PRED_KEEP_DAYS, not forever
             self.pred_pruned = time.time()
             cutoff = now_ms - PRED_KEEP_DAYS * DAY_MS
