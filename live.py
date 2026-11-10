@@ -2104,7 +2104,11 @@ class LiveBot(core.Bot):
             definite = isinstance(error, OrderRejected) or 400 <= http_status(error) < 500
             # 1.122.0: an answer that the order already exists (a resend taken twice, a hash Predict holds) is Predict having it,
             # not a refusal: the record is "result unknown" and the sync adopts the order by its hash, nothing is freed
-            duplicate = any(w in text.lower() for w in ("already exist", "already placed", "duplicate", "exists"))
+            # 1.150.0: a bare 409 Conflict on an order POST is the same answer without the wording (Predict, or a gateway in front
+            # of it, holding that hash): failed and freed, a taker it took and filled at once was never looked at again (no order
+            # id) — real shares outside exposure, P&L and the loss stop. Kept "result unknown": the sync adopts it by its hash,
+            # or the positions evidence books it, or the grace period gives it up. Other 4xx answers stay definite refusals
+            duplicate = http_status(error) == 409 or any(w in text.lower() for w in ("already exist", "already placed", "duplicate", "exists"))
             limited = isinstance(error, core.RemoteError) and (http_status(error) == 429 or (error.retry_after and http_status(error) == 0))
             if limited and not trade.get("withdrawn") and st.get("state") != "cancelling":
                 # refused by the client itself (a cooldown that began between the check above and the request), or by Predict's rate
