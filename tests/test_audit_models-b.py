@@ -373,4 +373,41 @@ def _range_wick():
 
 _range_wick()
 
+# audit MOD-RANGE-SCAN-EMPTY: an hourly klines answer that is empty (or stops short) without raising must not stamp the
+# scan as "read up to now": "through" stays hours behind, the running hour is unknown, and advice must hold.
+def _range_scan_empty():
+    D, H = m.D, 3_600_000
+    spec = m.RANGE_MARKETS[0]
+    now = spec.start_ms + 9 * 24 * H + 30 * 60_000
+    hour = now - now % H
+    through = hour - 3 * H  # persisted: read up to three hours ago
+    saved = {"start": spec.start_ms, "through": through, "open": 100000.0, "high": 104000.0, "high_at": spec.start_ms,
+             "low": 96000.0, "low_at": spec.start_ms}
+    rm = m.RangeMarket(m.Store(":memory:"), spec)
+    rm.store.put(f"range:{spec.slug}", dict(saved))
+
+    async def empty(path, **p):
+        return []  # Binance (or a proxy in BINANCE_BASE_URL) answers [] for the range
+    rm.get = empty
+    _asyncio.run(rm.scan(now))
+    rm.price, rm.priced_ms, rm.sigma, rm.sigma_ms = D("99000"), now, 0.5, now
+    assert rm.history["through"] == through and rm.running == {}, (rm.history, rm.running)
+    assert rm.scanned_ms != now, rm.scanned_ms
+    assert rm.advice_problem(now) != "", rm.advice_problem(now)
+
+    # a normal scan (the finished hours plus the running candle) still counts as read up to now
+    rm2 = m.RangeMarket(m.Store(":memory:"), spec)
+    rm2.store.put(f"range:{spec.slug}", dict(saved))
+
+    async def full(path, **p):
+        assert p["interval"] == "1h", p
+        return [[t, "100000", "101000", "99000", "100500", "1", t + H - 1] for t in range(p["startTime"], hour + H, H)]
+    rm2.get = full
+    _asyncio.run(rm2.scan(now))
+    rm2.price, rm2.priced_ms, rm2.sigma, rm2.sigma_ms = D("99000"), now, 0.5, now
+    assert rm2.history["through"] == hour and rm2.running.get("open") == hour, (rm2.history, rm2.running)
+    assert rm2.scanned_ms == now and rm2.advice_problem(now) == "", (rm2.scanned_ms, rm2.advice_problem(now))
+
+_range_scan_empty()
+
 print("AUDIT_MODELS_B_OK")

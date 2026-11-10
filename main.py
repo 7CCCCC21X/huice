@@ -10400,7 +10400,14 @@ class RangeMarket:
                 break
         if now_ms >= end and not running:
             hist["through"] = max(int(hist["through"]), end)  # hours without a candle had no trades
-        self.running, self.scanned_ms = running, now_ms
+        self.running = running
+        # audit MOD-RANGE-SCAN-EMPTY: count the scan as "read up to now" (advice_problem) only when the record really
+        # reaches the last hour (or the window's end). An empty or short hourly answer that does not raise (a proxy in
+        # BINANCE_BASE_URL, maintenance) leaves "through" hours behind with the running hour unknown; stamping it fresh
+        # let advice through while a level touched in those unread hours was still priced as open. Every normal scan
+        # passes: the running candle's hour, the current minute (opening hour), this hour's start, or the window's end.
+        if int(hist["through"]) >= min(now_ms, end) - 3_600_000:
+            self.scanned_ms = now_ms
         self.store.put(f"range:{self.spec.slug}", hist)
 
     def marks(self) -> dict:
