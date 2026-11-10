@@ -225,4 +225,151 @@ async def _pnl_drop(folder):
 with tempfile.TemporaryDirectory() as _folder:
     asyncio.run(_pnl_drop(_folder))
 
+# PRE-PAUSE-STRIKES: withdraw_all — /preopen pause, /live cancel all, the emergency stop — withdrew a book of BULK_MIN_IDS
+# ids or fewer (or any book of a crashed controller) here and now under the operator's reason without the free mark: one
+# failure against every withdrawn window's level, so after three pauses the window was never quoted again ("失败满 3 次"),
+# though PREOPEN.md says a pause does not count and a bigger book's pause (the loop's "到时撤单或真实交易暂停") never did.
+# place_pair's tail did the same to a pair whose two POSTs an operator's stop overtook. Now the resting (active) pairs an
+# operator's stop withdraws are free; a pair already closing on its own failure, and a side not confirmed at placement,
+# still count (marking every pair free — cancel_all(reason, free=True) — would erase those, and the cap with them).
+
+
+async def _quote_all(ctl):
+    """One discovery pass (a full scan), each queued level placed as the placement workers would: the keys placed."""
+    ctl.full_scan_ms = 0
+    await ctl.discover()
+    keys = []
+    while not ctl.queue.empty():
+        _, _, c = ctl.queue.get_nowait()
+        ctl.account_at = ctl.now()
+        assert await ctl.place_pair(c) == "", c["slug"]
+        ctl.queued.discard(c["slug"])
+        keys.append(c["slug"])
+    return sorted(keys)
+
+
+async def _settled(ctl):
+    await asyncio.gather(*list(ctl.settling.values()), return_exceptions=True)
+
+
+def _operator(ctl, clock):
+    """A LiveBot with the real command handlers over the controller; the model trader has nothing resting."""
+    bot = _L.LiveBot.__new__(_L.LiveBot)
+    bot.preopen, bot.store, bot.market = ctl, _m.Store(":memory:"), types.SimpleNamespace(now_ms=lambda: clock.ms)
+
+    async def model_cancel(words, now_ms):
+        return "没有真实挂单可撤。"
+    bot._live_cancel_command = model_cancel
+    return bot
+
+
+async def _operator_stops_are_free():
+    # PREOPEN_AHEAD_MINUTES=60 (PREOPEN.md: "60 = 大约 4 场"), BTC alone: four windows, eight ids — the small path
+    rows = [_T.market(at=_T.NOW + k * 15 * 60_000, mid=200 + k) for k in range(1, 5)]
+    ctl, api, clock = _T.controller(rows, PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="60", PREOPEN_SHARES="10")
+    bot = _operator(ctl, clock)
+    pause, resume = (_m.Request("/preopen", [a], 1, 0, 1) for a in ("pause", "resume"))
+    stops = [("/preopen pause", lambda: bot.cmd_preopen(pause), lambda: bot.cmd_preopen(resume)),
+             ("/live cancel all", lambda: bot.live_cancel_command(["all"], clock.ms), lambda: bot.cmd_preopen(resume)),
+             ("emergency stop", lambda: bot.live_control("stop", {}), lambda: bot.live_action("resume", [], clock.ms)),
+             ("/preopen pause", lambda: bot.cmd_preopen(pause), lambda: bot.cmd_preopen(resume))]  # four stops: past MAX_ATTEMPTS
+    windows = None
+    for name, stop, again in stops:
+        keys = await _quote_all(ctl)
+        windows = windows or keys
+        assert len(keys) == 4 and keys == windows, f"before {name}: {len(keys)} of 4 windows quoted ({keys})"
+        assert sum(len(_p.removable_ids(x)) for x in ctl.ledger.rows.values() if x["phase"] != "closed") <= _p.BULK_MIN_IDS
+        await stop()
+        await _settled(ctl)
+        withdrawn = [x for x in ctl.ledger.rows.values() if x["phase"] != "active"]
+        assert ctl.manual_pause and not [x for x in ctl.ledger.rows.values() if x["phase"] == "active"], name
+        assert all(x.get("accounted") for x in withdrawn), f"{name}: the withdrawn pairs' records not all read"
+        strikes = _p.window_strikes(ctl.ledger.rows.values())
+        assert strikes == {}, f"{name}: an operator's stop counted against the windows: {strikes}"
+        await again()
+        assert not ctl.manual_pause, name
+        clock.ms += 30_000
+    assert await _quote_all(ctl) == windows, "after four operator stops every window is still quoted (new salts)"
+    assert "不再报价" not in ctl.status()
+    assert len({x["orders"]["up"]["hash"] for x in ctl.ledger.rows.values()}) == 5 * 4, "every quote a new order"
+    for task in ctl.settling.values():
+        task.cancel()
+    await _settled(ctl)
+    ctl.ledger.close()
+
+    # a pair already closing on its own failure (a side cancelled by someone else; the other side's removal not answered
+    # yet) when the operator pauses: it still counts — only the resting pair is the operator's doing
+    rows = [_T.market(at=_T.NOW + 30 * 60_000, mid=301), _T.market(at=_T.NOW + 45 * 60_000, mid=302)]
+    ctl, api, clock = _T.controller(rows, PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="60", PREOPEN_SHARES="10")
+    bot = _operator(ctl, clock)
+    a, b = (_p.candidate(r, _T.NOW, ctl.owner.config, ctl.settings) for r in rows)
+    for c in (a, b):
+        await ctl.place_pair(c)
+    failed, resting = ctl.ledger.rows[a["slug"]], ctl.ledger.rows[b["slug"]]
+    api.rows[failed["orders"]["up"]["hash"]]["status"] = "CANCELLED"
+    api.stuck = {failed["orders"]["down"]["id"]}
+    clock.ms += 15_000
+    ctl.account_at, ctl.listed_ids = clock.ms, set()
+    await ctl.monitor_pair(failed)
+    await _settled(ctl)
+    assert (failed["phase"], failed.get("free"), resting["phase"]) == ("closing", None, "active"), (failed["phase"], failed.get("free"), resting["phase"])
+    await bot.cmd_preopen(pause)
+    api.stuck = set()
+    clock.ms += 20_000
+    for pair in (failed, resting):
+        if not pair.get("accounted"):
+            await ctl.cancel_pair(pair, pair.get("reason") or "撤单状态核对")  # the reconciliation's next try
+    await _settled(ctl)
+    assert failed.get("accounted") and resting.get("accounted"), (failed.get("accounted"), resting.get("accounted"))
+    assert _p.counts_against(failed), "the window's own failure must still count after the pause"
+    assert not _p.counts_against(resting), "the resting pair the pause withdrew must be free"
+    assert _p.window_strikes(ctl.ledger.rows.values()) == {a["slug"]: 1}, _p.window_strikes(ctl.ledger.rows.values())
+    ctl.ledger.close()
+
+    # a crashed controller (no loop to leave a big book to): the operator's pause withdraws all 50 ids here — free too
+    rows = [_T.market(at=_T.NOW + k * 15 * 60_000, mid=400 + k) for k in range(1, 26)]
+    ctl, api, clock = _T.controller(rows, PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="1440", PREOPEN_SHARES="10")
+    bot = _operator(ctl, clock)
+    assert len(await _quote_all(ctl)) == 25
+    ctl.alive = False
+    reply = await bot.cmd_preopen(pause)
+    assert reply.startswith("预挂模式已停止：50 张预挂单已撤"), reply
+    await _settled(ctl)
+    assert all(x.get("accounted") for x in ctl.ledger.rows.values())
+    assert _p.window_strikes(ctl.ledger.rows.values()) == {}, _p.window_strikes(ctl.ledger.rows.values())
+    ctl.ledger.close()
+
+    # the operator's stop lands while a pair's two POSTs are on their way, after Predict took both: place_pair's tail
+    # withdraws it — free, as the loop would; a side that was not confirmed (the second POST timed out) still counts
+    for fail in (0, 2):
+        ctl, api, clock = _T.controller([_T.market(at=_T.NOW + 30 * 60_000, mid=501)], PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="60", PREOPEN_SHARES="10")
+        api.fail_side = fail
+        real = api.create_order
+
+        async def create(body, real=real, api=api, ctl=ctl):
+            try:
+                return await real(body)
+            finally:
+                if len(api.sent) == 2:
+                    ctl.manual_pause = ctl.ledger.pause(True)  # /preopen pause lands during the round trip
+        api.create_order = create
+        c = _p.candidate(_T.market(at=_T.NOW + 30 * 60_000, mid=501), _T.NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        await _settled(ctl)
+        pair = ctl.ledger.rows[c["slug"]]
+        states = sorted(o["state"] for o in pair["orders"].values())
+        assert pair["phase"] != "active" and ctl.manual_pause and len(api.sent) == 2, (pair["phase"], len(api.sent))
+        if not fail:
+            assert pair.get("accounted") and not _p.counts_against(pair), (states, pair.get("reason"), pair.get("free"))
+            assert _p.window_strikes(ctl.ledger.rows.values()) == {}
+        else:
+            assert "unknown" in states and not pair.get("free") and _p.counts_against(pair), (states, pair.get("free"))
+        for task in ctl.settling.values():
+            task.cancel()
+        await _settled(ctl)
+        ctl.ledger.close()
+
+
+asyncio.run(_operator_stops_are_free())
+
 print("AUDIT_PREOPEN_OK")

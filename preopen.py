@@ -440,7 +440,8 @@ def resting_orders(pair: dict, now_ms: int) -> int:
 def counts_against(pair: dict) -> bool:
     """Whether a withdrawn record counts against its window's MAX_ATTEMPTS: one that ended by its own failure (a side not
     confirmed, a side ended unfilled — an external cancel, a deferred refusal — the market's status) does; one withdrawn
-    for what was not the window's doing (a settings change, the mode stopped, LIVE paused, the stock guard) does not
+    for what was not the window's doing (a settings change, the mode stopped, an operator's stop — the mode or LIVE
+    paused, /live cancel all, the emergency stop, at any book size: Audit PRE-PAUSE-STRIKES — and the stock guard) does not
     (1.131.6: a day of settings changes used up the three quotes of every window listed the day before). Marked on the
     record (free); an older record by its reason."""
     if pair.get("free"):
@@ -1494,6 +1495,11 @@ class Controller:
             LOG.warning("开盘前预挂 %s 没有发出：%s", pair["slug"], self.error)
             return ""
         if pair["phase"] != "active" or self.now() >= pair["cancel_ms"] or self.withdrawing():
+            if pair["phase"] == "active":
+                # Audit PRE-PAUSE-STRIKES: still active = both sides confirmed (an unconfirmed side made it "closing" in send,
+                # and that still counts): withdrawn here only for its cancel time or an operator's stop that came during the
+                # two POSTs, which the cancellation loop withdraws free ("到时撤单或真实交易暂停") — not the window's failure
+                pair["free"] = True
             await self.cancel_pair(pair, "单边未确认或已到撤单时间")
         LOG.info("开盘前预挂 %s：%s", pair["slug"], {s: o["state"] for s, o in pair["orders"].items()})
         return ""
@@ -1687,6 +1693,20 @@ class Controller:
         by the caller (1.141.0): a few withdrawn here and now; a book of more than BULK_MIN_IDS left to the cancellation
         loop, which withdraws it in batches — the command answers at once instead of minutes later. The reply's line."""
         n = sum(len(removable_ids(p)) for p in self.ledger.rows.values() if p["phase"] != "closed")
+        if n <= BULK_MIN_IDS or not self.alive:
+            # Audit PRE-PAUSE-STRIKES: an operator's stop is not the window's doing, so the resting pairs withdrawn here and
+            # now are free (counts_against), as the cancellation loop's withdrawal of a bigger book always was
+            # ("到时撤单或真实交易暂停", free=True). They used to keep the operator's reason without the mark: a pause, /live
+            # cancel all or the emergency stop of BULK_MIN_IDS ids or fewer (PREOPEN_AHEAD_MINUTES=60 with BTC alone: about
+            # eight), or of any book once the controller had crashed, counted one failure against every withdrawn window's
+            # level — three pauses and the window was never quoted again ("失败满 3 次"), against PREOPEN.md (停止或暂停预挂
+            # 撤掉的不算次数); whether a pause counted depended on the book's size. Only the active pairs: one already closing
+            # on its own failure (a side not confirmed or ended unfilled, the market's status) keeps its count —
+            # cancel_all(free=True) would erase it, and the cap with it. cancel_all below saves the marks (cancel_many saves
+            # every pair it withdraws, with no await before).
+            for pair in self.ledger.rows.values():
+                if pair["phase"] == "active":
+                    pair["free"] = True
         if n <= BULK_MIN_IDS:
             await self.cancel_all(reason)
             return ""
