@@ -30,4 +30,65 @@ assert rows["btc-updown-day-x"][head.index("sigma_sqrt_tau")] == f"{st:.6g}"
 assert rows["btc-updown-day-y"][head.index("realized_z")] == ""
 store.delete_prefix("wsample:")
 
+# --- BOT-STOCK-QUOTE-CLOSE: a realtime quote stamped before the closing auction is not that day's close -----------------
+import asyncio, datetime as dt
+D = m.D
+def bj_ms(y, mo, d, h, mi): return int(dt.datetime(y, mo, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+def tencent_sh(last, prev, when):
+    fields = ["0"] * 40
+    fields[3], fields[4], fields[30] = last, prev, when
+    return ('v_sh688836="' + "~".join(fields) + '";').encode("gbk")
+sh_info = m.STOCK_MARKETS["sh"]
+stuck = tencent_sh("47.90", "50.00", "20261009143000")  # feed stuck on the 14:30 print
+try:
+    got = m.parse_quote_close("腾讯", "sh", stuck, sh_info, bj_ms(2026, 10, 9, 15, 20))
+    raise AssertionError(f"a 14:30 print was taken as the close: {got}")
+except ValueError as error:
+    assert "早于收盘竞价" in str(error), error
+try:  # also on a later day (the stuck record still dated 10-09)
+    m.parse_quote_close("腾讯", "sh", stuck, sh_info, bj_ms(2026, 10, 10, 10, 0)); raise AssertionError("stale close accepted")
+except ValueError:
+    pass
+# while the session runs the record still gives the previous close (unchanged behaviour)
+assert m.parse_quote_close("腾讯", "sh", stuck, sh_info, bj_ms(2026, 10, 9, 14, 40))[:2] == (None, D("50.00"))
+good = tencent_sh("48.10", "50.00", "20261009150003")
+assert m.parse_quote_close("腾讯", "sh", good, sh_info, bj_ms(2026, 10, 9, 15, 20))[:2] == (dt.date(2026, 10, 9), D("48.10"))
+hk_info = m.STOCK_MARKETS["hk"]
+sina_hk_early = ('var hq_str_rt_hk00625="SHEIN,希音,38.00,38.10,38.20,37.50,37.76,' + ",".join(["0"] * 10) + ',2026/10/09,15:40:00";').encode("gbk")
+try:
+    m.parse_quote_close("新浪", "hk", sina_hk_early, hk_info, bj_ms(2026, 10, 9, 17, 0)); raise AssertionError("HK 15:40 print accepted")
+except ValueError:
+    pass
+
+async def quote_close_fallback():
+    # Eastmoney down, Tencent stuck on 14:30 -> StockMarket asks Sina, whose 15:00:03 close is used
+    sina_good = ('var hq_str_sh688836="宇树科技,49.00,50.00,48.10,' + ",".join(["0"] * 26) + ',2026-10-09,15:00:03,00";').encode("gbk")
+    async def fake_get(url, timeout=15, headers=None):
+        if "eastmoney" in url: raise m.RemoteError("网络错误 (RemoteDisconnected)")
+        if "qt.gtimg.cn" in url: return stuck
+        if "sina" in url: return sina_good
+        raise AssertionError(url)
+    real_get, real_sleep = m.http_get, m.asyncio.sleep
+    async def no_sleep(_s): await real_sleep(0)
+    m.http_get, m.asyncio.sleep = fake_get, no_sleep
+    try:
+        cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT"})
+        sm = m.StockMarket(cfg, m.Store(":memory:"))
+        await sm.refresh(bj_ms(2026, 10, 9, 15, 20), force=True)
+        close = sm.closes["UNITREEUSDT"]
+        assert close.value == D("48.10") and "新浪" in close.source, (close, sm.errors)
+        # Sina stuck too -> no close for the day is invented from a 14:30 print
+        sina_stuck = ('var hq_str_sh688836="宇树科技,49.00,50.00,47.90,' + ",".join(["0"] * 26) + ',2026-10-09,14:30:00,00";').encode("gbk")
+        async def all_stuck(url, timeout=15, headers=None):
+            if "eastmoney" in url: raise m.RemoteError("网络错误 (RemoteDisconnected)")
+            return stuck if "qt.gtimg.cn" in url else sina_stuck
+        m.http_get = all_stuck
+        sm2 = m.StockMarket(cfg, m.Store(":memory:"))
+        await sm2.refresh(bj_ms(2026, 10, 9, 15, 20), force=True)
+        assert "UNITREEUSDT" not in sm2.closes or sm2.closes["UNITREEUSDT"].value != D("47.90"), sm2.closes
+        assert "早于收盘竞价" in sm2.errors.get("UNITREEUSDT", ""), sm2.errors
+    finally:
+        m.http_get, m.asyncio.sleep = real_get, real_sleep
+asyncio.run(quote_close_fallback())
+
 print("AUDIT_BOTCORE_OK")

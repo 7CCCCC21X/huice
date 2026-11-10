@@ -2054,6 +2054,16 @@ def parse_quote_close(source: str, market: str, raw: bytes, info: StockMarketInf
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
     final_from = dt.datetime.combine(local.date(), CALENDAR.close_time_for(info, local.date()), tz) + dt.timedelta(minutes=15)
     if quoted.date() < local.date() or (quoted.date() == local.date() and local >= final_from):
+        # A "final" quote must itself be stamped at the closing auction. A record stuck on an earlier print
+        # (feed lag, a source serving a cached snapshot) is otherwise taken as the dated close and settles the daily
+        # cards (outcome:<sym>:<day>, /calib, the LIVE daily-loss tally). Same 5-minute tolerance as note_live_close.
+        # Raise rather than return day=None: fetch then asks the next source (Sina after Tencent) and, if none has a
+        # real close, the caller keeps the last good close; day=None would stop the search and swap in the previous
+        # close as a baseline. A stock halted for the rest of the day therefore waits for the dated daily bar.
+        # `quoted` is naive exchange-local time (both feeds stamp local time), so compare with a naive close time.
+        close_at = dt.datetime.combine(quoted.date(), CALENDAR.close_time_for(info, quoted.date()))
+        if quoted < close_at - dt.timedelta(minutes=5):
+            raise ValueError(f"{source}最后一笔 {quoted:%m-%d %H:%M} 早于收盘竞价，不能当作收盘价")
         return quoted.date(), number(current, "收盘价"), number(previous, "昨收价")
     return None, number(previous, "昨收价"), None
 
