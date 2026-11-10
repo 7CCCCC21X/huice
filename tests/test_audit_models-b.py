@@ -93,4 +93,57 @@ _bot2.record_predictions(_now)
 _rows = [v for _, v in _bot2.store.items("pred:KOSPI")]
 assert len(_rows) == 1 and _rows[0]["mode"] == "盘中" and _rows[0]["target"] == "2026-11-10", _rows
 
+
+# --- MOD-SHAPE-RETRY: while there is no shape of the day (too few 15-minute candles, or a failed read), read_vol must not
+# re-read the 15-minute candles on every σ read: read_shape's SHAPE_RETRY_SECONDS stamp decides when it is tried again ---------
+import asyncio as _asyncio
+
+
+class _ShapeFeed:
+    """Candles with no shape: [] for 15m (vol_shape -> None, as for a new listing), flat-ish 1-minute rows otherwise."""
+    def __init__(self):
+        self.calls, self.now = [], 0
+
+    async def __call__(self, path, **p):
+        self.calls.append(p["interval"])
+        if p["interval"] == "15m":
+            return []
+        end = (p.get("endTime") or self.now) // 60_000 * 60_000
+        return [[o, "0", "0", "0", str(20 * (1 + 0.001 * (o // 60_000 % 2))), "0", o + 59_999]
+                for o in range(end - (p["limit"] - 1) * 60_000, end + 1, 60_000)]
+
+
+async def _shape_retry():
+    _U = next(s for s in m.WINDOW_UPDOWN_MARKETS if s.key == "UNITREE-15M")
+    now = int(_dt.datetime(2026, 11, 10, 10, 5, tzinfo=m.BEIJING).timestamp() * 1000)
+    fut = _ShapeFeed()
+    card = m.IndexUpDownMarket(m.Store(":memory:"), _U.current(now), fut, "sh", m.session_minute_fn("sh"))
+    for i in range(4):  # four σ reads a minute apart (VOL_SECONDS near a window)
+        fut.now = now + i * 60_000
+        await card.read_vol(fut.now)
+    assert fut.calls.count("15m") == 1, fut.calls
+    assert card.shape is None and card.shape_error and card.sigma is not None  # the plain σ meanwhile
+    nxt = card.carry(m.IndexUpDownMarket(card.store, _U.current(now + 240_000), fut, "sh", m.session_minute_fn("sh")))
+    fut.now = now + 240_000
+    await nxt.read_vol(fut.now)  # the next window's card keeps the retry stamp
+    assert fut.calls.count("15m") == 1, fut.calls
+    fut.now = now + m.IndexUpDownMarket.SHAPE_RETRY_SECONDS * 1000
+    await nxt.read_vol(fut.now)  # tried again after SHAPE_RETRY_SECONDS
+    assert fut.calls.count("15m") == 2, fut.calls
+
+    _B = next(s for s in m.WINDOW_UPDOWN_MARKETS if s.key == "BTC-15M")
+    start = int(_dt.datetime(2026, 11, 10, 14, 0, tzinfo=_dt.timezone.utc).timestamp() * 1000)
+    spot = m.SpotWindowMarket(m.Store(":memory:"), _B.window_spec(start))
+    feed = _ShapeFeed()
+    spot.get = feed
+    for i in range(4):
+        feed.now = start + i * 60_000
+        await spot.read_vol(feed.now)
+    assert feed.calls.count("15m") == 1, feed.calls
+    feed.now = start + m.SpotWindowMarket.SHAPE_RETRY_SECONDS * 1000
+    await spot.read_vol(feed.now)
+    assert feed.calls.count("15m") == 2, feed.calls
+
+_asyncio.run(_shape_retry())
+
 print("AUDIT_MODELS_B_OK")

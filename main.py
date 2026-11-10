@@ -8615,8 +8615,8 @@ class IndexUpDownMarket(UpDownMarket):
     SIGMA_MINUTES = 240          # σ: the last four hours of 1-minute index candles, the last hour weighing about half (minute_vol)
     SIGMA_MODEL = 3              # the estimator's version, kept on each sample: the calibration counts samples of the current one alone
     #                              (3: the shape of the day, 1.121.0; 2: the weighted four hours, 1.106.0)
-    SHAPE_SECONDS = 3600         # the shape of the day (vol_shape) is read this often, and at once while there is none
-    SHAPE_RETRY_SECONDS = 300    # ...and this soon after a read failed
+    SHAPE_SECONDS = 3600         # the shape of the day (vol_shape) is read this often, and at once at first (shape_ms = 0)
+    SHAPE_RETRY_SECONDS = 300    # ...and this soon after a read failed or found no shape
     SHAPE_ROWS = 1500            # 15-minute candles read for it (the futures API's most: 15 days round the clock; a stock's sessions within SHAPE_DAYS)
     TIE = D("0.0005")            # an end this close to the start (relative) is left to Predict: Chainlink's report may differ
 
@@ -8841,7 +8841,11 @@ class IndexUpDownMarket(UpDownMarket):
         """σ from the 1-minute index candles: the session's minutes alone when the windows follow one (the index stands still
         outside it: a σ over the night or the lunch break would call the open near certain); enough candles to reach the
         previous session. 1.121.0: the level they show is put on the shape of the day (read_shape, minute_vol_shaped)."""
-        if self.shape is None or now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:
+        # 1.149.x (audit MOD-SHAPE-RETRY): the stamp alone decides. "self.shape is None or" used to re-read the 1,500 15-minute
+        # candles on every σ read (each minute near a window) while there was no shape — a new listing, or a session card
+        # after a long closure — bypassing SHAPE_RETRY_SECONDS. The first read is still at once (shape_ms starts at 0),
+        # read_shape stamps shape_ms for a retry in SHAPE_RETRY_SECONDS when it finds none, and carry() passes the stamp on.
+        if now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:
             await self.read_shape(now_ms)  # the usual volatility of the window's quarter hour, which the level below is put on
         rows, keep = await self.sigma_rows()
         self.sigma, self.shape_factor = minute_vol_shaped(rows, now_ms, self.SIGMA_MINUTES, keep, shape=self.shape,
@@ -9001,7 +9005,7 @@ class SpotWindowMarket(IndexUpDownMarket):
 
     async def read_vol(self, now_ms: int) -> None:
         """σ from the pair's 1-minute candles (minute_vol), put on the shape of the day (1.121.0: read_shape, minute_vol_shaped)."""
-        if self.shape is None or now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:
+        if now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:  # the stamp alone decides (IndexUpDownMarket.read_vol)
             await self.read_shape(now_ms)
         rows = await self.candles("1m", self.SIGMA_MINUTES + 2)
         self.sigma, self.shape_factor = minute_vol_shaped(rows, now_ms, self.SIGMA_MINUTES, shape=self.shape, at_ms=self.spec.start_ms + 60_000)
