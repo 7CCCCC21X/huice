@@ -15450,6 +15450,7 @@ class Bot:
         # the price streams (1.87.0): the crypto cards by the pair that prices them, the Binance venues, Hyperliquid
         self.pair_markets: dict[tuple[str, str], list] = {}  # (venue, pair) -> the cards priced from it (BinanceStream)
         self.index_markets: dict[str, list] = {}  # futures pair -> the 15-minute cards its index prices (markPrice field i)
+        self.pair_trades: dict[tuple[str, str], tuple] = {}  # (venue, pair) -> the last trade (time, price) pushed to its cards (price_pushed)
         for card in (*self.touches.values(), *self.updowns.values()):
             if isinstance(card, StockTouchMarket):
                 continue  # a US stock's touch market (1.146.0): Yahoo's prices, nothing on Binance
@@ -23114,11 +23115,21 @@ class Bot:
             except ValueError:
                 price = None
             if price is not None:
+                # audit MOD-HYPE-MARKPRICE: the row is merged per pair, so a markPriceUpdate frame (a SYMBOLS pair, a 15-minute
+                # card's index) re-sends it with the LAST aggTrade's price and time. push_price stamps that price "now" and
+                # defers the card's own 30-second REST read, so with aggTrade stalled and markPrice@1s still arriving the
+                # futures ladder (HYPE) was priced from a frozen trade that looked fresh forever. Only a trade not pushed yet
+                # (its time and price) prices the cards that take "now"; a spot window takes the trade's own time already.
+                trade = (row.get("time"), row.get("price"))
+                fresh = row.get("time") is None or self.pair_trades.get((venue, symbol)) != trade
+                self.pair_trades[(venue, symbol)] = trade
                 for card in cards:
                     if isinstance(card, SpotWindowMarket) and row.get("time") is not None:
                         card.push_index(price, int(row["time"]), now_ms)  # a 15-minute spot window: the trade's own time, as an index push
-                    else:
+                    elif fresh:
                         card.push_price(price, now_ms)
+                    else:
+                        continue  # the same trade again (a mark frame): nothing moved, the card's price ages and its REST read comes due
                     keys.append(card.spec.key)
         if keys:
             self.priced(keys)

@@ -245,4 +245,45 @@ assert _asked.count("allMids") >= 1, _asked
 _odds = _fm.odds(_now)
 assert isinstance(_odds, str) and "价格停在" in _odds, _odds  # REST down too: the frozen leg holds the odds after 5 min
 
+
+# --- MOD-HYPE-MARKPRICE: with HYPEUSDT in SYMBOLS, a markPriceUpdate frame re-sends the merged row (the LAST aggTrade's
+# price and time); it must not stamp the futures ladder's price "now" nor defer its 30-second REST read ---------------
+def _hype_markprice() -> None:
+    import json as _json, time as _time
+    now = [1_794_000_000_000]
+
+    class _FM:
+        def now_ms(self): return now[0]
+        async def prices(self): return {}
+        async def get(self, path, **params): return {}
+
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT,HYPEUSDT", "PROBABILITY": "off"})
+    bot = m.Bot(cfg, m.Store(":memory:"), _FM(), None)
+    bot.priced = lambda keys: None
+    rm = bot.ranges["HYPE-HIT-11"]
+    st = bot.binance_streams["futures"]
+    st.connected_at = _time.monotonic()
+
+    async def go():
+        await st.frame(None, _json.dumps({"e": "aggTrade", "s": "HYPEUSDT", "p": "45.000", "T": now[0]}))
+        assert rm.price == m.D("45.000") and rm.priced_ms == now[0], (rm.price, rm.priced_ms)
+        traded = now[0]
+        rm.times["price"] = -1e9  # as if PRICE_SECONDS had passed since the trade: the REST read is due
+        for _ in range(360):  # six minutes of mark prices while aggTrade is stalled (PRICE_STALE_MS is five)
+            now[0] += 1000
+            await st.frame(None, _json.dumps({"e": "markPriceUpdate", "s": "HYPEUSDT", "p": "47.000", "i": "47.010", "E": now[0]}))
+        assert rm.priced_ms == traded, now[0] - rm.priced_ms  # the frozen trade ages
+        assert rm.times["price"] == -1e9, rm.times["price"]  # the REST read is not deferred by the mark frames
+        assert _time.monotonic() - rm.times["price"] >= rm.PRICE_SECONDS
+        assert rm.price_stale(now[0])
+        now[0] += 500
+        await st.frame(None, _json.dumps({"e": "aggTrade", "s": "HYPEUSDT", "p": "47.100", "T": now[0]}))
+        assert rm.price == m.D("47.100") and rm.priced_ms == now[0] and rm.times["price"] > 0  # a new trade still pushes
+        await st.frame(None, _json.dumps({"e": "aggTrade", "s": "HYPEUSDT", "p": "47.200", "T": now[0]}))
+        assert rm.price == m.D("47.200")  # another trade in the same millisecond at another price still pushes
+
+    _asyncio.run(go())
+
+_hype_markprice()
+
 print("AUDIT_MODELS_B_OK")
