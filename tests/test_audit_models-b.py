@@ -70,4 +70,27 @@ assert len(bars) == 2 and bars[1][2] == _D("4021.50") and bars[1][1] == _D("4011
 bars = m.parse_yahoo_daily(yahoo_chart([4000, None, 4010]))
 assert len(bars) == 2 and bars[1] == (_dt.date(2026, 11, 10), _D("4010"), _D("4021.50")), bars
 
+# --- MOD-KOSPI-AFTER-CLOSE: 15:30-15:33 KST the KRX session still reads live (cards roll over at KRX_SETTLED), so
+# kospi_odds prices today's already-decided close 盘中 with the 1-minute floor; record_predictions must not save that as
+# a prediction (it would be scored by /calib and fed into the (KOSPI, 盘中) σ factor). Before the close it still saves --
+_kst = _dt.timezone(_dt.timedelta(hours=9))
+_at = lambda h, mi, s=0: int(_dt.datetime(2026, 11, 10, h, mi, s, tzinfo=_kst).timestamp() * 1000)  # a Tuesday
+_cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "SSE_INDEX": "off"})
+_bot = m.Bot(_cfg, m.Store(":memory:"), m.Binance(_cfg), None)
+_bot.sse_odds = _bot.hsi_odds = lambda now: None
+_now = _at(15, 31)
+_bot.kospi.quote = m.IndexQuote("KOSPI", _D("4105.20"), _D("4100.00"), None, None, None, _at(15, 30, 40), "Naver", fetched_ms=_now)
+_odds = _bot.kospi_odds(_now)
+assert isinstance(_odds, m.CloseOdds) and _odds.mode == "盘中" and _odds.target == _dt.date(2026, 11, 10), _odds  # the premise
+_bot.record_predictions(_now)
+assert [v for _, v in _bot.store.items("pred:KOSPI")] == [], list(_bot.store.items("pred:KOSPI"))
+assert "KOSPI" not in _bot.pred_last  # the skipped tick does not use up the half-hour slot
+_bot2 = m.Bot(_cfg, m.Store(":memory:"), m.Binance(_cfg), None)
+_bot2.sse_odds = _bot2.hsi_odds = lambda now: None
+_now = _at(15, 20)
+_bot2.kospi.quote = m.IndexQuote("KOSPI", _D("4105.20"), _D("4100.00"), None, None, None, _now - 5_000, "Naver", fetched_ms=_now)
+_bot2.record_predictions(_now)
+_rows = [v for _, v in _bot2.store.items("pred:KOSPI")]
+assert len(_rows) == 1 and _rows[0]["mode"] == "盘中" and _rows[0]["target"] == "2026-11-10", _rows
+
 print("AUDIT_MODELS_B_OK")

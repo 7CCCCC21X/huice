@@ -16839,6 +16839,13 @@ class Bot:
             raw = odds_of(now_ms)
             if not isinstance(raw, CloseOdds) or now_ms - self.pred_last.get(key, -PRED_EVERY_MS) < PRED_EVERY_MS:
                 continue
+            if now_ms >= self.target_close(title, raw.target)[0]:
+                # 1.149.x: past the target session's own close the outcome is decided, only not published yet — KRX
+                # 15:30-15:33 KST before the cards roll over at KRX_SETTLED (the auction's random end and Naver's delay),
+                # a stock card or 上证 until its close+15. Such a snapshot is no prediction: scored by /calib it would
+                # pull the (key, 盘中) σ factor (residual_factor) toward an R=1-minute "forecast" of a known close.
+                # Skipped before pred_last, so the half-hour slot is kept for the first snapshot on the next target.
+                continue
             self.pred_last[key] = now_ms
             prev = self.pred_prev.get(key)  # where the price had been going: the effective price against the snapshot before (1.120.2)
             trend = (math.log(float(raw.effective) / prev[3]) if prev and prev[1] == raw.target.isoformat() and prev[2] == raw.mode
