@@ -14512,17 +14512,29 @@ class WebServer:
                 return last[:64]
         return peer_ip or "-"
 
+    def account_private(self) -> bool:
+        """A real account is behind the data: a real-trading key is configured, or the records hold real orders (a
+        database kept after the key was removed). Its account, orders, positions and trade records are then shown only
+        with the control key."""
+        return bool(getattr(self.bot.config, "live_key", "")) or self.bot.sim_has_real()
+
     def journal_locked(self) -> bool:
         """The review data (every trade with its fills, costs and real order records) needs the control key once a
         real-trading key is configured, or the records hold real orders (a database kept after the key was removed):
-        the page token alone shows the odds, never an account's activity."""
-        return bool(self.bot.config.web_control_key) and (bool(getattr(self.bot.config, "live_key", "")) or self.bot.sim_has_real())
+        the page token alone shows the odds, never an account's activity. 1.150.0: this holds with WEB_CONTROL_KEY unset
+        too (the data is then refused, see key_check), where before the lock was off and anyone with the page link read
+        the account's whole trade history."""
+        return self.account_private()
 
     def key_check(self, head: str, client: str) -> tuple[int, str] | None:
         """None when X-Control-Key carries the configured key; else (status, message), the failure counted."""
         configured = self.bot.config.web_control_key
         if not configured:
-            return None
+            # 1.150.0: no key to check. A paper bot's view-only console stays open; a real account's data fails closed
+            # (no failure counted: nobody guessed wrong, there is nothing to guess), since the page token alone must
+            # never show an account, its orders or its trades.
+            return None if not self.account_private() else (
+                403, "未设置 WEB_CONTROL_KEY：实盘账户的数据（账户、订单、持仓、交易记录）不对外显示，请在环境变量设置 WEB_CONTROL_KEY（12～64 个字符）后重启")
         now = time.monotonic()
         if now < self.control_global_lock_until:
             return 429, f"口令错误次数过多（全站），{int(self.control_global_lock_until - now) + 1} 秒后再试"
@@ -14565,8 +14577,8 @@ class WebServer:
                                           json.dumps({"ok": False, "locked": True, "message": message}, ensure_ascii=False).encode("utf-8"))
         full = lambda: (200, "application/json; charset=utf-8", self.cached(
             "control.json", lambda: json.dumps(self.bot.control_payload(), ensure_ascii=False, default=str).encode("utf-8")))
-        if not self.bot.config.web_control_key:
-            return full()  # no key configured: the page is view-only and says so
+        if not self.bot.config.web_control_key and not self.account_private():
+            return full()  # no key configured and no real account behind it: the page is view-only and says so
         if failed := self.key_check(head, client):
             return answer(*failed)
         return full()
@@ -23485,6 +23497,8 @@ class Bot:
         LOG.info("secrets configured: telegram_token=%s predict_api_key=%s predict_private_key=%s predict_account=%s web_control_key=%s live=%s",
                  bool(self.config.token), bool(self.config.predict_api_key), bool(self.config.live_key), bool(self.config.live_account),
                  bool(self.config.web_control_key), self.config.live)
+        if self.config.live_key and not self.config.web_control_key:
+            LOG.warning("PREDICT_PRIVATE_KEY 已配置但 WEB_CONTROL_KEY 未设置：控制台和复盘数据（账户、订单、交易记录）锁定，设置 WEB_CONTROL_KEY 后才显示")
         await self.register_menu()
         if not self.config.admin_id:
             LOG.warning("ADMIN_USER_ID 尚未配置：只能使用 /id；没有任何自动订阅")
