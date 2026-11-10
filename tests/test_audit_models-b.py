@@ -492,4 +492,15 @@ def _prewindow():
 
 _prewindow()
 
+
+# --- MOD-PRICE-LEVEL-20XX: a level from 2000 to 2099 written without a thousands separator right after an arrow or $
+# is the price, not a year; years elsewhere are still not read as levels ---------------------------------------------
+from decimal import Decimal as _D
+for _title, _want in [("↑ 2050", "2050"), ("↓ 2000", "2000"), ("↑ $2050", "2050"), ("↑ 2099", "2099"),
+                      ("Will Ethereum reach $2050 in November 2026?", "2050"), ("↓ 2050 November 2026", "2050"),
+                      ("Will BTC reach $150k in 2026?", "150000"), ("October 2026 ↑ 130k", "130000"),
+                      ("↑ 130k before 2027", "130000"), ("↑ 2,050", "2050"), ("↑ 130,000", "130000")]:
+    assert m.price_level(_title) == _D(_want), (_title, m.price_level(_title))
+assert m.price_level("October 2026") is None and m.price_level("Yes") is None
+
 print("AUDIT_MODELS_B_OK")

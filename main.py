@@ -10054,7 +10054,11 @@ def price_level(title: str) -> D | None:
     """The price a ladder market's title names: '↑ 130,000' / '$4.5K' / '↓ $100k' / 'Will Solana reach $250?' -> the
     number; a year next to a month name is not a price. None when there is none."""
     text = re.sub(r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?:\d{1,2},?\s+)?20\d\d\b", " ", str(title))
-    text = re.sub(r"\b20\d\d\b(?![,.]?\d)", " ", text) if re.search(r"[$↑↓▲▼]|\d\s*[kK]\b", text) else text
+    # audit MOD-PRICE-LEVEL-20XX: '↑ 2050' / '↓ 2000' / '$2050' is a level, not a year: a 20xx right after an
+    # arrow or $ (with at most one space between) is the price and is kept; a bare year elsewhere ('in 2026', 'before
+    # 2027') is still removed. Removing it too made such a level vanish from the ladder without a word (no row, no trade).
+    # Python lookbehinds are fixed-width, hence one for "marker+digits" and one for "marker, space, digits".
+    text = re.sub(r"(?<![$↑↓▲▼])(?<![$↑↓▲▼]\s)\b20\d\d\b(?![,.]?\d)", " ", text) if re.search(r"[$↑↓▲▼]|\d\s*[kK]\b", text) else text
     found = [(m.group(1), m.group(2), m.start()) for m in re.finditer(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*([kKmM]?)(?![\w.])", text)]
     if not found:
         return None
