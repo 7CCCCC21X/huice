@@ -14268,7 +14268,9 @@ function renderLive(L,liveOn){const box=$("livelines");box.replaceChildren();
   (L.info||[]).forEach(r=>box.append(...kvRow(r.k,r.v,r.tone)));
   box.append(...kvRow("策略",data.scope.join("；"),""));
   box.append(...kvRow("占用","持仓+挂单 $"+L.exposure.toFixed(2)+"，上限 $"+L.caps.open,L.exposure>=L.caps.open*0.9?"warn":""));
-  box.append(...kvRow("今日","已结算盈亏 "+money(L.daily_pnl)+(L.caps.daily_loss?"，亏损上限 $"+L.caps.daily_loss:"，亏损不设上限"),L.daily_pnl<0?"bad":""));
+  // the day's stop counts the pre-open mode's P&L with the model trader's (1.125.0): show that sum, and the split when non-zero
+  const dayPnl=L.day_pnl??L.daily_pnl;
+  box.append(...kvRow("今日","已结算盈亏 "+money(dayPnl)+(L.preopen_pnl?"（原策略 "+money(L.daily_pnl)+" + 预挂 "+money(L.preopen_pnl)+"）":"")+(L.caps.daily_loss?"，亏损上限 $"+L.caps.daily_loss:"，亏损不设上限"),dayPnl<0?"bad":""));
   box.append(...kvRow("订单","挂单中 "+L.resting+"，未确认 "+L.unconfirmed+"，今日下单 "+L.placed_today+"，失败 "+L.failed_today,L.unconfirmed?"warn":""));
   if(L.synced_at)box.append(...kvRow("订单同步",L.synced_at,""));
   if(L.unknown_open&&L.unknown_open.length)box.append(...kvRow("注意","账户上有 "+L.unknown_open.length+" 张本机器人没有记录的挂单（#"+L.unknown_open.map(u=>u.id).join("、#")+"）：不计入这里的额度；“撤掉账户全部挂单”可一起撤","warn"))}
@@ -14284,7 +14286,7 @@ function renderBar(){const L=data.live,b=$("bar");b.replaceChildren();const live
   const mode=L?(L.mode==="off"?"LIVE=off 只记账":L.mode==="pause"?"LIVE=pause 不开仓":L.paused?"已暂停":L.killed?"今日停开新仓":L.ready?(L.gate?"LIVE=on 新单受限":"LIVE=on 运行中"):"LIVE=on 未就绪"):"纸面模拟";
   b.append(el("span","state "+(L?(L.mode==="off"?"":L.mode==="pause"||L.paused||L.killed||(L.ready&&L.gate)?"warn":L.ready?"on":"off"):""),mode));
   b.append(chip("持仓",data.sim.open),chip("挂单中",data.sim.resting),chip("已结算",data.sim.settled+" 笔 "+money(data.sim.pnl)));
-  if(liveOn)b.append(chip("持仓+挂单","$"+L.exposure.toFixed(2)+" / $"+L.caps.open),chip("今日",money(L.daily_pnl)),chip("未确认",L.unconfirmed),chip("对账",L.sync_age_s!=null?L.sync_age_s+" 秒前":"—"));
+  if(liveOn)b.append(chip("持仓+挂单","$"+L.exposure.toFixed(2)+" / $"+L.caps.open),chip("今日",money(L.day_pnl??L.daily_pnl)),chip("未确认",L.unconfirmed),chip("对账",L.sync_age_s!=null?L.sync_age_s+" 秒前":"—"));
   b.append(chip("刷新于",new Date().toTimeString().slice(0,8)))}
 // the quick switches: the few settings that are turned on and off most, one tap each, their value from the cards below
 const QUICK_DEFAULT={SIM_TAKER_AFTER_HOURS_CENTS:"15",SIM_MAKER_AFTER_HOURS_CENTS:"10",SIM_MAKER_DEEP_CENTS:"25",SIM_QUIET_MINUTES:"15"};

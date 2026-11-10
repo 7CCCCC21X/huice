@@ -399,4 +399,29 @@ async def live_unknown_open_block():
 
 
 asyncio.run(live_unknown_open_block())
+async def live_pnl_display():
+    """LIVE-PNL-DISPLAY: /live's 今日已结算盈亏 and the page's 今日 (live_status day_pnl) show the sum the day's stop compares
+    against LIVE_MAX_DAILY_LOSS_USD (the model trader's day plus the pre-open mode's, 1.125.0), not only the model trader's part;
+    and the pre-open status in /live is escaped once (by Bot.tell's to_html), not twice."""
+    import types
+    bot = make_bot()
+    await bot.live_prepare()
+    bot.live_daily_pnl = lambda trades, now_ms: -15.0
+    bot.preopen = types.SimpleNamespace(alive=True, risk=lambda: 0.0, daily_pnl=lambda: -40.0, status=lambda: "预挂 最近问题：HTTP 400 a & <b>",
+                                        filled_by_outcome=lambda days=3: {}, ledger=types.SimpleNamespace(rows={}))
+    text = bot.live_text(NOW)
+    assert "今日已结算盈亏 −$55.00（原策略 −$15.00 + 预挂 −$40.00）（上限 −$50）" in text, [l for l in text.split("\n") if "今日已结算盈亏" in l]
+    st = bot.live_status(NOW)
+    assert st["day_pnl"] == -55.0 and st["daily_pnl"] == -15.0 and st["preopen_pnl"] == -40.0, (st["day_pnl"], st["daily_pnl"], st["preopen_pnl"])
+    assert "HTTP 400 a & <b>" in text, [l for l in text.split("\n") if "HTTP 400" in l]
+    out = m.to_html(text)  # what Bot.tell sends for the Reply(html=True)
+    assert "HTTP 400 a &amp; &lt;b&gt;" in out and "&amp;amp;" not in out and "&amp;lt;" not in out, [l for l in out.split("\n") if "HTTP 400" in l]
+    # a pre-open mode that is not running (crashed: alive False) does not count: the line keeps its old shape, no split
+    bot.preopen.alive = False
+    text = bot.live_text(NOW)
+    assert "今日已结算盈亏 −$15.00（上限 −$50）" in text and "原策略" not in text, [l for l in text.split("\n") if "今日已结算盈亏" in l]
+    assert bot.live_status(NOW)["day_pnl"] == -15.0
+
+
+asyncio.run(live_pnl_display())
 print("AUDIT_LIVE_B_OK")

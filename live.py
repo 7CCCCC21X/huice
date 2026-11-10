@@ -4083,7 +4083,10 @@ class LiveBot(core.Bot):
         positions, at = self.live_positions
         return {"ready": self.live.ready, "ready_error": self.live.not_ready_why, "mode": c.live_mode, "paused": self.live_paused(), "killed": self.live_killed(),
                 "lines": self.live.summary_lines(), "info": self.live.summary_info(), "account": short_addr(self.live.wallet.maker),
-                "exposure": self.live_exposure(trades), "daily_pnl": self.live_daily_pnl(trades, now_ms),
+                "exposure": self.live_exposure(trades), "daily_pnl": (own_pnl := self.live_daily_pnl(trades, now_ms)),
+                # the stop (live_check_kill / live_send_block) compares the model trader's day PLUS the pre-open mode's against
+                # LIVE_MAX_DAILY_LOSS_USD (1.125.0): the page shows that same sum (day_pnl), daily_pnl stays the model trader's own
+                "preopen_pnl": (pre_pnl := self.preopen_pnl()), "day_pnl": own_pnl + pre_pnl,
                 "caps": {"order": c.live_max_order_usd, "open": c.live_max_open_usd, "daily_loss": c.live_max_daily_loss_usd},
                 "resting": sum(t["status"] == "resting" for _, t in live),
                 "unconfirmed": sum(t["live"].get("state") in {"pending", "placing", "cancelling", "unknown"} for _, t in live),
@@ -4465,8 +4468,13 @@ class LiveBot(core.Bot):
         since = int(today.timestamp() * 1000)
         placed_today = sum(int(t["opened"]) >= since for t in live)
         failed_today = sum(int(t["opened"]) >= since and (t["live"].get("final") == "failed") for t in live)
-        lines.append(f"持仓+挂单 ${exposure:,.2f} / ${self.config.live_max_open_usd:g}｜今日已结算盈亏 {money(self.live_daily_pnl(trades, now_ms))}"
-                     f"（上限 −${self.config.live_max_daily_loss_usd:g}）｜挂单中 {resting}｜今日下单 {placed_today}｜失败 {failed_today}")
+        # the stop (live_check_kill / live_send_block) compares the model trader's day plus the pre-open mode's against
+        # LIVE_MAX_DAILY_LOSS_USD (1.125.0), so the line shows the same number (and the split when the pre-open part is non-zero):
+        # showing only the model trader's part read e.g. −$15 of a −$50 cap while the stop had tripped at a combined −$55
+        own, pre = self.live_daily_pnl(trades, now_ms), self.preopen_pnl()
+        lines.append(f"持仓+挂单 ${exposure:,.2f} / ${self.config.live_max_open_usd:g}｜今日已结算盈亏 {money(own + pre)}"
+                     + (f"（原策略 {money(own)} + 预挂 {money(pre)}）" if pre else "")
+                     + f"（上限 −${self.config.live_max_daily_loss_usd:g}）｜挂单中 {resting}｜今日下单 {placed_today}｜失败 {failed_today}")
         lines.append(self.live_redeem_status_line())
         stats = core.sim_stats(live)
         if stats["settled"]:
@@ -4486,7 +4494,9 @@ class LiveBot(core.Bot):
             lines.append("\n最近挂单测试：" + str(last).split("\n")[0].removeprefix("🧪 挂单测试 ") + "…（/live test 重跑）")
         lines.append("\n/live mode off|pause|on｜pause｜resume｜cancel all｜redeem｜redeem check｜check｜orders｜positions｜test [市场] [份数] [价格¢]")
         if getattr(self, "preopen", None) is not None:
-            lines.append("\n" + core.html.escape(self.preopen.status()) + "\n/preopen 查看预挂；紧急停止会撤销本模式订单")
+            # no html.escape here: the /live reply is sent with Bot.tell's to_html, which escapes the whole text once; escaping the
+            # status too showed "&amp;lt;" etc. for any &, < or > in it (e.g. a remote error in "最近问题：")
+            lines.append("\n" + self.preopen.status() + "\n/preopen 查看预挂；紧急停止会撤销本模式订单")
         return "\n".join(lines)
 
     def sim_text(self) -> str:
