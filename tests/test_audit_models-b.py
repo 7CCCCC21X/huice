@@ -503,4 +503,47 @@ for _title, _want in [("↑ 2050", "2050"), ("↓ 2000", "2000"), ("↑ $2050", 
     assert m.price_level(_title) == _D(_want), (_title, m.price_level(_title))
 assert m.price_level("October 2026") is None and m.price_level("Yes") is None
 
+
+# --- MOD-STOCKRANGE-CHOOSE: once a stock ladder's card moves to a later deadline's market (choose / learn move its
+# window), a trade on the earlier market is not judged on the new market's window and extremes -------------------------
+def _stock_range_switch():
+    import retired, types, datetime as dt, time as t
+    saved = m.STOCK_HIT_MARKETS
+    m.STOCK_HIT_MARKETS = retired.STOCK_HIT_MARKETS
+    try:
+        strc, = m.STOCK_HIT_MARKETS
+        utc = lambda *a: int(dt.datetime(*a, tzinfo=dt.timezone.utc).timestamp() * 1000)
+        rm = m.StockRangeMarket(m.Store(":memory:"), strc)
+        old = m.LadderRow(m.D("100"), "41", "STRC hits $100 by September 30?", None, "", "Will STRC hit $100 by September 30?")
+        new = m.LadderRow(m.D("100"), "77", "STRC hits $100 by December 31?", None, "", "Will STRC hit $100 by December 31?")
+        meta = {"41": ({"created_ms": utc(2026, 6, 18, 0, 16), "question": old.question, "rules": ""}, t.monotonic()),
+                "77": ({"created_ms": utc(2026, 9, 1, 14, 0), "question": new.question, "rules": ""}, t.monotonic())}
+        rm.learn(rm.choose([old], meta), meta)
+        old_end = rm.end_ms
+        assert m.et_date(old_end) == dt.date(2026, 9, 30), m.et_date(old_end)
+        picked = rm.choose([old, new], meta)
+        assert [r.market_id for r in picked] == ["77"], picked
+        rm.learn(picked, meta)
+        assert m.et_date(rm.end_ms) == dt.date(2026, 12, 31) and rm.end_ms != old_end
+        bars, d = [], dt.date(2026, 9, 1)
+        while d <= dt.date(2026, 10, 9):  # $100 is touched on 10-05, after the September market's deadline
+            if m.us_session(d):
+                bars.append((m.us_session(d)[0], 99.0, 100.4 if d == dt.date(2026, 10, 5) else 99.6, 98.0, 99.5))
+            d += dt.timedelta(days=1)
+        now = utc(2026, 10, 9, 18, 0)
+        rm.scan_days(bars, now)
+        fake = types.SimpleNamespace(ranges={strc.key: rm}, SIM_SETTLE_MS=m.Bot.SIM_SETTLE_MS,
+                                     predict=types.SimpleNamespace(ladders={strc.key: picked}, yes_book=lambda row: (None, None)))
+        trade = lambda mid, end: {"kind": "range", "key": strc.key, "market": f"{strc.slug}#{mid}",
+                                  "settle": {"target": "100", "dir": "up", "end": end}}
+        assert m.Bot.sim_result(fake, trade("41", old_end), now) is None  # the old market: Predict settles it
+        res = m.Bot.sim_result(fake, trade("77", rm.end_ms), now)  # the card's current market: still a touch
+        assert res is not None and res[0] == 1.0, res
+        legacy = {"kind": "range", "key": strc.key, "market": f"{strc.slug}#77", "settle": {"target": "100", "dir": "up"}}
+        assert m.Bot.sim_result(fake, legacy, now)[0] == 1.0  # a record without "end" keeps the previous behaviour
+    finally:
+        m.STOCK_HIT_MARKETS = saved
+
+_stock_range_switch()
+
 print("AUDIT_MODELS_B_OK")

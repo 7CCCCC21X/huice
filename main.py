@@ -19627,6 +19627,15 @@ class Bot:
             rm = self.ranges.get(trade["key"])
             if rm is None:
                 return None
+            end = int(s.get("end") or 0)
+            if end and end != rm.end_ms:
+                # MOD-STOCKRANGE-CHOOSE: there is one range object per spec key, and the card can move to another
+                # deadline's market (StockRangeMarket.choose / learn moves its start and end; a changed LADDER_DEADLINES
+                # pin does the same). rm's window and extremes then belong to the new market, not to this trade's: a
+                # touch after this trade's own deadline would read as a Yes. The trade's end was kept in its settle dict,
+                # so when it no longer matches, the bot's own data cannot decide it and Predict's own result settles it.
+                # Records without "end" (older versions) keep the previous behaviour.
+                return None
             level, direction = D(str(s["target"])), s.get("dir", "up")
             marks = rm.marks()
             high, low = marks["high"], marks["low"]
