@@ -17508,10 +17508,16 @@ class Bot:
         tick = price_tick(ticker.market, strike) if ticker and "｜" in title else D("0.01")
         # A proxy-mapped estimate is "our close × proxy move": move it onto the settlement close too.
         effective = odds.effective if odds.direct else odds.effective * strike / odds.ref
+        # 1.150.0: the whole day's σ goes along (sigma_day). Left out, close_odds stored sigma_daily in its place — in session
+        # only the open-to-close part, after hours the σ with SIGMA_CALIB's 盘后 factor — and SIM_AGAINST_MOVE_SIGMAS, a count
+        # of whole-day σ (sim_against_move), measured the day's move against that whenever Predict's figure was known: early
+        # where that σ is the smaller one (a stock card in session: at 0.7–0.8 of the configured count), late where it is the
+        # larger (a 盘中 factor of 1.5, a 盘后 one of 1.4: a buy let into the move the rule was set to refuse, a resting bid
+        # kept). The widen goes as it is, so the prices are what they were (no big-move pass here: the σ note is not doubled)
         return dataclasses.replace(
             close_odds(odds.name, strike, effective, odds.sigma_daily, odds.remaining, odds.target, tick,
                        f"Predict 目标价（本地参考 {fmt(odds.ref)}·{odds.ref_note}）", odds.proxy_note, odds.sigma_note,
-                       odds.unit, odds.beta, odds.mode, widen=odds.widen), warn=odds.warn)
+                       odds.unit, odds.beta, odds.mode, sigma_day=odds.sigma_day, widen=odds.widen), warn=odds.warn)
 
     def odds_payload(self) -> dict:
         """JSON for the web page: one entry per item, numbers raw, text already plain."""

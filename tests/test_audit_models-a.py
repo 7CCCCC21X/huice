@@ -1,5 +1,5 @@
 """Audit regression tests for the models-a cluster."""
-import sys, math, datetime as dt
+import sys, math, time, types, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -151,5 +151,98 @@ for i in range(8):
     bot.note_outcome("KOSPI", target, close, "test")
     factors.append(bot.vols.calib[("KOSPI", "盘后")][0])
 assert all(abs(f - 1.0) < 1e-9 for f in factors), factors
+
+
+# --- MOD-STRIKE-SIGMA-DAY: settle_on_strike re-prices a card against Predict's own target price and rebuilt it without the
+# whole day's σ, so close_odds kept sigma_daily — in session the open-to-close part, after hours (1.150.0) the σ with the
+# 盘后 factor — as CloseOdds.sigma_day, the σ SIM_AGAINST_MOVE_SIGMAS counts the day's move in. With Predict's figure known
+# the rule fired early (σ ahead below the day's) or late (a 盘中 / 盘后 factor above 1: a buy let into the move it was set
+# to refuse, a resting bid kept). Now a known strike changes neither that σ nor the verdict. Real card builders → odds_items
+# → settle_on_strike → sim_markets → sim_against_move / sim_withdraw_reason ----
+GUARD = {"SIM_AGAINST_MOVE_SIGMAS": "1.5", "SIM_AGAINST_MOVE_INDEX": "on", "SIM_WAYS": "both"}  # both: resting bids stand
+SKH = "SKHYNIXUSDT"
+
+
+def _kospi_live(calib: dict, sigmas: float) -> tuple[m.Bot, int, str]:
+    """In session: the live KOSPI ``sigmas`` raw day σ below the previous close."""
+    now = _kr(11, 10, 10, 30)
+    bot = _bot(now, calib, **GUARD)
+    prev = D("4000")
+    last = (prev * D(str(math.exp(-sigmas * _raw_day("KOSPI"))))).quantize(D("0.01"))
+    bot.kospi.quote = m.IndexQuote("KOSPI", last, prev, None, None, None, now - 5000, "Naver", fetched_ms=now - 5000)
+    return bot, now, "KOSPI"
+
+
+def _kospi_after(calib: dict, sigmas: float) -> tuple[m.Bot, int, str]:
+    """After hours: HL KR200 ``sigmas`` raw day σ below its 15:30 anchor (β 1)."""
+    bot = _bot(AH_NOW, calib, HSI_FUTURES="off", SSE_INDEX="off", **GUARD)
+    _after_hours(bot, -sigmas * _raw_day("KOSPI"))
+    return bot, AH_NOW, "KOSPI"
+
+
+def _skhynix_live(calib: dict, sigmas: float) -> tuple[m.Bot, int, str]:
+    """In session: SK hynix's own print ``sigmas`` day σ below the previous close (a stock card: the rule needs no
+    SIM_AGAINST_MOVE_INDEX)."""
+    now = _kr(11, 10, 10, 30)
+    bot = _bot(now, calib, SIM_AGAINST_MOVE_SIGMAS="1.5", SIM_WAYS="both")
+    bot.vols.estimates[SKH], bot.vols.bodies[SKH] = (0.03, 40, "test"), (0.02, 40)
+    prev = D("1000000")
+    last = (prev * D(str(math.exp(-sigmas * bot.vols.get(SKH, "kr")[0])))).quantize(D("1000"))
+    bot.stocks.closes[SKH] = m.StockMarket.baseline(m.StockTicker("kr", "000660"), m.STOCK_MARKETS["kr"], "Naver", dt.date(2026, 11, 9), prev)
+    bot.stocks.live[SKH] = m.IndexQuote("SK하이닉스", last, prev, None, None, None, now - 5000, "Naver", fetched_ms=now - 5000)
+    bot.snapshots[SKH] = {"quote": types.SimpleNamespace(price=D("700"), timestamp_ms=now)}
+    return bot, now, SKH
+
+
+def _seen(bot: m.Bot, now: int, key: str) -> tuple[m.CloseOdds, m.SimMarket]:
+    """The card's odds as shown and its SimMarket, through the real odds_items → settle_on_strike → sim_markets."""
+    shown = next(odds for title, odds in bot.odds_items(now) if bot.predict_key(title) == key)
+    assert isinstance(shown, m.CloseOdds), shown
+    return shown, next(mk for mk in bot.sim_markets(now) if mk.key == key)
+
+
+CASES = [  # (card, SIGMA_CALIB factors, the move in raw day σ, Predict's target price off our reference,
+    #          the card's sigma_daily / its day σ, 1.5 day σ reached); the comments: what the strike did before the fix
+    (_skhynix_live, {}, 1.3, D("-1000"), 0.69, False),  # in session: blocked at 1.27 day σ, said "1.8 个日 σ"
+    (_kospi_live, {}, 1.3, D("0.5"), 0.76, False),      # blocked at 1.3, "1.7 个日 σ"
+    (_kospi_live, {("KOSPI", "盘中"): (1.5, 21), ("KOSPI", "盘后"): (1.0, 21)}, 1.6, D("0.5"), 1.14, True),  # let through
+    (_kospi_after, {("KOSPI", "盘后"): (1.4, 20)}, 1.6, D("0.5"), 1.40, True),  # the 1.150.0 card's raw day σ: let through
+    (_kospi_after, {("KOSPI", "盘后"): (0.7, 20)}, 1.3, D("0.5"), 0.70, False),  # blocked, "1.9 个日 σ"
+    (_kospi_after, {}, 1.3, D("0.5"), 1.00, False),  # no factor after hours: one σ either way, as before
+]
+for build, calib, sigmas, off, ratio, reached in CASES:
+    label = (build.__name__, calib, sigmas)
+    bot, now, key = build(calib, sigmas)
+    card = bot.kospi_odds(now) if key == "KOSPI" else bot.contract_odds(SKH, D("700"), now, now)
+    assert isinstance(card, m.CloseOdds) and card.direct == (build is not _kospi_after), (label, card)
+    day = bot.vols.get(key, "KOSPI" if key == "KOSPI" else "kr", calibrated=False)[0]
+    assert card.sigma_day == day and abs(card.sigma_daily / day - ratio) < 0.005, (label, card.sigma_daily, day)
+    slug = m.predict_slug(bot.config.predict_slugs[key], card.target)
+    bot.predict.books[key] = m.PredictBook(key, slug, "1", "t", ((D("0.10"), D("50")),), ((D("0.12"), D("50")),), now)
+    unsettled, plain = _seen(bot, now, key)  # Predict's figure not known yet: the card as built
+    assert unsettled == card and plain.sigma_day == day, (label, unsettled, plain.sigma_day)
+    bot.predict.strikes[slug] = (card.ref + off, time.monotonic())
+    shown, mk = _seen(bot, now, key)
+    assert shown.ref == card.ref + off and "Predict 目标价" in shown.ref_note, (label, shown.ref)
+    # the whole day's σ goes along to the shown odds and their SimMarket (before: shown.sigma_day == card.sigma_daily)
+    assert shown.sigma_day == card.sigma_day == mk.sigma_day == plain.sigma_day, (label, shown.sigma_day, mk.sigma_day, card.sigma_day)
+    # ...and nothing else moves: the σ ahead, the widen and its note as the card's, the prices those of the strike alone
+    assert shown.sigma == card.sigma and shown.widen == card.widen and shown.sigma_note == card.sigma_note, label
+    assert m.dataclasses.replace(shown, sigma_day=0.0) == m.dataclasses.replace(m.close_odds(
+        shown.name, shown.ref, shown.effective, shown.sigma_daily, shown.remaining, shown.target, shown.tick, shown.ref_note,
+        shown.proxy_note, shown.sigma_note, shown.unit, shown.beta, shown.mode, widen=shown.widen), warn=shown.warn, sigma_day=0.0), label
+    # the rule's verdict and a resting 涨 bid's fate are the same with and without Predict's figure
+    verdict, before = bot.sim_against_move(mk, "up"), bot.sim_against_move(plain, "up")
+    assert bool(verdict) == bool(before) == reached, (label, verdict, before)
+    assert bot.sim_against_move(mk, "down") == "", label  # a fall never blocks the side it favours
+    bid = {"kind": "close", "key": key, "side": "up", "maker": True, "status": "resting", "order": 50, "shares": 0}
+    assert bot.sim_withdraw_reason(bid, mk, now) == bot.sim_withdraw_reason(bid, plain, now) == verdict, (label, bot.sim_withdraw_reason(bid, mk, now))
+    if reached:
+        assert verdict.startswith(f"今日已跌 {abs(mk.move) * 100:.1f}%、{abs(mk.move) / day:.1f} 个日 σ") and abs(mk.move) / day >= 1.5, (label, verdict)
+# odds without a day σ of their own (sigma_day 0, the CloseOdds default) still fall back to their sigma_daily
+bot, now, key = _kospi_after({("KOSPI", "盘后"): (1.4, 20)}, 0.5)
+bare = m.dataclasses.replace(bot.kospi_odds(now), sigma_day=0.0)
+bot.predict.strikes[m.predict_slug(bot.config.predict_slugs["KOSPI"], bare.target)] = (bare.ref + D("0.5"), time.monotonic())
+assert bot.settle_on_strike("KOSPI", bare).sigma_day == bare.sigma_daily != _raw_day("KOSPI")
 
 print("AUDIT_MODELS_A_OK")
