@@ -121,4 +121,108 @@ async def _zhipu_halt_is_held():
 
 asyncio.run(_zhipu_halt_is_held())
 
+# PRE-PNL-DROP: live_check_kill and live_send_block add preopen_pnl() — the pre-open mode's accounted day — to the model
+# trader's day against LIVE_MAX_DAILY_LOSS_USD, but it was 0.0 whenever the mode was not running: a crash (the dead
+# controller stays attached until the next apply), /preopen off (wound down, then cleared) or a restart with the mode off
+# took the day's realised pre-open loss out of the stop and gave the model trader its whole cap back. Now a stopped mode's
+# loss of the day still counts (its controller's records, else the ledger file, read once a day while no controller holds
+# it); its gain still counts 0 then, and the running mode counts net as before.
+import copy
+import live as _L
+
+_PROBE = {"live": {"want": {"shares": 10}, "events": [{"at": 0}]}, "maker": True, "price": 0.5, "order": 10}
+
+
+def _pnl_config(db, on=True, **env):
+    return _m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "STATE_DB": ":memory:", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64,
+                               "LIVE_MAX_DAILY_LOSS_USD": "100", "PREOPEN_DB": db, "PREOPEN_15M": "on" if on else "off", **env})
+
+
+def _pnl_bot(clock, db, on, stopping):
+    bot = _L.LiveBot.__new__(_L.LiveBot)
+    bot.config, bot.store, bot.stopping = _pnl_config(db, on), _m.Store(":memory:"), stopping
+    bot.market = types.SimpleNamespace(now_ms=lambda: clock.ms)
+    bot.live_notify, bot.live_note_error = (lambda text, key="": None), (lambda text: None)
+    bot.live = types.SimpleNamespace(ready=False, not_ready_why="past the loss check", usd=lambda: None)
+    bot.preopen, bot.preopen_task, bot.preopen_lock, bot.preopen_factory = None, None, asyncio.Lock(), None
+    return bot
+
+
+def _stop_hits(bot, clock, model_loss=60.0):
+    """(the send-time recheck refuses, the kill switch trips) with the model trader's settled day at −model_loss."""
+    trades = {"m1": {"live": {"state": "done"}, "status": "settled", "settled": clock.ms - 1000, "payout": 0.0, "price": 0.5,
+                     "shares": model_loss / 0.5}}
+    bot.store.delete_keys(["live:killed"])
+    refused = "已达 LIVE_MAX_DAILY_LOSS_USD $100" in bot.live_send_block(_PROBE, trades, clock.ms)
+    bot.live_check_kill(trades, clock.ms)
+    tripped = bool(bot.live_kill_record())
+    bot.store.delete_keys(["live:killed"])
+    return refused, tripped
+
+
+async def _pnl_drop(folder):
+    db = str(Path(folder) / "p.preopen.sqlite3")
+    # a real loss of the day, booked by the controller in its ledger file: Up filled in full, withdrawn, Down won (−$49);
+    # and a bigger loss booked yesterday, which today's stop must not count
+    ctl, api, clock = _T.controller(PREOPEN_DB=db, PREOPEN_SHARES="100", LIVE_MAX_DAILY_LOSS_USD="100")
+    c = _p.candidate(_T.market(), _T.NOW, ctl.owner.config, ctl.settings)
+    await ctl.place_pair(c)
+    pair = ctl.ledger.rows[c["slug"]]
+    up = api.rows[pair["orders"]["up"]["hash"]]
+    up["amountFilled"] = up["amount"]
+    await ctl.cancel_many([pair], "cancel")
+    await asyncio.gather(*list(ctl.settling.values()), return_exceptions=True)
+    clock.ms = c["start_ms"] + 20 * 60_000  # 10:20 Beijing, the same day
+    api.markets["123"]["outcomes"][0]["status"] = "WON"
+    await ctl.settle_pair(pair)
+    assert pair["accounted_day"] == "2026-11-06" and abs(pair["pnl"] + 49) < 1e-9, (pair.get("accounted_day"), pair.get("pnl"))
+    ctl.ledger.save({**copy.deepcopy(pair), "slug": pair["slug"] + "-yesterday", "accounted_day": "2026-11-05", "pnl": -500.0})
+    # running (started by the bot itself): its day counts, as before — −60 + −49 is past the $100 stop, −40 + −49 is not
+    bot = _pnl_bot(clock, db, True, ctl.owner.stopping)
+    bot.preopen_factory = lambda owner: ctl
+    await bot.preopen_apply()
+    await asyncio.sleep(0.2)
+    assert bot.preopen is ctl and bot.preopen_active() and abs(bot.preopen_pnl() + 49) < 1e-9, bot.preopen_pnl()
+    assert _stop_hits(bot, clock) == (True, True) and _stop_hits(bot, clock, 40.0) == (False, False)
+    # a crash: an exception escapes its cancellation loop; the bot's own done-callback marks it dead, still attached
+    async def fault(now_ms):
+        raise RuntimeError("injected fault")
+    ctl.check_cards = fault
+    await asyncio.wait([bot.preopen_task], timeout=5)
+    await asyncio.sleep(0)
+    assert bot.preopen is ctl and not ctl.alive and not bot.preopen_active(), (bot.preopen, ctl.alive)
+    assert abs(bot.preopen_pnl() + 49) < 1e-9, f"crashed: the day's realised pre-open loss left the stop ({bot.preopen_pnl():+.2f})"
+    assert _stop_hits(bot, clock) == (True, True), "crashed: the model trader got its whole cap back"
+    # switched off on the page: the dead controller is cleared (nothing left to wind down) — no controller, the file counts
+    bot.config = _pnl_config(db, on=False)
+    await bot.preopen_apply()
+    assert bot.preopen is None
+    reads, real = [], _p.read_rows
+    _p.read_rows = lambda path: (reads.append(path), real(path))[1]
+    try:
+        assert abs(bot.preopen_pnl() + 49) < 1e-9, f"off and cleared: today's loss off the file ({bot.preopen_pnl():+.2f})"
+        assert _stop_hits(bot, clock) == (True, True) and _stop_hits(bot, clock, 40.0) == (False, False)
+        assert len(reads) == 1, f"the file is read once, not at every check ({len(reads)} reads)"
+        clock.ms += 86_400_000
+        assert bot.preopen_pnl() == 0.0 and len(reads) == 2, "the next Beijing day: read again, nothing booked on it"
+        clock.ms -= 86_400_000
+        # a restart the same day with the mode off: nothing is started, the loss still counts
+        again = _pnl_bot(clock, db, False, asyncio.Event())
+        await again.preopen_apply()
+        assert again.preopen is None and abs(again.preopen_pnl() + 49) < 1e-9 and _stop_hits(again, clock) == (True, True)
+    finally:
+        _p.read_rows = real
+    # a stopped mode's gain never loosens the stop (it counted 0 before too); running, its day counts net as before; with
+    # LIVE≠on the mode is not running for real, and its real loss of the day still counts
+    bot.preopen = types.SimpleNamespace(alive=False, daily_pnl=lambda: 60.0)
+    assert bot.preopen_pnl() == 0.0
+    bot.config, bot.preopen.alive = _pnl_config(db), True
+    assert bot.preopen_pnl() == 60.0
+    bot.config, bot.preopen = _pnl_config(db, LIVE="pause"), types.SimpleNamespace(alive=True, daily_pnl=lambda: -49.0)
+    assert not bot.preopen_active() and bot.preopen_pnl() == -49.0
+
+
+with tempfile.TemporaryDirectory() as _folder:
+    asyncio.run(_pnl_drop(_folder))
+
 print("AUDIT_PREOPEN_OK")

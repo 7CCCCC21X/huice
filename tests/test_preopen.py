@@ -1121,7 +1121,9 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((bot.live_fit_why({}, 0.5), bot.live_fit_shares({}, 0.5)), ("", 81.), "the model trader keeps its whole LIVE_MAX_OPEN_USD")
         bot.preopen.alive = False
         self.assertFalse(bot.preopen_active())  # crashed: the model trader is free again — the mode's fills still its own (1.131.2), never positions to adopt
-        self.assertEqual((bot.preopen_risk(), bot.preopen_pnl(), bot.preopen_filled()), (0., 0., {("123", 2): 50.}))
+        # Audit PRE-PNL-DROP: ...and its day's realised loss still in the loss stop (this pinned 0: a crash gave the model
+        # trader its whole LIVE_MAX_DAILY_LOSS_USD back); the reservation and the exclusive hold end with the mode
+        self.assertEqual((bot.preopen_risk(), bot.preopen_pnl(), bot.preopen_filled()), (0., -10., {("123", 2): 50.}))
         bot.preopen.alive = True
         bot.config = cfg  # LIVE=off: paper trading goes on
         self.assertFalse(bot.preopen_active())

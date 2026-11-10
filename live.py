@@ -1361,6 +1361,7 @@ class LiveBot(core.Bot):
         self.live_place_ms = 0       # the last step's placement time (sim_after_decide), for the phases
         self.preopen = None  # the pre-open quoting mode's controller while it runs (preopen_apply: PREOPEN_15M, on the page or in the environment)
         self.preopen_task: asyncio.Task | None = None
+        self.preopen_day_read: tuple | None = None  # (ledger file, Beijing day, its accounted P&L, valid until): read while no controller holds it (preopen_file_day)
         self.preopen_factory: Any = None  # the tests' stand-in controller class
         self.preopen_lock = asyncio.Lock()
         self.handlers["/preopen"] = self.cmd_preopen  # the status, on / off, pause / resume, and the read-only probe of the listing
@@ -4403,6 +4404,7 @@ class LiveBot(core.Bot):
 
     def preopen_start(self, wind_down: str = "") -> None:
         from preopen import Controller
+        self.preopen_day_read = None  # a controller holds the ledger from here: its own records count (preopen_pnl), not a figure read off the file
         preopen = self.preopen = (self.preopen_factory or Controller)(self)
         if wind_down:  # nothing new goes out: the orders still resting are withdrawn, then it stops itself
             preopen.wind_down(wind_down)
@@ -4412,7 +4414,8 @@ class LiveBot(core.Bot):
             if not t.cancelled() and t.exception() is not None:
                 text = core.clean_error(t.exception()) or type(t.exception()).__name__
                 LOG.error("开盘前策略异常结束：%s", text)
-                # the bot goes on (its run() withdrew this mode's orders on the way out); the model trader is free again
+                # the bot goes on (its run() withdrew this mode's orders on the way out); the model trader is free again —
+                # within the day's loss stop, which still counts this mode's realised loss (preopen_pnl, Audit PRE-PNL-DROP)
                 preopen.error, preopen.alive = f"预挂模式已停止：{text}", False
                 self.live_note_error(f"开盘前预挂模式异常停止：{text}")
                 self.live_notify(f"⚠️ 开盘前预挂模式异常停止：{text}（本模式的挂单已撤，重启后恢复）", key="preopen:crash")
@@ -4437,6 +4440,7 @@ class LiveBot(core.Bot):
         with contextlib.suppress(Exception):
             preopen.ledger.close()
         self.preopen, self.preopen_task = None, None
+        self.preopen_day_read = None  # its last records are on file now: read afresh at the next loss check (preopen_file_day)
         LOG.info("开盘前预挂模式停止：%s", why)
 
     def preopen_active(self) -> bool:
@@ -4457,8 +4461,45 @@ class LiveBot(core.Bot):
         return float(self.preopen.risk()) if self.preopen_active() else 0.0
 
     def preopen_pnl(self) -> float:
-        """The running pre-open mode's accounted P&L of the day, counted with the model trader's against LIVE_MAX_DAILY_LOSS_USD."""
-        return float(self.preopen.daily_pnl()) if self.preopen_active() else 0.0
+        """The pre-open mode's accounted P&L of the day, counted with the model trader's against LIVE_MAX_DAILY_LOSS_USD: while
+        it runs for real, its day as it stands (a gain offsets the model trader's losses); while it does not — crashed (alive
+        False, kept until the next apply), LIVE≠on, switched off and cleared, off since a restart — its day's realised loss
+        alone, a gain counting 0."""
+        if self.preopen_active():
+            return float(self.preopen.daily_pnl())
+        # Audit PRE-PNL-DROP: this was 0.0 whenever the mode was not running (1.125.0 gated the day on preopen_active together
+        # with the reservation), so a crash, /preopen off (wound down, then cleared) or a restart with the mode off took the
+        # day's realised pre-open loss out of the stop: the model trader got its whole LIVE_MAX_DAILY_LOSS_USD back, and the
+        # account's real loss of the Beijing day could reach the cap plus that loss. A booked loss stays booked; what ends
+        # with the mode is its reservation (preopen_risk) and its exclusive hold (preopen_exclusive). Floored at 0: a stopped
+        # mode's gain never loosens the stop (it counted 0 before), so no state counts less loss than it used to. Records
+        # that cannot be read count 0, as before (logged).
+        preopen = getattr(self, "preopen", None)
+        try:
+            day = float(preopen.daily_pnl()) if preopen is not None else self.preopen_file_day()
+        except Exception as error:
+            LOG.warning("预挂当日盈亏读取失败（日亏损停机线这次只算原策略）：%s", core.clean_error(error) or type(error).__name__)
+            return 0.0
+        return min(0.0, day)
+
+    def preopen_file_day(self) -> float:
+        """Today's (Beijing) accounted P&L in the pre-open mode's ledger file while no controller holds it (Audit PRE-PNL-DROP):
+        read once and kept for the day — the loss checks run every step, every sync and every send, the file is never pruned
+        (about a second's read at 20,000 records), and nothing writes it while no controller runs; preopen_start and
+        preopen_stop drop the figure. A file that cannot be read counts 0 (the stop as it was) and is tried again a minute
+        on, not at every check."""
+        from preopen import read_rows
+        path, day, now = self.config.preopen.db, core.beijing_day(self.market.now_ms() / 1000), time.monotonic()
+        kept = getattr(self, "preopen_day_read", None)
+        if kept is not None and kept[:2] == (path, day) and now < kept[3]:
+            return kept[2]
+        try:
+            value, until = sum(float(p.get("pnl") or 0) for p in read_rows(path) if p.get("accounted_day") == day), math.inf
+        except Exception as error:
+            LOG.warning("预挂记录读取失败（日亏损停机线暂只算原策略，一分钟后再读）：%s", core.clean_error(error) or type(error).__name__)
+            value, until = 0.0, now + 60
+        self.preopen_day_read = (path, day, value, until)
+        return value
 
     def preopen_rows(self) -> list[dict]:
         """The pre-open mode's ledger records: the controller's (running or stopped), else the file; [] when neither reads."""
