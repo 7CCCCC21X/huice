@@ -1647,7 +1647,7 @@ class Controller:
                 or self.now() - int(pair.get("checked_ms") or 0) < 5_000):
             return  # (no snapshot yet: the first one covers every resting order at once — no burst of reads at a start)
         pair["checked_ms"] = self.now()
-        rejected = False
+        rejected = read = False
         for order in pair["orders"].values():
             if order["state"] != "open":
                 continue
@@ -1656,6 +1656,7 @@ class Controller:
             row = await self.api.order(order["id"], order.get("api_hash") or order["hash"])
             if row is None:
                 continue  # replication lag is not a zero-fill rejection
+            read = True
             self.apply_fill(order, row, pair)
             if final_order(row):
                 order["state"] = "final"
@@ -1663,7 +1664,13 @@ class Controller:
                     rejected = True
                     if str(row.get("status") or "").upper() in REFUSED_STATUSES:
                         order["refused"] = True  # Predict's deferred refusal (a post-only order that would cross): the window is not quoted again
-        self.ledger.save(pair)
+        if read:
+            # Audit PRE-MONITOR-SAVES: saved only when a record was read (a fill or a final state may have changed). checked_ms
+            # is pacing only (the same dict sits in ledger.rows, so the next look is paced from memory; after a restart a
+            # stale value just makes the first look due at once). A look that every fresh account snapshot covered read
+            # nothing and has nothing to make durable — before, it still cost one fsync'd commit (synchronous=FULL) on the
+            # event loop per resting pair every MONITOR_MS, i.e. hundreds a second with a full book of pairs.
+            self.ledger.save(pair)
         if rejected:
             await self.cancel_many([pair], "一边未成交即结束，撤掉另一边")
 
