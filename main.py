@@ -10212,6 +10212,9 @@ class RangeMarket:
         self.sigma_ms = 0
         self.running: dict = {}           # the running hour's candle (in the window): {"open", "high", "low"}
         self.scanned_ms = 0               # when the extremes were last read up to now
+        # audit MOD-RANGE-WICK: hour open ms -> [highest, lowest] trade pushed in that hour (in the window). In memory only:
+        # after a restart the next scan's running candle covers the hour.
+        self.pushed: dict[int, list[float]] = {}
         self.error = ""
         self.failures = {"price": "", "vol": "", "scan": ""}  # each part's last failure, kept until that part succeeds
         self.times = {"price": -1e9, "vol": -1e9, "scan": -1e9}
@@ -10223,6 +10226,16 @@ class RangeMarket:
         """A trade pushed in (BinanceStream): the price as the 30-second read would set it, that read deferred by as long."""
         self.price, self.priced_ms, self.times["price"] = price, now_ms, time.monotonic()
         self.failures["price"] = ""
+        # audit MOD-RANGE-WICK: a trade pushed through a level is a touch (Predict's book shows it decided at once), but
+        # marks() only took the latest price, so the next push back under the level un-reached it until the next scan's
+        # running-hour candle (up to SCAN_SECONDS) — a decided level priced as open, its No side looking cheap. Keep the
+        # extremes of the pushed trades per hour until the persisted hours (history "through") cover that hour.
+        if self.start_ms and self.start_ms <= now_ms < self.window_end:  # a window not known yet records nothing
+            hour, p = now_ms - now_ms % 3_600_000, float(price)
+            seen = self.pushed.get(hour)
+            self.pushed[hour] = [max(seen[0], p), min(seen[1], p)] if seen else [p, p]
+            through = int(self.history.get("through") or 0)
+            self.pushed = {h: x for h, x in self.pushed.items() if h + 3_600_000 > through}
 
     @property
     def window_end(self) -> int:
@@ -10401,6 +10414,10 @@ class RangeMarket:
             hour = self.priced_ms - self.priced_ms % 3_600_000
             highs.append((float(self.price), hour))
             lows.append((float(self.price), hour))
+        for hour, (top, bottom) in self.pushed.items():  # audit MOD-RANGE-WICK: trades pushed since the last scan
+            if self.start_ms < hour + 3_600_000 and hour < self.window_end:
+                highs.append((top, hour))
+                lows.append((bottom, hour))
         high = max((x for x in highs if x[0] is not None), key=lambda x: x[0], default=(None, 0))
         low = min((x for x in lows if x[0] is not None), key=lambda x: x[0], default=(None, 0))
         return {"high": high[0], "high_at": high[1], "low": low[0], "low_at": low[1]}

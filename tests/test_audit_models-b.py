@@ -340,4 +340,37 @@ def _flip_vol_retry() -> None:
 
 _flip_vol_retry()
 
+# audit MOD-RANGE-WICK: a trade pushed through a ladder level is a touch; the next push back under it must not un-reach
+# the level before the next scan (up to SCAN_SECONDS) reads the running hour's candle.
+def _range_wick():
+    D, H = m.D, 3_600_000
+    import dataclasses as _dc
+    spec = next(s for s in m.RANGE_MARKETS if s.symbol == "ETHUSDT" and s.start_ms)  # ETH November ladder
+    rm = m.RangeMarket(m.Store(":memory:"), spec)
+    now = spec.start_ms + 9 * 24 * H + 30 * 60_000
+    hour = now - now % H
+    rm.store.put(f"range:{spec.slug}", {"start": spec.start_ms, "through": hour, "open": 3900.0, "high": 4480.0,
+                                        "high_at": spec.start_ms, "low": 3700.0, "low_at": spec.start_ms})
+    rm.running, rm.scanned_ms, rm.sigma, rm.sigma_ms = {"open": hour, "high": 4470.0, "low": 4400.0}, now - 5_000, 0.7, now
+    rm.push_price(D("4500.10"), now)        # a trade through ↑ 4,500
+    assert rm.reached(D("4500"), "up") and rm.probability(D("4500"), "up", now) == 1.0
+    rm.push_price(D("4492.00"), now + 400)  # the next trade, back under (no scan in between)
+    assert rm.reached(D("4500"), "up"), rm.marks()
+    assert rm.probability(D("4500"), "up", now + 400) == 1.0
+    assert rm.marks()["high"] == 4500.10 and rm.marks()["high_at"] == hour, rm.marks()
+    rm.push_price(D("3650.00"), now + 800)  # a low pushed in the same hour counts for ↓ levels too
+    rm.push_price(D("3720.00"), now + 900)
+    assert rm.reached(D("3660"), "down") and rm.marks()["low"] == 3650.0, rm.marks()
+    # once the persisted hours cover that hour, its pushed extremes are dropped (the kline High/Low carries them)
+    rm.store.put(f"range:{spec.slug}", {**rm.history, "through": hour + H, "high": 4500.10, "low": 3650.0})
+    rm.push_price(D("4490.00"), hour + H + 1000)
+    assert list(rm.pushed) == [hour + H], rm.pushed
+    # a window not known yet (start 0) records nothing
+    rm2 = m.RangeMarket(m.Store(":memory:"), _dc.replace(spec, start_ms=0))
+    assert not rm2.start_ms
+    rm2.push_price(D("4500"), now)
+    assert rm2.pushed == {}, rm2.pushed
+
+_range_wick()
+
 print("AUDIT_MODELS_B_OK")
