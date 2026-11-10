@@ -251,4 +251,32 @@ def ctrl_want_info():
 
 
 ctrl_want_info()
+def ctrl_edge_level():
+    """CTRL-EDGE-LEVEL: /edge saves a ladder level in the card's own spelling (4500 -> 4.5k, as level_label shows it), so the
+    confirmed bar is the one edge_bar applies; a market without levels refuses one (it could never match a card); a level
+    the market does not list is refused once its levels are known."""
+    bot = m.Bot(m.Config.from_env(base), m.Store(":memory:"), FM(NOW), None)
+    D = m.D
+    assert bot.edge_target(["ETH", "11月", "4500"])[0] == "level:ETH-HIT-11|4.5k"
+    assert bot.edge_target(["ETH", "11月", "4.5K"])[0] == "level:ETH-HIT-11|4.5k"
+    reply = bot.cmd_edge(m.Request("/edge", ["ETH", "11月", "4500", "3"], 1, 0, 1))
+    assert reply.startswith("✅"), reply
+    book = m.PredictBook("ETH-HIT-11", "s", "1", "t", ((D("0.4"), D("10")),), ((D("0.5"), D("10")),), NOW)
+    mk = m.SimMarket("s#1", "ETH 11月价格 ↑ " + m.level_label(4500), "range", "ETH-HIT-11", 0.6, book, 0.02, "", ("Yes", "No"), {})
+    assert abs(bot.edge_bar(mk) - 0.03) < 1e-12, (bot.edge_bars()[0], bot.edge_bar(mk))
+    before = dict(bot.edge_bars()[0])
+    try:
+        bot.cmd_edge(m.Request("/edge", ["恒指", "300m", "4"], 1, 0, 1)); assert False, "a level on a market without levels"
+    except ValueError as e:
+        assert "没有档位" in str(e), e
+    assert bot.edge_bars()[0] == before
+    bot.predict.ladders["ETH-HIT-11"] = [m.LadderRow(D(t), str(i), f"${t}", None) for i, t in enumerate((4000, 4500, 5000))]
+    assert bot.edge_target(["ETH", "11月", "5000"])[0] == "level:ETH-HIT-11|5k"
+    try:
+        bot.edge_target(["ETH", "11月", "4600"]); assert False, "a level the market does not list"
+    except ValueError as e:
+        assert "4.5k" in str(e), e
+
+
+ctrl_edge_level()
 print("AUDIT_CONTROL_OK")

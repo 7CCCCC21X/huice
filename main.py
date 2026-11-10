@@ -21782,9 +21782,21 @@ class Bot:
             if found:
                 key, name = found[0]
                 if rest:
-                    level = edge_level_norm(" ".join(rest))
-                    if not re.fullmatch(r"\d+(\.\d+)?[kmb]?", level):
+                    # CTRL-EDGE-LEVEL: edge_bar finds a level's bar by the card's own label (level_label on a price
+                    # ladder: 4500 -> "4.5k"; usd_short on a cap ladder: 1.234B -> "1.23b"), so a level typed any other
+                    # way ("4500", "130000", "1.234b") was saved, confirmed and listed, yet never matched a card; and a
+                    # market without levels (恒指 300m) got a bar that could never apply. Refuse the latter, and save
+                    # the typed number in the card's spelling; when the market's levels are known, it must be one.
+                    if key not in self.ranges and key not in self.caps:
+                        raise ValueError(f"「{name}」没有档位；去掉档位写 /edge {head} <¢>")
+                    match = re.fullmatch(r"(\d+(?:\.\d+)?)([kmb]?)", edge_level_norm(" ".join(rest)))
+                    if not match:
                         raise ValueError(f"档位「{' '.join(rest)}」看不懂；写成 300M、1B、120k 这样")
+                    spell = lambda v: edge_level_norm(level_label(v) if key in self.ranges else usd_short(v))
+                    level = spell(D(match.group(1)) * {"": 1, "k": 10 ** 3, "m": 10 ** 6, "b": 10 ** 9}[match.group(2)])
+                    known = [spell(row.target) for row in self.predict.ladders.get(key) or []]
+                    if known and level not in known:
+                        raise ValueError(f"「{name}」没有「{' '.join(rest)}」这一档；现有档位：" + "、".join(dict.fromkeys(known)))
                     return f"level:{key}|{level}", f"{name} {' '.join(rest)}"
                 return f"key:{key}", name
         raise ValueError(f"找不到市场或栏目「{text}」。栏目：{'、'.join(self.EDGE_GROUPS.values())}；市场：" +
