@@ -2106,6 +2106,21 @@ class LiveBot(core.Bot):
             # not a refusal: the record is "result unknown" and the sync adopts the order by its hash, nothing is freed
             duplicate = any(w in text.lower() for w in ("already exist", "already placed", "duplicate", "exists"))
             limited = isinstance(error, core.RemoteError) and (http_status(error) == 429 or (error.retry_after and http_status(error) == 0))
+            if st.get("order_id") or st.get("state") not in {"pending", "placing", "cancelling"}:
+                # 1.150.0: the step's sync ran while this request was in flight (the express lane sends outside sim_lock) and found
+                # the order by its hash: live_reconcile made the record "open", or "done" for a taker that filled at once; live_cancel
+                # gave one withdrawn meanwhile its id, and maybe its end. Predict has the order, so this answer (the 20 s timeout, a
+                # dropped connection, a 5xx, even a 4xx or a 429) says nothing about it: the record stays as the sync left it, where it
+                # lives, and Predict's own record decides its fills and its end. It used to be failed (live_fail): a filled taker booked
+                # "cancelled" with every share unfilled (outside the share caps, SIM_GROUP_USD and the local pre-settlement), a resting
+                # maker untracked and unreserved while its side was quoted again beside it after the backoff, and a "下单失败" alert; a
+                # 429 here would have cleared its hash (live_unsend) and sent it again. Checked before all of that: the request itself
+                # and a withdrawal only set pending/placing/cancelling and never an id — an id, or any other state, is a record another
+                # path has taken on (found on Predict, or already finished), and failing it again would undo what that path recorded
+                found = f"同步已按哈希找到订单 #{st['order_id']}" if st.get("order_id") else f"这条记录已另行处理（{st.get('state')}）"
+                st["events"].append({"at": now_ms, "what": f"下单应答出错（{text}），但{found}：以 Predict 的记录为准，不按下单失败处理"})
+                self.sim_save([(tid, trade)])
+                return
             if limited and not trade.get("withdrawn") and st.get("state") != "cancelling":
                 # refused by the client itself (a cooldown that began between the check above and the request), or by Predict's rate
                 # limiter (429: turned away before it was processed — 1.138.0, it counted as a refusal and shut the side out for five
