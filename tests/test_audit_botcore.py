@@ -91,4 +91,19 @@ async def quote_close_fallback():
         m.http_get, m.asyncio.sleep = real_get, real_sleep
 asyncio.run(quote_close_fallback())
 
+# --- BOT-NOTE-CLOSES-SIM-OFF: with the paper trader off, the stock cards' closes are still recorded for /calib ----------
+close_ms = bj_ms(2026, 10, 5, 15, 0)
+for env in ({"SIM": "off"}, {"PREDICT": "off"}):
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", **env})
+    store = m.Store(":memory:")
+    bot = m.Bot(cfg, store, m.Binance(cfg), None)
+    assert "模拟交易" not in [n for n, _ in bot.reference_jobs()]  # sim_step (the old only caller) is not scheduled
+    bot.sse_odds = bot.kospi_odds = bot.hsi_odds = lambda now: "暂缺"
+    bot.stocks.closes["UNITREEUSDT"] = m.Baseline(D("75.5"), "k", "label", 0, close_ms, "", "src")
+    bot.record_predictions(close_ms + 3_600_000)
+    assert store.get("outcome:UNITREEUSDT:2026-10-05") == 75.5, (env, store.get("outcome:UNITREEUSDT:2026-10-05"))
+    assert store.get("outsrc:UNITREEUSDT:2026-10-05")["source"] == "src", env
+    bot.record_predictions(close_ms + 7_200_000)  # again: idempotent
+    assert store.get("outcome:UNITREEUSDT:2026-10-05") == 75.5
+
 print("AUDIT_BOTCORE_OK")

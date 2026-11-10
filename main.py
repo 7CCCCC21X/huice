@@ -16884,6 +16884,11 @@ class Bot:
                 close, source = q.spot, f"{q.spot_source or q.source} 实时（日K未出）"
             if close is not None:
                 self.note_outcome("HSI", local.date().isoformat(), close, source)
+        # 1.150.0: the stock cards' closes too. sim_note_closes ran only inside sim_step, which is scheduled only with SIM
+        # and PREDICT both on, so with the paper trader off the stock snapshots saved above were never scored by /calib
+        # (no outcome:{SYMBOL}:{day} ever written). Harmless when the trader is on as well: note_outcome writes only a
+        # changed value, and a stock outcome never moves the index σ factors (index_sigma_calibs keeps the indices alone).
+        self.sim_note_closes()
 
     PRED_FIELDS = frozenset({"key", "t", "target", "mode", "ref", "up", "move", "R", "beta", "sigma"})
 
