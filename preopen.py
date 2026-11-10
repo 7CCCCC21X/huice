@@ -1178,8 +1178,50 @@ class Controller:
             return
         if not resting and not any(removable_ids(p) for p in self.ledger.rows.values() if p["phase"] != "closed"):
             return  # nothing left to withdraw (a wind-down that finished)
-        with contextlib.suppress(Exception):  # 1.141.0: in batches, a rate limit waited out (was cut after 12 s: a book of thousands mostly stayed)
+        until = time.monotonic() + STOP_CANCEL_S  # the whole way out, the fallback below included: STOP_CANCEL_S at most
+        try:  # 1.141.0: in batches, a rate limit waited out (was cut after 12 s: a book of thousands mostly stayed)
             await self.cancel_all("预挂模式停止，撤销预挂单", free=True, deadline_s=STOP_CANCEL_S)
+        except Exception as error:
+            # Audit PRE-CRASH-WITHDRAW: this was contextlib.suppress — and the withdrawal fails exactly when the mode crashed on
+            # a ledger it cannot write (a full disk, an I/O error, a read-only volume): cancel_many saves every pair before
+            # it sends a removal, and each answer is saved inside the batch withdrawal, so the first write raised again, the
+            # suppress swallowed it, and not one removal went out — every resting order stayed up, unmonitored and its
+            # fills unbooked, until its signed expiry, while the crash notice said they were withdrawn. A removal needs no
+            # record (save-first is for sending an order: place_pair), so what may still rest is withdrawn here with
+            # nothing written; the next start reconciles the records against Predict, as after any stop.
+            why = core.clean_error(error) or type(error).__name__
+            LOG.error("开盘前预挂停止时撤单出错：%s；改为不写记录直接撤", why)
+            self.error = f"停止时撤单出错：{why}；改为不写记录直接撤（下次启动时按 Predict 核对）"
+            await self.remove_unrecorded(until)
+
+    async def remove_unrecorded(self, until: float) -> None:
+        """on_stop's fallback (Audit PRE-CRASH-WITHDRAW): every order of this mode that may still rest (an id, not ended,
+        the signed expiry ahead) withdrawn in batches, the soonest window first, until ``until`` (time.monotonic), with
+        nothing written to the ledger — a removal is marked in memory only, so the crash notice and the status count what
+        is left (resting_orders). Never raises: a failure is logged, and what is left is counted the same way."""
+        import live
+        try:
+            now = self.now()
+            pairs = sorted((p for p in self.ledger.rows.values() if resting_orders(p, now)),
+                           key=lambda p: (int(p.get("cancel_ms") or p.get("start_ms") or 0), str(p.get("slug") or "")))
+            by_id = {str(o["id"]): o for p in pairs for o in p["orders"].values() if o.get("id") and o.get("state") not in TERMINAL}  # (removable_ids)
+            if not by_id:
+                return
+
+            def answered(removed: list[str], noop: list[str]) -> None:
+                for oid in removed:
+                    if oid in by_id:
+                        by_id[oid]["state"] = "removed"
+            # patient whatever the count: the last try — no loop, no reconciliation follows — so a rate limit is waited out
+            # and a failed batch tried again, within ``until`` (impatient, a few ids would not be sent into a cooldown at all)
+            result = await live.remove_in_batches(
+                self.bulk_client(), list(by_id), self.remove_limit(), workers=BULK_WORKERS, patient=True,
+                deadline=until, stop=self.owner.stopping.is_set, on_answer=answered, now_ms=self.now)
+            LOG.warning("开盘前预挂不写记录直接撤：%d 张里撤掉 %d 张，%d 张已不在簿上，%d 张没撤成%s", len(by_id), len(result["removed"]),
+                        len(result["noop"]) + len(result["unanswered"]), len(result["failed"]) + len(result["left"]),
+                        f"（{result['errors'][-1]}）" if result["errors"] else "")
+        except Exception as error:
+            LOG.error("开盘前预挂不写记录直接撤单失败：%s", core.clean_error(error) or type(error).__name__)
 
     async def discover(self, probe_only: bool = False) -> None:
         """One discovery pass: first each card's next listing (the windows beyond the latest known listed, concurrently across
@@ -1846,7 +1888,9 @@ class Controller:
             parts.append(f"上次分批撤 {last['orders']} 张（{when(last['at'], now)}）：撤掉 {last['removed']} 张" + (f"、{last['quiet']} 张已不在簿上" if last.get("quiet") else "")
                          + f"，{last['seconds']:.0f} 秒、{last['requests']} 个请求" + (f"、限流 {last['limited']} 次" if last.get("limited") else "")
                          + (f"；{last['missed']} 张没撤成，稍后接着撤" if last.get("missed") else ""))
-        if self.winding:
+        if self.winding or not self.alive:
+            # Audit PRE-CRASH-WITHDRAW: a crashed controller too — its status's "N 条挂着" counts the active records, which its
+            # withdrawal marked closing in memory whether or not a removal went out ("0 条挂着" with every order still up)
             parts.append(f"还可能挂着 {sum(resting_orders(p, now) for p in self.ledger.rows.values())} 张")
         return "批量撤单：" + self.remove_limit().text() + ("；" + "；".join(parts) if parts else "")
 
@@ -2040,15 +2084,21 @@ class Controller:
             await asyncio.sleep(0.5)
 
     async def run(self) -> None:
+        jobs: list[asyncio.Task] = []
+        stops: list[asyncio.Task] = []
         try:
-            self.adopt()  # the last run's pairs: taken over as they are, or withdrawn and reconciled
-            jobs = [asyncio.create_task(self.account_loop(), name="preopen-account"),
-                    asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
-                    asyncio.create_task(self.refresh_loop(), name="preopen-refresh"),
-                    asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
-                    *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(PLACE_WORKERS))]
-            stops = [asyncio.create_task(self.owner.stopping.wait()), asyncio.create_task(self.stop.wait())]
             try:
+                # Audit PRE-CRASH-WITHDRAW: adopt() inside the guard whose finally runs on_stop. It ran before it, so a failure
+                # there (a record it must change — a window that started during a restart, a pair to withdraw — on a ledger
+                # it cannot write) ended the mode with the orders it had just taken over left resting, unmonitored, while
+                # the crash notice said they were withdrawn; now it withdraws them like any crash.
+                self.adopt()  # the last run's pairs: taken over as they are, or withdrawn and reconciled
+                jobs = [asyncio.create_task(self.account_loop(), name="preopen-account"),
+                        asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
+                        asyncio.create_task(self.refresh_loop(), name="preopen-refresh"),
+                        asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
+                        *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(PLACE_WORKERS))]
+                stops = [asyncio.create_task(self.owner.stopping.wait()), asyncio.create_task(self.stop.wait())]
                 await asyncio.wait([*stops, *jobs], return_when=asyncio.FIRST_COMPLETED)
                 for job in jobs:
                     if job.done() and not job.cancelled() and job.exception():

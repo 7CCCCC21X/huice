@@ -372,4 +372,100 @@ async def _operator_stops_are_free():
 
 asyncio.run(_operator_stops_are_free())
 
+# PRE-CRASH-WITHDRAW: a crash withdraws the mode's orders (PREOPEN.md, on_stop), but a crash on a ledger it cannot write (a
+# full disk, an I/O error) withdrew nothing: on_stop's withdrawal raised at its first write (cancel_many saves every pair
+# before it sends a removal, each batch answer is saved inside the withdrawal), contextlib.suppress swallowed it, and not
+# one removal went out — every order stayed up until its signed expiry, unmonitored, while LiveBot's crash notice said
+# "本模式的挂单已撤" and /preopen said "0 条挂着". adopt() ran outside the guard that calls on_stop, so a failure there
+# withdrew nothing either. Now a failed withdrawal falls back to removals that write nothing, adopt() is inside the guard,
+# and the notice and the status count what may still rest. The ledger here refuses every write from a moment on.
+import sqlite3
+
+
+def _ledger_full(*args, **kwargs):
+    raise sqlite3.OperationalError("database or disk is full")
+
+
+async def _crash(ctl, then=None):
+    """The controller started through LiveBot.preopen_start (whose done-callback sends the crash notice); ``then()`` once it
+    runs healthy — adopt() done, every loop going. The crash notice."""
+    bot = _L.LiveBot.__new__(_L.LiveBot)
+    notes = []
+    bot.preopen, bot.preopen_factory, bot.stopping = None, (lambda owner: ctl), ctl.owner.stopping
+    bot.live_note_error, bot.live_notify = (lambda text: None), (lambda text, key="": notes.append(text))
+    bot.preopen_start()
+    if then is not None:
+        await asyncio.sleep(0.2)
+        assert not bot.preopen_task.done(), "the mode must start healthy"
+        then()
+    await asyncio.wait([bot.preopen_task], timeout=10)
+    await asyncio.sleep(0)
+    assert bot.preopen_task.done() and isinstance(bot.preopen_task.exception(), sqlite3.OperationalError), bot.preopen_task
+    crash = [n for n in notes if n.startswith("⚠️ 开盘前预挂模式异常停止")]
+    assert len(crash) == 1 and not ctl.alive, notes
+    return crash[0]
+
+
+def _resting(ctl, api):
+    """The mode's orders still OPEN on the fake book, their signed expiry ahead."""
+    expiry = {o["id"]: int(x["expires"]) * 1000 for x in ctl.ledger.rows.values() for o in x["orders"].values() if o.get("id")}
+    return sorted(r["id"] for r in api.rows.values() if r["status"] == "OPEN" and expiry.get(r["id"], 0) > ctl.now())
+
+
+async def _crash_withdraws():
+    rows = [_T.market(at=_T.NOW + k * 15 * 60_000, mid=200 + k) for k in (1, 2, 3)]
+
+    async def three():  # three windows quoted, six orders resting
+        ctl, api, clock = _T.controller(rows, PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="1440", PREOPEN_SHARES="10")
+        for r in rows:
+            await ctl.place_pair(_p.candidate(r, _T.NOW, ctl.owner.config, ctl.settings))
+        assert len(_resting(ctl, api)) == 6
+        return ctl, api, clock
+
+    # the ledger stops taking writes, then the soonest window reaches its cancel time: the cancellation loop crashes on
+    # its first save (the path a full disk takes), and the crash withdraws all six orders
+    ctl, api, clock = await three()
+
+    def fail():
+        ctl.ledger.save = ctl.ledger.save_many = _ledger_full
+        clock.ms = min(x["cancel_ms"] for x in ctl.ledger.rows.values())
+    note = await _crash(ctl, fail)
+    assert _resting(ctl, api) == [], f"a crash on a ledger it cannot write left {_resting(ctl, api)} resting (removals {api.removed})"
+    assert "本模式的挂单已撤" in note, note
+    assert any("改为不写记录直接撤" in e for _, e in ctl.errors), "the failed withdrawal must be recorded, not swallowed"
+    assert "还可能挂着 0 张" in ctl.status()
+    # a book bigger than one round of batches (200 orders): all of it, not just the first answers' worth
+    ctl, api, clock = _T.controller()
+    pairs = await _T.PreopenTests.book_of(None, ctl, api, 100)
+
+    def fail():
+        ctl.ledger.save = ctl.ledger.save_many = _ledger_full
+        clock.ms = pairs[0]["cancel_ms"]
+    await _crash(ctl, fail)
+    assert _resting(ctl, api) == [], f"{len(_resting(ctl, api))} of 200 orders left resting"
+    # every removal refused as well (401): the notice and the status say what may still rest, never "已撤"
+    ctl, api, clock = await three()
+
+    async def refused(ids):
+        raise _m.RemoteError("HTTP 401: unauthorized")
+
+    def fail():
+        ctl.ledger.save = ctl.ledger.save_many = _ledger_full
+        api.remove_orders = refused
+        clock.ms = min(x["cancel_ms"] for x in ctl.ledger.rows.values())
+    note = await _crash(ctl, fail)
+    assert len(_resting(ctl, api)) == 6 and "已撤" not in note and "还有 6 张预挂单可能还挂着" in note, note
+    assert "还可能挂着 6 张" in ctl.status(), ctl.status()
+    # adopt() fails at a start (a window started during the restart: its record must change, the ledger cannot be
+    # written): the orders it took over are withdrawn on the way out like any crash's
+    ctl, api, clock = await three()
+    clock.ms = _T.NOW + 16 * 60_000  # past the first window's start, before the other two's cancel times
+    ctl.ledger.save = ctl.ledger.save_many = _ledger_full
+    note = await _crash(ctl)
+    assert _resting(ctl, api) == [], f"an adopt() failure left {_resting(ctl, api)} resting"
+    assert "本模式的挂单已撤" in note, note
+
+
+asyncio.run(_crash_withdraws())
+
 print("AUDIT_PREOPEN_OK")

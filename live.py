@@ -4414,11 +4414,22 @@ class LiveBot(core.Bot):
             if not t.cancelled() and t.exception() is not None:
                 text = core.clean_error(t.exception()) or type(t.exception()).__name__
                 LOG.error("开盘前策略异常结束：%s", text)
-                # the bot goes on (its run() withdrew this mode's orders on the way out); the model trader is free again —
-                # within the day's loss stop, which still counts this mode's realised loss (preopen_pnl, Audit PRE-PNL-DROP)
+                # the bot goes on (its run() withdrew what it could of this mode's orders on the way out: counted below); the
+                # model trader is free again — within the day's loss stop, which still counts this mode's realised loss
+                # (preopen_pnl, Audit PRE-PNL-DROP)
                 preopen.error, preopen.alive = f"预挂模式已停止：{text}", False
                 self.live_note_error(f"开盘前预挂模式异常停止：{text}")
-                self.live_notify(f"⚠️ 开盘前预挂模式异常停止：{text}（本模式的挂单已撤，重启后恢复）", key="preopen:crash")
+                # Audit PRE-CRASH-WITHDRAW: what is left is counted, not assumed. "本模式的挂单已撤" went out whatever the
+                # withdrawal did — nothing at all on a ledger it could not write (fixed in on_stop), cut short by
+                # STOP_CANCEL_S, or stopped by a refusal of every request (401/403). The records in memory carry each removal.
+                try:
+                    from preopen import resting_orders
+                    left = sum(resting_orders(p, preopen.now()) for p in preopen.ledger.rows.values())
+                    gone = ("本模式的挂单已撤" if not left else
+                            f"还有 {left} 张预挂单可能还挂着，开场前 {preopen.settings.expiry_seconds} 秒签名到期之前仍可能成交，请到 Predict 核对")
+                except Exception:
+                    gone = "撤单情况不明，请到 Predict 核对"
+                self.live_notify(f"⚠️ 开盘前预挂模式异常停止：{text}（{gone}，重启后恢复）", key="preopen:crash")
             elif not t.cancelled() and getattr(preopen, "winding", "") and self.preopen is preopen and not self.stopping.is_set():
                 asyncio.get_running_loop().create_task(self.preopen_apply(), name="preopen-apply")  # wound up: cleared (or started afresh)
         task.add_done_callback(finished)
