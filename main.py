@@ -9872,8 +9872,10 @@ class CapMarket:
             return 0.0  # the window is over: only what happened inside it counts, never today's market cap
         if cap is None or self.sigma is None or self.input_problem(now_ms):
             return None
-        if now_ms < self.spec.start_ms and cap >= target:
-            return None  # audit MOD-PREWINDOW: before the window opens today's cap above the target is no touch yet
+        if now_ms < self.spec.start_ms:
+            # audit MOD-PREWINDOW: before the window opens nothing counts yet and the touch model from today's cap (kinked
+            # at the target, the days before the start ignored) overprices every target near it: unpriced until it opens.
+            return None
         years = max(0.0, (self.spec.end_ms - max(now_ms, self.spec.start_ms)) / YEAR_MS)
         return hit_probability(float(cap), float(target), self.sigma, years)
 
@@ -10461,20 +10463,22 @@ class RangeMarket:
 
     def probability(self, level: D, direction: str, now_ms: int) -> float | None:
         """P(Yes) for one level: 1 once reached; 0 once the window is over and read to its end without it; else the touch
-        model from the live price (zero drift, the 30-day σ). None while the price or σ is missing or stale, or while the
-        window's last hours are not read yet."""
+        model from the live price (zero drift, the 30-day σ). None while the price or σ is missing or stale, while the
+        window's last hours are not read yet, or before the window opens."""
         if self.reached(level, direction):
             return 1.0
         if now_ms >= self.window_end:
             return 0.0 if self.complete() else None
         if self.price is None or self.sigma is None or self.price_stale(now_ms):
             return None
-        if now_ms < self.start_ms and (float(self.price) >= float(level) if direction == "up" else float(self.price) <= float(level)):
-            # audit MOD-PREWINDOW: before the window opens (a next-month ladder added early) a level already beyond
-            # today's price is not reached: only a candle inside the window counts, and the price can turn back before
-            # the first day. The touch model from today's price calls it certain (1.0) and the trader would buy Yes up
-            # to its fair cap, while the true P is about 0.9 for a level 1% beyond with five days to go. Leave it
-            # unpriced until the window opens (start 0, not known yet, never gets here: nothing is before it).
+        if now_ms < self.start_ms:
+            # audit MOD-PREWINDOW: before the window opens (a next-month ladder added early) no level is reached: only a
+            # candle inside the window counts. The touch model from today's price is the wrong model there: a level
+            # already beyond today's price comes out certain (1.0), one just short of it 0.95-0.995 (the model is kinked
+            # at the level and ignores the days before the start), while the true P, averaged over the price at the
+            # window's start, is about 0.85-0.89 with six days to go. The trader would buy Yes up to its fair cap on
+            # those. Leave every level unpriced until the window opens (no fair: no sim row, "—" on the card); a
+            # start of 0 (not known yet) never gets here, and advice_problem already holds then.
             return None
         years = self.remaining_years(now_ms)
         touch = hit_probability if direction == "up" else low_probability

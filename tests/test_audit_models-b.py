@@ -528,13 +528,17 @@ def _prewindow():
     assert not rm.reached(D("95000"), "down")
     assert rm.probability(D("95000"), "down", now) is None, rm.probability(D("95000"), "down", now)
     assert rm.probability(D("90000"), "up", now) is None
-    far = rm.probability(D("90000"), "down", now)
-    assert isinstance(far, float) and 0 < far < 1, far
-    assert 0 < rm.probability(D("100000"), "up", now) < 1
+    # review fix-up: levels just short of today's price were still priced by the touch model from today's price (0.995 for
+    # 0.1% inside, 0.952 for 1%, true P about 0.85 with six days to go) with no book_disputes hold: before the window opens
+    # no level gets a price, near or far, on either side
+    for lv, way in (("93900", "down"), ("93500", "down"), ("93000", "down"), ("90000", "down"), ("94100", "up"), ("100000", "up")):
+        assert rm.probability(D(lv), way, now) is None, (lv, way, rm.probability(D(lv), way, now))
+    assert rm.probability(D("93900"), "down", dec.start_ms - 1) is None
     # once the window is open the live price inside it is a touch: certain
     inside = dec.start_ms + 1
     rm.price, rm.priced_ms, rm.sigma_ms, rm.fetched_ms = D("94000"), inside, inside, inside
     assert rm.reached(D("95000"), "down") and rm.probability(D("95000"), "down", inside) == 1.0
+    assert 0 < rm.probability(D("93000"), "down", inside) < 1  # and levels not reached get the touch model again
     # the same for a market-cap ladder whose window has not opened yet
     spec = next(s for s in retired.CAP_MARKETS if s.key == "NIULAI")
     spec = _dc.replace(spec, start_ms=now + 6 * 86_400_000, end_ms=now + 36 * 86_400_000)
@@ -543,7 +547,10 @@ def _prewindow():
     cap.supply = D("1000000")
     assert cap.input_problem(now) == "" and cap.cap == D("1000000")
     assert cap.probability(D("900000"), now) is None
-    assert 0 < cap.probability(D("2000000"), now) < 1
+    assert cap.probability(D("1010000"), now) is None and cap.probability(D("2000000"), now) is None
+    opened = spec.start_ms + 1
+    cap.priced_ms = opened
+    assert cap.input_problem(opened) == "" and 0 < cap.probability(D("2000000"), opened) < 1
 
 _prewindow()
 
