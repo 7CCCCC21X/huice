@@ -4655,7 +4655,13 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
             a, b, k = fit
             for r in (r for r in done if r["target"] == day):
                 tested.append(r)
-                fitted.append(norm_cdf((a + b * r["move"]) / max(k * math.sqrt(max(r["R"], 1e-6)), 1e-9)))
+                # 1.149.1: the fit stands on the model's own reference (y = ln(close/ref_raw)), but the hit is judged on the
+                # reference the page showed (the Predict target price when settle_on_strike used it) — so, as in the σ
+                # walk-forward above (1.122.0), the formula must stand on that reference too:
+                # P(close > ref) = Φ((a + b·move − ln(ref/ref_raw)) / (k√R)). Without a strike ref == ref_raw and the shift is 0.
+                ref, ref_raw = float(r.get("ref") or 0), float(r.get("ref_raw") or r.get("ref") or 0)
+                shift = math.log(ref / ref_raw) if ref > 0 and ref_raw > 0 else 0.0
+                fitted.append(norm_cdf((a + b * r["move"] - shift) / max(k * math.sqrt(max(r["R"], 1e-6)), 1e-9)))
         if tested:
             old = scores([r["up"] for r in tested], [r["hit"] for r in tested])
             new = scores(fitted, [r["hit"] for r in tested])
