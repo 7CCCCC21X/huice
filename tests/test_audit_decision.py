@@ -53,4 +53,20 @@ groups = m.sim_groups([window_rec("BTC-DAY", {"end": 5, "day": "2026-11-10"}, "B
                        window_rec("BTC-15M", win, "BTC 15分涨跌 16:30–16:45")])
 assert [(g["driver"], g["worst"]) for g in groups] == [("BTCUSDT", -100.0)], [(g["driver"], g["name"], g["worst"]) for g in groups]
 
+# --- SIM-OWN-ON-BOOK-CLOCK: own_on_book compares a book's read with Predict's answer on one clock (the books' wall clock) ---------
+# Predict answered at local wall time L; answered_at is on the Binance-offset clock (here the local clock lags Binance by 2 s,
+# so answered_at = L + 2000). A book read 500 ms after the answer already shows our order: it is ours, not someone else's 买1.
+# A book read 500 ms before the answer cannot show it.
+L = NOW
+for offset in (2000, -2000):
+    rec = {"order": 10.0, "shares": 0.0, "live": {"state": "open", "answered_ms": L, "answered_at": L + offset}}
+    after = m.PredictBook("HSI", "hsi-slug", "101", "t", [], [], L + 500, None)
+    before = m.PredictBook("HSI", "hsi-slug", "101", "t", [], [], L - 500, None)
+    assert m.own_on_book(rec, after) == 10.0, ("a book read after the answer shows our order", offset, m.own_on_book(rec, after))
+    assert m.own_on_book(rec, before) == 0.0, ("a book read before the answer cannot show it", offset, m.own_on_book(rec, before))
+# a record saved before the fix (answered_at only) keeps the old comparison
+old = {"order": 10.0, "shares": 4.0, "live": {"state": "open", "answered_at": L}}
+assert m.own_on_book(old, m.PredictBook("HSI", "hsi-slug", "101", "t", [], [], L + 1, None)) == 6.0
+assert m.own_on_book(old, m.PredictBook("HSI", "hsi-slug", "101", "t", [], [], L - 1, None)) == 0.0
+
 print("AUDIT_DECISION_OK")

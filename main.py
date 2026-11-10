@@ -11093,7 +11093,9 @@ def own_on_book(trade: Mapping, book: Any) -> float:
     st = trade.get("live") if isinstance(trade.get("live"), Mapping) else None
     if st is None or st.get("state") in ("pending", "placing"):
         return 0.0
-    answered = int(st.get("answered_at") or 0)
+    # 1.150.0: compared in the books' clock (answered_ms, the wall clock fetched_ms is stamped with), not answered_at on the
+    # Binance-offset clock; a record saved before 1.150.0 has only answered_at and keeps the old comparison
+    answered = int(st.get("answered_ms") or st.get("answered_at") or 0)
     if answered and book is not None and int(getattr(book, "fetched_ms", 0) or 0) < answered:
         return 0.0
     return max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0)
