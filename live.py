@@ -2751,7 +2751,8 @@ class LiveBot(core.Bot):
         beyond what its records explain are read from the order's own record first, and what that still does not show
         is taken as filled on the newest such order, at most its unfilled count, costed as a fill of that order (a
         maker's price; a taker's limit, 待对账), noted on the record and announced; not within LIVE_LATE_FILLS_GRACE_MS
-        of the end (the positions list follows the matching a little late);
+        of the end (the positions list follows the matching a little late), nor while an order still working on the
+        outcome may hold that fill unread (live_late_unread, 1.150.0);
         (b) 1.119.1: an outcome the account holds a little less of than its open records say (Predict takes the taker
         fee in shares: 97.74 bought, 96.30 held) — the records are trimmed to the holding, in proportion, when no order
         with fills is still working there, the shortfall is within LIVE_TRIM_MAX and the same shortfall stands a minute
@@ -2830,6 +2831,23 @@ class LiveBot(core.Bot):
                     left -= got
                     recorded[k] = recorded.get(k, 0.0) + got
                     self.live_adopted_status(tid, t, now_ms, f"结束后再读订单记录，读到成交 {got:g} 份（累计 {float(t['shares']):g}/{float(t.get('order') or 0):g}）")
+            if left <= self.LIVE_DUST_SHARES:
+                continue
+            # 1.150.0: the excess may be a WORKING order's own fill that its record here does not show yet — a resting maker the
+            # step's bounded read left for later (read by its hash every LIVE_TRACK_READ_MS), a cancel confirmed whose fills are
+            # read beside the step (fills_pending), a placement in flight. Before, it went at once onto the ended order whose price
+            # or time matched (a maker re-quoted at the same price is the normal re-quote; an ended taker matches any average at or
+            # under its limit) — not a guess, so never checked again — and when the working order's own read landed, the same
+            # shares sat on two records for good (50 held, 100 recorded): exposure, the journal, the P&L and the daily loss stop
+            # counting them twice. The orders resting there are read now (live_late_unread); while a record there may still hold
+            # fills not read, the outcome waits for the next minute's look (not trimmed either: it is in ``seen``). An order read
+            # now does not hold it — a re-quote resting on the side would otherwise keep a genuine late fill unbooked for hours.
+            if await self.live_late_unread(k, key_of, now_ms):
+                continue
+            # ...and the records as they stand now: a working order's read may have landed during the awaited reads above (the
+            # express lane and the cancels' fills reads run beside the step), after ``recorded`` was summed
+            left = min(left, held.get(k, 0.0) - po.get(k, 0.0) - sum(float(o.get("shares") or 0) for o in self.sim_trades().values()
+                                                                 if isinstance(o.get("live"), dict) and key_of(o) == k))
             if left <= self.LIVE_DUST_SHARES:
                 continue
             price, when = pos_price.get(k), pos_time.get(k, 0)
@@ -3002,6 +3020,42 @@ class LiveBot(core.Bot):
         self.live_apply(tid, t, row, None, now_ms)
         st.pop("fills_pending", None)
         return max(0.0, float(t.get("shares") or 0) - before)
+
+    async def live_late_unread(self, k: tuple[str, int], key_of: Any, now_ms: int) -> str:
+        """Why the account's excess on outcome ``k`` may still be a working order's own fill that its record here does not
+        show — "" when none (live_late_fills (a), 1.150.0). The orders resting there are read first, by their hash, as
+        live_track reads them: a record Predict still shows open gets its fills. What still holds the outcome is a record
+        whose fills cannot be known now: a cancel confirmed whose fills are read beside the step (fills_pending), a
+        placement or a cancel in flight, an order of unknown state, a resting order whose read failed, found it ended
+        (its end is the sync's to book) or that was withdrawn meanwhile. A record never sent, or ended and read, holds
+        nothing; nor does a resting order read here."""
+        read: set[str] = set()
+        for tid, t in list(self.sim_trades().items()):
+            st = t.get("live")
+            if not isinstance(st, dict) or key_of(t) != k or st.get("state") != "open" or not st.get("hash"):
+                continue  # (by its hash alone: a read by id searches the account's whole open list)
+            row = None
+            with contextlib.suppress(Exception):
+                row = await self.live.api.order(str(st.get("order_id") or ""), str(st["hash"]))
+            if st.get("state") != "open" or not isinstance(row, dict) or order_final(row, float(t.get("order") or 0)):
+                continue  # withdrawn meanwhile (its cancel reads it), unreadable, or ended: not read here — it holds the outcome
+            before = float(t.get("shares") or 0)
+            self.live_apply(tid, t, row, None, now_ms)
+            read.add(str(st.get("order_id") or st["hash"]))
+            if float(t.get("shares") or 0) > before + 1e-9:
+                self.sim_save([(st.get("rekeyed") or tid, t)])
+        for t in list(self.sim_trades().values()):
+            st = t.get("live")
+            if not isinstance(st, dict) or key_of(t) != k:
+                continue
+            state, name = st.get("state"), str(st.get("order_id") or st.get("hash") or "")
+            if core.fills_pending(st):
+                return f"订单 #{name} 撤单已确认，撤单前的成交还没读回"
+            if state in {"placing", "cancelling", "unknown"} and name:  # (never sent: no id, no hash — nothing to fill)
+                return f"订单 #{name} {'发送中' if state == 'placing' else '撤单中' if state == 'cancelling' else '状态未知'}，成交未定"
+            if state == "open" and name not in read:
+                return f"挂着的订单 #{name} 这次没读到"
+        return ""
 
     def live_adopted_status(self, tid: str, t: dict, now_ms: int, how: str) -> None:
         """A record that gained fills after its order ended: a position now (unless settled), the event, the notice, saved."""
