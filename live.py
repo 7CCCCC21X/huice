@@ -1103,6 +1103,18 @@ class LiveTrader:
         return not self.ready_error and not self.account_error and self.account_checked
 
     @property
+    def signed_in(self) -> bool:
+        """Predict's sign-in succeeded: enough to follow the orders already out — read their fills, send their cancels —
+        which go through Predict's API alone (the sign-in names the order account, wallet.maker, as its signer: a session
+        Predict accepted is that account's). New orders need ``ready`` (live_room, live_send_block). 1.150.0: the order
+        management waited for ``ready`` too, whose on-chain account check is one BNB RPC read, made at a restart, /live
+        check, /live mode and the not-ready retries — a node that timed out once there kept every withdrawal (the edge
+        gone, the market's end, the loss stop, LIVE=off, a taker's rest) unsent and every fill unread until a retry a
+        minute later found the node answering again, for the whole outage when it did not; a withdrawn order then rested
+        where /live cancel all and the emergency stop no longer looked (they skip records already being cancelled)."""
+        return not self.ready_error
+
+    @property
     def not_ready_why(self) -> str:
         return self.ready_error or self.account_error or ("账户校验尚未完成" if not self.account_checked else "")
 
@@ -1715,7 +1727,7 @@ class LiveBot(core.Bot):
             # list; the step's other cancels stay in its sync, after the open list's read, whose fills count before a confirmed removal
             # (1.83.0: a single-order read may lag the list, and a blind cancel would lose what filled)
             unsent = {tid: t for tid, t in self.live_cancels_unsent().items() if not t["live"].get("order_id")}
-            if unsent and self.live.ready:
+            if unsent and self.live.signed_in:  # 1.150.0: signed in, not ready — closed all the same (its re-quote waits for ready)
                 await self.live_cancel_blind(unsent, now_ms)
                 await self.live_requote_freed(list(unsent), now_ms)
             await self.live_place_pending(now_ms)
@@ -1971,7 +1983,7 @@ class LiveBot(core.Bot):
                     self.live_note_error(f"快车道下单失败：{core.clean_error(error) or type(error).__name__}")
 
         async def cancel(records: dict[str, dict]) -> None:
-            if records and self.live.ready:
+            if records and self.live.signed_in:  # 1.150.0: a cancel needs the sign-in alone (LiveTrader.signed_in), not the account check
                 try:
                     await self.live_cancel_blind(records, now_ms)
                 except Exception as error:
@@ -1997,8 +2009,10 @@ class LiveBot(core.Bot):
         operator's cancel, the emergency stop, LIVE=off and the loss stop are not followed by a fresh order here. The
         fresh order faces every gate a first one does; at the withdrawn price within the lane's cooldown it is not
         placed (sim_express_cooling). It names the record it follows (requote_of) and that one's withdrawal
-        (withdrawn_at): the 撤单→重挂 span of live_latency."""
-        if self.config.live_mode == "off" or self.config.sim_ways == "taker" or not tids:
+        (withdrawn_at): the 撤单→重挂 span of live_latency. Not while the account is not ready (1.150.0): the cancels of a
+        bot signed in but not ready go out (LiveTrader.signed_in), a fresh order would only be refused (live_room) — the
+        step quotes the slot again once ready."""
+        if self.config.live_mode == "off" or self.config.sim_ways == "taker" or not tids or not self.live.ready:
             return
         trades = self.sim_trades()
         freed: dict[tuple[str, str], tuple[str, dict]] = {}
@@ -2243,13 +2257,13 @@ class LiveBot(core.Bot):
                   and t["live"].get("state") != "pending"}
         if active and not self.live.ready:
             await self.live_ensure_ready()  # real orders are followed to their end whatever the mode (LIVE=off included)
-        if not self.live.ready:
-            return
+        if not self.live.signed_in:
+            return  # 1.150.0: the sign-in is enough (LiveTrader.signed_in): the on-chain account check holds new orders, never these reads and cancels
         await self.live_renew_auth()
         if active or now_ms - self.live_list_at_ms >= self.LIVE_IDLE_LIST_MS:
             cancelling = [tid for tid, t in active.items() if t["live"].get("state") == "cancelling"]
             await self.live_sync_orders(active, now_ms)  # with nothing in flight the list is still read now and then: orders this bot did not place
-            await self.live_requote_freed(cancelling, now_ms)  # the slots the confirmed cancels freed: quoted again now, not next step
+            await self.live_requote_freed(cancelling, now_ms)  # the slots the confirmed cancels freed: quoted again now (once ready), not next step
         try:
             await self.live_late_fills(now_ms)  # 1.119.0: an order that ended with shares unfilled, against the account's positions
         except Exception as error:

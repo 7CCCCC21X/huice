@@ -118,5 +118,101 @@ async def place_timeout_race():
     assert "下单失败：HTTP 400" in t["note"] and bot.live_backoff, (t["note"], bot.live_backoff)
 
 
+async def account_check_rpc_down():
+    """LIVE-ACCOUNT-VERIFY-RPC: PREDICT_ACCOUNT's on-chain check is one BNB RPC read (at a restart, /live check, /live mode and
+    the not-ready retries); a node that does not answer there leaves the bot signed in to Predict but not ready. New orders
+    stay refused; the orders already out are still followed — their withdrawals sent, their fills read — through Predict's
+    API, which needs the sign-in alone. They used to wait for the node: live_sync returned before reading or cancelling
+    anything, and the express lane and the step's cancels were held the same way, for as long as the node stayed down."""
+    PA = T["PA"]
+    owner_of = lambda bot: bot.live.chain.owner  # FakeChain: the key's own address, what the validator holds when the node answers
+
+    def node_down(bot, empty=False):
+        tries = []
+        async def read(account):  # Chain.account_owner as a node that times out (Chain.rpc makes one attempt), or answers 0x
+            tries.append(account)
+            if empty:
+                return "0x" + "0" * 40  # an empty eth_call result reads as the zero owner ("链上没有…签名记录")
+            raise m.RemoteError("网络错误 (TimeoutError)")
+        bot.live.chain.account_owner = read
+        return tries
+
+    def node_back(bot):
+        async def read(account): return owner_of(bot)
+        bot.live.chain.account_owner = read
+
+    def a_minute_on(bot):
+        bot.live_last_signin -= 61  # live_ensure_ready's once-a-minute retry is due (monotonic): signed in again, the account checked again
+
+    sent = lambda bot, n, kind: [c[1] for c in bot.live.api.calls[n:] if c[0] == kind]
+    by_order = lambda bot, oid: next(t for t in bot.sim_trades().values() if isinstance(t.get("live"), dict) and t["live"].get("order_id") == oid)
+    fair70 = lambda at: hsi(0.70, [("0.55", "300")], [("0.58", "400")], at)
+
+    async def down_after_check(ways, empty=False, **env):
+        """An order resting on Predict, then the operator's /live check while the node is down."""
+        bot = make_bot(SIM_WAYS=ways, PREDICT_ACCOUNT=PA, **env)
+        await bot.live_prepare()
+        world["markets"] = [fair70(NOW)]
+        await bot.live_prefetch(NOW)
+        await step(bot, NOW, fair70(NOW))
+        tid = f"{HSI_SLUG}|up|{'挂' if ways == 'maker' else '吃'}"
+        oid = bot.sim_trades()[tid]["live"]["order_id"]
+        assert bot.live.ready and oid in bot.live.api.open, (bot.live.not_ready_why, sorted(bot.live.api.open))
+        tries = node_down(bot, empty)
+        await bot.live_action("check", [], NOW + 2_000)
+        why = "链上没有 Predict 账户" if empty else "无法在链上核对 PREDICT_ACCOUNT 的控制钥匙"
+        assert not bot.live.ready and not bot.live.ready_error and why in bot.live.not_ready_why, bot.live.not_ready_why  # signed in, not ready
+        assert "未就绪" in bot.live_room({}, fair70(NOW + 2_000), "up", 0.55, 100)  # unchanged: nothing new while not ready
+        return bot, tid, oid, tries, len(bot.live.api.calls)
+
+    # a maker whose edge is gone (fair 70¢ → 40¢ under a 55¢ bid, SIM_MAKER_EXIT_CENTS 5): withdrawn and removed, the retry failing again
+    for empty in (False, True):
+        bot, tid, oid, tries, n = await down_after_check("maker", empty=empty, SIM_MAKER_EXIT_CENTS="5")
+        a_minute_on(bot)
+        await step(bot, NOW + 10_000, hsi(0.40, [("0.55", "300")], [("0.58", "400")], NOW + 10_000))
+        t = by_order(bot, oid)
+        assert not bot.live.ready and len(tries) >= 2, (bot.live.ready, tries)
+        assert sent(bot, n, "remove") == [[oid]] and oid not in bot.live.api.open, (empty, sent(bot, n, "remove"), t["live"]["state"], t["live"].get("cancel_why"))
+        assert (t["status"], t["live"]["state"]) == ("cancelled", "done") and "低于撤单线" in t["live"]["cancel_why"], (t["status"], t["live"])
+        assert not sent(bot, n, "create")
+    # ...and once the node answers again, the next retry makes the bot ready: the slot is quoted again as usual
+    node_back(bot)
+    a_minute_on(bot)
+    await step(bot, NOW + 75_000, fair70(NOW + 75_000))
+    assert bot.live.ready and len(sent(bot, n, "create")) == 1, (bot.live.not_ready_why, sent(bot, n, "create"))
+
+    # a taker's rest: removed at LIVE_TAKER_WAIT_SECONDS, the 40 shares Predict filled meanwhile read and kept a position
+    bot, tid, oid, tries, n = await down_after_check("taker")
+    bot.live.api.fill(oid, 40, price="0.58")
+    a_minute_on(bot)
+    await step(bot, NOW + 61_000, fair70(NOW + 61_000))
+    t = by_order(bot, oid)
+    assert sent(bot, n, "remove") == [[oid]] and oid not in bot.live.api.open and t["live"]["state"] == "done", (sent(bot, n, "remove"), t["live"])
+    assert (t["status"], t["shares"], t.get("unfilled")) == ("filled", 40, 60), (t["status"], t["shares"], t.get("unfilled"))
+    assert not bot.live.ready and not sent(bot, n, "create")
+
+    # LIVE=off and the loss stop while the node is down: their withdrawals go out at the next step
+    for how in ("off", "kill"):
+        bot, tid, oid, tries, n = await down_after_check("maker")
+        if how == "off":
+            await bot.live_set_mode("off")
+        else:
+            bot.live_daily_pnl = lambda trades, now_ms: -60.0  # past LIVE_MAX_DAILY_LOSS_USD (50)
+        a_minute_on(bot)
+        await step(bot, NOW + 10_000, fair70(NOW + 10_000))
+        t = by_order(bot, oid)
+        assert sent(bot, n, "remove") == [[oid]] and oid not in bot.live.api.open and t["live"]["state"] == "done", (how, sent(bot, n, "remove"), t["live"])
+        assert not sent(bot, n, "create") and (how == "off" or bot.live_killed()), how
+
+    # the express lane: a book that moves the fair price under the bid — the withdrawal decided and its cancel sent in the lane itself
+    bot, tid, oid, tries, n = await down_after_check("maker", SIM_MAKER_EXIT_CENTS="5")
+    world["markets"], bot.market.now = [hsi(0.40, [("0.55", "300")], [("0.58", "400")], NOW + 3_000)], NOW + 3_000
+    await bot.sim_express("HSI")
+    t = by_order(bot, oid)
+    assert sent(bot, n, "remove") == [[oid]] and t["live"]["state"] == "done" and oid not in bot.live.api.open, (sent(bot, n, "remove"), t["live"])
+    assert "低于撤单线" in t["live"]["cancel_why"] and not sent(bot, n, "create") and not bot.live.ready, t["live"].get("cancel_why")
+
+
 asyncio.run(place_timeout_race())
+asyncio.run(account_check_rpc_down())
 print("AUDIT_LIVE_A_OK")
