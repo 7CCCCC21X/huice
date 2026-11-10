@@ -1656,7 +1656,13 @@ async def pick_quote(sources: Any, parse: Any, problem: Any) -> tuple[Any, list[
         except Exception as error:
             notes.append(f"{name}: {clean_error(error) or type(error).__name__}")
             continue
-        why = problem(quote)
+        try:
+            why = problem(quote)
+        except Exception as error:
+            # 1.149.x: a check that cannot run (e.g. a field it divides by came as 0) must not abort the whole round:
+            # the later sources were never asked and the caller kept its old quote. The answer is passed over like a
+            # stale one (why is non-empty, so it is never returned as current) and the next source is tried.
+            why = f"无法校验：{clean_error(error) or type(error).__name__}"
         if not why:
             return quote, notes, ""
         notes.append(f"{name}: {why}")
@@ -2940,9 +2946,15 @@ class IndexFutures:
             day = hk_cash_close_date(now_ms, self.holidays)
         before = hk_previous_day(day, self.holidays)
         expected = self.dated_close(before)
-        if expected is not None and q.spot_prev is not None and abs(percent(q.spot_prev, expected)) > D("0.005"):
-            return (f"恒指现货的前收 {fmt(q.spot_prev)} 不是 {before:%m-%d} 收盘 {fmt(expected)}，"
-                    f"不是 {day:%m-%d} 的行情")
+        if expected is not None and q.spot_prev is not None:
+            if q.spot_prev <= 0:
+                # 1.149.x: a 前收 of 0 (an empty field, which _opt keeps as 0) cannot show which day the figure is.
+                # Refuse it rather than skip the check (skipping would let another day's page through); percent()
+                # would raise on it and abort the refresh round and every caller of spot_problem (hsi_odds).
+                return f"恒指现货的前收为 0，无法确认是 {day:%m-%d} 的行情"
+            if abs(percent(q.spot_prev, expected)) > D("0.005"):
+                return (f"恒指现货的前收 {fmt(q.spot_prev)} 不是 {before:%m-%d} 收盘 {fmt(expected)}，"
+                        f"不是 {day:%m-%d} 的行情")
         return ""
 
     def spot_still(self, q: FuturesQuote, now_ms: int) -> str:

@@ -170,4 +170,60 @@ async def feed_sync_clock() -> None:
 
 asyncio.run(feed_sync_clock())
 
+
+# FEED-SPOT-PREV-ZERO: one cash-index source answering a 前收 of 0 (an empty field kept as 0) made spot_problem raise
+# in percent(), and pick_quote ran problem() outside its try: the whole IndexFutures.refresh aborted, Sina (good
+# figure) was never asked and self.quote stayed stale. The zero prev must be refused and the next source tried.
+async def feed_spot_prev_zero() -> None:
+    import datetime as dt, json
+    D = m.D
+
+    def ms(d: int, h: int, mi: int) -> int:
+        return int(dt.datetime(2026, 9, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+
+    now = ms(23, 10, 30)
+    asked: list[str] = []
+
+    async def fake_get(url, timeout=15, headers=None):
+        asked.append(url)
+        if "etnet" in url:
+            raise m.RemoteError("HTTP 502")
+        if "134.HSI_M" in url:
+            return json.dumps({"data": {"f43": 24822.0, "f60": 25055.0, "f86": now // 1000, "f58": "恒指主连"}}).encode()
+        if "100.HSI" in url:  # the cash index with an empty 前收 written as 0
+            return json.dumps({"data": {"f43": 24834.12, "f60": 0, "f86": now // 1000}}).encode()
+        if "rt_hkHSI" in url:
+            return ('var hq_str_rt_hkHSI="HSI,恒生指数,25064.84,25087.75,25072.25,24811.85,24834.12,'
+                    + ",".join(["0"] * 10) + ',2026/09/23,10:30:00";').encode("gbk")
+        raise m.RemoteError("HTTP 404")
+
+    real_get, real_health = m.http_get, m.SOURCE_HEALTH
+    m.http_get, m.SOURCE_HEALTH = fake_get, m.SourceHealth()
+    try:
+        # (a) the refresh round survives the zero 前收 and takes Sina's cash index
+        h = m.IndexFutures(True, frozenset())
+        h.dated_close = lambda day: D("25087.75") if day == dt.date(2026, 9, 22) else None
+        await h.refresh(now, force=True)
+        assert any("rt_hkHSI" in url for url in asked), asked
+        assert h.quote is not None and "新浪" in h.quote.spot_source, h.quote
+        assert h.quote.spot_prev == D("25087.75") and h.spot_problem(h.quote, now) == "", h.quote
+        # (b) a stored quote with a zero 前收 is refused (not raised on) once the dated close is known
+        zero = m.FuturesQuote("恒指", D("24822"), D("25055"), None, None, None, now, "东方财富",
+                              spot=D("24834.12"), spot_source="东方财富", spot_prev=D(0), spot_ms=now)
+        why = h.spot_problem(zero, now)
+        assert why and "前收" in why, why
+        # (c) a check that raises passes the source over instead of aborting pick_quote
+        sources = [("东方财富", "https://push2.eastmoney.com/api/qt/stock/get?secid=100.HSI", {})]
+
+        def boom(quote):
+            raise ValueError("数值必须是正的有限数字")
+
+        best, notes, error = await m.pick_quote(sources, lambda name, raw: zero, boom)
+        assert best is zero and error and "数值必须是正的有限数字" in notes[0], (best, notes, error)
+    finally:
+        m.http_get, m.SOURCE_HEALTH = real_get, real_health
+
+
+asyncio.run(feed_spot_prev_zero())
+
 print("AUDIT_FEEDS_OK")
