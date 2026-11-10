@@ -13460,7 +13460,7 @@ let sumOpen=true;try{sumOpen=localStorage.getItem("jrnsum")!=="0"}catch(e){}  //
 let anaOpen=false;try{anaOpen=localStorage.getItem("jrnana")==="1"}catch(e){}  // the analysis tables: folded unless opened by hand
 const base=location.pathname.replace(/\/journal\/?$/,"");
 document.getElementById("back").href=base;document.getElementById("ctl").href=base+"/control";
-document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";  // also right under /journal/
+document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";document.getElementById("mcsv").href=base+"/samples.csv";  // also right under /journal/ (CTRL-MCSV: the 导出模型样本 link too, else /journal/samples.csv 404s)
 function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
   if(MS_KEYS.has(k))return v?when(v):"—";if(k==="high_at")return v?when(v*1000):"—";if(CENT_KEYS.has(k))return cent(v);
   if(k==="sigma_daily"||k==="sigma"||k==="sigma_raw")return (v*100).toFixed(2)+"%";if(k==="history")return JSON.stringify(v);

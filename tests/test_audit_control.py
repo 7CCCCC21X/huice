@@ -121,4 +121,30 @@ def ctrl_ladder_hot():
 
 
 ctrl_ladder_hot()
+
+
+def ctrl_mcsv():
+    # CTRL-MCSV: the review page rewrote csv/scsv/json to base+"/..." so they also work when the page is opened as
+    # /p/<t>/journal/ (trailing slash, which route serves too), but left 导出模型样本 (mcsv) relative: from there the browser
+    # resolved it to /p/<t>/journal/samples.csv, a 404.
+    import re, urllib.parse
+    src = m.JOURNAL_PAGE
+    assert 'getElementById("mcsv").href=base+"/samples.csv"' in src, "mcsv link must be rewritten like csv/scsv/json"
+    # what the page's script computes, for both forms of the journal URL, lands on the served samples.csv
+    class B:
+        def window_csv(self): return "a,b\n1,2\n"
+    ws = m.WebServer.__new__(m.WebServer)
+    ws.token, ws.bot, ws.pages = TOKEN, B(), {"page": b"p", "journal": b"j", "control": b"c"}
+    for page in ("/p/" + TOKEN + "/journal", "/p/" + TOKEN + "/journal/"):
+        assert ws.route("GET", page)[0] == 200
+        base_ = re.sub(r"/journal/?$", "", page)
+        href = urllib.parse.urlsplit(urllib.parse.urljoin("http://h" + page, base_ + "/samples.csv")).path
+        status, ctype, body = ws.route("GET", href)
+        assert status == 200 and ctype.startswith("text/csv") and body == b"a,b\n1,2\n", (page, href, status)
+    # the relative href alone 404s from the trailing-slash page: that is why the script must rewrite it
+    rel = urllib.parse.urlsplit(urllib.parse.urljoin("http://h/p/" + TOKEN + "/journal/", "samples.csv")).path
+    assert ws.route("GET", rel)[0] == 404
+
+
+ctrl_mcsv()
 print("AUDIT_CONTROL_OK")
