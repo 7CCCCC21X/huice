@@ -584,9 +584,15 @@ def review_side(name: str, side: str, qs: list[dict]) -> dict:
 
 
 def ev_bets(rows: list[dict]) -> list[dict]:
-    """The mode's settled fills as bets for the review page's 模型 EV 对实际盈亏 (core.sim_ev_timeline, 1.140.0): each filled side
-    of an accounted pair is one coin-flip bet at the pair's price — EV = (0.5 − price) × filled, P&L the side's own (side_pnl),
-    the variance filled² / 4. A pair without a sent order, an unsettled one or a side whose result is not kept is no bet."""
+    """The mode's settled fills as bets for the review page's 模型 EV 对实际盈亏 (core.sim_ev_timeline, 1.140.0): each accounted
+    pair (one window) is one bet at the pair's price over its filled sides — EV = (0.5 − price) × the shares filled, P&L the
+    filled sides' own (side_pnl) summed, the variance that of the unhedged part: (filled_up − filled_down)² / 4.
+    1.150.x: the window's two sides settle on the same coin flip X, so the pair pays filled_up · X + filled_down · (1 − X) − cost
+    and only the difference of the fills is at risk; a window filled alike on both sides is a near-certain payoff. Counted as two
+    independent flips (filled² / 4 each, as before) it added variance it does not have — σ grew, z was pulled to 0 and the 激进
+    verdict (and the hourly "模型把优势看高了" notice) could be hidden behind the hedged windows; it also counted the window twice
+    toward EV_MIN_BETS. A one-sided window keeps core.ev_bet's filled² / 4. A pair without a sent order, an unsettled one or a
+    side whose result is not kept is no bet (a window none of whose filled sides is kept is skipped)."""
     out = []
     for pair in rows:
         if not any(o.get("state") not in NEVER_PLACED for o in (pair.get("orders") or {}).values()):
@@ -594,10 +600,15 @@ def ev_bets(rows: list[dict]) -> list[dict]:
         q = quote_of(pair)
         if not q["settled"]:
             continue
-        for side in ("up", "down"):
-            filled, pnl = q[f"filled_{side}"], q["side_pnl"][side]
-            if filled > 0 and pnl is not None:
-                out.append(core.ev_bet(q["start_ms"], "预挂", q["card"], q["price"], filled, 0.5, (0.5 - q["price"]) * filled, pnl))
+        kept = {side: (q[f"filled_{side}"], q["side_pnl"][side]) for side in ("up", "down")
+                if q[f"filled_{side}"] > 0 and q["side_pnl"][side] is not None}
+        if not kept:
+            continue
+        filled = sum(f for f, _ in kept.values())
+        bet = core.ev_bet(q["start_ms"], "预挂", q["card"], q["price"], filled, 0.5, (0.5 - q["price"]) * filled, sum(x for _, x in kept.values()))
+        if len(kept) == 2:
+            bet["var"] = (kept["up"][0] - kept["down"][0]) ** 2 * 0.25
+        out.append(bet)
     return out
 
 

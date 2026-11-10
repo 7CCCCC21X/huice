@@ -20586,7 +20586,7 @@ class Bot:
 
     def sim_ev(self, trades: list[dict] | None = None, preopen: bool = True) -> dict:
         """模型 EV 对实际盈亏 (sim_ev_timeline, 1.140.0) over ``trades`` (every record when None) and, when ``preopen``, the
-        pre-open mode's settled fills (preopen.ev_bets: each filled side a coin-flip bet at its price)."""
+        pre-open mode's settled fills (preopen.ev_bets: each window one coin-flip bet at its price, 1.150.x)."""
         bets = sim_ev_bets(list(self.sim_trades().values()) if trades is None else trades)
         if preopen and (rows := self.preopen_rows()):
             from preopen import ev_bets
