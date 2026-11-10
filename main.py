@@ -5059,6 +5059,7 @@ async def predict_blocking(fn: Any, *args: Any) -> Any:
     return await asyncio.get_running_loop().run_in_executor(predict_pool(), fn, *args)
 PREDICT_BACKOFF_SECONDS = 20    # after a 429 without retry_after: how long every Predict request waits
 PREDICT_META_SECONDS = 600     # outcome names / status of a ladder market are re-read this often
+PREDICT_META_KEEP_SECONDS = 86400  # FEED-CACHE-GROWTH: a market no card follows any more loses its details/fee after a day untouched
 PREDICT_REWARD_SECONDS = 60    # price-ladder reward metadata is refreshed every minute
 PREDICT_REWARD_STALE_SECONDS = 120  # allows the normal refresh to finish across a 60-second alert confirmation
 PREDICT_POINTS_STALE_SECONDS = 3 * PREDICT_META_SECONDS  # other markets' points (read with the fee) are shown this long
@@ -6139,10 +6140,28 @@ class PredictFeed:
                 table.pop(key)
         self.slugs = dict(targets)
         keep = set(targets.values())  # yesterday's daily slugs are not kept around for ever
-        for table in (self.markets, self.market_lists, self.strikes, self.types, self.info):
+        # FEED-CACHE-GROWTH: category_raw too (strike() reads it only for the current slug and re-reads it when missing;
+        # /market writes it afresh right before reading it). A 5/15-minute window card gets a new slug every window, so
+        # without this the whole REST category answer of every past window stayed for the life of the process.
+        for table in (self.markets, self.market_lists, self.strikes, self.types, self.info, self.category_raw):
             for slug in [s for s in table if s not in keep]:
                 table.pop(slug, None)
         now = time.monotonic()
+        # FEED-CACHE-GROWTH: the market-id tables (details incl. rules, fee, the key that answered the orderbook, the
+        # last details failure) grew by one market per window too. A market some current card still follows (its book,
+        # a level of its ladder, its resolved market) is never dropped here; any other entry goes once nothing has
+        # refreshed it for PREDICT_META_KEEP_SECONDS (current markets are re-read every PREDICT_META_SECONDS, so a day
+        # untouched means a past window). Losing one costs a single REST read later, never a wrong answer.
+        live = ({str(book.market_id) for book in self.books.values()}
+                | {str(row.market_id) for rows in self.ladders.values() for row in rows or ()}
+                | {str(m[0]["id"]) for m in self.markets.values() if m and isinstance(m[0], dict) and m[0].get("id") is not None})
+        for table in (self.market_meta, self.fees):
+            for mid in [k for k, v in table.items() if k not in live and now - v[1] >= PREDICT_META_KEEP_SECONDS]:
+                table.pop(mid, None)
+        known = live | set(self.market_meta) | set(self.fees)
+        for table in (self.book_keys, self.meta_errors):
+            for mid in [k for k in table if k not in known]:
+                table.pop(mid, None)
         cold = getattr(self.config, "predict_cold_poll", 0) or 0
         wall = int(time.time() * 1000)
 
