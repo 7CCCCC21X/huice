@@ -21556,10 +21556,17 @@ class Bot:
             return
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
         hour, minute = (int(x) for x in clock.split(":"))
-        due_at = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if local < due_at or local - due_at > dt.timedelta(milliseconds=self.REPORT_WINDOW_MS):
+        # 1.150.0: the catch-up window may run past Beijing midnight (a late SIM_DAILY_REPORT such as 23:30, with the bot
+        # down at the hour or Telegram refusing until after 00:00). Taking only today's due time cut the window at
+        # midnight: at 00:10 the due time became tonight's 23:30 and yesterday's report was lost for good. So the due time
+        # is the latest of today's and yesterday's that has passed (BEIJING has a fixed offset, so a day back is exact),
+        # and the report, its text and its record belong to that day, not to `local`.
+        today_due = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        due_at = today_due if today_due <= local else today_due - dt.timedelta(days=1)
+        if local - due_at > dt.timedelta(milliseconds=self.REPORT_WINDOW_MS):
             return
-        day_key = f"simreport:{local.date().isoformat()}"
+        report_day = due_at.date()
+        day_key = f"simreport:{report_day.isoformat()}"
         due = [(sub_id, sub) for sub_id, sub in self.subscriptions().items() if sub.get("active")
                and not self.store.get(f"{day_key}:{sub_id}") and not self.delivering(f"{day_key}:{sub_id}")]
         if not due:
@@ -21573,7 +21580,7 @@ class Bot:
             key = f"{day_key}:{sub_id}"
             private = bool(self.config.admin_id) and (sub["chat"], sub["thread"]) == (self.config.admin_id, 0)
             if private not in texts:
-                texts[private] = self.daily_report_text(now_ms, link=private)
+                texts[private] = self.daily_report_text(now_ms, link=private, day=report_day)
             text = texts[private]
             if not text:
                 self.store.put(key, {"skipped": now_ms})  # nothing to say today: the day is done for this subscription
@@ -21584,13 +21591,15 @@ class Bot:
                     self.store.put(key, self.market.now_ms())
             self.deliver(key, send)
 
-    def daily_report_text(self, now_ms: int, link: bool = True) -> str:
+    def daily_report_text(self, now_ms: int, link: bool = True, day: dt.date | None = None) -> str:
         """The day's trading for Telegram (bold sentinels; send as HTML): what was ordered today and how it filled, the
         underlyings with the most records, what settled today and its P&L, the open positions with their unrealized P&L
         at the books' middles, the lifetime, the resting orders' fill rate, and (link) the review page's link. "" when there
-        is nothing to say: no record opened or settled today, no position held, no order resting."""
+        is nothing to say: no record opened or settled today, no position held, no order resting. `day` (Beijing) is the
+        day reported, by default now_ms's; daily_report passes yesterday for a catch-up sent after midnight. Positions,
+        marks and the lifetime are always as of now_ms."""
         trades = list(self.sim_trades().values())
-        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+        today = day or dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         day_of = lambda ms: dt.datetime.fromtimestamp(int(ms or 0) / 1000, BEIJING).date()
         today_rows = [t for t in trades if day_of(t.get("opened")) == today]
         settled_rows = [t for t in trades if t["status"] == "settled" and day_of(t.get("settled")) == today]

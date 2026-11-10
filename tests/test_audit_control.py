@@ -183,4 +183,45 @@ async def ctrl_report_token():
 
 
 asyncio.run(ctrl_report_token())
+async def ctrl_report_midnight():
+    # CTRL-REPORT-MIDNIGHT: with a late SIM_DAILY_REPORT (23:30) the "sent when back, up to REPORT_WINDOW_MS later"
+    # catch-up stopped at Beijing midnight: at 00:10 the due time was recomputed as tonight's 23:30, so yesterday's
+    # report was never sent nor recorded. Now the latest passed due time (yesterday's 23:30) counts, and the report,
+    # its text and its record are for that day.
+    import datetime as dt
+    BJ = lambda d, h, mi: int(dt.datetime(2026, 11, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+    bot = m.Bot(m.Config.from_env({**base, "SIM_DAILY_REPORT": "23:30"}), m.Store(":memory:"), FM(BJ(11, 0, 10)), None)
+    assert bot.config.sim and bot.config.predict
+    bot.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    yesterday = BJ(10, 22, 0)  # one record opened and settled on 11-10, nothing on 11-11
+    bot.sim_trades = lambda: {"a": {"status": "settled", "opened": yesterday, "settled": yesterday + 60_000, "price": .4,
+                                    "shares": 10, "payout": 1, "edge": .1, "maker": True, "item": "BTC"}}
+    sent = []
+
+    async def tell(chat, thread, text, **kw):
+        sent.append(text)
+        return True
+    bot.tell = tell
+    await bot.daily_report(BJ(11, 0, 10))  # back 40 minutes after 23:30, past midnight
+    await bot.drain_deliveries()
+    assert len(sent) == 1, sent
+    assert bot.store.get("simreport:2026-11-10:1:0") and not bot.store.keys("simreport:2026-11-11"), bot.store.keys("simreport:")
+    assert "11-10" in sent[0] and "今天结算 1 笔" in sent[0] and "今天下单 1 笔" in sent[0], sent[0]
+    await bot.daily_report(BJ(11, 0, 20)); await bot.drain_deliveries()
+    assert len(sent) == 1  # once a day
+    # more than six hours after yesterday's 23:30 (and before tonight's): nothing is sent or recorded
+    late = m.Bot(bot.config, m.Store(":memory:"), FM(BJ(11, 6, 0)), None)
+    late.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    late.sim_trades, late.tell = bot.sim_trades, tell
+    await late.daily_report(BJ(11, 6, 0)); await late.drain_deliveries()
+    assert len(sent) == 1 and not late.store.keys("simreport:")
+    # the same-day path is unchanged: at 23:40 on 11-10 the 11-10 report goes
+    same = m.Bot(bot.config, m.Store(":memory:"), FM(BJ(10, 23, 40)), None)
+    same.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    same.sim_trades, same.tell = bot.sim_trades, tell
+    await same.daily_report(BJ(10, 23, 40)); await same.drain_deliveries()
+    assert len(sent) == 2 and same.store.get("simreport:2026-11-10:1:0") and "11-10" in sent[1]
+
+
+asyncio.run(ctrl_report_midnight())
 print("AUDIT_CONTROL_OK")
