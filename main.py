@@ -19369,7 +19369,17 @@ class Bot:
         the attempt stays in the journal. A record already numbered keeps its key."""
         if "#" in tid.rsplit("|", 1)[-1]:
             return tid
-        numbers = [int(k.rpartition("#")[2]) for k in self.sim_trades() if k.startswith(tid + "#") and k.rpartition("#")[2].isdigit()]
+        current = self.sim_trades()
+        # 1.150.x: already moved. sim_decide takes its copy of the records and then yields once; a placement task resuming in
+        # that slice can fail or end the record (live_fail / live_end_unsent -> slot#1), and the step, still seeing it under the
+        # slot in its stale copy, asked to move it again: the same attempt was stored a second time at slot#2. The record's
+        # own marker alone is not proof (a record cloned back to the slot keeps its old "rekeyed"), nor is the cache's identity
+        # (a rebuild holds new objects): moved only when the marker names a tid#n that exists AND the slot no longer does.
+        live = trade.get("live")
+        moved = live.get("rekeyed") if isinstance(live, dict) else None
+        if isinstance(moved, str) and moved.startswith(tid + "#") and tid not in current and moved in current:
+            return moved
+        numbers = [int(k.rpartition("#")[2]) for k in current if k.startswith(tid + "#") and k.rpartition("#")[2].isdigit()]
         new_tid = f"{tid}#{max(numbers, default=0) + 1}"  # past the highest ever used: a number sim_prune removed is never reused
         if isinstance(trade.get("live"), dict):
             trade["live"]["rekeyed"] = new_tid

@@ -128,4 +128,48 @@ async def live_yield_allowance():
 
 
 asyncio.run(live_yield_allowance())
+
+async def live_double_rekey():
+    """LIVE-DOUBLE-REKEY: sim_decide takes its copy of the records, then yields once (sleep(0)). An express placement whose
+    store flush returns in that slice fails its gate (decision 91 s old) -> live_fail -> sim_rekey(slot -> slot#1); the step
+    then found the record still under the slot in its stale copy, spent, and re-keyed it AGAIN (slot -> slot#2): one
+    attempt stored twice. sim_rekey now returns the key the record already moved to."""
+    import live as L, types
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare(); await bot.live_prefetch(NOW)
+    release = asyncio.Event()
+    async def slow_to_thread(fn, *a, **k):  # the store flush the placement waits for (a busy writer)
+        await release.wait()
+        return fn(*a, **k)
+    real_asyncio = L.asyncio
+    L.asyncio = types.SimpleNamespace(**{n: getattr(asyncio, n) for n in dir(asyncio) if not n.startswith("__")})
+    L.asyncio.to_thread = slow_to_thread
+    try:
+        bot.market.now = NOW
+        T["world"]["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+        express = asyncio.create_task(bot.sim_express("HSI"))  # decides the maker, sends it: waits in the flush
+        for _ in range(500):
+            if bot.live_placing:
+                break
+            await asyncio.sleep(0.01)
+        assert bot.live_placing, "the express placement never reached the flush"
+        tid = next(iter(bot.live_placing))
+        later = NOW + 91_000  # the decision is too old when the flush returns
+        bot.market.now = later
+        T["world"]["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], later)]
+        release.set()  # the placement task resumes at the step's next yield: sim_decide's sleep(0)
+        async with bot.sim_lock:
+            confirm = await bot.sim_decide(later)
+        await confirm
+        await express
+    finally:
+        L.asyncio = real_asyncio
+    keys = sorted(k for k in bot.store.keys("sim:") if k.startswith(f"sim:{tid}"))
+    assert f"sim:{tid}#2" not in keys and f"sim:{tid}#2" not in [f"sim:{k}" for k in bot.sim_trades()], keys
+    one = bot.store.get(f"sim:{tid}#1")
+    assert one is not None and one["live"].get("final") == "failed" and one["live"].get("rekeyed") == f"{tid}#1", (keys, one and one["live"])
+    assert any("决定已过时" in e["what"] for e in one["live"]["events"]), one["live"]["events"]
+
+
+asyncio.run(live_double_rekey())
 print("AUDIT_LIVE_B_OK")
