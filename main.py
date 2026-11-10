@@ -22294,7 +22294,20 @@ class Bot:
         threshold = D(settings["threshold"])
         self.last_cycle = time.time()
         try:
-            await self.market.sync_clock()
+            # FEED-SYNC-CLOCK: a failed re-sync (the /time read refused during a 418/429 cooldown that a klines or
+            # price_at read started, or one failed /time request) used to abort the whole cycle, so every contract
+            # snapshot showed the error for the rest of the cooldown although the pushed stream rows were fresh.
+            # The offset drifts by a few ms over minutes, so after a successful sync within the last hour the old
+            # offset is kept and the cycle goes on; clock_checked moves only on success, so the next cycle retries
+            # (and get() sends nothing while the cooldown lasts). Never synced (offset still 0, the raw local clock)
+            # or the last good sync over an hour old: the failure still aborts the cycle as before.
+            try:
+                await self.market.sync_clock()
+            except Exception as error:
+                checked = getattr(self.market, "clock_checked", 0.0) or 0.0
+                if not checked or time.monotonic() - checked >= 3600:
+                    raise
+                self.log_limited("clock", f"币安对时失败，沿用上次时钟偏移：{clean_error(error)}")
             rows = await self.market.prices()
             now_ms = self.market.now_ms()
         except Exception as error:

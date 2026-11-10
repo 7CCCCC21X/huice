@@ -110,4 +110,64 @@ async def feed_cache_growth() -> None:
 
 asyncio.run(feed_cache_growth())
 
+
+# FEED-SYNC-CLOCK: a failed clock re-sync (the /time read refused during a Binance cooldown) must not abort the cycle
+# when the clock synced before and the pushed stream rows are fresh; with no sync yet it still aborts
+async def feed_sync_clock() -> None:
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "SYMBOLS": "UNITREEUSDT",
+                             "BASELINE_MODE": "manual", "AUCTION_ALERT": "off"})
+
+    class TG:
+        async def send(self, *a, **k):
+            pass
+
+    def build():
+        store = m.Store(":memory:")
+        market = m.Binance(cfg)
+
+        class FreshStream:
+            def rows(self, symbols):
+                return {s: {"symbol": s, "price": "76", "time": market.now_ms()} for s in symbols}
+
+            def seed(self, rows):
+                pass
+
+        bot = m.Bot(cfg, store, market, TG())
+        market.stream = FreshStream()
+        store.put(f"manual:UNITREEUSDT:{m.beijing_day()}", {"value": "75", "valid_date": m.beijing_day()})
+        return bot, market
+
+    real = m.http_json
+
+    async def no_http(*a, **k):
+        raise AssertionError("no request may go out during the cooldown")
+
+    m.http_json = no_http
+    try:
+        # synced 601 s ago (re-sync due) and a 418 cooldown running: the stream rows still serve
+        bot, market = build()
+        market.offset_ms = 37
+        market.clock_checked = time.monotonic() - 601
+        market.blocked_until = time.monotonic() + 120
+        await bot.one_cycle()
+        snap = bot.snapshots["UNITREEUSDT"]
+        assert "quote" in snap and "error" not in snap, snap
+        assert market.offset_ms == 37 and time.monotonic() - market.clock_checked > 600  # old offset kept; retried next cycle
+        # never synced (offset 0 = raw local clock): the failure still aborts the cycle
+        bot, market = build()
+        market.blocked_until = time.monotonic() + 120
+        await bot.one_cycle()
+        assert bot.snapshots["UNITREEUSDT"] == {"error": "币安接口冷却中，暂停请求"}, bot.snapshots
+        # the last good sync over an hour old: it aborts too
+        bot, market = build()
+        market.clock_checked = time.monotonic() - 3601
+        market.blocked_until = time.monotonic() + 120
+        await bot.one_cycle()
+        assert bot.snapshots["UNITREEUSDT"] == {"error": "币安接口冷却中，暂停请求"}, bot.snapshots
+    finally:
+        m.http_json = real
+
+
+asyncio.run(feed_sync_clock())
+
 print("AUDIT_FEEDS_OK")
