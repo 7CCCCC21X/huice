@@ -2879,12 +2879,22 @@ class LiveBot(core.Bot):
         """An automatic redeem round started when one is due (LIVE_REDEEM_SECONDS since the last, sooner after a win:
         live_redeem_soon) and none runs — beside the caller: a round of chain calls (a dozen positions failing on gas took
         25 s) never holds a decision. Called by the trading step and by the redeem's own loop."""
-        if not self.config.live_auto_redeem or (self.config.live_mode == "off" and not self.live.ready):
+        if not self.config.live_auto_redeem or self.live_redeem_shut():
             return
         if time.monotonic() - self.live_last_redeem < self.LIVE_REDEEM_SECONDS or (self.live_redeem_task is not None and not self.live_redeem_task.done()):
             return
         self.live_last_redeem = time.monotonic()
         self.live_redeem_task = asyncio.create_task(self.live_redeem_round(self.market.now_ms() if now_ms is None else now_ms), name="live-redeem")
+
+    def live_redeem_shut(self) -> str:
+        """Why no automatic redeem round can start now, "" when one can (LIVE_AUTO_REDEEM aside): live_redeem_tick's gate, and
+        the words live_redeem_status_line says it in — one test for both, so the line follows the gate (1.150.0). LIVE=off
+        and not ready: an off process does not sign in to Predict by itself (off 只记账): started in off it stays so until a
+        command signs in (/live redeem, /live redeem check, /live check) or /live mode pause|on; switched to off while
+        running it keeps the sign-in it had, and its rounds go on."""
+        if self.config.live_mode == "off" and not self.live.ready:
+            return f"LIVE=off 且未就绪（{self.live.not_ready_why}）"
+        return ""
 
     async def live_redeem_loop(self) -> None:
         """The automatic redeem's own timer (1.131.4): it rode on the paper trader's step only, so with SIM=off (the
@@ -4913,7 +4923,16 @@ class LiveBot(core.Bot):
             return "自动领取：关（/live redeem 手动领取）"
         last = getattr(self, "live_redeem_last", {}) or {}
         task = getattr(self, "live_redeem_task", None)
-        when = f"上一轮 {max(0, int((self.market.now_ms() - int(last['at'])) / 60_000))} 分钟前：{self.live_redeem_summary(last)}" if last.get("at") else "本次启动后还没跑过"
+        ago = f"上一轮 {max(0, int((self.market.now_ms() - int(last['at'])) / 60_000))} 分钟前：{self.live_redeem_summary(last)}" if last.get("at") else ""
+        if shut := self.live_redeem_shut():
+            # 1.150.0 (audit RDM-OFF-NO-SIGNIN): a process started in LIVE=off does not sign in to Predict by itself (as designed:
+            # off 只记账), so live_redeem_tick's gate stays shut and no automatic round runs for the positions still held — a
+            # restart after /live mode off (every deploy) leaves the winners unclaimed — while this line said 自动领取：开｜本次启动后
+            # 还没跑过 for as long as the process lived. It says now that nothing runs, and why (the gate's own words); nothing
+            # in what the bot does changes (a sign-in in off would read the account every minute and sweep its unrecorded
+            # orders). /live redeem claims them (it signs in: the rounds then run, until the next restart)
+            return f"自动领取：开，但 {shut}，不会自动领取（/live redeem 手动领取）" + (f"｜{ago}" if ago else "")
+        when = ago or "本次启动后还没跑过"
         since = int(getattr(self, "live_redeem_since", 0) or 0)  # 1.150.0 (RDM-ROUND-LOCK-STALL): a long round is told from a fresh one
         running = (f"｜正在领取（{core.stamp(since, seconds=False)} 起）" if since
                    else "｜正在领取" if task is not None and not task.done() else "")
@@ -4924,12 +4943,18 @@ class LiveBot(core.Bot):
         the last round, the account's positions by what the redeem makes of each (a dry run of live_redeem_pass), a
         conclusion, the recent redeem problems (1.131.4)."""
         c, wallet = self.config, self.live.wallet
+        shut = self.live_redeem_shut()  # (before the sign-in below: the state the check found)
         if not self.live.ready:
             await self.live_ensure_ready()
         ready = self.live.ready
         lines = [f"🔎 自动领取自检 {core.stamp(now_ms, seconds=False)}",
                  f"开关：自动领取 {'开' if c.live_auto_redeem else '关'}｜LIVE={c.live_mode}｜" + ("已就绪" if ready else f"未就绪：{self.live.not_ready_why}"),
                  self.live_redeem_status_line()]
+        if c.live_auto_redeem and shut and not self.live_redeem_shut():
+            # 1.150.0 (audit RDM-OFF-NO-SIGNIN): the check signs in when not ready, and in LIVE=off that is what opens the automatic
+            # rounds' gate — it said 已就绪 … 下一轮自动领取会领 of the state after its own sign-in, never that until then nothing
+            # had run (a start in off does not sign in): said, and that it lasts until the next restart
+            lines.append(f"{shut}：这次自检之前自动领取没在跑；自检已登录 Predict，从现在到下次重启自动领取照常（LIVE=off 启动时不登录）")
         try:
             bnb = await self.live.chain.bnb_balance()
         except Exception as error:
@@ -5209,7 +5234,10 @@ class LiveBot(core.Bot):
                 if isinstance(st, dict) and t["status"] == "resting" and st.get("state") in {"open", "placing", "unknown"}:
                     self.sim_withdraw(t, "切换到 LIVE=off", now_ms)
                     self.sim_save([(tid, t)])
-            self.live_notify(f"⚪ 真实交易模式 {before} → off：回到只记账，已请求撤掉未成交的真实挂单（以 Predict 的确认为准），已有持仓继续跟踪到结算。")
+            # 1.150.0 (audit RDM-OFF-NO-SIGNIN): ...and what a restart in off then does — no sign-in, so no automatic redeem for the
+            # positions still held (they used to be "followed to settlement" here with no word of it)
+            self.live_notify(f"⚪ 真实交易模式 {before} → off：回到只记账，已请求撤掉未成交的真实挂单（以 Predict 的确认为准），已有持仓继续跟踪到结算；"
+                             "但重启后（每次部署都会重启）LIVE=off 不登录 Predict、不自动领取，赢的持仓发 /live redeem 领。")
         else:
             self.live_last_signin = -1e9
             if before == "off":  # paper orders resting from LIVE=off are not real: withdrawn, placed again as real ones

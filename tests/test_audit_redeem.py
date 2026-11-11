@@ -1569,4 +1569,50 @@ async def loop_not_started():
 asyncio.run(loop_not_started())
 
 
+# --- RDM-OFF-NO-SIGNIN ----------------------------------------------------------------------------------------------------------
+async def off_no_signin():
+    """RDM-OFF-NO-SIGNIN: a process started in LIVE=off does not sign in to Predict by itself (as designed: off 只记账), so
+    live_redeem_tick's gate stays shut and no automatic round runs for the positions still held — a restart after /live mode off
+    left the winners unclaimed — while /live said 自动领取：开｜本次启动后还没跑过, the switch to off said 已有持仓继续跟踪到结算,
+    and /live redeem check (which signs in itself, opening the gate) said 已就绪 … 下一轮自动领取会领 with no word that nothing
+    had run until then. Said now; what the bot does is unchanged (no sign-in, no request in off until a command signs in)."""
+    off_line = "自动领取：开，但 LIVE=off 且未就绪（尚未登录 Predict），不会自动领取（/live redeem 手动领取）"
+    plain = "自动领取：开｜本次启动后还没跑过｜/live redeem check 查原因"
+    bot = make_bot(LIVE="off")
+    fake, chain = bot.live.api, bot.live.chain
+    fake.positions_rows, fake.markets["201"] = [held(201)], mk(201, won=1)
+    api_log = counting(fake, ("ensure_auth", "positions", "market", "orders", "order"))
+    assert bot.live_redeem_status_line() == off_line and off_line in bot.live_text(NOW), bot.live_redeem_status_line()
+    assert "本次启动后还没跑过" not in bot.live_text(NOW)
+    bot.live_redeem_tick()  # the gate itself unchanged: no round, no sign-in, no request
+    assert bot.live_redeem_task is None and api_log == [] and not bot.live.ready, api_log
+    # the check signs in by itself, as before — and now says that until then nothing had run, and until when it runs now
+    report = await bot.live_redeem_report(NOW)
+    assert "开关：自动领取 开｜LIVE=off｜已就绪" in report and plain in report, report
+    assert ("LIVE=off 且未就绪（尚未登录 Predict）：这次自检之前自动领取没在跑；自检已登录 Predict，从现在到下次重启自动领取照常"
+            "（LIVE=off 启动时不登录）") in report, report
+    assert bot.live_redeem_status_line() == plain, "signed in: the gate is open, the usual line"
+    await auto_round(bot)  # ready in off: the rounds run (as after a switch to off while running)
+    assert [cid for cid, *_ in chain.redeemed] == [cond(201)], chain.redeemed
+    assert "这次自检之前" not in await bot.live_redeem_report(NOW + MIN), "ready before this check: no such line"
+    # readiness lost in off with a round behind it: said, the round kept
+    bot.live.ready_error = "HTTP 401: Unauthorized"
+    line = bot.live_redeem_status_line()
+    assert line.startswith("自动领取：开，但 LIVE=off 且未就绪（HTTP 401: Unauthorized），不会自动领取（/live redeem 手动领取）｜上一轮 0 分钟前：持仓 1 个"), line
+    # LIVE=on: the usual line; the switch to off says what a restart then does (the process itself stays signed in: rounds go on)
+    on = await ready_bot()
+    assert on.live_redeem_status_line() == plain, on.live_redeem_status_line()
+    sent = notices(on)
+    await on.live_set_mode("off")
+    assert len(sent) == 1 and sent[0][1].startswith("⚪ 真实交易模式 on → off：回到只记账") and "已有持仓继续跟踪到结算" in sent[0][1], sent
+    assert "但重启后（每次部署都会重启）LIVE=off 不登录 Predict、不自动领取，赢的持仓发 /live redeem 领。" in sent[0][1], sent
+    assert on.live_redeem_status_line() == plain, on.live_redeem_status_line()
+    # LIVE_AUTO_REDEEM=off: as before
+    assert make_bot(LIVE="off", LIVE_AUTO_REDEEM="off").live_redeem_status_line() == "自动领取：关（/live redeem 手动领取）"
+    print("RDM_OFF_NO_SIGNIN_OK")
+
+
+asyncio.run(off_no_signin())
+
+
 print("AUDIT_REDEEM_OK")
