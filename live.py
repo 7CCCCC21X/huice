@@ -1426,6 +1426,7 @@ class LiveTrader:
         self.ready_at = 0.0
         self.account_error = ""  # a Predict account the key does not control (checked on-chain): nothing is sent
         self.account_checked = False  # the on-chain check has succeeded (a plain wallet needs none): "no error" alone is not readiness
+        self.account_reread = ""  # why the last RE-read of an account verified in this run failed (display only: verify_account, 1.150.0)
         self.balance: tuple[int, int, float] | None = None  # (USDT wei, BNB wei, when)
         self.balance_error = ""
         self.approvals: dict[str, bool] = {}  # exchange key -> allowance in place (read from the chain)
@@ -1463,9 +1464,23 @@ class LiveTrader:
         try:
             owner = await self.chain.account_owner(self.wallet.predict_account)
         except Exception as error:
-            self.account_error = f"无法在链上核对 PREDICT_ACCOUNT 的控制钥匙：{core.clean_error(error) or type(error).__name__}"
-            self.account_checked = False  # not verified: not ready, whatever the sign-in said
-            raise core.RemoteError(self.account_error) from None
+            why = core.clean_error(error) or type(error).__name__
+            text = f"无法在链上核对 PREDICT_ACCOUNT 的控制钥匙：{why}"
+            if self.account_checked:
+                # 1.150.0 (audit RDM-CHECK-UNREADIES): a failed RE-read keeps the verification this run already made. The key that
+                # controls the account does not change while the process runs, and nothing re-reads it on a timer — only the start,
+                # /live check (the page's 自检), /live mode pause|on and the not-ready retries do. One timeout or a public node's
+                # "limit exceeded" at the owner's own self-check un-readied a bot that traded a minute before: no new order or
+                # pre-open quote, the redeem round starting in that minute voided (真实交易未就绪), a 🔴 未就绪 and a ✅ 登录成功
+                # push a minute later when the step's retry found the node again (with SIM=off: the next redeem round's retry,
+                # minutes on). The failure is still raised (live_prepare's 账户校验失败 note; live_ensure_ready withholds its
+                # ✅) and said beside the ✓ (account_reread). A first verification that fails stays not ready, retried once a
+                # minute; a read that ANSWERS — another owner, or none — un-readies as before, verified or not.
+                self.account_reread = why
+            else:
+                self.account_error = text  # never verified in this run: not ready, whatever the sign-in said
+            raise core.RemoteError(text) from None
+        self.account_reread = ""
         if int(owner, 16) == 0:
             self.account_error = f"链上没有 Predict 账户 {short_addr(self.wallet.predict_account)} 的签名记录：地址填错，或账户还没在链上激活（先在网站交易一次）"
         elif owner.lower() != self.wallet.signer.lower():
@@ -1529,6 +1544,11 @@ class LiveTrader:
         return (bool(a.get("CTF_EXCHANGE")) and bool(a.get("NEG_RISK_CTF_EXCHANGE")),
                 bool(a.get("YIELD_BEARING_CTF_EXCHANGE")) and bool(a.get("YIELD_BEARING_NEG_RISK_CTF_EXCHANGE")))
 
+    def account_reread_note(self) -> str:
+        """Beside the account check's ✓: the last re-read failed and this run's earlier verification stands (1.150.0, audit
+        RDM-CHECK-UNREADIES) — the ✓ no longer sits silently above /live check's 账户校验失败 note."""
+        return f"（最近一次重读没读到：{self.account_reread}，沿用本次运行早先的核对）" if self.account_reread and self.account_checked else ""
+
     def summary_lines(self) -> list[str]:
         c = self.config
         lines = [f"钱包：{self.wallet.kind}｜下单账户 {short_addr(self.wallet.maker)}"
@@ -1538,7 +1558,7 @@ class LiveTrader:
                   if not self.ready_error else f"API：未就绪：{self.ready_error}")
                  + ("" if c.predict_api_key else "｜未设置 PREDICT_API_KEY")]
         if self.wallet.predict_account:
-            lines.append("账户校验：" + (f"✗ {self.account_error}" if self.account_error else "✓ 私钥是这个 Predict 账户的控制钥匙"))
+            lines.append("账户校验：" + (f"✗ {self.account_error}" if self.account_error else "✓ 私钥是这个 Predict 账户的控制钥匙" + self.account_reread_note()))
         if self.balance:
             lines.append(f"余额：USDT {from_wei(self.balance[0]):,.2f}｜BNB {from_wei(self.balance[1]):.4f}（gas）"
                          f"｜读取于 {core.stamp(self.balance[2] * 1000)}")
@@ -1573,7 +1593,7 @@ class LiveTrader:
             rows.append({"k": "API", "v": "已登录" + (f"，token 至 {core.stamp(self.api.jwt_exp * 1000, seconds=False)}" if self.api.jwt_exp else "")
                          + ("" if c.predict_api_key else "，未设置 PREDICT_API_KEY"), "tone": "ok" if c.predict_api_key else "warn"})
         if self.wallet.predict_account:
-            rows.append({"k": "账户校验", "v": f"✗ {self.account_error}" if self.account_error else "✓ 私钥是这个 Predict 账户的控制钥匙",
+            rows.append({"k": "账户校验", "v": f"✗ {self.account_error}" if self.account_error else "✓ 私钥是这个 Predict 账户的控制钥匙" + self.account_reread_note(),
                          "tone": "bad" if self.account_error else "ok"})
         if self.balance:
             rows.append({"k": "余额", "v": f"USDT {from_wei(self.balance[0]):,.2f}，BNB {from_wei(self.balance[1]):.4f}（gas），"

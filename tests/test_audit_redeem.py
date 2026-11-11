@@ -1615,4 +1615,66 @@ async def off_no_signin():
 asyncio.run(off_no_signin())
 
 
+# --- RDM-CHECK-UNREADIES --------------------------------------------------------------------------------------------------------
+async def check_unreadies():
+    """RDM-CHECK-UNREADIES: the Predict account's on-chain check is one BNB RPC read, made at the start, /live check (the page's
+    自检), /live mode pause|on and the not-ready retries. A read that failed there — one timeout, a public node's "limit
+    exceeded" — un-readied a bot verified earlier in the same run: no new order, the redeem round starting in that minute voided
+    (真实交易未就绪), until a retry a minute later (with SIM=off: the next redeem round's). A failed RE-read now keeps the
+    earlier verification, the failure still reported (最近错误, and beside the ✓); a first verification that fails, and a read
+    that answers another owner or none, un-ready the bot as before."""
+    PA, ADDR = T["PA"], T["ADDR"]
+    bot = make_bot(PREDICT_ACCOUNT=PA)
+    await bot.live_prepare()
+    assert bot.live.ready and bot.live.account_checked
+    fake, chain = bot.live.api, bot.live.chain
+    fake.positions_rows, fake.markets["401"] = [held(401)], mk(401, won=1)
+    good = chain.account_owner
+
+    async def boom(account):
+        raise m.RemoteError("网络错误 (TimeoutError)")
+    chain.account_owner = boom
+    text = await bot.live_action("check", [], NOW)
+    assert bot.live.ready and bot.live.account_checked and bot.live.account_error == "", bot.live.not_ready_why
+    assert "账户校验失败：无法在链上核对 PREDICT_ACCOUNT 的控制钥匙：网络错误 (TimeoutError)" in text, text  # still reported
+    assert "账户校验：✓ 私钥是这个 Predict 账户的控制钥匙（最近一次重读没读到：网络错误 (TimeoutError)，沿用本次运行早先的核对）" in text, text
+    assert "🟢 运行中" in bot.live_text(NOW) and any("最近一次重读没读到" in r["v"] for r in bot.live.summary_info()), bot.live_text(NOW)
+    await auto_round(bot)  # the round in that minute looks, and redeems
+    assert not bot.live_redeem_last.get("error") and [cid for cid, *_ in chain.redeemed] == [cond(401)], bot.live_redeem_last
+    # the same through /live mode pause and on (the page's 自检 is /live check)
+    for mode in ("pause", "on"):
+        reply = await bot.live_set_mode(mode)
+        assert bot.live.ready and "⚠️ 未就绪" not in reply and "账户校验失败" in bot.live_errors[-1], (mode, reply)
+    # a read that answers: the plain ✓ again; another owner, or none, un-readies a verified bot as before
+    chain.account_owner = good
+    text = await bot.live_action("check", [], NOW)
+    assert bot.live.ready and "账户校验：✓ 私钥是这个 Predict 账户的控制钥匙\n" in text and "最近一次重读没读到" not in text, text
+    chain.owner = "0x2222222222222222222222222222222222222222"
+    await bot.live_action("check", [], NOW)
+    assert not bot.live.ready and "不是 Predict 账户" in bot.live.not_ready_why, bot.live.not_ready_why
+    chain.account_owner = boom  # ...and from there a failed read makes nothing ready
+    await bot.live_action("check", [], NOW)
+    assert not bot.live.ready and "无法在链上核对" in bot.live.not_ready_why, bot.live.not_ready_why
+    chain.account_owner, chain.owner = good, ADDR
+    await bot.live_action("check", [], NOW)
+    assert bot.live.ready
+    chain.owner = "0x" + "0" * 40
+    await bot.live_action("check", [], NOW)
+    assert not bot.live.ready and "链上没有 Predict 账户" in bot.live.not_ready_why, bot.live.not_ready_why
+    # a first verification that fails (a restart with the node down): signed in, not ready; ready at the retry once the node answers
+    fresh = make_bot(PREDICT_ACCOUNT=PA)
+    answers = fresh.live.chain.account_owner
+    fresh.live.chain.account_owner = boom
+    await fresh.live_prepare()
+    assert not fresh.live.ready and fresh.live.signed_in and "无法在链上核对" in fresh.live.not_ready_why, fresh.live.not_ready_why
+    fresh.live.chain.account_owner = answers
+    fresh.live_last_signin -= 61  # live_ensure_ready's once-a-minute retry is due
+    await fresh.live_ensure_ready()
+    assert fresh.live.ready and not fresh.live.account_reread
+    print("RDM_CHECK_UNREADIES_OK")
+
+
+asyncio.run(check_unreadies())
+
+
 print("AUDIT_REDEEM_OK")

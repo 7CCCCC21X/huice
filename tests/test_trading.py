@@ -1795,9 +1795,17 @@ async def audit_fixes():
     await abot.live_prepare()
     assert abot.live.ready and abot.live.account_checked
     async def boom(account): raise m.RemoteError("RPC 超时")
+    # 1.150.0 (audit RDM-CHECK-UNREADIES): a failed RE-read keeps this run's verification (it used to un-ready the bot); a FIRST
+    # verification that fails is no readiness, nor is a check not yet made with no error text
     abot.live.chain.account_owner = boom
     await abot.live_prepare()
-    assert not abot.live.ready and "无法在链上核对" in abot.live.not_ready_why
+    assert abot.live.ready and abot.live.account_checked and not abot.live.account_error
+    cbot = make_bot(PREDICT_ACCOUNT=PA)
+    cbot.live.chain.account_owner = boom
+    await cbot.live_prepare()
+    assert not cbot.live.ready and not cbot.live.ready_error and "无法在链上核对" in cbot.live.not_ready_why
+    cbot.live.account_error = ""
+    assert not cbot.live.ready and cbot.live.not_ready_why == "账户校验尚未完成"
     bbot = make_bot()
     await bbot.live_prepare()
     bmk = hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)
