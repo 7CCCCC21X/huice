@@ -1096,4 +1096,169 @@ FOLLOW_CASES = (follow_gone_flicker, follow_gone_for_good, follow_gone_at_once, 
 for follow_case in FOLLOW_CASES:
     asyncio.run(follow_case())
 
+# --- SIM-FLOOR-CHURN: a floor order goes at its own count or not at all — the group cap and the real-trading limits refuse it too ----
+# A floor order's count is its own (sim_floor_shares: SIM_MAKER_FLOOR_SHARES, at least Predict's $1 at its price), and one resting
+# at another count is withdrawn to be placed afresh ("托底单份数已改为 N 份，按新份数重挂": the setting changed). The share caps
+# refuse a floor order they cannot take whole; the group cap's branch of sim_maker_pick cut it to what fits, as it does an
+# ordinary order. The cut order went out, was withdrawn at the next look for its count and was placed again, cut again: a
+# withdrawn attempt a look on paper — at the DEFAULT floor order and group cap, once a group has less than the order's $1 of
+# room — and with LIVE on a cancel and a new real order every few seconds, each announced on Telegram, for as long as the limit
+# bound. The real trader's own limits come through that branch too (LiveBot.sim_group_room → live_room): a floor order worth more
+# than LIVE_MAX_ORDER_USD (500 × 5¢ against $20, each a preset of the control page) looped on every empty side, no position needed.
+FLOOR_THIN = (("0.54", "60"),)  # the 涨 bids: nothing of SIM_MAKER_MIN_BID (100) shares to follow, so the side wants a floor order (跌: 买1 38¢, no edge)
+FLOOR_UP = f"{STALE}|up|挂"
+FLOOR_RECOUNT = "托底单份数已改为 {:g} 份，按新份数重挂"  # sim_requote_reason: a floor order whose count is not the setting's
+FLOOR_GROUP = "合计将亏 ${:,.2f}，超过组上限 $300"      # sim_group_room: SIM_GROUP_USD, at its default
+
+
+class FloorChain(StaleChain):
+    """The chain's stand-in with ``usdt`` dollars in the wallet."""
+    def __init__(self, usdt: float): self.usdt = usdt
+    async def usdt_balance(self, owner=None): return int(self.usdt * 10 ** 18)
+
+
+def floor_held(bot, shares: float, side: str = "up") -> dict:
+    """A position on the 恒指 card: ``shares`` of one side bought at 60¢ by a resting order a minute ago, filled whole. A paper
+    record: the group cap counts it whoever trades (the real trader's own exposure counts the records of real orders)."""
+    rec = m.Bot.sim_open(bot, stale_mk(0.70 if side == "up" else 0.30, NOW - 60_000), side, NOW - 60_000,
+                         maker=m.BookEdge("涨" if side == "up" else "跌", True, 0.60, 0.10, 300.0, 0.10), shares=shares)
+    rec.update(status="filled", shares=float(shares), filled=NOW - 60_000)
+    return rec
+
+
+async def floor_bot(real: bool, position: float = 0.0, usdt: float = 1000.0, **env):
+    """The paper trader or the real one (LIVE=on with the SDK test suite's key, never a real one; Predict and the chain are the
+    stand-ins) on the DEFAULT maker settings but ``env`` — SIM_GROUP_USD 300, a floor order of 100 × 1¢, SIM_SHARES 100, the
+    settle 2 s — holding ``position`` 涨 shares of the 恒指 card (floor_held), the market's details read. (the bot, Predict's
+    stand-in, the world, the card with no 涨 bid to follow)."""
+    mk = stale_mk(0.70, NOW, bids=FLOOR_THIN)
+    world = {"markets": [mk]}
+    if real:
+        bot = live.LiveBot(m.Config.from_env({**STALE_ENV, "LIVE": "on", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, "PREDICT_API_KEY": "k", **env}),
+                           m.Store(":memory:"), SelfFM(NOW), None)
+        bot.live.api, bot.live.chain = StaleApi(), FloorChain(usdt)
+        await bot.live_prepare()
+        assert bot.live.ready, bot.live.ready_error
+    else:
+        bot = stale_bot(**env)
+    bot.sim_markets = lambda now, only=None: world["markets"]
+    if real:
+        await bot.live_prefetch(NOW)
+    if position:
+        bot.sim_save([(f"{FLOOR_UP}#1", floor_held(bot, position))])
+    return bot, (bot.live.api if real else None), world, mk
+
+
+async def floor_looks(bot, world, start: int = 0, seconds: int = 24) -> None:
+    """The trader's looks at the card, its 涨 side with nothing to follow, from ``start`` ms on: a step every four seconds and a
+    pushed book (the express lane) two seconds after each."""
+    for ms in range(start, start + seconds * 1000, 4_000):
+        await follow_look(bot, world, ms, FLOOR_THIN, step=True)
+        await follow_look(bot, world, ms + 2_000, FLOOR_THIN)
+
+
+def floor_noted(bot) -> str:
+    """Why the 涨 side's resting order was last refused (what the card and the journal keep of it); "" when it never was."""
+    return next((b["why"] for b in bot.sim_blocks() if b["id"] == FLOOR_UP), "")
+
+
+async def floor_pick():
+    """sim_maker_pick, the one place that sizes a resting order, on the paper trader's default counts and caps: 499 涨 at 60¢
+    lose $299.40 when the index closes down, which leaves $0.60 under SIM_GROUP_USD."""
+    bot, _, _, mk = await floor_bot(False, position=499)
+    c = bot.config
+    assert (c.sim_group_usd, c.sim_maker_floor_shares, c.sim_maker_floor, c.sim_shares, c.sim_maker_follow_settle) == (300.0, 100.0, 0.01, 100.0, 2.0), "the defaults"
+    trades = bot.sim_trades()
+    floor = bot.sim_maker_reason(mk, trades, NOW)[0]
+    assert floor.floor and (floor.side, floor.price) == ("涨", 0.01) and bot.sim_floor_shares(0.01) == 100.0, floor
+    count, why = bot.sim_maker_pick(mk, trades, "up", floor, NOW)
+    # refused at its 100 shares, in the cap's own words — before the fix: (60.0, ""), an order sim_requote_reason withdraws
+    assert count == 100.0 and FLOOR_GROUP.format(300.40) in why and "SIM_GROUP_USD" in why, (count, why)
+    row = next(r for r in bot.sim_why(mk, trades, NOW)["maker"]["sides"] if r["side"] == "up")
+    assert row["state"] == "blocked" and "托底单" in row["text"] and why in row["text"], row  # the card — before the fix: "可挂 1.0¢×60 份…下一轮挂出"
+    # an ordinary order is cut to what fits, as ever (it is judged by SIM_SHARES, never by its own count): 2 × 30¢ = the $0.60 left
+    assert bot.sim_maker_pick(mk, trades, "up", m.BookEdge("涨", True, 0.30, 0.40, 300.0, 0.40), NOW) == (2.0, "")
+    # ... and a floor order the cap takes whole is placed at its count: 498 涨 leave $1.20
+    roomy, _, _, _ = await floor_bot(False, position=498)
+    assert roomy.sim_maker_pick(mk, roomy.sim_trades(), "up", floor, NOW) == (100.0, "")
+
+
+async def floor_paper_looks():
+    """The paper trader over 24 s of steps and pushed books, the same defaults: nothing is placed on the 涨 side and nothing
+    withdrawn (before the fix: a 60-share floor order at every step, withdrawn at the next look — six attempts for the journal).
+    With room for the whole order it is placed at its count, and rests."""
+    bot, _, world, _ = await floor_bot(False, position=499)
+    await floor_looks(bot, world)
+    assert follow_records(bot) == {"up|挂#1": ("filled", 0.6, "")}, follow_records(bot)
+    assert FLOOR_GROUP.format(300.40) in floor_noted(bot), floor_noted(bot)
+    bot.config = m.dataclasses.replace(bot.config, sim_group_usd=301.0)  # a dollar more: the whole floor order fits
+    await floor_looks(bot, world, 24_000, 12)
+    assert follow_records(bot) == {"up|挂#1": ("filled", 0.6, ""), "up|挂": ("resting", 0.01, "")}, follow_records(bot)
+    placed = bot.sim_trades()[FLOOR_UP]
+    assert placed["order"] == 100.0 and placed.get("floor") and placed["opened"] == NOW + 24_000, (placed["order"], placed["opened"] - NOW)
+
+
+async def floor_left_cut():
+    """A cut floor order left resting — placed by the code before the fix, or a whole one under a count the setting has since
+    raised past what the cap takes: withdrawn once for its count, as ever, and nothing takes its place while the cap binds
+    (before the fix: placed cut again and withdrawn again, look after look)."""
+    bot, _, world, mk = await floor_bot(False, position=499)
+    floor = bot.sim_maker_reason(mk, bot.sim_trades(), NOW)[0]
+    bot.sim_save([(FLOOR_UP, m.Bot.sim_open(bot, mk, "up", NOW, maker=floor, shares=60.0))])
+    await floor_looks(bot, world, 1_000)
+    assert follow_records(bot) == {"up|挂#1": ("filled", 0.6, ""), "up|挂#2": ("cancelled", 0.01, FLOOR_RECOUNT.format(100))}, follow_records(bot)
+    # the real trader, a floor order of 500 × 1¢ (a preset of the control page) and $3.60 of room under the group cap: the 360
+    # shares resting on Predict are cancelled once, and no order follows (before the fix: six more of 360, each cancelled)
+    bot, api, world, mk = await floor_bot(True, position=494, SIM_MAKER_FLOOR_SHARES="500")
+    floor = bot.sim_maker_reason(mk, bot.sim_trades(), NOW)[0]
+    bot.sim_save([(FLOOR_UP, bot.sim_open(mk, "up", NOW, maker=floor, shares=360.0))])
+    await bot.live_place_pending(NOW)
+    assert api.calls == [("create", "101")] and bot.sim_trades()[FLOOR_UP]["live"]["state"] == "open", (api.calls, bot.sim_trades()[FLOOR_UP]["live"])
+    await floor_looks(bot, world, 1_000)
+    assert api.calls == [("create", "101"), ("remove", ["101"])] and not api.open, api.calls
+    assert follow_records(bot) == {"up|挂#1": ("filled", 0.6, ""), "up|挂#2": ("cancelled", 0.01, FLOOR_RECOUNT.format(500))}, follow_records(bot)
+    assert FLOOR_GROUP.format(301.40) in floor_noted(bot), floor_noted(bot)
+
+
+async def floor_real_limits():
+    """The real trader: each limit that cannot take the floor order whole refuses it and names itself, and nothing is sent to
+    Predict over 24 s of steps and pushed books (before the fix, where the cut order was still worth Predict's $1: placed and
+    cancelled six times)."""
+    for name, env, position, usdt, full, limit in (
+            # $3.60 of room under the group cap — before the fix: 360 shares
+            ("SIM_GROUP_USD", {"SIM_MAKER_FLOOR_SHARES": "500"}, 494, 1000.0, 500.0, FLOOR_GROUP.format(301.40)),
+            # a floor order of $25 against a $20 order limit, no position — before the fix: 400 shares, on every empty side
+            ("LIVE_MAX_ORDER_USD", {"SIM_MAKER_FLOOR_SHARES": "500", "SIM_MAKER_FLOOR_CENTS": "5", "LIVE_MAX_ORDER_USD": "20"}, 0, 1000.0, 500.0,
+             "单笔 $25.00 超过 LIVE_MAX_ORDER_USD $20"),
+            # $3 in the wallet for a $5 floor order — before the fix: 60 shares
+            ("the USDT balance", {"SIM_MAKER_FLOOR_CENTS": "5"}, 0, 3.0, 100.0, "USDT 余额 $3.00 不足本单 $5.00"),
+            # the default 100 × 1¢ and $0.60 of room: cut it was under Predict's $1 minimum, so it never went out — but its refusal,
+            # "缩到 60 份（$0.60）仍被拦：本单 $0.60 低于 Predict 最低订单金额 $1（提高 SIM_SHARES）", named a setting it does not go by
+            ("SIM_GROUP_USD, the default floor order", {}, 499, 1000.0, 100.0, FLOOR_GROUP.format(300.40))):
+        bot, api, world, mk = await floor_bot(True, position=position, usdt=usdt, **env)
+        floor = bot.sim_maker_reason(mk, bot.sim_trades(), NOW)[0]
+        assert floor.floor and floor.side == "涨" and bot.sim_floor_shares(floor.price) == full, (name, floor)
+        count, why = bot.sim_maker_pick(mk, bot.sim_trades(), "up", floor, NOW)
+        assert count == full and limit in why and "缩到" not in why, (name, count, why)
+        await floor_looks(bot, world)
+        assert api.calls == [] and FLOOR_UP not in bot.sim_trades() and limit in floor_noted(bot), (name, api.calls, floor_noted(bot))
+    # what LIVE_MAX_OPEN_USD leaves: a real 跌 position of $296.40 under a $300 limit (the group cap has room: that one loses the
+    # other way) — before the fix: (360.0, "")
+    bot, api, world, mk = await floor_bot(True, SIM_MAKER_FLOOR_SHARES="500", LIVE_MAX_OPEN_USD="300")
+    floor = bot.sim_maker_reason(mk, {}, NOW)[0]
+    down = m.TradeMap({f"{STALE}|down|挂#1": {**floor_held(bot, 494, "down"), "live": {"state": "done", "final": "filled"}}})
+    assert bot.sim_maker_pick(mk, down, "up", floor, NOW) == (500.0, "持仓+挂单 $296.40 加本单 $5.00 超过 LIVE_MAX_OPEN_USD $300"), \
+        bot.sim_maker_pick(mk, down, "up", floor, NOW)
+    # a floor order the limits take whole goes out once, at its count, and rests
+    assert bot.sim_maker_pick(mk, bot.sim_trades(), "up", floor, NOW) == (500.0, "")
+    await floor_looks(bot, world)
+    placed = bot.sim_trades()[FLOOR_UP]
+    assert api.calls == [("create", "101")] and int(api.open["101"]["amount"]) == 500 * 10 ** 18, api.calls
+    assert (placed["price"], placed["order"], placed.get("floor"), placed["live"]["state"]) == (0.01, 500.0, True, "open"), placed["live"]
+
+
+FLOOR_CASES = (floor_pick, floor_paper_looks, floor_left_cut, floor_real_limits)
+for floor_case in FLOOR_CASES:
+    asyncio.run(floor_case())
+
 print("AUDIT_DECISION_OK")

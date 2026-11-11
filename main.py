@@ -632,7 +632,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_CRYPTO_15M_QUIET_SECONDS", "15 分钟涨跌结束前多少秒不下单（内测）", "0～600：每个 15 分钟窗口结束前这么多秒起不下任何订单（吃单、挂单都不下，真实订单在这之前决定、发出时已进入这段时间的也不发），未成交的挂单撤掉；默认 90；最后一分钟（结算价那根 1 分钟 K）本来就不交易；只管 15 分钟涨跌，“结束前多少分钟不交易”不管这类市场"),
     ("SIM_CRYPTO_15M_MAKER_QUIET_SECONDS", "15 分钟涨跌结束前多少秒不挂新单（内测）", "0～600：每个 15 分钟窗口结束前这么多秒起不再挂新的挂单（撤了重挂的也算新单，这段时间里只撤不挂）；已挂着的不动、吃单照常，直到“结束前多少秒不下单”那段才全部停下；默认 180（复盘里剩不到 3 分钟才挂的单成交后多半亏）；0 = 不另设"),
     ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
-    ("SIM_MAKER_FLOOR_SHARES", "托底单份数", "这一边没有可跟的买价（盘口空着、买单都不够“买1 至少多少份”）时，按“托底单价格”挂这么多份守在最底下，等有人砸盘；至少挂到 Predict 最低订单金额 $1（1¢ 就是 100 份）；有了可跟的买1 就改跟；挂着时不占每边份数上限；0 = 不挂"),
+    ("SIM_MAKER_FLOOR_SHARES", "托底单份数", "这一边没有可跟的买价（盘口空着、买单都不够“买1 至少多少份”）时，按“托底单价格”挂这么多份守在最底下，等有人砸盘；至少挂到 Predict 最低订单金额 $1（1¢ 就是 100 份）；有了可跟的买1 就改跟；挂着时不占每边份数上限；每边份数、组上限或真实交易限额（单笔、持仓 + 挂单、余额）容不下整单时不挂，不缩份数；0 = 不挂"),
     ("SIM_MAKER_FLOOR_CENTS", "托底单价格（¢）", "1～50：托底单挂的价格；两边各按各的公平价算净优势，不够触发门槛的那一边不挂"),
     ("SIM_MAKER_FLOOR_MARKETS", "托底单只做这些市场（详细选项）", "逗号分隔的市场代码；在“托底单份数”卡片展开详细选项点选，空 = 范围内的所有市场"),
     ("SIM_MAKER_DEEPER", "买1 不够门槛时跟更深的买价", "开 = 跟买1 的净优势不够门槛（或不超过模型误差）时，挂到下面第一个够门槛的买价档位（买2、买3…，同样要有“买1 至少多少份”那么多别人的单），等有人砸穿买1 时接；涨、跌两边各按各的；关 = 只跟买1，不够就不挂"),
@@ -20302,7 +20302,8 @@ class Bot:
         sweep orders too) is outside SIM_AFTER_HOURS_MAX_SHARES — placed whatever the side holds, at its whole count:
         a bid far under the fair price, filled only when someone dumps into the book, is wanted however large the
         position (10-20); the cap counts the positions and the ordinary orders (side_held). The group cap and the
-        real-trading limits hold for every order. (shares, "" | why none may be placed)."""
+        real-trading limits hold for every order. A floor order (maker.floor) goes at its own count (sim_floor_shares) or
+        not at all: a cap or limit that cannot take it whole refuses it, none cuts it. (shares, "" | why none may be placed)."""
         want = float(min(self.config.sim_shares, self.sim_order_cap(mk)))  # SIM_CRYPTO_DAY_SHARES on a daily crypto market
         if maker.floor:
             want = self.sim_floor_shares(maker.price)  # a floor order: its own count, never cut (under Predict's minimum it could not go out)
@@ -20339,6 +20340,18 @@ class Bot:
         why = self.sim_group_room(trades, mk, side, maker.price, want)
         if not why:
             return want, ""
+        if maker.floor:
+            # 1.150.0 (audit SIM-FLOOR-CHURN): refused at its count, as by the share caps above — the size-down below is for the
+            # orders judged by SIM_SHARES. A floor order is judged by its own count (sim_requote_reason): one cut here went out,
+            # was withdrawn at the next look ("托底单份数已改为 N 份，按新份数重挂") and was placed again, cut again — the loop
+            # an ordinary order made on 10-14 — a cancel and a new order every few seconds for as long as the limit bound, on the
+            # rate limit every order and cancel shares. The group cap is one such limit (on paper the default 100 × 1¢ under a
+            # group with less than its $1 of room: a withdrawn attempt a look); the real trader's come through the same call
+            # (LiveBot.sim_group_room → live_room) — what LIVE_MAX_OPEN_USD leaves, the USDT balance, and LIVE_MAX_ORDER_USD
+            # itself: a floor order worth more than it (500 × 5¢ against $20, each a one-click preset) looped on every empty
+            # side, no position needed. (For real only a floor order worth more than Predict's $1 minimum got that far: the
+            # default one cut was under it, and refused as such.) The refusal is the limit's own, at the whole count
+            return want, why
         best = self.sim_size_down(self.sim_size_top(trades, want, maker.price),
                                   lambda n: not Bot.sim_group_room(self, trades, mk, side, maker.price, float(n)))
         if best is not None:
