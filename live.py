@@ -4808,7 +4808,11 @@ class LiveBot(core.Bot):
                 seen.append({**entry, "kind": "fields", "error": "市场没写 conditionId，领取交易填不出来"})
                 continue
             if dry_run or low_gas or held or gas_unread:  # (RDM-GAS-STALE) no BNB figure to send on: none sent blind
-                seen.append({**entry, "kind": "claimable"})
+                # 1.150.0 (audit RDM-CHECK-FORGETS-FAILURE): with its back-off over, a position whose last redeem failed was 可领取 with
+                # nothing more — the remembered reason was read in the back-off alone — and /live redeem check concluded 下一轮自动领取会领
+                # for one the chain refuses round after round (half of every ten minutes for a redeem that never leaves). The reason goes
+                # with the row; the kind stays (the counts, /live redeem, the ⛽ note count it as before).
+                seen.append({**entry, "kind": "claimable", **({"error": errors[key]} if key in errors else {})})
                 continue
             if info.neg_risk:  # (RDM-NEGRISK-AMOUNT) the chain's balance, not Predict's figure: what the adapter will pull
                 amount = await self.live_negrisk_amount(outcome, info, index_set, amount)
@@ -5046,7 +5050,9 @@ class LiveBot(core.Bot):
                 continue
             lines.append(f"{label}：")
             for s in items[:cap]:
-                extra = {"claimable": f"，约 ${float(s.get('value') or 0):,.2f}",
+                extra = {"claimable": f"，约 ${float(s.get('value') or 0):,.2f}"  # (RDM-CHECK-FORGETS-FAILURE) a failure remembered past its back-off
+                                      + (f"｜上次领取失败：{s['error']}（{'下一轮自动再试' if c.live_auto_redeem else '自动领取关着，发 /live redeem 再试'}）"
+                                         if s.get("error") else ""),
                          "waiting": f"：{s.get('error') or '?'}（{max(1, int(float(s.get('left') or 0) / 60))} 分钟后再试）",
                          "sent": f"（交易 {s.get('tx')}，{int(s.get('age_ms') or 0) // 60_000} 分钟前发出" + (f"；{s['error']}" if s.get("error") else "") + "）",
                          "fields": f"：{s.get('error')}", "unclear": f"：{s.get('error')}（市场状态 {s.get('status')}）",
@@ -5057,6 +5063,7 @@ class LiveBot(core.Bot):
                 lines.append(f"  …另有 {len(items) - cap} 个")
         low = bnb is not None and bnb < self.LIVE_REDEEM_MIN_BNB_WEI
         waiting = [s for s in seen if s["kind"] == "waiting"]
+        retrying = [s for s in seen if s["kind"] == "claimable" and s.get("error")]  # (RDM-CHECK-FORGETS-FAILURE) failed last time, back-off over
         reasons = []  # the gas first: without it neither the automatic round nor /live redeem can send anything
         refused = str((getattr(self, "live_redeem_last", {}) or {}).get("gas_refused") or "")
         if (n("claimable") or waiting) and low:
@@ -5068,8 +5075,8 @@ class LiveBot(core.Bot):
             reasons.append(f"自动领取关着，{n('claimable')} 个可领取（约 ${value:,.2f}）不会自己领：控制台“高级”里打开“自动领取已结算持仓”，或发 /live redeem 手动领")
         if reasons:
             why = "；".join(reasons)
-        elif waiting:
-            why = f"链上领取失败：{waiting[0].get('error') or '见下方'}；到时自动再试，一直失败就把这条发我"
+        elif waiting or retrying:
+            why = f"链上领取失败：{(waiting or retrying)[0].get('error') or '见下方'}；到时自动再试，一直失败就把这条发我"
         elif n("sent"):  # (RDM-RECEIPT-POLL, RDM-RESTART-MID-SEND)
             why = ("有领取交易已经发出、还没确认上链（见上）：下一轮先查它的回执，上链了就记为已领取，不会再发一次；"
                    "一小时后还没上链、节点里也查不到它，才重新领取")

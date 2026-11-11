@@ -1776,4 +1776,42 @@ async def check_abort():
 asyncio.run(check_abort())
 
 
+# --- RDM-CHECK-FORGETS-FAILURE --------------------------------------------------------------------------------------------------
+async def check_forgets_failure():
+    """RDM-CHECK-FORGETS-FAILURE: a position whose redeem fails every round (the estimate reverts: nothing sent, five minutes'
+    back-off) was 可领取 in the dry run once its back-off was over, and /live redeem check concluded 有 1 个可领取 … 下一轮自动领取
+    会领 — half of every ten minutes for a position that is never redeemed. The remembered reason now goes with the row and the
+    conclusion follows it; the check stays read-only, a winner that never failed reads as before, the gas still comes first."""
+    bot = await ready_bot()
+    fake, chain, key = bot.live.api, bot.live.chain, "live:redeemed:500:1"
+    fake.positions_rows, fake.markets["500"] = [held(500, shares=60)], mk(500, won=1)
+    chain.fail_unsent = "RPC 错误：execution reverted"
+    assert await bot.live_redeem(NOW) == [] and bot.live_redeem_last["counts"] == {"failed": 1}
+    report = await bot.live_redeem_report(NOW + MIN)  # inside the back-off: as before
+    assert "持仓 1 个：失败等重试 1" in report and "结论：链上领取失败：RPC 错误：execution reverted；到时自动再试" in report, report
+    bot.live_redeem_failed[key] -= 360  # its five minutes over, the next round not come yet
+    state = lambda: (dict(bot.live_redeem_failed), dict(bot.live_redeem_errors), bot.store.get(key), list(chain.redeemed), dict(bot.live_redeem_last))
+    before = state()
+    report = await bot.live_action("redeem", ["check"], NOW + 6 * MIN)
+    verdict = next(line for line in report.split("\n") if line.startswith("结论："))
+    assert verdict.startswith("结论：链上领取失败：RPC 错误：execution reverted；到时自动再试") and "下一轮自动领取会领" not in verdict, report  # (before: 有 1 个可领取…会领)
+    assert "持仓 1 个：可领取 1" in report and "window 500 / Up 60 份，约 $60.00｜上次领取失败：RPC 错误：execution reverted（下一轮自动再试）" in report, report
+    assert state() == before, "the check writes nothing"
+    # it goes out at last: redeemed, the reason forgotten
+    chain.fail_unsent = ""
+    assert len(await bot.live_redeem(NOW + 10 * MIN)) == 1 and key not in bot.live_redeem_errors
+    fake.positions_rows = [held(501)]  # (500 redeemed: Predict lists it no more)
+    fake.markets["501"] = mk(501, won=1)
+    report = await bot.live_redeem_report(NOW + 11 * MIN)  # a winner that never failed: word for word as before
+    assert "结论：有 1 个可领取（约 $10.00），下一轮自动领取会领；急用就发 /live redeem" in report and "上次领取失败" not in report, report
+    bot.live_redeem_errors["live:redeemed:501:1"] = "RPC 错误：execution reverted"
+    chain.bnb = 10 ** 13  # a remembered failure under the gas floor: the gas first, as before
+    report = await bot.live_redeem_report(NOW + 12 * MIN)
+    assert "结论：签名钱包的 BNB 不够付 gas" in report and "上次领取失败：RPC 错误：execution reverted" in report, report
+    print("RDM_CHECK_FORGETS_FAILURE_OK")
+
+
+asyncio.run(check_forgets_failure())
+
+
 print("AUDIT_REDEEM_OK")
