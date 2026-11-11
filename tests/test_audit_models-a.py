@@ -1,8 +1,9 @@
 """Audit regression tests for the models-a cluster."""
-import sys, math, time, types, datetime as dt
+import asyncio, sys, math, time, types, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+import live as L
 D = m.D
 
 
@@ -244,5 +245,250 @@ bot, now, key = _kospi_after({("KOSPI", "盘后"): (1.4, 20)}, 0.5)
 bare = m.dataclasses.replace(bot.kospi_odds(now), sigma_day=0.0)
 bot.predict.strikes[m.predict_slug(bot.config.predict_slugs["KOSPI"], bare.target)] = (bare.ref + D("0.5"), time.monotonic())
 assert bot.settle_on_strike("KOSPI", bare).sigma_day == bare.sigma_daily != _raw_day("KOSPI")
+
+
+# --- MOD-WINDOW-STALE-PRICE: an up/down card takes its odds from the price in hand as if it were this instant's, and the one
+# check of that price's age was the display's (PRICE_STALE_MS: a minute on a 15-minute card, five on a daily one). While the
+# price feed stalled (the stream silent or reconnecting, the REST read in a rate-limit cooldown) and Predict's book went on
+# moving, the trader bought the side the stale price made look cheap: a 59-s-old price with four minutes left is 19¢ off per
+# σ of the move it has not seen. Now a price read longer ago than 2% of the time left (5 s at least) is not traded on — the
+# card holds its suggestion (SimMarket.hold) and a resting order is withdrawn (SimMarket.price_problem → sim_requote_reason) —
+# while the odds stay on the card until the documented minute. The daily crypto cards' five minutes are the same defect,
+# under the same rule; a stock card is judged by its index's age while the index is the price its odds are taken at ----
+WT0 = _bj(11, 4, 11, 0)   # BTC 15分涨跌 11:00–11:15 Beijing (11-03 22:00–22:15 ET)
+WT1 = WT0 + 15 * 60_000
+W4 = WT1 - 4 * 60_000     # four minutes left: before the last 180 s (no new resting order) and the last 90 s (no order at all)
+WLINE = D("100000.00")
+BTC15 = next(s for s in m.WINDOW_UPDOWN_MARKETS if s.key == "BTC-15M")
+WENV = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_MARKETS": "updown",
+        "SIM_MAKER_POINTS": "off"}  # the rest at its default: SIM_WAYS=taker, SIM_EDGE_CENTS=10, ten shares a buy on these cards
+
+
+def _window_bot(now: int, cls: type = m.Bot, **env: str) -> tuple:
+    """A real Bot (or LiveBot) whose BTC 15-minute card is on the 11:00–11:15 window: the line at 100,000, σ 50%."""
+    spec = BTC15.window_spec(WT0)
+    store = m.Store(":memory:")
+    store.put(f"updown:{BTC15.before(spec).slug}:end", {"open": WT0 - 60_000, "close": str(WLINE), "read_ms": WT0 + 2_000})
+    store.put(f"updown:{spec.slug}:start", {"open": spec.start_ms, "close": str(WLINE), "read_ms": WT0 + 2_000})
+    bot = cls(m.Config.from_env({**WENV, **env}), store, _Clock(now), None)
+    card = bot.updowns["BTC-15M"]
+    assert isinstance(card, m.SpotWindowMarket) and card.spec == spec, card.spec
+    card.sigma, card.sigma_ms = 0.5, now
+    bot.predict.info[spec.slug] = {"outcomes": ["Up", "Down"], "created_ms": 0, "question": "BTC Up or Down - November 3, 10:00PM-10:15PM ET"}
+    return bot, card, spec
+
+
+def _priced(card: m.UpDownMarket, price: object, at: int) -> None:
+    """The card's price as a push or a read at ``at`` left it."""
+    card.price, card.priced_ms = D(str(price)), at
+    if isinstance(card, m.IndexUpDownMarket):
+        card.index_ms = at
+
+
+def _wbook(bot: m.Bot, key: str, slug: str, bid: str, ask: str, at: int) -> None:
+    """Predict's book of the card's market, read at ``at``: 涨 bid / ask, 300 shares each."""
+    bot.predict.books[key] = m.PredictBook(key, slug, "702", "t", ((D(bid), D("300")),), ((D(ask), D("300")),), at, None)
+
+
+def _looks(bot: m.Bot, key: str, *nows: int) -> dict:
+    """The trader's two looks at each moment — the step (sim_decide) and the express lane — and the records after them."""
+    async def go() -> None:
+        for now in nows:
+            bot.market.now = now
+            await (await bot.sim_decide(now))
+            await bot.sim_express_look(key, now)
+    asyncio.run(go())
+    return dict(bot.sim_trades())
+
+
+def _mk(bot: m.Bot, key: str, now: int) -> m.SimMarket:
+    return next(x for x in bot.sim_markets(now) if x.key == key)
+
+
+# 1. the finding's case: four minutes left, the card's price standing at the line for 59 / 30 / 6 s while the fresh book shows
+#    Up 67/70 — it has priced a +1σ move of those 59 s (the true fair Up: 0.69). The card still shows its 50¢ (the display's
+#    minute is not over) but holds its suggestion, and neither the step nor the express lane buys. Before: 吃跌 10 @ 33¢ at
+#    every look — 100 shares, the window's cap, within the minute
+for age in (59_000, 30_000, 6_000):
+    bot, card, spec = _window_bot(W4)
+    _wbook(bot, "BTC-15M", spec.slug, "0.67", "0.70", W4)
+    _priced(card, WLINE, W4 - age)
+    odds = card.odds(W4)
+    assert isinstance(odds, m.UpDownOdds) and abs(odds.fair_up - 0.5) < 0.001, (age, odds)  # still priced: PRICE_STALE_MS is the display's
+    mk = _mk(bot, "BTC-15M", W4)
+    got = _looks(bot, "BTC-15M", W4)
+    assert got == {}, (age, [(t["label"], t["shares"], round(t["price"], 4)) for t in got.values()])  # (before: 吃跌 10 @ 0.3366, twice)
+    stale = f"现货价 {age // 1000} 秒未更新，超过离结束 4.0 分钟时的上限 5 秒"
+    assert mk.hold == stale + "；暂不给建议" and bot.updown_hold(card, odds, W4) == (mk.hold, "") and abs(mk.fair_up - 0.5) < 0.001, (age, mk.hold)
+    assert mk.price_problem == card.price_problem(W4) == stale, (age, mk.price_problem)
+    pay = bot.updown_payload(card, W4)  # the page: the odds and the warning, no direction framed
+    assert "missing" not in pay and abs(pay["fair_up"] - 0.5) < 0.001 and pay["warn"] == pay["predict"]["hold"] == mk.hold, pay
+    assert pay["predict"]["edges"] and not any(e["best"] for e in pay["predict"]["edges"]), pay["predict"]["edges"]
+
+# 2. a fresh price trades as before: at the line with a real edge in the book (涨 offered at 35¢) the taker buys 涨 — a second
+#    old, and at the very limit (5 s old with four minutes left); with the price where the book has it, nothing (the control)
+for age in (1_000, 5_000):
+    bot, card, spec = _window_bot(W4)
+    _wbook(bot, "BTC-15M", spec.slug, "0.30", "0.35", W4)
+    _priced(card, WLINE, W4 - age)
+    mk = _mk(bot, "BTC-15M", W4)
+    assert mk.hold == "" and mk.price_problem == "" and card.price_problem(W4) == "", (age, mk.hold, mk.price_problem)
+    got = _looks(bot, "BTC-15M", W4)
+    assert got and all((t["label"], t["shares"], t["status"]) == ("吃涨", 10.0, "filled") for t in got.values()), (age, got)
+seen = D(f"{float(WLINE) * math.exp(0.5 * math.sqrt(59_000 / m.YEAR_MS)):.2f}")  # where the price is, a σ of 59 s on
+bot, card, spec = _window_bot(W4)
+_wbook(bot, "BTC-15M", spec.slug, "0.67", "0.70", W4)
+_priced(card, seen, W4 - 500)
+mk = _mk(bot, "BTC-15M", W4)
+assert abs(mk.fair_up - 0.69) < 0.005 and mk.hold == "" and _looks(bot, "BTC-15M", W4) == {}, (mk.fair_up, mk.hold)
+# ...and the documented minute still pauses the odds themselves (README: 推送一分钟没来就暂停概率)
+_priced(card, WLINE, W4 - 61_000)
+assert card.odds(W4).startswith("现货价停在 ") and card.odds(W4).endswith("（61 秒未更新），暂停概率"), card.odds(W4)
+assert "missing" in bot.updown_payload(card, W4) and all(x.key != "BTC-15M" for x in bot.sim_markets(W4))
+
+# 3. the limit: 2% of the time left to the window's end, 5 s at least. What it bounds — a σ of unseen move shifts the fair
+#    price at the line by Φ(√(age / left)) − ½, whatever σ: 19¢ for the 59 s at four minutes that used to pass, 5.6¢ under
+#    the share, 9¢ at the floor where the orders stop (90 s left)
+assert (m.UpDownMarket.TRADE_STALE_SHARE, m.UpDownMarket.TRADE_STALE_MIN_MS) == (0.02, 5_000)
+assert (m.IndexUpDownMarket.PRICE_STALE_MS, m.UpDownMarket.PRICE_STALE_MS) == (60_000, 300_000)  # the display's pauses, as they were
+shift = lambda age_s, left_s: m.norm_cdf(math.sqrt(age_s / left_s)) - 0.5
+assert 0.18 < shift(59, 240) < 0.20 and all(0.056 < shift(0.02 * left, left) < 0.057 for left in (900, 600, 300)) and 0.09 < shift(5, 90) < 0.095
+bot, card, spec = _window_bot(W4)
+for left_s, limit_ms in ((840, 16_800), (600, 12_000), (300, 6_000), (250, 5_000), (240, 5_000), (91, 5_000)):
+    now = WT1 - left_s * 1000
+    for age, held in ((limit_ms - 200, False), (limit_ms + 200, True), (-3_000, False)):  # (−3 s: a push stamped after the look's clock was read)
+        _priced(card, WLINE, now - age)
+        assert bool(card.price_problem(now)) is held and bool(card.advice_problem(card.odds(now), now)) is held, (left_s, age, card.price_problem(now))
+_priced(card, WLINE, WT1 - 840_000 - 17_000)
+assert card.price_problem(WT1 - 840_000) == "现货价 17 秒未更新，超过离结束 14.0 分钟时的上限 16.8 秒", card.price_problem(WT1 - 840_000)
+card.sigma_ms = WT1 - 840_000 - m.IndexUpDownMarket.SIGMA_STALE_MS - 1  # σ too old as well: its own reason comes first, as before
+assert card.advice_problem(card.odds(WT1 - 840_000), WT1 - 840_000) == "波动率超过一天未更新；暂不给建议"
+
+# 4. a resting order: under a hold it stands unjudged (sim_requote_reason: "no fresh view of the market: the order stands"),
+#    and before there was a hold it stood on the stale fair price. Now the step withdraws it, and the next look with a fresh
+#    price places it afresh. Ten minutes left: 挂涨 36¢ goes on a fresh price; half a minute later the price has not come
+#    again (31 s old, the limit there 11.4 s) while the others' bids have fallen away to 33¢ — they saw the fall
+N1 = WT0 + 5 * 60_000
+bot, card, spec = _window_bot(N1, SIM_WAYS="both")
+_wbook(bot, "BTC-15M", spec.slug, "0.36", "0.40", N1)
+_priced(card, WLINE, N1 - 1_000)
+tid = f"{spec.slug}|up|挂"
+got = _looks(bot, "BTC-15M", N1)
+assert {k: (t["label"], t["status"], t["order"], t["price"]) for k, t in got.items()} == {tid: ("挂涨", "resting", 10.0, 0.36)}, got
+N2 = N1 + 30_000
+card.sigma_ms = N2
+_wbook(bot, "BTC-15M", spec.slug, "0.33", "0.37", N2)
+mk = _mk(bot, "BTC-15M", N2)
+why = "现货价 31 秒未更新，超过离结束 9.5 分钟时的上限 11.4 秒，撤单"
+assert mk.price_problem and mk.hold and bot.sim_requote_reason(got[tid], mk, N2) == why, (mk.hold, bot.sim_requote_reason(got[tid], mk, N2))
+said = bot.sim_why(mk, m.TradeMap(got), N2)["maker"]["sides"][0]["text"]  # the page's 为什么挂 row says what the next look does
+assert said.startswith("挂单中：36.0¢×10 份") and said.endswith("；下一轮撤掉：" + why.removesuffix("，撤单")), said
+got = _looks(bot, "BTC-15M", N2)  # withdrawn by the step; nothing placed or bought on the stale price (the stale 50¢ against a 37¢ ask)
+assert {k: (t["status"], t["withdrawn"]["why"], t["withdrawn"]["rule"]) for k, t in got.items()} == {tid + "#1": ("cancelled", why, True)}, got
+N3 = N2 + 2_000  # the feed is back: a fresh price, the book where it was — the order is placed afresh and stands
+_priced(card, WLINE, N3 - 500)
+_wbook(bot, "BTC-15M", spec.slug, "0.36", "0.40", N3)
+got = _looks(bot, "BTC-15M", N3)
+assert {k: (t["status"], t["price"]) for k, t in got.items()} == {tid: ("resting", 0.36), tid + "#1": ("cancelled", 0.36)}, got
+assert bot.sim_requote_reason(got[tid], _mk(bot, "BTC-15M", N3), N3) == ""
+
+# 5. a stock card under LEAD_QUOTE=on: while its exchange quote leads (the index at the start × the quote's ratio to its own
+#    start) the odds are the quote's, not the index's, and nothing changes there — how long a quote may go unread stays
+#    LEAD_STALE_MS's business (15 s). Once the quote leads no more, or is only recorded (shadow), the index is the price in
+#    use and its age counts. 宇树 15 分, four minutes left, the quote +0.07% since the start
+U15 = m.WINDOW_UPDOWN_MARKETS[0]
+uspec = U15.window_spec(WT0)
+assert U15.key == "UNITREE-15M" and uspec.end_ms + 60_000 == WT1
+
+
+def _lead_bot(index_age: int, lead_age: int | None) -> tuple:
+    """A real Bot whose 宇树 card has its index read ``index_age`` ms ago and its exchange quote fetched ``lead_age`` ms ago."""
+    store = m.Store(":memory:")
+    store.put(f"updown:{U15.before(uspec).slug}:end", {"open": WT0 - 60_000, "close": "90.0000", "read_ms": WT0 + 2_000})
+    store.put(f"updown:{uspec.slug}:start", {"open": uspec.start_ms, "close": "90.0000", "read_ms": WT0 + 2_000})
+    store.put(f"updown:{uspec.slug}:lead", {"price": "150.00", "at": WT0 + 500, "read_ms": WT0 + 1_000, "source": "腾讯"})  # the quote at the start (note_lead)
+    bot = m.Bot(m.Config.from_env(WENV), store, _Clock(W4), None)
+    card = bot.updowns["UNITREE-15M"]
+    assert type(card) is m.IndexUpDownMarket and card.spec == uspec, card.spec
+    card.sigma, card.sigma_ms, card.lead_mode = 0.5, W4, "on"
+    _priced(card, "90.0500", W4 - index_age)
+    if lead_age is not None:
+        card.lead = m.IndexQuote("宇树科技", D("150.10"), D("149.00"), None, None, None, W4 - lead_age - 300, "腾讯", "交易中", W4 - lead_age)
+    bot.predict.info[uspec.slug] = {"outcomes": ["Up", "Down"], "created_ms": 0, "question": ""}
+    _wbook(bot, "UNITREE-15M", uspec.slug, "0.45", "0.50", W4)  # 涨 offered at 50¢ against a fair 68¢ (the quote's) or 65¢ (the index's)
+    return bot, card
+
+
+for index_age, lead_age, led, problem in (
+        (1_000, 2_000, True, ""),                    # both fresh: the quote leads
+        (30_000, 2_000, True, ""),                   # the quote leads: the odds are its, whatever the index's age — as before
+        (1_000, 16_000, False, ""),                  # the quote dropped (LEAD_STALE_MS): the index, fresh
+        (8_000, 16_000, False, "指数价 8 秒未更新"),   # ...the index itself too old: held (before: bought)
+        (8_000, None, False, "指数价 8 秒未更新")):    # no exchange quote at all: the index's age
+    bot, card = _lead_bot(index_age, lead_age)
+    assert (card.effective(W4)[1] != "") is led and card.effective(W4)[0] == (D("90.0600") if led else D("90.0500")), (index_age, lead_age, card.effective(W4))
+    mk = _mk(bot, "UNITREE-15M", W4)
+    want = f"{problem}，超过离结束 4.0 分钟时的上限 5 秒" if problem else ""
+    assert mk.price_problem == card.price_problem(W4) == want and mk.hold == (want + "；暂不给建议" if want else ""), (index_age, lead_age, mk.hold)
+    got = _looks(bot, "UNITREE-15M", W4)
+    if problem:
+        assert got == {}, (index_age, lead_age, got)
+    else:
+        assert got and all((t["label"], t["shares"]) == ("吃涨", 10.0) for t in got.values()), (index_age, lead_age, got)
+bot, card = _lead_bot(8_000, 2_000)
+card.lead_mode = "shadow"  # the quote only recorded: the card prices on the index, and it is the index's age that counts
+assert card.effective(W4) == (D("90.0500"), "") and card.price_problem(W4) == "指数价 8 秒未更新，超过离结束 4.0 分钟时的上限 5 秒"
+
+# 6. the daily crypto cards (BTC / ETH / BNB 日涨跌): PRICE_STALE_MS is five minutes there and they trade until half an hour
+#    before the end. 40 minutes left: a 294-s-old price was traded on (0.4·√(294 / 2400) = 14¢ off per σ of unseen move); the
+#    limit there is 48 s — over the 30-s cadence of the REST read that prices the card while its stream is quiet. Twelve hours
+#    from the end 2% is far more than the five minutes after which the card shows no odds at all: nothing changes there
+DAY = next(s for s in m.DAILY_UPDOWN_MARKETS if s.key == "BTC-DAY")
+day = DAY.day_spec(dt.date(2026, 11, 4))
+assert m.UpDownMarket.PRICE_SECONDS == 30 and m.Config.from_env(WENV).sim_crypto_day_quiet == 30
+for left_min, age, held in ((40, 294_000, True), (40, 49_000, True), (40, 47_000, False), (40, 31_000, False), (720, 294_000, False)):
+    now = day.end_ms + 60_000 - left_min * 60_000
+    store = m.Store(":memory:")
+    store.put(f"updown:{day.slug}:start", {"open": day.start_ms, "close": "100000", "read_ms": day.start_ms + 61_000})
+    bot = m.Bot(m.Config.from_env(WENV), store, _Clock(now), None)
+    card = bot.updowns["BTC-DAY"]
+    assert type(card) is m.UpDownMarket and card.spec.slug == day.slug, card.spec
+    card.sigma, card.sigma_ms = 0.45, now
+    _priced(card, "100000", now - age)
+    bot.predict.info[day.slug] = {"outcomes": ["Up", "Down"], "created_ms": 0}
+    _wbook(bot, "BTC-DAY", day.slug, "0.63", "0.66", now)  # the book has seen a rise the card's price has not: 跌 offered at 37¢
+    mk = _mk(bot, "BTC-DAY", now)
+    got = _looks(bot, "BTC-DAY", now)
+    if held:
+        want = f"币安价格 {age // 1000} 秒未更新，超过离结束 40.0 分钟时的上限 48 秒"
+        assert mk.price_problem == want and mk.hold == want + "；暂不给建议" and got == {}, (left_min, age, mk.hold, got)
+        assert bot.updown_payload(card, now)["warn"] == mk.hold and "missing" not in bot.updown_payload(card, now)
+    else:
+        assert mk.hold == "" and mk.price_problem == "" and got and all((t["label"], t["shares"]) == ("吃跌", 10.0) for t in got.values()), (left_min, age, mk.hold, got)
+
+# 7. the real trader: an order decided on a fresh price and held back a moment (a cooldown, a sign-in) is judged again right
+#    before it is signed (LiveBot.live_taker_recheck) — a price gone stale meanwhile voids it, a resting order as a taker — and
+#    a taker's unfilled rest is cancelled (live_taker_stale). The SDK test suite's key (tests/test_trading.py: never a real
+#    one); nothing is signed or sent here
+lb, card, spec = _window_bot(W4, cls=L.LiveBot, SIM_WAYS="both", LIVE="on", PREDICT_PRIVATE_KEY="0x" + "a" * 64, PREDICT_API_KEY="k")
+_wbook(lb, "BTC-15M", spec.slug, "0.36", "0.40", W4)
+
+
+def _pending(maker: bool, price: float) -> dict:
+    """A real order decided three seconds ago, not sent yet: 挂涨 at ``price``, or 吃涨 with its limit there."""
+    return {"v": 2, "market": spec.slug, "slug": spec.slug, "item": spec.name, "kind": "updown", "key": "BTC-15M", "side": "up",
+            "label": "挂涨" if maker else "吃涨", "maker": maker, "status": "resting", "shares": 0.0, "order": 10.0, "price": price, "cap": price,
+            "fills": [], "revisions": [], "settle": lb.updown_settle(spec), "opened": W4 - 3_000, "version": {"sim_shares": lb.config.sim_shares},
+            "live": {"state": "pending", "want": {"maker": maker, "limit": price, "cap": price}, "events": [{"at": W4 - 3_000, "what": "决定下单"}]}}
+
+
+_priced(card, WLINE, W4 - 1_000)  # the price fresh: both go out, the rest waits
+assert lb.live_taker_recheck(_pending(True, 0.36), W4) == ("", False) and lb.live_taker_recheck(_pending(False, 0.37), W4) == ("", False)
+assert lb.live_taker_stale(_pending(False, 0.37), _mk(lb, "BTC-15M", W4), W4) == ""
+_priced(card, WLINE, W4 - 8_000)  # ...the price 8 s old at the send: neither does
+stale = "现货价 8 秒未更新，超过离结束 4.0 分钟时的上限 5 秒"
+assert lb.live_taker_recheck(_pending(True, 0.36), W4) == (f"盘口变了：{stale}，撤单，3 秒前的挂单决定作废", False)
+assert lb.live_taker_recheck(_pending(False, 0.37), W4) == (f"卡片暂不建议（{stale}；暂不给建议），3 秒前的吃单决定作废", False)
+assert lb.live_taker_stale(_pending(False, 0.37), _mk(lb, "BTC-15M", W4), W4) == f"卡片暂不建议（{stale}；暂不给建议），剩余吃单撤掉"
 
 print("AUDIT_MODELS_A_OK")

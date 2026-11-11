@@ -8282,6 +8282,15 @@ class UpDownMarket:
     CANDLE_GRACE_MS = 2_000        # and only this long after its minute ended
     PRICE_STALE_MS = TouchMarket.PRICE_STALE_MS
     SIGMA_STALE_MS = TouchMarket.SIGMA_STALE_MS
+    # 1.150.0: how old a price may be and still be traded on (price_problem); PRICE_STALE_MS above only pauses the odds
+    # shown. The odds take the price in hand as this instant's, with σ√τ counted from now: a standard deviation of the
+    # move since it was read shifts the fair price at the line by Φ(√(age / time left)) − ½, about 0.4·√(age / time
+    # left), whatever σ is. The share keeps that at 5.6¢ and the floor at 9¢ where the 15-minute cards stop ordering
+    # (90 s left), both under the 10¢ entry bar. Before, a 59-s-old price with four minutes left was 19¢ off per σ of
+    # unseen move, while Predict's book, which had seen it, looked mispriced on the stale side: the taker bought into it
+    TRADE_STALE_SHARE = 0.02       # a price read longer ago than this share of the time left to the end is not traded on...
+    TRADE_STALE_MIN_MS = 5_000     # ...in the last minutes one older than this (a push comes every second, a read behind a slow round in two or three)
+    PRICE_NAME = "币安价格"         # the live price, as that message names it (a 15-minute card's: 指数价 / 现货价)
 
     SIGMA_HALF_LIFE = 120          # σ: the last 30 days' hourly returns, a weight halving every five days back (1.106.1; a plain 30-day σ before)
     SIGMA_MODEL = 2                # the estimator's version, kept on each sample: the calibration counts samples of the current one alone
@@ -8431,12 +8440,30 @@ class UpDownMarket:
                    ((used * MODEL_SIGMA_ERROR, -0.5), (used / MODEL_SIGMA_ERROR, -0.5), (used, 0.0)))
 
 
+    def price_problem(self, now_ms: int) -> str:
+        """Why the price in hand is too old to trade on ("" while it is not): read longer ago than TRADE_STALE_SHARE of
+        the time left to the end, or than TRADE_STALE_MIN_MS in the last minutes. The odds stay on the card (only
+        PRICE_STALE_MS pauses those); nothing is suggested or bought from them (advice_problem) and a resting order is
+        withdrawn (SimMarket.price_problem, Bot.sim_requote_reason). 1.150.0: until then the one check was PRICE_STALE_MS
+        — a minute on a 15-minute card, five on a daily one — so while the price feed stalled (the stream silent or
+        reconnecting, the REST read in a rate-limit cooldown) and Predict's book went on moving, the trader kept buying
+        the side the stale price made look cheap from those who had seen the move."""
+        left = self.spec.end_ms + 60_000 - now_ms
+        limit = max(self.TRADE_STALE_MIN_MS, self.TRADE_STALE_SHARE * left)
+        age = now_ms - self.priced_ms
+        if age <= limit:
+            return ""
+        return (f"{self.PRICE_NAME} {math.ceil(age / 1000)} 秒未更新，超过离结束 {max(left, 0) / 60_000:.1f} 分钟时的上限 "
+                f"{math.floor(limit / 100 + 1e-6) / 10:g} 秒")  # (the age rounded up, the limit down: never "5 秒" against a limit of 5)
+
     def advice_problem(self, odds: UpDownOdds, now_ms: int) -> str:
         """Why no trade is suggested from these odds ("" when one may be)."""
         if odds.settled:
             return "已出结果，以 Predict 结算为准；不再给建议"
         if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
             return "波动率超过一天未更新；暂不给建议"
+        if stale := self.price_problem(now_ms):
+            return f"{stale}；暂不给建议"
         return ""
 
 
@@ -8621,6 +8648,7 @@ class IndexUpDownMarket(UpDownMarket):
     WORD = "指数"                 # the price, as the card's messages name it (指数价 / 现货价)
     SOURCE = "币安合约指数价"      # the price's source, as the card and the evidence name it
     PRICE_KIND = "指数价 i"       # the kind of price (price_evidence)
+    PRICE_NAME = "指数价"         # the price, as price_problem names it
     SOURCE_LINE = "币安合约指数 1 分钟 K"  # the candles the boundaries are read from
     PRICE_TEXT = "币安合约 {symbol} 指数价"  # the card's reference line
     SIGMA_TEXT = "币安合约 {symbol} 指数近 4 小时 1 分钟 K（近 1 小时权重过半，开盘首小时按开盘后的）"
@@ -8718,6 +8746,16 @@ class IndexUpDownMarket(UpDownMarket):
             if price is not None:
                 return price, f"交易所现价先行 {gap:+.2%}"
         return self.price, ""
+
+    def price_problem(self, now_ms: int) -> str:
+        """Why the index in hand is too old to trade on (UpDownMarket.price_problem: by its own time — the push's event
+        time, the read's), while the index is the price the odds are taken at. While the exchange quote leads it
+        (effective: LEAD_QUOTE=on) the odds are the quote's, whatever the index's age: how long that quote may go
+        unread stays LEAD_STALE_MS's business (15 s), as before. (The quote is stamped at the start of its polling
+        round and reaches the card at the card's own next round: by the two loops' cadence a few seconds old in
+        ordinary running, close to this rule's 5 s — it wants its real age measured before the rule is put on it.)
+        Once the quote leads no more, the index's age counts again."""
+        return "" if self.effective(now_ms)[1] else super().price_problem(now_ms)
 
     def lead_text(self, now_ms: int) -> str:
         """The exchange quote's part in the price now, for the card and the evidence; "" without one."""
@@ -8961,6 +8999,7 @@ class SpotWindowMarket(IndexUpDownMarket):
     WORD = "现货"
     SOURCE = "币安现货最新成交（Chainlink 取买卖一中间价）"
     PRICE_KIND = "最新成交"
+    PRICE_NAME = "现货价"
     SOURCE_LINE = "币安现货 1 分钟 K"
     PRICE_TEXT = "币安现货 {symbol} 价格"
     SIGMA_TEXT = "币安现货 {symbol} 近 4 小时 1 分钟 K（近 1 小时权重过半）"
@@ -10920,6 +10959,8 @@ class SimMarket:
     lunch: bool = False      # a daily card: its underlying is in its lunch break (in_session is False then: the after-hours rules apply)
     move: float | None = None  # a daily card: ln(effective / reference), the day's move so far — the proxy's after hours (1.120.0)
     sigma_day: float = 0.0   # ...and the whole day's σ it is measured against (sim_against_move)
+    price_problem: str = ""  # an up/down card: why its price is too old to trade on now (UpDownMarket.price_problem; "" = fresh enough) —
+    #                          the card's ``hold`` says so too, and a resting order is withdrawn for it (sim_requote_reason, 1.150.0)
 
 
 class LazyEvidence(Mapping):
@@ -18169,7 +18210,8 @@ class Bot:
                 out.append(SimMarket(mkt.spec.slug, mkt.spec.name, "updown", mkt.spec.key, odds.fair_up, book,
                                      self.edge_need(mkt.model_swing(odds)), self.updown_hold(mkt, odds, now_ms)[0], ("涨", "跌"),
                                      self.updown_settle(mkt.spec),
-                                     self.evidence(lambda mkt=mkt, odds=odds: self.market_evidence("updown", now_ms, mkt=mkt, odds=odds))))
+                                     self.evidence(lambda mkt=mkt, odds=odds: self.market_evidence("updown", now_ms, mkt=mkt, odds=odds)),
+                                     price_problem="" if odds.settled else mkt.price_problem(now_ms)))
         for fm in self.flips.values():
             if only is not None and fm.spec.key != only:
                 continue
@@ -19270,6 +19312,12 @@ class Bot:
         stale_ms = SIM_WINDOW_STALE_WITHDRAW_MS if (trade.get("settle") or {}).get("window") else SIM_STALE_WITHDRAW_MS
         if mk.book.stale(now_ms) and now_ms - mk.book.fetched_ms > stale_ms:  # no pricing basis: not left for someone with one to fill
             return f"盘口断流超过 {stale_ms // 1000} 秒，撤单" if stale_ms < 120_000 else f"盘口断流超过 {stale_ms // 60_000} 分钟，撤单"
+        if mk.price_problem:
+            # 1.150.0: the card's own price is too old to trade on (its feed stalled while the book is fresh), and the card holds
+            # its suggestion for it. An order under a hold stands unjudged (the next line) — its edge not held against the exit
+            # line, a 买1 that fell away not followed — a bid left for whoever saw the move the card has not. It is withdrawn,
+            # as on a book gone stale, and placed afresh by the next look that has a fresh price
+            return f"{mk.price_problem}，撤单"
         if mk.hold or mk.book.stale(now_ms) or book_crossed(mk.book):
             return ""  # no fresh view of the market: the order stands
         side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)

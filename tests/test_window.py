@@ -680,6 +680,12 @@ async def samples():
     assert m.WSAMPLE_HORIZONS == {"window": (840, 600, 300, 120), "day": (43200, 21600, 7200, 1800)}
     # nothing before a minute in; then the 14-minutes-left sample, once (SK 海力士's 10:45 window is past its moments: passed over)
     assert bot.window_sample(T0 + 30_000) == 0 and not store.keys("wsample:")
+    # 1.150.0: the index kept current to the sample, as the push keeps it — the one read at T0 + 4.5 s would be 56 s old by
+    # then, and a price that old with 14 minutes left is no longer suggested on (UpDownMarket.price_problem: 2% of the time
+    # left; this sample used to pin hold == "" on it)
+    held = bot.updown_hold(card, card.odds(T0 + 61_000), T0 + 61_000)[0]
+    assert held.startswith("指数价 57 秒未更新，超过离结束 14.0 分钟时的上限 ") and held.endswith(" 秒；暂不给建议"), held
+    card.push_index(D("90.1200"), T0 + 60_500, T0 + 61_000)
     assert bot.window_sample(T0 + 61_000) == 1 and bot.window_sample(T0 + 62_000) == 0
     row = store.get(f"wsample:{spec.slug}:840")
     assert {k: row[k] for k in ("left", "kind", "card", "key", "start", "end", "mkt", "bid", "ask", "line", "price", "hold")} == {
