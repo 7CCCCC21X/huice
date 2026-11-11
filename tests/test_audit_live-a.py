@@ -766,9 +766,241 @@ async def maker_expiry():
     assert deadline(True, {}, want={"expires": L.FAR_FUTURE}) == 0
 
 
+async def resume_rearms_loss_stop():
+    """LIVE-RESUME-KILL: /live resume — and the control page's 恢复 — lifts today's loss stop (README: 可提前解除). It also took
+    the stop away until midnight (Beijing): a day with a record, tripped or resumed, was skipped whole by the check and by the
+    send-time recheck, so after one resume no loss of any size stopped the trader (−$294 in a day at a $50 cap in the audit's
+    run), and a cap lowered afterwards changed nothing. The stop is now armed again a cap's worth under the P&L the resume
+    found (live_loss_floor): the losses the operator went on with never trip it again (test_trading pins that, and it holds),
+    the next cap's worth does — refused, withdrawn and announced like the first, and lifted by another resume in turn. The
+    answer says that a stop was lifted and where it stands now; the page asks before it lifts one; and a pause no longer hides
+    a stop behind it (one command ends both). The pre-open mode's own loss check is not lifted by the resume, as before: the
+    conservative side — said in the answer, not changed."""
+    import types
+    import preopen as P
+    BJ, market_json, book = T["BJ"], T["market_json"], T["book"]
+    today = m.beijing_day(NOW / 1000)
+    creates = lambda bot: len([c for c in bot.live.api.calls if c[0] == "create"])
+    total = lambda bot: bot.live_daily_pnl(bot.sim_trades(), bot.market.now_ms()) + bot.preopen_pnl()  # the figure the stop goes by
+    check = lambda bot: bot.live_check_kill(bot.sim_trades(), bot.market.now_ms())  # as every step and every sync does
+    resume = lambda bot: bot.cmd_live(m.Request("/live", ["resume"], 1, 0, 1))
+    RESUMED = "▶️ 真实交易已恢复：满足条件的建议会重新下单"
+    lifted = lambda found, line: f"{RESUMED}；同时解除了今日亏损停机：今日已结算 {found}，再亏到 {line} 会再次停机。"
+
+    # --- the whole path, as the audit ran it: real orders, filled by the exchange, settled by the bot, the stop tripped by its step ---
+    def card(n, at, close_ms):  # a daily card of its own: 涨 fair at 70¢ and asked at 58¢ (a taker's buy), settled by note_outcome("K<n>")
+        return m.SimMarket(f"mkt{n}", f"mkt{n}", "close", f"K{n}", 0.70, book([], [("0.58", "400")], at, f"mkt{n}", f"K{n}", mid=str(200 + n)), 0.03, "",
+                           ("涨", "跌"), {"key": f"K{n}", "target": today, "line": 1.0, "close_ms": close_ms})
+    # ...and a card with a bid worth joining and nothing worth taking (60¢ bid, 69¢ asked, fair 70¢): a resting order, when both ways are on
+    rest = lambda at: m.SimMarket("rest", "rest", "close", "R", 0.70, book([("0.60", "100")], [("0.69", "100")], at, "rest", "R", mid="110"), 0.03, "", ("涨", "跌"), {})
+
+    async def buy(bot, n, at, close_ms, *beside):
+        """A look at card n: True when the taker's order went out — filled in full then: 100 shares at 58¢ and the fee, $58.84."""
+        bot.live.api.markets[str(200 + n)] = market_json(str(200 + n))
+        await step(bot, at, card(n, at, close_ms), *(mk(at) for mk in beside))
+        t = bot.sim_trades().get(f"mkt{n}|up|吃")
+        if t is None or not t["live"].get("order_id"):
+            return False
+        bot.live.api.fill(t["live"]["order_id"], 100, done=True, price=0.58)
+        await step(bot, at + 10_000, card(n, at + 10_000, close_ms), *(mk(at + 10_000) for mk in beside))
+        return True
+
+    async def lose(bot, n, close_ms, *beside):  # card n closes under its line: 涨 pays nothing, settled at the step an hour after the close
+        bot.note_outcome(f"K{n}", today, 0.5, "test")
+        world["markets"] = [mk(close_ms + 61 * 60_000) for mk in beside]
+        await step(bot, close_ms + 61 * 60_000)
+
+    bot = make_bot(SIM_WAYS="taker")  # LIVE_MAX_DAILY_LOSS_USD $50 (make_bot)
+    await bot.live_prepare()
+    fake = bot.live.api
+    fake.markets["110"] = market_json("110")
+    assert await buy(bot, 1, BJ(10, 5, 10, 0), BJ(10, 5, 11, 0))
+    await lose(bot, 1, BJ(10, 5, 11, 0))
+    assert abs(total(bot) + 58.84) < 1e-6 and bot.live_killed() == "今日已结算亏损 −$58.84 达到 LIVE_MAX_DAILY_LOSS_USD $50"  # the day's first stop, as ever
+    assert not await buy(bot, 2, BJ(10, 5, 12, 30), BJ(10, 5, 13, 30)) and creates(bot) == 1
+    assert RESUMED in await resume(bot) and bot.live_killed() == ""
+    bot.config = bot.live.config = dataclasses.replace(bot.config, sim_ways="both")  # ...and a bid resting on another market from here on (60¢ × 100)
+    assert await buy(bot, 2, BJ(10, 5, 12, 31), BJ(10, 5, 13, 30), rest) and creates(bot) == 3  # lifted, as documented: the next orders go out
+    maker = bot.sim_trades()["rest|up|挂"]
+    oid = maker["live"]["order_id"]
+    assert (maker["status"], maker["live"]["state"]) == ("resting", "open") and oid in fake.open, (maker["status"], maker["live"]["state"])
+    await lose(bot, 2, BJ(10, 5, 13, 30), rest)  # −$117.68 on the day: a cap's worth and more since the resume found −$58.84
+    assert abs(total(bot) + 117.68) < 1e-6, total(bot)
+    # the stop trips again — it never did, whatever was lost: four more losses went out in the audit's run, −$294 on the day
+    assert bot.live_killed() == "今日已结算亏损 −$117.68 达到 LIVE_MAX_DAILY_LOSS_USD $50，手动恢复时 −$58.84、之后又亏 $58.84", bot.live_killed()
+    maker = next(t for t in bot.sim_trades().values() if t["live"].get("order_id") == oid)
+    assert maker["status"] == "cancelled" and maker["withdrawn"]["why"] == "触发日亏损上限" and oid not in fake.open and ("remove", [oid]) in fake.calls, \
+        (maker["status"], maker.get("withdrawn"), sorted(fake.open))  # the resting bid withdrawn on Predict, like the first stop's
+    assert not await buy(bot, 3, BJ(10, 5, 14, 35), BJ(10, 5, 15, 30), rest) and creates(bot) == 3, creates(bot)  # nothing new goes out
+    assert any(b["market"] == "mkt3" and "今日停止开新仓：今日已结算亏损 −$117.68" in b["why"] for b in bot.sim_blocks()), bot.sim_blocks()[:3]
+    bot.market.now = BJ(10, 6, 0, 1)  # the next day (Beijing): no stop, the plain line again
+    assert bot.live_kill_record() == {} and bot.live_killed() == "" and bot.live_loss_floor(50.0) == -50.0 and bot.live_resumed_floor() is None
+
+    # --- the line, to the cent: positions settled at exact figures (2 × usd shares bought at 50¢, paid nothing: a loss of usd) ---
+    def settled(bot, name, usd, payout=0.0):
+        at = bot.market.now_ms()
+        bot.sim_save([(f"{name}|up|吃", {"item": name, "label": "吃涨", "market": name, "side": "up", "maker": False, "status": "settled", "shares": 2.0 * usd,
+                                         "order": 2.0 * usd, "price": 0.5, "payout": payout, "edge": 0.05, "fair": 0.55, "settled": at, "opened": at,
+                                         "fills": [], "revisions": [], "live": {"state": "done", "events": []}})])
+
+    def blocked(bot):  # the send-time recheck of an order decided a moment ago ($5: within every cap)
+        at = bot.market.now_ms()
+        pending = {"maker": True, "order": 10.0, "price": 0.5, "opened": at, "settle": {}, "live": {"state": "pending", "want": {"shares": 10.0}, "events": [{"at": at}]}}
+        return bot.live_send_block(pending, bot.sim_trades(), at)
+
+    class Telegram:  # the administrator's chat: what live_notify sends there
+        def __init__(self): self.sent = []
+        async def send(self, chat, thread, text, *more): self.sent.append(text)
+
+    async def stops_told(bot):
+        for _ in range(5):
+            await asyncio.sleep(0)  # the deliveries run beside the step
+        return [t for t in bot.telegram.sent if t.startswith("🛑")]
+
+    b = make_bot()
+    await b.live_prepare()
+    b.telegram = Telegram()
+    b.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    record = lambda bot=b: bot.store.get("live:killed")
+    settled(b, "l1", 60); check(b)
+    assert b.live_killed() == "今日已结算亏损 −$60.00 达到 LIVE_MAX_DAILY_LOSS_USD $50" and len(await stops_told(b)) == 1 and b.live_resumed_floor() is None
+    assert await resume(b) == lifted("−$60.00", "−$110.00")  # the answer says what was lifted, and where the stop stands now
+    assert b.live_killed() == "" and (record()["resumed"], record()["resumed_pnl"], record()["resumed_at"]) == (True, -60.0, NOW), record()
+    assert b.live_loss_floor(50.0) == b.live_resumed_floor() == -110.0
+    check(b)
+    assert b.live_killed() == "" and blocked(b) == ""  # the losses the resume found do not trip it again (test_trading's pin, kept)
+    settled(b, "l2", 40); check(b)  # −$100
+    assert b.live_killed() == "" and blocked(b) == ""
+    settled(b, "l3", 9.5); check(b)  # −$109.50: half a dollar short of a cap's worth since the resume
+    assert b.live_killed() == "" and blocked(b) == "" and len(await stops_told(b)) == 1
+    settled(b, "l4", 0.5)  # −$110.00: the line
+    b.sim_save([("held|up|挂", {"item": "held", "label": "挂涨", "market": "held", "side": "up", "maker": True, "status": "resting", "shares": 0.0, "order": 100.0,
+                                "price": 0.3, "opened": NOW, "fills": [], "revisions": [],
+                                "live": {"state": "open", "order_id": "901", "hash": "0x1", "events": [], "want": {"maker": True}}})])
+    assert blocked(b) == "今日已结算亏损 −$110.00 已达 LIVE_MAX_DAILY_LOSS_USD $50"  # at the send, before any step has looked (it was skipped once resumed)
+    check(b)
+    assert b.live_killed() == "今日已结算亏损 −$110.00 达到 LIVE_MAX_DAILY_LOSS_USD $50，手动恢复时 −$60.00、之后又亏 $50.00", b.live_killed()
+    held = b.sim_trades()["held|up|挂"]
+    assert (held["status"], held["live"]["state"], held["live"]["cancel_why"]) == ("cancelled", "cancelling", "触发日亏损上限"), (held["status"], held["live"])
+    assert "resumed" not in record() and b.live_resumed_floor() is None and "今日停止开新仓" in blocked(b)
+    assert "今日停止开新仓" in b.live_room(b.sim_trades(), hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW), "up", 0.58, 100)
+    told = await stops_told(b)  # announced again, however soon after the first notice (a keyed notice is held back LIVE_NOTE_SECONDS: the key goes with the stop)
+    assert len(told) == 2 and "手动恢复时 −$60.00" in told[1] and "/live resume" in told[1], told
+    check(b)
+    assert len(await stops_told(b)) == 2 and "resumed" not in record()  # standing: nothing more until the operator lifts it
+    assert await resume(b) == lifted("−$110.00", "−$160.00") and record()["resumed_pnl"] == -110.0  # another resume: another cap's worth, from here
+    at = record()["resumed_at"]
+    # ...and only a standing stop is lifted: a resume that ends a pause later in the day moves nothing (or each one would hand out a cap)
+    b.market.now = NOW + 60_000
+    settled(b, "l5", 5); check(b)  # −$115.00
+    assert "⏸" in await b.cmd_live(m.Request("/live", ["pause", "午休"], 1, 0, 1)) and b.live_paused() == "午休"
+    assert await resume(b) == RESUMED + "。" and await resume(b) == RESUMED + "。" and b.live_paused() == ""
+    assert (record()["resumed_pnl"], record()["resumed_at"]) == (-110.0, at) and b.live_loss_floor(50.0) == -160.0
+    # a cap lowered after the resume counts (it did nothing until midnight): $10 from what the resume found
+    assert b.control_set({"LIVE_MAX_DAILY_LOSS_USD": "10"})["ok"] and b.config.live_max_daily_loss_usd == 10
+    assert b.live_loss_floor(10.0) == b.live_resumed_floor() == b.live_status(b.market.now_ms())["loss_floor"] == -120.0
+    check(b)
+    assert b.live_killed() == "" and blocked(b) == ""
+    settled(b, "l6", 5)  # −$120.00
+    assert "已达 LIVE_MAX_DAILY_LOSS_USD $10" in blocked(b)
+    check(b)
+    assert b.live_killed() == "今日已结算亏损 −$120.00 达到 LIVE_MAX_DAILY_LOSS_USD $10，手动恢复时 −$110.00、之后又亏 $10.00" and len(await stops_told(b)) == 3
+    # no limit (0): nothing to arm, and the answer does not promise a line; a limit set again counts from what the resume found
+    assert b.control_set({"LIVE_MAX_DAILY_LOSS_USD": "0"})["ok"] and b.live_killed()  # (the stop that stands is not lifted by the setting)
+    assert await resume(b) == f"{RESUMED}；同时解除了今日亏损停机：今日已结算 −$120.00，现在不设亏损上限（LIVE_MAX_DAILY_LOSS_USD=0）。"
+    settled(b, "l7", 30); check(b)  # −$150.00
+    assert b.live_killed() == "" and blocked(b) == "" and b.live_resumed_floor() is None
+    assert b.control_set({"LIVE_MAX_DAILY_LOSS_USD": "50"})["ok"] and b.live_loss_floor(50.0) == -170.0
+    check(b)
+    assert b.live_killed() == "" and blocked(b) == ""
+    settled(b, "l8", 20); check(b)  # −$170.00
+    assert b.live_killed().startswith("今日已结算亏损 −$170.00 达到 LIVE_MAX_DAILY_LOSS_USD $50，手动恢复时 −$120.00") and len(await stops_told(b)) == 4
+
+    # a day in profit when the stop is lifted keeps the plain line: never tighter than a day that had no stop
+    p = make_bot()
+    await p.live_prepare()
+    settled(p, "l1", 60); check(p)
+    settled(p, "w1", 70, payout=1.0)  # +$70 settles behind the stop: +$10 on the day
+    assert p.live_killed() and await resume(p) == lifted("+$10.00", "−$50.00") and p.live_loss_floor(50.0) == -50.0
+    settled(p, "l2", 50); check(p)  # −$40.00
+    assert p.live_killed() == "" and blocked(p) == ""
+    settled(p, "l3", 10); check(p)  # −$50.00
+    assert p.live_killed() == "今日已结算亏损 −$50.00 达到 LIVE_MAX_DAILY_LOSS_USD $50，手动恢复时 +$10.00、之后又亏 $60.00", p.live_killed()
+
+    # a stop resumed by the version before (the record has no figure): counted from the first look after the upgrade
+    o = make_bot()
+    await o.live_prepare()
+    settled(o, "l1", 70)
+    o.store.put("live:killed", {"day": today, "why": "今日已结算亏损 −$60.00 达到 LIVE_MAX_DAILY_LOSS_USD $50", "at": NOW, "resumed": True, "resumed_at": NOW})
+    assert o.live_killed() == "" and blocked(o) == "" and o.live_resumed_floor() is None  # (no figure yet: as that version left it)
+    check(o)
+    assert o.live_killed() == "" and record(o)["resumed"] and record(o)["resumed_pnl"] == -70.0 and o.live_loss_floor(50.0) == o.live_resumed_floor() == -120.0
+    settled(o, "l2", 49); check(o)
+    assert o.live_killed() == "" and blocked(o) == ""
+    settled(o, "l3", 1); check(o)  # −$120.00
+    assert o.live_killed().startswith("今日已结算亏损 −$120.00 达到 LIVE_MAX_DAILY_LOSS_USD $50，手动恢复时 −$70.00"), o.live_killed()
+    o.market.now = NOW + 24 * 3_600_000  # the next day: yesterday's record and yesterday's losses are no part of it
+    assert o.live_kill_record() == {} and o.live_loss_floor(50.0) == -50.0 and blocked(o) == ""
+    settled(o, "n1", 49); check(o)
+    assert o.live_killed() == ""
+    settled(o, "n2", 1); check(o)
+    assert o.live_killed() == "今日已结算亏损 −$50.00 达到 LIVE_MAX_DAILY_LOSS_USD $50"
+
+    # --- the control page: a stop that trips behind a pause is shown beside it, and 恢复 asks before it lifts one ---
+    c = make_bot()
+    await c.live_prepare()
+    assert (await c.control_action({"action": "pause", "why": "午休"}))["ok"]
+    settled(c, "l1", 60); check(c)
+    st = c.live_status(NOW)
+    assert st["paused"] == "午休" and st["killed"] == "今日已结算亏损 −$60.00 达到 LIVE_MAX_DAILY_LOSS_USD $50" and st["loss_floor"] is None
+    assert "⏸ 已暂停（午休）｜🛑 今日停开新仓（今日已结算亏损 −$60.00 达到 LIVE_MAX_DAILY_LOSS_USD $50）" in c.live_text(NOW), c.live_text(NOW).split("\n")[0]
+    assert "真实交易 已暂停、今日停开新仓｜" in c.status("1:0"), c.status("1:0")
+    got = await c.control_action({"action": "resume"})  # the page's 恢复 (the same code as /live resume)
+    assert got == {"ok": True, "message": lifted("−$60.00", "−$110.00")}, got
+    st = c.live_status(NOW)
+    assert (st["paused"], st["killed"], st["loss_floor"], st["caps"]["daily_loss"]) == ("", "", -110.0, 50), (st["paused"], st["killed"], st["loss_floor"])
+    text = c.live_text(NOW)
+    assert "🟢 运行中" in text.split("\n")[0] and "今日已结算盈亏 −$60.00（上限 −$50；今天手动恢复过，停机线 −$110.00）" in text, text
+    assert "真实交易 运行中｜" in c.status("1:0")
+    page = m.CONTROL_PAGE
+    assert 'else if(a==="resume"){const k=data&&data.live&&data.live.killed;if(!k||confirm("今日亏损停机正在生效（"+k+"）' in page  # asked first while a stop stands
+    assert '"已暂停："+L.paused+(L.killed?"｜今日停开新仓："+L.killed:"")' in page and 'L.paused?(L.killed?"已暂停｜今日停开新仓":"已暂停")' in page
+    assert 'L.loss_floor!=null?"（今天手动恢复过，停机线 "+money(L.loss_floor)+"）"' in page
+
+    # --- the pre-open mode: its day's P&L is in the figure the stop goes by, before the resume and after; its own check stays ---
+    f = make_bot()
+    await f.live_prepare()
+    day = {"pnl": -30.0}
+    f.preopen = types.SimpleNamespace(alive=True, daily_pnl=lambda: day["pnl"], manual_pause=True, ledger=types.SimpleNamespace(pause=lambda value=None: False),
+                                      withdrawing=lambda: "已达到今日真实亏损上限")
+    settled(f, "l1", 30); check(f)  # −$30 of the model's and −$30 of the mode's
+    assert f.live_killed() == "今日已结算亏损 −$60.00 达到 LIVE_MAX_DAILY_LOSS_USD $50"
+    assert await resume(f) == lifted("−$60.00", "−$110.00") + "开盘前预挂模式仍不挂单：已达到今日真实亏损上限。"
+    assert f.preopen.manual_pause is False and record(f)["resumed_pnl"] == -60.0  # (the mode's manual pause ends with the command, as documented)
+    day["pnl"] = -79.5; check(f)
+    assert f.live_killed() == "" and blocked(f) == ""
+    day["pnl"] = -80.0
+    assert "已达 LIVE_MAX_DAILY_LOSS_USD" in blocked(f)
+    check(f)
+    assert f.live_killed().startswith("今日已结算亏损 −$110.00 达到 LIVE_MAX_DAILY_LOSS_USD $50，手动恢复时 −$60.00"), f.live_killed()
+    # the mode itself (preopen.Controller, its loop not started): held by the stop, and by its own check of the day's loss once
+    # the stop is lifted — the model trader goes on, the mode stays out for the day, as before (PREOPEN.md: 日亏损上限 withdraws it)
+    r = make_bot(PREOPEN_15M="on", PREOPEN_DB=":memory:")
+    await r.live_prepare()
+    r.preopen = P.Controller(r)
+    try:
+        settled(r, "l1", 60); check(r)
+        assert r.preopen_active() and r.live_killed() and r.preopen.withdrawing() == r.live_killed()
+        assert await resume(r) == lifted("−$60.00", "−$110.00") + "开盘前预挂模式仍不挂单：已达到今日真实亏损上限。"
+        assert r.live_killed() == "" and blocked(r) == "" and r.preopen.withdrawing() == "已达到今日真实亏损上限"
+    finally:
+        r.preopen.ledger.close()
+
+
 asyncio.run(place_timeout_race())
 asyncio.run(account_check_rpc_down())
 asyncio.run(double_cancel())
 asyncio.run(order_test_limits())
 asyncio.run(maker_expiry())
+asyncio.run(resume_rearms_loss_stop())
 print("AUDIT_LIVE_A_OK")

@@ -1444,6 +1444,30 @@ class LiveBot(core.Bot):
         record = self.live_kill_record()
         return "" if not record or record.get("resumed") else str(record.get("why") or "触发日亏损上限")
 
+    def live_loss_floor(self, cap: float) -> float:
+        """The day's settled P&L (the model trader's and the pre-open mode's) at or under which LIVE_MAX_DAILY_LOSS_USD stops
+        new orders: −cap. After /live resume lifted today's stop (1.150.0): a cap's worth under the loss the resume found —
+        the loss the operator went on with is not counted again, the next cap's worth is. The resume used to take the stop
+        away until midnight (Beijing) whatever was lost after it — −$294 in a day at a $50 cap — and a cap lowered after
+        it changed nothing: the line follows the cap as it is set now. A day in profit at the resume keeps the plain line
+        (never tighter than a day that had no stop). −inf for a record resumed by a version that kept no figure, until
+        live_check_kill dates it from its next look."""
+        record = self.live_kill_record()
+        if not record.get("resumed"):
+            return -cap
+        found = record.get("resumed_pnl")
+        return -cap + min(0.0, float(found)) if found is not None else -math.inf
+
+    def live_resumed_floor(self) -> float | None:
+        """For the status texts: the line the stop stands at once /live resume has lifted it today (live_loss_floor) — the
+        day's P&L may be past the cap there with the trader running. None on a day without a resume, with no limit set, or
+        while a record of an older version has no figure yet."""
+        cap = self.config.live_max_daily_loss_usd
+        if not cap or not self.live_kill_record().get("resumed"):
+            return None
+        floor = self.live_loss_floor(cap)
+        return floor if math.isfinite(floor) else None
+
     # --- the gate: why a decision is not sent (recorded like a group-cap refusal) ------------------------------------
     def sim_group_room(self, trades: dict[str, dict], mk: core.SimMarket, side: str, price: float, shares: float,
                        taker: dict | None = None) -> str:
@@ -1610,12 +1634,25 @@ class LiveBot(core.Bot):
                    if isinstance(t.get("live"), dict) and t.get("status") == "settled" and int(t.get("settled") or 0) >= since)
 
     def live_check_kill(self, trades: dict[str, dict], now_ms: int) -> None:
+        """The daily loss stop: tripped when the day's settled P&L is at −LIVE_MAX_DAILY_LOSS_USD or under — new orders
+        stop until midnight (Beijing), the resting ones are withdrawn. 1.150.0: lifted by hand (/live resume), it is armed
+        again a cap's worth further down (live_loss_floor): the losses the resume found do not trip it again (the operator
+        went on with them), the next cap's worth does — as the first did, and another resume lifts that one in turn. A day
+        with a record used to be skipped whole, tripped or resumed: one resume, and no loss of any size stopped the trader
+        until midnight."""
         cap = self.config.live_max_daily_loss_usd
-        if not cap or self.live_kill_record():
-            return  # once a day: tripped already, or resumed by hand (the losses are still there)
+        record = self.live_kill_record()
+        if not cap or (record and not record.get("resumed")):
+            return  # no limit set; or tripped today and standing
         pnl = self.live_daily_pnl(trades, now_ms) + self.preopen_pnl()  # the pre-open mode's day counted too (1.125.0)
-        if pnl <= -cap:
+        if record and record.get("resumed_pnl") is None:  # resumed by a version that kept no figure: counted from this look on
+            self.store.put("live:killed", {**record, "resumed_pnl": pnl})
+            return
+        if pnl <= self.live_loss_floor(cap):
             why = f"今日已结算亏损 {money(pnl)} 达到 LIVE_MAX_DAILY_LOSS_USD ${cap:g}"
+            if record:  # the second stop of a day says what the first one's resume found, and what went since
+                found = float(record["resumed_pnl"])
+                why += f"，手动恢复时 {money(found)}、之后又亏 ${found - pnl:,.2f}"
             self.store.put("live:killed", {"day": core.beijing_day(now_ms / 1000), "why": why, "at": now_ms})
             for tid, t in trades.items():
                 if isinstance(t.get("live"), dict) and t["status"] == "resting" and t["live"].get("state") in {"open", "placing", "unknown"}:
@@ -1884,9 +1921,10 @@ class LiveBot(core.Bot):
             return f"真实交易已暂停（{paused}）"
         if killed := self.live_killed():
             return f"今日停止开新仓：{killed}"
-        resumed = bool(self.live_kill_record().get("resumed"))  # /live resume after today's stop: the operator's call stands
-        if (cap := c.live_max_daily_loss_usd) and not resumed and (pnl := self.live_daily_pnl(trades, now_ms) + self.preopen_pnl()) <= -cap:
-            return f"今日已结算亏损 {money(pnl)} 已达 LIVE_MAX_DAILY_LOSS_USD ${cap:g}"  # recomputed now, not a flag saved a step ago
+        # recomputed now, not a flag saved a step ago — after /live resume too (1.150.0: against the line the resume left,
+        # live_loss_floor; the check used to be skipped for the rest of a day whose stop was lifted by hand)
+        if (cap := c.live_max_daily_loss_usd) and (pnl := self.live_daily_pnl(trades, now_ms) + self.preopen_pnl()) <= self.live_loss_floor(cap):
+            return f"今日已结算亏损 {money(pnl)} 已达 LIVE_MAX_DAILY_LOSS_USD ${cap:g}"
         if not self.live.ready:
             return f"真实交易未就绪：{self.live.not_ready_why}"
         decided = self.live_decided(trade, now_ms)
@@ -3913,9 +3951,24 @@ class LiveBot(core.Bot):
             self.store.delete_keys(["live:paused"])
             if getattr(self, "preopen", None) is not None:
                 self.preopen.manual_pause = self.preopen.ledger.pause(False)
-            if record := self.live_kill_record():
-                self.store.put("live:killed", {**record, "resumed": True, "resumed_at": now_ms})
-            return "▶️ 真实交易已恢复：满足条件的建议会重新下单。"
+            lifted = ""
+            record = self.live_kill_record()
+            if record and not record.get("resumed"):
+                # 1.150.0: today's loss stop lifted. The day's settled P&L as the resume finds it is kept with the record: the stop
+                # is armed again a cap's worth under it (live_loss_floor), where it used to be gone until midnight whatever was lost
+                # next. Only a standing stop is lifted — a resume that merely ends a pause later in the day moves nothing, or every
+                # pause and resume would hand out another cap. And the answer says what was lifted: the same command (the page's
+                # 恢复 button) ends a pause, and an operator ending one had no word that the day's loss stop went with it.
+                pnl = self.live_daily_pnl(self.sim_trades(), now_ms) + self.preopen_pnl()
+                self.store.put("live:killed", {**record, "resumed": True, "resumed_at": now_ms, "resumed_pnl": pnl})
+                self.live_noted.pop("kill", None)  # the next stop is announced however soon it comes (a keyed notice waits LIVE_NOTE_SECONDS)
+                cap = self.config.live_max_daily_loss_usd
+                lifted = f"；同时解除了今日亏损停机：今日已结算 {money(pnl)}，" + (
+                    f"再亏到 {money(self.live_loss_floor(cap))} 会再次停机" if cap else "现在不设亏损上限（LIVE_MAX_DAILY_LOSS_USD=0）")
+                held = getattr(self.preopen, "withdrawing", None) if self.preopen_active() else None
+                if held is not None and (why := held()):  # its own loss check is not lifted by this command (PREOPEN.md): said, not changed
+                    lifted += f"。开盘前预挂模式仍不挂单：{why}"
+            return "▶️ 真实交易已恢复：满足条件的建议会重新下单" + lifted + "。"
         if action == "cancel":
             return await self.live_cancel_command(words, now_ms)
         if action == "release":
@@ -4051,6 +4104,7 @@ class LiveBot(core.Bot):
                 "lines": self.live.summary_lines(), "info": self.live.summary_info(), "account": short_addr(self.live.wallet.maker),
                 "exposure": self.live_exposure(trades), "daily_pnl": self.live_daily_pnl(trades, now_ms),
                 "caps": {"order": c.live_max_order_usd, "open": c.live_max_open_usd, "daily_loss": c.live_max_daily_loss_usd},
+                "loss_floor": self.live_resumed_floor(),  # 1.150.0: where the loss stop stands after today's /live resume (None: at the cap)
                 "resting": sum(t["status"] == "resting" for _, t in live),
                 "unconfirmed": sum(t["live"].get("state") in {"pending", "placing", "cancelling", "unknown"} for _, t in live),
                 "synced_at": core.stamp(self.live_synced_at) if self.live_synced_at else "",
@@ -4447,10 +4501,13 @@ class LiveBot(core.Bot):
     def live_text(self, now_ms: int) -> str:
         trades = self.sim_trades()
         live = [t for t in trades.values() if isinstance(t.get("live"), dict)]
+        # 1.150.0: a pause and today's loss stop are shown side by side — the pause alone was shown, and /live resume, sent to end
+        # it, lifts the stop as well
+        stops = "｜".join(x for x in ("⏸ 已暂停（" + self.live_paused() + "）" if self.live_paused() else "",
+                                    "🛑 今日停开新仓（" + self.live_killed() + "）" if self.live_killed() else "") if x)
         state = ("⚪ LIVE=off：只记账（/live mode pause 登录测试，/live mode on 真实下单）" if self.config.live_mode == "off"
                  else "🧪 LIVE=pause：只测试，不开新仓" + ("" if self.live.ready else "｜未就绪：" + self.live.not_ready_why) if self.config.live_mode == "pause"
-                 else "⏸ 已暂停（" + self.live_paused() + "）" if self.live_paused() else "🛑 今日停开新仓（" + self.live_killed() + "）"
-                 if self.live_killed() else ("🟢 运行中" if self.live.ready else "🔴 未就绪：" + self.live.not_ready_why))
+                 else stops or ("🟢 运行中" if self.live.ready else "🔴 未就绪：" + self.live.not_ready_why))
         ways, kinds = core.sim_scope(self.config)
         lines = [f"💰 {core.bold('真实交易')} v{core.VERSION}｜{state}", *self.live.summary_lines(),
                  f"策略：同模拟交易：净优势 ≥{self.config.sim_edge * 100:g}¢ 买 {self.config.sim_shares:g} 份；{ways}；{kinds}"]
@@ -4468,8 +4525,10 @@ class LiveBot(core.Bot):
         since = int(today.timestamp() * 1000)
         placed_today = sum(int(t["opened"]) >= since for t in live)
         failed_today = sum(int(t["opened"]) >= since and (t["live"].get("final") == "failed") for t in live)
+        floor = self.live_resumed_floor()  # 1.150.0: after /live resume the stop stands a cap's worth further down: said, beside the cap
         lines.append(f"持仓+挂单 ${exposure:,.2f} / ${self.config.live_max_open_usd:g}｜今日已结算盈亏 {money(self.live_daily_pnl(trades, now_ms))}"
-                     f"（上限 −${self.config.live_max_daily_loss_usd:g}）｜挂单中 {resting}｜今日下单 {placed_today}｜失败 {failed_today}")
+                     f"（上限 −${self.config.live_max_daily_loss_usd:g}" + (f"；今天手动恢复过，停机线 {money(floor)}" if floor is not None else "")
+                     + f"）｜挂单中 {resting}｜今日下单 {placed_today}｜失败 {failed_today}")
         lines.append(self.live_redeem_status_line())
         stats = core.sim_stats(live)
         if stats["settled"]:
@@ -4507,8 +4566,8 @@ class LiveBot(core.Bot):
 
     def status(self, sub_id: str) -> str:
         state = ("LIVE=off，只记账（/live mode 切换）" if self.config.live_mode == "off" else "LIVE=pause，不开新仓" if self.config.live_mode == "pause"
-                 else "已暂停" if self.live_paused() else "今日停开新仓" if self.live_killed()
-                 else ("运行中" if self.live.ready else f"未就绪：{self.live.not_ready_why}"))
+                 else "、".join(x for x in ("已暂停" if self.live_paused() else "", "今日停开新仓" if self.live_killed() else "") if x)  # both, when both (1.150.0)
+                 or ("运行中" if self.live.ready else f"未就绪：{self.live.not_ready_why}"))
         return super().status(sub_id).replace("仅价格提醒；不会自动撤单/交易。", f"💰 真实交易 {state}｜/live 查看订单、持仓与风控")
 
     def journal_payload(self, full: bool = False, history: int | None = None) -> dict:

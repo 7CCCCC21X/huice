@@ -14115,7 +14115,8 @@ function render(){
   $("authnote").textContent=data.enabled?"每次操作都会带上口令；口令只在环境变量里，页面不显示。":"未设置 WEB_CONTROL_KEY：只能查看，不能操作。";
   const L=data.live;
   const liveOn=!!L&&L.mode!=="off";
-  $("livestate").textContent=L?(L.mode==="off"?"LIVE=off：只记账":L.mode==="pause"?"LIVE=pause：只测试，不开新仓"+(L.ready?"":"｜未就绪："+L.ready_error):L.paused?"已暂停："+L.paused:L.killed?"今日停开新仓："+L.killed:L.ready?"LIVE=on：运行中":"未就绪："+L.ready_error):"未加载（没有私钥）";
+  // 1.150.0: a pause and today's loss stop side by side — the pause alone was shown, and 恢复, clicked to end it, lifts the stop as well
+  $("livestate").textContent=L?(L.mode==="off"?"LIVE=off：只记账":L.mode==="pause"?"LIVE=pause：只测试，不开新仓"+(L.ready?"":"｜未就绪："+L.ready_error):L.paused?"已暂停："+L.paused+(L.killed?"｜今日停开新仓："+L.killed:""):L.killed?"今日停开新仓："+L.killed:L.ready?"LIVE=on：运行中":"未就绪："+L.ready_error):"未加载（没有私钥）";
   $("livestate").className="state "+(L?(L.mode==="off"?"":L.mode==="pause"||L.paused||L.killed?"warn":L.ready?"on":"off"):"");
   if(L&&L.allowed===false)$("livestate").textContent+="｜硬开关 LIVE_TRADING_ALLOWED=off";
   $("modebtns").querySelectorAll("button").forEach(b=>{b.disabled=!L||!data.enabled;b.className=L&&b.dataset.mode===L.mode?"pri":""});
@@ -14268,7 +14269,7 @@ function renderLive(L,liveOn){const box=$("livelines");box.replaceChildren();
   (L.info||[]).forEach(r=>box.append(...kvRow(r.k,r.v,r.tone)));
   box.append(...kvRow("策略",data.scope.join("；"),""));
   box.append(...kvRow("占用","持仓+挂单 $"+L.exposure.toFixed(2)+"，上限 $"+L.caps.open,L.exposure>=L.caps.open*0.9?"warn":""));
-  box.append(...kvRow("今日","已结算盈亏 "+money(L.daily_pnl)+(L.caps.daily_loss?"，亏损上限 $"+L.caps.daily_loss:"，亏损不设上限"),L.daily_pnl<0?"bad":""));
+  box.append(...kvRow("今日","已结算盈亏 "+money(L.daily_pnl)+(L.caps.daily_loss?"，亏损上限 $"+L.caps.daily_loss+(L.loss_floor!=null?"（今天手动恢复过，停机线 "+money(L.loss_floor)+"）":""):"，亏损不设上限"),L.daily_pnl<0?"bad":""));
   box.append(...kvRow("订单","挂单中 "+L.resting+"，未确认 "+L.unconfirmed+"，今日下单 "+L.placed_today+"，失败 "+L.failed_today,L.unconfirmed?"warn":""));
   if(L.synced_at)box.append(...kvRow("订单同步",L.synced_at,""));
   if(L.unknown_open&&L.unknown_open.length)box.append(...kvRow("注意","账户上有 "+L.unknown_open.length+" 张本机器人没有记录的挂单（#"+L.unknown_open.map(u=>u.id).join("、#")+"）：不计入这里的额度；“撤掉账户全部挂单”可一起撤","warn"))}
@@ -14281,7 +14282,7 @@ function renderTest(text){const box=$("testlines");box.replaceChildren();box.sty
 // the sticky bar: the mode, the counts, the limits, when the page last refreshed
 function renderBar(){const L=data.live,b=$("bar");b.replaceChildren();const liveOn=!!L&&L.mode!=="off";
   const chip=(k,v)=>{const s=el("span");s.append(el("span","k",k+" "),el("b","",String(v)));return s};
-  const mode=L?(L.mode==="off"?"LIVE=off 只记账":L.mode==="pause"?"LIVE=pause 不开仓":L.paused?"已暂停":L.killed?"今日停开新仓":L.ready?(L.gate?"LIVE=on 新单受限":"LIVE=on 运行中"):"LIVE=on 未就绪"):"纸面模拟";
+  const mode=L?(L.mode==="off"?"LIVE=off 只记账":L.mode==="pause"?"LIVE=pause 不开仓":L.paused?(L.killed?"已暂停｜今日停开新仓":"已暂停"):L.killed?"今日停开新仓":L.ready?(L.gate?"LIVE=on 新单受限":"LIVE=on 运行中"):"LIVE=on 未就绪"):"纸面模拟";
   b.append(el("span","state "+(L?(L.mode==="off"?"":L.mode==="pause"||L.paused||L.killed||(L.ready&&L.gate)?"warn":L.ready?"on":"off"):""),mode));
   b.append(chip("持仓",data.sim.open),chip("挂单中",data.sim.resting),chip("已结算",data.sim.settled+" 笔 "+money(data.sim.pnl)));
   if(liveOn)b.append(chip("持仓+挂单","$"+L.exposure.toFixed(2)+" / $"+L.caps.open),chip("今日",money(L.daily_pnl)),chip("未确认",L.unconfirmed),chip("对账",L.sync_age_s!=null?L.sync_age_s+" 秒前":"—"));
@@ -14319,6 +14320,8 @@ $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if
   else if(a==="test"){if(confirm("在 Predict 上挂一张远离盘口的限价单（不高于 2¢，份数按 Predict 最低订单金额 $1 取，2¢ 时 50 份），确认它出现在盘口后立即撤掉，用来验证真实下单链路。最多锁定约 1 美元，极少数情况下可能成交。继续？"))act({action:"test"})}
   else if(a==="cancelall"){if(confirm("撤掉本策略在 Predict 上的全部真实挂单？已成交的份数继续持有；以 Predict 的确认为准，确认前额度仍占用。"))act({action:"cancel",id:"all"})}
   else if(a==="cancelaccount"){if(confirm("撤掉这个 Predict 账户上的全部挂单，包括手动单和本机器人没有记录的单？"))act({action:"cancel",id:"account"})}
+  // 1.150.0: 恢复 also lifts today's loss stop (as /live resume does): asked first while one stands — the button ends a pause too, and went straight through
+  else if(a==="resume"){const k=data&&data.live&&data.live.killed;if(!k||confirm("今日亏损停机正在生效（"+k+"）。\n\n点“恢复”会同时解除它：之后要再亏满一个 LIVE_MAX_DAILY_LOSS_USD 才会再次停机。不点的话，它到明天 0 点（北京时间）自动解除。继续？"))act({action:"resume"})}
   else act({action:a})});
 $("reset").addEventListener("click",()=>{if(confirm("清除网页上保存的全部设置，恢复为环境变量？真实交易模式也回到环境变量的 LIVE 值（回到 off 会撤掉未成交的真实挂单），挂着的单按恢复后的设置重新判断。"))act({action:"reset"})});
 $("reload").addEventListener("click",()=>{keyBad=false;load()});
