@@ -677,4 +677,295 @@ assert not nv.note_index(D("189.00"), late + 5_000 - NV_LAG, late + 5_000) and n
 closed = m.et_wall_ms(dt.date(2026, 11, 10), 16, 0)
 assert not nv.note_index(D("185.70"), closed - NV_LAG, closed) and nv.price == D("185.52")
 
+
+# --- MOD-NVDA-OPEN-GAP: NVDA 先触 $160 / $210 advises in the regular session only — overnight the price in hand is the close
+# and the stock goes on trading, so a quote on it is a free option for whoever saw the after-hours move. At 09:30 that hold
+# lifted with the price in hand still the close: Yahoo's last trade is yesterday's until its first read of the new session
+# (half a minute on any day; all morning from a host stuck on yesterday's chart), and Binance's index — the price that does
+# know the open — is refused as "another instrument" for being over 2% from that very close whenever the stock has gapped
+# over 2%. The staleness check lets the close stand for the session's first half hour (the hit markets' rule, borrowed), and
+# the 1-minute-bar check is stamped by the read, whatever day its bars are of. So after a +4% open the card priced
+# "$210 first" 15¢ under its worth with no hold on it, and from the session's first second the taker bought the other side
+# above its worth off a book that had the open in it (a real order with LIVE on); with Yahoo stuck or failing the alert went
+# out too. Now there is no advice in the session on a price from before its open — nor, later in it, on one over five
+# minutes old by its own time: the same thing with Yahoo's trade standing still mid-session. Real Bot, second by second:
+# the index as raw markPrice frames → BinanceStream.frame → Bot.price_pushed, the first-touch round (Bot.refresh_touch)
+# with Yahoo's reads, Predict's book, the trader's step and express lane, the edge alerts ----
+NVO_DAY = dt.date(2026, 11, 10)                # a Tuesday; NVDA closed at 185.00 on Monday
+NVO_OPEN = m.us_session(NVO_DAY)[0]            # the bell: 09:30 ET
+NVO_MON = m.us_session(dt.date(2026, 11, 9))   # Monday's session: its closing print is Yahoo's last trade until Tuesday's first
+NVO_ENV = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_MARKETS": "touch"}
+# ...the rest at its default: SIM_WAYS=taker, the 10¢ bar, no wait before a buy, the edge alerts on (10¢, held for 60 s)
+
+
+def _nvo_hold(priced_ms: int) -> str:
+    """The card's words while the session runs on a price from before its open (the price's own time, Beijing)."""
+    return f"美股已开盘，现价还是开盘前的（停在 {m.stamp(priced_ms, seconds=False)}），今天的价格还没读到；暂不给建议"
+
+
+def _nvo_old(priced_ms: int) -> str:
+    """...and on a price of the session itself that is over five minutes old."""
+    return f"美股交易中，现价还停在 {m.stamp(priced_ms, seconds=False)}（超过 5 分钟没更新）；暂不给建议"
+
+
+def _nvo_chart(bars: list, price: float | None = None, when: int | None = None) -> bytes:
+    """A Yahoo v8 chart body: (open ms, open, high, low, close) bars, the last regular trade and its time (s)."""
+    col = lambda n: [b[n] for b in bars]
+    return json.dumps({"chart": {"result": [{"meta": {"regularMarketPrice": price, "regularMarketTime": when, "gmtoffset": -18000},
+                                             "timestamp": [b[0] // 1000 for b in bars],
+                                             "indicators": {"quote": [{"open": col(1), "high": col(2), "low": col(3), "close": col(4)}]}}],
+                                 "error": None}}).encode()
+
+
+def _nvo_daily() -> list:
+    """A year of finished sessions through Monday: closes 185 and 190.18 in turn (±2.8% a day: σ 44%), Monday's 185.00."""
+    bars, day = [], NVO_DAY - dt.timedelta(days=365)
+    while day < NVO_DAY:
+        if m.us_session(day):
+            close = 185.0 * (1.028 if len(bars) % 2 else 1.0)
+            bars.append((m.us_session(day)[0], close * 0.999, close * 1.005, close * 0.995, close))
+        day += dt.timedelta(days=1)
+    return bars[:-1] + [(NVO_MON[0], 185.5, 186.0, 184.5, 185.0)]
+
+
+class _NvOpenYahoo:
+    """Yahoo's chart around Tuesday's bell: the 1-minute chart is Monday's, its last trade the closing print, until Yahoo
+    shows a trade of Tuesday's (``first`` seconds after the bell; None: never — a host stuck on yesterday's chart), then
+    Tuesday's minutes and the stock's trade 2 s old. From ``fails`` seconds after the bell on (None: never) the 1-minute
+    read is refused."""
+    def __init__(self, clock: _Clock, opened: float, first: int | None, fails: int | None):
+        self.clock, self.opened, self.first, self.fails = clock, opened, first, fails
+
+    async def fetch(self, url: str, extra: object = None, record: bool = True) -> bytes:
+        q, now = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query)), self.clock.now
+        assert "/NVDA?" in url and q.get("interval") in ("1m", "1d"), url
+        if q["interval"] == "1d":
+            return _nvo_chart(_nvo_daily())
+        if self.fails is not None and now >= NVO_OPEN + self.fails * 1000:
+            raise m.RemoteError("HTTP 429: Too Many Requests")
+        if self.first is not None and now >= NVO_OPEN + self.first * 1000:
+            price = self.opened
+            return _nvo_chart([(o, price, price + 0.1, price - 0.1, price) for o in range(NVO_OPEN, now, 60_000)], price, now // 1000 - 2)
+        return _nvo_chart([(o, 185.0, 185.3, 184.8, 185.0) for o in range(NVO_MON[0], NVO_MON[1], 60_000)], 185.0, NVO_MON[1] // 1000)
+
+
+def _nvo_bot(clock: _Clock, fetch: object) -> tuple:
+    """A real Bot at its defaults but for SIM_MARKETS=touch, its NVDA first-touch card reading ``fetch`` for Yahoo."""
+    bot = m.Bot(m.Config.from_env(NVO_ENV), m.Store(":memory:"), clock, None)
+    card, stream = bot.touches["NVDA-2027"], bot.binance_streams["futures"]
+    assert isinstance(card, m.StockTouchMarket) and (bot.config.sim_ways, bot.config.sim_edge, bot.config.sim_taker_hold) == ("taker", 0.1, 0.0)
+    assert bot.config.edge_alert and (bot.config.edge_alert_edge, bot.config.edge_alert_confirm) == (0.1, 60)
+    for key, touch in bot.touches.items():
+        if key != "NVDA-2027":
+            touch.refresh = _nv_idle  # the crypto first-touch cards read Binance: not this test's business
+    bot.predict.info[NVDA.slug] = {"outcomes": ["$160", "$210"], "created_ms": NV_CREATED}
+    m.fetch_source = fetch
+    return bot, card, stream
+
+
+async def _nvo_index(stream: object, now: int, k: int, stock: float) -> None:
+    """Binance's index of the second: the stock's price, a cent of movement in it every delivery (an index that lives)."""
+    await stream.frame(None, json.dumps({"e": "markPriceUpdate", "E": now - NV_LAG, "s": "NVDAUSDT", "p": f"{stock:.2f}",
+                                         "i": f"{stock + 0.01 * (k % 2):.2f}"}))
+
+
+async def _nvo_look(bot: m.Bot, card: m.StockTouchMarket, k: int, now: int, stock: float, cheap: bool = False) -> dict:
+    """One look at second ``k``: Predict's book has the stock's price in it — "$160 first", the outcome it lists first, bid
+    and offered a cent either side of its worth there (``cheap``: "$210 first" offered 15¢ under its worth instead) — and
+    what the card, the page, the trader (its step and its express lane) and the alerts make of it."""
+    fair = lambda price: m.first_touch(price, 160.0, 210.0, card.sigma, 0.0, card.remaining_years(now)).fair_upper
+    truth, close = fair(stock), fair(185.0)  # "$210 first" at the stock's price, and at Monday's close
+    low = round(1 - truth, 2)                # what "$160 first" is worth, to the cent
+    bid, ask = (low + 0.15, low + 0.17) if cheap else (low - 0.01, low + 0.01)
+    bot.predict.books["NVDA-2027"] = m.PredictBook("NVDA-2027", NVDA.slug, "77", "t", ((D(f"{bid:.2f}"), D("500")),),
+                                                   ((D(f"{ask:.2f}"), D("500")),), now, None)
+    odds = card.odds(now)
+    mk = next((x for x in bot.sim_markets(now) if x.key == "NVDA-2027"), None)
+    row = {"k": k, "now": now, "price": card.price, "live": card.index_live, "priced": card.priced_ms, "odds": odds, "truth": truth,
+           "close": close, "sigma": card.sigma, "why": card.advice_problem(now), "mk": mk, "pay": bot.touch_payload(card, now),
+           "gap": bot.sim_taker_gap(mk, bot.sim_trades(), now)["state"] if mk else None}
+    await (await bot.sim_decide(now))                # the trader's step...
+    await bot.sim_express_look("NVDA-2027", now)     # ...and its express lane
+    bot.edge_ran = -1e9
+    await bot.edge_alerts(now)                       # the Telegram alerts (they look at every card, whatever SIM_MARKETS trades)
+    return {**row, "bought": [(t["label"], t["shares"], round(t["price"], 4)) for t in bot.sim_trades().values()],
+            "alert": dict((bot.store.get("edgealerts", {}) or {}).get(NVDA.slug) or {})}
+
+
+async def _nv_open(opened: float, first: int | None, last: int, look: object, index: bool = True, fails: int | None = None,
+                   chance: int | None = None) -> list[dict]:
+    """From a minute before Tuesday's bell to ``last`` seconds after it, second by second: the stock at ``opened`` all
+    along (pre-market too), Binance's index with it (``index`` False: nothing delivered), the first-touch round with
+    Yahoo read on the card's cadence (every 30 s in the session); a look at the seconds ``look`` picks — from ``chance``
+    seconds on with "$210 first" on offer 15¢ under its worth."""
+    clock = _Clock(NVO_OPEN - 60_000)
+    bot, card, stream = _nvo_bot(clock, _NvOpenYahoo(clock, opened, first, fails).fetch)
+    rows = []
+    for k in range(-60, last + 1):
+        clock.now = now = NVO_OPEN + k * 1000
+        if index:
+            await _nvo_index(stream, now, k, opened)
+        # Yahoo's reads by this clock, not the machine's: a minute before the bell (the card's first), then every 30 s of the session
+        card.times["price"] = -1e9 if k == -60 or (k >= 0 and k % 30 == 0) else time.monotonic()
+        await bot.refresh_touch(now)
+        if look(k):
+            rows.append(await _nvo_look(bot, card, k, now, opened, chance is not None and k >= chance))
+    return rows
+
+
+_nv_fetch = m.fetch_source
+NVO_GAP = 192.50  # Tuesday opens 4% up (ln 3.97%: over INDEX_MAX_GAP from Monday's close): "$210 first" worth 65¢, 50¢ at the close
+assert math.log(NVO_GAP / 185.0) > m.StockTouchMarket.INDEX_MAX_GAP
+# 1. Yahoo healthy, its first trade of the day there 25 s after the bell (read at 09:30:30). Until then the card is on Monday's
+#    close, the index refused every second for its distance from it: the odds stay on the card, as they do overnight, but
+#    nothing is advised, bought or announced. (Before: no hold from 09:30:00 on, and 吃160 300 @ 36¢ at the first look —
+#    "$160 first" being worth 35¢, 36.7¢ paid with the fee)
+rows = asyncio.run(_nv_open(NVO_GAP, 25, 45, lambda k: k >= -5 or k % 30 == 0))  # every second from 09:29:55 on
+for r in rows:
+    k, mk = r["k"], r["mk"]
+    assert isinstance(r["odds"], m.TouchOdds) and mk is not None and mk.kind == "touch" and mk.hold == r["why"] == r["pay"]["touch"]["hold"], (k, r["why"])
+    assert r["bought"] == [] and not r["alert"], (k, r["bought"], r["alert"])
+    if k < 30:
+        assert (r["price"], r["live"], r["priced"]) == (D("185.0000"), False, NVO_MON[1]), (k, r["price"], r["live"])
+        assert (r["why"] == _nvo_hold(NVO_MON[1])) if k >= 0 else r["why"].startswith("美股休市中：盘前盘后的价格不算数"), (k, r["why"])
+        assert mk.fair_up == r["close"] and 0.14 < r["truth"] - r["close"] < 0.16 and 0.43 < r["sigma"] < 0.45, (k, mk.fair_up, r["truth"])  # 15¢ off
+        assert r["gap"] == "wait" and r["pay"]["predict"]["hold"] == r["why"] and not any(e["best"] for e in r["pay"]["predict"]["edges"]), (k, r["gap"])
+    elif k == 30:  # Yahoo's read: Tuesday's trade, 2 s old — a price of this session; the index is checked against it from now on
+        assert (r["price"], r["live"], r["priced"]) == (D("192.5000"), False, r["now"] - 2_000) and r["why"] == "" and mk.fair_up == r["truth"], (r["price"], r["why"])
+    else:          # ...and is the price from its next delivery
+        assert r["live"] and r["priced"] == r["now"] - NV_LAG and r["why"] == "" and abs(mk.fair_up - r["truth"]) < 0.001 and r["gap"] == "near", (k, r["why"], r["gap"])
+assert [r["k"] for r in rows] == [-60, -30, *range(-5, 46)]
+
+# 2. Yahoo stuck on Monday's chart all morning (it answers; the trade it answers with is yesterday's), the index delivered and
+#    right all the while: held for the half hour the close stands as the price, then the odds pause (price_stale, 1.83.0's
+#    rule, as before). (Before: advised on for all thirty minutes — the 300 bought at the first look, and at 09:31 the alert
+#    "新机会｜NVDA 先触 160/210：挂160 @ 34¢ 净优势 +16¢（模型 50¢），也可以：吃160 @ 36¢ +13.3¢", the wrong side)
+rows = asyncio.run(_nv_open(NVO_GAP, None, 1830, lambda k: k % 30 == 0 or k == 1801))  # after each of Yahoo's reads
+for r in rows:
+    k = r["k"]
+    assert (r["price"], r["live"], r["priced"]) == (D("185.0000"), False, NVO_MON[1]) and r["bought"] == [] and not r["alert"], (k, r["price"], r["bought"], r["alert"])
+    if 0 <= k <= 1800:
+        assert isinstance(r["odds"], m.TouchOdds) and r["why"] == r["mk"].hold == _nvo_hold(NVO_MON[1]) and r["gap"] == "wait", (k, r["why"], r["gap"])
+    elif k > 1800:
+        assert r["odds"] == f"Yahoo 行情停在 {m.stamp(NVO_MON[1], seconds=False)}，暂停概率" and r["mk"] is None, (k, r["odds"])
+assert [r["k"] for r in rows][-3:] == [1800, 1801, 1830]  # the half hour to the second: the close is the price through 10:00:00
+
+# 3. both feeds down at the bell — Yahoo refusing its reads from 09:29:30 on, nothing from Binance: the last good read is the
+#    close's. Held until the odds pause, five minutes after that read (09:29:00). (Before: advised on until then, bought at
+#    the first look and announced at 09:31)
+rows = asyncio.run(_nv_open(NVO_GAP, None, 320, lambda k: k % 10 == 0, index=False, fails=-30))
+for r in rows:
+    k = r["k"]
+    assert (r["price"], r["live"], r["priced"]) == (D("185.0000"), False, NVO_MON[1]) and r["bought"] == [] and not r["alert"], (k, r["price"], r["bought"], r["alert"])
+    if 0 <= k <= 240:
+        assert isinstance(r["odds"], m.TouchOdds) and r["why"] == r["mk"].hold == _nvo_hold(NVO_MON[1]) and r["gap"] == "wait", (k, r["why"], r["gap"])
+    elif k > 240:
+        assert r["odds"] == f"Yahoo 行情停在 {m.stamp(NVO_MON[1], seconds=False)}：价格：HTTP 429: Too Many Requests，暂停概率" and r["mk"] is None, (k, r["odds"])
+
+# 4. the control, an open within 2% of the close (187.50: +1.35%): the index is the price from the bell on, as 1.147.0 has
+#    it — all but the one delivery stamped before the bell, a pre-market value (the next, a second later, is the session's).
+#    The book where the stock is: nothing bought. From 09:30:10 "$210 first" (worth 55¢) offered at 40¢: bought at that look
+rows = asyncio.run(_nv_open(187.50, 25, 15, lambda k: k >= -5 or k % 30 == 0, chance=10))
+for r in rows:
+    k, mk = r["k"], r["mk"]
+    if k < 0:
+        assert not r["live"] and mk.hold.startswith("美股休市中：盘前盘后的价格不算数") and r["gap"] == "wait" and r["bought"] == [], (k, mk.hold)
+        continue
+    assert r["live"] and r["priced"] == r["now"] - NV_LAG and r["price"] in (D("187.50"), D("187.51")), (k, r["live"], r["price"])
+    assert mk.hold == r["why"] == (_nvo_hold(NVO_OPEN - NV_LAG) if k == 0 else ""), (k, r["why"])
+    assert abs(mk.fair_up - r["truth"]) < 0.001 and 0.54 < r["truth"] < 0.56, (k, mk.fair_up, r["truth"])
+    assert r["gap"] == ("wait" if k == 0 else "near" if k < 10 else "ready") or k > 10, (k, r["gap"])
+    assert r["bought"] == ([] if k < 10 else [("吃210", 300.0, 0.408)]), (k, r["bought"])  # 40¢ and the 2% fee on it
+
+# 5. the same later in the session: from 11:05 Yahoo answers every read with the chart it had then (its trade of 11:04:55, at
+#    185.00) while the stock climbs half a dollar a minute, to 192.50 (+4%) at 11:20. The index, right all along, is the price
+#    until it is 2% from that trade (taken at 11:12:28, refused from 11:12:29 on, exactly as at the open); Yahoo's read at
+#    11:13:00 finds the price in hand over 15 s old and puts the card back on the trade of 11:04:55 — over five minutes old:
+#    not advised on. (Before: advised on for the half hour price_stale gives a trade — the alert "新机会｜NVDA 先触 160/210：
+#    挂160 @ 38¢ +12¢" out at 11:15:30, 吃160 300 bought at 11:16:30 at 39¢, 39.8¢ with the fee, "$160 first" worth 38.5¢ by
+#    then and falling.) At 11:20:00 Yahoo answers again: its trade at once, the index from the next second
+NVS0 = m.et_wall_ms(NVO_DAY, 11, 0)
+NVS_STUCK = (300, 1200)  # seconds after 11:00 between which Yahoo answers as it did at the first of them
+
+
+def _nvs_stock(k: int) -> float:
+    return 185.0 + 7.5 * (min(max(k, 300), 1200) - 300) / 900
+
+
+async def _nvs_yahoo(url: str, extra: object = None, record: bool = True) -> bytes:
+    q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+    if q["interval"] == "1d":
+        return _nvo_chart(_nvo_daily())
+    k = (_nvs_clock.now - NVS0) // 1000
+    k = NVS_STUCK[0] if NVS_STUCK[0] <= k < NVS_STUCK[1] else k
+    price, now = _nvs_stock(k), NVS0 + k * 1000
+    return _nvo_chart([(o, price, price + 0.1, price - 0.1, price) for o in range(NVO_OPEN, now, 60_000)], price, now // 1000 - 5)
+
+
+async def _nv_stuck() -> list[dict]:
+    bot, card, stream = _nvo_bot(_nvs_clock, _nvs_yahoo)
+    rows = []
+    for k in range(0, 1231):
+        _nvs_clock.now = now = NVS0 + k * 1000
+        await _nvo_index(stream, now, k, _nvs_stock(k))
+        card.times["price"] = -1e9 if k % 30 == 0 else time.monotonic()  # Yahoo's read every 30 s of this clock
+        await bot.refresh_touch(now)
+        if k % 30 == 0 or k in (748, 749, 1201):
+            rows.append(await _nvo_look(bot, card, k, now, _nvs_stock(k)))
+    return rows
+
+
+_nvs_clock = _Clock(NVS0)
+rows = asyncio.run(_nv_stuck())
+stuck = NVS0 + (NVS_STUCK[0] - 5) * 1000  # the trade Yahoo is stuck on: 11:04:55
+for r in rows:
+    k, mk = r["k"], r["mk"]
+    assert isinstance(r["odds"], m.TouchOdds) and mk.hold == r["why"] and r["bought"] == [] and not r["alert"], (k, r["why"], r["bought"], r["alert"])
+    if k == 0:                  # 11:00:00, the card's first read: Yahoo's trade, 5 s old
+        assert (r["price"], r["live"], r["priced"]) == (D("185.0000"), False, NVS0 - 5_000) and r["why"] == "" and mk.fair_up == r["truth"], (r["price"], r["why"])
+    elif k <= 748 or k >= 1201:  # the index within 2% of Yahoo's trade: the price, each second's
+        assert r["live"] and r["priced"] == r["now"] - NV_LAG and r["why"] == "" and abs(mk.fair_up - r["truth"]) < 0.001 and r["gap"] == "near", (k, r["live"], r["why"])
+    elif k < 780:               # refused from 11:12:29 on; the last one taken stands until Yahoo's read finds it over 15 s old
+        assert r["live"] and r["priced"] == NVS0 + 748_000 - NV_LAG and r["why"] == "" and abs(mk.fair_up - r["truth"]) < 0.001, (k, r["live"], r["priced"] - NVS0)
+    elif k < 1200:              # Yahoo's trade of 11:04:55 again — the stock 2.1% to 4% from it, "$210 first" 8¢ to 15¢ under its worth on the card
+        assert (r["price"], r["live"], r["priced"]) == (D("185.0000"), False, stuck) and r["why"] == _nvo_old(stuck) and r["gap"] == "wait", (k, r["price"], r["why"])
+        assert mk.fair_up == r["close"] and 0.07 < r["truth"] - r["close"] < 0.15, (k, mk.fair_up, r["truth"])
+        assert r["pay"]["touch"]["hold"] == r["pay"]["predict"]["hold"] == r["why"] and not any(e["best"] for e in r["pay"]["predict"]["edges"]), k
+    else:                       # 11:20:00, Yahoo's read answers with the stock's trade (5 s old): the price, advised on
+        assert (r["price"], r["live"], r["priced"]) == (D("192.5000"), False, r["now"] - 5_000) and r["why"] == "" and mk.fair_up == r["truth"], (k, r["price"], r["why"])
+assert [r["k"] for r in rows if 720 < r["k"] <= 780 or r["k"] >= 1170] == [748, 749, 750, 780, 1170, 1200, 1201, 1230]
+m.fetch_source = _nv_fetch
+
+# the two rules themselves, on a card set by hand. The session's first minute, the price in hand Monday's close (read a moment ago)
+nv = m.StockTouchMarket(m.Store(":memory:"), NVDA)
+nv.start_ms = NV_CREATED
+nv.save({"kind": "clear", "through": m.et_wall_ms(NVO_DAY, 0, 0)})
+nv.sigma, nv.sigma_ms, at = 0.44, NVO_OPEN, NVO_OPEN + 60_000
+nv.yahoo = (D("185.0000"), NVO_MON[1])
+nv.price, nv.priced_ms, nv.fetched_ms, nv.minutes_ms = *nv.yahoo, at, at
+assert nv.advice_problem(NVO_OPEN - 1).startswith("美股休市中：盘前盘后的价格不算数")  # a millisecond before the bell: the overnight hold, as it was
+assert nv.advice_problem(NVO_OPEN) == nv.advice_problem(at) == _nvo_hold(NVO_MON[1])   # from the bell on: the same price, the same reason
+assert isinstance(nv.odds(at), m.TouchOdds) and not nv.price_stale(at)  # the odds stand (price_stale is the hit markets', untouched)
+for priced, held in ((NVO_OPEN - 1, True), (NVO_OPEN, False), (at - 20_000, False)):  # a price of this session — the opening print on — is advised on
+    nv.priced_ms = priced
+    assert bool(nv.advice_problem(at)) is held, priced - NVO_OPEN
+# two hours in: a trade five minutes old is advised on, one older is not — though its odds stand for the half hour they did
+at = NVO_OPEN + 2 * 3600_000
+nv.fetched_ms = nv.minutes_ms = at
+for age, why in ((20_000, ""), (300_000, ""), (300_001, _nvo_old(at - 300_001)), (29 * 60_000, _nvo_old(at - 29 * 60_000))):
+    nv.yahoo = (D("185.0000"), at - age)
+    nv.price, nv.priced_ms = nv.yahoo
+    assert nv.advice_problem(at) == why and isinstance(nv.odds(at), m.TouchOdds), (age, nv.advice_problem(at))
+assert m.StockTouchMarket.PRICE_STALE_MS == m.TouchMarket.PRICE_STALE_MS == 300_000  # the crypto card's five minutes
+nv.priced_ms = at - 31 * 60_000
+assert nv.odds(at) == f"Yahoo 行情停在 {m.stamp(at - 31 * 60_000, seconds=False)}，暂停概率"  # ...and pause after it, as before
+# 1.147.0's fallback as it was: an index 8% from a Yahoo trade 20 s old is "another instrument" — refused, the trade advised on
+nv.yahoo = (D("185.0000"), at - 20_000)
+nv.price, nv.priced_ms = nv.yahoo
+assert not nv.note_index(D("200.00"), at - NV_LAG, at) and (nv.price, nv.index_live) == (D("185.0000"), False) and nv.advice_problem(at) == ""
+# a market already decided is not a matter of the price: nothing to hold
+nv.priced_ms = NVO_MON[1]
+nv.save({"kind": "high", "time": NVO_MON[0], "hi": 210.5, "lo": 184.5})
+assert nv.advice_problem(at) == "" and nv.odds(at) == m.TouchOdds(0.0, 1.0, 0.0)
+
 print("AUDIT_MODELS_A_OK")

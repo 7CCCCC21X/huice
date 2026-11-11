@@ -10749,7 +10749,8 @@ class StockTouchMarket(TouchMarket):
     one, cannot be ordered from it: a manual check) and the running session's minutes as they come. Advice only while
     the regular session runs: between sessions the last trade is the price, but the stock trades on after hours — a
     quote on the close is a free option for whoever saw the after-hours move (the fair price moves some 3.7¢ a 1% move
-    between the lines), and a held card's resting orders are withdrawn after SIM_NO_ODDS_WITHDRAW_MINUTES."""
+    between the lines), and a held card's resting orders are withdrawn after SIM_NO_ODDS_WITHDRAW_MINUTES. 1.150.0: and
+    in the session only on a price of that session, no more than PRICE_STALE_MS old by its own time (advice_problem)."""
     PRICE_SECONDS = StockRangeMarket.PRICE_SECONDS
     CLOSED_PRICE_SECONDS = StockRangeMarket.CLOSED_PRICE_SECONDS
     CLOSE_PRINT_MS = StockRangeMarket.CLOSE_PRINT_MS
@@ -10928,6 +10929,28 @@ class StockTouchMarket(TouchMarket):
         if state != "交易中":
             return ("美股休市中：盘前盘后的价格不算数，但会影响开盘价，按收盘价报价会被知道盘后行情的人吃掉；"
                     + (f"北京时间 {stamp(opens, seconds=False)} 开盘后恢复" if opens else "开盘后恢复") + "；暂不给建议")
+        session = us_session(et_date(now_ms))
+        if session and self.price is not None and self.priced_ms < session[0]:
+            # 1.150.0: the session runs, and the price in hand is still from before its open — the close's: the hold above,
+            # for the same reason, until a price of this session is in. Yahoo's last trade is yesterday's until its first
+            # read of the new session (half a minute on any day; for as long as its reads fail, or answer with
+            # yesterday's chart), and Binance's index, the one price that knows the open, is refused (note_index) for
+            # standing over INDEX_MAX_GAP from that very close whenever the stock opens over 2% away — the mornings
+            # this card's rule is about. Nothing else held it: price_stale lets the close stand for the session's first
+            # half hour (the hit markets' rule: they advise on the last trade between sessions too), and minutes_ms is
+            # the time of the read, whatever day its bars are of. So a +4% open priced "$210 first" 15¢ under its worth
+            # with the suggestion on, and from the first second the taker bought the other side above its worth off a
+            # book that had the open in it; with Yahoo stuck, for thirty minutes, the alert sent as well. An index
+            # delivery stamped before the bell (taken in the session's first second) is a pre-market price too: the
+            # next one, a second later, is the session's.
+            return f"美股已开盘，现价还是开盘前的（停在 {stamp(self.priced_ms, seconds=False)}），今天的价格还没读到；暂不给建议"
+        if self.price is not None and now_ms - self.priced_ms > self.PRICE_STALE_MS:
+            # 1.150.0: the same later in the session — a price over five minutes old by its own time (PRICE_STALE_MS: what
+            # prices nothing on the crypto card) is not advised on. It is Yahoo's trade standing still while its reads go
+            # on answering (a stuck host; a halt): the index, once the stock is 2% from that trade, is refused for it
+            # exactly as at the open, and until now the trade was advised on for the half hour price_stale gives it
+            # (stuck at 10:05 with the stock up 2.5% by 10:20: 9¢ of fair price, to 10:35). The odds stay, as above.
+            return f"美股交易中，现价还停在 {stamp(self.priced_ms, seconds=False)}（超过 {self.PRICE_STALE_MS // 60_000} 分钟没更新）；暂不给建议"
         if now_ms - self.minutes_ms > self.MINUTES_STALE_MS:
             return "今天的 1 分钟 K 超过 5 分钟没读到；暂不给建议"
         if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
