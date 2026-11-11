@@ -191,7 +191,7 @@ def _skhynix_live(calib: dict, sigmas: float) -> tuple[m.Bot, int, str]:
     last = (prev * D(str(math.exp(-sigmas * bot.vols.get(SKH, "kr")[0])))).quantize(D("1000"))
     bot.stocks.closes[SKH] = m.StockMarket.baseline(m.StockTicker("kr", "000660"), m.STOCK_MARKETS["kr"], "Naver", dt.date(2026, 11, 9), prev)
     bot.stocks.live[SKH] = m.IndexQuote("SK하이닉스", last, prev, None, None, None, now - 5000, "Naver", fetched_ms=now - 5000)
-    bot.snapshots[SKH] = {"quote": types.SimpleNamespace(price=D("700"), timestamp_ms=now)}
+    bot.snapshots[SKH] = {"quote": types.SimpleNamespace(price=D("700"), timestamp_ms=now, source="last")}  # source: read by odds_items since FEED-MARK-VS-LAST
     return bot, now, SKH
 
 
