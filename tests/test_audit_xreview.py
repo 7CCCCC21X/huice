@@ -1486,6 +1486,7 @@ SH_UNMOVED = "恒指期货 etnet 页面启动后尚未见变动，报价时间�
 SH_QUIET = (((D("0.58"), D("300")),), ((D("0.70"), D("300")),))  # others bid 58¢ × 300; "涨" worth ~78¢ on the card: 20¢ over
 SH_PULLED = (((D("0.58"), D("20")), (D("0.50"), D("300"))), ((D("0.70"), D("300")),))  # the book saw the futures fall: 58¢ pulled
 SH_SWEPT = (((D("0.50"), D("300")),), ((D("0.58"), D("500")),))  # ...and a seller offers 58¢: a bid still there is filled
+SH_STRIKE = "24595.09"  # Predict's own target price for the market (its startPrice), a little off the local dated close 24,595.00
 sh_feed = {"last": 24840}
 
 
@@ -1529,16 +1530,20 @@ async def sh_bot(live_on: bool = False, store=None):
     return bot
 
 
-async def sh_look(bot, now: int, book: tuple, step: bool = True):
-    """The feed read at ``now`` (the etnet page as it stands), Predict's book for the card's market, the trader's step (``step``):
-    (the market as the trader sees it, the records — label, status, price, filled, why withdrawn)."""
+async def sh_look(bot, now: int, book: tuple, step: bool = True, strike: str | None = None):
+    """The feed read at ``now`` (the etnet page as it stands), Predict's book for the card's market — with ``strike``, Predict's own
+    target price for it too (settle_on_strike then measures the card against that, the odds rebuilt) —, the trader's step
+    (``step``): (the market as the trader sees it, the records — label, status, price, filled, why withdrawn)."""
     bot.market.now = now
     await bot.hsi.refresh(now, force=True)
     odds = bot.hsi_odds(now)
     assert isinstance(odds, m.CloseOdds), odds
     slug = m.predict_slug(bot.config.predict_slugs["HSI"], odds.target)
+    if strike is not None:
+        bot.predict.strikes[slug] = (D(strike), m.time.monotonic())
     bot.predict.books["HSI"] = m.PredictBook("HSI", slug, "902", "t", *book, now)
     (mk,) = [x for x in bot.sim_markets(now) if x.key == "HSI"]
+    assert mk.settle["line"] == float(strike or odds.ref), (mk.settle, strike)  # the line the trader sees: Predict's figure, given one
     if step:
         bot.sim_ran = -1e9
         await bot.sim_step(now)
@@ -1548,36 +1553,39 @@ async def sh_look(bot, now: int, book: tuple, step: bool = True):
                       for t in bot.sim_trades().values())
 
 
-async def stale_hold_hsi(live_on: bool):
+async def stale_hold_hsi(live_on: bool, strike: str | None = None):
     """The page moves until 21:00, then stands still. Three minutes on (futures_hold's INDEX_STALE_MS) the card holds — and the
     跟买1 resting at 58¢ is withdrawn at that look, its cancel sent to Predict. The book that saw the futures fall pulls its 58¢
     bids and a seller comes at 58¢: nothing of ours is there, nothing is placed while the card holds. The page moves: quoted afresh
-    at the valid 买1 (50¢). (Before: the bid stood unjudged at 58¢ and was filled, 100 @ 58¢, the real order open on Predict.)"""
+    at the valid 买1 (50¢). (Before: the bid stood unjudged at 58¢ and was filled, 100 @ 58¢, the real order open on Predict.)
+    ``strike``: Predict's own target price for the market known and a little off the local close — the card measured against it
+    (settle_on_strike, at every look), all the same. (Before the review's follow-up: the odds rebuilt there kept the hold and lost
+    the stale price — the bid frozen at 58¢ and filled, the real order left open on Predict, as with no fix.)"""
     sh_feed["last"] = 24840
     bot = await sh_bot(live_on)
     api = bot.live.api if live_on else None
-    await sh_look(bot, sh_at(20, 59, 56), SH_QUIET)
+    await sh_look(bot, sh_at(20, 59, 56), SH_QUIET, strike=strike)
     sh_feed["last"] = 24846  # the page moves (a live one) and stands still from 21:00
-    mk, recs = await sh_look(bot, sh_at(21, 0), SH_QUIET)
+    mk, recs = await sh_look(bot, sh_at(21, 0), SH_QUIET, strike=strike)
     assert not mk.hold and not mk.price_problem and recs == [("挂涨", "resting", 0.58, 0.0, "")], (mk.hold, recs)
     if live_on:
         assert [c[0] for c in api.calls] == ["create"] and len(api.open) == 1, api.calls
         oid = next(iter(api.open))
-    mk, recs = await sh_look(bot, sh_at(21, 3), SH_QUIET)  # three minutes: a short gap, nothing held, the order rests
+    mk, recs = await sh_look(bot, sh_at(21, 3), SH_QUIET, strike=strike)  # three minutes: a short gap, nothing held, the order rests
     assert not mk.hold and not mk.price_problem and recs == [("挂涨", "resting", 0.58, 0.0, "")], (mk.hold, recs)
-    mk, recs = await sh_look(bot, sh_at(21, 3, 1), SH_QUIET)  # past them: the card holds — and the order goes
+    mk, recs = await sh_look(bot, sh_at(21, 3, 1), SH_QUIET, strike=strike)  # past them: the card holds — and the order goes
     assert mk.hold == mk.price_problem == SH_STUCK and 0.77 < mk.fair_up < 0.79, (mk.hold, mk.price_problem, mk.fair_up)
     assert recs == [("挂涨", "cancelled", 0.58, 0.0, f"{SH_STUCK}，撤单")], recs  # before: ("挂涨", "resting", 0.58, 0.0, "")
     if live_on:
         assert api.calls[1:] == [("remove", [oid])] and not api.open, api.calls
     for at, book in ((sh_at(21, 4), SH_PULLED), (sh_at(21, 5), SH_SWEPT)):  # before: filled at 21:05, 100 @ 58¢
-        mk, recs = await sh_look(bot, at, book)
+        mk, recs = await sh_look(bot, at, book, strike=strike)
         assert mk.hold == SH_STUCK and recs == [("挂涨", "cancelled", 0.58, 0.0, f"{SH_STUCK}，撤单")], (at, mk.hold, recs)
     assert all(t["shares"] == 0 for t in bot.sim_trades().values())
     if live_on:
         assert [c[0] for c in api.calls] == ["create", "remove"] and not api.open, api.calls
     sh_feed["last"] = 24850  # the page moves again: priced, and quoted afresh where the book now is
-    mk, recs = await sh_look(bot, sh_at(21, 6), SH_SWEPT)
+    mk, recs = await sh_look(bot, sh_at(21, 6), SH_SWEPT, strike=strike)
     assert not mk.hold and not mk.price_problem and ("挂涨", "resting", 0.5, 0.0, "") in recs, (mk.hold, recs)
     if live_on:
         assert [c[0] for c in api.calls] == ["create", "remove", "create"] and len(api.open) == 1, api.calls
@@ -1610,27 +1618,28 @@ async def stale_hold_hsi_restart(moves: bool):
     assert recs == [("挂涨", "cancelled", 0.58, 0.0, f"{SH_STUCK}，撤单")], recs
 
 
-async def stale_hold_hsi_unsent():
+async def stale_hold_hsi_unsent(strike: str | None = None):
     """A resting-order decision made at 21:02:30 on a page last seen to move at 21:00, held back by an API cooldown; the cooldown
     over at 21:03:05, the page still as it was: the send-time re-check (live_taker_recheck → sim_requote_reason) voids it — no
-    new order under the hold, as none is decided there (sim_maker_gate). (Before: sent into the held card, and left there.)"""
+    new order under the hold, as none is decided there (sim_maker_gate). (Before: sent into the held card, and left there.)
+    ``strike``: as in stale_hold_hsi (before the review's follow-up: sent, as with no fix)."""
     sh_feed["last"] = 24840
     bot = await sh_bot(True)
     api, send = bot.live.api, bot.sim_after_decide
-    await sh_look(bot, sh_at(20, 59, 56), SH_QUIET, step=False)
+    await sh_look(bot, sh_at(20, 59, 56), SH_QUIET, step=False, strike=strike)
     sh_feed["last"] = 24846
-    await sh_look(bot, sh_at(21, 0), SH_QUIET, step=False)
+    await sh_look(bot, sh_at(21, 0), SH_QUIET, step=False, strike=strike)
 
     async def cooled(now_ms, api=api, send=send):
         api.blocked_until = m.time.monotonic() + 3600
         await send(now_ms)
     bot.sim_after_decide = cooled
-    mk, _ = await sh_look(bot, sh_at(21, 2, 30), SH_QUIET)
+    mk, _ = await sh_look(bot, sh_at(21, 2, 30), SH_QUIET, strike=strike)
     bot.sim_after_decide = send
     waiting = {t["label"]: (t["live"]["state"], t["price"]) for t in bot.sim_trades().values()}
     assert not mk.hold and waiting == {"挂涨": ("pending", 0.58)} and api.calls == [], (mk.hold, waiting, api.calls)
     api.blocked_until = 0.0
-    mk, _ = await sh_look(bot, sh_at(21, 3, 5), SH_QUIET, step=False)
+    mk, _ = await sh_look(bot, sh_at(21, 3, 5), SH_QUIET, step=False, strike=strike)
     assert mk.hold == mk.price_problem == SH_STUCK, (mk.hold, mk.price_problem)
     await bot.live_place_pending(sh_at(21, 3, 5))
     assert not [c for c in api.calls if c[0] == "create"] and not api.open, api.calls  # before: sent, open on Predict at 58¢
@@ -1664,6 +1673,14 @@ async def stale_hold_hsi_scope():
     for at, stale in ((sh_at(21, 1), ""), (sh_at(21, 3, 1), SH_STUCK)):
         odds = bot.hsi_odds(at)
         assert (odds.warn, odds.stale) == ("期货锚点是近似值，暂不给建议", stale), (at, odds.warn, odds.stale)
+    # Predict's own target price for the market known: settle_on_strike measures the card against it, the odds rebuilt — the stale
+    # price goes along with the hold (before the review's follow-up: the hold alone, so nothing withdrawn on that path); a figure
+    # too far from the local close (another unit) is not used, the odds kept as they were, the stale price with them
+    slug = m.predict_slug(bot.config.predict_slugs["HSI"], odds.target)
+    for strike, ref in ((SH_STRIKE, D(SH_STRIKE)), ("20000", odds.ref)):
+        bot.predict.strikes[slug] = (D(strike), m.time.monotonic())
+        shown = bot.settle_on_strike("恒生指数", odds)
+        assert shown.ref == ref and (shown.warn, shown.stale) == ("期货锚点是近似值，暂不给建议", SH_STUCK), (strike, shown.ref, shown.warn, shown.stale)
 
 
 async def stale_hold_nvda():
@@ -1744,10 +1761,12 @@ _sh_get, _sh_health = m.http_get, m.SOURCE_HEALTH
 m.http_get, m.SOURCE_HEALTH = sh_get, m.SourceHealth()
 try:
     for live_on in (False, True):
-        asyncio.run(stale_hold_hsi(live_on))
+        for strike in (None, SH_STRIKE):
+            asyncio.run(stale_hold_hsi(live_on, strike))
     for moves in (True, False):
         asyncio.run(stale_hold_hsi_restart(moves))
-    asyncio.run(stale_hold_hsi_unsent())
+    for strike in (None, SH_STRIKE):
+        asyncio.run(stale_hold_hsi_unsent(strike))
     asyncio.run(stale_hold_hsi_scope())
 finally:
     m.http_get, m.SOURCE_HEALTH = _sh_get, _sh_health

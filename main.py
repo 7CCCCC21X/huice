@@ -4572,7 +4572,8 @@ class CloseOdds:
     widen: float = 1.0     # the σ ahead is this many times the plain estimate: the day's own move widened it (big_move_widen); 1 = not
     sigma_day: float = 0.0  # the whole day's σ (sigma_daily is the part ahead: in session the open-to-close share); 0 = sigma_daily (1.120.0)
     stale: str = ""        # 1.150.0 (XR-STALE-HOLD-FREEZE): why the proxy price is too old to trade on (HSI: futures_stale) —
-    #                        ``warn`` holds the suggestions for it, and a resting order is withdrawn (SimMarket.price_problem)
+    #                        ``warn`` holds the suggestions for it, and a resting order is withdrawn (SimMarket.price_problem);
+    #                        settle_on_strike, which rebuilds the odds on Predict's own target price, carries both
 
     @property
     def direct(self) -> bool:
@@ -18366,11 +18367,16 @@ class Bot:
         # of whole-day σ (sim_against_move), measured the day's move against that whenever Predict's figure was known: early
         # where that σ is the smaller one (a stock card in session: at 0.7–0.8 of the configured count), late where it is the
         # larger (a 盘中 factor of 1.5, a 盘后 one of 1.4: a buy let into the move the rule was set to refuse, a resting bid
-        # kept). The widen goes as it is, so the prices are what they were (no big-move pass here: the σ note is not doubled)
+        # kept). The widen goes as it is, so the prices are what they were (no big-move pass here: the σ note is not doubled).
+        # 1.150.0 (cross review XR-STALE-HOLD-FREEZE, review follow-up): the reason the proxy price is too old to trade on goes
+        # along with the hold it comes with (stale beside warn). Left out, a card measured against Predict's figure — read for
+        # the HSI market at every book refresh — kept the hold and lost the withdrawal (SimMarket.price_problem): the order
+        # resting when the futures stalled stood unjudged at its old price, for real with LIVE on, and a resting-order decision
+        # held back by an API cooldown was sent into the held card
         return dataclasses.replace(
             close_odds(odds.name, strike, effective, odds.sigma_daily, odds.remaining, odds.target, tick,
                        f"Predict 目标价（本地参考 {fmt(odds.ref)}·{odds.ref_note}）", odds.proxy_note, odds.sigma_note,
-                       odds.unit, odds.beta, odds.mode, sigma_day=odds.sigma_day, widen=odds.widen), warn=odds.warn)
+                       odds.unit, odds.beta, odds.mode, sigma_day=odds.sigma_day, widen=odds.widen), warn=odds.warn, stale=odds.stale)
 
     def odds_payload(self) -> dict:
         """JSON for the web page: one entry per item, numbers raw, text already plain."""
