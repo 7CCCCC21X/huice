@@ -1219,4 +1219,194 @@ async def stop_ok_preopen():
 
 
 asyncio.run(stop_ok_preopen())
+
+
+# --- XR-DISPUTE-HOLD-FREEZE: a flip / market-cap level's dispute hold and the orders that exist when it begins -------------------
+# MOD-BOOK-DISPUTES judges "the book does not agree with our data" on the best Yes bid alone (was max(bid, ask)): a thin book bid
+# 60¢ / offered 95¢ now holds a market our data has settled Yes ("数据显示已触及 / 已反超，但盘口仍低于 90¢") where 1.149.0 took the
+# data's word. A held card's resting order stands unjudged (sim_requote_reason) — the pattern SIM-TOUCH-DECIDED-HOLD's fix-up
+# removed for a first-touch market's book hold alone (mk.decided). On a market-cap level sim_result waits for Predict while the book
+# disputes, so a real No bid (worth 0 by our data, at most 10¢ under such a book) stayed on Predict for the half hour (for good with
+# SIM_NO_ODDS_WITHDRAW_MINUTES=0) where 1.149.0's exit line cancelled it at the next look; and on both kinds a decision an API
+# cooldown had held back went out under the hold when the cooldown ended (a flip's before the step's next look settled it), where
+# 1.149.0's send-time re-check voided the No bid. No market-cap ladder is listed now (CAP_MARKETS): one is registered by hand, as
+# tests/test_cap.py does; the flip is this section's own (FLIP_MARKETS' line goes with its market).
+import datetime as dt  # noqa: E402
+import itertools  # noqa: E402
+from decimal import Decimal as D  # noqa: E402
+
+DH_NOW = int(dt.datetime(2026, 11, 10, 12, 0, tzinfo=m.BEIJING).timestamp() * 1000)
+DH_ENV = {"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off",
+          "SIM_MAKER_FLOOR_SHARES": "0", "SIM_MAKER_DEEP_CENTS": "0"}  # the defaults otherwise (exit line 5¢, the half hour)
+DH_HOLD = {"ladder": "数据显示已触及，但盘口仍低于 90¢", "flip": "数据显示已反超，但盘口仍低于 90¢；以 Hyperliquid 1 分钟 K 为准，请核实"}
+DH_GONE = "净优势降到 -5.0¢，低于撤单线 5.0¢"
+
+
+async def dispute_bot(kind: str, live_on: bool = False):
+    """A paper Bot, or the real trader over the stand-ins (LIVE=on with the SDK test suite's key, never a real one), with one
+    market of ``kind`` on Predict's market 401 (Yes / No): a market-cap level ($200M, "ladder") or a flip. (the bot, its spec,
+    look(at, settled, bid="0.60", fair=0.70): one look's data — our data's verdict, Yes reached or not, and the Yes book bid
+    ``bid``, offered at 95¢; until our data settles it the model gives Yes 70¢, a market-cap level ``fair``)."""
+    env = {**DH_ENV, **({"LIVE": "on", "PREDICT_PRIVATE_KEY": T["KEY"], "PREDICT_API_KEY": "k"} if live_on else {})}
+    bot = (L.LiveBot if live_on else m.Bot)(m.Config.from_env(env), m.Store(":memory:"), T["FM"](DH_NOW), None)
+    if live_on:
+        bot.live.api, bot.live.chain = T["FakeApi"](), T["FakeChain"]()
+        bot.live.api.markets["401"] = T["market_json"]("401", names=("Yes", "No"))
+        await bot.live_prepare()
+        assert bot.live.ready, bot.live.ready_error
+        await bot.live.market("401")
+    start, end = DH_NOW - 9 * m.DAY_MS, DH_NOW + 20 * m.DAY_MS
+    book = lambda key, slug, at, bid: m.PredictBook(key, slug, "401", "t", ((D(bid), D("300")),), ((D("0.95"), D("300")),), at, 200)
+    if kind == "ladder":
+        spec = m.CapSpec("XRCAP", "what-marketcap-will-xrcap-hit", "$XRCAP 市值", "0x" + "cd" * 20, start, end, (D("200000000"),))
+        cap, seen = m.CapMarket(bot.store, spec), {"high": D("150000000"), "fair": 0.70}
+        cap.probability = lambda target, now_ms: 1.0 if seen["high"] >= target else seen["fair"]
+        cap.window_high = lambda: (seen["high"], DH_NOW)
+        cap.coverage = lambda: ""
+        cap.model_swing = lambda target, now_ms, fair: 0.0
+        bot.caps = {spec.key: cap}
+        bot.predict.market_meta["401"] = ({"outcomes": ["Yes", "No"], "status": "REGISTERED"}, 0)
+
+        def look(at, settled, bid="0.60", fair=0.70):
+            seen.update(high=D("210000000") if settled else D("150000000"), fair=fair)
+            bot.predict.ladders[spec.key] = [m.LadderRow(D("200000000"), "401", "$200M", book(spec.key, spec.slug, at, bid))]
+            bot.market.now = at
+    else:
+        spec = m.FlipSpec("XR-FLIP", "will-xr-flip-test", "XR 反超测试", "HYPE", "SOL", start, end)
+        fm = m.FlipMarket(bot.store, spec)
+        fm.odds = lambda now_ms: 1.0 if fm.history.get("kind") == "flip" else 0.70
+        fm.model_swing = lambda now_ms: 0.0
+        bot.flips = {spec.key: fm}
+        bot.predict.info[spec.slug] = {"outcomes": ["Yes", "No"]}
+
+        def look(at, settled, bid="0.60", fair=0.70):
+            fm.sigma_ms = at  # σ current and the path read to the minute before: the market's own reasons hold nothing
+            bot.store.put(f"flip:{spec.slug}", {"kind": "flip", "time": at - 60_000, "a": 181.0, "b": 180.0, "start": start, "top": 1.005,
+                                                "top_at": at - 60_000} if settled else
+                          {"kind": "clear", "through": at - 60_000, "start": start, "top": 0.99, "top_at": at - 3_600_000})
+            bot.predict.books[spec.key] = book(spec.key, spec.slug, at, bid)
+            bot.market.now = at
+    return bot, spec, look
+
+
+async def dispute_step(bot, at: int, key: str = "", lane: bool = False) -> None:
+    """One look of the trader at ``at``: the step's, or the express lane's on ``key``."""
+    if lane:
+        await bot.sim_express(key)
+    else:
+        bot.sim_ran = -1e9
+        await bot.sim_step(at)
+    if isinstance(bot, L.LiveBot):
+        await bot.live_fills_wait()
+
+
+async def dispute_hold_resting():
+    """A market-cap level: a No bid rests at 5¢ (the model gives No 30¢) beside a Yes bid at 60¢; then our data sees the level
+    reached while the book still bids Yes at 60¢. The No bid — worth 0 by our data — is withdrawn at the exit line at that very
+    look, by the step or by the express lane, on paper and for real (its cancel sent to Predict); the Yes bid, worth more by our
+    data, stands as judged; nothing is placed while the card holds. Before: both stood unjudged, the real No bid open on Predict
+    for the half hour (for good with SIM_NO_ODDS_WITHDRAW_MINUTES=0)."""
+    for live_on, lane in itertools.product((False, True), (False, True)):
+        bot, spec, look = await dispute_bot("ladder", live_on)
+        market, api = f"{spec.slug}#401", bot.live.api if live_on else None
+        look(DH_NOW, False)
+        await dispute_step(bot, DH_NOW)
+        trades = bot.sim_trades()
+        no, yes = trades[f"{market}|down|挂"], trades[f"{market}|up|挂"]
+        assert (no["status"], no["price"], yes["status"], yes["price"]) == ("resting", 0.05, "resting", 0.6), (no, yes)
+        if live_on:
+            ids = {side: t["live"].get("order_id") for side, t in (("no", no), ("yes", yes))}
+            assert sorted(api.open) == sorted(ids.values()) and [c[0] for c in api.calls] == ["create", "create"], (ids, api.calls)
+        at = DH_NOW + 5_000
+        look(at, True)
+        (mk,) = [x for x in bot.sim_markets(at) if x.key == spec.key]
+        assert (mk.fair_up, mk.hold) == (1.0, DH_HOLD["ladder"]), (mk.fair_up, mk.hold)
+        assert bot.sim_maker_gate(mk, at).startswith("卡片暂不建议") and bot.sim_result(no, at) is None  # held; Predict settles it
+        await dispute_step(bot, at, spec.key, lane)
+        trades = bot.sim_trades()
+        states = {tid.partition("|")[2]: (t["status"], (t.get("withdrawn") or {}).get("why", "")) for tid, t in trades.items()}
+        assert states == {"down|挂#1": ("cancelled", DH_GONE), "up|挂": ("resting", "")}, (live_on, lane, states)  # before: both resting
+        if live_on:
+            assert api.calls[2:] == [("remove", [ids["no"]])] and sorted(api.open) == [ids["yes"]], (lane, api.calls[2:], api.open)
+        for later in (6_000, 10_000):  # nothing takes its place while the card holds
+            look(DH_NOW + later, True)
+            await dispute_step(bot, DH_NOW + later, spec.key, lane)
+        assert {tid.partition("|")[2] for tid in bot.sim_trades()} == {"down|挂#1", "up|挂"}, (live_on, lane, list(bot.sim_trades()))
+        if live_on:
+            assert [c[0] for c in api.calls] == ["create", "create", "remove"], (lane, api.calls)
+
+
+async def dispute_hold_unsent():
+    """A resting-order decision made on the open market and held back by an API cooldown (a 429 answered to another request between
+    the decision and its send); four seconds on, our data has settled the market Yes while the book still bids it at 60¢, and the
+    cooldown is over. What is pending goes out after any express look that acts, on whichever market (live_place_pending): neither
+    order is sent now — not the No bid (worth 0 by our data; before: sent, and on a market-cap level left there for the half hour)
+    nor the Yes bid (no hold lets a new order out). With our data as it was, both go out."""
+    for kind, settled in itertools.product(("ladder", "flip"), (True, False)):
+        bot, spec, look = await dispute_bot(kind, True)
+        api, send = bot.live.api, bot.sim_after_decide
+
+        async def cooled(now_ms, api=api, send=send):
+            api.blocked_until = m.time.monotonic() + 3600
+            await send(now_ms)
+        bot.sim_after_decide = cooled
+        look(DH_NOW, False)
+        await dispute_step(bot, DH_NOW)
+        bot.sim_after_decide = send
+        waiting = {t["label"]: (t["live"]["state"], t["price"]) for t in bot.sim_trades().values()}
+        assert waiting == {"挂No": ("pending", 0.05), "挂Yes": ("pending", 0.6)} and api.calls == [], (kind, waiting, api.calls)
+        api.blocked_until = 0.0
+        at = DH_NOW + 4_000
+        look(at, settled)
+        (mk,) = [x for x in bot.sim_markets(at) if x.key == spec.key]
+        assert mk.hold == (DH_HOLD[kind] if settled else ""), (kind, settled, mk.hold)
+        await bot.live_place_pending(at)
+        sent = [c for c in api.calls if c[0] == "create"]
+        if not settled:
+            assert len(sent) == 2 and len(api.open) == 2, (kind, api.calls)
+            continue
+        assert sent == [], (kind, [c[1]["data"]["order"]["tokenId"] for c in sent])  # before: both sent, the No bid at 5¢ first
+        notes = {t["label"]: (t["status"], t["live"]["state"], t.get("note") or (t.get("withdrawn") or {}).get("why", ""))
+                 for t in bot.sim_trades().values()}
+        assert all(status == "cancelled" and state == "done" and f"卡片暂不建议（{DH_HOLD[kind]}）" in note and note.endswith("4 秒前的挂单决定作废")
+                   for status, state, note in notes.values()) and len(notes) == 2, (kind, notes)
+        look(at + 1_000, True)
+        await dispute_step(bot, at + 1_000)  # the step that follows: nothing new under the hold
+        assert not [c for c in api.calls if c[0] == "create"] and not api.open, (kind, api.calls)
+
+
+async def dispute_hold_scope():
+    """Only the dispute is told apart (SimMarket.decided "up": our data settled Yes, the book bids under 90¢). The market's own
+    holds leave it empty, and an order resting under them stands as on every other held card, to the half hour (a market-cap
+    level whose σ is the prior, our data short of the level: the No bid's edge gone); a book bidding 90¢ or more agrees with our
+    data — no hold, and the market is settled on our data (sim_result) as before; the card's hold is the trader's, its words
+    unchanged (flip_payload)."""
+    bot, spec, look = await dispute_bot("ladder")
+    cap, at = bot.caps[spec.key], DH_NOW + 5_000
+    look(DH_NOW, False)
+    await dispute_step(bot, DH_NOW)
+    no = bot.sim_trades()[f"{spec.slug}#401|down|挂"]
+    assert no["status"] == "resting" and no["price"] == 0.05, no
+    for settled, bid, sigma_kind, fair, want in ((True, "0.60", "", 0.70, (DH_HOLD["ladder"], "up")), (True, "0.92", "", 0.70, ("", "")),
+                                                 (False, "0.60", "prior", 0.97, ("σ 是先验值", ""))):  # last: the No side worth 3¢
+        cap.sigma_kind = sigma_kind
+        look(at, settled, bid, fair)
+        (mk,) = [x for x in bot.sim_markets(at) if x.key == spec.key]
+        assert (mk.hold, mk.decided) == want, (settled, bid, sigma_kind, mk.hold, mk.decided)
+    assert bot.sim_requote_reason(no, mk, at) == ""  # under its 5¢ bid, and it stands under σ's hold, as before
+    cap.sigma_kind = ""
+    look(at, True, "0.92")
+    assert bot.sim_result(no, at)[0] == 1.0  # the book agrees: settled on our data, as before
+    bot, spec, look = await dispute_bot("flip")
+    fm = bot.flips[spec.key]
+    for settled, bid, sigma_age, want in ((True, "0.60", 0, (DH_HOLD["flip"], "up")), (True, "0.92", 0, ("", "")),
+                                          (False, "0.60", 25 * 3_600_000, ("波动率超过一天未更新；暂不给建议", ""))):
+        look(DH_NOW, settled, bid)
+        fm.sigma_ms = DH_NOW - sigma_age
+        (mk,) = [x for x in bot.sim_markets(DH_NOW) if x.key == spec.key]
+        assert (mk.hold, mk.decided) == want and bot.flip_payload(fm, DH_NOW)["flip"]["hold"] == mk.hold, (settled, bid, mk.hold, mk.decided)
+
+
+for dispute_case in (dispute_hold_resting, dispute_hold_unsent, dispute_hold_scope):
+    asyncio.run(dispute_case())
 print("AUDIT_XREVIEW_OK")

@@ -11379,7 +11379,9 @@ class SimMarket:
     #                          the card's ``hold`` says so too, and a resting order is withdrawn for it (sim_requote_reason, 1.150.0)
     decided: str = ""        # a first-touch market whose ``hold`` is the book's alone (Bot.touch_hold): the way Predict's book already
     # trades the question as settled against the model's fair price — "up" (the high line first) / "down". No hold lets an order be
-    # opened; under the others one already resting stands, under this one it is judged as on a card that holds nothing (sim_requote_reason)
+    # opened; under the others one already resting stands, under this one it is judged as on a card that holds nothing (sim_requote_reason).
+    # 1.150.0 (XR-DISPUTE-HOLD-FREEZE): also a flip / market-cap level whose hold is the dispute alone — our data settled it Yes, its
+    # book still bids under 90¢ (book_disputes; Bot.flip_hold, sim_markets): "up", the side our data settled
 
 
 class LazyEvidence(Mapping):
@@ -18551,12 +18553,21 @@ class Bot:
             return flip_book(book), ""
         return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
 
-    def flip_hold(self, fm: "FlipMarket", odds: float, book: PredictBook | None, now_ms: int) -> str:
-        """Why no trade is suggested: the market's own reasons, or our data says it flipped while the book disagrees."""
+    def flip_hold(self, fm: "FlipMarket", odds: float, book: PredictBook | None, now_ms: int) -> tuple[str, str]:
+        """(why no trade is suggested — "" = it may be —, "up" when that is our data's flip the book disagrees with, else
+        ""): the market's own reasons, or our data says it flipped while the book disagrees (book_disputes). One answer for
+        the web card (flip_payload) and for SimMarket.hold / .decided (sim_markets).
+        1.150.0 (cross review XR-DISPUTE-HOLD-FREEZE): the dispute is told apart from the market's own reasons, as a
+        first-touch market's book hold is (touch_hold): it keeps new orders out, the orders already resting are still judged
+        and a decision not yet sent is void (sim_requote_reason). A resting order was ended here all the same — sim_result
+        settles a flip on our data whatever the book says, at the step's next look — but MOD-BOOK-DISPUTES' wider dispute
+        (the best bid alone: a book bid 60¢ / offered 95¢ now disputes) let a No bid an API cooldown had held back go out
+        under it when the cooldown ended before that look (what is pending goes out after any express look that acts, on
+        whichever market: live_place_pending), where 1.149.0's send-time re-check voided it at the exit line."""
         hold = fm.advice_problem(now_ms)
-        if odds >= 1.0 and fm.history.get("kind") == "flip" and book_disputes(book):
-            hold = hold or "数据显示已反超，但盘口仍低于 90¢；以 Hyperliquid 1 分钟 K 为准，请核实"
-        return hold
+        if not hold and odds >= 1.0 and fm.history.get("kind") == "flip" and book_disputes(book):
+            return "数据显示已反超，但盘口仍低于 90¢；以 Hyperliquid 1 分钟 K 为准，请核实", "up"
+        return hold, ""
 
     def flip_payload(self, fm: "FlipMarket", now_ms: int) -> dict:
         """Web card for a flip market: Yes = A closes a minute above B inside the window."""
@@ -18565,7 +18576,7 @@ class Bot:
                 "close_label": f"{spec.window()}，任一 1 分钟 K 收盘 {spec.coin} > {spec.other} 即 Yes"}
         odds = fm.odds(now_ms)
         book, why = self.flip_yes_book(spec)
-        hold = self.flip_hold(fm, odds, book, now_ms) if isinstance(odds, float) else ""
+        hold = self.flip_hold(fm, odds, book, now_ms)[0] if isinstance(odds, float) else ""
         out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
         if book is not None:
             ok = isinstance(odds, float)
@@ -19047,9 +19058,10 @@ class Bot:
             odds = fm.odds(now_ms)
             book, _ = self.flip_yes_book(fm.spec)
             if isinstance(odds, float) and book is not None:
+                hold, decided = self.flip_hold(fm, odds, book, now_ms)  # decided: the dispute alone (XR-DISPUTE-HOLD-FREEZE, below)
                 out.append(SimMarket(fm.spec.slug, fm.spec.name, "flip", fm.spec.key, odds, book, self.edge_need(fm.model_swing(now_ms)),
-                                     self.flip_hold(fm, odds, book, now_ms), ("Yes", "No"), {"end": fm.spec.end_ms},
-                                     self.evidence(lambda fm=fm: self.market_evidence("flip", now_ms, fm=fm))))
+                                     hold, ("Yes", "No"), {"end": fm.spec.end_ms},
+                                     self.evidence(lambda fm=fm: self.market_evidence("flip", now_ms, fm=fm)), decided=decided))
         for rm in self.ranges.values():
             if only is not None and rm.spec.key != only:
                 continue
@@ -19079,13 +19091,26 @@ class Bot:
                 book, _ = self.predict.yes_book(row) if row.market_id else (None, "")
                 if fair is None or book is None:
                     continue
-                hold = ("数据显示已触及，但盘口仍低于 90¢" if fair == 1.0 and book_disputes(book)
+                disputed = fair == 1.0 and book_disputes(book)
+                hold = ("数据显示已触及，但盘口仍低于 90¢" if disputed
                         else "窗口已结束" if now_ms >= cap.spec.end_ms + 60_000
                         else "σ 是先验值" if cap.sigma_kind == "prior" else "")
+                # 1.150.0 (cross review XR-DISPUTE-HOLD-FREEZE): the dispute is told apart from the other holds (decided), as a
+                # first-touch market's book hold is: it keeps new orders out, but the orders already resting are still judged
+                # (sim_requote_reason, the express lane) and a decision not yet sent is void. MOD-BOOK-DISPUTES judges the dispute
+                # on the best bid alone, so a thin book bid 60¢ / offered 95¢ now holds a level our data saw reached, where 1.149.0
+                # settled it at once (sim_result). Handed as one more hold that lets a resting order stand, the real No bid there —
+                # worth 0 by our data; at most 10¢ under such a book — stayed on Predict for SIM_NO_ODDS_WITHDRAW_MINUTES (for good
+                # at 0), where the exit line had cancelled it at the next look: sim_result waits for Predict's own result on a
+                # disputed level, so no local settlement ends it either; and a No bid an API cooldown had held back went out into
+                # that book when the cooldown ended. Withdrawals only: nothing is placed while the card holds (sim_maker_gate,
+                # sim_requote_freed, sim_express_look), and the half hour still ends what the rules leave. A flip's dispute is told
+                # apart the same way (flip_hold); a range level's has no resting orders (RANGE_SIM_MAKERS)
                 out.append(SimMarket(f"{cap.spec.slug}#{row.market_id}", f"{cap.spec.name} {usd_short(row.target)}", "ladder",
                                      cap.spec.key, fair, book, self.edge_need(cap.model_swing(row.target, now_ms, fair)), hold,
                                      ("Yes", "No"), {"target": str(row.target), "end": cap.spec.end_ms},
-                                     self.evidence(lambda cap=cap, row=row: self.market_evidence("ladder", now_ms, cap=cap, row=row))))
+                                     self.evidence(lambda cap=cap, row=row: self.market_evidence("ladder", now_ms, cap=cap, row=row)),
+                                     decided="up" if disputed else ""))
         return out
 
     SIM_STEP_MIN_SECONDS = 1.0  # two looks never closer than this, however the books come in
@@ -20345,7 +20370,8 @@ class Bot:
         (SIM_MAKER_MIN_BID; either for SIM_MAKER_FOLLOW_SETTLE_SECONDS: sim_follow_settled). "" while it may stand. On a
         stale or crossed book the rules that read the book wait for a fresh one; those that need the fair price alone —
         the exit line, after hours the after-hours bar — are judged all the same (1.150.0), and a held card's order
-        stands (sim_unpriced_reason) — but for a first-touch market held by its book alone (mk.decided): an order
+        stands (sim_unpriced_reason) — but for a market held by its book alone (mk.decided: a first-touch market's book
+        trading the question as settled; a flip / market-cap level whose book disputes what our data settled): an order
         resting there is judged as on a card that holds nothing, and a decision not yet sent is void."""
         c = self.config
         if not trade.get("maker") or mk is None:
@@ -21500,7 +21526,7 @@ class Bot:
                         # 1.150.0 (audit SIM-TOUCH-DECIDED-HOLD, the review of its fix): a first-touch market held by its book alone
                         # opens nothing, but its resting orders are still judged by this look (sim_requote_reason), as they were
                         # before the trader was handed that hold: an edge gone is acted on at the push that shows it, not at the
-                        # step's next turn
+                        # step's next turn. So is a flip / market-cap level held by its dispute alone (XR-DISPUTE-HOLD-FREEZE)
                         self.sim_express_rest(mk, trades, now_ms, changed)
                     continue
                 self.sim_paper_seen(mk)  # as the step: the asks paper fills took that this book no longer shows are forgotten
