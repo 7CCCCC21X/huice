@@ -134,4 +134,140 @@ async def positions_cut():
 asyncio.run(positions_cut())
 
 
+# --- RDM-ROUND-VOID -------------------------------------------------------------------------------------------------------------
+def due(bot) -> float:
+    """Seconds until the next automatic redeem round is due (live_redeem_tick's own test)."""
+    return bot.LIVE_REDEEM_SECONDS - (time.monotonic() - bot.live_last_redeem)
+
+
+async def auto_round(bot):
+    """One automatic round, as the redeem's own timer starts it when due."""
+    bot.live_last_redeem = -1e9
+    bot.live_redeem_tick()
+    await bot.live_redeem_task
+
+
+async def round_void():
+    """RDM-ROUND-VOID: the tick stamps the clock before the round runs, and a round that could not look — the key's 429 cooldown
+    (shared with the pre-open mode's orders and cancels), one failed positions read, the sign-in not there yet — or whose market
+    reads a rate limit cut short, left every waiting winner ten more minutes (the round a win had brought included). Such a round
+    now brings the next one soon: after the cooldown, 30 / 60 / 120 s, three times in a row at most, never later than a round
+    already due; a round that looked, a mid-pass failure, low gas and the dry run keep the ten minutes."""
+    cooling_text = "Predict 接口限流冷却中（15 秒后重试）"
+
+    async def account(*winners):
+        bot = await ready_bot()
+        fake = bot.live.api
+        fake.blocked_until, plain = 0.0, fake.positions
+        fake.positions_rows = [held(mid) for mid in winners]
+        fake.markets.update({str(mid): mk(mid, won=1) for mid in winners})
+        return bot, fake, plain
+
+    # (a) the key cooling when the round starts: nothing read — the next round the cooldown's end + 30 s on, not 600
+    bot, fake, plain = await account(500)
+
+    async def refused():
+        raise m.RemoteError(cooling_text, 15)
+    fake.positions, fake.blocked_until = refused, time.monotonic() + 15
+    await auto_round(bot)
+    assert bot.live_redeem_last["error"] == "读取持仓失败：" + cooling_text and bot.live.chain.redeemed == [], bot.live_redeem_last
+    assert 40 <= due(bot) <= 46, due(bot)
+    task = bot.live_redeem_task
+    bot.live_redeem_tick()
+    assert bot.live_redeem_task is task, "inside the wait: no round"
+    fake.positions, fake.blocked_until = plain, 0.0
+    bot.live_last_redeem -= due(bot) + 1  # the wait is over
+    bot.live_redeem_tick()
+    assert bot.live_redeem_task is not task
+    await bot.live_redeem_task
+    assert [cid for cid, *_ in bot.live.chain.redeemed] == [cond(500)] and bot.live_redeem_again_n == 0, bot.live_redeem_last
+    assert due(bot) > 595, ("a round that looked keeps the ten minutes", due(bot))
+    # (b) the positions read failing round after round: 30, 60, 120 s, then the usual cadence; a round that looks starts over
+    bot, fake, plain = await account(500)
+
+    async def down():
+        raise m.RemoteError("HTTP 500: Internal Server Error")
+    fake.positions, waits = down, []
+    for _ in range(5):
+        await auto_round(bot)
+        waits.append(round(due(bot)))
+    assert waits == [30, 60, 120, 600, 600] and bot.live_redeem_last["error"] == "读取持仓失败：HTTP 500: Internal Server Error", (waits, bot.live_redeem_last)
+    fake.positions = plain
+    await auto_round(bot)
+    assert len(bot.live.chain.redeemed) == 1 and due(bot) > 595 and bot.live_redeem_again_n == 0
+    fake.positions = down
+    await auto_round(bot)
+    assert round(due(bot)) == 30, due(bot)
+    # (c) never inside the cooldown, and never later than a round already due (min, as live_redeem_soon)
+    fake.blocked_until = time.monotonic() + 100
+    bot.live_last_redeem = time.monotonic()
+    bot.live_redeem_pull(5)
+    assert 129 <= due(bot) <= 131, due(bot)
+    fake.blocked_until = 0.0
+    bot.live_redeem_soon()
+    assert due(bot) <= 20, due(bot)
+    bot.live_redeem_pull(45)
+    assert due(bot) <= 20, ("a sooner round is not put off", due(bot))
+    # (d) not signed in yet: the next round past the sign-in's once-a-minute throttle, not ten minutes on
+    bot, fake, plain = await account(500)
+    bot.live.account_error = "账户校验失败：RPC 超时"
+    await auto_round(bot)
+    assert bot.live_redeem_last["error"].startswith("真实交易未就绪") and 58 <= due(bot) <= 66, (bot.live_redeem_last, due(bot))
+    # (e) a rate limit in the middle of the market reads: the rest once the cooldown is over (7 s + 30 s), not ten minutes on
+    bot, fake, plain = await account(501, 502, 503)
+    reads, market = [], fake.market
+
+    async def limited(mid):
+        reads.append(str(mid))
+        if len(reads) == 2:
+            fake.blocked_until = time.monotonic() + 7
+            raise m.RemoteError("HTTP 429: Too Many Requests", 7)
+        return await market(mid)
+    fake.market = limited
+    await auto_round(bot)
+    assert bot.live_redeem_last["counts"] == {"redeemed": 1, "unread": 2} and bot.live_redeem_last["limited"], bot.live_redeem_last
+    assert 35 <= due(bot) <= 38, due(bot)
+    fake.blocked_until = 0.0
+    await auto_round(bot)
+    assert sorted(cid for cid, *_ in bot.live.chain.redeemed) == [cond(501), cond(502), cond(503)] and due(bot) > 595, bot.live_redeem_last
+    # (f) the usual cadence: a failure in the middle of the pass (its own label), no gas, a dry run, /live redeem
+    bot, fake, plain = await account(500)
+    bot.position_time = lambda row: 1 // 0
+    await auto_round(bot)
+    assert bot.live_redeem_last["error"].startswith("这一轮中途出错：") and due(bot) > 595, (bot.live_redeem_last, due(bot))
+    del bot.position_time
+    bot.live.chain.bnb = 10 ** 13
+    await bot.live.refresh_balance()
+    await auto_round(bot)
+    assert bot.live_redeem_last["counts"] == {"claimable": 1} and bot.live.chain.redeemed == [] and due(bot) > 595, bot.live_redeem_last
+    bot.live.chain.bnb = 10 ** 17
+    await bot.live.refresh_balance()
+    fake.positions = down
+    bot.live_last_redeem = stamp = time.monotonic()
+    try:
+        await bot.live_redeem_report(NOW)
+        assert False, "the check's read failed"
+    except m.RemoteError as error:
+        assert "HTTP 500" in str(error)
+    try:
+        await bot.live_redeem(NOW)
+        assert False, "/live redeem's read failed"
+    except m.RemoteError as error:
+        assert "HTTP 500" in str(error)
+    assert bot.live_last_redeem == stamp, "/live redeem and the check never move the automatic clock"
+    # (g) no round has looked for half an hour (a cause that does not pass): said on Telegram, once an hour
+    sent = notices(bot)
+    bot.live_redeem_whole_at = time.monotonic() - bot.LIVE_REDEEM_STUCK_SECONDS - 1
+    for _ in range(3):
+        await auto_round(bot)
+    assert [k for k, _ in sent] == ["redeem:read"] and "分钟没能看完持仓（读取持仓失败：HTTP 500" in sent[0][1], sent
+    fake.positions = plain
+    await auto_round(bot)
+    assert time.monotonic() - bot.live_redeem_whole_at < 5 and len(bot.live.chain.redeemed) == 1
+    print("RDM_ROUND_VOID_OK")
+
+
+asyncio.run(round_void())
+
+
 print("AUDIT_REDEEM_OK")

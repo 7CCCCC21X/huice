@@ -951,6 +951,12 @@ class TxNotSent(core.RemoteError):
     revert in simulation — a market Predict shows resolved before the chain does). Nothing spent: tried again soon."""
 
 
+class RedeemUnread(core.RemoteError):
+    """A redeem round could not read the account's positions (the key's rate-limit cooldown, a 429, a 5xx, a timeout):
+    no position was judged and nothing was sent — the one failure of a round after which looking again soon is safe
+    (1.150.0, audit RDM-ROUND-VOID). Its text and retry_after are the read's own."""
+
+
 class Chain:
     """The few on-chain calls real trading needs, over plain JSON-RPC: USDT / BNB balances, the exchange allowances
     and operator approvals, and the transactions that set them or redeem resolved positions (from the signing wallet;
@@ -1414,6 +1420,10 @@ class LiveBot(core.Bot):
     LIVE_REDEEM_RETRY_SECONDS = 3600  # a position whose redeem failed (gas, a revert) is tried again after this long, not every look...
     LIVE_REDEEM_UNSENT_RETRY_SECONDS = 300  # ...one whose transaction never left (TxNotSent: not resolved on-chain yet, an RPC blip) after this long
     LIVE_REDEEM_TICK_SECONDS = 5     # the automatic redeem's own timer (live_redeem_loop): rounds whatever the paper trader does
+    LIVE_REDEEM_AGAIN_SECONDS = 30   # a round that could not look (the key cooling, the list unread, not signed in) or that a rate limit cut short:
+    #                                  the next one this long after the key's cooldown ends, not LIVE_REDEEM_SECONDS on (live_redeem_again, 1.150.0)...
+    LIVE_REDEEM_AGAIN_MAX = 3        # ...this many times in a row, the wait doubling (30, 60, 120 s); then the usual cadence again
+    LIVE_REDEEM_STUCK_SECONDS = 1800  # no round has looked at the positions for this long: told on Telegram (key redeem:read), not only in /live
     LIVE_REDEEM_NOTE_SECONDS = 3600  # a failed redeem reaches Telegram at most this often
     REDEEM_REPORT_LINES = 6          # /live redeem check: the positions listed per kind (the rest counted)
     LIVE_REDEEM_MIN_BNB_WEI = 5 * 10 ** 14  # under 0.0005 BNB no redeem goes out (one costs about 0.0002): one note, not a failure per position
@@ -1463,6 +1473,9 @@ class LiveBot(core.Bot):
         self.live_redeem_errors: dict[str, str] = {}         # position key -> why its last redeem failed (/live redeem check)
         self.live_redeem_read_round: dict[str, int] = {}     # market id -> the number of the redeem round that last read it (this process's rounds): the longest unread are read first (1.150.0)
         self.live_redeem_noted = -1e9                        # the last failed redeem told on Telegram (LIVE_REDEEM_NOTE_SECONDS)
+        self.live_redeem_again_n = 0                         # early rounds in a row asked for by live_redeem_again (0 again once a round looked, 1.150.0)
+        self.live_redeem_whole_at = time.monotonic()         # when a round last looked at the positions with no rate limit cutting it (the start counts)
+        self.live_redeem_stuck_noted = -1e9                  # ...and when no such look for LIVE_REDEEM_STUCK_SECONDS was last told (hourly at most)
         self.live_redeem_loop_task: asyncio.Task | None = None
         self.live_gas_noted = -1e9
         self.live_redeem_cut = 0          # the last redeem pass's own positions read: 0 = whole, else the rows it read of a longer list (1.150.0)
@@ -2643,17 +2656,63 @@ class LiveBot(core.Bot):
             await self.wait(self.LIVE_REDEEM_TICK_SECONDS)
 
     async def live_redeem_round(self, now_ms: int) -> None:
+        # 1.150.0 (audit RDM-ROUND-VOID): the tick stamps live_last_redeem before the round runs, and a round that could not look —
+        # the key's 20 s cooldown (any client's 429: the pre-open mode's orders and cancels share it), one failed positions read,
+        # the sign-in not there yet — or whose market reads a rate limit cut short left every waiting winner ten minutes more,
+        # the round live_redeem_soon had brought included. Such a round now asks for the next one soon (live_redeem_again: after
+        # the cooldown, at most LIVE_REDEEM_AGAIN_MAX times in a row). A failure in the middle of the pass keeps the usual cadence
+        # under its own label — what it sent is marked, the rest is not hurried — and 读取持仓失败 names the positions read alone.
         try:
             if not self.live.ready:
                 await self.live_ensure_ready()  # signed in by the step otherwise: with the step off, here
                 if not self.live.ready:
                     self.live_redeem_last = {"at": now_ms, "error": f"真实交易未就绪：{self.live.not_ready_why}"}
+                    # the sign-in is tried once a minute (live_ensure_ready): the next round past that minute, not ten on
+                    self.live_redeem_again(65 - (time.monotonic() - getattr(self, "live_last_signin", -1e9)))
                     return
             await self.live_redeem(now_ms)
-        except Exception as error:
+        except RedeemUnread as error:  # the list itself: nothing judged, nothing sent
             text = core.clean_error(error) or type(error).__name__
             self.live_redeem_last = {"at": now_ms, "error": f"读取持仓失败：{text}"}
             self.live_note_error(f"领取结算失败：{text}")
+            self.live_redeem_again()
+        except Exception as error:  # in the middle of the pass: the usual cadence
+            text = core.clean_error(error) or type(error).__name__
+            self.live_redeem_last = {"at": now_ms, "error": f"这一轮中途出错：{text}"}
+            self.live_note_error(f"领取结算失败：{text}")
+        else:
+            if (self.live_redeem_last or {}).get("limited"):
+                self.live_redeem_again()  # the rate limit ended the market reads: the ones left once the cooldown is over, not ten minutes on
+            else:
+                self.live_redeem_again_n = 0  # a round that looked: the usual cadence, and the next trouble has its early rounds again
+
+    def live_redeem_pull(self, seconds: float) -> None:
+        """The next automatic redeem round within ``seconds`` (1.150.0): never later than one already due (the min, as
+        live_redeem_soon — neither undoes the other), and never inside the API key's 429 cooldown — the end of it plus
+        LIVE_REDEEM_AGAIN_SECONDS at the soonest, a round would only be refused there or start the next 429. Only the
+        clock moves: nothing is read or sent here, and that round redeems only what has no mark and no back-off. Its
+        callers bound how often (live_redeem_again; the retry of a redeem that never left, live_redeem_pass)."""
+        cooling = max(0.0, float(getattr(self.live.api, "blocked_until", 0.0) or 0.0) - time.monotonic())
+        wait = max(0.0, float(seconds), (cooling + self.LIVE_REDEEM_AGAIN_SECONDS) if cooling else 0.0)
+        self.live_last_redeem = min(self.live_last_redeem, time.monotonic() - self.LIVE_REDEEM_SECONDS + min(float(self.LIVE_REDEEM_SECONDS), wait))
+
+    def live_redeem_again(self, floor: float = 0.0) -> None:
+        """The round that just ended judged nothing, or not everything, for a reason that passes by itself — the key's
+        rate-limit cooldown, the positions list not read, the sign-in not there yet: the next automatic round
+        LIVE_REDEEM_AGAIN_SECONDS after the cooldown ends (``floor`` at the soonest), the wait doubling each time, at most
+        LIVE_REDEEM_AGAIN_MAX times in a row; then the usual cadence. When no round has looked at the positions for
+        LIVE_REDEEM_STUCK_SECONDS (a cause that does not pass: /positions down for an hour, the key limited round after
+        round) it is said on Telegram, hourly at most — a void round itself was never pushed."""
+        n = self.live_redeem_again_n = getattr(self, "live_redeem_again_n", 0) + 1
+        stuck = time.monotonic() - getattr(self, "live_redeem_whole_at", time.monotonic())
+        if stuck >= self.LIVE_REDEEM_STUCK_SECONDS and time.monotonic() - getattr(self, "live_redeem_stuck_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
+            self.live_redeem_stuck_noted = time.monotonic()
+            self.live_notify(f"⚠️ 自动领取：已 {int(stuck // 60)} 分钟没能看完持仓（{self.live_redeem_summary(self.live_redeem_last)}），"
+                             "赢的暂时领不了；恢复后自动继续。/live redeem check 查看原因", key="redeem:read")
+        if n > self.LIVE_REDEEM_AGAIN_MAX:
+            return
+        cooling = max(0.0, float(getattr(self.live.api, "blocked_until", 0.0) or 0.0) - time.monotonic())
+        self.live_redeem_pull(max(float(floor), cooling + self.LIVE_REDEEM_AGAIN_SECONDS * 2 ** (n - 1)))
 
     def live_redeem_soon(self) -> None:
         """A real position just settled in the bot's favour (the pre-open mode's window, a record on Predict's final
@@ -4135,11 +4194,14 @@ class LiveBot(core.Bot):
         # (live_late_fills, /live fills, live_unexplained), which keep their twenty pages and their flag. A list longer even
         # than this read is said — live_redeem_cut, the round's summary, the check, one notice an hour — never taken whole.
         read = getattr(self.live.api, "positions_read", None)
-        if callable(read):
-            rows, whole = await read(self.LIVE_REDEEM_PAGES)
-        else:  # a client without it (a stand-in): its own read and flag
-            rows = await self.live.api.positions()
-            whole = bool(getattr(self.live.api, "positions_complete", True))
+        try:
+            if callable(read):
+                rows, whole = await read(self.LIVE_REDEEM_PAGES)
+            else:  # a client without it (a stand-in): its own read and flag
+                rows = await self.live.api.positions()
+                whole = bool(getattr(self.live.api, "positions_complete", True))
+        except Exception as error:  # (RDM-ROUND-VOID) the same words for /live redeem and the check; the automatic round looks again soon
+            raise RedeemUnread(core.clean_error(error) or type(error).__name__, int(getattr(error, "retry_after", 0) or 0)) from error
         cut = 0 if whole else len(rows)
         self.live_redeem_cut = cut  # (the dry run's for live_redeem_report, read under the same lock right after it)
         self.live_positions = (rows, time.time())
@@ -4273,7 +4335,9 @@ class LiveBot(core.Bot):
         counts: dict[str, int] = {}
         for s in seen:
             counts[s["kind"]] = counts.get(s["kind"], 0) + 1
-        self.live_redeem_last = {"at": now_ms, "counts": counts, "low_gas": low_gas, "error": "", "cut": cut}
+        self.live_redeem_last = {"at": now_ms, "counts": counts, "low_gas": low_gas, "error": "", "cut": cut, "limited": limited}
+        if not limited:
+            self.live_redeem_whole_at = time.monotonic()  # (RDM-ROUND-VOID) a look no rate limit cut short: live_redeem_again's notice waits again
         return done, seen
 
     @classmethod
