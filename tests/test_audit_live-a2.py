@@ -948,4 +948,219 @@ async def live_fill_after_local_settle():
 
 asyncio.run(live_fill_after_local_settle())
 
+
+async def live_redeem_starve():
+    """LIVE-REDEEM-STARVE: a redeem round reads at most LIVE_REDEEM_READS (40) markets. It read them by the newest positions
+    first and kept nothing about a market it found unresolved, so with forty or more unresolved (or unreadable) markets newer
+    than a resolved winner every round — the ten-minute one, the one a win starts within seconds, /live redeem — spent its reads
+    on the same forty and never reached the winner: its USDT stayed locked until enough of the newer markets resolved, while
+    /live redeem check said the next round would look. The pre-open mode makes it so: its fills on the windows ahead are newer
+    than the window that just resolved. The round now reads first the markets it read the longest ago (never yet: first of all)
+    and fills up with the newest; the cap, the stop at a rate limit and the redeem itself are as they were."""
+    market_json, CAP, MIN = T["market_json"], T["L"].LiveBot.LIVE_REDEEM_READS, 60_000
+    cond = lambda mid: "0x" + f"{int(mid):064x}"
+    assert CAP == 40
+
+    def mk(mid, won=0):
+        """A two-outcome market by Predict's word: unresolved, or resolved with index set ``won`` the winner."""
+        raw = {**market_json(str(mid), status="RESOLVED" if won else "REGISTERED"), "conditionId": cond(mid)}
+        if won:
+            raw["outcomes"] = [{**o, "status": "WON" if o["indexSet"] == won else "LOST"} for o in raw["outcomes"]]
+        return raw
+
+    def held(mid, at=None, index_set=1):
+        """Ten shares held on a market's outcome, bought at ``at`` (None: a row that states no time at all)."""
+        row = {"id": f"p{mid}:{index_set}", "market": {"id": int(mid), "title": f"window {mid}"},
+               "outcome": {"name": "Up" if index_set == 1 else "Down", "indexSet": index_set}, "amount": str(10 * WEI)}
+        return row if at is None else {**row, "updatedAt": at}
+
+    async def account():
+        """A ready bot on stand-ins. Every market read is logged (fake.reads); the markets in fake.gone answer HTTP 404, and
+        past fake.budget reads a round Predict answers HTTP 429."""
+        bot = make_bot()
+        await bot.live_prepare(); fake = bot.live.api
+        assert bot.live.ready, bot.live.not_ready_why
+        fake.positions_rows, fake.reads, fake.gone, fake.budget, read = [], [], set(), None, fake.market
+
+        async def market(mid):
+            fake.reads.append(str(mid))
+            if fake.budget is not None and len(fake.reads) > fake.budget:
+                raise m.RemoteError("HTTP 429: slow down", 7)
+            if str(mid) in fake.gone:
+                raise m.RemoteError("HTTP 404: not found")
+            return await read(mid)
+        fake.market = market
+        return bot, fake
+
+    async def look(bot, at, command=False):
+        """One redeem round — the automatic one, or /live redeem: (its lines or its answer, the markets it read, in order)."""
+        bot.market.now, bot.live.api.reads = at, []
+        answer = await (bot.live_action("redeem", [], at) if command else bot.live_redeem(at))
+        assert len(bot.live.api.reads) <= CAP, ("never more than the cap a round", len(bot.live.api.reads))
+        return answer, list(bot.live.api.reads)
+
+    async def behind(n=45, timed=True):
+        """Market 500, resolved in the bot's favour, its position an hour old, behind ``n`` unresolved markets (600…) with newer
+        positions, a minute apart, the newest first. ``timed`` False: no row states a time — Predict's own order, the winner last."""
+        bot, fake = await account()
+        newer = [str(600 + i) for i in range(n)]
+        fake.markets.update({"500": mk(500, won=1), **{mid: mk(mid) for mid in newer}})
+        fake.positions_rows = ([held(500, NOW - 60 * MIN)] + [held(mid, NOW - i * MIN) for i, mid in enumerate(newer)] if timed
+                               else [held(mid) for mid in newer] + [held(500)])
+        return bot, fake, newer
+
+    redeemed = lambda bot: [(cid, index_set) for cid, index_set, *_ in bot.live.chain.redeemed]
+
+    async def winner_behind_the_cap():
+        # (a) the finding. The first round: the newest forty, as before — the winner and five more not reached
+        bot, fake, newer = await behind()
+        done, reads = await look(bot, NOW)
+        assert done == [] and reads == newer[:CAP] and bot.live_redeem_last["counts"] == {"open": 40, "unread": 6}, (done, reads, bot.live_redeem_last)
+        # ...the next round reads first what that one did not reach — the winner with it: redeemed (before: the same forty again,
+        # round after round, {"open": 40, "unread": 6} and nothing redeemed) — and fills up with the newest
+        done, reads = await look(bot, NOW + 20_000)
+        assert len(done) == 1 and "已领取 window 500 Up 10 份：0xredeem" in done[0], (done, reads, bot.live_redeem_last)
+        assert reads == newer[CAP:] + ["500"] + newer[:CAP - 6], reads
+        assert redeemed(bot) == [(cond(500), 1)] and bot.store.get("live:redeemed:500:1")["tx"] == "0xredeem", bot.live.chain.redeemed
+        assert bot.live_redeem_last["counts"] == {"open": 39, "redeemed": 1, "unread": 6}, bot.live_redeem_last
+        # ...and so on: forty a round, no market left out two rounds running, the newest thirty read in every one (a fresh win
+        # there is still redeemed by the round it starts), the redeemed one never read again
+        last = set(reads)
+        for k in range(1, 7):
+            done, reads = await look(bot, NOW + k * 10 * MIN)
+            assert done == [] and len(reads) == len(set(reads)) == CAP and "500" not in reads, (k, done, reads)
+            assert set(newer) <= last | set(reads) and set(newer[:30]) <= set(reads), (k, sorted(set(newer) - last - set(reads)), reads)
+            last = set(reads)
+        fake.markets["603"] = mk(603, won=1)  # one of the newest resolves in the bot's favour: the very next round, as before
+        done, reads = await look(bot, NOW + 61 * MIN)
+        assert len(done) == 1 and "已领取 window 603" in done[0] and redeemed(bot)[-1] == (cond(603), 1), (done, reads)
+        waiting = [mid for mid in newer if mid not in reads]  # the older ones this round did not reach: the next reads them first
+        fake.markets[waiting[-1]] = mk(waiting[-1], won=1)   # ...the oldest of them resolved meanwhile
+        done, reads = await look(bot, NOW + 70 * MIN)
+        assert 0 < len(waiting) <= 6 and reads[:len(waiting)] == waiting, (waiting, reads)
+        assert len(done) == 1 and f"已领取 window {waiting[-1]}" in done[0], (waiting, done, reads)
+        just_read = next(mid for mid in reversed(newer) if mid in reads and mid != waiting[-1])  # an older one resolves right after its read:
+        fake.markets[just_read] = mk(just_read, won=1)                                             # two rounds at most
+        done, _ = await look(bot, NOW + 80 * MIN)
+        more, _ = await look(bot, NOW + 90 * MIN)
+        assert len(done + more) == 1 and f"已领取 window {just_read}" in (done + more)[0], (just_read, done, more)
+        assert len(redeemed(bot)) == 4 == len(set(redeemed(bot))), bot.live.chain.redeemed
+
+    async def by_command_no_times():
+        # (b) /live redeem ran the same round: "没有可领取的已结算持仓" however often it was sent. Here no row states a time, so
+        # the order was Predict's own — the winner last in its list
+        bot, fake, newer = await behind(timed=False)
+        answer, reads = await look(bot, NOW, command=True)
+        assert "没读到市场 6" in answer and "已领取" not in answer and reads == newer[:CAP], (answer, reads)
+        answer, reads = await look(bot, NOW + 5_000, command=True)
+        assert "已领取 window 500 Up 10 份：0xredeem" in answer and redeemed(bot) == [(cond(500), 1)], (answer, reads)
+
+    async def unreadable_markets():
+        # (c) forty newer markets whose read fails every time (delisted: HTTP 404) took the forty reads of every round just the
+        # same: they wait their turn like the others now — and are still asked when it comes
+        bot, fake = await account()
+        dead = [str(700 + i) for i in range(CAP)]
+        fake.markets["500"], fake.gone = mk(500, won=1), set(dead)
+        fake.positions_rows = [held(500, NOW - 60 * MIN)] + [held(mid, NOW - i * MIN) for i, mid in enumerate(dead)]
+        done, reads = await look(bot, NOW)
+        assert done == [] and reads == dead and bot.live_redeem_last["counts"] == {"unread": 41}, (done, reads, bot.live_redeem_last)
+        done, reads = await look(bot, NOW + 10 * MIN)
+        assert len(done) == 1 and reads[0] == "500" and redeemed(bot) == [(cond(500), 1)], (done, reads)
+        done, reads = await look(bot, NOW + 20 * MIN)
+        assert done == [] and sorted(reads) == dead and bot.live_redeem_last["counts"] == {"kept": 1, "unread": 40}, (done, reads, bot.live_redeem_last)
+        # ...whatever a read finds, the market's turn is taken: forty newer markets resolved in the bot's favour that cannot be
+        # redeemed (no conditionId: 缺字段, read again every round) do not hold up the one that can
+        bot, fake, newer = await behind(CAP)
+        fake.markets.update({mid: {**mk(mid, won=1), "conditionId": ""} for mid in newer})
+        done, reads = await look(bot, NOW)
+        assert done == [] and reads == newer and bot.live_redeem_last["counts"] == {"fields": 40, "unread": 1}, (done, reads, bot.live_redeem_last)
+        done, reads = await look(bot, NOW + 10 * MIN)
+        assert len(done) == 1 and reads[0] == "500" and redeemed(bot) == [(cond(500), 1)], (done, reads)
+
+    async def rate_limited_rounds():
+        # (d) a rate limit ends the round, as before — and the next began at the same newest markets again: with Predict
+        # answering three reads a round the fourth market was never read. The round goes on where the limit stopped the last
+        # one (the market whose read met the limit first), so the winner behind ten unresolved markets is reached in the fourth
+        bot, fake, newer = await behind(10)
+        fake.budget = 3
+        rounds = [await look(bot, NOW + k * 10 * MIN) for k in range(4)]
+        assert [reads for _, reads in rounds] == [newer[0:4], newer[3:7], newer[6:10], [newer[9], "500", newer[0], newer[1]]], rounds
+        assert [len(done) for done, _ in rounds] == [0, 0, 0, 1] and redeemed(bot) == [(cond(500), 1)], rounds
+        assert bot.live_redeem_last["counts"] == {"open": 2, "redeemed": 1, "unread": 8}, bot.live_redeem_last
+
+    async def under_the_cap():
+        # (e) while one round reads every market nothing changes: each is read every round, the newest first, a win is redeemed
+        # by the next round and its market not read again
+        bot, fake, newer = await behind(12)
+        fake.markets["500"] = mk(500)  # not resolved yet
+        everything = newer + ["500"]
+        for k in range(3):
+            done, reads = await look(bot, NOW + k * 10 * MIN)
+            assert done == [] and reads == everything, (k, done, reads)
+        fake.markets["605"] = mk(605, won=1)
+        done, reads = await look(bot, NOW + 30 * MIN)
+        assert len(done) == 1 and "已领取 window 605" in done[0] and reads == everything, (done, reads)
+        done, reads = await look(bot, NOW + 40 * MIN)
+        assert done == [] and reads == [mid for mid in everything if mid != "605"] and len(redeemed(bot)) == 1, (done, reads)
+
+    async def check_is_read_only():
+        # (f) /live redeem check (the dry run) shows the markets the next round will read and leaves their turn as it was: the
+        # winner it calls claimable is redeemed by that round — a check that took the turn would have sent it to the back
+        bot, fake, newer = await behind()
+        await look(bot, NOW)
+        for again in range(2):  # (asked twice: the second check reads what the first read)
+            fake.reads = []
+            report = await bot.live_action("redeem", ["check"], NOW + 5_000 + again)
+            checked = list(fake.reads)
+            assert "window 500 / Up 10 份，约 $10.00" in report and "结论：有 1 个可领取（约 $10.00），下一轮自动领取会领" in report, report
+            assert checked == newer[CAP:] + ["500"] + newer[:CAP - 6], checked
+            assert redeemed(bot) == [] and bot.store.get("live:redeemed:500:1") is None, bot.live.chain.redeemed
+        done, reads = await look(bot, NOW + 20_000)
+        assert len(done) == 1 and "已领取 window 500" in done[0] and reads == checked, (done, reads, checked)
+
+    async def turns_are_forgotten():
+        # (g) only the markets of positions still to be judged are remembered: a market redeemed or lost here, or no longer
+        # held, is dropped from the turns (hundreds of windows a day pass through the pre-open mode's account)
+        bot, fake, newer = await behind(12)
+        done, _ = await look(bot, NOW)  # the winner redeemed, the twelve unresolved
+        assert len(done) == 1 and set(newer) <= set(bot.live_redeem_read_round), (done, bot.live_redeem_read_round)
+        fake.markets["601"] = mk(601, won=2)  # resolved against the Up shares held
+        fake.positions_rows = [row for row in fake.positions_rows if row["market"]["id"] != 602]  # sold: no longer listed
+        await look(bot, NOW + 10 * MIN)
+        assert bot.store.get("live:redeemed:601:1")["lost"] is True and "602" not in bot.live_redeem_read_round, bot.live_redeem_read_round
+        await look(bot, NOW + 20 * MIN)
+        assert set(bot.live_redeem_read_round) == set(newer) - {"601", "602"}, bot.live_redeem_read_round
+
+    async def a_day_in_small():
+        # (h) the pre-open mode's flow in small: three windows filled every quarter of an hour, each resolved in the bot's
+        # favour six hours after its fill — some 72 unresolved markets held at any time, every one of them newer than the
+        # window that just resolved. A round every ten minutes and one as a window is won; before: not one of the wins redeemed
+        bot, fake = await account()
+        due, won_at, paid_at, last, HOURS = {}, {}, {}, 0, 10
+        for minute in range(HOURS * 60 + 1):
+            at = NOW + minute * MIN
+            if minute % 15 == 0:
+                for mid in [str(1000 + len(due) + i) for i in range(3)]:
+                    fake.markets[mid], due[mid] = mk(mid), at + 6 * 60 * MIN
+                    fake.positions_rows.append(held(mid, at))
+            fresh = [mid for mid, when in due.items() if when <= at and mid not in won_at]
+            for mid in fresh:
+                fake.markets[mid], won_at[mid] = mk(mid, won=1), at
+            if minute % 10 == 0 or fresh:
+                await look(bot, at)
+                paid_at.update({mid: at for mid in won_at if mid not in paid_at and bot.store.get(f"live:redeemed:{mid}:1")})
+                last = at
+        waits = [(paid_at[mid] - won_at[mid]) // MIN for mid in paid_at]
+        left = [mid for mid, at in won_at.items() if mid not in paid_at and at <= last - 20 * MIN]
+        assert len(won_at) == 51 and not left and len(paid_at) >= 48 and max(waits) <= 20, (len(won_at), len(paid_at), left, sorted(waits)[-5:])
+        assert len(redeemed(bot)) == len(set(redeemed(bot))) == len(paid_at), "each win redeemed once"
+
+    for case in (winner_behind_the_cap, by_command_no_times, unreadable_markets, rate_limited_rounds, under_the_cap, check_is_read_only,
+                 turns_are_forgotten, a_day_in_small):
+        await case()
+    print("LIVE_REDEEM_STARVE_OK")
+
+
+asyncio.run(live_redeem_starve())
+
 print("AUDIT_LIVE_A2_OK")

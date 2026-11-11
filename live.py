@@ -1277,7 +1277,7 @@ class LiveBot(core.Bot):
     LIVE_APPROVALS_SECONDS = 600
     LIVE_REDEEM_SECONDS = 600   # resolved positions are looked for this often...
     LIVE_REDEEM_SOON_SECONDS = 20  # ...and this soon after a real position settled in the bot's favour (live_redeem_soon: the USDT back for the next quotes)
-    LIVE_REDEEM_READS = 40      # markets read a redeem round at most, the newest positions first (the rest the next round): never a flood on the rate limit the orders share
+    LIVE_REDEEM_READS = 40      # markets read a redeem round at most, the longest unread first (1.150.0; the rest the next rounds): never a flood on the rate limit the orders share
     LIVE_REDEEM_RETRY_SECONDS = 3600  # a position whose redeem failed (gas, a revert) is tried again after this long, not every look...
     LIVE_REDEEM_UNSENT_RETRY_SECONDS = 300  # ...one whose transaction never left (TxNotSent: not resolved on-chain yet, an RPC blip) after this long
     LIVE_REDEEM_TICK_SECONDS = 5     # the automatic redeem's own timer (live_redeem_loop): rounds whatever the paper trader does
@@ -1325,6 +1325,7 @@ class LiveBot(core.Bot):
         self.live_redeem_lock = asyncio.Lock()               # one redeem round at a time (the command beside the automatic round)
         self.live_redeem_last: dict = {}                     # the last round (automatic or /live redeem): when, what it found, or why it could not look
         self.live_redeem_errors: dict[str, str] = {}         # position key -> why its last redeem failed (/live redeem check)
+        self.live_redeem_read_round: dict[str, int] = {}     # market id -> the number of the redeem round that last read it (this process's rounds): the longest unread are read first (1.150.0)
         self.live_redeem_noted = -1e9                        # the last failed redeem told on Telegram (LIVE_REDEEM_NOTE_SECONDS)
         self.live_redeem_loop_task: asyncio.Task | None = None
         self.live_gas_noted = -1e9
@@ -3704,18 +3705,22 @@ class LiveBot(core.Bot):
         position resolved against the bot is marked settled (``lost``) and never asked about again (1.131.3: each one
         cost a market read every round, and the pre-open mode leaves one or more a filled window — hundreds a day
         against the rate limit its orders and cancels share); a market is read once a round whatever outcomes are held,
-        at most LIVE_REDEEM_READS markets a round, the newest positions first (the rest the next round), and a rate limit
-        ends the round. One round at a time: the command and the automatic round never redeem one position twice."""
+        at most LIVE_REDEEM_READS markets a round, the longest unread first (the rest the next rounds; 1.150.0: by the
+        newest positions alone the same markets took every read for as long as they stayed unresolved, and a resolved
+        winner behind them was never reached), and a rate limit ends the round. One round at a time: the command and
+        the automatic round never redeem one position twice."""
         async with self.redeem_lock():
             done, _ = await self.live_redeem_pass(now_ms)
             return done
 
     async def live_redeem_pass(self, now_ms: int, dry_run: bool = False) -> tuple[list[str], list[dict]]:
-        """One look at the account's positions, the newest first: (the redeemed lines, each position judged). Kinds:
+        """One look at the account's positions, the markets read the longest ago first (never yet: first of all; the
+        newest positions first among equals): (the redeemed lines, each position judged). Kinds:
         redeemed (now), claimable (resolved in its favour, not redeemed now: ``dry_run``, or no gas), failed (this
         round), waiting (a failed redeem's back-off), lost, open (not resolved), unread (its market not read: the round's
         cap, a failed read, a rate limit), fields (no index set on the position, no condition on the market), kept
-        (redeemed before, still listed). ``dry_run`` (/live redeem check): nothing sent, written or announced."""
+        (redeemed before, still listed). ``dry_run`` (/live redeem check): nothing sent, written or announced — the
+        markets the next round would read, whose turn it leaves as it was."""
         rows = await self.live.api.positions()
         self.live_positions = (rows, time.time())
         done: list[str] = []
@@ -3730,10 +3735,22 @@ class LiveBot(core.Bot):
         read_errors: dict[str, str] = {}
         limited = False
         errors = self.__dict__.setdefault("live_redeem_errors", {})
-        for row in sorted(rows, key=lambda r: -self.position_time(r)):  # the newest first: a capped round reaches the fresh wins
+        # 1.150.0: the markets go by how long ago this process read them here — never yet first, then by the round of their last read,
+        # the newest positions first among equals. By the newest positions alone (1.131.3) a capped round spent its LIVE_REDEEM_READS
+        # on the same newest markets every round for as long as they stayed unresolved (or their read kept failing), so a resolved
+        # winner behind forty of them was never read — by the automatic round or by /live redeem — and its USDT stayed locked: the
+        # pre-open mode's fills on the windows ahead are newer than the window that just resolved. A round that a rate limit cut
+        # short began at the same markets again, too. Now a round reads first what the last one did not reach and fills up with the
+        # newest: every market's turn comes within about (markets / LIVE_REDEEM_READS) rounds, and while one round reads them all
+        # each is read every round, as before.
+        read_round = self.__dict__.setdefault("live_redeem_read_round", {})
+        this_round = max(read_round.values(), default=0) + 1
+        unsettled: set[str] = set()  # the markets of the positions with no redeemed / lost mark: only their turn is remembered
+        market_of = lambda r: str((r.get("market") if isinstance(r.get("market"), dict) else {}).get("id") or r.get("marketId") or "")
+        for row in sorted(rows, key=lambda r: (read_round.get(market_of(r), 0), -self.position_time(r))):
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
             outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
-            mid = str(market.get("id") or row.get("marketId") or "")
+            mid = market_of(row)
             try:
                 amount = int(str(row.get("amount") or "0"))
             except ValueError:
@@ -3748,6 +3765,7 @@ class LiveBot(core.Bot):
             if mark:
                 seen.append({**entry, "kind": "lost" if mark.get("lost") else "kept", "tx": str(mark.get("tx") or "")})
                 continue
+            unsettled.add(mid)
             failed_at = self.live_redeem_failed.get(key)
             if failed_at is not None and time.monotonic() - failed_at < self.LIVE_REDEEM_RETRY_SECONDS:
                 seen.append({**entry, "kind": "waiting", "left": self.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - failed_at), "error": errors.get(key, "")})
@@ -3765,6 +3783,10 @@ class LiveBot(core.Bot):
                     markets[mid] = None
                     read_errors[mid] = core.clean_error(error) or type(error).__name__
                     limited = bool(getattr(error, "retry_after", 0) or http_status(error) == 429)  # rate-limited: nothing more asked of Predict this round
+                if not dry_run and not limited:
+                    # read — or not readable (a delisted market's 404): the other markets' turn before it is read again. One the rate
+                    # limit stopped keeps its place: it is the next round's first
+                    read_round[mid] = this_round
             raw = markets[mid]
             if raw is None:
                 seen.append({**entry, "kind": "unread", "error": read_errors.get(mid, "")})
@@ -3806,6 +3828,8 @@ class LiveBot(core.Bot):
             self.live_notify(line)
         if dry_run:
             return done, seen
+        for gone in set(read_round) - unsettled:
+            del read_round[gone]  # every position on it settled here (redeemed, lost) before this round, or no longer held: forgotten
         claimable = [s for s in seen if s["kind"] == "claimable"]
         if low_gas and claimable and time.monotonic() - self.live_gas_noted >= self.LIVE_REDEEM_RETRY_SECONDS:
             self.live_gas_noted = time.monotonic()
