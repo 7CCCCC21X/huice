@@ -206,7 +206,61 @@ async def resume_preopen_anchor():
     assert bot.live_killed() == "今日已结算亏损 −$100.00 达到 LIVE_MAX_DAILY_LOSS_USD $50，手动恢复时 −$50.00、之后又亏 $50.00", bot.live_killed()
 
 
+async def hash_read_error_409_adopt():
+    """XR-409-HASH-ERROR follow-up: a taker's order Predict DID take answers a bare 409; the open list omits it and its hash read
+    errors past the placing grace, so it turns "unknown" (the fix above). Both recover and live_recheck adopts it as open — but
+    without a 下单时间 (placed_at): live_taker_due's clock read 0 for ever and the unfilled rest stayed on the book until its signed
+    expiry instead of being cancelled LIVE_TAKER_WAIT_SECONDS (60 s) after it was found, as live_reconcile's adoption does."""
+    close = T["CLOSE"]
+    deep = lambda at: m.SimMarket("deep", "deep", "close", "X", 0.70,
+                                  T["book"]([], [("0.58", "100"), ("0.70", "1000")], at, "deep", mid="103"), 0.03, "", ("涨", "跌"),
+                                  {"key": "X", "target": "2026-10-05", "line": 1.0, "close_ms": close})
+    bot = make_bot(SIM_WAYS="taker")
+    await bot.live_prepare()
+    api = bot.live.api
+    api.markets["103"] = T["market_json"]("103")
+    world["markets"] = [deep(NOW)]
+    await bot.live_prefetch(NOW)
+    real_create, real_orders, real_order = api.create_order, api.orders, api.order
+    hide = {"on": True}
+
+    async def create(body):  # Predict took it, the answer is a bare 409
+        await real_create(body)
+        raise m.RemoteError("HTTP 409: Conflict")
+
+    async def orders(status="OPEN", **p):
+        rows = await real_orders(status, **p)
+        return [r for r in rows if not hide["on"]]
+
+    async def order(oid, hash_=""):
+        if hide["on"]:
+            raise m.RemoteError("HTTP 503: Service Unavailable")
+        return await real_order(oid, hash_)
+    api.create_order, api.orders, api.order = create, orders, order
+    await step(bot, NOW, deep(NOW))
+    key = next(k for k in bot.sim_trades() if k.startswith("deep|up|吃"))
+    st = bot.sim_trades()[key]["live"]
+    assert st["state"] == "placing" and not st.get("placed_at"), st
+    for s in (30, 60, 90, 130):
+        await step(bot, NOW + s * 1000, deep(NOW + s * 1000))
+    assert st["state"] == "unknown", (st["state"], st.get("last_error"))
+    hide["on"] = False
+    found = NOW + 140_000
+    await step(bot, found, deep(found))
+    assert st["state"] == "open" and st.get("placed_at") == found, (st["state"], st.get("placed_at"))
+    removes = lambda: [c for c in api.calls if c[0] == "remove"]
+    await step(bot, found + 30_000, deep(found + 30_000))
+    assert removes() == [], removes()  # not before the taker wait
+    for s in (80, 140):
+        await step(bot, found + s * 1000, deep(found + s * 1000))
+    # before: still "open", placed_at None, nothing removed — the unfilled rest left on the book until its expiry
+    assert removes() == [("remove", [st["order_id"]])], (st["state"], st.get("placed_at"), removes())
+    assert st["state"] == "done", st["state"]
+    assert len([c for c in api.calls if c[0] == "create"]) == 1  # never re-sent
+
+
 asyncio.run(hash_read_error_409())
+asyncio.run(hash_read_error_409_adopt())
 asyncio.run(sendrefused_reconcile())
 asyncio.run(resume_preopen_anchor())
 

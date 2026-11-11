@@ -3883,6 +3883,13 @@ class LiveBot(core.Bot):
                 return
             st["state"] = "cancelling" if trade.get("withdrawn") else "open"  # withdrawn meanwhile: the cancel goes out again
             st["cancel_sent"] = 0
+            # 1.150.0 (XR-409-HASH-ERROR follow-up): a record that went "unknown" while still "placing" (a lost or bare-409
+            # answer, then a hash read answering nothing or an error past the grace) never got a 下单时间 — placed_at is set only
+            # by a POST answer or live_reconcile's adoption. Adopted here without one, live_taker_due's clock read 0 for ever (now
+            # minus "placed_at or now"): a taker's unfilled rest was never cancelled after LIVE_TAKER_WAIT_SECONDS and sat on the
+            # book until its signed expiry, and live_track's miss window never elapsed. Found now, it starts its clock now, as
+            # live_reconcile's adoption does; a record that had one (an open order that went unknown) keeps it
+            st["placed_at"] = st.get("placed_at") or now_ms
             self.live_apply(tid, trade, row, mk, now_ms)
             return
         if self.live_counts_miss(st, int(st.get("unknown_since") or 0)):
