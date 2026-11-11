@@ -23520,7 +23520,16 @@ class Bot:
             if result.get("ok"):
                 result["message"] = f"已套用「{preset[1]}」。" + result["message"]
             return result
-        return await self.live_control(action, data)
+        # 1.150.0 (audit RDM-PAGE-REDEEM): an action that raised — 领取已结算 or 刷新持仓 with Predict's positions list failing or the
+        # key in its 429 cooldown — went to the web server's catch-all: HTTP 500, a body that is not JSON, and the page's toast
+        # said only 「HTTP 500」, the reason in the log alone (Telegram's /live redeem says it). The page now gets the reason, as
+        # the command does; a cancellation still goes through (Exception only)
+        try:
+            return await self.live_control(action, data)
+        except Exception as error:
+            text = clean_error(error) or type(error).__name__
+            self.log_limited("control", f"control action {action} failed: {text}")
+            return {"ok": False, "message": f"操作失败：{text}"}
 
     def control_set(self, values: dict) -> dict:
         """Save the settings given, validated together like the environment. None clears a saved value (the environment's

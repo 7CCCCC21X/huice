@@ -5704,7 +5704,9 @@ class LiveBot(core.Bot):
         else:
             return {"ok": False, "message": "未知操作"}
         message = text if isinstance(text, str) else text.text
-        failed = message.startswith(("❌", "未就绪", "用法")) or "失败" in message.split("\n")[0]  # "nothing to do" is not a failure
+        # "nothing to do" is not a failure — but 这次没有领取 is: something claimable was not claimed (no BNB for gas, a redeem that
+        # failed, 缺字段 …). 1.150.0 (audit RDM-PAGE-REDEEM): the page's 领取已结算 showed that as a success (the green toast)
+        failed = message.startswith(("❌", "未就绪", "用法", "这次没有领取")) or "失败" in message.split("\n")[0]
         return {"ok": not failed, "message": message}
 
     async def live_cancel_command(self, words: list[str], now_ms: int) -> str:

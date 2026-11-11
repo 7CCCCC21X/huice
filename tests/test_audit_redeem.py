@@ -2161,4 +2161,64 @@ async def fields_silent():
 asyncio.run(fields_silent())
 
 
+# --- RDM-PAGE-REDEEM ------------------------------------------------------------------------------------------------------------
+PAGE_KEY, PAGE_TOKEN = "page-key-123456", "p" * 20
+
+
+async def page_post(port, body):
+    """POST /p/<token>/control on the bot's own web server (loopback): (HTTP status, the JSON answer or the raw body)."""
+    raw = json.dumps({"key": PAGE_KEY, **body}, ensure_ascii=False).encode("utf-8")
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(f"POST /p/{PAGE_TOKEN}/control HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {len(raw)}\r\n\r\n".encode() + raw)
+    await writer.drain()
+    data = await reader.read()
+    writer.close()
+    head, _, out = data.partition(b"\r\n\r\n")
+    try:
+        return int(head.split(b" ")[1]), json.loads(out)
+    except ValueError:
+        return int(head.split(b" ")[1]), {"raw": out.decode(errors="replace")}
+
+
+async def page_redeem():
+    """RDM-PAGE-REDEEM: the control page's 领取已结算 gave a GREEN toast when nothing was sent for lack of gas (the answer 这次没有
+    领取… is no failure word the page knew), and when the positions could not be read (Predict 5xx, the key's 429 cooldown) the
+    action raised into the web server's catch-all: HTTP 500 and a toast saying only 「HTTP 500」, the reason in the log alone.
+    Now 这次没有领取 is not ok (400: the red toast) and a raising action answers 操作失败：<the reason>; nothing held is still ok."""
+    bot = await ready_bot(WEB_CONTROL_KEY=PAGE_KEY)
+    fake, chain = bot.live.api, bot.live.chain
+    web = m.WebServer(bot, 0, PAGE_TOKEN)
+    web.CACHE_SECONDS = {}
+    port = await web.start()
+    try:
+        # nothing held: ok, as before
+        assert await page_post(port, {"action": "redeem"}) == (200, {"ok": True, "message": "没有可领取的已结算持仓：持仓 0 个。/live redeem check 看原因"})
+        # a winner, the signer's BNB under the floor: nothing sent — not ok (before: 200, ok, the green toast)
+        fake.positions_rows, fake.markets["500"] = [held(500)], mk(500, won=1)
+        chain.bnb = 10 ** 13
+        await bot.live.refresh_balance()
+        st, j = await page_post(port, {"action": "redeem"})
+        assert st == 400 and j["ok"] is False and j["message"].startswith("这次没有领取：持仓 1 个：可领取 1；签名钱包 BNB 不足") and chain.redeemed == [], (st, j)
+        # the positions list failing / the key cooling: the reason, not 「HTTP 500」 (before: 500, body "error")
+        for trouble in (m.RemoteError("HTTP 500: Internal Server Error"), m.RemoteError("Predict 接口限流冷却中（20 秒后重试）", 20)):
+            async def refused(trouble=trouble):
+                raise trouble
+            fake.positions = refused
+            for action in ("redeem", "positions"):
+                st, j = await page_post(port, {"action": action})
+                assert st == 400 and j == {"ok": False, "message": f"操作失败：{trouble}"}, (action, st, j)
+        # redeemed: ok, as before
+        del fake.positions
+        chain.bnb = 10 ** 17
+        await bot.live.refresh_balance()
+        st, j = await page_post(port, {"action": "redeem"})
+        assert st == 200 and j["ok"] and j["message"].startswith("💵 已领取 window 500 Up 10 份") and len(chain.redeemed) == 1, (st, j)
+    finally:
+        await web.stop()
+    print("RDM_PAGE_REDEEM_OK")
+
+
+asyncio.run(page_redeem())
+
+
 print("AUDIT_REDEEM_OK")
