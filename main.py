@@ -5046,9 +5046,18 @@ class VolBook:
             sigma = math.sqrt((n * own ** 2 + ALT_TODAY_WEIGHT * sigma ** 2) / (n + ALT_TODAY_WEIGHT))
         return sigma, n
 
-    def get(self, key: str, prior_key: str, intraday: bool = False) -> tuple[float, str]:
+    def factor(self, key: str, mode: str) -> float:
+        """The SIGMA_CALIB factor get puts on key's σ in this mode (盘中 / 盘后): the measured one, or 1 while no day stands
+        behind it or it is within 0.005 of 1. 1.150.0: one rule for get and record_predictions — a snapshot divides out the
+        factor its σ really carried, not a stored one get skipped."""
+        factor, days = self.calib.get((key, mode), (1.0, 0))
+        return factor if days and abs(factor - 1) > 0.005 else 1.0
+
+    def get(self, key: str, prior_key: str, intraday: bool = False, calibrated: bool = True) -> tuple[float, str]:
         """Daily close-to-close σ. intraday=True: only the in-session part (today's opening gap has happened) — the
-        share the bars show, or until they do the prior share (INTRADAY_SHARE_PRIOR), never the whole day's."""
+        share the bars show, or until they do the prior share (INTRADAY_SHARE_PRIOR), never the whole day's.
+        calibrated=False: without SIGMA_CALIB's factor — the day σ the closes give, which the move a day has already made
+        is measured against (big_move_widen, 1.150.0)."""
         if key in self.overrides:
             sigma, note = self.overrides[key], "PROB_VOL 手动设定"
         else:
@@ -5061,11 +5070,12 @@ class VolBook:
             else:
                 sigma = math.sqrt((n * est ** 2 + PRIOR_WEIGHT * prior ** 2) / (n + PRIOR_WEIGHT))
                 note = f"{source} {n} 日 {est * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
-        factor, days = self.calib.get((key, "盘中" if intraday else "盘后"), (1.0, 0))
+        mode = "盘中" if intraday else "盘后"
+        factor = self.factor(key, mode) if calibrated else 1.0
         calib_note = ""
-        if days and abs(factor - 1) > 0.005:  # SIGMA_CALIB (1.106.1): the snapshots' residuals said σ was off by this much
+        if factor != 1.0:  # SIGMA_CALIB (1.106.1): the snapshots' residuals said σ was off by this much
             sigma *= factor
-            calib_note = f"；按 {days} 日快照残差校准 ×{factor:.2f}"
+            calib_note = f"；按 {self.calib[(key, mode)][1]} 日快照残差校准 ×{factor:.2f}"
         note += calib_note
         body = self.bodies.get(key)
         if intraday and key not in self.overrides and body is not None:
@@ -5075,7 +5085,7 @@ class VolBook:
             # 盘中 residuals ran 1.59 while its day σ looked right)
             prior_in = PRIOR_VOL[prior_key] * math.sqrt(INTRADAY_SHARE_PRIOR.get(prior_key) or INTRADAY_SHARE_BOUNDS[1])
             sigma_in = math.sqrt((body[1] * body[0] ** 2 + PRIOR_WEIGHT * prior_in ** 2) / (body[1] + PRIOR_WEIGHT))
-            if days and abs(factor - 1) > 0.005:
+            if factor != 1.0:
                 sigma_in *= factor
             return sigma_in, (f"{self.estimates.get(key, (0.0, 0, ''))[2] or '日K'} {body[1]} 日开盘到收盘 {body[0] * 100:.2f}% 与盘中先验 "
                               f"{prior_in * 100:.2f}% 加权（盘中直接估，不按份额扣跳空）{calib_note}")
@@ -8345,6 +8355,15 @@ class UpDownMarket:
     CANDLE_GRACE_MS = 2_000        # and only this long after its minute ended
     PRICE_STALE_MS = TouchMarket.PRICE_STALE_MS
     SIGMA_STALE_MS = TouchMarket.SIGMA_STALE_MS
+    # 1.150.0: how old a price may be and still be traded on (price_problem); PRICE_STALE_MS above only pauses the odds
+    # shown. The odds take the price in hand as this instant's, with σ√τ counted from now: a standard deviation of the
+    # move since it was read shifts the fair price at the line by Φ(√(age / time left)) − ½, about 0.4·√(age / time
+    # left), whatever σ is. The share keeps that at 5.6¢ and the floor at 9¢ where the 15-minute cards stop ordering
+    # (90 s left), both under the 10¢ entry bar. Before, a 59-s-old price with four minutes left was 19¢ off per σ of
+    # unseen move, while Predict's book, which had seen it, looked mispriced on the stale side: the taker bought into it
+    TRADE_STALE_SHARE = 0.02       # a price read longer ago than this share of the time left to the end is not traded on...
+    TRADE_STALE_MIN_MS = 5_000     # ...in the last minutes one older than this (a push comes every second, a read behind a slow round in two or three)
+    PRICE_NAME = "币安价格"         # the live price, as that message names it (a 15-minute card's: 指数价 / 现货价)
 
     SIGMA_HALF_LIFE = 120          # σ: the last 30 days' hourly returns, a weight halving every five days back (1.106.1; a plain 30-day σ before)
     SIGMA_MODEL = 2                # the estimator's version, kept on each sample: the calibration counts samples of the current one alone
@@ -8494,12 +8513,30 @@ class UpDownMarket:
                    ((used * MODEL_SIGMA_ERROR, -0.5), (used / MODEL_SIGMA_ERROR, -0.5), (used, 0.0)))
 
 
+    def price_problem(self, now_ms: int) -> str:
+        """Why the price in hand is too old to trade on ("" while it is not): read longer ago than TRADE_STALE_SHARE of
+        the time left to the end, or than TRADE_STALE_MIN_MS in the last minutes. The odds stay on the card (only
+        PRICE_STALE_MS pauses those); nothing is suggested or bought from them (advice_problem) and a resting order is
+        withdrawn (SimMarket.price_problem, Bot.sim_requote_reason). 1.150.0: until then the one check was PRICE_STALE_MS
+        — a minute on a 15-minute card, five on a daily one — so while the price feed stalled (the stream silent or
+        reconnecting, the REST read in a rate-limit cooldown) and Predict's book went on moving, the trader kept buying
+        the side the stale price made look cheap from those who had seen the move."""
+        left = self.spec.end_ms + 60_000 - now_ms
+        limit = max(self.TRADE_STALE_MIN_MS, self.TRADE_STALE_SHARE * left)
+        age = now_ms - self.priced_ms
+        if age <= limit:
+            return ""
+        return (f"{self.PRICE_NAME} {math.ceil(age / 1000)} 秒未更新，超过离结束 {max(left, 0) / 60_000:.1f} 分钟时的上限 "
+                f"{math.floor(limit / 100 + 1e-6) / 10:g} 秒")  # (the age rounded up, the limit down: never "5 秒" against a limit of 5)
+
     def advice_problem(self, odds: UpDownOdds, now_ms: int) -> str:
         """Why no trade is suggested from these odds ("" when one may be)."""
         if odds.settled:
             return "已出结果，以 Predict 结算为准；不再给建议"
         if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
             return "波动率超过一天未更新；暂不给建议"
+        if stale := self.price_problem(now_ms):
+            return f"{stale}；暂不给建议"
         return ""
 
 
@@ -8684,6 +8721,7 @@ class IndexUpDownMarket(UpDownMarket):
     WORD = "指数"                 # the price, as the card's messages name it (指数价 / 现货价)
     SOURCE = "币安合约指数价"      # the price's source, as the card and the evidence name it
     PRICE_KIND = "指数价 i"       # the kind of price (price_evidence)
+    PRICE_NAME = "指数价"         # the price, as price_problem names it
     SOURCE_LINE = "币安合约指数 1 分钟 K"  # the candles the boundaries are read from
     PRICE_TEXT = "币安合约 {symbol} 指数价"  # the card's reference line
     SIGMA_TEXT = "币安合约 {symbol} 指数近 4 小时 1 分钟 K（近 1 小时权重过半，开盘首小时按开盘后的）"
@@ -8781,6 +8819,16 @@ class IndexUpDownMarket(UpDownMarket):
             if price is not None:
                 return price, f"交易所现价先行 {gap:+.2%}"
         return self.price, ""
+
+    def price_problem(self, now_ms: int) -> str:
+        """Why the index in hand is too old to trade on (UpDownMarket.price_problem: by its own time — the push's event
+        time, the read's), while the index is the price the odds are taken at. While the exchange quote leads it
+        (effective: LEAD_QUOTE=on) the odds are the quote's, whatever the index's age: how long that quote may go
+        unread stays LEAD_STALE_MS's business (15 s), as before. (The quote is stamped at the start of its polling
+        round and reaches the card at the card's own next round: by the two loops' cadence a few seconds old in
+        ordinary running, close to this rule's 5 s — it wants its real age measured before the rule is put on it.)
+        Once the quote leads no more, the index's age counts again."""
+        return "" if self.effective(now_ms)[1] else super().price_problem(now_ms)
 
     def lead_text(self, now_ms: int) -> str:
         """The exchange quote's part in the price now, for the card and the evidence; "" without one."""
@@ -9028,6 +9076,7 @@ class SpotWindowMarket(IndexUpDownMarket):
     WORD = "现货"
     SOURCE = "币安现货最新成交（Chainlink 取买卖一中间价）"
     PRICE_KIND = "最新成交"
+    PRICE_NAME = "现货价"
     SOURCE_LINE = "币安现货 1 分钟 K"
     PRICE_TEXT = "币安现货 {symbol} 价格"
     SIGMA_TEXT = "币安现货 {symbol} 近 4 小时 1 分钟 K（近 1 小时权重过半）"
@@ -10054,19 +10103,29 @@ def us_trading_years(now_ms: int, end_ms: int, intraday: float = 1.0) -> float:
 
 def deadline_from_text(texts: list[str], after_ms: int) -> int:
     """The deadline a market's title names, as 23:59 ET of that date: "by December 31", "by Dec. 31, 2026", "by (the end
-    of) December", "截止于 12 月 31 日", "2026-12-31". A date without a year is the first such date on or after after_ms (the
-    market's creation). The first text that names one wins; 0 when none does."""
+    of) December", "by December 2026" (a month with no day: its last one), "截止于 12 月 31 日", "2026-12-31". A date without
+    a year is the first such date on or after after_ms (the market's creation). The first text that names one wins; 0 when
+    none does."""
     since = et_date(after_ms) if after_ms else dt.date.today()
     # whole month words only: "before MARket close" and "by DECision of the committee" name no month
     month = (r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|"
              r"october|oct|november|nov|december|dec)\b\.?")
+    # 1.150.0: a day is one or two digits with no digit after them — the (?!\d) of the two month patterns. Without it a month
+    # followed by its year and no day lost both: in "by June 2027" and "by the end of December 2026" the year's "20" was the
+    # day and no year was left, so the deadline was the 20th of the creation year or the next. Ten days early, or a year:
+    # "by December 2027" read in November 2026 was 2026-12-20. The card priced to that end (the time left cut short: P(Yes)
+    # too low, the No side bought on an edge that was not there), closed its window there and settled its paper trades as
+    # No with the market still open, and a LADDER_DEADLINES pin of the true date matched no market. Now "by <month> <year>"
+    # is that month's last day, as "by <month>" is. A month and a year with no "by" ("June 2027", "in December 2026") name
+    # no deadline, as a month alone never did ("in January"): the next text decides, or the card waits for the pin — the
+    # last pattern's day stays required (were it optional, every month word would match: "the price may rise")
     patterns = [
         (r"(20\d\d)-(\d\d)-(\d\d)", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
         (r"(20\d\d)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
         (r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (0, int(g[0]), int(g[1]))),
-        (r"(?i)\b(?:by|before|until|through)\s+(?:the\s+)?(?:end\s+of\s+)?" + month + r"\s*(\d{1,2})?(?:st|nd|rd|th)?,?\s*(20\d\d)?",
+        (r"(?i)\b(?:by|before|until|through)\s+(?:the\s+)?(?:end\s+of\s+)?" + month + r"\s*(\d{1,2}(?!\d))?(?:st|nd|rd|th)?,?\s*(20\d\d)?",
          lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()[:3]], int(g[1]) if g[1] else 0)),
-        (r"(?i)\b" + month + r"\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(20\d\d)?",
+        (r"(?i)\b" + month + r"\s+(\d{1,2}(?!\d))(?:st|nd|rd|th)?,?\s*(20\d\d)?",
          lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()[:3]], int(g[1]))),
     ]
     for text in texts:
@@ -10859,7 +10918,10 @@ class StockTouchMarket(TouchMarket):
     one, cannot be ordered from it: a manual check) and the running session's minutes as they come. Advice only while
     the regular session runs: between sessions the last trade is the price, but the stock trades on after hours — a
     quote on the close is a free option for whoever saw the after-hours move (the fair price moves some 3.7¢ a 1% move
-    between the lines), and a held card's resting orders are withdrawn after SIM_NO_ODDS_WITHDRAW_MINUTES."""
+    between the lines), so an order resting at the close is withdrawn at it (Bot.sim_stock_touch_closed, 1.150.0; until
+    then only once the hold had lasted SIM_NO_ODDS_WITHDRAW_MINUTES — the half hour NVDA's results come out in).
+    1.150.0: and in the session only on a price of that session, no more than PRICE_STALE_MS old by its own time
+    (advice_problem)."""
     PRICE_SECONDS = StockRangeMarket.PRICE_SECONDS
     CLOSED_PRICE_SECONDS = StockRangeMarket.CLOSED_PRICE_SECONDS
     CLOSE_PRINT_MS = StockRangeMarket.CLOSE_PRINT_MS
@@ -10889,8 +10951,10 @@ class StockTouchMarket(TouchMarket):
         self.failures = {"price": "", "scan": ""}
         self.yahoo: tuple[D, int] | None = None  # (Yahoo's last trade, its time): the check on the index, the price when it is not live
         self.index_live = False  # the price in hand is Binance's futures index (note_index), not Yahoo's trade
+        self.index_seen: tuple[D, int] | None = None  # (the index as last delivered, when that value first came): standing still, it ages (note_index)
 
     INDEX_STALE_MS = 15_000      # 1.147.0: Binance's index older than this is not live: Yahoo's trade prices the card
+    INDEX_STILL_MS = 15_000      # 1.150.0: ...nor one whose value has not changed for this long, delivered every second though it is: a stalled index
     INDEX_MAX_GAP = 0.02         # ...nor an index further than this (ln) from Yahoo's trade: another instrument, a bad print
 
     @property
@@ -10903,9 +10967,24 @@ class StockTouchMarket(TouchMarket):
         """Binance's futures index of the stock (the 15-minute card's: pushed every second, read every second without the
         push), 1.147.0: while the regular session runs, fresh and within INDEX_MAX_GAP of Yahoo's trade, it is the price —
         Yahoo's 30-second reads lagged the stock by up to half a minute, a few cents of fair price between the lines.
-        True when it moved the price (the express lane looks then)."""
-        if (price is None or not price > 0 or self.yahoo is None or us_session_state(now_ms)[0] != "交易中"
-                or now_ms - at_ms > self.INDEX_STALE_MS or at_ms <= (self.priced_ms if self.index_live else 0)
+        True when it moved the price (the express lane looks then).
+        1.150.0: fresh by its value too, not by its delivery alone. A push's event time (a read's server time) is new
+        every second whether or not the index behind it moved, so an index stalled at one value while the stock went
+        on trading (its sources stuck; a closure the calendar does not know) passed as live for as long as it stayed
+        within INDEX_MAX_GAP of Yahoo's trade — and while it did, that trade, read every 30 s, priced nothing: ten
+        minutes of it with the stock up 1.9% were 6.4¢ of fair price, advised on. Now a value delivered unchanged for
+        over INDEX_STILL_MS (by the deliveries' own times) is refused: the price in hand is left to age, and the Yahoo
+        read that finds it over INDEX_STALE_MS old prices the card (refresh, as when the index goes quiet: half a
+        minute to a minute after the index last moved), as does each read after it — the standing value is not taken
+        back — until the index moves. Where the index stands still because the stock does (a halt), Yahoo's trade is
+        that same price: nothing is lost by it."""
+        if price is None or not price > 0 or now_ms - at_ms > self.INDEX_STALE_MS:
+            return False  # nothing, or a delivery come late (a stalled socket catching up): no news of the index as it is now
+        if self.index_seen is None or price != self.index_seen[0]:
+            self.index_seen = (price, at_ms)  # a new value — in the session or out of it, whichever price the card is on: its clock starts
+        if (self.yahoo is None or us_session_state(now_ms)[0] != "交易中"
+                or at_ms <= (self.priced_ms if self.index_live else 0)
+                or at_ms - self.index_seen[1] > self.INDEX_STILL_MS
                 or abs(math.log(float(price) / float(self.yahoo[0]))) > self.INDEX_MAX_GAP):
             return False
         moved = price != self.price
@@ -11021,6 +11100,28 @@ class StockTouchMarket(TouchMarket):
         if state != "交易中":
             return ("美股休市中：盘前盘后的价格不算数，但会影响开盘价，按收盘价报价会被知道盘后行情的人吃掉；"
                     + (f"北京时间 {stamp(opens, seconds=False)} 开盘后恢复" if opens else "开盘后恢复") + "；暂不给建议")
+        session = us_session(et_date(now_ms))
+        if session and self.price is not None and self.priced_ms < session[0]:
+            # 1.150.0: the session runs, and the price in hand is still from before its open — the close's: the hold above,
+            # for the same reason, until a price of this session is in. Yahoo's last trade is yesterday's until its first
+            # read of the new session (half a minute on any day; for as long as its reads fail, or answer with
+            # yesterday's chart), and Binance's index, the one price that knows the open, is refused (note_index) for
+            # standing over INDEX_MAX_GAP from that very close whenever the stock opens over 2% away — the mornings
+            # this card's rule is about. Nothing else held it: price_stale lets the close stand for the session's first
+            # half hour (the hit markets' rule: they advise on the last trade between sessions too), and minutes_ms is
+            # the time of the read, whatever day its bars are of. So a +4% open priced "$210 first" 15¢ under its worth
+            # with the suggestion on, and from the first second the taker bought the other side above its worth off a
+            # book that had the open in it; with Yahoo stuck, for thirty minutes, the alert sent as well. An index
+            # delivery stamped before the bell (taken in the session's first second) is a pre-market price too: the
+            # next one, a second later, is the session's.
+            return f"美股已开盘，现价还是开盘前的（停在 {stamp(self.priced_ms, seconds=False)}），今天的价格还没读到；暂不给建议"
+        if self.price is not None and now_ms - self.priced_ms > self.PRICE_STALE_MS:
+            # 1.150.0: the same later in the session — a price over five minutes old by its own time (PRICE_STALE_MS: what
+            # prices nothing on the crypto card) is not advised on. It is Yahoo's trade standing still while its reads go
+            # on answering (a stuck host; a halt): the index, once the stock is 2% from that trade, is refused for it
+            # exactly as at the open, and until now the trade was advised on for the half hour price_stale gives it
+            # (stuck at 10:05 with the stock up 2.5% by 10:20: 9¢ of fair price, to 10:35). The odds stay, as above.
+            return f"美股交易中，现价还停在 {stamp(self.priced_ms, seconds=False)}（超过 {self.PRICE_STALE_MS // 60_000} 分钟没更新）；暂不给建议"
         if now_ms - self.minutes_ms > self.MINUTES_STALE_MS:
             return "今天的 1 分钟 K 超过 5 分钟没读到；暂不给建议"
         if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
@@ -11069,6 +11170,8 @@ class SimMarket:
     lunch: bool = False      # a daily card: its underlying is in its lunch break (in_session is False then: the after-hours rules apply)
     move: float | None = None  # a daily card: ln(effective / reference), the day's move so far — the proxy's after hours (1.120.0)
     sigma_day: float = 0.0   # ...and the whole day's σ it is measured against (sim_against_move)
+    price_problem: str = ""  # an up/down card: why its price is too old to trade on now (UpDownMarket.price_problem; "" = fresh enough) —
+    #                          the card's ``hold`` says so too, and a resting order is withdrawn for it (sim_requote_reason, 1.150.0)
 
 
 class LazyEvidence(Mapping):
@@ -17067,8 +17170,12 @@ class Bot:
                 "ref_raw": float(raw.ref), "up_raw": raw.fair_up, "strike": float(shown.ref) if shown.ref != raw.ref else None,
                 "move": raw.move, "beta": raw.beta, "sigma": raw.sigma_daily * raw.widen, "widen": raw.widen, "R": raw.remaining, "proxy": raw.proxy_note,
                 "trend": trend,  # ln(effective / the snapshot before's), about half an hour: the direction the price had been going (1.120.2)
-                "calib": self.vols.calib.get((key, raw.mode), (1.0, 0))[0],  # the factor in that σ: the residuals are taken on the raw one
-                "sigma_raw": raw.sigma_daily * raw.widen / self.vols.calib.get((key, raw.mode), (1.0, 0))[0],
+                # the factor in that σ — the one VolBook.get applied (1.150.0: not a stored one within 0.005 of 1 it skipped) — and
+                # the σ without it: the residuals are taken on the raw one. Raw now also on a big-move day: the widen is measured
+                # against the day σ before the factor (sigma_day in the card builders), so dividing the factor out leaves the σ
+                # the card would price with SIGMA_CALIB off
+                "calib": self.vols.factor(key, raw.mode),
+                "sigma_raw": raw.sigma_daily * raw.widen / self.vols.factor(key, raw.mode),
                 "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else "",
                 **(self.sse_alt(raw, shown) if key == "SSE" else {})})
         if time.time() - self.pred_pruned > 86400:  # the snapshots are kept PRED_KEEP_DAYS, not forever
@@ -17254,7 +17361,12 @@ class Bot:
             return None
         holidays = self.config.holidays.get("sh", frozenset())
         sigma, sigma_note = self.vols.get("SSE", "SSE")
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen). 1.150.0: the closes' own, before
+        # SIGMA_CALIB's factor — the calibrated one cancelled the 盘后 factor out of a big move's σ ahead (|move|·√R/1.5 whatever
+        # it was) while the snapshot still divided it out (its "raw" σ not raw: the factor fed on itself), and carried the 盘后
+        # factor into the in-session card (a factor 1.4 took KOSPI's in-session widen on a −3% day from 1.43 to 1.02). The card
+        # keeps it as CloseOdds.sigma_day, so sim_against_move's "N 个日 σ" is this σ too, as on the stock cards
+        sigma_day = self.vols.get("SSE", "SSE", calibrated=False)[0]
         close = self.cn.close
         if self.cn.sse_session(now_ms)[0]:
             # the session runs: only today's own, fresh print prices it (never a frozen or yesterday's quote, and
@@ -17415,7 +17527,9 @@ class Bot:
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         close_date = dt.datetime.fromtimestamp(base_ms / 1000, tz).date()
         sigma, sigma_note = self.stock_sigma(symbol, ticker.market)
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen) — before any SIGMA_CALIB factor, as
+        # the index cards' (1.150.0; a stock card has none today: index_sigma_calibs measures the index cards alone)
+        sigma_day = self.vols.get(symbol, ticker.market, calibrated=False)[0]
         unit = "" if ticker.same_unit else ((ref.currency if ref else "") or info.currency)
         live, live_why = self.stocks.live_quote(symbol, now_ms)
         closed_today = close_date == dt.datetime.fromtimestamp(now_ms / 1000, tz).date() and base_ms <= now_ms
@@ -17575,7 +17689,8 @@ class Bot:
         holidays = self.hsi.holidays
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
         sigma, sigma_note = self.vols.get("HSI", "HSI")
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen) — before SIGMA_CALIB's factor (1.150.0, see sse_odds)
+        sigma_day = self.vols.get("HSI", "HSI", calibrated=False)[0]
         if self.hsi.cash_open(now_ms):
             # the cash session runs: only today's own, fresh index prices it (never yesterday's page or a frozen feed)
             why = self.hsi.spot_problem(q, now_ms) or self.hsi.spot_still(q, now_ms)
@@ -17625,7 +17740,8 @@ class Bot:
         if k is None:
             return "缺少 KOSPI"
         sigma, sigma_note = self.vols.get("KOSPI", "KOSPI")
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen) — before SIGMA_CALIB's factor (1.150.0, see sse_odds)
+        sigma_day = self.vols.get("KOSPI", "KOSPI", calibrated=False)[0]
         kst = dt.timezone(dt.timedelta(hours=9))
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
         holidays = self.config.holidays.get("kr", frozenset())
@@ -17724,10 +17840,16 @@ class Bot:
         tick = price_tick(ticker.market, strike) if ticker and "｜" in title else D("0.01")
         # A proxy-mapped estimate is "our close × proxy move": move it onto the settlement close too.
         effective = odds.effective if odds.direct else odds.effective * strike / odds.ref
+        # 1.150.0: the whole day's σ goes along (sigma_day). Left out, close_odds stored sigma_daily in its place — in session
+        # only the open-to-close part, after hours the σ with SIGMA_CALIB's 盘后 factor — and SIM_AGAINST_MOVE_SIGMAS, a count
+        # of whole-day σ (sim_against_move), measured the day's move against that whenever Predict's figure was known: early
+        # where that σ is the smaller one (a stock card in session: at 0.7–0.8 of the configured count), late where it is the
+        # larger (a 盘中 factor of 1.5, a 盘后 one of 1.4: a buy let into the move the rule was set to refuse, a resting bid
+        # kept). The widen goes as it is, so the prices are what they were (no big-move pass here: the σ note is not doubled)
         return dataclasses.replace(
             close_odds(odds.name, strike, effective, odds.sigma_daily, odds.remaining, odds.target, tick,
                        f"Predict 目标价（本地参考 {fmt(odds.ref)}·{odds.ref_note}）", odds.proxy_note, odds.sigma_note,
-                       odds.unit, odds.beta, odds.mode, widen=odds.widen), warn=odds.warn)
+                       odds.unit, odds.beta, odds.mode, sigma_day=odds.sigma_day, widen=odds.widen), warn=odds.warn)
 
     def odds_payload(self) -> dict:
         """JSON for the web page: one entry per item, numbers raw, text already plain."""
@@ -18382,7 +18504,8 @@ class Bot:
                 out.append(SimMarket(mkt.spec.slug, mkt.spec.name, "updown", mkt.spec.key, odds.fair_up, book,
                                      self.edge_need(mkt.model_swing(odds)), self.updown_hold(mkt, odds, now_ms)[0], ("涨", "跌"),
                                      self.updown_settle(mkt.spec),
-                                     self.evidence(lambda mkt=mkt, odds=odds: self.market_evidence("updown", now_ms, mkt=mkt, odds=odds))))
+                                     self.evidence(lambda mkt=mkt, odds=odds: self.market_evidence("updown", now_ms, mkt=mkt, odds=odds)),
+                                     price_problem="" if odds.settled else mkt.price_problem(now_ms)))
         for fm in self.flips.values():
             if only is not None and fm.spec.key != only:
                 continue
@@ -18638,10 +18761,12 @@ class Bot:
     def sim_withdraw_reason(self, trade: dict, mk: SimMarket | None, now_ms: int | None = None) -> str:
         """Why a resting paper order is withdrawn now rather than left to the result: the trader no longer places such
         orders (SIM_WAYS, SIM_MARKETS, a kind that is taker-only such as the price ladders), the market is in its
-        last minutes (SIM_QUIET_MINUTES), or what is left of the order is a fraction of a share that never fills
-        (SIM_MAKER_DUST_SHARES, 1.118.0). "" while it stands."""
+        last minutes (SIM_QUIET_MINUTES), what is left of the order is a fraction of a share that never fills
+        (SIM_MAKER_DUST_SHARES, 1.118.0), or it rests on a US stock's first-touch card between two sessions
+        (sim_stock_touch_closed, 1.150.0). "" while it stands."""
         kind = str(trade.get("kind") or "")
-        quiet = self.sim_quiet(trade.get("settle") or (mk.settle if mk is not None else None), self.market.now_ms() if now_ms is None else now_ms)
+        now = self.market.now_ms() if now_ms is None else now_ms
+        quiet = self.sim_quiet(trade.get("settle") or (mk.settle if mk is not None else None), now)
         if quiet:
             return quiet
         if trade.get("maker") and trade.get("status") == "resting" and float(trade.get("shares") or 0) > 1e-9:
@@ -18658,7 +18783,39 @@ class Bot:
             return f"详细选项已排除{trade.get('item') or trade.get('key')}"
         if (kind == "range" and not RANGE_SIM_MAKERS) or (mk is not None and not mk.makers):
             return f"{SIM_KINDS.get(kind, kind)}只做吃单"
-        return ""
+        return self.sim_stock_touch_closed(trade, now)  # last: where one of the reasons above applies, its words stand as they did
+
+    def sim_stock_touch_closed(self, trade: dict, now_ms: int) -> str:
+        """Why a resting order on a US stock's first-touch card (StockTouchMarket: NVDA 先触 $160 / $210) is withdrawn as
+        soon as the regular session is over — at the step's first look after the bell (a 13:00 early close too), and at
+        any look between two sessions (a restart overnight, a weekend) — whatever SIM_NO_ODDS_WITHDRAW_MINUTES says
+        (1.150.0). The card stops advising at the close, and its hold says why: the price in hand is the closing print
+        and stays so until the next open (Yahoo's regular-session trade knows nothing of the after hours; Binance's
+        index is refused out of the session), while the stock trades on — a quote on the close is a free option for
+        whoever saw the after-hours move. But the hold only kept new orders away. The one already resting stood under
+        it unjudged (sim_requote_reason: no exit line, no 买1 followed), and the rules that end a quote with its session
+        are the daily cards' alone (SIM_MAKER_SESSION wants in_session False — a first-touch market's is None — and
+        sim_open_quiet / sim_against_move are kind "close" only), so it stood until sim_unpriced_reason's clock ran
+        out: 30 minutes by default, 60 or 120 on the control page's presets, all night at 0. NVDA reports some twenty
+        minutes after the bell: the bid was still up, at the close's fair price, when the results came out — on Predict
+        too with LIVE on, where a resting order lives until it is cancelled (its own expiry is the market's deadline).
+        That clock's grace is for a hold that passes (a feed's hiccup is not worth a cancel and a new order); this one
+        is on the calendar and lasts until the next open, so the wait bought nothing — the daily cards' orders go at
+        their close as well (SIM_MAKER_SESSION, on by default). Read from the record's own kind and key, not from
+        ``mk``: the order goes just the same when the card shows no odds (Yahoo silent after hours: no SimMarket), and
+        a resting order decided before the bell and held back past it (a cooldown, a sign-in) is voided at the send
+        (LiveBot.live_taker_recheck asks sim_withdraw_reason). Only where the card itself holds (advice_problem) —
+        between two sessions that is every state of it but a line already reached: decided, the after hours move
+        nothing and the order is left to the result, as before — so nothing takes the order's place (sim_maker_gate):
+        it is one cancel a day, never a cancel and a new order, and the next order is the next session's, on a price
+        of that session. The crypto first-touch cards (they trade around the clock) and a taker's record are left as
+        they were. "" otherwise."""
+        if not trade.get("maker") or trade.get("kind") != "touch":
+            return ""
+        card = self.touches.get(str(trade.get("key") or ""))
+        if not isinstance(card, StockTouchMarket) or us_session_state(now_ms)[0] == "交易中" or not card.advice_problem(now_ms):
+            return ""
+        return "美股已收盘：盘前盘后的价格不算数、但会影响开盘价，按收盘价挂着的单会被知道盘后行情的人吃掉，收盘即撤（开盘后再挂）"
 
     @staticmethod
     def sim_own_resting(trades: dict[str, dict], market: str, side: str, book: PredictBook | None = None) -> tuple[float, float | None]:
@@ -19483,6 +19640,12 @@ class Bot:
         stale_ms = SIM_WINDOW_STALE_WITHDRAW_MS if (trade.get("settle") or {}).get("window") else SIM_STALE_WITHDRAW_MS
         if mk.book.stale(now_ms) and now_ms - mk.book.fetched_ms > stale_ms:  # no pricing basis: not left for someone with one to fill
             return f"盘口断流超过 {stale_ms // 1000} 秒，撤单" if stale_ms < 120_000 else f"盘口断流超过 {stale_ms // 60_000} 分钟，撤单"
+        if mk.price_problem:
+            # 1.150.0: the card's own price is too old to trade on (its feed stalled while the book is fresh), and the card holds
+            # its suggestion for it. An order under a hold stands unjudged (the next line) — its edge not held against the exit
+            # line, a 买1 that fell away not followed — a bid left for whoever saw the move the card has not. It is withdrawn,
+            # as on a book gone stale, and placed afresh by the next look that has a fresh price
+            return f"{mk.price_problem}，撤单"
         if mk.hold or mk.book.stale(now_ms) or book_crossed(mk.book):
             return ""  # no fresh view of the market: the order stands
         side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)
