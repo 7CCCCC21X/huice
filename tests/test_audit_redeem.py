@@ -2050,6 +2050,9 @@ async def notify_gates():
     assert await told_round(bot, NOW + 6 * MIN, "⚠️ 自动领取：1 个已结算的持仓没领成") == [ADMIN]  # (before: nothing — and an hour on)
     bot.live_redeem_failed.clear()
     assert await told_round(bot, NOW + 12 * MIN, "⚠️") == [ADMIN], "hourly: still the one notice"
+    # the control page's hint of the switch says what 关 still sends
+    hint = next(h for k, _, h in m.CONTROL_KEYS if k == "LIVE_NOTIFY")
+    assert "关了也照发 ⛽ 签名钱包没 gas、⚠️ 领取没领成、缺字段领不了这几条（没有订阅时发到管理员私聊）" in hint, hint
     print("RDM_NOTIFY_GATES_OK")
 
 
