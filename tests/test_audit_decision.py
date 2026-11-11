@@ -140,4 +140,58 @@ assert writes() - w0 == 4, "the same refusal is noted again once the window has 
 (rec,) = [b for b in sbot.sim_blocks() if b["id"] == btid]
 assert rec["first"] == NOW and rec["why"].startswith("收涨时"), rec
 
+# --- SIM-MAKER-EFF-SURVIVOR: the makers' efficiency counts the unfilled attempts sim_prune deleted ---------------------------------
+# sim_prune keeps every fill and only the newest 20 empty attempts per slot, so the figures taken over what is left were the
+# survivors': a slot quoted 100 times with 5 fills read 5 / 25 = 20% filled instead of 5%
+pbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}), m.Store(":memory:"), SelfFM(NOW), None)
+pbot.sim_markets = lambda now: []  # no books: the open positions are just not marked
+HSI = "hang-seng-index-up-or-down-on-november-10-2026"
+WIN = "btc-updown-15m-1"
+hsi = {"v": 2, "market": HSI, "slug": HSI, "market_id": "101", "item": "恒生指数", "kind": "close", "key": "HSI", "side": "up", "label": "挂涨",
+       "maker": True, "fair": 0.7, "settle": {"key": "HSI", "target": "2026-11-10", "line": 24600.0, "close_ms": NOW + 3_600_000},
+       "order": 100.0, "fills": [], "revisions": [], "price": 0.55, "edge": 0.15}
+btc = {**hsi, "market": WIN, "slug": WIN, "market_id": "202", "item": "BTC 15分涨跌 12:00–12:15", "kind": "updown", "key": "BTC-15M",
+       "driver": "BTCUSDT", "driver_name": "BTC", "order": 50.0, "settle": {"end": NOW + 900_000, "start": NOW, "window": "15m"}}
+gone = lambda n, cents: {"opened": NOW - n * 1000, "status": "cancelled", "shares": 0.0,
+                         "withdrawn": {"at": NOW - n * 1000 + 400, "why": f"买1 已到 {cents}¢，跟过去", "unfilled": 100.0}}
+attempts = [(f"{HSI}|up|挂#{n}", {**hsi, **gone(n, 40 + n % 7)}) for n in range(1, 96)]  # 95 withdrawn empty after 0.4 s each
+attempts += [(f"{HSI}|up|挂#{n}", {**hsi, "opened": NOW - n * 1000, "status": "filled", "shares": 100.0, "filled": NOW - n * 1000 + 100}) for n in range(96, 101)]
+attempts += [(f"{WIN}|down|挂#{n}", {**btc, "side": "down", "label": "挂跌", "opened": NOW - n * 1000, "status": "expired", "shares": 0.0,
+                                     "settled": NOW - n * 1000 + 900}) for n in range(1, 31)]  # another card: 30 lapsed at the end, 0.9 s each
+attempts += [(f"{HSI}|down|吃#{n}", {**hsi, "side": "down", "label": "吃跌", "maker": False, "opened": NOW - n * 1000, "status": "cancelled",
+                                     "shares": 0.0}) for n in range(1, 26)]  # takers that lapsed: pruned too, never part of the makers' figures
+pbot.sim_save(attempts)
+makers_of = lambda flt=None: pbot.journal_analysis(flt)["analysis"]["makers"]
+before = makers_of()
+assert (before["placed"], before["unfilled"], before["cancelled"], before["expired"], before["filled"]) == (130, 125, 95, 30, 5), before
+assert abs(before["fill_rate"] - 5 / 130) < 1e-12 and abs(before["share_rate"] - 500 / 11_500) < 1e-12 and before["rest_n"] == 125, before
+before_hsi, before_btc = makers_of({"card": "恒生指数"}), makers_of({"kind": "updown"})
+assert pbot.sim_prune() == 75 + 10 + 5 and pbot.store.count("sim:") == len(pbot.sim_trades()) == 155 - 90
+after = makers_of()
+assert (after["placed"], after["unfilled"], after["fill_rate"]) == (130, 125, 5 / 130), ("the pruned attempts fell out of the figures", after)  # before the fix: 45, 40, 5 / 45
+assert after == before, (before, after)  # shares, rests and withdrawal reasons too: nothing the page shows moved with the prune
+assert makers_of({"card": "恒生指数"}) == before_hsi and before_hsi["fill_rate"] == 0.05 and before_hsi["placed"] == 100  # the page's filter: per card …
+assert makers_of({"kind": "updown"}) == before_btc and (before_btc["placed"], before_btc["expired"], before_btc["fill_rate"]) == (30, 30, 0.0)  # … and per kind
+assert makers_of({"way": "maker"}) == before and makers_of({"way": "taker"})["placed"] == 0 and makers_of({"card": "恒生指数", "kind": "updown"})["placed"] == 0
+assert "挂单成交率 4%（130 笔挂单" in pbot.daily_report_text(NOW), pbot.daily_report_text(NOW)  # the daily report's line: 5 / 130, was 5 / 45 = 11%
+# what is kept: one line per card and kind (not per slot: a 15-minute card opens two new slots every window), outside "sim:"
+stored = {(r["card"], r["kind"]): r for r in pbot.store.get(m.SIM_PRUNED_KEY)}
+assert set(stored) == {("恒生指数", "close"), ("BTC 15分涨跌", "updown")} and m.SIM_PRUNED_KEY not in pbot.sim_trades(), stored
+h = stored[("恒生指数", "close")]
+assert (h["n"], h["cancelled"], h.get("expired", 0), h["order"], h["rest_ms"], h["rest_n"]) == (75, 75, 0, 7500.0, 75 * 400, 75), h
+assert h["reasons"] == {"买N 已到 N¢，跟过去": 75}, h["reasons"]
+# a later prune adds to the totals; one with nothing to remove leaves them alone
+assert pbot.sim_prune() == 0 and pbot.store.get(m.SIM_PRUNED_KEY) == list(stored.values())
+pbot.sim_save([(f"{HSI}|up|挂#{n}", {**hsi, **gone(n - 200, 50)}) for n in range(101, 111)])  # ten newer attempts: ten older ones go
+assert pbot.sim_prune() == 10
+later = makers_of()
+assert (later["placed"], later["unfilled"], later["cancelled"]) == (140, 135, 105) and abs(later["fill_rate"] - 5 / 140) < 1e-12, later
+# the function alone, as before: without the totals it reads only the records it is given
+alone = m.sim_maker_efficiency(list(pbot.sim_trades().values()))
+assert (alone["placed"], alone["unfilled"]) == (45, 40) and m.sim_maker_efficiency([], [])["fill_rate"] is None, alone
+# the reasons kept per card and kind are bounded: past SIM_PRUNED_REASONS distinct ones a new one counts as 其他
+many = m.sim_pruned_count([], [{**hsi, "status": "cancelled", "shares": 0.0, "opened": NOW, "withdrawn": {"at": NOW + 1, "why": f"原因{chr(0x4E00 + i)}"}}
+                               for i in range(m.SIM_PRUNED_REASONS + 5)])
+assert len(many) == 1 and many[0]["n"] == m.SIM_PRUNED_REASONS + 5 and len(many[0]["reasons"]) == m.SIM_PRUNED_REASONS + 1 and many[0]["reasons"]["其他"] == 5, many
+
 print("AUDIT_DECISION_OK")

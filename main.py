@@ -12060,11 +12060,60 @@ def median(values: Iterable[float]) -> float | None:
     return ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
 
 
-def sim_maker_efficiency(trades: list[dict]) -> dict:
+def maker_rest_ms(trade: dict) -> int | None:
+    """How long a resting order that filled nothing rested: its withdrawal (or its settlement, when it expired) less its
+    opening; None when either is not on the record."""
+    end = int((trade.get("withdrawn") or {}).get("at") or trade.get("settled") or 0)
+    return end - int(trade["opened"]) if end and trade.get("opened") else None
+
+
+def withdrawal_reason_key(trade: dict) -> str:
+    """A record's withdrawal reason with its numbers replaced by N, so one rule's lines count as one; "" for none."""
+    why = str((trade.get("withdrawn") or {}).get("why") or "")
+    return re.sub(r"\d+(?:\.\d+)?", "N", why) if why else ""
+
+
+SIM_PRUNED_KEY = "simpruned"   # the store's record of what sim_prune removed; not under "sim:", so never read as a trade
+SIM_PRUNED_REASONS = 40        # distinct withdrawal reasons kept per card and kind there; any further one counts as 其他
+
+
+def sim_pruned_count(rows: Any, gone: Iterable[dict]) -> list[dict]:
+    """``rows`` (the stored totals, SIM_PRUNED_KEY) with the resting orders among ``gone`` — the records sim_prune is
+    about to delete — added: per card (card_of) and kind, how many, how many of them cancelled and expired, the shares
+    they asked for, how long they rested and why they were withdrawn. Everything sim_maker_efficiency reads off an
+    unfilled record, kept per card and kind so the review page's filter still applies (a per-slot count would grow by
+    two lines per 15-minute window for ever). Takers and refused orders are not counted: the efficiency is the makers'."""
+    by = {(str(r.get("card") or ""), str(r.get("kind") or "")): r for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict)}
+    for t in gone:
+        if not t.get("maker"):
+            continue
+        key = (card_of(t), str(t.get("kind") or ""))
+        r = by.setdefault(key, {"card": key[0], "kind": key[1]})
+        r["n"] = int(r.get("n") or 0) + 1
+        status = "expired" if t.get("status") == "expired" else "cancelled"
+        r[status] = int(r.get(status) or 0) + 1
+        r["order"] = float(r.get("order") or 0) + float(t.get("order") or t.get("shares") or 0)
+        rest = maker_rest_ms(t)
+        if rest is not None:
+            r["rest_ms"], r["rest_n"] = int(r.get("rest_ms") or 0) + rest, int(r.get("rest_n") or 0) + 1
+        if why := withdrawal_reason_key(t):
+            reasons = r.setdefault("reasons", {})
+            if why not in reasons and len(reasons) >= SIM_PRUNED_REASONS:
+                why = "其他"
+            reasons[why] = int(reasons.get(why) or 0) + 1
+    return list(by.values())
+
+
+def sim_maker_efficiency(trades: list[dict], pruned: Iterable[Mapping] | None = None) -> dict:
     """The resting orders' record: how many were placed, filled whole, filled in part, never filled (expired at the end
     or withdrawn empty) or still rest; the fill rate of the finished ones by count (any fill) and by shares; how long
     the filled ones waited for their first fill (mean, median); how long the unfilled ones rested; the most frequent
-    withdrawal reasons, their numbers replaced by N so one rule's lines count as one."""
+    withdrawal reasons, their numbers replaced by N so one rule's lines count as one.
+
+    ``pruned``: the totals of the unfilled attempts sim_prune has deleted (sim_pruned_count's rows). 1.150.0: without them
+    the figures were survivors': every fill is kept for ever and only the newest SIM_ATTEMPTS_KEEP empty attempts per
+    slot, so a slot quoted 100 times with 5 fills read 5 / 25 = 20% filled, not 5% — the more often a slot was re-quoted,
+    the better it looked. They count as placed, ended and unfilled, with their shares, rests and reasons."""
     makers = [t for t in trades if bool(t.get("maker"))]
     resting = [t for t in makers if t.get("status") == "resting"]
     ended = [t for t in makers if t.get("status") != "resting"]
@@ -12074,24 +12123,26 @@ def sim_maker_efficiency(trades: list[dict]) -> dict:
     partial = [t for t in ended if 0 < shares_of(t) < order_of(t) - 1e-9]
     unfilled = [t for t in ended if shares_of(t) <= 0]
     waits = sorted(int(t["filled"]) - int(t.get("opened") or 0) for t in makers if t.get("filled") and shares_of(t) > 0)
-    rests = []
-    for t in unfilled:
-        end = int((t.get("withdrawn") or {}).get("at") or t.get("settled") or 0)
-        if end and t.get("opened"):
-            rests.append(end - int(t["opened"]))
+    rests = [rest for t in unfilled if (rest := maker_rest_ms(t)) is not None]
     reasons: dict[str, int] = {}
     for t in makers:
-        why = str((t.get("withdrawn") or {}).get("why") or "")
-        if why:
-            key = re.sub(r"\d+(?:\.\d+)?", "N", why)
+        if key := withdrawal_reason_key(t):
             reasons[key] = reasons.get(key, 0) + 1
-    ordered = sum(order_of(t) for t in ended)
-    return {"placed": len(makers), "filled": len(whole), "partial": len(partial), "unfilled": len(unfilled), "resting": len(resting),
-            "expired": sum(t.get("status") == "expired" for t in unfilled), "cancelled": sum(t.get("status") == "cancelled" for t in unfilled),
-            "fill_rate": (len(whole) + len(partial)) / len(ended) if ended else None,
+    gone = [p for p in pruned or () if isinstance(p, Mapping)]
+    total = lambda field: sum(p.get(field) or 0 for p in gone)
+    for p in gone:
+        for key, n in (p.get("reasons") or {}).items():
+            reasons[key] = reasons.get(key, 0) + int(n or 0)
+    n_gone, n_ended = int(total("n")), len(ended) + int(total("n"))
+    ordered = sum(order_of(t) for t in ended) + float(total("order"))
+    rest_n, rest_ms = len(rests) + int(total("rest_n")), sum(rests) + total("rest_ms")
+    return {"placed": len(makers) + n_gone, "filled": len(whole), "partial": len(partial), "unfilled": len(unfilled) + n_gone, "resting": len(resting),
+            "expired": sum(t.get("status") == "expired" for t in unfilled) + int(total("expired")),
+            "cancelled": sum(t.get("status") == "cancelled" for t in unfilled) + int(total("cancelled")),
+            "fill_rate": (len(whole) + len(partial)) / n_ended if n_ended else None,
             "share_rate": sum(shares_of(t) for t in ended) / ordered if ordered else None,
             "wait_n": len(waits), "wait_avg": sum(waits) / len(waits) if waits else None, "wait_median": median(waits),
-            "rest_n": len(rests), "rest_avg": sum(rests) / len(rests) if rests else None,
+            "rest_n": rest_n, "rest_avg": rest_ms / rest_n if rest_n else None,
             "reasons": [{"why": why, "n": n} for why, n in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:8]]}
 
 
@@ -19420,9 +19471,14 @@ class Bot:
         """Of the attempts that filled nothing — a resting order withdrawn, a taker that lapsed, an order refused:
         cancelled or expired records with no shares, moved to tid#n — only the newest SIM_ATTEMPTS_KEEP per slot are
         kept. A maker re-quoted every few seconds for days left tens of thousands of them, and every look at the
-        records (the step, the journal, the page) paid for all of them. How many were removed."""
+        records (the step, the journal, the page) paid for all of them. How many were removed.
+
+        1.150.0: the resting orders among them are counted before they go (sim_pruned_count, under SIM_PRUNED_KEY), in
+        the transaction that deletes them: the review page's 挂单效率 and the daily report's 挂单成交率 are taken over
+        every attempt, not over every fill and the last 20 misses of each slot."""
         by_slot: dict[str, list[tuple[int, str]]] = {}
-        for tid, t in self.sim_trades().items():
+        trades = self.sim_trades()
+        for tid, t in trades.items():
             head, _, way = tid.rpartition("|")
             label, _, n = way.partition("#")
             if not n.isdigit() or t.get("status") not in {"cancelled", "expired"} or float(t.get("shares") or 0) > 1e-9:
@@ -19435,12 +19491,24 @@ class Bot:
             by_slot.setdefault(f"{head}|{label}", []).append((int(t.get("opened") or 0), tid))
         doomed = [tid for rows in by_slot.values() for _, tid in sorted(rows, reverse=True)[self.SIM_ATTEMPTS_KEEP:]]
         if doomed:
-            self.store.delete_keys([f"sim:{tid}" for tid in doomed])
+            counted = sim_pruned_count(self.store.get(SIM_PRUNED_KEY), [trades[tid] for tid in doomed])
+            # one transaction (Store.replace): an attempt is never deleted uncounted, nor counted and still there to be counted again
+            self.store.replace([f"sim:{tid}" for tid in doomed], [(SIM_PRUNED_KEY, counted)])
             if self.sim_cache is not None:
                 for tid in doomed:
                     self.sim_cache.pop(tid, None)
                 self.sim_gen = self.store.touched.get("sim", 0)
         return len(doomed)
+
+    def sim_pruned(self, flt: Mapping | None = None) -> list[dict]:
+        """The totals of the resting orders sim_prune has deleted (sim_pruned_count), those in ``flt`` (the review page's
+        filter: a card, a kind, a way — none of them under 吃单): what sim_maker_efficiency adds to the records still kept."""
+        flt = flt or {}
+        if flt.get("way") and not JOURNAL_WAYS.get(flt["way"], True):
+            return []
+        rows = self.store.get(SIM_PRUNED_KEY)
+        return [r for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict)
+                and (not flt.get("card") or r.get("card") == flt["card"]) and (not flt.get("kind") or r.get("kind") == flt["kind"])]
 
     def prunable(self, trade: dict) -> bool:
         """Whether sim_prune may drop this record of an attempt that filled nothing; on paper always (LiveBot: not while its
@@ -20607,7 +20675,7 @@ class Bot:
                 "edges": sim_by_bucket(trades, lambda t: t.get("edge"), EDGE_BUCKETS, marks),
                 "fairs": sim_by_bucket(trades, lambda t: t.get("fair"), FAIR_BUCKETS, marks),
                 "sessions": sim_by_session(trades, exchange_of, holidays_of, marks),
-                "makers": sim_maker_efficiency(trades),
+                "makers": sim_maker_efficiency(trades, self.sim_pruned(flt)),  # 1.150.0: the attempts sim_prune removed counted in
                 "blocked": sim_blocked_outcomes(blocks, trades, self.config.sim_shares),
                 "versions": sim_by_version(trades, marks),  # 1.107.0: a setting changed, its values side by side
                 "windows": sim_by_window(trades, marks),    # 1.107.0: the 15-minute windows by start hour and by minutes left
@@ -21623,7 +21691,7 @@ class Bot:
         money = lambda x: ("+$" if x >= 0 else "−$") + f"{abs(x):,.2f}"
         wl = lambda r: f"赢 {r['wins']} 输 {r['losses']}" + (f" 平 {r['ties']}" if r["ties"] else "")
         day, total, done = summary_of(today_rows, marks), summary_of(trades, marks), summary_of(settled_rows)
-        lifetime, makers = sim_stats(trades), sim_maker_efficiency(trades)
+        lifetime, makers = sim_stats(trades), sim_maker_efficiency(trades, self.sim_pruned())
         body = []
         if today_rows:
             ways = "、".join(f"{name} {n} 笔" for name, n in (("挂单", sum(bool(t.get("maker")) for t in today_rows)),
