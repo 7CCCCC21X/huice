@@ -907,4 +907,67 @@ async def unsent_as_sent():
 asyncio.run(unsent_as_sent())
 
 
+# --- RDM-RECEIPT-POLL (the failed poll) -----------------------------------------------------------------------------------------
+def polls(*answers):
+    """eth_getTransactionReceipt answering ``answers`` one after another (the last one for ever after)."""
+    queue = list(answers)
+    return lambda params: queue.pop(0) if len(queue) > 1 else queue[0]
+
+
+MINED = {"blockNumber": "0x10", "status": "0x1", "logs": []}
+
+
+async def receipt_poll():
+    """RDM-RECEIPT-POLL: one receipt poll that failed (a timeout, HTTP 429 / 503, a body that is no JSON, a JSON-RPC error answer
+    — a POST the HTTP layer never repeats) ended Chain.wait, and a redeem that had been sent and was mined a block later was booked
+    as failed: no mark, no 💵 line, a 没领成 alert, an hour's back-off. A failed poll now means "no receipt yet": asked again to the
+    same deadline. A revert still ends the wait at once, the deadline is still TxPending, a cancel still ends it."""
+    chain = L.Chain("https://rpc.invalid", L.Wallet(KEY, 56, PA))
+    chain.RECEIPT_POLL_SECONDS = 0
+    for trouble in (m.RemoteError("网络错误 (TimeoutError: timed out)"), m.RemoteError("HTTP 503: 接口请求失败"),
+                    m.RemoteError("HTTP 429: 接口限流，等待后重试"), b"<html>502</html>", {"error": {"code": -32005, "message": "limit exceeded"}}):
+        with RpcNode(eth_getTransactionReceipt=polls(trouble, MINED)) as node:
+            assert (await chain.wait("0xtxhash"))["status"] == "0x1", trouble  # (before: the RemoteError of poll 1)
+        assert node.methods() == ["eth_getTransactionReceipt"] * 2, node.methods()
+    # unchanged: a revert at once; no receipt to the deadline is TxPending (now saying why it was not read); a cancel ends the wait
+    with RpcNode(eth_getTransactionReceipt=polls(m.RemoteError("HTTP 503: 接口请求失败"), {"blockNumber": "0x10", "status": "0x0"})):
+        try:
+            await chain.wait("0xtxhash")
+            assert False
+        except m.RemoteError as error:
+            assert str(error) == "交易失败（已回滚）：0xtxhash" and not isinstance(error, L.TxPending)
+    with RpcNode(eth_getTransactionReceipt=polls(None, m.RemoteError("HTTP 503: 接口请求失败"))) as node:
+        try:
+            await chain.wait("0xtxhash", timeout=0.05)
+            assert False
+        except L.TxPending as error:
+            assert str(error).startswith("交易 0xtxhash 在 0 秒内未上链（回执读取失败：HTTP 503") and error.tx_hash == "0xtxhash", str(error)
+    with RpcNode(eth_getTransactionReceipt=None):
+        task = asyncio.create_task(chain.wait("0xtxhash"))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+            assert False
+        except asyncio.CancelledError:
+            pass
+    # the round: sent, mined, poll 1 failed — 💵 with the hash and the mark, no failure, no alert, one transaction
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["701"] = [held(701)], mk(701, won=1)
+    bot.live.chain = L.Chain("https://rpc.invalid", bot.live.wallet)
+    bot.live.chain.RECEIPT_POLL_SECONDS = 0
+    sent = notices(bot)
+    with node_for(eth_getTransactionReceipt=polls(m.RemoteError("HTTP 503: 接口请求失败"), MINED)) as node:
+        done = await bot.live_redeem(NOW)
+    tx = keccak_of(next(p[0] for meth, p in node.log if meth == "eth_sendRawTransaction"))
+    assert done == [f"💵 已领取 window 701 Up 10 份：{tx}"], (done, bot.live_errors[-1:])  # (before: [] — 领取失败, an hour)
+    assert bot.store.get("live:redeemed:701:1")["tx"] == tx and bot.live_redeem_failed == {} and node.methods().count("eth_sendRawTransaction") == 1
+    assert [k for k, _ in sent] == [""] and "redeem:fail" not in [k for k, _ in sent], sent
+    print("RDM_RECEIPT_POLL_OK")
+
+
+asyncio.run(receipt_poll())
+
+
 print("AUDIT_REDEEM_OK")

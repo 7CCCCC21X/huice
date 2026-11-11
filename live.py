@@ -1138,17 +1138,33 @@ class Chain:
                 raise
             return str(answer) if answer else tx_hash  # (a node answering null: the hash of what it was given)
 
+    RECEIPT_POLL_SECONDS = 3.0  # the receipt is asked for this often while a sent transaction is awaited (Chain.wait)
+
     async def wait(self, tx_hash: str, timeout: float = 120.0) -> dict:
-        """The receipt once mined; RemoteError when it reverted or did not come in time."""
+        """The receipt once mined; RemoteError when it reverted, TxPending when it did not come in time."""
+        # 1.150.0 (audit RDM-RECEIPT-POLL): one poll that failed — a timeout, a dropped connection, HTTP 429 / 5xx, a body that is
+        # no JSON, a JSON-RPC error answer: every JSON-RPC call is a POST, which the HTTP layer never repeats — ended the wait,
+        # and the redeem of a transaction that had been sent (and was mined a block later) was booked as failed: no mark, no
+        # 💵 line, a 没领成 alert and an hour's back-off (then, while Predict still listed the row, a second redeem that paid
+        # nothing). A failed poll says nothing about the transaction: polled again, to the same deadline (at most 40 reads, no
+        # transaction); after a 429 not sooner than the node asked. A revert still ends the wait at once; the deadline is
+        # still TxPending (never "not sent": the transaction may still be mined), now saying why the receipt was not read.
         deadline = time.monotonic() + timeout
+        trouble = ""
         while time.monotonic() < deadline:
-            receipt = await self.rpc("eth_getTransactionReceipt", [tx_hash])
+            pause = self.RECEIPT_POLL_SECONDS
+            try:
+                receipt, trouble = await self.rpc("eth_getTransactionReceipt", [tx_hash]), ""
+            except core.RemoteError as error:  # (only a RemoteError: a cancel at shutdown still ends the wait)
+                receipt, trouble = None, core.clean_error(error) or type(error).__name__
+                pause = max(pause, float(error.retry_after or 0))
             if isinstance(receipt, dict) and receipt.get("blockNumber"):
                 if int(str(receipt.get("status") or "0x0"), 16) != 1:
                     raise core.RemoteError(f"交易失败（已回滚）：{tx_hash}")
                 return receipt
-            await asyncio.sleep(3)
-        raise TxPending(f"交易 {tx_hash} 在 {int(timeout)} 秒内未上链", tx_hash)  # (a RemoteError: every caller's except as before)
+            await asyncio.sleep(max(0.0, min(pause, deadline - time.monotonic())))
+        raise TxPending(f"交易 {tx_hash} 在 {int(timeout)} 秒内未上链" + (f"（回执读取失败：{core.brief_error(trouble, 80)}）" if trouble else ""),
+                        tx_hash)  # (a RemoteError: every caller's except as before)
 
     def approval_steps(self, yield_bearing: bool) -> list[tuple[str, str, str]]:
         """(label, kind, spender) for one market track, as the SDK's setApprovals sets them."""
