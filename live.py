@@ -6091,9 +6091,25 @@ class LiveBot(core.Bot):
             self.stopping.set()
             await self.preopen_stop("进程停止", keep=True)  # the orders stay on the book: the signed expiry is the backstop, the next process takes them over
 
+    def live_redeem_loop_start(self) -> None:
+        """The redeem's own timer (live_redeem_loop), one per process, started by _run_live whatever LIVE says at the start."""
+        task = getattr(self, "live_redeem_loop_task", None)
+        if task is None or task.done():
+            self.live_redeem_loop_task = asyncio.create_task(self.live_redeem_loop(), name="live-redeem-loop")
+
     async def _run_live(self) -> int:
         if self.config.live_mode == "off":
             LOG.info("真实交易模块已加载（LIVE=off，只记账）：/live mode pause|on 切换")
+            # 1.150.0 (audit RDM-LOOP-NOT-STARTED): the redeem's own timer in this mode too. It was started only below, after a
+            # start in pause / on had signed in, so a process started in off — the documented first start: LIVE=off in the
+            # environment, no mode saved yet — and switched to pause / on while running (/live mode, the control page) had none
+            # until its next restart: its rounds came from the trading step alone, whose call (the end of live_sync) a failing
+            # open-order read skips, and the winners waited for as long as that read failed. Here it idles: live_redeem_tick's
+            # gate keeps an off process that is not signed in from signing in or reading anything (no request, no round); the
+            # rounds run once a switch to pause / on (or a command that signs in) has made it ready. Never started above the
+            # off test: at a start in pause / on its first round would race live_prepare's sign-in (a second account check and
+            # a stray ✅ 登录成功 push ahead of 💰 真实交易已启动) — that start keeps its order below.
+            self.live_redeem_loop_start()
             return await super().run()
         lines = await self.live_prepare()
         if self.config.live_mode == "pause":
@@ -6102,7 +6118,7 @@ class LiveBot(core.Bot):
         else:
             LOG.warning("LIVE=on：模拟交易的决定会真实下单。%s", "｜".join(lines))
             self.live_notify("💰 真实交易已启动\n" + "\n".join(lines), key="start")
-        self.live_redeem_loop_task = asyncio.create_task(self.live_redeem_loop(), name="live-redeem-loop")  # 1.131.4: whatever the paper trader does
+        self.live_redeem_loop_start()  # 1.131.4: whatever the paper trader does
         return await super().run()
 
 

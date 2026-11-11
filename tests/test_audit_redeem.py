@@ -1478,4 +1478,95 @@ async def gas_stale():
 asyncio.run(gas_stale())
 
 
+# --- RDM-LOOP-NOT-STARTED -------------------------------------------------------------------------------------------------------
+def counting(obj, names) -> list:
+    """Every call of ``names`` on ``obj`` (the fake Predict API, the fake chain) logged by name, the call itself unchanged."""
+    asked: list = []
+    for name in names:
+        async def call(*a, _real=getattr(obj, name), _name=name, **k):
+            asked.append(_name)
+            return await _real(*a, **k)
+        setattr(obj, name, call)
+    return asked
+
+
+async def loop_not_started():
+    """RDM-LOOP-NOT-STARTED: the redeem's own timer (live_redeem_loop, 1.131.4) was created only by a process STARTED in pause
+    or on, after its sign-in. One started in LIVE=off — the documented first start — and switched to pause / on while running
+    (/live mode, the control page) had none until its next restart: its rounds came from the trading step alone, whose call (the
+    end of live_sync) a failing open-order read skips. The timer now starts in off too, and idles there — no sign-in, no request,
+    no round — until a switch makes the bot ready; a start in pause / on keeps its order (the timer after live_prepare and the
+    start notice: its first round never races that sign-in)."""
+    real_run = m.Bot.run
+
+    async def idle(self):  # the core bot's life (feeds, commands, the trading step) left out: only the redeem's own timer runs
+        await self.stopping.wait()
+        return 0
+    m.Bot.run = idle
+    try:
+        bot = make_bot(LIVE="off", PREOPEN_DB=":memory:")
+        fake, chain = bot.live.api, bot.live.chain
+        fake.positions_rows, fake.markets["201"] = [held(201)], mk(201, won=1)
+        api_log = counting(fake, ("ensure_auth", "positions", "market", "orders", "order"))
+        chain_log = counting(chain, ("account_owner", "usdt_balance", "bnb_balance", "allowance"))
+        bot.LIVE_REDEEM_TICK_SECONDS = 0.01
+        runner = asyncio.create_task(bot.run())
+        await asyncio.sleep(0.2)
+        loop = bot.live_redeem_loop_task
+        assert loop is not None and not loop.done(), "the redeem's own timer runs from a start in LIVE=off"
+        # idle while off and not signed in — a bot that never had LIVE on stays as it was: no sign-in, no request, no round
+        assert bot.live_redeem_task is None and api_log == [] and chain_log == [] and fake.calls == [] and chain.redeemed == [], (api_log, chain_log)
+        assert not bot.live.ready
+        # switched on while running; the trading step's open-order read would fail (its tick never reached) — no step runs here at all
+        fake.fail_open = "HTTP 500: Internal Server Error"
+        assert (await bot.live_set_mode("on")).startswith("真实交易模式：off → on")
+        for _ in range(200):
+            if chain.redeemed:
+                break
+            await asyncio.sleep(0.01)
+        if bot.live_redeem_task is not None:
+            await bot.live_redeem_task
+        assert [cid for cid, *_ in chain.redeemed] == [cond(201)] and bot.store.get("live:redeemed:201:1")["tx"] == "0xredeem", chain.redeemed
+        bot.live_last_redeem = -1e9  # another round due: the mark stands, nothing sent twice
+        await asyncio.sleep(0.1)
+        if bot.live_redeem_task is not None:
+            await bot.live_redeem_task
+        assert len(chain.redeemed) == 1 and bot.live_redeem_last.get("counts") == {"kept": 1}, (chain.redeemed, bot.live_redeem_last)
+        # off and on again: still the one timer
+        await bot.live_set_mode("off")
+        await bot.live_set_mode("on")
+        await asyncio.sleep(0.05)
+        timers = [t for t in asyncio.all_tasks() if t.get_name() == "live-redeem-loop" and not t.done()]
+        assert timers == [loop] and bot.live_redeem_loop_task is loop, timers
+        bot.stopping.set()
+        assert await asyncio.wait_for(runner, 5) == 0
+        await asyncio.wait_for(loop, 5)
+        if bot.live_redeem_task is not None:
+            await bot.live_redeem_task
+        # a start in on, as before: the sign-in, then the start notice, then the timer
+        bot = make_bot(PREOPEN_DB=":memory:")
+        seen, prepare = [], bot.live_prepare
+
+        async def prepared():
+            seen.append(("prepare", bot.live_redeem_loop_task))
+            return await prepare()
+        bot.live_prepare = prepared
+        bot.live_notify = lambda text, key="": seen.append((key or text, bot.live_redeem_loop_task))
+        bot.LIVE_REDEEM_TICK_SECONDS = 0.01
+        runner = asyncio.create_task(bot.run())
+        await asyncio.sleep(0.1)
+        assert seen[:2] == [("prepare", None), ("start", None)] and bot.live_redeem_loop_task is not None, seen
+        bot.stopping.set()
+        assert await asyncio.wait_for(runner, 5) == 0
+        await asyncio.wait_for(bot.live_redeem_loop_task, 5)
+        if bot.live_redeem_task is not None:
+            await bot.live_redeem_task
+    finally:
+        m.Bot.run = real_run
+    print("RDM_LOOP_NOT_STARTED_OK")
+
+
+asyncio.run(loop_not_started())
+
+
 print("AUDIT_REDEEM_OK")
