@@ -5102,7 +5102,14 @@ class LiveBot(core.Bot):
         # else changes for it: no mark (a field may come later), no back-off, no transaction.
         fields = [s for s in seen if s["kind"] == "fields"]
         told = self.__dict__.setdefault("live_redeem_fields_told", set())
-        told &= {(s["market_id"], s["index_set"]) for s in fields}  # (one no longer 缺字段: forgotten)
+        # A told position is forgotten once a round judges it otherwise (a field come since: claimable, redeemed …) or, the list
+        # read whole, no longer lists it — never by a round that did not get to judge it: its market not read (unread: the read
+        # cap's rotation, a rate limit, a failed read) or its row past a cut list. Forgotten by every round that did not find it
+        # 缺字段, a winner whose market was not read every round (the rotation over more markets than LIVE_REDEEM_READS) was
+        # announced afresh at every hourly gate — a must-notice LIVE_NOTIFY cannot silence — with a /live line each time.
+        told -= {(s["market_id"], s["index_set"]) for s in seen if s["kind"] not in ("fields", "unread")}
+        if not cut:
+            told &= {(s["market_id"], s["index_set"]) for s in seen}
         fresh = [s for s in fields if (s["market_id"], s["index_set"]) not in told]
         if fresh:
             text = (f"⚠️ 自动领取：{len(fields)} 个持仓缺字段，机器人领不了（{fresh[0]['title']}：{fresh[0]['error']}）："

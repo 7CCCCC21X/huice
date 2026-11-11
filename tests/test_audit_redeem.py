@@ -2711,4 +2711,53 @@ async def manual_backoff_twice_listed():
 asyncio.run(manual_backoff_twice_listed())
 
 
+# --- RDM-FIELDS-SILENT (follow-up: a round that did not judge it) ---------------------------------------------------------------
+async def fields_told_unread():
+    """RDM-FIELDS-SILENT: a told 缺字段 position was forgotten by every round that did not find it 缺字段 — also by one that did
+    not get to judge it: its market not read (the read cap's rotation over more markets than LIVE_REDEEM_READS, a rate limit, a
+    failed read) or its row past a cut list. Such a winner was announced afresh at every hourly gate — a must-notice LIVE_NOTIFY
+    cannot silence — with a /live line each time. It is now forgotten only once judged otherwise or, the list read whole, no
+    longer listed (then told again if it comes back, as before)."""
+    bot = await told_bot({}, LIVE_NOTIFY="off")  # (the administrator's chat)
+    fake = bot.live.api
+    fake.markets["701"] = {**mk(701, won=1), "conditionId": ""}
+    fake.positions_rows = [held(701)] + [held(1000 + i) for i in range(3 * L.LiveBot.LIVE_REDEEM_READS)]
+    fake.markets.update({str(1000 + i): mk(1000 + i) for i in range(3 * L.LiveBot.LIVE_REDEEM_READS)})
+    said = lambda: [text for _, _, text in bot.telegram.sent if "缺字段" in text]
+
+    async def round_at(minutes):
+        # (an hour on for the notice's own clock and the /live line's: every round may tell a newcomer)
+        bot.live_noted["redeem:fields"] = bot.live_noted.get("redeem:fields", -1e9) - 3601
+        bot.live_redeem_fields_noted = getattr(bot, "live_redeem_fields_noted", -1e9) - 3601
+        await bot.live_redeem(NOW + minutes * MIN)
+        await bot.drain_deliveries()
+        return bot.live_redeem_last["counts"]
+    # (a) the rotation: judged 缺字段 and told; its market not read the next two rounds; read again — nothing more
+    assert (await round_at(0)).get("fields") == 1 and len(said()) == 1
+    errors = len(bot.live_errors)
+    assert "fields" not in await round_at(10) and "fields" not in await round_at(20)  # (unread: the reads went to the others)
+    assert (await round_at(30)).get("fields") == 1
+    assert len(said()) == 1 and len(bot.live_errors) == errors, said()  # (before: told again, a /live line again — each hourly gate)
+    # (b) its market's read failing one round (unread): still told
+    fake.positions_rows, raw = [held(701)], fake.markets.pop("701")
+    assert await round_at(40) == {"unread": 1}
+    fake.markets["701"] = raw
+    assert await round_at(50) == {"fields": 1} and len(said()) == 1, said()  # (before: told again)
+    # (c) a list cut before its row: still told
+    fake.positions_rows, fake.positions_complete = [held(1000)], False
+    await round_at(60)
+    fake.positions_rows, fake.positions_complete = [held(701)], True
+    assert await round_at(70) == {"fields": 1} and len(said()) == 1, said()  # (before: told again)
+    # (d) as before: no longer listed by a whole list — forgotten; listed again, told again at the next hourly gate
+    fake.positions_rows = [held(1000)]
+    await round_at(80)
+    fake.positions_rows = [held(701)]
+    assert await round_at(90) == {"fields": 1} and len(said()) == 2, said()
+    assert bot.live.chain.redeemed == [] and bot.store.get("live:redeemed:701:1") is None and bot.live_redeem_failed == {}
+    print("RDM_FIELDS_TOLD_UNREAD_OK")
+
+
+asyncio.run(fields_told_unread())
+
+
 print("AUDIT_REDEEM_OK")
