@@ -18,7 +18,8 @@ async def live_unexplained_preopen():
     expiry) took the pre-open mode's shares on its outcome for its own fill: booked filled at its limit, the same shares then in
     the model trader's records and in the pre-open ledger (exposure, the P&L and the loss stop counting them twice). The pre-open
     mode's read fills now explain their shares there; while that mode's order on the outcome is not read, or a pair of it may
-    have been merged into USDT with the market's other side, a surplus is not attributed: the record waits, reserved."""
+    have been merged into USDT with the market's other side, a surplus is not attributed: the record waits, reserved — the
+    positions read for it once a minute at most, past its expiry too ((i)–(k), the review's follow-up)."""
     async def _none(*a, **k): return None
     async def _empty(*a, **k): return []
     async def _noop(ids): return {"removed": [], "noop": list(ids)}
@@ -162,6 +163,80 @@ async def live_unexplained_preopen():
     assert await bot.live_unexplained(gone) is None and "合并" in bot.live_positions_busy, bot.live_positions_busy
     bot.sim_trades = lambda: {"gone": gone}
     assert await bot.live_unexplained(gone) == 0.0 and bot.live_positions_busy == "", bot.live_positions_busy
+
+    # --- review follow-up: a look that settles nothing is made once a minute at most past the order's expiry too. An expired record
+    # looked every step, which the waits above turned into a standing flood: every page of /positions read each step for as long as
+    # the surplus cannot be told apart (days; until /live release), inside the step's sync and on the rate limit the orders share
+    def counted(bot):
+        """Every read of the account's positions from here on: the bot's clock at each."""
+        reads, whole = [], bot.live.api.positions
+        async def positions():
+            reads.append(bot.market.now)
+            return await whole()
+        bot.live.api.positions = positions
+        return reads
+
+    async def steps(bot, first, last):
+        for at in range(first, last + 1, 5_000):  # the trader's look every five seconds
+            await step(bot, at, mkt(at))
+
+    EVERY = T["L"].LiveBot.LIVE_UNEXPLAINED_EVERY_MS
+    EXPIRED = NOW + T["L"].TAKER_ORDER_SECONDS * 1000 + T["L"].LiveBot.LIVE_UNKNOWN_MARGIN_MS  # a taker placed at NOW: given up from here (900 s)
+    GONE = EXPIRED + 5_000  # ...and the first step past it, as in (f)
+
+    # (i) the pre-open pair filled both ways (the wait of (d), which only an operator ends), five-second steps from the evidence
+    # path to two minutes past the order's expiry: looked at once a minute throughout (before: every step from the expiry on)
+    bot, fake, pair, oid = await lost(po_order("up", "final", 10.0), po_order("down", "final", 10.0), way="taker")
+    fake.positions_rows = held(up=10)
+    reads = counted(bot)
+    await settle_by_evidence(bot, 125_000, 185_000, 245_000)
+    assert reads == [NOW + 245_000] and rec(bot, oid)["live"]["state"] == "unknown", ([r - NOW for r in reads], see(rec(bot, oid)))
+    await steps(bot, NOW + 250_000, EXPIRED + 120_000)
+    t = rec(bot, oid)
+    assert t["live"]["state"] == "unknown" and t["shares"] == 0 and bot.live_reserved(t) > 0, see(t)
+    assert "有效期已过" in t["live"]["last_error"] and "合并" in t["live"]["last_error"], see(t)  # the last looks were the expiry path's
+    assert reads == [NOW + 245_000 + i * EVERY for i in range(13)], [r - NOW for r in reads]  # 245 s, 305 s, … 965 s: straight across the expiry
+    result = await bot.live_control("release", {"id": oid})
+    assert result["ok"] and rec(bot, oid)["live"]["state"] == "done" and bot.live_reserved(rec(bot, oid)) == 0, (result, see(rec(bot, oid)))
+
+    # (j) past the expiry, the pre-open order there not read yet: the first look is made at once (none within the last minute) and
+    # the record waits, reserved; the ledger reads its order (the 10 held are its own) and the next look — a minute after the
+    # first, not sooner — ends the record unfilled: the wait still ends by itself
+    bot, fake, pair, oid = await lost(po_order("up", "open", 0.0), po_order("down", "final", 0.0), way="taker")
+    fake.positions_rows = held(up=10)
+    reads = counted(bot)
+    await steps(bot, GONE, GONE + 25_000)
+    t = rec(bot, oid)
+    assert reads == [GONE] and t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0 and "预挂" in t["live"]["last_error"], ([r - GONE for r in reads], see(t))
+    pair["orders"]["up"].update(state="final", filled=10.0)
+    await steps(bot, GONE + 30_000, GONE + 55_000)
+    t = rec(bot, oid)
+    assert reads == [GONE] and t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0, ([r - GONE for r in reads], see(t))
+    await step(bot, GONE + EVERY, mkt(GONE + EVERY))
+    t = rec(bot, oid)
+    assert reads == [GONE, GONE + EVERY], [r - GONE for r in reads]
+    assert t["live"]["state"] == "done" and t["status"] == "cancelled" and t["shares"] == 0 and bot.live_reserved(t) == 0, see(t)
+    assert any("有效期已过" in e["what"] and "按未成交结束" in e["what"] for e in t["live"]["events"]), see(t)
+
+    # (k) the older looks that settle nothing past the expiry — the list cut at the page cap (every page read to learn that), the
+    # read failing — are spaced the same (before: each step too); readable and whole again, the next look ends the record
+    for case, why in (("cut", "持仓列表没读全"), ("unreadable", "持仓读取失败")):
+        bot, fake, pair, oid = await lost(po_order("up", "final", 0.0), po_order("down", "final", 0.0), way="taker")
+        readable = fake.positions
+        async def cut():
+            fake.positions_complete = False
+            return held(down=5)
+        async def broken(): raise T["m"].RemoteError("HTTP 503")
+        fake.positions = cut if case == "cut" else broken
+        reads = counted(bot)
+        await steps(bot, GONE, GONE + 115_000)
+        t = rec(bot, oid)
+        assert t["live"]["state"] == "unknown" and bot.live_reserved(t) > 0 and why in t["live"]["last_error"], (case, see(t))
+        assert reads == [GONE, GONE + EVERY], (case, [r - GONE for r in reads])
+        fake.positions, fake.positions_complete = readable, True
+        await step(bot, GONE + 2 * EVERY, mkt(GONE + 2 * EVERY))
+        t = rec(bot, oid)
+        assert t["live"]["state"] == "done" and t["status"] == "cancelled" and t["shares"] == 0 and bot.live_reserved(t) == 0, (case, see(t))
     print("LIVE_UNEXPLAINED_PREOPEN_OK")
 
 

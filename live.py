@@ -3289,8 +3289,11 @@ class LiveBot(core.Bot):
         LIVE_UNKNOWN_SETTLE_MS, the account's positions decide (1.104.9): nothing beyond what the other records explain
         and it ends unfilled, its slot and reservation freed; a surplus is what it filled. Before, only its expiry plus a
         margin ended it — a daily market's maker order expires two hours after the close, so the 11-04 长鑫 跌 side sat
-        blocked from 16:46 for a day ("状态未知、对账中"). The expiry path stays for a record the positions cannot
-        settle (unreadable, or the list cut)."""
+        blocked from 16:46 for a day ("状态未知、对账中"). The expiry path stays for a record the evidence did not
+        settle by then: past its expiry the positions alone decide. While they cannot (unreadable, the list cut, a
+        surplus that cannot be told from the pre-open mode's shares — live_unexplained) the record stays unknown and
+        reserved on either path, the positions read for it once a minute at most, until they can, Predict's word, or
+        an operator's /live release."""
         st = trade["live"]
         order = float(trade.get("order") or 0)
         row = by_id.get(str(st.get("order_id") or "-")) or by_hash.get(str(st.get("hash") or "-").lower())
@@ -3324,8 +3327,13 @@ class LiveBot(core.Bot):
             st["last_error"] = (f"连续 {st['unknown_misses']} 次完整列表没有它，但账户上还有 {len(self.live_unknown_open)} 张本机器人没有记录的挂单"
                                 f"（#{'、#'.join(u['id'] for u in self.live_unknown_open[:3])}）：可能就是这张，先核对；核对后 /live release 或 /live cancel account")
             return
-        if not expired and now_ms - int(st.get("unexplained_at") or 0) < self.LIVE_UNEXPLAINED_EVERY_MS:
-            return  # the positions are read for it once a minute at most
+        if now_ms - int(st.get("unexplained_at") or 0) < self.LIVE_UNEXPLAINED_EVERY_MS:
+            # the positions are read for it once a minute at most — past its expiry too (1.150.0). An expired record used to look
+            # every step until a look settled it; but a look can settle nothing for days — the list cut at the page cap, and now
+            # a surplus that cannot be told from the pre-open mode's shares (live_positions_busy: until an operator's /live
+            # release) — and each look reads every page of /positions, inside the step's sync and on the rate limit the orders
+            # and the pre-open mode share. The record stays reserved between the looks, as before its expiry.
+            return
         st["unexplained_at"] = now_ms
         # nothing can fill it any more (expired), or nothing says it exists (settled) — but it may have filled while it could
         # not be found (Predict's hash of it differing from the one computed here, its answer lost): the account's position on
@@ -3396,7 +3404,9 @@ class LiveBot(core.Bot):
                     across += float(other.get("shares") or 0)
         extra = max(0.0, held - explained)
         if extra <= 1e-9:
-            return extra  # nothing beyond the records: whatever else the account holds there, this order filled nothing
+            # nothing beyond the records: this order filled nothing the account still holds, whatever the pre-open mode holds or
+            # has yet to read there (as before; a fill since merged into USDT with shares on the market's other side would not show)
+            return extra
         # 1.150.0: the pre-open mode's shares are not this order's fill (PREOPEN.md: its fills are never booked onto the model
         # trader's orders; live_recorded_by_outcome, live_late_fills and /live fills count them as recorded). Before, they stayed
         # in this surplus: an order lost on an outcome where that mode held 10 shares was booked "filled 10" at its limit, the
