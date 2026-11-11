@@ -24922,6 +24922,21 @@ class Bot:
 
     COMMAND_TIMEOUT_S = 90  # a command's handling is cut off after this long (the updates are handled one after another)
 
+    async def command_cut(self, update: dict) -> None:
+        """The administrator's command that COMMAND_TIMEOUT_S cut off, answered. 1.150.0 (audit RDM-ANSWER-LOST): the cut was in the
+        log alone — process_message's "never leave the administrator without any answer" catches errors, not the cancellation —
+        so /live positions, /live orders or /live cancel past the limit got no reply at all, not even an error. Said now, and that
+        part of it may have been done (a cancel, a test order); other senders, other bots' commands and button taps: nothing."""
+        message = update.get("message")
+        if not isinstance(message, dict) or not is_admin(message, self.config):
+            return
+        req = self.parse_request(message)
+        if req is None or req.command not in self.handlers:
+            return
+        with contextlib.suppress(Exception):
+            await self.reply(req, f"⌛ {' '.join([req.command, *req.args[:1]])} 处理超过 {self.COMMAND_TIMEOUT_S} 秒，已中止（可能只做了一部分）。"
+                             + ("请稍后重发；真实交易的状态先用 /live 看。" if req.command == "/live" else "请稍后重发。"))
+
     async def process_update(self, update: dict) -> None:
         message = update.get("message")
         if isinstance(message, dict):
@@ -25004,6 +25019,7 @@ class Bot:
                         await asyncio.wait_for(self.process_update(update), timeout=self.COMMAND_TIMEOUT_S)  # 1.131.1: one stuck command never holds the rest
                     except asyncio.TimeoutError:
                         self.log_limited("command", f"命令处理超过 {self.COMMAND_TIMEOUT_S} 秒，已中止")
+                        await self.command_cut(update)
                     except Exception as error:
                         self.log_limited("command", "命令处理异常：" + clean_error(error))
                     offset = int(update["update_id"]) + 1

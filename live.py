@@ -5336,7 +5336,15 @@ class LiveBot(core.Bot):
                     answer = await self.live_action(action, req.args[1:], self.market.now_ms())
                 except Exception as error:
                     answer = f"/live {action} 失败：{core.clean_error(error) or type(error).__name__}"
-                await self.reply(req, answer if isinstance(answer, str) else getattr(answer, "text", str(answer)))
+                text = answer if isinstance(answer, str) else getattr(answer, "text", str(answer))
+
+                async def send() -> None:
+                    # 1.150.0 (audit RDM-ANSWER-LOST): the answer promised by 「…结果随后发来」 went out once — a 429 or a network blip on
+                    # that one message, and the owner, in the middle of finding why nothing is redeemed, got the placeholder alone
+                    # (the trace only in /status). Sent once more; the sender waits out the chat's cool-down first. Plain text as before
+                    if not await self.tell(req.chat, req.thread, text) and not self.stopping.is_set():
+                        await self.tell(req.chat, req.thread, text)
+                await self.background("reply", send)
             asyncio.create_task(later(), name=f"live-{action}")
             if action == "redeem" and words[1:2] == ["check"]:
                 return "领取自检中，结果随后发来"

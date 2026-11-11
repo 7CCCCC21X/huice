@@ -2253,4 +2253,61 @@ async def status_line():
 asyncio.run(status_line())
 
 
+# --- RDM-ANSWER-LOST ------------------------------------------------------------------------------------------------------------
+class Poll(Chat):
+    """Telegram with getUpdates: ``updates`` once, then none — and the bot stopping (the end of commands_loop)."""
+    def __init__(self, bot, updates):
+        super().__init__()
+        self.bot, self.updates = bot, list(updates)
+
+    async def call(self, method, payload=None, timeout=None):
+        if method == "getUpdates":
+            updates, self.updates = self.updates, []
+            if not updates:
+                self.bot.stopping.set()
+            return updates
+        return {}
+
+
+async def answer_lost():
+    """RDM-ANSWER-LOST: the answer a background /live command promised (「…结果随后发来」) went out once — Telegram refusing that
+    one message (a 429, a network blip) left the owner with the placeholder alone; and an inline /live command cut at the
+    command time limit got no reply at all, the cut in the log only. The answer is now sent once more (one retry, no loop), and
+    a cut command is answered ⌛ … 已中止（可能只做了一部分）; another sender's message gets nothing. (A redeploy in the middle of
+    a command still loses its answer: report-only.)"""
+    bot = await ready_bot(ADMIN_USER_ID=str(ADMIN))
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["500"] = [held(500)], mk(500)
+    # (a) the result refused once: sent again, it arrives (before: the placeholder alone)
+    bot.telegram = Chat(refuse=["🔎 自动领取自检"])
+    texts = await in_background(bot, "/live redeem check")
+    assert len(texts) == 2 and texts[0] == "领取自检中，结果随后发来" and texts[1].startswith("🔎 自动领取自检"), texts
+    assert sum(t.startswith("🔎") for _, _, t in bot.telegram.tried) == 2
+    # (b) refused twice: no third try
+    bot.telegram = Chat(refuse=["🔎 自动领取自检", "🔎 自动领取自检"])
+    assert await in_background(bot, "/live redeem check") == ["领取自检中，结果随后发来"]
+    assert sum(t.startswith("🔎") for _, _, t in bot.telegram.tried) == 2
+    # (c) an inline /live command past the time limit (here 0.2 s): answered ⌛, the next update read (before: nothing at all)
+    async def slow():
+        await asyncio.sleep(2)
+        return []
+    fake.positions = slow
+    bot.COMMAND_TIMEOUT_S, bot.telegram_ok = 0.2, True
+    bot.telegram = Poll(bot, [{"update_id": 10, "message": dm("/live positions")}])
+    await asyncio.wait_for(bot.commands_loop(), 10)
+    assert [(chat, text) for chat, _, text in bot.telegram.sent] == [
+        (ADMIN, "⌛ /live positions 处理超过 0.2 秒，已中止（可能只做了一部分）。请稍后重发；真实交易的状态先用 /live 看。")], bot.telegram.sent
+    assert bot.store.get("telegram_offset") == 11
+    # another sender, a button tap, not a command: nothing
+    bot.telegram = Chat()
+    for update in ({"update_id": 12, "message": {**dm("/live positions"), "from": {"id": 99, "is_bot": False}}},
+                   {"update_id": 13, "callback_query": {"id": "q"}}, {"update_id": 14, "message": dm("hello")}):
+        await bot.command_cut(update)
+    assert bot.telegram.sent == []
+    print("RDM_ANSWER_LOST_OK")
+
+
+asyncio.run(answer_lost())
+
+
 print("AUDIT_REDEEM_OK")
