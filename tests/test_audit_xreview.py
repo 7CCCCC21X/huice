@@ -1130,4 +1130,93 @@ async def unknown_takes_latefill():
 
 
 asyncio.run(unknown_takes_latefill())
+
+
+async def stop_ok_preopen():
+    """XR-STOP-OK-PREOPEN: the emergency stop's verdict (Audit LIVE-STOP-OK) reads "没撤成" in the line of its own pre-open
+    withdraw_all, but a book of BULK_MIN_IDS ids or fewer — PREOPEN_AHEAD_MINUTES=60 with BTC alone (PREOPEN.md: about four
+    windows, eight ids), or the 30 a crashed controller's first try left — took a branch that answered "" whatever its
+    removals did: removals failing (HTTP 500, a cooldown on the key) came back ok=True, a green toast, the bids still up; on a
+    crashed controller nothing tries again before their signed expiry. Now that branch says how many it could not withdraw
+    and why, and the stop is red; a stop whose removals went through, or found the order already gone ("noop"), stays green."""
+    import time
+    import preopen as P
+    import test_preopen as TP
+
+    async def http500(ids):
+        raise m.RemoteError("HTTP 500: internal error")
+
+    async def book(windows, alive, ahead="60"):
+        rows = [TP.market(at=TP.NOW + k * 15 * 60_000, mid=200 + k) for k in range(1, windows + 1)]
+        ctl, api, _ = TP.controller(rows, PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES=ahead, PREOPEN_SHARES="10")
+        for r in rows:
+            assert await ctl.place_pair(P.candidate(r, TP.NOW, ctl.owner.config, ctl.settings)) == "", r["id"]
+        ctl.alive = alive  # False: crashed, still attached — no loop to try again
+        return ctl, api
+
+    def up(api):
+        return sum(1 for r in api.rows.values() if r["status"] == "OPEN")
+
+    async def stop(ctl):
+        """The real stop path: a LiveBot whose model trader has one resting maker order, its cancel working, over the controller."""
+        bot = make_bot(SIM_WAYS="maker")
+        await bot.live_prepare(); await bot.live_prefetch(NOW)
+        await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+        bot.preopen = ctl
+        out = await bot.live_control("stop", {})
+        await asyncio.gather(*list(ctl.settling.values()), return_exceptions=True)  # the reconcile tasks the withdrawal launched
+        ctl.ledger.close()
+        assert bot.live_paused() == "紧急停止" and out["message"].split("\n")[1].startswith("✅ 策略挂单 1 笔：Predict 确认撤掉 1 笔"), out
+        return out
+
+    # (a) a small book (8 ids) whose removals all fail, on a running and on a crashed controller: red, and the line says so
+    for alive in (True, False):
+        ctl, api = await book(4, alive)
+        assert sum(len(P.removable_ids(x)) for x in ctl.ledger.rows.values()) == 8 <= P.BULK_MIN_IDS
+        api.remove_orders = http500
+        out = await stop(ctl)
+        assert not out["ok"] and "还有 8 张没撤成（HTTP 500: internal error" in out["message"] and up(api) == 8, (alive, out)
+        assert ("预挂模式已停止：还有 8 张没撤成" in out["message"]) == (not alive), (alive, out)
+    # ...a cooldown on the key (another client's 429): nothing sent at all — not withdrawn either
+    ctl, api = await book(4, True)
+    real = api.remove_orders
+
+    async def cooling(ids):  # (as the real client: nothing goes out during the cooldown)
+        if api.blocked_until > time.monotonic():
+            raise m.RemoteError("HTTP 429: too many requests", 60)
+        return await real(ids)
+    api.remove_orders, api.blocked_until = cooling, time.monotonic() + 60
+    out = await stop(ctl)
+    assert not out["ok"] and "还有 8 张没撤成（Predict 接口限流冷却中" in out["message"] and up(api) == 8, out
+    # (b) a crashed controller's book of 50 ids: Predict takes the first batch of 20, then fails — the cancel command's own
+    # withdraw_all leaves 30, and the stop's second one (30 <= BULK_MIN_IDS, the small branch) must say so as well
+    ctl, api = await book(25, False, ahead="1440")
+    real, budget = api.remove_orders, [20]
+
+    async def flaky(ids):
+        if budget[0] < len(ids):
+            raise m.RemoteError("HTTP 500: internal error")
+        budget[0] -= len(ids)
+        return await real(ids)
+    api.remove_orders = flaky
+    out = await stop(ctl)
+    assert not out["ok"] and up(api) == 30 and "预挂模式已停止：还有 30 张没撤成（HTTP 500: internal error" in out["message"], out
+    # (c) still green: removals that work (running and crashed), nothing to withdraw — and an order Predict answers "noop" for
+    # (gone already): not a miss, though the ledger says "open" until the reconcile reads it (a recount would have said 1 left)
+    for alive in (True, False):
+        ctl, api = await book(4, alive)
+        out = await stop(ctl)
+        assert out["ok"] and "没撤成" not in out["message"] and up(api) == 0, (alive, out)
+    ctl, api = await book(0, True)
+    out = await stop(ctl)
+    assert out["ok"] and "没撤成" not in out["message"], out
+    ctl, api = await book(4, False)
+    gone = next(iter(api.rows.values()))
+    gone["status"] = "CANCELLED"
+    api.stuck.add(gone["id"])  # answered "noop", its record left as it is
+    out = await stop(ctl)
+    assert out["ok"] and "没撤成" not in out["message"] and up(api) == 0, out
+
+
+asyncio.run(stop_ok_preopen())
 print("AUDIT_XREVIEW_OK")

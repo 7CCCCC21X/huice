@@ -2225,8 +2225,8 @@ class Controller:
         if rejected:
             await self.cancel_many([pair], "一边未成交即结束，撤掉另一边")
 
-    async def cancel_all(self, reason: str, free: bool = False, deadline_s: float | None = None) -> None:
-        await self.cancel_many([p for p in list(self.ledger.rows.values()) if p["phase"] != "closed"], reason, free, deadline_s)
+    async def cancel_all(self, reason: str, free: bool = False, deadline_s: float | None = None) -> dict:
+        return await self.cancel_many([p for p in list(self.ledger.rows.values()) if p["phase"] != "closed"], reason, free, deadline_s)
 
     async def withdraw_all(self, reason: str) -> str:
         """An operator's withdrawal of this mode's orders (the pause, /live cancel, the emergency stop), the pause already set
@@ -2248,8 +2248,24 @@ class Controller:
                 if pair["phase"] == "active":
                     pair["free"] = True
         if n <= BULK_MIN_IDS:
-            await self.cancel_all(reason)
-            return ""
+            # 1.150.0 (Audit XR-STOP-OK-PREOPEN): the few withdrawn here and now say what did not go. This answered "" whatever
+            # the removals did, and the emergency stop's verdict (LiveBot.live_control, Audit LIVE-STOP-OK) reads "没撤成" in this
+            # line alone: a stop whose pre-open removals all failed (a server error, the sign-in refused, a cooldown on the key)
+            # on a book of BULK_MIN_IDS ids or fewer — PREOPEN_AHEAD_MINUTES=60 with BTC alone, or the 30 a crashed controller's
+            # first try left — came back ok=True, a green toast, with the bids still up; on a crashed controller nothing tries
+            # again (no loop) before their signed expiry. Counted from the removals' own answer, as the bulk status and /live
+            # cancel account count it: failed (the request failed) and left (never sent) are misses; Predict's "noop" (nothing
+            # to remove: the order is gone) and an id its answer left out are not — the ledger still says "open" for those
+            # until the reconcile reads them, so a recount of removable_ids here would turn an ordinary stop red. The same
+            # requests go out as before; only the reply changes (the stop, /preopen pause and /live cancel all print it).
+            result = await self.cancel_all(reason)
+            missed = len(result["failed"]) + len(result["left"])
+            if not missed:
+                return ""
+            why = result["errors"][-1] if result["errors"] else "没发出"
+            if not self.alive:
+                return f"预挂模式已停止：还有 {missed} 张没撤成（{why}；各自到期前仍挂着；重新打开预挂会接着撤，或再发一次）"
+            return f"预挂单还有 {missed} 张没撤成（{why}）：本模式的撤单循环稍后接着撤"
         if not self.alive:  # 1.141.1: no loop to leave them to — here, for DEAD_WITHDRAW_S at most (the command waits)
             await self.cancel_all(reason, deadline_s=DEAD_WITHDRAW_S)
             left = sum(len(removable_ids(p)) for p in self.ledger.rows.values() if p["phase"] != "closed")
@@ -2257,17 +2273,18 @@ class Controller:
                     if left else f"预挂模式已停止：{n} 张预挂单已撤")
         return f"正在分批撤 {n} 张预挂单（{self.remove_limit().text()}），/preopen 看进度"
 
-    async def cancel_many(self, pairs: list[dict], reason: str, free: bool = False, deadline_s: float | None = None) -> None:
+    async def cancel_many(self, pairs: list[dict], reason: str, free: bool = False, deadline_s: float | None = None) -> dict:
         """Bulk removals first; slow hash/fill reads never queue known IDs behind them. ``free``: a withdrawal that was not
         the window's doing — it does not count against its MAX_ATTEMPTS (counts_against). 1.141.0: the removals in batches
-        at Predict's measured size (remove_pairs), a rate limit waited out when there are many."""
+        at Predict's measured size (remove_pairs), a rate limit waited out when there are many. Returns remove_pairs' result
+        (1.150.0: withdraw_all's reply says what it could not withdraw)."""
         for pair in pairs:
             pair.update(phase="closing", reason=reason, **({"free": True} if free else {}))
             for order in pair["orders"].values():
                 if order["state"] == "prepared":
                     order["state"] = "not_sent"
         self.ledger.save_many(pairs)
-        await self.remove_pairs(pairs, deadline_s=deadline_s)
+        return await self.remove_pairs(pairs, deadline_s=deadline_s)
 
     def bulk_client(self) -> Any:
         """The client the batch withdrawals use: their own (bulk_api), unless the cancel client was put in from outside (the tests)."""
