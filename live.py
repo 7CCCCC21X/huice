@@ -948,6 +948,50 @@ def order_price(row: dict) -> float | None:
 
 
 # --- BNB chain (JSON-RPC): balances, allowances, approvals, redeeming -----------------------------------------------------
+# 1.150.0 (audit RDM-REVERT-REASON-DROPPED): the custom errors both SDKs' ABIs declare (ConditionalTokens, the yield-bearing
+# ConditionalTokens, the NegRiskAdapter, Kernel), by their 4-byte selector — what a redeem that reverts in simulation names.
+REVERT_ERRORS = {
+    "0xe237d922": "ERC1155MissingApprovalForAll：结果代币没授权给调用的合约",
+    "0x03dee4c5": "ERC1155InsufficientBalance：链上份额少于要领的数量",
+    "0xcd7769ff": "NotApprovedForAll：多结果适配器没有结果代币的操作权",
+    "0x1c1f9e2e": "NotAllowedToTransfer：合约不允许这次转移",
+    "0xfc220038": "Insolvent：收益金库资不抵债",
+    "0x855bef1a": "VTokenCallFailed：收益金库（Venus）取款失败",
+    "0xe2517d3f": "AccessControlUnauthorizedAccount：合约拒绝了这个调用方",
+    "0x48f5c3ed": "InvalidCaller：Predict 账户不接受这个签名钱包的调用",
+}
+
+
+def rpc_error_text(error: Any) -> str:
+    """A JSON-RPC error object in words (after 「RPC 错误：」): the node's own message, cut at 120 characters, and — for a
+    revert carrying a custom error — its 4-byte selector with the error's name when both SDKs' ABIs declare it.
+
+    1.150.0 (audit RDM-REVERT-REASON-DROPPED): only ``message`` was kept and ``data`` dropped, so a redeem reverting in
+    simulation with a custom error read the bare 「RPC 错误：execution reverted」 whatever the cause — a missing adapter
+    approval, an amount over the balance, the yield vault — on a node that keeps the revert bytes in ``data`` alone (a
+    BSC_RPC_URL of that kind); BNB Chain's own client (1.5.16+) repeats them after the message, where they showed as raw hex
+    cut at 120 characters. Such a refusal never leaves the bot, so there is no transaction to look up on bscscan: this text
+    is all the owner has. The selector goes after the cut, so the cut never takes it; the node's message, a reason string
+    (Error(string): 「…: result for condition not received yet」), a Panic and every non-revert text (nonce too low,
+    insufficient funds…) read as before. Never raises (only isinstance tests): an exception that is not a RemoteError here
+    would turn a five-minute retry into an hour's."""
+    if not isinstance(error, dict):
+        return core.brief_error(str(error), 120)
+    text = str(error.get("message") or (f"code {error['code']}" if error.get("code") is not None else "?"))
+    data = error.get("data")
+    if isinstance(data, dict):  # (some clients nest it: {"data": "0x…"})
+        data = data.get("data")
+    blob = data if isinstance(data, str) and re.fullmatch(r"0x[0-9a-fA-F]*", data) else ""
+    if blob:
+        text = text.removesuffix(": " + blob)  # the BNB Chain client repeats the raw data after the message
+    elif found := re.fullmatch(r"(execution reverted):\s*(0x[0-9a-fA-F]{8,})", text):
+        text, blob = found.group(1), found.group(2)  # the data in the message alone
+    selector = blob[:10].lower()
+    if len(selector) < 10 or selector in {"0x08c379a0", "0x4e487b71"}:  # none, Error(string), Panic: the message has the words
+        return core.brief_error(text, 120)
+    return core.brief_error(text, 120) + f"（合约错误 {selector}" + (f" {REVERT_ERRORS[selector]}" if selector in REVERT_ERRORS else "") + "）"
+
+
 class TxNotSent(core.RemoteError):
     """A transaction that never left the bot: its nonce or gas price could not be read, or its gas not estimated (a
     revert in simulation — a market Predict shows resolved before the chain does). Nothing spent: tried again soon."""
@@ -992,8 +1036,7 @@ class Chain:
             self.error = "RPC 未返回有效 JSON"
             raise core.RemoteError(self.error) from None
         if isinstance(data, dict) and data.get("error"):
-            text = data["error"].get("message") if isinstance(data["error"], dict) else str(data["error"])
-            self.error = f"RPC 错误：{core.brief_error(str(text), 120)}"
+            self.error = f"RPC 错误：{rpc_error_text(data['error'])}"  # (RDM-REVERT-REASON-DROPPED) a custom error's selector kept
             raise core.RemoteError(self.error)
         self.error = ""
         return data.get("result") if isinstance(data, dict) else None

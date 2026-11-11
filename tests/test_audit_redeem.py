@@ -700,4 +700,92 @@ async def yb_negrisk_approval():
 asyncio.run(yb_negrisk_approval())
 
 
+# --- RDM-REVERT-REASON-DROPPED --------------------------------------------------------------------------------------------------
+class RpcNode:
+    """A BNB JSON-RPC node in miniature under the REAL Chain.rpc (main._http_get replaced while ``with node:``): it answers
+    by method — a value is the result, {"error": {...}} the error object, bytes a raw body, an exception is raised (the
+    request failed on the way), a callable decides per call from the params — and logs every (method, params)."""
+    def __init__(self, **answers):
+        self.answers, self.log, self.plain = dict(answers), [], None
+
+    def __call__(self, url, payload=None, timeout=15, headers=None):
+        method, params = payload["method"], payload["params"]
+        self.log.append((method, params))
+        answer = self.answers[method]
+        if callable(answer):
+            answer = answer(params)
+        if isinstance(answer, BaseException):
+            raise answer
+        if isinstance(answer, bytes):
+            return answer
+        if isinstance(answer, dict) and set(answer) == {"error"}:
+            return json.dumps({"jsonrpc": "2.0", "id": 1, "error": answer["error"]}).encode()
+        return json.dumps({"jsonrpc": "2.0", "id": 1, "result": answer}).encode()
+
+    def methods(self):
+        return [method for method, _ in self.log]
+
+    def __enter__(self):
+        self.plain, m._http_get = m._http_get, self
+        return self
+
+    def __exit__(self, *exc):
+        m._http_get = self.plain
+
+
+def revert(data, wording="upstream", reason=""):
+    """eth_estimateGas reverting: go-ethereum keeps the revert bytes in ``data`` (and a reason string in the message);
+    BNB Chain's client (1.5.16+) also repeats them after the message."""
+    message = "execution reverted" + (f": {reason}" if reason else "")
+    return {"error": {"code": 3, "message": message + (f": {data}" if wording == "bsc" else ""), "data": data}}
+
+
+async def revert_reason():
+    """RDM-REVERT-REASON-DROPPED: Chain.rpc kept only the error's message and dropped its data, so a redeem reverting in
+    simulation with a custom error read the bare 「RPC 错误：execution reverted」 whatever the cause (missing approval, amount
+    over the balance, the yield vault) — the only evidence there is, since such a redeem never leaves the bot. The selector
+    is now kept, after the 120-character cut, with the error's name when both SDKs' ABIs declare it; a reason string, a
+    Panic and the node's other answers read as before; the exception classes are untouched."""
+    approval = "0xe237d922" + "00" * 12 + "ab" * 20 + "00" * 12 + "cd" * 20
+    balance = "0x03dee4c5" + "00" * 128
+    string = "0x08c379a0" + L.Chain.encode("x(string)", ["string"], ["result for condition not received yet"])[4:].hex()
+    chain = L.Chain("https://rpc.example", L.Wallet(KEY, 56, PA))
+
+    async def estimate_fails(answer) -> str:
+        with RpcNode(eth_getTransactionCount="0x5", eth_gasPrice="0x5", eth_estimateGas=answer) as node:
+            try:
+                await chain.redeem("0x" + "ab" * 32, 1, 7 * WEI, False, False)
+                assert False, "the estimate reverted"
+            except L.TxNotSent as error:
+                assert node.methods() == ["eth_getTransactionCount", "eth_gasPrice", "eth_estimateGas"], node.methods()
+                assert error.retry_after == 0 and str(error) == chain.error
+                return str(error)
+
+    for wording in ("upstream", "bsc"):
+        text = await estimate_fails(revert(approval, wording))
+        assert text.startswith("RPC 错误：execution reverted（合约错误 0xe237d922 ERC1155MissingApprovalForAll") and text.count("e237d922") == 1, (wording, text)
+        other = await estimate_fails(revert(balance, wording))
+        assert "0x03dee4c5 ERC1155InsufficientBalance" in other and other != text, (wording, other)
+        assert await estimate_fails(revert(string, wording, "result for condition not received yet")) == "RPC 错误：execution reverted: result for condition not received yet"
+        assert await estimate_fails(revert("0xdeadbeef" + "00" * 32, wording)) == "RPC 错误：execution reverted（合约错误 0xdeadbeef）"
+    # unchanged: no data, empty data, the node's other refusals; a long message keeps the selector (cut before it, not through it)
+    assert await estimate_fails({"error": {"code": 3, "message": "execution reverted"}}) == "RPC 错误：execution reverted"
+    assert await estimate_fails({"error": {"code": 3, "message": "execution reverted", "data": "0x"}}) == "RPC 错误：execution reverted"
+    assert await estimate_fails({"error": {"code": -32000, "message": "nonce too low: next nonce 6, tx nonce 5"}}) == "RPC 错误：nonce too low: next nonce 6, tx nonce 5"
+    long = await estimate_fails({"error": {"code": 3, "message": "execution reverted" + " x" * 150, "data": approval}})
+    assert "0xe237d922 ERC1155MissingApprovalForAll" in m.clean_error(long) and len(long) <= 280, long
+    assert await estimate_fails({"error": {"code": -32000}}) == "RPC 错误：code -32000"  # (before: 「RPC 错误：None」)
+    # a read (eth_call) answered with a revert: a plain RemoteError carrying the same words
+    with RpcNode(eth_call=revert(approval, "bsc")):
+        try:
+            await chain.usdt_balance()
+            assert False
+        except m.RemoteError as error:
+            assert not isinstance(error, L.TxNotSent) and "（合约错误 0xe237d922" in str(error), str(error)
+    print("RDM_REVERT_REASON_DROPPED_OK")
+
+
+asyncio.run(revert_reason())
+
+
 print("AUDIT_REDEEM_OK")
