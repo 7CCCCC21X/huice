@@ -1750,7 +1750,8 @@ class LiveBot(core.Bot):
         record = self.live_kill_record()
         if not cap or (record and not record.get("resumed")):
             return  # no limit set; or tripped today and standing
-        pnl = self.live_daily_pnl(trades, now_ms) + self.preopen_pnl()  # the pre-open mode's day counted too (1.125.0)
+        own, pre = self.live_daily_pnl(trades, now_ms), self.preopen_pnl()
+        pnl = own + pre  # the pre-open mode's day counted too (1.125.0)
         if record and record.get("resumed_pnl") is None:  # resumed by a version that kept no figure: counted from this look on
             self.store.put("live:killed", {**record, "resumed_pnl": pnl})
             return
@@ -1758,7 +1759,21 @@ class LiveBot(core.Bot):
             why = f"今日已结算亏损 {money(pnl)} 达到 LIVE_MAX_DAILY_LOSS_USD ${cap:g}"
             if record:  # the second stop of a day says what the first one's resume found, and what went since
                 found = float(record["resumed_pnl"])
-                why += f"，手动恢复时 {money(found)}、之后又亏 ${found - pnl:,.2f}"
+                was_own, was_pre = record.get("resumed_own"), record.get("resumed_preopen")
+                if was_own is not None and was_pre is not None and abs(pre - float(was_pre)) >= 0.005:
+                    # 1.150.0 (Audit XR-RESUME-PREOPEN-ANCHOR): the pre-open part is counted as the mode stands — its day while it
+                    # runs, its loss alone (a gain counting 0, PRE-PNL-DROP) while it has crashed, LIVE≠on or it is switched off. A
+                    # resume taken with the mode running at +$60, then a crash, re-trips the stop with no trade at all, and the text
+                    # said "之后又亏 $60.00": a loss that never happened, in a real-money notice and the /live header. The stop itself
+                    # is left as it is (conservative: it only ever stops sooner); the text now says where the change came from — the
+                    # two parts at the resume and now — instead of a loss figure. A pre-open part that did not move, or a record of a
+                    # resume that kept no parts, keeps the plain wording.
+                    why += (f"，手动恢复时 {money(found)}（原策略 {money(float(was_own))}、预挂 {money(float(was_pre))}），"
+                            f"现在原策略 {money(own)}、预挂 {money(pre)}")
+                    if not self.preopen_active():
+                        why += "（预挂未运行：当日盈利不计入）"
+                else:
+                    why += f"，手动恢复时 {money(found)}、之后又亏 ${found - pnl:,.2f}"
             self.store.put("live:killed", {"day": core.beijing_day(now_ms / 1000), "why": why, "at": now_ms})
             for tid, t in trades.items():
                 if isinstance(t.get("live"), dict) and t["status"] == "resting" and t["live"].get("state") in {"open", "placing", "unknown"}:
@@ -4452,8 +4467,12 @@ class LiveBot(core.Bot):
                 # next. Only a standing stop is lifted — a resume that merely ends a pause later in the day moves nothing, or every
                 # pause and resume would hand out another cap. And the answer says what was lifted: the same command (the page's
                 # 恢复 button) ends a pause, and an operator ending one had no word that the day's loss stop went with it.
-                pnl = self.live_daily_pnl(self.sim_trades(), now_ms) + self.preopen_pnl()
-                self.store.put("live:killed", {**record, "resumed": True, "resumed_at": now_ms, "resumed_pnl": pnl})
+                # The two parts are kept as well (1.150.0, Audit XR-RESUME-PREOPEN-ANCHOR): only for the next stop's text, which
+                # says so when the pre-open part has changed meaning since (a crash, LIVE≠on, /preopen off hides its gain).
+                own, pre = self.live_daily_pnl(self.sim_trades(), now_ms), self.preopen_pnl()
+                pnl = own + pre
+                self.store.put("live:killed", {**record, "resumed": True, "resumed_at": now_ms, "resumed_pnl": pnl,
+                                               "resumed_own": own, "resumed_preopen": pre})
                 self.live_noted.pop("kill", None)  # the next stop is announced however soon it comes (a keyed notice waits LIVE_NOTE_SECONDS)
                 cap = self.config.live_max_daily_loss_usd
                 lifted = f"；同时解除了今日亏损停机：今日已结算 {money(pnl)}，" + (

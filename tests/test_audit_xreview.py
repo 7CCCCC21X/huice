@@ -149,6 +149,64 @@ async def sendrefused_reconcile():
         assert not any("状态未知" in e["what"] for e in st["events"]), (how, st["events"])
 
 
+async def resume_preopen_anchor():
+    """XR-RESUME-PREOPEN-ANCHOR: /live resume keeps the day's counted P&L (the model trader's + the pre-open mode's) and arms the
+    stop a cap's worth under it. The pre-open part counts the mode's day while it runs, its loss alone while it has crashed, LIVE≠on
+    or it is switched off (PRE-PNL-DROP): a resume taken with the mode at +$60, then a crash, re-trips the stop with no trade, and
+    the notice / /live header said "之后又亏 $60.00" — a loss that never happened. The stop stays (conservative); the text now says
+    where the change came from. A day whose pre-open part did not move keeps the plain wording."""
+    import types
+
+    def bot_with(pre_day):
+        bot = make_bot()
+        bot.notes = []
+        bot.live_notify = lambda text, key="": bot.notes.append(text)
+        bot.preopen = types.SimpleNamespace(alive=True, daily_pnl=lambda: pre_day, winding="", manual_pause=False, withdrawing=lambda: "",
+                                            ledger=types.SimpleNamespace(pause=lambda value=None: False))
+        trades = {}
+        bot.sim_trades = lambda: trades
+        return bot, trades
+
+    def model_day(trades, pnl, now):  # the model trader's settled day: one record settled now with this P&L
+        trades.clear()
+        trades["m1"] = {"live": {"state": "done"}, "status": "settled", "settled": now - 1000, "payout": 0.0 if pnl < 0 else 1.0,
+                        "price": 0.5, "shares": abs(pnl) / 0.5}
+
+    # the mode running at +$60, the model trader at −$110: −$50 counted, the stop trips; resumed, the line is −$100
+    bot, trades = bot_with(60.0)
+    model_day(trades, -110.0, NOW)
+    bot.live_check_kill(trades, NOW)
+    assert bot.live_killed().startswith("今日已结算亏损 −$50.00"), bot.live_killed()
+    reply = await bot.live_action("resume", [], NOW)
+    assert "再亏到 −$100.00 会再次停机" in reply, reply
+    assert bot.live_killed() == "" and bot.live_loss_floor(50.0) == -100.0
+    rec = bot.live_kill_record()
+    assert rec["resumed_pnl"] == -50.0, rec
+    # the mode crashes, no trade: its gain counts 0, −$110 counted — the stop trips again (kept: conservative) ...
+    bot.preopen.alive = False
+    bot.live_check_kill(trades, NOW + 1000)
+    why = bot.live_killed()
+    assert why, "the conservative re-trip is kept"
+    # ... and says what moved, not a loss that never happened
+    assert "之后又亏 $60.00" not in why, why
+    assert "原策略 −$110.00" in why and "预挂 +$60.00" in why and "预挂 +$0.00" in why and "预挂未运行" in why, why
+    assert why in bot.notes[-1], bot.notes
+    assert rec.get("resumed_own") == -110.0 and rec.get("resumed_preopen") == 60.0, rec  # the parts kept with the resume
+
+    # control: the mode running throughout, the model trader −$110 → −$160: the plain wording, unchanged
+    bot, trades = bot_with(60.0)
+    model_day(trades, -110.0, NOW)
+    bot.live_check_kill(trades, NOW)
+    await bot.live_action("resume", [], NOW)
+    model_day(trades, -159.0, NOW + 1000)
+    bot.live_check_kill(trades, NOW + 1000)
+    assert bot.live_killed() == ""
+    model_day(trades, -160.0, NOW + 2000)
+    bot.live_check_kill(trades, NOW + 2000)
+    assert bot.live_killed() == "今日已结算亏损 −$100.00 达到 LIVE_MAX_DAILY_LOSS_USD $50，手动恢复时 −$50.00、之后又亏 $50.00", bot.live_killed()
+
+
 asyncio.run(hash_read_error_409())
 asyncio.run(sendrefused_reconcile())
+asyncio.run(resume_preopen_anchor())
 print("AUDIT_XREVIEW_OK")
