@@ -910,4 +910,232 @@ async def feed_fetched_ms() -> None:
 
 asyncio.run(feed_fetched_ms())
 
+
+# FEED-CLOSE-BOOK-ORIENT: a daily index / stock card ("close") took Predict's book — which prices the market's FIRST
+# outcome — for 涨 just as it came, while the real order's token and the result go by the outcome NAMES (every other
+# kind turns its book by the names). No market has been listed Down (or No) first so far. On one, replayed here, the
+# card was priced on the other outcome's book: model and market agreeing at 68¢ for 涨 read as a 38¢ edge, the paper
+# trader bought "涨" at 30¢, and real BUYs of the Up token went out at 30¢ and 33¢ — nothing refused them. The card now
+# holds such a book (by the names the feed reads with the fee), and a real order is refused on the trader's own read
+# of the names whatever the feed knows.
+async def feed_close_book_orient() -> None:
+    import datetime as dt, math, statistics
+    import live as L
+    D, WEI, real_time = m.D, 10 ** 18, m.time
+    BJ = lambda mo, d, h, mi=0: int(dt.datetime(2026, mo, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+    NOW, TARGET = BJ(10, 5, 10, 0), dt.date(2026, 10, 5)
+    SLUG = m.predict_slug("hang-seng-index", TARGET)
+    NOTE, HELD, REFUSED = "按名称第一个结果不是涨", "盘口方向未确认", "结果名称无法确认方向，不下真实单"
+
+    def listing(names):  # Predict's market 101: indexSet 1 is the outcome its orderbook prices (token 1011), whatever the JSON's order
+        return {"id": 101, "status": "REGISTERED", "isNegRisk": False, "isYieldBearing": False, "feeRateBps": 200,
+                "conditionId": "0x" + "ab" * 32, "title": "HSI Up or Down", "question": "HSI up?",
+                "outcomes": [{"name": names[1], "indexSet": 2, "onChainId": "1012"}, {"name": names[0], "indexSet": 1, "onChainId": "1011"}]}
+
+    class Api:  # Predict as the real trader sees it (tests/test_trading.py's FakeApi, cut down): every order sent is kept
+        def __init__(self, market):
+            self.jwt, self.jwt_exp, self.auth_error, self.lookup = "t", 0, "", ""
+            self.markets, self.open, self.sent, self.positions_rows, self.next_id = {"101": market}, {}, [], [], 100
+
+        async def ensure_auth(self): pass
+
+        async def market(self, mid): return self.markets[str(mid)]
+
+        async def create_order(self, body):
+            self.next_id += 1
+            oid, data = str(self.next_id), body["data"]
+            self.sent.append((data["order"]["tokenId"], data["order"]["side"], round(int(data["pricePerShare"]) / WEI, 2)))
+            self.open[oid] = {"id": oid, "status": "OPEN", "amount": data["order"]["takerAmount"], "amountFilled": "0",
+                              "strategy": data["strategy"], "order": {**data["order"]}}
+            return {"order_id": oid, "hash": data["order"]["hash"], "code": None}
+
+        async def remove_orders(self, ids):
+            removed = [i for i in ids if self.open.pop(i, None) is not None]
+            return {"removed": removed, "noop": [i for i in ids if i not in removed]}
+
+        async def orders(self, status="OPEN", **params): return [dict(r) for r in self.open.values()] if status == "OPEN" else []
+
+        async def order(self, oid, hash_=""): return dict(self.open[oid]) if oid in self.open else None
+
+        async def positions(self): return self.positions_rows
+
+    class Chain:
+        async def account_owner(self, account): return "0x8fd379246834eac74B8419FfdA202CF8051F7A03"  # the test key's address
+        async def usdt_balance(self, owner=None): return 1000 * WEI
+        async def bnb_balance(self, owner=None): return 10 ** 17
+        async def allowance(self, key, owner=None): return 10 ** 30
+
+    class FM:  # the bot's market clock: the test's time
+        config = None
+
+        def now_ms(self): return NOW
+
+    class Clock:  # main's and live's wall clock at the test's time too (as feed_fetched_ms): the books read below are stamped NOW
+        def time(self): return (NOW + 0.5) / 1000
+
+        def __getattr__(self, name): return getattr(real_time, name)
+
+    # the model: 涨 68¢ (the cash index in session, a third of a percent over the reference close)
+    spot = D(str(round(24600 * math.exp(statistics.NormalDist().inv_cdf(0.68) * 0.01 * math.sqrt(0.5)), 2)))
+    odds = m.close_odds("恒生指数", D("24600"), spot, 0.01, 0.5, TARGET, D("0.01"), "10-02 收盘", "恒指现货（盘中直接用现货）", "σ")
+    assert abs(odds.fair_up - 0.68) < 0.002, odds.fair_up
+
+    ENV = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+           "SIM_WAYS": "both", "SIM_MARKETS": "close", "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off",
+           "SIM_MAKER_POINTS": "off", "SIM_MAKER_SPREAD_CENTS": "10", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0",
+           "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0", "PREDICT_GRAPHQL": "off", "PREDICT_WS": "off"}
+    LIVE = {"LIVE": "on", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, "PREDICT_API_KEY": "k",  # the SDK test suite's key, never a real one
+            "LIVE_MAX_ORDER_USD": "100", "LIVE_MAX_OPEN_USD": "250", "LIVE_MAX_DAILY_LOSS_USD": "50"}
+
+    async def world(names, live=True, details=True):
+        """The bot on Predict's HSI market listed with ``names`` (first = the outcome the book prices), whose book shows
+        30¢ / 33¢: read by the real feed round (the category, the market's details with the fee, the orderbook; with
+        ``details`` off the details read fails, as a best-effort read may), the card priced by the real Bot.sim_markets
+        (only the model's odds are given), the real trader on a fake API and chain. (bot, feed, api, the feed's switch)."""
+        market, switch, asked = listing(names), {"details": details}, []
+        if live:
+            bot = L.LiveBot(m.Config.from_env({**ENV, **LIVE}), m.Store(":memory:"), FM(), None)
+            bot.live.api, bot.live.chain = Api(market), Chain()
+        else:
+            bot = m.Bot(m.Config.from_env(ENV), m.Store(":memory:"), FM(), None)
+        bot.odds_items = lambda now_ms, only=None: [("恒生指数", odds)]
+        feed = bot.predict
+
+        async def fetch(url, payload=None):
+            path = url.removeprefix(m.PREDICT_REST)
+            asked.append(path)
+            if path == f"/categories/{SLUG}":
+                return {"success": True, "data": {"slug": SLUG, "markets": [market]}}
+            if path == "/markets/101/orderbook":
+                return {"success": True, "data": {"bids": [["0.30", "500"]], "asks": [["0.33", "500"]]}}
+            if path == "/markets/101" and switch["details"]:
+                return {"success": True, "data": market}
+            raise m.RemoteError(f"HTTP 500: {path}", 0)
+        feed.fetch = fetch
+        lane, feed.on_update = feed.on_update, None  # the looks below are made by hand: the express lane's, then the step's
+        assert await feed.refresh({"HSI": SLUG}, force=True) is not False and not feed.errors, feed.errors
+        feed.on_update = lane
+        assert asked == [f"/categories/{SLUG}", "/markets/101", "/markets/101/orderbook"], asked  # no request for the names alone
+        raw = feed.books["HSI"]
+        assert (float(raw.bid[0]), float(raw.ask[0]), raw.fetched_ms, raw.fee_bps) == (0.30, 0.33, NOW, 200 if details else None), raw
+        assert SLUG not in feed.want_info
+        if live:
+            await bot.live_prepare()
+            await bot.live_prefetch(NOW)
+            assert bot.live.ready, bot.live.ready_error
+        return bot, feed, getattr(bot.live.api if live else None, "sent", None), switch
+
+    async def look(bot):  # a book in (the express lane), then the trader's step
+        await bot.sim_express("HSI")
+        bot.sim_ran = -1e9
+        await bot.sim_step(NOW)
+
+    def card(bot):
+        return [mk for mk in bot.sim_markets(NOW) if mk.kind == "close"]
+
+    def shown(bot):  # what the card says of the book everywhere it is shown: the page, /book, /prob, the auction reminder, /calib's market price
+        return (bot.predict_payload("恒生指数", odds, NOW), bot.cmd_book(None).text, bot.cmd_prob(None).text,
+                bot.auction_text("收盘竞价", [("恒生指数", odds)], NOW), bot.predict_mid("HSI", SLUG, NOW))
+
+    def outs(*names):  # a market's outcomes as the trader holds them (parse_market: in index order)
+        return [{"name": name, "index_set": i + 1, "token": f"101{i + 1}"} for i, name in enumerate(names)]
+
+    async def listed_up_first(details):
+        """The listings there are (Up first), the feed having read the names or not: nothing changes — the card is priced,
+        the orders go out for the Up token."""
+        bot, feed, sent, _ = await world(("Up", "Down"), details=details)
+        raw = feed.books["HSI"]
+        assert (feed.market_meta["101"][0]["outcomes"] == ["Up", "Down"]) if details else ("101" not in feed.market_meta)
+        assert bot.close_book("HSI", SLUG) == (raw, "") == bot.close_book("HSI") and bot.close_book("HSI", "another-day") == (None, "")
+        (mk,) = card(bot)
+        assert mk.book is raw and bot.live_room({}, mk, "up", 0.33, 100) == "" and bot.live_room({}, mk, "down", 0.70, 100) == ""
+        payload, book_text, prob_text, auction, mid = shown(bot)
+        assert payload["bids"] == [[0.30, 500.0]] and payload["error"] == "" and any(e["best"] for e in payload["edges"])
+        assert "Predict 涨 买1 30.0¢" in book_text and "Predict 涨 买1 30.0¢" in prob_text and "Predict 买1 30.0¢" in auction
+        assert "👉" in book_text and "👉" in auction and mid == 0.315
+        await look(bot)
+        assert sorted(sent) == [("1011", 0, 0.30), ("1011", 0, 0.33)], sent  # 挂涨 at the 买1, 吃涨 at the 卖1: BUYs of Up
+        assert {t["label"] for t in bot.sim_trades().values()} == {"挂涨", "吃涨"}
+
+    async def listed_down_first(names):
+        """Listed Down (No) first, the feed having read the names: the book is the other outcome's — the card is held."""
+        bot, feed, sent, _ = await world(names)
+        assert feed.market_meta["101"][0]["outcomes"] == list(names)  # read with the fee, before the book was stored
+        assert card(bot) == [], f"a book that prices the {names[0]} outcome was taken for 涨"
+        payload, book_text, prob_text, auction, mid = shown(bot)
+        why = payload["error"]
+        assert HELD in why and NOTE in why and "、".join(names) in why, payload
+        assert payload == {"url": m.predict_url(SLUG, bot.config.predict_ref), "error": why}, payload  # no depth, no edges: the page says why
+        for text in (book_text, prob_text):
+            assert f"Predict 盘口暂缺：{why}" in text and "Predict 涨 买1" not in text and "👉" not in text, text
+        assert "Predict 买1" not in auction and "👉" not in auction and "模型 涨" in auction, auction
+        assert mid is None, f"/calib would score the model against the other outcome's price: {mid}"
+        await look(bot)
+        assert sent == [] and bot.sim_trades() == {}, (sent, list(bot.sim_trades()))
+        assert bot.close_book("HSI", SLUG) == (None, why) == bot.close_book("HSI") and bot.close_book("HSI", "another-day") == (None, "")
+
+    async def names_unread_by_the_feed():
+        """The feed's details read failed (best effort: the book is read all the same): the card is as before, and the
+        real order is refused on the trader's own read of the market — until the feed's next read brings the names."""
+        bot, feed, sent, switch = await world(("Down", "Up"), details=False)
+        raw = feed.books["HSI"]
+        assert "101" not in feed.market_meta and bot.close_book("HSI", SLUG) == (raw, "")
+        (mk,) = card(bot)
+        assert [o["name"] for o in bot.live.markets["101"].outcomes] == ["Down", "Up"]  # the trader's own read
+        for side, price in (("up", 0.33), ("down", 0.70)):
+            why = bot.live_room({}, mk, side, price, 100)
+            assert REFUSED in why and NOTE in why, f"a real order priced on the other outcome's book was let through: {why!r}"
+        await look(bot)
+        assert sent == [], f"real orders for the Up token at the Down outcome's prices: {sent}"
+        assert bot.sim_trades() == {}  # a refused decision is no paper position either
+        blocks = bot.sim_blocks()
+        assert {b["label"] for b in blocks} == {"挂涨", "吃涨"} and all(REFUSED in b["why"] and NOTE in b["why"] for b in blocks), blocks
+        switch["details"] = True  # PREDICT_META_SECONDS later the details are read: the card is held from then on
+        feed.fees["101"] = (feed.fees["101"][0], time.monotonic() - m.PREDICT_META_SECONDS - 1)
+        feed.on_update = None
+        assert await feed.refresh({"HSI": SLUG}, force=True) is not False
+        assert feed.market_meta["101"][0]["outcomes"] == ["Down", "Up"] and card(bot) == [] and bot.close_book("HSI", SLUG)[0] is None
+
+    async def on_paper(names, traded):
+        """LIVE=off: no paper position at the other outcome's prices either (it would be settled by the name)."""
+        bot, feed, _, _ = await world(names, live=False)
+        await look(bot)
+        assert {t["label"] for t in bot.sim_trades().values()} == traded, list(bot.sim_trades())
+
+    # the trader's choice of the token: by the name, as before — and noted on a daily card whose book is the other outcome's
+    up_first, down_first, no_first = outs("Up", "Down"), outs("Down", "Up"), outs("No", "Yes")
+    for pair in (down_first, no_first):
+        (up, up_note), (down, down_note) = L.outcome_for_side("close", "up", pair), L.outcome_for_side("close", "down", pair)
+        assert up is pair[1] and down is pair[0] and NOTE in up_note and NOTE in down_note, (up_note, down_note)
+        for kind in ("updown", "ladder", "range", "flip"):  # their books are turned by the names (the pre-open's pairs are bought at fixed prices)
+            assert L.outcome_for_side(kind, "up", pair) == (pair[1], "") and L.outcome_for_side(kind, "down", pair) == (pair[0], "")
+    assert L.outcome_for_side("close", "up", up_first) == (up_first[0], "") and L.outcome_for_side("close", "down", up_first) == (up_first[1], "")
+    odd = outs("A", "B")  # names that say neither way: the order of the outcomes, noted as before (never a real order)
+    assert L.outcome_for_side("close", "up", odd) == (odd[0], "按结果顺序推定（结果名称：a、b）")
+    # the card's reading of the names is the trader's: held exactly where a real order would be refused for it
+    assert all(m.second_outcome_up(pair) for pair in (["Down", "Up"], ["No", "Yes"], [" DOWN ", "up"], ["下跌", "上涨"], ["Down", "Flat"], ["Flat", "Up"]))
+    assert not any(m.second_outcome_up(pair) for pair in (["Up", "Down"], ["Yes", "No"], ["Up", "Flat"], ["Flat", "Down"], ["A", "B"],
+                                                          ["Up", "Up"], ["Down", "Down"], [], ["Down"], ["Down", "Up", "Flat"], None))
+    words = ["Up", "Down", "Yes", "No", "涨", "跌", "上涨", "下跌", "Higher", "Lower", "Above", "Below", " up ", "DOWN", "Flat", "A", ""]
+    for first in words:
+        for second in words:
+            noted = [NOTE in L.outcome_for_side("close", side, outs(first, second))[1] for side in ("up", "down")]
+            assert noted == [m.second_outcome_up([first, second])] * 2, (first, second, noted)
+    assert m.OUTCOME_UP_WORDS == L.UP_WORDS and m.OUTCOME_DOWN_WORDS == L.DOWN_WORDS
+
+    m.time = L.time = Clock()
+    try:
+        await listed_up_first(True)
+        await listed_up_first(False)
+        await listed_down_first(("Down", "Up"))
+        await listed_down_first(("No", "Yes"))
+        await names_unread_by_the_feed()
+        await on_paper(("Up", "Down"), {"挂涨", "吃涨"})
+        await on_paper(("Down", "Up"), set())
+    finally:
+        m.time = L.time = real_time
+
+
+asyncio.run(feed_close_book_orient())
+
 print("AUDIT_FEEDS_OK")

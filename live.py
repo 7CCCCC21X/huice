@@ -1051,8 +1051,9 @@ def parse_market(market: dict, default_fee: int) -> MarketInfo:
 
 def outcome_for_side(kind: str, side: str, outcomes: list[dict], touch_spec: Any = None) -> tuple[dict | None, str]:
     """The outcome (name, index set, token) a paper trade's side buys, and a note when it was assumed from the order
-    of the outcomes rather than read from their names. The card prices the 涨 / Yes / high-barrier side first; its 跌
-    is the other outcome, bought as its own token (never a sale of the first)."""
+    of the outcomes rather than read from their names — or, for a daily index / stock card (kind "close"), when the
+    names put the side at the other place than the book the card was priced from. The card prices the 涨 / Yes /
+    high-barrier side first; its 跌 is the other outcome, bought as its own token (never a sale of the first)."""
     if len(outcomes) != 2 or not all(o.get("token") for o in outcomes):
         return None, "市场不是两个结果，或缺少结果代币编号"
     names = [str(o.get("name") or "").strip().lower() for o in outcomes]
@@ -1062,16 +1063,30 @@ def outcome_for_side(kind: str, side: str, outcomes: list[dict], touch_spec: Any
         return (hits[0], "") if len(hits) == 1 else (None, f"结果名称无法对应触价线：{'、'.join(names)}")
     ups = [o for o, n in zip(outcomes, names) if n in UP_WORDS]
     downs = [o for o, n in zip(outcomes, names) if n in DOWN_WORDS]
+    hit = None  # the side's outcome by the names: the one named for it, else the other one of the pair
     if side == "up":
         if len(ups) == 1:
-            return ups[0], ""
-        if len(downs) == 1:
-            return next(o for o in outcomes if o is not downs[0]), ""
+            hit = ups[0]
+        elif len(downs) == 1:
+            hit = next(o for o in outcomes if o is not downs[0])
     else:
         if len(downs) == 1:
-            return downs[0], ""
-        if len(ups) == 1:
-            return next(o for o in outcomes if o is not ups[0]), ""
+            hit = downs[0]
+        elif len(ups) == 1:
+            hit = next(o for o in outcomes if o is not ups[0])
+    if hit is not None:
+        if kind == "close" and hit is not outcomes[0 if side == "up" else 1]:
+            # 1.150.0 (audit FEED-CLOSE-BOOK-ORIENT): a daily index / stock card reads Predict's book — which prices the
+            # market's FIRST outcome — as 涨 just as it comes (Bot.sim_markets; every other kind turns its book by the
+            # names: updown_book, touch_book, flip_yes_book, yes_book). On a market listed Down / No first the price, the
+            # limit, the cap and the count would all be worked out on the other outcome's book while the token bought is
+            # the one the name says, and with no note nothing refused the order: model and market agreeing at 68¢ for 涨
+            # read as a 38¢ edge, a real BUY of Up at 30¢ (the audit's replay; no market has been listed that way so
+            # far). The names say which token is which, and that the book is not this side's: noted, so never a real
+            # order (live_room). The card itself holds such a book once the feed has read the names (Bot.close_book);
+            # this is the trader's own read of them, for when the feed has not
+            return hit, f"卡片把第一个结果的盘口当作涨，但按名称第一个结果不是涨（结果名称：{'、'.join(names)}）"
+        return hit, ""
     if kind in {"close", "updown"}:  # a daily book prices its first outcome as 涨 (see resolution_up)
         return outcomes[0 if side == "up" else 1], f"按结果顺序推定（结果名称：{'、'.join(names)}）"
     return None, f"结果名称无法对应方向：{'、'.join(names)}"

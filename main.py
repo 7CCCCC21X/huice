@@ -5279,6 +5279,27 @@ def flip_book(book: "PredictBook") -> "PredictBook":
     return dataclasses.replace(book, bids=flip(book.asks), asks=flip(book.bids))
 
 
+# The names an outcome is read as 涨 / Yes or 跌 / No by: the real trader's own (live.UP_WORDS / DOWN_WORDS, by which it
+# picks the token an order buys) — the two pairs are kept equal (tests/test_audit_feeds.py), so that the card and the
+# trader read a market's names the same way
+OUTCOME_UP_WORDS = frozenset({"yes", "up", "涨", "上涨", "higher", "above"})
+OUTCOME_DOWN_WORDS = frozenset({"no", "down", "跌", "下跌", "lower", "below"})
+
+
+def second_outcome_up(names: Any) -> bool:
+    """Whether a two-outcome market's names say its SECOND outcome is the 涨 / Yes side — so that the first, the one
+    Predict's book prices (market_details), is not: the one outcome named 涨 / Yes is the second, or (neither named so)
+    the one named 跌 / No is the first. Read as the real trader reads them for the token (live.outcome_for_side). False
+    for names that say neither way (the order of the outcomes is then all there is) and for anything but two names."""
+    if not isinstance(names, (list, tuple)) or len(names) != 2:
+        return False
+    words = [str(name or "").strip().lower() for name in names]
+    ups = [i for i, word in enumerate(words) if word in OUTCOME_UP_WORDS]
+    downs = [i for i, word in enumerate(words) if word in OUTCOME_DOWN_WORDS]
+    up = ups[0] if len(ups) == 1 else 1 - downs[0] if len(downs) == 1 else None
+    return up == 1
+
+
 @dataclass(frozen=True)
 class LadderRow:
     """One market of a threshold ladder (e.g. "$200M" of "what market cap will X hit")."""
@@ -16331,9 +16352,10 @@ class Bot:
 
     def predict_mid(self, key: str, slug: str, now_ms: int) -> float | None:
         """The 涨 / Yes middle of the Predict book a card is compared with right now (None without a fresh book for
-        that very market)."""
-        book = self.predict.books.get(key)
-        if book is None or (slug and book.slug != slug) or book.stale(now_ms):
+        that very market, or with one the names say is not 涨's: close_book — /calib would score the model against the
+        other outcome's price)."""
+        book, _ = self.close_book(key, slug)
+        if book is None or book.stale(now_ms):
             return None
         return side_mid(book, "up")
 
@@ -17773,6 +17795,30 @@ class Bot:
                     "p_low": odds.lower, "p_high": odds.upper, "p_none": odds.none,
                     "error": touch.error, "hold": hold}}
 
+    def close_book(self, key: str, slug: str = "") -> tuple[PredictBook | None, str]:
+        """A daily index / stock card's book as 涨 — with ``slug``, that very market's (the finished day's book is no
+        book for the next day's card) — or (None, why) when the market's names say the book is not 涨's.
+        1.150.0 (audit FEED-CLOSE-BOOK-ORIENT): Predict's book prices the market's FIRST outcome, and these cards took it
+        for 涨 just as it came, while the real order's token (live.outcome_for_side) and the result (resolution_up) go
+        by the outcome names. On a market listed Down / No first every figure of the card would be the other outcome's:
+        the edges and the suggestion (the page, /book, /prob, the auction reminder), the paper fills (settled by the
+        name), a real order's price, limit and count, the market price /calib scores the model against. Such a book is
+        held — nothing compared, nothing traded — rather than turned over (flip_book, as updown_book does): no daily
+        market has been listed that way so far, so what its book really prices has never been seen, and trading one the
+        first day it shows up is the owner's call, not a default. The names are the ones the fee's refresh keeps
+        (PredictFeed.market_fee → market_meta, read before the book and every PREDICT_META_SECONDS): no request of its
+        own. Not read (the details failing) or saying neither way: the book as it comes, as before — a real order is
+        refused all the same, on the trader's own read of the names (a mismatch noted by outcome_for_side; names that
+        say neither way were refused already)."""
+        book = self.predict.books.get(key)
+        if book is None or (slug and book.slug != slug):
+            return None, ""
+        meta = (self.predict.market_meta.get(str(book.market_id)) or ({}, 0))[0]
+        names = (meta.get("outcomes") if isinstance(meta, dict) else None) or []
+        if second_outcome_up(names):
+            return None, f"盘口方向未确认（结果名称：{'、'.join(map(str, names))}，按名称第一个结果不是涨），暂不比较"
+        return book, ""
+
     def updown_book(self, spec: UpDownSpec) -> tuple[PredictBook | None, str]:
         """The book priced as "Up" (the card's 涨 side), whatever the market's outcome order — this market's: a daily
         card's book of the day before (until the new day's is read) is no book for it."""
@@ -18229,9 +18275,12 @@ class Bot:
                 # session's market, which Predict may not list yet, while the finished day's book is still cached until the
                 # next Predict refresh: judged against tomorrow's fair price its 1¢ asks looked like a bargain (10-08, three
                 # markets). So the slug comes from the card's target, not from the refresher's last target list.
+                # 1.150.0 (audit FEED-CLOSE-BOOK-ORIENT): and it must be 涨's — a market listed Down / No first is not priced,
+                # on paper or for real (close_book), as the other kinds' books are oriented by their names below
                 stem = self.config.predict_slugs.get(key)
-                slug, book = predict_slug(stem, odds.target) if stem else "", self.predict.books.get(key)
-                if not slug or book is None or book.slug != slug:
+                slug = predict_slug(stem, odds.target) if stem else ""
+                book = self.close_book(key, slug)[0] if slug else None
+                if book is None:
                     continue
                 name, _, symbol = title.partition("｜")
                 close_ms, _ = self.target_close(title, odds.target)
@@ -21758,7 +21807,7 @@ class Bot:
             unit = f" {odds.unit}" if odds.unit else ""
             rows = [f"昨收 {fmt(odds.ref)}{unit} → 现 {fmt(odds.effective)}{unit}（{percent(odds.effective, odds.ref):+.2f}%）",
                     f"模型 涨 {bold(cents(odds.fair_up))}｜跌 {bold(cents(odds.fair_down))}"]
-            book = self.predict.books.get(self.predict_key(title))
+            book, _ = self.close_book(self.predict_key(title))  # none for a market whose names say the book is not 涨's
             if book is not None and not book.stale(now_ms):
                 need = self.edge_need(model_swing(odds))
                 best = None if odds.warn else best_edge(book_edges(odds.fair_up, book, self.edge_costs()), need)
@@ -22004,8 +22053,8 @@ class Bot:
         slug = self.predict.slugs.get(key)
         if not self.config.predict or not slug:
             return None
-        book, error = self.predict.books.get(key), self.predict.errors.get(key, "")
-        out: dict[str, Any] = {"url": predict_url(slug, self.config.predict_ref), "error": error}
+        book, why = self.close_book(key)  # held (why) when the market's names say the book is not 涨's: no depth, no edges
+        out: dict[str, Any] = {"url": predict_url(slug, self.config.predict_ref), "error": why or self.predict.errors.get(key, "")}
         if book is None:
             return out
         ok = isinstance(odds, CloseOdds)
@@ -22032,7 +22081,8 @@ class Bot:
                 continue
             shown += 1
             item = odds.get(title)
-            book, error = self.predict.books.get(key), self.predict.errors.get(key, "")
+            book, why = self.close_book(key)
+            error = why or self.predict.errors.get(key, "")
             lines.append("\n" + bold(f"📍 {title}"))
             url = predict_url(slug, self.config.predict_ref)
             rows = book_lines(book, error, item, now_ms, url, self.edge_costs(), self.config.predict_min_edge)
@@ -22294,7 +22344,8 @@ class Bot:
             rows = odds.detail() if isinstance(odds, CloseOdds) else [f"概率暂缺：{odds}"]
             key = self.predict_key(title)
             if key in self.predict.slugs:
-                rows += book_lines(self.predict.books.get(key), self.predict.errors.get(key, ""), odds, now_ms, "",
+                book, why = self.close_book(key)
+                rows += book_lines(book, why or self.predict.errors.get(key, ""), odds, now_ms, "",
                                    self.edge_costs(), self.config.predict_min_edge)
             lines.extend(tree(rows))
         lines.append("\n⚠️ 目标日跳过周末和已配置的交易所假期（HOLIDAYS_*），每个假日按半天方差计入；σ 为历史估计；代理与结算标的之间有基差。")
