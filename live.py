@@ -2823,8 +2823,9 @@ class LiveBot(core.Bot):
         later (the positions list follows the matching a little late); a position's payout is then exactly the shares
         held, and its cost the money spent, over the fewer shares: a maker's price × shares, kept (1.122.0); a taker's
         average price × the shares it bought — the fee its price carries was paid in the shares cut, not in USDT
-        (1.150.0: left in the cost as well, it was counted twice). A list that cannot be read, or came cut at the page
-        cap, changes nothing."""
+        (1.150.0: left in the cost as well, it was counted twice); a taker whose shares were booked from the holding
+        (live_from_holding), net of the fee already: its price × shares, kept like a maker's. A list that cannot be
+        read, or came cut at the page cap, changes nothing."""
         if now_ms - self.live_late_checked < self.LIVE_LATE_FILLS_MS:
             return
         self.live_late_checked = now_ms
@@ -3031,7 +3032,7 @@ class LiveBot(core.Bot):
                 if after > 0:
                     price = float(t["price"])
                     keep = price * before / after  # 1.122.0: the money spent is the same, over fewer shares
-                    if not t.get("maker"):
+                    if not t.get("maker") and not self.live_from_holding(t):
                         # 1.150.0: ...but a taker's price × shares is not the money it spent. live_apply costs it at the average
                         # plus the fee per share, and Predict takes that fee out of the shares bought — the very shares cut here —
                         # not in USDT: a fill costs average × shares, never more than the order signed for (100 shares at 58¢:
@@ -3042,8 +3043,19 @@ class LiveBot(core.Bot):
                         # average price × the shares it bought (those held now and every share cut off it): the cost goes there —
                         # never above the cost the record had, and never by lowering its per-share price (the 1.119.1 rule): a
                         # record cut by less than its own fee (the shortfall is spread in proportion over the outcome's records)
-                        # keeps the rest of the fee in its cost, dear rather than cheap, and one whose shares were booked from
-                        # the holding, already net of the fee, gives up no more than the shares cut are worth.
+                        # keeps the rest of the fee in its cost, dear rather than cheap. (The premise — no USDT fee beside the
+                        # shares — is what the signed order allows and what the shortfall 1.119.1 saw amounts to: 97.74 bought,
+                        # 96.30 held is the whole 2% fee at about 58¢. It has not been confirmed with Predict.)
+                        # Only a taker whose shares were read from its order's own record, though: the shares bought, the fee
+                        # still among them. One whose shares were booked from the account's holding (live_from_holding: a late
+                        # fill adopted from the positions, an order of unknown state settled by them) holds them net of the fee
+                        # already, at a cost that is the money spent as it stands (within a cent), its "average" its limit and
+                        # the shares it bought unknown: it carries no fee twice, and what is cut off it is not its fee (another
+                        # record's, spread onto it; shares that left the account since) — its cost is kept whole, like a
+                        # maker's, as before 1.150.0. (Under the taker's rule only the per-share floor held it, and its cost
+                        # fell by price × the shares cut: 98.55 shares adopted at 58¢ beside a later taker of 100 at 30¢ —
+                        # $88.00 spent — were booked $87.70 together after the trim: under the money spent, the one way this
+                        # must not err.)
                         keep = min(keep, max(price, float(t.get("avg") or price) * (before + cut) / after))
                         if price * before - keep * after >= 0.005:
                             fee_off += price * before - keep * after
@@ -3052,9 +3064,22 @@ class LiveBot(core.Bot):
                 t["live"]["events"].append({"at": now_ms, "what": what})
                 self.sim_save([(tid, t)])
             costs = "（成本不变）" if fee_off < 0.005 else (f"（吃单的手续费就是少掉的这些份额，不再另算进成本：成本共减 ${fee_off:,.2f}"
-                                                           + ("；挂单的成本不变" if any(t.get("maker") for _, t in recs) else "") + "）")
+                                                           + ("；挂单的成本不变" if any(t.get("maker") for _, t in recs) else "")
+                                                           + ("；按账户持仓记入的吃单本来就是扣过手续费的份数，成本不变"
+                                                              if any(not t.get("maker") and self.live_from_holding(t) for _, t in recs) else "") + "）")
             self.live_notify(f"📐 份数校正：{recs[0][1]['item']} {recs[0][1]['label']}：账户持有 {got:g} 份，记录 {total:g} 份，少的 {short:g} 份是手续费以份额扣除；"
                              f"{len(recs)} 笔记录按比例改为持有的份数{costs}", key=f"trim:{k[0]}:{k[1]}")
+
+    @staticmethod
+    def live_from_holding(t: dict) -> bool:
+        """Whether shares of this record were booked from the account's holding rather than read from its order's own
+        record (1.150.0): a late fill adopted from the positions (live_late_fills (a): ``adopted``), or an order of
+        unknown state settled by them (live_recheck, which leaves no mark but its event). Both events say the holding
+        exceeded the records — 持仓比记录多, the words matched here: they stay in those two events. Shares booked so are
+        what the account holds, net of the fee Predict takes in shares; read from the order's record they are the
+        shares bought, the fee still among them (live_late_fills (b))."""
+        st = t["live"]
+        return bool(st.get("adopted")) or any("持仓比记录多" in str(e.get("what") or "") for e in st.get("events") or ())
 
     async def live_undo_preopen_adoptions(self, live: list[tuple[str, dict]], key_of: Any, busy: set, po: dict, now_ms: int) -> None:
         """A backfill that was the pre-open mode's fill, undone (1.131.5): the order's own record, read again once the
