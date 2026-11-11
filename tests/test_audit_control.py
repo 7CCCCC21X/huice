@@ -601,4 +601,111 @@ async def ctrl_datajson_leak():
 
 
 asyncio.run(ctrl_datajson_leak())
+
+
+async def ctrl_live_allowed_failopen():
+    """CTRL-LIVE-ALLOWED-FAILOPEN: LIVE_TRADING_ALLOWED — the deployment's hard switch, the README's emergency stop — was read
+    like an ordinary default-on switch (`not off(...)`): only off / 0 / false / no stopped real orders, and a stop typed any
+    other way (关, disabled, pause, a typo, a quoted "off", an emptied value) left LIVE=on sending them, the mode shown as on
+    and no 硬开关 line anywhere. Now it fails closed: only the variable left unset, or on / 1 / true / yes, allows real orders;
+    every other value gives the very configuration off gives. And the page's save under the switch refuses every word that
+    reads as LIVE=on, no longer the bare "on" alone (true / 1 / yes were saved, and came up on at the restart that lifted it)."""
+    import dataclasses, datetime as dt
+    D = m.D
+    live = {**base, "LIVE": "on", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, "PREDICT_API_KEY": "k", "STATE_DB": ":memory:",  # the SDK test suite's key, never a real one
+            "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_MAKER_MIN_BID": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off"}
+    conf = lambda word=None, **more: m.Config.from_env({**live, **more, **({} if word is None else {"LIVE_TRADING_ALLOWED": word})})
+
+    # (a) the words. Allowed: the variable left unset (the documented default) and on / 1 / true / yes, in any case, blanks around
+    for word in (None, "on", "ON", " On ", "on\n", "1", "true", "True", "yes", "YES"):
+        c = conf(word)
+        assert c.live_allowed is True and c.live_mode == "on" and c.live, (word, c.live_allowed, c.live_mode)
+    off = conf("off")
+    assert off.live_allowed is False and off.live_mode == "pause" and off.live  # the documented stop: capped at pause, the module loaded
+    stops = ("OFF", " off ", "0", "false", "no",  # these stopped before too
+             "关", "关闭", "否", "停", "disabled", "disable", "pause", "paused", "stop", "none", "never", "n", "f", "of", "0ff", "offf",  # a stop in other words, a typo
+             "", "  ", '"off"', "'off'", "off # stop", "Off.", "false # emergency",  # emptied; quoted (docker --env-file keeps the quotes); a comment kept
+             "enabled", "allow", "y", "开", '"on"', "on!")  # meant as allowed but none of the four: a pause the operator is told of, never a guess
+    for word in stops:
+        c = conf(word)
+        assert c.live_allowed is False and c.live_mode == "pause" and c.live, (word, c.live_allowed, c.live_mode)  # 关: was True, on
+        assert c == off, word  # every field (the environment itself kept aside): whatever off does downstream, this does
+    for word in (None, "on", "off", "关"):  # the switch only caps on: pause and off stay as chosen
+        assert conf(word, LIVE="pause").live_mode == "pause" and conf(word, LIVE="off").live_mode == "off" and not conf(word, LIVE="off").live, word
+
+    # (b) the README's emergency stop, end to end: the page saved LIVE=on earlier (it stands over the environment's LIVE), the
+    # operator sets the deployment variable and the service restarts; one step on a market with edge both ways
+    BJ = lambda h, mi=0: int(dt.datetime(2026, 10, 5, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+    now, slug = BJ(10), "hang-seng-index-up-or-down-on-october-5-2026"
+    book = m.PredictBook("HSI", slug, "101", "t", ((D("0.55"), D("300")),), ((D("0.58"), D("400")),), now, None)
+    card = m.SimMarket(slug, "恒生指数", "close", "HSI", 0.70, book, 0.03, "", ("涨", "跌"),
+                       {"key": "HSI", "target": "2026-10-05", "line": 24600.0, "close_ms": BJ(16, 10)},
+                       {"basis": {"fair_up": 0.70, "ref": 24600.0}, "sources": [{"what": "恒指期货", "source": "etnet"}], "proxy": None})
+    detail = {"id": 101, "status": "REGISTERED", "isNegRisk": False, "isYieldBearing": False, "feeRateBps": 200, "conditionId": "0x" + "ab" * 32,
+              "outcomes": [{"name": "Up", "indexSet": 1, "onChainId": "1011"}, {"name": "Down", "indexSet": 2, "onChainId": "1012"}]}
+
+    class Api(FakeApi):  # Predict with a book of the bot's own orders: every order that reaches it is counted
+        async def create_order(self, body):
+            self.calls.append(("create", body))
+            oid, data = str(100 + len(self.calls)), body["data"]
+            self.open[oid] = {"id": oid, "status": "OPEN", "amount": data["order"]["takerAmount"], "amountFilled": "0",
+                              "strategy": data["strategy"], "order": {**data["order"]}}
+            return {"order_id": oid, "hash": data["order"]["hash"], "code": None}
+        async def orders(self, status="OPEN", **params): return [dict(r) for r in self.open.values()] if status == "OPEN" else []
+        async def order(self, oid, hash_=""): return dict(self.open[oid]) if oid in self.open else None
+
+    async def restart(word):
+        store = m.Store(":memory:")
+        store.put("control:env", {"LIVE": "on"})
+        bot = L.LiveBot(conf(word, LIVE="off"), store, FM(now), None)  # Bot.__init__ lays the saved LIVE=on over the environment
+        bot.live.api, bot.live.chain = Api(), FakeChain()
+        bot.live.api.markets["101"] = dict(detail)
+        bot.sim_markets = lambda now_ms, only=None: [card]
+        await bot.live_prepare()
+        await bot.live_prefetch(now)
+        bot.sim_ran = -1e9
+        await bot.sim_step(now)
+        return bot, [body for kind, body in bot.live.api.calls if kind == "create"]
+
+    bot, sent = await restart(None)  # the switch left unset: real orders go out — what follows is not an empty check
+    assert bot.live.ready and bot.config.live_mode == "on" and bot.config.live_allowed and len(sent) >= 1, (bot.config.live_mode, len(sent))
+    for word in ("off", "关", "disabled", "pause", "", '"off"'):
+        bot, sent = await restart(word)
+        assert bot.live.ready and bot.config.live_mode == "pause" and bot.config.live_allowed is False, (word, bot.config.live_mode)
+        assert sent == [] and not bot.sim_trades(), (word, len(sent))  # 关: was on, real orders sent
+        text, status = "\n".join(bot.live.summary_lines()), bot.live_status(now)
+        assert "硬开关" in text and "LIVE_TRADING_ALLOWED" in text and status["allowed"] is False and status["mode"] == "pause", (word, text)
+        reply = await bot.cmd_live(m.Request("/live", ["mode", "on"], 1, 0, 1))
+        assert "LIVE_TRADING_ALLOWED" in reply and bot.config.live_mode == "pause", (word, reply)
+        r = bot.control_set({"LIVE": "on"})
+        assert not r["ok"] and "LIVE_TRADING_ALLOWED" in r["message"] and bot.config.live_mode == "pause", (word, r)
+        r = bot.control_set({"SIM_EDGE_CENTS": "12"})  # a later save reads the environment again: the cap stands
+        assert r["ok"] and bot.config.sim_edge == 0.12 and bot.config.live_mode == "pause" and bot.config.live_allowed is False, (word, r)
+        bot.apply_config(dataclasses.replace(bot.config, live_mode="on"))  # even forced on in memory, both gates refuse by the switch
+        await asyncio.sleep(0)
+        assert "LIVE_TRADING_ALLOWED" in bot.live_room({}, card, "up", 0.58, 100), word
+        assert "LIVE_TRADING_ALLOWED" in bot.live_send_block({"live": {"want": {"shares": 100}, "events": [{"at": now}]}, "order": 100,
+                                                              "price": 0.5, "opened": now}, {}, now), word
+
+    # (c) the page's save under the switch: every word Config.from_env reads as LIVE=on is refused and nothing is saved. A
+    # hand-made request's true / 1 / yes (the page's buttons send off / pause / on) was saved, capped at pause while the switch
+    # stood, and came up on at the restart that lifted it
+    for switch in ("off", "关"):
+        for word in ("on", "ON", " on ", "1", "true", "True", "yes", "YES", True, 1):
+            store = m.Store(":memory:")
+            bot = m.Bot(conf(switch, LIVE="pause"), store, FM(NOW), None)
+            r = bot.control_set({"LIVE": word})
+            assert not r["ok"] and "LIVE_TRADING_ALLOWED" in r["message"] and store.get("control:env") is None, (switch, word, r)
+            assert bot.config.live_mode == "pause", (switch, word, bot.config.live_mode)
+            lifted = m.Bot(conf("on", LIVE="pause"), store, FM(NOW), None)  # the switch lifted, the service restarted on the same database
+            assert lifted.config.live_mode == "pause", (switch, word, lifted.config.live_mode)  # true / 1 / yes: was on
+        # the refusal and Config.from_env agree on the words: one that does not read as on is saved as before
+        bot = m.Bot(conf(switch, LIVE="pause"), m.Store(":memory:"), FM(NOW), None)
+        for word in ("on", "1", "true", "yes", "y", "t", "enable", "enabled", "开", "live", "pause", "paused", "test", "off", "0", "false", "no"):
+            reads, before = conf("on", LIVE=word).live_mode, bot.config.live_mode
+            r = bot.control_set({"LIVE": word})
+            assert r["ok"] is (reads != "on") and bot.config.live_mode == (before if reads == "on" else reads), (switch, word, r, bot.config.live_mode)
+
+
+asyncio.run(ctrl_live_allowed_failopen())
 print("AUDIT_CONTROL_OK")

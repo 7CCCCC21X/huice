@@ -838,7 +838,7 @@ class Config:
     # Real trading (live.py): LIVE=on sends every paper-trading decision to Predict as a real order.
     live: bool = False                 # LIVE=on or LIVE=pause: the real-trading module runs (live_mode says whether it opens positions)
     live_mode: str = "off"             # off | pause (wallet, sign-in, checks, the order test and cancels work; no new positions) | on
-    live_allowed: bool = True          # LIVE_TRADING_ALLOWED: the deployment's hard switch; off caps the mode at pause whatever the database saved
+    live_allowed: bool = True          # LIVE_TRADING_ALLOWED: the deployment's hard switch; anything but on/1/true/yes (unset = on) caps the mode at pause whatever the database saved
     live_key: str = field(default="", repr=False)  # PREDICT_PRIVATE_KEY: the signing wallet's private key (never logged)
     live_account: str = ""             # PREDICT_ACCOUNT: the Predict account (smart wallet / deposit address) the key controls; "" = the key's own address
     live_chain: int = 56               # PREDICT_CHAIN_ID: 56 = BNB mainnet, 97 = BNB testnet
@@ -894,7 +894,18 @@ class Config:
         live_mode = {"on": "on", "1": "on", "true": "on", "yes": "on", "pause": "pause", "paused": "pause", "test": "pause"}.get(
             e.get("LIVE", "off").strip().lower(), "off")
         live = live_mode != "off"
-        live_allowed = not off(e.get("LIVE_TRADING_ALLOWED", "on"))
+        # 1.150.0 (audit CTRL-LIVE-ALLOWED-FAILOPEN): the hard switch fails closed. It was read like the ordinary default-on
+        # switches (`not off(...)`): only off / 0 / false / no stopped real orders and every other value allowed them, so a
+        # stop typed as 关, 关闭, disabled, pause, stop, "of", a quoted "off", `off # why` or an emptied value left LIVE=on
+        # sending real orders — the mode shown as on, no 硬开关 line on /live or the page. It is the emergency stop (README:
+        # 紧急停止用它), typed by hand on the deployment in a hurry, and LIVE itself already reads an unknown word as off. Now
+        # only the variable left unset, or on / 1 / true / yes, allows real orders; anything else (set but empty too) caps
+        # the mode at pause exactly as off does. A word meant as "allowed" that is none of those costs a pause which /live,
+        # the page and the start-up notice put down to this switch (/live mode on answers how to lift it: 改成 on), never
+        # real orders the operator believed stopped. Not a ValueError: a crash loop at start-up would leave the resting
+        # orders and the pre-open quotes on the book with nobody watching, while pause keeps the sign-in, the cancels, the
+        # redeeming and the pre-open withdrawal at work.
+        live_allowed = str(e.get("LIVE_TRADING_ALLOWED", "on")).strip().lower() in {"on", "1", "true", "yes"}
         if live_mode == "on" and not live_allowed:
             live_mode = "pause"  # the hard switch: nothing the database saved can turn real orders on past it
         live_key, live_account = e.get("PREDICT_PRIVATE_KEY", "").strip(), e.get("PREDICT_ACCOUNT", "").strip()
@@ -22218,7 +22229,10 @@ class Bot:
         and the answer names it: a stale value never blocks a save, /live mode off included."""
         before_saved = {k: str(v) for k, v in (self.store.get("control:env") or {}).items() if k in CONTROL_KEY_SET}
         saved = dict(before_saved)
-        if str(values.get("LIVE") or "").strip().lower() == "on" and not self.config.live_allowed:
+        # 1.150.0 (audit CTRL-LIVE-ALLOWED-FAILOPEN): refused for every word Config.from_env reads as LIVE=on, no longer the
+        # bare "on" alone — a hand-made request's LIVE=true / 1 / yes was saved under the hard switch (capped at pause while
+        # it stood) and turned real orders on at the restart that lifted the switch, nobody having chosen on then
+        if str(values.get("LIVE") or "").strip().lower() in {"on", "1", "true", "yes"} and not self.config.live_allowed:
             return {"ok": False, "message": "部署变量 LIVE_TRADING_ALLOWED=off 禁止真实下单（硬开关）：不能保存 LIVE=on"}
         changed = []
         for key, _, _ in CONTROL_KEYS:
