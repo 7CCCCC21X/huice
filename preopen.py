@@ -32,6 +32,11 @@ a pause or an external cancel is quoted again too, at most MAX_ATTEMPTS times
 the book: the signed expiry is the backstop, the next process takes them over.
 1.127.1: the request wrapper takes a cancel's answer (no "data" key) as the
 success it is; only an explicit success=false is a refusal.
+
+Audit PRE-LATE-FILL: an order off the book is ended by a read of its record made
+LATE_FILL_MS after it left, not by the one right after its removal, which may
+not show the last seconds' matches yet — a pair withdrawn with nothing filled
+gives its reservation back a minute on, not at once (Controller.ended).
 """
 from __future__ import annotations
 
@@ -58,6 +63,7 @@ TERMINAL = {"removed", "not_sent", "rejected", "not_found", "final"}  # states a
 NEVER_PLACED = {"not_sent", "rejected", "not_found"}                  # ...of which these never tied money up
 RETRY_MS, RETRY_MAX_MS = 15_000, 120_000  # a closing pair's cancels and reads are tried again this long after a try, doubling to the cap
 GIVE_UP_MS = 15 * 60_000  # after a window's start + this, an order Predict cannot show by its hash is taken as never placed (it expired before the start)
+LATE_FILL_MS = 60_000     # an order off the book is ended only by a read of its record made this long after it left: an earlier one may not show its last matches yet (Controller.ended)
 SPRINT_MS = 2_000         # the last stretch (past the cancel time, before the expiry): an order still open is asked to be cancelled this often, no backoff
 REFRESH_MS = 30_000       # an active window's market is read again this often (matching on; a status change withdraws the pair)
 REFRESH_FAR_MS = 900_000  # ...a window starting more than an hour away: this often (a day's windows must not cost a read a second; 1.134.1: 15 min, was 5)
@@ -1366,7 +1372,7 @@ class Controller:
             def answered(removed: list[str], noop: list[str]) -> None:
                 for oid in removed:
                     if oid in by_id:
-                        by_id[oid]["state"] = "removed"
+                        self.off_book(by_id[oid])
             # patient whatever the count: the last try — no loop, no reconciliation follows — so a rate limit is waited out
             # and a failed batch tried again, within ``until`` (impatient, a few ids would not be sent into a cooldown at all)
             result = await live.remove_in_batches(
@@ -1716,6 +1722,56 @@ class Controller:
         the start), and what it shows is final."""
         return self.now() >= pair["start_ms"] + GIVE_UP_MS
 
+    def off_book(self, order: dict) -> None:
+        """Predict's word that the order left the book (a removal it confirmed): "removed" — withdrawn, its final fills
+        unread — and when (gone_ms), for the read that may end it (final_read_ms)."""
+        order.update(state="removed", gone_ms=self.now())
+
+    def final_read_ms(self, order: dict, pair: dict) -> int:
+        """When a read of the record of an order off the book is its last word (ended): LATE_FILL_MS after the order was
+        known off the book (gone_ms: the removal's confirmation, or the first read that showed it ended). 0 — any time —
+        while that is not known (the first read says), and past the give-up (its signature expired a quarter hour ago)."""
+        gone = int(order.get("gone_ms") or 0)
+        return gone + LATE_FILL_MS if gone and not self.gave_up(pair) else 0
+
+    def ended(self, order: dict, pair: dict) -> None:
+        """An order whose record, just read and its fills applied, says it ended: "final" when that record is its last word
+        — the whole order filled (nothing more can show), or read LATE_FILL_MS after the order was known off the book
+        (final_read_ms) — else "removed": off the book, its final fills still to read (cancel_pair, at the try bookkeep
+        books; monitor_pair for a pair that rests on).
+
+        Audit PRE-LATE-FILL: any such read used to end the order, and a pair whose two records, read right after the
+        removal, said CANCELLED with nothing filled was accounted there and then (pnl 0) — and nothing reads an accounted
+        pair's orders again (due and settle_pair pass it by; the account snapshot shows open orders alone). That read can
+        lag the matching: README 1.119.0, the model trader's 300-share order "撤掉、0 成交" by the cancel's read of the same
+        GET /orders/{hash}, with 299.99 shares on the account. Shares matched in the seconds before a withdrawal so stayed
+        out of this ledger for good: no P&L, nothing in the day's loss stop, the outcome neither in fills_by_outcome nor in
+        unverified_outcomes — the model trader's positions check then took them for a fill of an order of its own on that
+        side (the 1.131.5 mix-up, with no undo: the pre-open fills read there never cover them) — and a window withdrawn
+        early through no fault of its own (supersedable) was quoted again on top of the fill. Held as "removed" instead,
+        the order is all a doubt needs: not verified (the outcome stays in unverified_outcomes, the pair reserved and not
+        accounted, its window not quoted again), nothing left to cancel, read again. The price is a minute: a pair
+        withdrawn with nothing filled is released, and its window quoted again, LATE_FILL_MS after its orders left the
+        book, not at once. A withdrawal costs no request more: the read right after a confirmed removal, which could not
+        end the order, is not made (cancel_pair), and a read that comes that late anyway (a big withdrawal's, a start's,
+        the result's) ends it as before; only an order that ended outside this mode's cancel is read once more. Not
+        covered: a record that shows a fill later still, or never (the model trader's backstop for those is the account's
+        positions; this mode has none)."""
+        if order["state"] == "final":
+            return  # (settle_pair reads a final order's record once more for its fills: final it stays)
+        order.setdefault("gone_ms", self.now())
+        whole = float(order.get("filled") or 0) >= float(pair_quote(pair)[1] or self.settings.shares) - 1e-9
+        order["state"] = "final" if whole or self.now() >= self.final_read_ms(order, pair) else "removed"
+
+    def finals_wait(self, pair: dict) -> int:
+        """When a pair with nothing left to cancel has its withdrawn orders' final fills read: once each record is its last
+        word (final_read_ms) — the one thing left to do for it. 0, nothing to wait for, while an order is still to cancel
+        or to find, or when no order waits for such a read."""
+        orders = pair["orders"].values()
+        if any(o["state"] not in TERMINAL for o in orders):
+            return 0
+        return max((self.final_read_ms(o, pair) for o in orders if o["state"] == "removed"), default=0)
+
     def note_open(self, market: dict) -> None:
         """The first time the listing shows one of this mode's windows OPEN (matching on): kept on the pair — how long
         before the start matching begins is what the cancel time should be set against (/preopen shows the median)."""
@@ -1737,8 +1793,9 @@ class Controller:
 
     def bookkeep(self, pair: dict, save: bool = True) -> None:
         """A closing or unverified pair's next try: SPRINT_MS on in the last stretch (in_sprint), else RETRY_MS after this one,
-        doubling to RETRY_MAX_MS; closed once nothing is left to cancel; accounted (its money released) once every order is
-        verified and nothing filled."""
+        doubling to RETRY_MAX_MS — and, with nothing left but its withdrawn orders' final fills, not before a read of their
+        records can end them (finals_wait); closed once nothing is left to cancel; accounted (its money released) once
+        every order is verified and nothing filled."""
         if self.in_sprint(pair):
             pair["retry_ms"] = self.now() + SPRINT_MS
         else:
@@ -1746,6 +1803,7 @@ class Controller:
             pair["tries"], pair["retry_ms"] = tries, self.now() + min(RETRY_MS * 2 ** (tries - 1), RETRY_MAX_MS)
         if pair["phase"] != "closed" and all(o["state"] in TERMINAL for o in pair["orders"].values()):
             pair["phase"] = "closed"
+        pair["retry_ms"] = max(pair["retry_ms"], self.finals_wait(pair))  # (Audit PRE-LATE-FILL: the read that ends a withdrawn order is made LATE_FILL_MS after it left the book)
         if (not pair.get("accounted") and all(order_verified(o) for o in pair["orders"].values())
                 and all(float(o.get("filled") or 0) <= 0 for o in pair["orders"].values())):
             pair.update(accounted=True, accounted_day=dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat(), pnl=0.0)
@@ -1753,15 +1811,16 @@ class Controller:
             self.ledger.save(pair)
 
     async def read_final(self, order: dict, pair: dict) -> None:
-        """An order's own record, for its final fills: final → "final"; none, past the give-up — never placed (no id) or
-        final as known (an id Predict no longer answers to)."""
+        """An order's own record, for its final fills: final → "final" once that record is its last word (ended: "removed",
+        to be read again, till then); none, past the give-up — never placed (no id) or final as known (an id Predict no
+        longer answers to)."""
         row = await self.cancel_api.order(order.get("id", ""), order.get("api_hash") or order["hash"])
         if row:
             if not order.get("id") and row.get("id") is not None:
                 order["id"] = str(row["id"])
             self.apply_fill(order, row, pair)
             if final_order(row):
-                order["state"] = "final"
+                self.ended(order, pair)
             elif self.gave_up(pair):  # a record Predict still shows open past the give-up: its signature expired long ago, nothing more can fill
                 order.update(state="final", note="开始后 15 分钟记录仍不是终态，签名早已过期：按已知成交记账")
         elif self.gave_up(pair):
@@ -1785,8 +1844,9 @@ class Controller:
                 if order["state"] in NEVER_PLACED or order["state"] == "final":
                     continue
                 if order["state"] == "removed":  # removed: its final fills, read once more (nothing is left to cancel)
-                    await self.read_final(order, pair)
-                    self.ledger.save(pair)
+                    if self.now() >= self.final_read_ms(order, pair):  # ...once that read can end it (ended), not before
+                        await self.read_final(order, pair)
+                        self.ledger.save(pair)
                     continue
                 # Unknown submissions are reconciled by their original hash.
                 if not order.get("id"):
@@ -1803,10 +1863,12 @@ class Controller:
                 pair.setdefault("cancel_sent_ms", self.now())
                 result = await self.cancel_api.remove_orders([order["id"]])
                 if order["id"] in result["removed"]:
-                    order["state"] = "removed"
+                    self.off_book(order)
                     pair.setdefault("cancel_done_ms", self.now())
                     self.ledger.save(pair)
-                await self.read_final(order, pair)  # the fills before the removal (bulk removals went first: no cancel waits behind this)
+                    if self.now() < self.final_read_ms(order, pair):
+                        continue  # the fills before the removal are read LATE_FILL_MS on, at the try bookkeep books: a read now could not end the order (ended)
+                await self.read_final(order, pair)  # not removed on Predict's word (it ended some other way, or rests on), or long past its window: what its record says now
                 self.ledger.save(pair)
             self.bookkeep(pair)
         finally:
@@ -1857,7 +1919,8 @@ class Controller:
         pair["checked_ms"] = self.now()
         rejected = read = False
         for order in pair["orders"].values():
-            if order["state"] != "open":
+            # an open order — or one this look found ended a while ago (with a fill: the pair rests on), now that a read of its record can end it (ended)
+            if order["state"] != "open" and not (order["state"] == "removed" and self.now() >= self.final_read_ms(order, pair)):
                 continue
             if order.get("id") in self.listed_ids and self.now() - self.account_at <= self.account_stale_ms():
                 continue  # one paginated account snapshot covers every healthy resting order
@@ -1867,7 +1930,7 @@ class Controller:
             read = True
             self.apply_fill(order, row, pair)
             if final_order(row):
-                order["state"] = "final"
+                self.ended(order, pair)  # its last word only LATE_FILL_MS after it was seen ended: "removed" till then, and read again (Audit PRE-LATE-FILL)
                 if order["filled"] <= 0:
                     rejected = True
                     if str(row.get("status") or "").upper() in REFUSED_STATUSES:
@@ -1962,7 +2025,7 @@ class Controller:
             for oid in removed:
                 if oid in by_id:
                     pair, order = by_id[oid]
-                    order["state"] = "removed"
+                    self.off_book(order)
                     pair.setdefault("cancel_done_ms", self.now())
                     touched[pair["slug"]] = pair
             self.ledger.save_many(list(touched.values()))
@@ -2004,6 +2067,8 @@ class Controller:
                 continue
             if patient and any(str(o.get("id") or "") in unsent for o in pair["orders"].values()):
                 continue  # not sent: the loop takes it on in batches again once its retry is due
+            if self.now() < self.finals_wait(pair):
+                continue  # every order off the book this moment: their final fills are read LATE_FILL_MS on, at the try bookkeep booked (ended) — nothing to do now
             self.launch_reconcile(pair)  # the removed orders' final fills, the unknown ones' hashes: the reservation ends on what they show
         return result
 
@@ -2202,6 +2267,8 @@ class Controller:
                     held = {p["slug"] for p in heavy}  # the running batch's turn ends first: these wait for the next
                     stale = [p for p in stale if p["slug"] not in held]
                 for pair in stale:
+                    if self.now() < self.finals_wait(pair):
+                        continue  # withdrawn this very pass, every order off the book: nothing to do before their final reads, which its bookkeep booked (ended)
                     self.bookkeep(pair)  # the next try is booked now: a read that hangs does not make the loop ask again meanwhile
                     self.launch_reconcile(pair)
             if self.winding and self.wound_up(now):
@@ -2386,7 +2453,7 @@ class Controller:
                 + (f"，另有 {self.ledger.archived_count} 条已归档（结束超过 {ARCHIVE_AFTER_MS // core.DAY_MS} 天、已撤且没成交的；复盘页照常统计）" if self.ledger.archived_count else "") + "，"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
-                f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉且一份没成交的场次立即释放）"
+                f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉的场次在撤单 {LATE_FILL_MS // 1000} 秒后读到一份没成交才释放）"
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，按开场先后补挂中") if pairs_left else "")
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
                 + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）"

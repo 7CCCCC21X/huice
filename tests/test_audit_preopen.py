@@ -252,6 +252,21 @@ async def _settled(ctl):
     await asyncio.gather(*list(ctl.settling.values()), return_exceptions=True)
 
 
+async def _read_finals(ctl, clock, pairs=None):
+    """The cancellation loop's next try for the withdrawn pairs not cleared yet (all of them, or those given), the clock moved
+    to it. Audit PRE-LATE-FILL: an order off the book is ended by a read of its record made LATE_FILL_MS after it left, not
+    by one right after the removal — so a pair withdrawn with nothing filled is accounted at that try, a minute on. The
+    blocks here that go on to what follows the accounting (written when it came on the spot) make the try with this;
+    nothing to do, it does nothing."""
+    waiting = [x for x in (ctl.ledger.rows.values() if pairs is None else pairs) if not x.get("accounted") and x["phase"] != "active"]
+    if waiting:
+        clock.ms = max(clock.ms, *(int(x.get("retry_ms") or 0) for x in waiting))
+        for x in waiting:
+            ctl.bookkeep(x)
+            ctl.launch_reconcile(x)
+        await _settled(ctl)
+
+
 def _operator(ctl, clock):
     """A LiveBot with the real command handlers over the controller; the model trader has nothing resting."""
     bot = _L.LiveBot.__new__(_L.LiveBot)
@@ -281,6 +296,7 @@ async def _operator_stops_are_free():
         assert sum(len(_p.removable_ids(x)) for x in ctl.ledger.rows.values() if x["phase"] != "closed") <= _p.BULK_MIN_IDS
         await stop()
         await _settled(ctl)
+        await _read_finals(ctl, clock)
         withdrawn = [x for x in ctl.ledger.rows.values() if x["phase"] != "active"]
         assert ctl.manual_pause and not [x for x in ctl.ledger.rows.values() if x["phase"] == "active"], name
         assert all(x.get("accounted") for x in withdrawn), f"{name}: the withdrawn pairs' records not all read"
@@ -320,6 +336,7 @@ async def _operator_stops_are_free():
         if not pair.get("accounted"):
             await ctl.cancel_pair(pair, pair.get("reason") or "撤单状态核对")  # the reconciliation's next try
     await _settled(ctl)
+    await _read_finals(ctl, clock)
     assert failed.get("accounted") and resting.get("accounted"), (failed.get("accounted"), resting.get("accounted"))
     assert _p.counts_against(failed), "the window's own failure must still count after the pause"
     assert not _p.counts_against(resting), "the resting pair the pause withdrew must be free"
@@ -335,6 +352,7 @@ async def _operator_stops_are_free():
     reply = await bot.cmd_preopen(pause)
     assert reply.startswith("预挂模式已停止：50 张预挂单已撤"), reply
     await _settled(ctl)
+    await _read_finals(ctl, clock)  # (a crashed controller has no loop of its own: the next start's)
     assert all(x.get("accounted") for x in ctl.ledger.rows.values())
     assert _p.window_strikes(ctl.ledger.rows.values()) == {}, _p.window_strikes(ctl.ledger.rows.values())
     ctl.ledger.close()
@@ -356,6 +374,7 @@ async def _operator_stops_are_free():
         c = _p.candidate(_T.market(at=_T.NOW + 30 * 60_000, mid=501), _T.NOW, ctl.owner.config, ctl.settings)
         await ctl.place_pair(c)
         await _settled(ctl)
+        await _read_finals(ctl, clock)
         pair = ctl.ledger.rows[c["slug"]]
         states = sorted(o["state"] for o in pair["orders"].values())
         assert pair["phase"] != "active" and ctl.manual_pause and len(api.sent) == 2, (pair["phase"], len(api.sent))
@@ -528,6 +547,7 @@ async def _ledger_growth(folder):
     assert await _quote_all(ctl) == sorted([A, A + "#1", B, B + "#1", C, C + "#1"])
     await ctl.cancel_many([ctl.ledger.rows[C], ctl.ledger.rows[C + "#1"]], "设置不同，撤掉后重新报价", free=True)
     await _settled(ctl)
+    await _read_finals(ctl, clock)
     clock.ms += 30_000
     assert await _quote_all(ctl) == [C, C + "#1"] and {C + "@0", C + "#1@0"} <= set(ctl.ledger.rows)
     # B's first level fills on Up before its cancel; D's second order times out and is never found (given up); E's Down
@@ -546,14 +566,18 @@ async def _ledger_growth(folder):
         await ctl.cancel_pair(ctl.ledger.rows[slug], ctl.ledger.rows[slug].get("reason") or "撤单状态核对")
     api.markets[str(mB["id"])]["outcomes"][0]["status"] = "WON"
     await ctl.settle_pair(ctl.ledger.rows[B])
+    await _read_finals(ctl, clock)  # (the pairs withdrawn at their cancel times with nothing filled: their records, long since due)
     # Saturday: U's second order times out too, and the process stops before it is given up — in doubt, its money
-    # reserved; R is withdrawn at its cancel time like any other
+    # reserved (its withdrawn side read a minute on: nothing filled); R is withdrawn at its cancel time like any other
     clock.ms = ctl.account_at = at(24 * 60 + 30)
     api.fail_side = len(api.sent) + 2
     await alone(mU)
     await _settled(ctl)
+    clock.ms = ctl.account_at = clock.ms + 60_000  # (LATE_FILL_MS)
+    await ctl.cancel_pair(ctl.ledger.rows[U], ctl.ledger.rows[U].get("reason") or "撤单状态核对")
     await alone(mR)
     await _at_cancel_time(ctl, clock, ctl.ledger.rows[R])
+    await _read_finals(ctl, clock, [ctl.ledger.rows[R]])  # (R's records read LATE_FILL_MS on; U's own next try has not come)
     # ...and an earlier attempt at A that ended with nothing filled but with Predict's result on it (the tally reads it)
     res = copy.deepcopy(ctl.ledger.rows[A])
     res.update(slug=A + "@7", attempt=7, result="up")
@@ -776,5 +800,216 @@ async def _ledger_growth(folder):
 
 with tempfile.TemporaryDirectory() as _folder:
     asyncio.run(_ledger_growth(_folder))
+
+# PRE-LATE-FILL: the read made right after a removal ended the order on whatever it showed, and a pair whose two records
+# said CANCELLED with nothing filled was accounted on the spot (pnl 0) — after which nothing reads its orders again (due
+# and settle_pair pass an accounted pair by, the account snapshot shows open orders alone). That record can lag the
+# matching (README 1.119.0: the model trader's order "撤掉、0 成交" by the same GET /orders/{hash}, 299.99 shares on the
+# account), so shares matched in the seconds before a withdrawal stayed out of the ledger for good: no P&L, nothing in
+# the day's loss stop, the outcome neither in fills_by_outcome nor in unverified_outcomes — the two the model trader's
+# positions check goes by (test_trading's preopen_fills_not_adopted: an unverified outcome is left alone, anything else
+# beyond the records is booked onto its own ended order on that side) — and a window withdrawn early through no fault of
+# its own was quoted again on top of the fill. Now an order off the book is ended only by a read of its record made
+# LATE_FILL_MS after it left: "removed" till then — unverified, its pair reserved and not accounted, its window not
+# quoted again. The read right after a confirmed removal is not made at all, so a withdrawal costs no request more; a
+# pair withdrawn with nothing filled is released a minute on. (A fill a record shows later than that is not covered.)
+
+
+def _order_reads(api, clock):
+    """Every read of an order's own record from here on, as [(when, order id)]."""
+    reads, real = [], api.order
+
+    async def order(oid, digest=""):
+        reads.append((clock.ms, oid))
+        return await real(oid, digest)
+    api.order = order
+    return reads
+
+
+async def _until(cond, timeout=5.0):
+    for _ in range(int(timeout / 0.01)):
+        if cond():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"waited {timeout:g}s")
+
+
+async def _placed(**env):
+    """A controller with the 10:00 BTC window quoted (50 a side at 49¢): (ctl, api, clock, candidate, pair, up, down, reads)."""
+    ctl, api, clock = _T.controller(**env)
+    reads = _order_reads(api, clock)
+    c = _p.candidate(_T.market(), _T.NOW, ctl.owner.config, ctl.settings)
+    await ctl.place_pair(c)
+    pair = ctl.ledger.rows[c["slug"]]
+    return ctl, api, clock, c, pair, pair["orders"]["up"], pair["orders"]["down"], reads
+
+
+async def _done(ctl):
+    for task in ctl.settling.values():
+        task.cancel()
+    await _settled(ctl)
+    ctl.ledger.close()
+
+
+async def _late_fill(folder):
+    shares = lambda n: str(_L.to_wei(n))
+    minute = getattr(_p, "LATE_FILL_MS", 60_000)  # (a minute; the name is the fix's)
+    # --- (1) the routine cancel, made by the cancellation loop itself. 20 of Up's 50 shares are matched in the last seconds:
+    # as the removal is confirmed the record says CANCELLED with nothing filled, and it shows them half a minute later
+    db = str(Path(folder) / "late.preopen.sqlite3")
+    ctl, api, clock, c, pair, up, down, reads = await _placed(PREOPEN_DB=db)
+    k_up, k_down = ("123", up["index_set"]), ("123", down["index_set"])
+    bot = _L.LiveBot.__new__(_L.LiveBot)  # the model trader's reading of this mode's records (its positions check goes by these two)
+    bot.preopen, bot.config, bot.market = ctl, ctl.owner.config, ctl.owner.market
+    assert (bot.preopen_filled(), bot.preopen_unverified()) == ({}, {k_up, k_down})
+    at = clock.ms = ctl.account_at = c["cancel_ms"]
+    loop = asyncio.create_task(ctl.cancellation_loop())
+    try:
+        await _until(lambda: pair["phase"] == "closed")
+        await asyncio.sleep(0.6)  # (a pass of the loop later)
+        assert set(api.removed) == {up["id"], down["id"]}
+        assert (up["state"], down["state"]) == ("removed", "removed"), f"ended by a read right after the removal: {up['state']}/{down['state']}"
+        assert not pair.get("accounted") and pair.get("pnl") is None, f"accounted on the spot with pnl {pair.get('pnl')}: nothing reads its orders again"
+        assert ctl.risk() == 49.0 and not ctl.supersedable(pair) and (pair["retry_ms"], pair["tries"]) == (at + minute, 1)
+        assert reads == [], f"a read right after the removal cannot end the order: not made ({reads})"
+        assert bot.preopen_unverified() == {k_up, k_down} and bot.preopen_filled() == {}, "the positions check must leave both outcomes alone meanwhile"
+        assert _p.unverified_outcomes(_p.read_rows(db), clock.ms) == {k_up, k_down}, "on file too (the mode off: the model trader reads the file)"
+        assert f"撤掉的场次在撤单 {minute // 1000} 秒后读到一份没成交才释放" in ctl.status()
+        api.rows[up["hash"]]["amountFilled"] = shares(20)  # Predict's record catches up
+        clock.ms = at + minute - 1_000
+        await asyncio.sleep(0.6)
+        assert reads == [] and up["state"] == "removed", "a second short of the minute: not read yet"
+        clock.ms = at + minute
+        await _until(lambda: up["state"] == "final" and down["state"] == "final")
+    finally:
+        ctl.stop.set()
+        await asyncio.gather(loop, return_exceptions=True)
+    assert not loop.cancelled() and loop.exception() is None, loop
+    assert (up["filled"], down["filled"], pair.get("accounted")) == (20.0, 0.0, None), "the fill is booked; a pair with a fill waits for the official result"
+    assert [(t - at, oid) for t, oid in reads] == [(minute, up["id"]), (minute, down["id"])], f"one read an order, as before — a minute on: {reads}"
+    assert (bot.preopen_filled(), bot.preopen_unverified()) == ({k_up: 20.0}, set()), "read: the ledger explains the position"
+    clock.ms = c["start_ms"] + 20 * 60_000
+    api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down won: the 20 Up shares bought at 49¢ are lost
+    await ctl.settle_pair(pair)
+    assert pair["accounted"] and pair["result"] == "down" and abs(pair["pnl"] + 9.8) < 1e-9, (pair.get("accounted"), pair.get("pnl"))
+    assert abs(ctl.daily_pnl() + 9.8) < 1e-9, "the loss is in the day's figure the loss stop reads"
+    await _done(ctl)
+
+    # --- (2) withdrawn early through no fault of its own (a settings change ten minutes before the start), 20 shares matched
+    # just before: the window waits for its final reads, and with the fill read it is not quoted again (PREOPEN.md: 有成交的不再报)
+    ctl, api, clock, c, pair, up, down, reads = await _placed()
+    at = clock.ms = ctl.account_at = c["start_ms"] - 600_000
+    await ctl.cancel_many([pair], "设置不同，撤掉后重新报价", free=True)
+    await _settled(ctl)
+    api.rows[up["hash"]]["amountFilled"] = shares(20)
+    ctl.full_scan_ms = 0
+    await ctl.discover()
+    assert not ctl.supersedable(pair) and ctl.queue.qsize() == 0, "quoted again before its withdrawn orders' records were read"
+    assert ctl.scan_state["pending"] == 1 and "1 档在等撤单核对" in ctl.scan_note, ctl.scan_note
+    await _read_finals(ctl, clock)
+    assert (clock.ms - at, up["state"], up["filled"], down["state"], pair.get("accounted")) == (minute, "final", 20.0, "final", None)
+    ctl.full_scan_ms, ctl.account_at = 0, clock.ms
+    await ctl.discover()
+    assert not ctl.supersedable(pair) and ctl.queue.qsize() == 0 and len(api.sent) == 2, "a window holding a fill was quoted again"
+    await _done(ctl)
+
+    # --- (3) nothing filled at all: released, and quoted again, a minute after the removal — one read an order, as before
+    ctl, api, clock, c, pair, up, down, reads = await _placed()
+    at = clock.ms = ctl.account_at = c["start_ms"] - 600_000
+    await ctl.cancel_many([pair], "设置不同，撤掉后重新报价", free=True)
+    await _settled(ctl)
+    assert (pair.get("accounted"), ctl.risk(), reads, ctl.due(at + minute - 1)) == (None, 49.0, [], [])
+    await _read_finals(ctl, clock)
+    assert (pair["accounted"], pair["pnl"], ctl.risk(), ctl.supersedable(pair)) == (True, 0.0, 0.0, True)
+    assert [(t - at, oid) for t, oid in reads] == [(minute, up["id"]), (minute, down["id"])], reads
+    ctl.full_scan_ms, ctl.account_at = 0, clock.ms
+    await ctl.discover()
+    assert ctl.queue.qsize() == 1 and ctl.queue.get_nowait()[2]["attempt"] == 1, "its window is quoted again once the records say nothing filled"
+    await _done(ctl)
+
+    # --- (4) an order that ended outside this mode's cancel (monitor_pair: CANCELLED, nothing filled as yet): the other side is
+    # withdrawn there and then, as before — and neither record ends its order before the read a minute on, which shows 15
+    ctl, api, clock, c, pair, up, down, reads = await _placed()
+    at = clock.ms = ctl.account_at = _T.NOW + 20_000
+    ctl.listed_ids = {down["id"]}  # (the fresh snapshot lists Down; Up is gone from it)
+    api.rows[up["hash"]]["status"] = "CANCELLED"
+    await ctl.monitor_pair(pair)
+    await _settled(ctl)
+    assert (up["state"], down["state"], pair["phase"], pair.get("accounted"), api.removed) == ("removed", "removed", "closed", None, [down["id"]])
+    assert _p.window_strikes(ctl.ledger.rows.values()) == {} and not ctl.supersedable(pair), "counted as a failure and quoted again on one read"
+    api.rows[up["hash"]]["amountFilled"] = shares(15)
+    await _read_finals(ctl, clock)
+    assert (up["state"], up["filled"], down["state"], pair.get("accounted"), ctl.supersedable(pair)) == ("final", 15.0, "final", None, False)
+    assert [(t - at, oid) for t, oid in reads] == [(0, up["id"]), (minute, up["id"]), (minute, down["id"])], reads  # (the one read more: Up's, seen ended)
+    assert _p.fills_by_outcome(list(ctl.ledger.rows.values()), clock.ms) == {("123", up["index_set"]): 15.0}
+    await _done(ctl)
+
+    # --- (5) ...ended outside with part of it filled, the pair resting on: the same monitor reads it again a minute later
+    ctl, api, clock, c, pair, up, down, reads = await _placed()
+    at = clock.ms = ctl.account_at = _T.NOW + 20_000
+    ctl.listed_ids = {down["id"]}
+    api.rows[up["hash"]].update(status="CANCELLED", amountFilled=shares(4))
+    await ctl.monitor_pair(pair)
+    assert (up["state"], up["filled"], pair["phase"], api.removed) == ("removed", 4.0, "active", [])
+    assert ("123", up["index_set"]) in _p.unverified_outcomes(list(ctl.ledger.rows.values()), clock.ms)
+    api.rows[up["hash"]]["amountFilled"] = shares(6)
+    clock.ms = ctl.account_at = at + minute - 6_000
+    await ctl.monitor_pair(pair)
+    assert (up["state"], up["filled"], len(reads)) == ("removed", 4.0, 1), "not read again before the minute is up"
+    clock.ms = ctl.account_at = at + minute
+    await ctl.monitor_pair(pair)
+    assert (up["state"], up["filled"], pair["phase"], len(reads), api.removed) == ("final", 6.0, "active", 2, [])
+    await _done(ctl)
+
+    # --- (6) the whole order filled: nothing more can show, its record is its last word at once (a removal answers "noop")
+    ctl, api, clock, c, pair, up, down, reads = await _placed()
+    api.rows[up["hash"]].update(status="FILLED", amountFilled=api.rows[up["hash"]]["amount"])
+    api.stuck = {up["id"]}
+    clock.ms = ctl.account_at = c["cancel_ms"]
+    await ctl.cancel_many([pair], "到时撤单或真实交易暂停", free=True)
+    await _settled(ctl)
+    assert (up["state"], up["filled"], down["state"], pair.get("accounted")) == ("final", 50.0, "removed", None)
+    await _done(ctl)
+
+    # --- (7) the process stops inside the minute: the withdrawn orders stay unverified on file, and the next controller reads
+    # them when the minute is up (the time they left the book is on the record) — the fill is booked
+    db = str(Path(folder) / "restart.preopen.sqlite3")
+    ctl, api, clock, c, pair, up, down, reads = await _placed(PREOPEN_DB=db)
+    at = clock.ms = ctl.account_at = c["cancel_ms"]
+    await ctl.cancel_many([pair], "到时撤单或真实交易暂停", free=True)
+    await _done(ctl)
+    api.rows[up["hash"]]["amountFilled"] = shares(20)
+    assert _p.unverified_outcomes(_p.read_rows(db), at + 10_000) == {("123", 1), ("123", 2)} and _p.fills_by_outcome(_p.read_rows(db), at + 10_000) == {}
+    again, _, clock2 = _controller_at(at + 10_000, PREOPEN_DB=db)
+    again.api = again.cancel_api = api
+    api.ctl = again
+    again.adopt()
+    pair = again.ledger.rows[c["slug"]]
+    assert (pair["phase"], pair.get("accounted"), again.due(at + minute - 1), [x["slug"] for x in again.due(at + minute)]) == ("closed", None, [], [c["slug"]])
+    await _read_finals(again, clock2)
+    assert (clock2.ms, pair["orders"]["up"]["state"], pair["orders"]["up"]["filled"], pair["orders"]["down"]["state"], pair.get("accounted")) == (at + minute, "final", 20.0, "final", None)
+    await _done(again)
+
+    # --- (8) a record an older version left "removed" with no time on it (its read in flight at the stop): read at the next
+    # try as before, and ended by the read a minute after that one; long past the window any read ends an order
+    ctl, api, clock, c, pair, up, down, reads = await _placed()
+    at = clock.ms = ctl.account_at = c["start_ms"] - 600_000
+    await ctl.cancel_many([pair], "设置不同，撤掉后重新报价", free=True)
+    await _settled(ctl)
+    for order in (up, down):
+        del order["gone_ms"]
+    pair["retry_ms"] = 0
+    await _read_finals(ctl, clock)
+    assert (clock.ms, len(reads), up["state"], down["state"], pair.get("accounted"), pair["retry_ms"]) == (at, 2, "removed", "removed", None, at + minute)
+    await _read_finals(ctl, clock)
+    assert (clock.ms, len(reads), up["state"], down["state"], pair["accounted"]) == (at + minute, 4, "final", "final", True)
+    assert ctl.final_read_ms({"gone_ms": c["start_ms"] + _p.GIVE_UP_MS - 1}, pair) > 0
+    clock.ms = c["start_ms"] + _p.GIVE_UP_MS
+    assert ctl.final_read_ms({"gone_ms": clock.ms}, pair) == 0, "past the give-up nothing waits"
+    await _done(ctl)
+
+
+with tempfile.TemporaryDirectory() as _folder:
+    asyncio.run(_late_fill(_folder))
 
 print("AUDIT_PREOPEN_OK")

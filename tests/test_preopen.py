@@ -126,6 +126,16 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         """The reconcile / verify tasks the loop would run: awaited here."""
         await asyncio.gather(*list(ctl.settling.values()), return_exceptions=True)
 
+    async def read_finals(self, ctl, clock, *pairs):
+        """The withdrawn pairs' next try as the cancellation loop makes it, the clock moved to it. Audit PRE-LATE-FILL: an
+        order off the book is ended by a read of its record made LATE_FILL_MS after it left, not by one right after the
+        removal — so a pair withdrawn with nothing filled is accounted at that try, a minute on, not at once."""
+        clock.ms = max(clock.ms, *(int(pair["retry_ms"]) for pair in pairs))
+        for pair in pairs:
+            self.assertIn(pair, ctl.due(clock.ms))
+            ctl.bookkeep(pair); ctl.launch_reconcile(pair)
+        await self.settle_tasks(ctl)
+
     async def test_identity_clock_and_all_three(self):
         ctl, api, clock = controller()
         for stem in ("btc", "unitree", "skhynix"):
@@ -205,12 +215,17 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(on(PREOPEN_MARKETS="").markets, frozenset({"BTC-15M"}))
 
     async def test_failure_cancels_other_side_and_never_resubmits_unknown(self):
-        ctl, api, _ = controller()
+        ctl, api, clock = controller()
         api.fail_side = 2
         c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
         await ctl.place_pair(c)
         self.assertEqual(api.removed, ["1"])
         pair = ctl.ledger.rows[c["slug"]]
+        self.assertEqual((pair["orders"]["down"]["state"], pair["orders"]["up"]["state"]), ("unknown", "removed"))  # Audit PRE-LATE-FILL: withdrawn, its record read LATE_FILL_MS on (this pinned "final" at once)
+        await self.read_finals(ctl, clock, pair)
+        self.assertEqual((clock.ms - NOW, pair["orders"]["down"]["state"], pair["orders"]["up"]["state"]), (p.RETRY_MS, "unknown", "removed"), "a try before the minute is up reads nothing of it")
+        clock.ms = NOW + p.LATE_FILL_MS
+        await ctl.cancel_pair(pair, pair["reason"])
         self.assertEqual((pair["orders"]["down"]["state"], pair["orders"]["up"]["state"]), ("unknown", "final"))
         self.assertEqual(ctl.risk(), 49.)  # the unknown side may exist; the removed side's record read: nothing filled, still reserved until the pair is accounted
         await ctl.place_pair(c)
@@ -219,15 +234,20 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_refusal_is_final_and_releases(self):
         """A definite refusal (post-only would cross) ends the order: nothing reserved for good, the other side withdrawn,
-        the pair accounted at once (the first revision kept it "unknown" with its money, and asked every half second)."""
-        ctl, api, _ = controller()
+        the pair accounted once that side's record is read (the first revision kept it "unknown" with its money, and asked
+        every half second). Audit PRE-LATE-FILL: that read is made LATE_FILL_MS after the removal — this pinned the pair
+        accounted at once, on the read right after it."""
+        ctl, api, clock = controller()
         api.reject_side = 2
         c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
         await ctl.place_pair(c)
         pair = ctl.ledger.rows[c["slug"]]
-        self.assertEqual((pair["orders"]["down"]["state"], pair["orders"]["up"]["state"], pair["phase"]), ("rejected", "final", "closed"))
+        self.assertEqual((pair["orders"]["down"]["state"], pair["orders"]["up"]["state"], pair["phase"]), ("rejected", "removed", "closed"))
         self.assertIn("would cross", pair["orders"]["down"]["error"])
-        self.assertTrue(pair["accounted"]) and self.assertEqual(pair["pnl"], 0.)
+        self.assertEqual((pair.get("accounted"), ctl.risk(), pair["retry_ms"]), (None, 24.5, NOW + p.LATE_FILL_MS))  # the withdrawn side reserved until its record is read; the refused one ties up nothing
+        self.assertEqual(ctl.due(NOW + p.LATE_FILL_MS - 1), [])
+        await self.read_finals(ctl, clock, pair)
+        self.assertEqual((pair["orders"]["up"]["state"], pair["accounted"], pair["pnl"]), ("final", True, 0.))
         self.assertEqual(ctl.risk(), 0.)
         self.assertEqual(ctl.due(NOW + 10 ** 9), [])  # nothing left to try
         ctl.stop.set()  # the stop itself is not a withdrawal: on_stop decides (1.128.2)
@@ -277,7 +297,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([x["slug"] for x in ctl.due(clock.ms)], [c["slug"]])
         await ctl.cancel_many([pair], "deadline")
         await self.settle_tasks(ctl)
-        self.assertEqual((pair["orders"]["up"]["state"], pair["orders"]["down"]["state"]), ("final", "open"))
+        self.assertEqual((pair["orders"]["up"]["state"], pair["orders"]["down"]["state"]), ("removed", "open"))  # (the removed one's record is read LATE_FILL_MS on: Audit PRE-LATE-FILL)
         self.assertEqual((pair["cancel_sent_ms"], pair["cancel_done_ms"]), (clock.ms, clock.ms))
         self.assertTrue(ctl.in_sprint(pair))
         self.assertEqual((pair["retry_ms"], pair["tries"]), (clock.ms + p.SPRINT_MS, 0))  # two seconds, the count untouched
@@ -316,7 +336,12 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(api.removed), {"1", "2"})
         self.assertEqual(pair["phase"], "closed")
         self.assertEqual(ctl.risk(), 49.)  # removed, fills not read yet
-        await self.settle_tasks(ctl)  # the reconcile the loop runs: both records final, nothing filled — released now, not at the result
+        await self.settle_tasks(ctl)
+        # Audit PRE-LATE-FILL: ...nor read right after the removal (this pinned the pair accounted there, on records that may not
+        # show the last seconds' matches yet): the loop's try comes LATE_FILL_MS on, and no read is made before it
+        self.assertEqual((pair.get("accounted"), ctl.risk(), pair["retry_ms"], ctl.due(pair["retry_ms"] - 1)), (None, 49., clock.ms + p.LATE_FILL_MS, []))
+        self.assertEqual({o["state"] for o in pair["orders"].values()}, {"removed"})
+        await self.read_finals(ctl, clock, pair)  # the reconcile the loop runs then: both records final, nothing filled — released a minute on, not at the result
         self.assertTrue(pair["accounted"])
         self.assertEqual((ctl.risk(), pair["pnl"]), (0., 0.))
         await self.finish(ctl)
@@ -333,7 +358,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([x["slug"] for x in ctl.due(clock.ms)], [c["slug"]])
         await ctl.cancel_many([pair], "deadline")
         await self.settle_tasks(ctl)
-        self.assertEqual((pair["orders"]["up"]["state"], pair["orders"]["down"]["state"], pair["phase"]), ("final", "open", "closing"))
+        self.assertEqual((pair["orders"]["up"]["state"], pair["orders"]["down"]["state"], pair["phase"]), ("removed", "open", "closing"))  # (up's record is read LATE_FILL_MS on: Audit PRE-LATE-FILL)
         self.assertEqual(ctl.risk(), 49.)
         asked = api.removed.count("2")
         self.assertEqual(ctl.due(clock.ms), [])
@@ -347,10 +372,15 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(api.removed.count("2"), asked)
         self.assertEqual(pair["retry_ms"] - clock.ms, p.RETRY_MAX_MS)  # capped
         self.assertGreater(pair["tries"], tries)
+        self.assertEqual(pair["orders"]["up"]["state"], "final", "read by the tries that came a minute after it left the book")
         api.stuck.clear()
         clock.ms = pair["retry_ms"]
         ctl.bookkeep(pair); ctl.launch_reconcile(pair)
         await self.settle_tasks(ctl)
+        # Audit PRE-LATE-FILL: removed now — its record ends it at the next try, not on a read right after the removal (this
+        # pinned the pair accounted here)
+        self.assertEqual((pair["orders"]["down"]["state"], pair["phase"], pair.get("accounted"), ctl.risk()), ("removed", "closed", None, 49.))
+        await self.read_finals(ctl, clock, pair)
         self.assertEqual((pair["orders"]["down"]["state"], pair["phase"], pair["accounted"], ctl.risk()), ("final", "closed", True, 0.))
         await self.finish(ctl)
 
@@ -466,7 +496,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         c2 = p.candidate(market(at=NOW + 30 * 60_000, mid=7), NOW, ctl.owner.config, ctl.settings)
         await ctl.place_pair(c2)
         pair = ctl.ledger.rows[c2["slug"]]
-        self.assertEqual((pair["orders"]["up"]["state"], pair["orders"]["down"]["state"], pair["phase"]), ("final", "not_sent", "closed"))
+        self.assertEqual((pair["orders"]["up"]["state"], pair["orders"]["down"]["state"], pair["phase"]), ("removed", "not_sent", "closed"))  # (withdrawn; its record is read LATE_FILL_MS on: Audit PRE-LATE-FILL)
         self.assertIn("限流冷却中", pair["orders"]["down"]["error"])
         self.assertIn("3", api.removed)  # the first side withdrawn
         api.create_order = original
@@ -1282,7 +1312,14 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             pair = bigger.ledger.rows[c["slug"]]
             self.assertEqual((pair["phase"], pair["reason"], bigger.resumed), ("closing", "设置不同，撤掉后重新报价", 0))
             await bigger.cancel_pair(pair, pair["reason"])
-            self.assertEqual((set(api.removed), pair["accounted"], bigger.supersedable(pair)), ({"1", "2"}, True, True))
+            # Audit PRE-LATE-FILL: withdrawn, but not accounted — nor quoted again — on a read right after the removal (this pinned
+            # both): the records are read LATE_FILL_MS on, and the window waits for them
+            self.assertEqual((set(api.removed), pair.get("accounted"), bigger.supersedable(pair)), ({"1", "2"}, None, False))
+            await bigger.discover()
+            self.assertEqual((bigger.queue.qsize(), bigger.scan_state["pending"]), (0, 1), "the withdrawn level waits for its final reads")
+            await self.read_finals(bigger, bclock, pair)
+            self.assertEqual((pair["accounted"], bigger.supersedable(pair)), (True, True))
+            bigger.account_at = bclock.ms
             await bigger.discover()
             self.assertEqual((bigger.queue.qsize(), bigger.requoted, c["slug"] in bigger.ledger.rows), (1, 1, False))
             old_key = c["slug"] + "@0"  # the window and the attempt that stepped aside
@@ -1301,6 +1338,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(pair.get("free") and not p.counts_against(pair))
             fresh["attempt"] = p.MAX_ATTEMPTS - 1
             await bigger.cancel_pair(fresh, "test")
+            await self.read_finals(bigger, bclock, fresh)  # (its records read LATE_FILL_MS after the removal: Audit PRE-LATE-FILL)
             self.assertTrue(fresh["accounted"] and bigger.supersedable(fresh), "one failure: quoted again, whatever the salt's attempt")
             self.assertFalse(bigger.supersedable(fresh, strikes=p.MAX_ATTEMPTS))
             fresh["attempt"] = 0
@@ -1453,6 +1491,10 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         clock.ms += 10_000; ctl.account_at = clock.ms; ctl.listed_ids = set()
         await ctl.monitor_pair(pair)
         await self.settle_tasks(ctl)
+        # Audit PRE-LATE-FILL: the refusal is noted and the other side withdrawn there and then; the two records end their orders
+        # on a read LATE_FILL_MS on, not on this one (this pinned the pair accounted here) — never quoted again either way
+        self.assertEqual((up["state"], up.get("refused"), pair.get("accounted"), ctl.supersedable(pair), pair["phase"]), ("removed", True, None, False, "closed"))
+        await self.read_finals(ctl, clock, pair)
         self.assertEqual((up["state"], up.get("refused"), pair["accounted"], ctl.supersedable(pair)), ("final", True, True, False))
         # a record Predict still shows open past the give-up: final as known
         stuck = {**pair, "slug": "btc-updown-15m-stuck", "phase": "closing", "accounted": False,
@@ -1585,10 +1627,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl.settings = dataclasses.replace(ctl.settings, limit_gap_pct=0.0)
         self.assertEqual(ctl.card_hold(unitree), "", "PREOPEN_LIMIT_GAP_PCT=0: off")
         ctl.settings = dataclasses.replace(ctl.settings, limit_gap_pct=2.0)
-        # the hold lifts: the withdrawn pair, accounted, is quoted again
+        # the hold lifts: the withdrawn pair, accounted, is quoted again — accounted by the read of its records LATE_FILL_MS after
+        # the removal (Audit PRE-LATE-FILL), not by one right after it (this pinned it accounted by then)
+        await self.settle_tasks(ctl)
+        self.assertEqual((pair.get("accounted"), ctl.supersedable(pair)), (None, False))
+        await self.read_finals(ctl, clock, pair)
         ctl.owner.updowns["SKHYNIX-15M"].lead = quote("110000")
         ctl.owner.updowns["UNITREE-15M"].lead = quote("110", "100")
-        await self.settle_tasks(ctl)
         clock.ms += p.CARD_CHECK_MS
         await ctl.check_cards(clock.ms)
         self.assertEqual((ctl.card_holds, pair["accounted"], ctl.supersedable(pair)), ({}, True, True))
@@ -1849,6 +1894,11 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         sizes = self.count_removals(api)
         task = asyncio.create_task(ctl.cancellation_loop())
         try:
+            # Audit PRE-LATE-FILL: removed in batches — and each order's record read LATE_FILL_MS after it left the book, not right
+            # after the removal (this waited for "final" with the clock standing still)
+            await self.until(lambda: all(pr["phase"] == "closed" for pr in pairs))
+            self.assertEqual(({o["state"] for pr in pairs for o in pr["orders"].values()}, any(pr.get("accounted") for pr in pairs)), ({"removed"}, False))
+            clock.ms += p.LATE_FILL_MS
             await self.until(lambda: all(o["state"] == "final" for pr in pairs for o in pr["orders"].values()))
         finally:
             ctl.stop.set()
@@ -1871,6 +1921,12 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ctl.status().startswith("开盘前自动预挂：收尾中（预挂模式已关闭）：不再新挂"), ctl.status())
         self.assertIn("还可能挂着 60 张", ctl.status())
         task = asyncio.create_task(ctl.cancellation_loop())
+        # Audit PRE-LATE-FILL: nothing rests any more — but the mode stops only once the withdrawn orders' records are read, and
+        # that is LATE_FILL_MS after they left the book, not right after the removal (this waited with the clock standing still)
+        await self.until(lambda: all(pr["phase"] == "closed" for pr in pairs))
+        await asyncio.sleep(0.6)  # (a pass of the loop with nothing left on the book)
+        self.assertEqual((ctl.stop.is_set(), any(pr.get("accounted") for pr in pairs), len(api.removed)), (False, False, 60))
+        clock.ms += p.LATE_FILL_MS
         await asyncio.wait_for(ctl.stop.wait(), 5)  # wound up: it stops itself
         await asyncio.gather(task, return_exceptions=True)
         self.assertTrue(all(pr["accounted"] for pr in pairs) and len(api.removed) == 60 and len(sizes) <= 4, sizes)
