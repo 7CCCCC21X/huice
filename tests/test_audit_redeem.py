@@ -508,4 +508,50 @@ async def round_lock_stall():
 asyncio.run(round_lock_stall())
 
 
+# --- RDM-ROW-ABORT --------------------------------------------------------------------------------------------------------------
+async def row_abort():
+    """RDM-ROW-ABORT: an index set int() cannot read ('YES' on a row, '1.0' on a market's outcome) raised out of the pass — every
+    round ended there (读取持仓失败 …invalid literal…), /live redeem check answered one line, and under the rotation the odd row's
+    market, never read, sorted first every round: nothing at all redeemed. A row whose amount is no whole number, or that names no
+    market, was dropped without a word. Each is now 缺字段 with its reason — no read, no transaction, no mark, never a guessed
+    side — and the round goes on; an emptied row (amount 0) stays out of the count as before."""
+    bot = await ready_bot()
+    fake, chain = bot.live.api, bot.live.chain
+    odd_market = mk(902, won=1)
+    odd_market["outcomes"][0]["indexSet"] = "1.0"  # the market's own outcome: no whole number
+    fake.markets.update({"900": mk(900, won=1), "902": odd_market, "903": mk(903, won=1), "901": mk(901, won=1), "905": mk(905)})
+    fake.positions_rows = [{**held(900), "outcome": {"name": "Up", "indexSet": "YES"}},  # the row's index set: no number
+                           held(902),
+                           {**held(903), "amount": "7.5"},  # an amount that is no whole number of wei
+                           {"id": "pX", "market": "?", "outcome": {"name": "Up", "indexSet": 1}, "amount": str(4 * WEI)},  # no market id
+                           {**held(904), "amount": "0"},  # emptied: nothing held
+                           held(905),  # open
+                           held(901, shares=25)]  # an ordinary winner, listed last
+    sent = notices(bot)
+    await auto_round(bot)
+    last = bot.live_redeem_last
+    assert not last.get("error"), last  # (before: 读取持仓失败 / 这一轮中途出错：invalid literal for int() with base 10: 'YES')
+    assert [(cid, index_set, amount) for cid, index_set, amount, *_ in chain.redeemed] == [(cond(901), 1, 25 * WEI)], chain.redeemed
+    assert last["counts"] == {"redeemed": 1, "fields": 4, "open": 1}, last
+    assert not any(bot.store.get(f"live:redeemed:{mid}:{i}") for mid in ("900", "902", "903") for i in (0, 1, 2)), "no mark, never a guess"
+    assert bot.live_redeem_summary(last) == "持仓 6 个：领了 1，缺字段 4，未结算 1", bot.live_redeem_summary(last)
+    assert [k for k, _ in sent] == [""] and "已领取 window 901 Up 25 份" in sent[0][1], sent  # the 💵 line, and nothing else
+    report = await bot.live_redeem_report(NOW + MIN)
+    assert report.startswith("🔎 自动领取自检") and "缺字段：" in report, report
+    for why in ("持仓的 indexSet 读不懂（'YES'），分不出是哪一边", "市场详情读不懂（", "持仓的份数（amount）读不懂（'7.5'）", "持仓没写市场编号"):
+        assert why in report, (why, report)
+    # the round after: the open market resolved in the bot's favour is redeemed (the odd row before it holds nothing up)
+    fake.markets["905"] = mk(905, won=1)
+    await auto_round(bot)
+    assert [cid for cid, *_ in chain.redeemed] == [cond(901), cond(905)] and not bot.live_redeem_last.get("error"), (chain.redeemed, bot.live_redeem_last)
+    # a row with no index set at all keeps its old words
+    fake.positions_rows = [{**held(906), "outcome": {"name": "Up"}}]
+    fake.markets["906"] = mk(906, won=1)
+    assert "持仓没写 indexSet，分不出是哪一边" in await bot.live_redeem_report(NOW + 2 * MIN)
+    print("RDM_ROW_ABORT_OK")
+
+
+asyncio.run(row_abort())
+
+
 print("AUDIT_REDEEM_OK")

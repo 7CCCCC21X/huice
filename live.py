@@ -4282,13 +4282,28 @@ class LiveBot(core.Bot):
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
             outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
             mid = market_of(row)
+            # 1.150.0 (audit RDM-ROW-ABORT): one row the pass cannot read is that row's problem, never the round's. An index set int()
+            # cannot read ('YES', '1.0', a list) raised out of the pass — every round (and /live redeem check) ended at that row, and
+            # under the rotation its market, never read, sorted first every round: nothing at all redeemed. A row whose amount is no
+            # whole number of wei, or that names no market, was dropped without a word (a false all-clear if every row came so).
+            # Each is now 缺字段 with its reason: shown and counted, no market read, no transaction, no mark — never a guess at a side
+            # or an amount (a guessed side can redeem the wrong one or mark a winner lost). An emptied row (amount 0) stays uncounted.
             try:
                 amount = int(str(row.get("amount") or "0"))
             except ValueError:
-                amount = 0
-            if not mid or amount <= 0:
+                amount = None  # stated, but no whole number of wei: unreadable, which is not "nothing held"
+            if amount is None or (not mid and amount > 0):
+                seen.append({"title": str(market.get("title") or market.get("question") or mid or "?"), "outcome": str(outcome.get("name") or "?"),
+                             "shares": 0.0 if amount is None else from_wei(amount), "market_id": mid, "index_set": 0, "kind": "fields",
+                             "error": f"持仓的份数（amount）读不懂（{core.brief_error(repr(row.get('amount')), 40)}）" if amount is None else "持仓没写市场编号"})
                 continue
-            index_set = int(outcome.get("indexSet") or 0)
+            if amount <= 0:
+                continue  # nothing held (an emptied position still listed): nothing to redeem, in no count — as before
+            unreadable = ""
+            try:
+                index_set = int(outcome.get("indexSet") or 0)
+            except (TypeError, ValueError, OverflowError):
+                index_set, unreadable = 0, f"持仓的 indexSet 读不懂（{core.brief_error(repr(outcome.get('indexSet')), 40)}），分不出是哪一边"
             key = f"live:redeemed:{mid}:{index_set}"
             entry = {"title": str(market.get("title") or market.get("question") or mid), "outcome": str(outcome.get("name") or index_set or "?"),
                      "shares": from_wei(amount), "market_id": mid, "index_set": index_set}
@@ -4304,7 +4319,7 @@ class LiveBot(core.Bot):
                     pull.append(key)  # a round inside its wait: the pull to the wait's end stands
                 continue
             if not index_set:
-                seen.append({**entry, "kind": "fields", "error": "持仓没写 indexSet，分不出是哪一边"})
+                seen.append({**entry, "kind": "fields", "error": unreadable or "持仓没写 indexSet，分不出是哪一边"})
                 continue
             if mid not in markets:
                 if limited or len(markets) >= self.LIVE_REDEEM_READS:
@@ -4325,8 +4340,12 @@ class LiveBot(core.Bot):
             if raw is None:
                 seen.append({**entry, "kind": "unread", "error": read_errors.get(mid, "")})
                 continue
-            info = parse_market(raw, self.config.predict_fee_bps)
-            resolved = core.predict_resolution(raw)
+            try:  # (RDM-ROW-ABORT) the market's own JSON in a shape these cannot read: this position alone — not redeemed, not marked lost
+                info = parse_market(raw, self.config.predict_fee_bps)
+                resolved = core.predict_resolution(raw)
+            except Exception as error:
+                seen.append({**entry, "kind": "fields", "error": f"市场详情读不懂（{core.clean_error(error) or type(error).__name__}），判断不了输赢"})
+                continue
             if not core.PredictFeed.market_settled({"status": info.status}) or resolved is None:
                 seen.append({**entry, "kind": "open", "status": info.status or "?"})
                 continue
