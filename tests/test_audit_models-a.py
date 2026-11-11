@@ -491,4 +491,190 @@ assert lb.live_taker_recheck(_pending(True, 0.36), W4) == (f"盘口变了：{sta
 assert lb.live_taker_recheck(_pending(False, 0.37), W4) == (f"卡片暂不建议（{stale}；暂不给建议），3 秒前的吃单决定作废", False)
 assert lb.live_taker_stale(_pending(False, 0.37), _mk(lb, "BTC-15M", W4), W4) == f"卡片暂不建议（{stale}；暂不给建议），剩余吃单撤掉"
 
+
+# --- MOD-NVDA-FROZEN-INDEX: NVDA 先触 $160 / $210 (StockTouchMarket) takes Binance's NVDAUSDT futures index as its live price
+# in the session (1.147.0), Yahoo's 30-second trade being the check on it and the fallback. The index counted as live by its
+# delivery alone — a push's event time E, a premiumIndex read's server time: both new every second whether or not the value
+# behind them moved. So an index stalled at one value while the stock went on trading stayed the price for as long as it kept
+# within 2% of Yahoo's trade, and that trade priced nothing: ten minutes of it with the stock up 1.9% put the "$210 first"
+# fair price 6.4¢ off with no hold on the card, and under a 3¢ bar the taker bought the other side above its worth. Now a
+# value delivered unchanged for over INDEX_STILL_MS (15 s, by the deliveries' own times) is refused and the next Yahoo read
+# prices the card — every read after it too: the standing value is not taken back — until the index moves again. Both ways
+# the index reaches the card: raw markPrice frames → BinanceStream.frame → Bot.price_pushed, and the NVDA-15M card's
+# premiumIndex read → Bot.refresh_touch ----
+import json, urllib.parse  # noqa: E401,E402
+
+NV0 = m.et_wall_ms(dt.date(2026, 11, 10), 11, 0)        # Tuesday 11:00 ET: the regular session running
+NV_CREATED = m.et_wall_ms(dt.date(2026, 11, 2), 10, 0)  # the market's creation (Predict's createdAt)
+NVDA = next(s for s in m.TOUCH_MARKETS if s.key == "NVDA-2027")
+NV_LAG = 150                  # a delivery's own time (the push's E, the read's server time) is this long before the bot's clock
+NV_STALL, NV_END = 120, 720   # seconds after NV0: the index's last change before it stalls; ten minutes on, when it moves again
+
+
+def _nv_index(k: int) -> str:
+    """Binance's index k seconds after NV0: a new value every second, but for a quiet 20 s (70–90: the stock itself
+    still) — then stalled at 185.00 from NV_STALL to NV_END, and after that moving again where the stock is."""
+    if k > NV_END:
+        return f"{_nv_stock(k):.2f}"
+    return "185.00" if 70 <= k <= 90 or k >= NV_STALL else f"{185 + 0.01 * (k % 5):.2f}"
+
+
+def _nv_stock(k: int) -> float:
+    """The stock (Yahoo's trade): where the index is while that lives; from NV_STALL on up $3.50 every ten minutes (+1.9%)."""
+    return float(_nv_index(k)) if k < NV_STALL else 185.0 + 3.5 * (k - NV_STALL) / 600
+
+
+class _NvYahoo:
+    """Yahoo's chart feed on the bot's clock: a year of daily bars (±1% a day: σ 15.8%), today's minutes (nowhere near a
+    line), the stock's last trade five seconds old."""
+    def __init__(self, clock: _Clock): self.clock = clock
+
+    async def fetch(self, url: str, extra: object = None, record: bool = True) -> bytes:
+        q, now = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query)), self.clock.now
+        assert "/NVDA?" in url and q.get("interval") in ("1m", "1d"), url
+        price = when = None
+        if q["interval"] == "1d":
+            bars, day = [], m.et_date(NV0) - dt.timedelta(days=365)
+            while day < m.et_date(NV0):
+                if m.us_session(day):
+                    close = 185.0 * (1.01 if len(bars) % 2 else 1.0)
+                    bars.append((m.us_session(day)[0], close * 0.999, close * 1.005, close * 0.995, close))
+                day += dt.timedelta(days=1)
+        else:
+            price, when = _nv_stock((now - NV0) // 1000), now // 1000 - 5
+            bars = [(o, price, price + 0.1, price - 0.1, price) for o in range(m.us_session(m.et_date(NV0))[0], now, 60_000)]
+        col = lambda n: [b[n] for b in bars]
+        return json.dumps({"chart": {"result": [{"meta": {"regularMarketPrice": price, "regularMarketTime": when, "gmtoffset": -18000},
+                                                 "timestamp": [b[0] // 1000 for b in bars],
+                                                 "indicators": {"quote": [{"open": col(1), "high": col(2), "low": col(3), "close": col(4)}]}}],
+                                     "error": None}}).encode()
+
+
+async def _nv_idle(now_ms: int) -> None:
+    return None
+
+
+async def _nv_stalled(rest: bool) -> None:
+    """Twelve minutes of a real Bot, second by second: the index delivered (a pushed frame — or, ``rest``, the 15-minute
+    card's read with the stream mute), the first-touch round (Bot.refresh_touch), Yahoo's read every 30 s."""
+    clock = _Clock(NV0)
+    bot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                   "SIM_MARKETS": "touch", "SIM_EDGE_CENTS": "3"}), m.Store(":memory:"), clock, None)
+    card, nvda15, stream = bot.touches["NVDA-2027"], bot.updowns["NVDA-15M"], bot.binance_streams["futures"]
+    assert isinstance(card, m.StockTouchMarket) and bot.index_markets["NVDAUSDT"] == [nvda15] and "NVDAUSDT" in stream.symbols()
+    for key, touch in bot.touches.items():
+        if key != "NVDA-2027":
+            touch.refresh = _nv_idle  # the crypto first-touch cards read Binance: not this test's business
+    card.start_ms = NV_CREATED
+    bot.predict.info[NVDA.slug] = {"outcomes": ["$160", "$210"], "created_ms": NV_CREATED}
+    m.fetch_source = _NvYahoo(clock).fetch
+
+    async def premium_index(path: str, **params: object) -> dict:  # the 15-minute card's read: the index now, the server's time
+        assert path == "premiumIndex" and params == {"symbol": "NVDAUSDT"}, (path, params)
+        return {"symbol": "NVDAUSDT", "markPrice": "185.05", "indexPrice": _nv_index((clock.now - NV0) // 1000), "time": clock.now - NV_LAG}
+    nvda15.futures = premium_index
+    await card.refresh(NV0)
+    assert card.error == "" and card.price == D("185.0000") and not card.index_live and card.advice_problem(NV0) == "", (card.error, card.price)
+    sources: list[tuple[int, str]] = []  # each change of where the card's price is from: (the second, "index" | "Yahoo")
+
+    async def second(k: int) -> None:
+        clock.now = NV0 + k * 1000
+        if rest:
+            await nvda15.read_price(clock.now)
+        else:
+            await stream.frame(None, json.dumps({"e": "markPriceUpdate", "E": clock.now - NV_LAG, "s": "NVDAUSDT", "p": "185.05", "i": _nv_index(k)}))
+        if k % 30 == 0:
+            card.times["price"] = -1e9  # Yahoo's read is due
+        await bot.refresh_touch(clock.now)
+        source = "index" if card.index_live else "Yahoo"
+        if not sources or sources[-1][1] != source:
+            sources.append((k, source))
+
+    at = lambda k: NV0 + k * 1000 - NV_LAG  # the time of the delivery of second k
+    # 1. the index moving every second: it is the price, through Yahoo's reads at 30 s and 60 s (the trade kept as the check)
+    for k in range(1, 70):
+        await second(k)
+    assert sources == [(1, "index")] and (card.price, card.priced_ms, card.yahoo[0]) == (D("185.04"), at(69), D("185.0000")), (sources, card.price)
+    # 2. a quiet 20 s, the stock itself still: the value is taken for its first 15 s; Yahoo's read at 90 s finds the price
+    #    in hand 5 s old and leaves the card on the index, and the next move is the price again — a pause is not a stall
+    for k in range(70, 91):
+        await second(k)
+        assert card.index_live and (card.price, card.priced_ms) == (D("185.00"), at(min(k, 85))), (k, card.price, card.priced_ms - NV0)
+    for k in range(91, NV_STALL + 1):
+        await second(k)
+        assert card.index_live and (card.price, card.priced_ms) == (D(_nv_index(k)), at(k)), (k, card.price, card.priced_ms - NV0)
+    assert sources == [(1, "index")], sources
+    # 3. the index stalls at 185.00 — delivered every second all the same, a time of its own on each — while the stock climbs
+    #    1.9% in ten minutes. Taken for 15 s more, then refused; Yahoo's read at 150 s, the price in hand over 15 s old by
+    #    then, takes the card, and so does every read after it: the standing value, never 2% from the trade, is not taken
+    #    back. (Before: the index all ten minutes, the card at 185.00 with the stock at 188.50)
+    for k in range(NV_STALL + 1, NV_END + 1):
+        await second(k)
+        if k < NV_STALL + 30:
+            assert card.index_live and (card.price, card.priced_ms) == (D("185.00"), at(min(k, NV_STALL + 15))), (k, card.price, card.priced_ms - NV0)
+        else:
+            read = k - k % 30  # Yahoo's last read: the stock then, its trade 5 s before
+            assert not card.index_live and card.price == card.yahoo[0] == D(f"{_nv_stock(read):.4f}") and card.priced_ms == NV0 + read * 1000 - 5_000, (k, card.price)
+    assert sources == [(1, "index"), (NV_STALL + 30, "Yahoo")], sources
+    now = clock.now
+    assert card.price == D("188.5000") and card.SOURCE == "Yahoo 行情（NASDAQ:NVDA，代 Pyth）" and math.log(188.5 / 185.0) < card.INDEX_MAX_GAP
+    # the odds are the stock's, 6.4¢ from the stalled index's, and still advised on (the card is fresh: Yahoo's trade)
+    years = card.remaining_years(now)
+    truth = m.first_touch(188.5, 160.0, 210.0, card.sigma, 0.0, years).fair_upper    # "$210 first" at the stock's price
+    stalled = m.first_touch(185.0, 160.0, 210.0, card.sigma, 0.0, years).fair_upper  # ...and at the stalled index
+    assert 0.06 < truth - stalled < 0.07 and card.odds(now) == m.first_touch(188.5, 160.0, 210.0, card.sigma, 0.0, years), (truth, stalled, card.odds(now))
+    assert card.advice_problem(now) == "" and not card.price_stale(now)
+    pay = bot.touch_payload(card, now)  # the page says which price it is
+    assert (pay["source"], pay["touch"]["price"], pay["fair_up"]) == (card.SOURCE, "188.50", truth), pay
+    # Predict's book has the stock's move in it: "$160 first" bid and offered a cent either side of its worth. Priced on the
+    # stalled index the card had that side 6.4¢ too dear, and a 3¢ bar (a preset of the control page) took the offer — 300
+    # shares a cent over their worth, a real order with LIVE on. Priced on the stock there is nothing to buy on either side
+    ask = D(f"{1 - truth + 0.01:.2f}")
+    assert (1 - stalled) - float(ask) > 0.03 + 0.01 and float(ask) > 1 - truth, (ask, truth, stalled)  # the bar cleared by a cent; a loss at the stock's price
+    bot.predict.books["NVDA-2027"] = m.PredictBook("NVDA-2027", NVDA.slug, "77", "t", ((ask - D("0.02"), D("500")),), ((ask, D("500")),), now, None)
+    mk = _mk(bot, "NVDA-2027", now)
+    assert (mk.kind, mk.hold, mk.fair_up) == ("touch", "", truth), (mk.hold, mk.fair_up)
+    await (await bot.sim_decide(now))
+    await bot.sim_express_look("NVDA-2027", now)
+    assert bot.sim_trades() == {}, [(t["label"], t["shares"], t["price"]) for t in bot.sim_trades().values()]  # (before: 吃160, 300 shares at the 43¢ offer)
+    # 4. the index moves again: the price at once
+    await second(NV_END + 1)
+    assert sources[-1] == (NV_END + 1, "index") and (card.price, card.priced_ms) == (D(_nv_index(NV_END + 1)), at(NV_END + 1)), (sources, card.price)
+    assert card.SOURCE == "币安合约 NVDAUSDT 指数价（交易时段每秒更新，Yahoo 核对）" and abs(float(card.price) - _nv_stock(NV_END + 1)) < 0.01
+
+
+_nv_fetch = m.fetch_source
+for rest in (False, True):
+    asyncio.run(_nv_stalled(rest))
+m.fetch_source = _nv_fetch
+# the limits those seconds rest on: 15 s without a delivery (1.147.0), 15 s without a change of the value, 2% from Yahoo's trade
+assert (m.StockTouchMarket.INDEX_STALE_MS, m.StockTouchMarket.INDEX_STILL_MS, m.StockTouchMarket.INDEX_MAX_GAP) == (15_000, 15_000, 0.02)
+
+# the open: an index that has stood at one value since before it (Binance's sources not on the session yet; a closure the
+# calendar does not know) is not the price at 09:30 on the strength of its deliveries' times — it was, from the first second —
+# and is from its first move on
+NV_OPEN = m.et_wall_ms(dt.date(2026, 11, 10), 9, 30)
+nv = m.StockTouchMarket(m.Store(":memory:"), NVDA)
+nv.yahoo = (D("185.0000"), m.et_wall_ms(dt.date(2026, 11, 9), 16, 0))  # Monday's close, read before the open
+nv.price, nv.priced_ms = nv.yahoo
+for s in range(-120, 3):
+    assert not nv.note_index(D("185.40"), NV_OPEN + s * 1000 - NV_LAG, NV_OPEN + s * 1000) and not nv.index_live and nv.price == D("185.0000"), s
+assert nv.note_index(D("185.52"), NV_OPEN + 3_000 - NV_LAG, NV_OPEN + 3_000) and nv.index_live and nv.price == D("185.52")
+# ...taken while it stands for 15 s, by the deliveries' own times, and no longer
+for s in range(4, 24):
+    assert not nv.note_index(D("185.52"), NV_OPEN + s * 1000 - NV_LAG, NV_OPEN + s * 1000) and nv.priced_ms == NV_OPEN + min(s, 18) * 1000 - NV_LAG, s
+# a frame delivered late (a stalled socket catching up: 16 s old) is no news of the index as it is now — the other value in
+# it does not start the standing one's clock afresh; one on time does (the index did move), and then it is the price
+late = NV_OPEN + 24_000
+assert not nv.note_index(D("185.30"), late - 16_000, late)
+assert not nv.note_index(D("185.52"), late + 1_000 - NV_LAG, late + 1_000) and nv.priced_ms == NV_OPEN + 18_000 - NV_LAG
+assert nv.note_index(D("185.30"), late + 2_000 - NV_LAG, late + 2_000) and (nv.price, nv.priced_ms) == (D("185.30"), late + 2_000 - NV_LAG)
+assert nv.note_index(D("185.52"), late + 3_000 - NV_LAG, late + 3_000) and (nv.price, nv.priced_ms) == (D("185.52"), late + 3_000 - NV_LAG)
+# nothing else of 1.147.0's rule moves: a delivery over 15 s old, one not newer than the price in hand, one 2% from Yahoo's
+# trade and one after the close are refused as they were
+assert not nv.note_index(D("185.60"), late + 3_000 - NV_LAG, late + 4_000) and not nv.note_index(D("185.60"), late - 12_000, late + 4_000)
+assert not nv.note_index(D("189.00"), late + 5_000 - NV_LAG, late + 5_000) and nv.price == D("185.52") and nv.index_live
+closed = m.et_wall_ms(dt.date(2026, 11, 10), 16, 0)
+assert not nv.note_index(D("185.70"), closed - NV_LAG, closed) and nv.price == D("185.52")
+
 print("AUDIT_MODELS_A_OK")

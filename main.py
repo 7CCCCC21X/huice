@@ -10779,8 +10779,10 @@ class StockTouchMarket(TouchMarket):
         self.failures = {"price": "", "scan": ""}
         self.yahoo: tuple[D, int] | None = None  # (Yahoo's last trade, its time): the check on the index, the price when it is not live
         self.index_live = False  # the price in hand is Binance's futures index (note_index), not Yahoo's trade
+        self.index_seen: tuple[D, int] | None = None  # (the index as last delivered, when that value first came): standing still, it ages (note_index)
 
     INDEX_STALE_MS = 15_000      # 1.147.0: Binance's index older than this is not live: Yahoo's trade prices the card
+    INDEX_STILL_MS = 15_000      # 1.150.0: ...nor one whose value has not changed for this long, delivered every second though it is: a stalled index
     INDEX_MAX_GAP = 0.02         # ...nor an index further than this (ln) from Yahoo's trade: another instrument, a bad print
 
     @property
@@ -10793,9 +10795,24 @@ class StockTouchMarket(TouchMarket):
         """Binance's futures index of the stock (the 15-minute card's: pushed every second, read every second without the
         push), 1.147.0: while the regular session runs, fresh and within INDEX_MAX_GAP of Yahoo's trade, it is the price —
         Yahoo's 30-second reads lagged the stock by up to half a minute, a few cents of fair price between the lines.
-        True when it moved the price (the express lane looks then)."""
-        if (price is None or not price > 0 or self.yahoo is None or us_session_state(now_ms)[0] != "交易中"
-                or now_ms - at_ms > self.INDEX_STALE_MS or at_ms <= (self.priced_ms if self.index_live else 0)
+        True when it moved the price (the express lane looks then).
+        1.150.0: fresh by its value too, not by its delivery alone. A push's event time (a read's server time) is new
+        every second whether or not the index behind it moved, so an index stalled at one value while the stock went
+        on trading (its sources stuck; a closure the calendar does not know) passed as live for as long as it stayed
+        within INDEX_MAX_GAP of Yahoo's trade — and while it did, that trade, read every 30 s, priced nothing: ten
+        minutes of it with the stock up 1.9% were 6.4¢ of fair price, advised on. Now a value delivered unchanged for
+        over INDEX_STILL_MS (by the deliveries' own times) is refused: the price in hand is left to age, and the Yahoo
+        read that finds it over INDEX_STALE_MS old prices the card (refresh, as when the index goes quiet: half a
+        minute to a minute after the index last moved), as does each read after it — the standing value is not taken
+        back — until the index moves. Where the index stands still because the stock does (a halt), Yahoo's trade is
+        that same price: nothing is lost by it."""
+        if price is None or not price > 0 or now_ms - at_ms > self.INDEX_STALE_MS:
+            return False  # nothing, or a delivery come late (a stalled socket catching up): no news of the index as it is now
+        if self.index_seen is None or price != self.index_seen[0]:
+            self.index_seen = (price, at_ms)  # a new value — in the session or out of it, whichever price the card is on: its clock starts
+        if (self.yahoo is None or us_session_state(now_ms)[0] != "交易中"
+                or at_ms <= (self.priced_ms if self.index_live else 0)
+                or at_ms - self.index_seen[1] > self.INDEX_STILL_MS
                 or abs(math.log(float(price) / float(self.yahoo[0]))) > self.INDEX_MAX_GAP):
             return False
         moved = price != self.price
