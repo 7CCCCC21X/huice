@@ -3486,7 +3486,20 @@ class LiveBot(core.Bot):
         st = trade["live"]
         row = by_hash.get(st.get("hash", ""))
         if row is None and st.get("hash"):
-            row = await self.live.api.order("", st["hash"])
+            try:
+                row = await self.live.api.order("", st["hash"])
+            except Exception as error:
+                # 1.150.0 (XR-409-HASH-ERROR): a hash read that keeps failing (success=false, a 4xx other than 404, a 5xx) used to
+                # abort this every step before the grace test, so the record stayed "placing" for good: reserved, its side blocked,
+                # no alert and out of /live release's reach. Past the grace it is "unknown" as a "no such order" makes it: still
+                # reserved and blocking, the ❓ alert sent, /live release open to an operator, and live_recheck's expiry backstop
+                # (LIVE-RECHECK-ERROR) left to decide by the positions. Nothing is released on the error itself
+                if st.get("state") != "placing":
+                    return  # another path took the record on while the read was out
+                if now_ms - int(st.get("placing_at") or 0) <= self.LIVE_PLACING_GRACE_MS:
+                    raise
+                st["last_error"] = core.clean_error(error) or type(error).__name__
+                return self.live_unknown(tid, trade, f"下单后无法确认 Predict 是否收到，按哈希查询也出错（{st['last_error']}）", now_ms)
         if row is not None:
             # withdrawn meanwhile: found, it is cancelled next, never tracked as open
             st.update(state="cancelling" if trade.get("withdrawn") else "open", order_id=str(row.get("id") or ""),
@@ -3583,7 +3596,16 @@ class LiveBot(core.Bot):
             if not st.get("hash"):
                 return self.live_finish(tid, trade, {"status": "CANCELLED"}, mk, now_ms)  # never built, never sent
             # the request may have reached Predict although no order id came back: ask by the hash first
-            row = await self.live.api.order("", st["hash"])
+            try:
+                row = await self.live.api.order("", st["hash"])
+            except Exception as error:
+                # 1.150.0 (XR-409-HASH-ERROR): as in live_reconcile — a failing read held the withdrawn record "cancelling" for good
+                if st.get("state") != "cancelling" or st.get("order_id"):
+                    return  # another path took the record on while the read was out
+                if now_ms - int(st.get("placing_at") or st.get("placed_at") or now_ms) <= self.LIVE_PLACING_GRACE_MS:
+                    raise
+                st["last_error"] = core.clean_error(error) or type(error).__name__
+                return self.live_unknown(tid, trade, f"撤单时按哈希查询出错（{st['last_error']}），下单是否送达未知", now_ms)
             if row is not None and row.get("id") is not None:
                 st["order_id"] = str(row.get("id"))
                 st["events"].append({"at": now_ms, "what": f"撤单前按哈希找到订单 #{st['order_id']}"})
