@@ -4895,8 +4895,9 @@ class LiveBot(core.Bot):
         if failed and time.monotonic() - getattr(self, "live_redeem_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
             self.live_redeem_noted = time.monotonic()
             when = "5 分钟后" if failed[0].get("pulled") else "下一轮（最迟约 10 分钟）" if failed[0].get("unsent") else "一小时后"
+            again = f"{when}自动再试" if self.config.live_auto_redeem else "自动领取关着，不会自己再试：发 /live redeem 再领"  # (RDM-CHECK-VERDICT)
             self.live_notify(f"⚠️ 自动领取：{len(failed)} 个已结算的持仓没领成（{failed[0]['title']}：{failed[0]['error']}），"
-                             f"{when}自动再试。/live redeem check 查看原因", key="redeem:fail")
+                             f"{again}。/live redeem check 查看原因", key="redeem:fail")
         if cut and time.monotonic() - getattr(self, "live_cut_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
             # 1.150.0 (RDM-POSITIONS-CUT): a list longer than even the redeem's own read — told once an hour on its own timer (a bare
             # key would come back every LIVE_NOTE_SECONDS, a round or two), not only in the summary nobody asks for
@@ -5060,7 +5061,8 @@ class LiveBot(core.Bot):
                 extra = {"claimable": f"，约 ${float(s.get('value') or 0):,.2f}"  # (RDM-CHECK-FORGETS-FAILURE) a failure remembered past its back-off
                                       + (f"｜上次领取失败：{s['error']}（{'下一轮自动再试' if c.live_auto_redeem else '自动领取关着，发 /live redeem 再试'}）"
                                          if s.get("error") else ""),
-                         "waiting": f"：{s.get('error') or '?'}（{max(1, int(float(s.get('left') or 0) / 60))} 分钟后再试）",
+                         "waiting": f"：{s.get('error') or '?'}（" + (f"{max(1, int(float(s.get('left') or 0) / 60))} 分钟后再试）" if c.live_auto_redeem
+                                                                       else "自动领取关着：发 /live redeem 再试）"),  # (RDM-CHECK-VERDICT)
                          "sent": f"（交易 {s.get('tx')}，{int(s.get('age_ms') or 0) // 60_000} 分钟前发出" + (f"；{s['error']}" if s.get("error") else "") + "）",
                          "fields": f"：{s.get('error')}", "unclear": f"：{s.get('error')}（市场状态 {s.get('status')}）",
                          "kept": f"（{marked(s)}领取，交易 {s.get('tx') or '?'}" + ("，没领到 USDT" if s.get("paid") == "0" else "") + "）",  # (RDM-PAYOUT-UNCHECKED)
@@ -5068,55 +5070,64 @@ class LiveBot(core.Bot):
                 lines.append(f"  · {s['title']} / {s['outcome']} {s['shares']:g} 份{extra}")
             if len(items) > cap:
                 lines.append(f"  …另有 {len(items) - cap} 个")
+        auto = c.live_auto_redeem
         low = bnb is not None and bnb < self.LIVE_REDEEM_MIN_BNB_WEI
         waiting = [s for s in seen if s["kind"] == "waiting"]
         retrying = [s for s in seen if s["kind"] == "claimable" and s.get("error")]  # (RDM-CHECK-FORGETS-FAILURE) failed last time, back-off over
-        reasons = []  # the gas first: without it neither the automatic round nor /live redeem can send anything
+        fresh = [s for s in seen if s["kind"] == "claimable" and not s.get("error")]
+        first = []  # the gas first: without it neither the automatic round nor /live redeem can send anything
         refused = str((getattr(self, "live_redeem_last", {}) or {}).get("gas_refused") or "")
+        then = "到账后下一轮自动领取" if auto else "到账后发 /live redeem 领取（自动领取关着）"
         if (n("claimable") or waiting) and low:
-            reasons.append(f"签名钱包的 BNB 不够付 gas，领取交易发不出去：往 {wallet.signer} 转一点 BNB（BNB 链，比如 0.005），到账后下一轮自动领取")
+            first.append(f"签名钱包的 BNB 不够付 gas，领取交易发不出去：往 {wallet.signer} 转一点 BNB（BNB 链，比如 0.005），{then}")
         elif (n("claimable") or waiting) and refused:  # (RDM-UNSENT-AS-SENT) over the floor, yet the node refused the last round's redeem for its gas
-            reasons.append(f"上一轮节点以 gas 不够拒收了领取交易（{refused}）：签名钱包的 BNB 不够付领取交易的 gas，"
-                           f"往 {wallet.signer} 转一点 BNB（BNB 链，比如 0.005），到账后下一轮自动领取")
-        if n("claimable") and not c.live_auto_redeem:
-            reasons.append(f"自动领取关着，{n('claimable')} 个可领取（约 ${value:,.2f}）不会自己领：控制台“高级”里打开“自动领取已结算持仓”，或发 /live redeem 手动领")
-        if reasons:
-            why = "；".join(reasons)
-        elif waiting or retrying:
-            why = f"链上领取失败：{(waiting or retrying)[0].get('error') or '见下方'}；到时自动再试，一直失败就把这条发我"
-        elif n("sent"):  # (RDM-RECEIPT-POLL, RDM-RESTART-MID-SEND)
-            why = ("有领取交易已经发出、还没确认上链（见上）：下一轮先查它的回执，上链了就记为已领取，不会再发一次；"
-                   "一小时后还没上链、节点里也查不到它，才重新领取")
-        elif n("kept"):
+            first.append(f"上一轮节点以 gas 不够拒收了领取交易（{refused}）：签名钱包的 BNB 不够付领取交易的 gas，"
+                         f"往 {wallet.signer} 转一点 BNB（BNB 链，比如 0.005），{then}")
+        if n("claimable") and not auto:
+            first.append(f"自动领取关着，{n('claimable')} 个可领取（约 ${value:,.2f}）不会自己领：控制台“高级”里打开“自动领取已结算持仓”，或发 /live redeem 手动领")
+        # 1.150.0 (audit RDM-CHECK-VERDICT): the conclusion was ONE reason picked by a fixed order — one row Predict still lists
+        # after its redeem, or one five-minute retry, took it from 缺字段 (money the bot can never claim), from the claimable and from
+        # the markets not read; and its 自动 promises (到时自动再试, 结算后自动领取…) were made with the switch off. Every kind found
+        # now has its clause — the first is the 结论, the others follow as 另外 lines, the most pressing first — each in the words
+        # of the switch as it stands. A single kind reads word for word as before.
+        reasons = ["；".join(first)] if first else []
+        if waiting or retrying:
+            reasons.append(f"链上领取失败：{(waiting or retrying)[0].get('error') or '见上'}；"
+                           + ("到时自动再试" if auto else "自动领取关着，不会自己再试：发 /live redeem 再试一次") + "，一直失败就把这条发我")
+        if n("fields"):
+            reasons.append("有已结算的持仓缺字段，没法领取：把这条发我")
+        if n("unclear"):  # 1.150.0 (RDM-OPEN-SHAPES): never 结算后自动领取 for half an answer
+            reasons.append("有持仓的市场 Predict 的结算读不出（见上），机器人不会去领、也不记成输：可先到 Predict 网站手动领取，并把这条发我")
+        if fresh and auto and not first:  # (the gas, the switch: said above, these included)
+            reasons.append(f"有 {len(fresh)} 个可领取（约 ${sum(float(s.get('value') or 0) for s in fresh):,.2f}），下一轮自动领取会领；急用就发 /live redeem")
+        if n("unread"):
+            reasons.append("有市场这次没读到（限流或一轮读满），" + ("下一轮继续看" if auto else "发 /live redeem 接着看（自动领取关着）"))
+        if n("sent"):  # (RDM-RECEIPT-POLL, RDM-RESTART-MID-SEND)
+            reasons.append("有领取交易已经发出、还没确认上链（见上）：下一轮先查它的回执，上链了就记为已领取，不会再发一次；"
+                           "一小时后还没上链、节点里也查不到它，才重新领取")
+        if n("kept"):
             # (RDM-MARKS-PERMANENT) by the marks' age: "过 10 分钟还在" was said for ever, of a mark a minute or a week old
             kept = [s for s in seen if s["kind"] == "kept"]
             empty = [s for s in kept if s.get("paid") == "0"]
             old = [int(s.get("marked_at") or now_ms) for s in kept if now_ms - int(s.get("marked_at") or now_ms) >= self.LIVE_REDEEM_KEPT_GRACE_MS]
             if empty:
-                why = (f"有 {len(empty)} 个持仓的领取交易上链了，但没领到 USDT（见上）：链上多半已经没有这份持仓（之前领过）；"
-                       "Predict 网站上若还显示可领取，到网站上领取，并把这条发我")
+                reasons.append(f"有 {len(empty)} 个持仓的领取交易上链了，但没领到 USDT（见上）：链上多半已经没有这份持仓（之前领过）；"
+                               "Predict 网站上若还显示可领取，到网站上领取，并把这条发我")
             elif old:
-                why = (f"有 {len(old)} 个持仓 {core.age_text((now_ms - min(old)) / 1000)}就发过领取交易并上链，Predict 一直还列着："
-                       "在 bscscan.com 打开上面的交易哈希，看持仓账户有没有收到 USDT；没收到就到 Predict 网站上领取，并把这条发我")
+                reasons.append(f"有 {len(old)} 个持仓 {core.age_text((now_ms - min(old)) / 1000)}就发过领取交易并上链，Predict 一直还列着："
+                               "在 bscscan.com 打开上面的交易哈希，看持仓账户有没有收到 USDT；没收到就到 Predict 网站上领取，并把这条发我")
             else:
-                why = "有持仓已经发过领取交易并上链，Predict 还列着：可能只是列表没更新，过半小时再查"
-        elif n("fields"):
-            why = "有已结算的持仓缺字段，没法领取：把这条发我"
-        elif n("unclear"):  # 1.150.0 (RDM-OPEN-SHAPES): never 结算后自动领取 for half an answer
-            why = "有持仓的市场 Predict 的结算读不出（见上），机器人不会去领、也不记成输：可先到 Predict 网站手动领取，并把这条发我"
-        elif n("claimable"):
-            why = f"有 {n('claimable')} 个可领取（约 ${value:,.2f}），下一轮自动领取会领；急用就发 /live redeem"
-        elif n("unread"):
-            why = "有市场这次没读到（限流或一轮读满），下一轮继续看"
-        elif n("open"):
-            why = "现在没有可领取的：赢的都领完了，剩下的还没结算，结算后自动领取"
-        else:
-            why = "现在没有可领取的：赢的都领完了，其余是输掉的"
+                reasons.append("有持仓已经发过领取交易并上链，Predict 还列着：可能只是列表没更新，过半小时再查")
+        settled = not reasons  # nothing to say but that the rest is open or lost
+        if settled:
+            reasons = ["现在没有可领取的：赢的都领完了，" + (("剩下的还没结算，结算后" + ("自动领取" if auto else "发 /live redeem 手动领（自动领取关着）"))
+                                                        if n("open") else "其余是输掉的")]
         if cut:
             # 1.150.0 (RDM-POSITIONS-CUT): the part read says nothing of the rest — the cut first, and never 赢的都领完了 on it
             head = f"持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查：后面可能还有赢的没领，先到 Predict 网站核对、手动领取"
-            why = head + ("；读到的这部分里没有可领取的" if "赢的都领完了" in why else "；" + why)
-        lines.append("结论：" + why)
+            reasons = [head + "；读到的这部分里没有可领取的"] if settled else [head + "；" + reasons[0], *reasons[1:]]
+        lines.append("结论：" + reasons[0])
+        lines.extend(f"另外：{r}" for r in reasons[1:])
         if recent:
             lines.append("最近的领取问题：\n" + "\n".join("  " + e for e in recent))
         return "\n".join(lines)
@@ -5775,7 +5786,11 @@ class LiveBot(core.Bot):
         if not lines:
             return "Predict 上的持仓：无"
         missing, differ, dust = sum("⚠️ 无记录" in l for l in lines), sum("比记录" in l for l in lines), sum("｜零头（" in l for l in lines)
-        return (f"Predict 上的持仓 {len(lines)} 个：{len(lines) - missing - differ - dust} 个与记录一致，{differ} 个份数不符，{missing} 个无记录"
+        # 1.150.0 (audit RDM-CHECK-VERDICT): the head counted the lines listed (30 at most), so an account of 48 read 持仓 30 个
+        whole = "" if getattr(self.live.api, "positions_complete", True) else "以上（列表没读全）"
+        head = (f"Predict 上的持仓共 {len(rows)} 个{whole}，只列出并核对前 {len(lines)} 个" if len(rows) > len(lines)
+                else f"Predict 上的持仓 {len(lines)} 个")
+        return (f"{head}：{len(lines) - missing - differ - dust} 个与记录一致，{differ} 个份数不符，{missing} 个无记录"
                 + (f"，{dust} 个零头" if dust else "") + "\n" + "\n".join(lines))
 
     def live_text(self, now_ms: int) -> str:

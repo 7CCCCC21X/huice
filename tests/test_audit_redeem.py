@@ -1908,4 +1908,75 @@ async def manual_backoff():
 asyncio.run(manual_backoff())
 
 
+# --- RDM-CHECK-VERDICT ----------------------------------------------------------------------------------------------------------
+def verdict_of(report):
+    """The check's conclusion: its 结论 line, and the 另外 lines after it (without the word)."""
+    lines = report.split("\n")
+    at = next(i for i, line in enumerate(lines) if line.startswith("结论："))
+    return lines[at], [line.removeprefix("另外：") for line in lines[at + 1:] if line.startswith("另外：")]
+
+
+async def check_verdict():
+    """RDM-CHECK-VERDICT: /live redeem check's conclusion was ONE reason by a fixed order — one row Predict still lists after its
+    redeem, or one five-minute retry, took it from 缺字段 (money the bot can never claim), from the claimable and from the markets
+    not read; its 自动 promises (到时自动再试, 结算后自动领取, the ⚠️ push's 自动再试) were made with the switch off; and /live
+    positions headed an account of 48 with 持仓 30 个. Every kind found now has its clause (结论, then 另外 lines), each in the
+    switch's words; a single kind reads as before."""
+    # (a) the owner's mix: a row still listed after its redeem, a winner without conditionId, three claimable, a market not read
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.markets.update({"101": mk(101, won=1), "102": {**mk(102, won=1), "conditionId": ""}, **{str(mid): mk(mid, won=1) for mid in (103, 104, 105)}})
+    fake.positions_rows = [held(mid) for mid in (101, 102, 103, 104, 105, 106)]  # (106: its market cannot be read)
+    bot.store.put("live:redeemed:101:1", {"at": NOW - MIN, "tx": "0x" + "7a" * 32, "amount": str(10 * WEI), "title": "window 101"})
+    report = await bot.live_redeem_report(NOW)
+    head, more = verdict_of(report)
+    assert "持仓 6 个：可领取 3，缺字段 1，已领仍列着 1，没读到市场 1" in report, report
+    assert head.startswith("结论：") and "缺字段" in head, report  # (before: 结论：有持仓已经发过领取交易并上链… — and nothing else)
+    assert more[0] == "有 3 个可领取（约 $30.00），下一轮自动领取会领；急用就发 /live redeem", more
+    assert more[1] == "有市场这次没读到（限流或一轮读满），下一轮继续看" and more[2].startswith("有持仓已经发过领取交易并上链，Predict 还列着"), more
+    # (b) a failure waiting for its retry beside a 缺字段 winner and a claimable one: the failure first, the others still said
+    bot = await ready_bot()
+    fake = bot.live.api
+    bot.live.chain = Picky({cond(201): ("sent", "交易失败（已回滚）：0xbad")})
+    fake.markets.update({"201": mk(201, won=1), "202": {**mk(202, won=1), "conditionId": ""}, "203": mk(203, won=1)})
+    fake.positions_rows = [held(201), held(202)]
+    await bot.live_redeem(NOW)
+    fake.positions_rows.append(held(203))
+    head, more = verdict_of(await bot.live_redeem_report(NOW + MIN))
+    assert head == "结论：链上领取失败：交易失败（已回滚）：0xbad；到时自动再试，一直失败就把这条发我", head  # word for word as before
+    assert len(more) == 2 and "缺字段" in more[0] and more[1].startswith("有 1 个可领取（约 $10.00）"), more  # (before: unsaid)
+    # (c) the switch off: no 自动 promise — the open positions, the ⚠️ push after a manual /live redeem, the failure in the check
+    bot = await ready_bot(LIVE_AUTO_REDEEM="off")
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["301"] = [held(301)], mk(301)
+    head, _ = verdict_of(await bot.live_redeem_report(NOW))
+    assert head == "结论：现在没有可领取的：赢的都领完了，剩下的还没结算，结算后发 /live redeem 手动领（自动领取关着）", head  # (before: 结算后自动领取)
+    sent = notices(bot)
+    bot.live.chain = Picky({cond(302): ("sent", "交易失败（已回滚）：0xbad")})
+    fake.positions_rows, fake.markets["302"] = [held(302)], mk(302, won=1)
+    assert (await bot.cmd_live(req("redeem"))).startswith("这次没有领取：持仓 1 个：领取失败 1")
+    assert [k for k, _ in sent] == ["redeem:fail"] and "自动再试" not in sent[0][1] and "自动领取关着，不会自己再试：发 /live redeem 再领" in sent[0][1], sent
+    report = await bot.live_redeem_report(NOW + MIN)
+    head, _ = verdict_of(report)
+    assert head == "结论：链上领取失败：交易失败（已回滚）：0xbad；自动领取关着，不会自己再试：发 /live redeem 再试一次，一直失败就把这条发我", report
+    assert "自动再试" not in report and "window 302 / Up 10 份：交易失败（已回滚）：0xbad（自动领取关着：发 /live redeem 再试）" in report, report
+    # (d) single kinds as before: claimable alone, a market not read alone
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["401"] = [held(401)], mk(401, won=1)
+    assert verdict_of(await bot.live_redeem_report(NOW)) == ("结论：有 1 个可领取（约 $10.00），下一轮自动领取会领；急用就发 /live redeem", [])
+    fake.positions_rows = [held(402)]
+    assert verdict_of(await bot.live_redeem_report(NOW)) == ("结论：有市场这次没读到（限流或一轮读满），下一轮继续看", [])
+    # (e) /live positions names the whole count, not the thirty it lists
+    fake.positions_rows = [held(800 + i) for i in range(48)]
+    text = await bot.cmd_live(req("positions"))
+    assert text.startswith("Predict 上的持仓共 48 个，只列出并核对前 30 个：") and text.count("\n") == 30, text.split("\n")[0]  # (before: 持仓 30 个)
+    fake.positions_rows = [held(800 + i) for i in range(3)]
+    assert (await bot.cmd_live(req("positions"))).startswith("Predict 上的持仓 3 个：")
+    print("RDM_CHECK_VERDICT_OK")
+
+
+asyncio.run(check_verdict())
+
+
 print("AUDIT_REDEEM_OK")
