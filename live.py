@@ -3094,11 +3094,21 @@ class LiveBot(core.Bot):
                 del first[min(first, key=first.get)]
         self.live_last_redeem = min(self.live_last_redeem, time.monotonic() - self.LIVE_REDEEM_SECONDS + self.LIVE_REDEEM_SOON_SECONDS)
 
-    def live_redeem_retry_words(self, wait: float) -> str:
+    def live_redeem_retry_words(self, wait: float, named: bool = True) -> str:
         """When a redeem that never left is tried again, counted from its failure (1.150.0, audit RDM-UNSENT-RETRY-GRID): by
         the next automatic round after its ``wait`` — at the soonest the wait's end, at the latest a round's interval after
         it: a round that comes inside the wait (another win's) finds it waiting and starts LIVE_REDEEM_SECONDS afresh. 「5 分钟
-        后再试」 named the wait, not the retry (five to fifteen minutes on), and 「最迟约 10 分钟」 left the wait out."""
+        后再试」 named the wait, not the retry (five to fifteen minutes on), and 「最迟约 10 分钟」 left the wait out.
+        1.150.0 (audit FR-UNSENT-RETRY-TEXT): that latest holds only while the position's market stays ``named``
+        (live_redeem_first: read first, inside the cap), its first LIVE_REDEEM_UNSENT_NAMED such failures in a row. From the
+        next one on it is back in the rotation, read when its turn comes: a round reads LIVE_REDEEM_READS markets at most, the
+        longest unread first, and it was read in the round that failed — with more markets to judge than that (positions never
+        read yet go first too) every other one is read before it, and the retry came 20 minutes on with 45 markets, 40 with
+        120, while the note, /live redeem check and the hourly ⚠️ said 5～15 分钟后的下一轮. No latest is said then, only the
+        wait and the turn. The rotation itself stays as it is: a name kept for good would let winners the chain keeps refusing
+        take every round's reads, and a round brought for it costs Predict requests on the key the orders share."""
+        if not named:
+            return f"每轮最多读 {self.LIVE_REDEEM_READS} 个市场，{max(1, round(wait / 60))} 分钟后起轮到读它的市场时"
         return f"{max(1, round(wait / 60))}～{round((wait + self.LIVE_REDEEM_SECONDS) / 60)} 分钟后的下一轮"
 
     async def live_sync_orders(self, active: dict[str, dict], now_ms: int) -> None:
@@ -4926,7 +4936,8 @@ class LiveBot(core.Bot):
         # waits LIVE_REDEEM_UNSENT_FIRST_SECONDS, so the rounds that come anyway take it — measured at a 90 s lag: the typical
         # wait 9 -> 5 min, the longest 15 -> 10, with the same rounds, requests and transactions; the later ones keep five minutes
         # (a chain still behind, an RPC still failing). The texts say what happens: the next round after the wait, at the latest
-        # a round's interval after it (live_redeem_retry_words). A sent failure (its gas paid; its transaction may yet be mined)
+        # a round's interval after it (live_redeem_retry_words) — while its market stays named (below); after that, its turn in
+        # the rotation, with no latest said (FR-UNSENT-RETRY-TEXT). A sent failure (its gas paid; its transaction may yet be mined)
         # keeps its hour. The counter of such failures in a row only bounds the naming below.
         unsent_runs = self.__dict__.setdefault("live_redeem_unsent", {})
         # 1.150.0 (audit RDM-SOON-NO-TARGET): a market a win just named (live_redeem_soon) is read first, inside the cap, ahead of the
@@ -5140,11 +5151,16 @@ class LiveBot(core.Bot):
                 errors[key] = text
                 if isinstance(error, TxPending):
                     held = text  # (RDM-ROUND-LOCK-STALL) sent, no receipt in time: nothing more sent this round
-                retry = self.live_redeem_retry_words(wait) if unsent else ""  # (RDM-UNSENT-RETRY-GRID) 1～11 / 5～15 分钟后的下一轮
+                retry = ""  # (RDM-UNSENT-RETRY-GRID) never left: 1～11 / 5～15 分钟后的下一轮 while named (below)
                 if unsent:
                     unsent_runs[key] = runs = unsent_runs.get(key, 0) + 1
-                    if runs <= self.LIVE_REDEEM_UNSENT_NAMED:
+                    named = runs <= self.LIVE_REDEEM_UNSENT_NAMED
+                    if named:
                         first[mid] = time.monotonic()  # (RDM-SOON-NO-TARGET) still named: the retry after the wait reads it first
+                    # 1.150.0 (audit FR-UNSENT-RETRY-TEXT): the words follow the name. They were worked out before it, the same
+                    # 5～15 for every failure in a row — but from the one that leaves the name the market waits its turn in the
+                    # rotation, behind every market the round did not reach: no latest said then (live_redeem_retry_words)
+                    retry = self.live_redeem_retry_words(wait, named)
                 else:
                     unsent_runs.pop(key, None)
                 self.live_redeem_note(key, f"领取 {entry['title']} 失败：{text}" + (f"（交易没发出，{retry}再试）" if unsent else "（一小时后再试）"))
@@ -5203,7 +5219,7 @@ class LiveBot(core.Bot):
         soft = [s for s in seen if s["kind"] == "failed" and s.get("unsent")]
         if untold or (soft and time.monotonic() - getattr(self, "live_redeem_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS):
             items, auto = [*untold.values(), *soft], self.config.live_auto_redeem
-            when = lambda s: (s.get("retry") or "一小时后") + "自动再试"  # (RDM-UNSENT-RETRY-GRID) never left: 1～11 / 5～15 分钟后的下一轮
+            when = lambda s: (s.get("retry") or "一小时后") + "自动再试"  # (RDM-UNSENT-RETRY-GRID) never left: 1～11 / 5～15 分钟后的下一轮, no latest once unnamed (FR-UNSENT-RETRY-TEXT)
             manual = "自动领取关着，不会自己再试：发 /live redeem 再领"  # (RDM-CHECK-VERDICT)
             if len(items) == 1:
                 text = f"⚠️ 自动领取：1 个已结算的持仓没领成（{items[0]['title']}：{items[0]['error']}），{when(items[0]) if auto else manual}"

@@ -367,9 +367,10 @@ async def unsent_retry_grid():
         lo, hi = span(note)
         assert lo <= chain.at[cond(510)] - tf <= hi, (chain.at[cond(510)] - tf, note)
         assert len(chain.redeemed) == 1 and bot.live_redeem_unsent == {}, (chain.redeemed, bot.live_redeem_unsent)
-        # (c) the chain refusing on: the second, third and fourth tries in a row wait five minutes and say 5～15 分钟后的下一轮;
-        #     the market stays named for the first three (the retry reads it first), not after — winners the chain refuses for
-        #     good never take every round's reads
+        # (c) the chain refusing on: the second, third and fourth tries in a row wait five minutes; the second and third say
+        #     5～15 分钟后的下一轮; the market stays named for the first three (the retry reads it first), not after — winners the
+        #     chain refuses for good never take every round's reads — so the fourth, back in the rotation, says the wait and the
+        #     turn with no latest (FR-UNSENT-RETRY-TEXT: its 5～15 was broken with more markets than a round reads: 20-40 minutes)
         bot, fake, chain, sent = await account()
         fake.positions_rows, fake.markets["520"] = [held(520)], mk(520, won=1)
         chain.ready[cond(520)] = clock.t + 10 ** 6
@@ -379,16 +380,17 @@ async def unsent_retry_grid():
             starts = await run_for(bot, 5)
             tf, note = starts[0], bot.live_errors[-1]
             wait = bot.LIVE_REDEEM_UNSENT_FIRST_SECONDS if runs == 1 else bot.LIVE_REDEEM_UNSENT_RETRY_SECONDS
-            assert note.endswith(f"（交易没发出，{'1～11' if runs == 1 else '5～15'} 分钟后的下一轮再试）"), (runs, note)
+            said = ("1～11 分钟后的下一轮" if runs == 1 else "5～15 分钟后的下一轮" if runs <= bot.LIVE_REDEEM_UNSENT_NAMED
+                    else f"每轮最多读 {bot.LIVE_REDEEM_READS} 个市场，5 分钟后起轮到读它的市场时")
+            assert note.endswith(f"（交易没发出，{said}再试）"), (runs, note)
             assert wait - 10 < left(bot, "live:redeemed:520:1") <= wait and due(bot) > bot.LIVE_REDEEM_SECONDS - 10, (runs, due(bot))
             assert bot.live_redeem_unsent == {"live:redeemed:520:1": runs}, bot.live_redeem_unsent
             assert ("520" in bot.live_redeem_first) == (runs <= bot.LIVE_REDEEM_UNSENT_NAMED), (runs, bot.live_redeem_first)
         # the reviewer's case: another win's round 250 s after the fourth (inside its five minutes), then the chain has it — the
-        # retry 14.5 minutes on (said: 最迟约 10 分钟 before), inside the 5～15 said now
+        # retry 14.5 minutes on (said: 最迟约 10 分钟 before, then 5～15 — FR-UNSENT-RETRY-TEXT: no latest now), after the 5 said
         chain.ready[cond(520)] = tf + 260
         starts = await run_for(bot, 20 * 60, [(245, lambda: bot.live_redeem_soon())])
-        lo, hi = span(note)
-        assert chain.at.get(cond(520)) is not None and lo <= chain.at[cond(520)] - tf <= hi, (starts, tf, note)
+        assert chain.at.get(cond(520)) is not None and 5 * 60 <= chain.at[cond(520)] - tf, (starts, tf, note)
         assert chain.at[cond(520)] - tf > 14 * 60 and bot.live_redeem_unsent == {}, (chain.at[cond(520)] - tf, bot.live_redeem_unsent)
         # (d) a flow: six wins seven minutes apart beside three markets still open, the chain in step with Predict's result or
         #     90 s behind it. Behind, every first try never leaves — and brings no round: the same rounds as in step, one market

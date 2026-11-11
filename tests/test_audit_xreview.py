@@ -2225,4 +2225,134 @@ async def stop_ok_unknown():
 
 
 asyncio.run(stop_ok_unknown())
+
+
+async def unsent_retry_text():
+    """FR-UNSENT-RETRY-TEXT: a redeem that never left (TxNotSent: the chain behind Predict's result, an RPC down, a missing
+    approval) is tried again by the next automatic round after its wait, and for its first LIVE_REDEEM_UNSENT_NAMED failures in
+    a row its market stays named — read first, inside the LIVE_REDEEM_READS cap — so the texts' 1～11 / 5～15 分钟后的下一轮 hold.
+    From the fourth on it is back in the rotation, read in the round that failed: with more markets to judge than one round
+    reads, every other one goes first — the next round shows it 这一轮读满了 and the retry came 20 minutes on with 45 other
+    markets open — while the note (/live 最近错误, /live redeem check's 最近的领取问题) and the hourly ⚠️ still said 5～15 分钟后的
+    下一轮. They now say the wait and the turn, no latest; the first three keep their bounds, and the rounds, reads and
+    transactions are as before (the rotation and the cap of three names untouched). The real tick on a virtual clock; fakes only."""
+    import re
+    import time as real_time
+    FakeChain, market_json, WEI = T["FakeChain"], T["market_json"], T["WEI"]
+
+    class Clock:
+        """live.py's ``time`` made virtual (monotonic and wall clock): minutes pass at once."""
+        def __init__(self):
+            self.t = 1_000_000.0
+
+        def monotonic(self):
+            return self.t
+
+        def time(self):
+            return 1.79e9 + self.t
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+    class Behind(FakeChain):
+        """The chain refusing the winner's redeem in its gas estimate (TxNotSent: nothing sent, nothing spent) until ``ready``."""
+        def __init__(self, clock):
+            super().__init__()
+            self.clock, self.ready, self.at, self.refused = clock, float("inf"), None, 0
+
+        async def redeem(self, cid, index_set, amount, neg, yb):
+            if self.clock.t < self.ready:
+                self.refused += 1
+                raise L.TxNotSent("RPC 错误：execution reverted")
+            self.at = self.clock.t
+            return await super().redeem(cid, index_set, amount, neg, yb)
+
+    def mk(mid, won=0):
+        """A two-outcome market by Predict's word: open, or resolved with index set ``won`` the winner."""
+        raw = {**market_json(str(mid), status="RESOLVED" if won else "REGISTERED"), "conditionId": "0x" + f"{int(mid):064x}"}
+        if won:
+            raw["outcomes"] = [{**o, "status": "WON" if o["indexSet"] == won else "LOST"} for o in raw["outcomes"]]
+        return raw
+
+    def held(mid):
+        return {"id": f"p{mid}:1", "market": {"id": int(mid), "title": f"window {mid}"}, "outcome": {"name": "Up", "indexSet": 1},
+                "amount": str(10 * WEI)}
+
+    plain_time = L.time
+    clock = L.time = Clock()
+    try:
+        bot = make_bot()
+        await bot.live_prepare()
+        assert bot.live.ready, bot.live.not_ready_why
+        chain = bot.live.chain = Behind(clock)
+        api = bot.live.api
+        others = [str(1000 + i) for i in range(45)]  # still open: more markets to judge than one round reads (LIVE_REDEEM_READS)
+        api.positions_rows = [*(held(x) for x in others), held(520)]  # the winner listed last: last among equals in the rotation
+        api.markets.update({x: mk(x) for x in others})
+        api.markets["520"] = mk(520, won=1)
+        sent: list = []
+        bot.live_notify = lambda text, key="": sent.append((key, text))
+        rows: list = []  # (round start, 520's row) of each automatic round
+        judge = bot.live_redeem_pass
+
+        async def watched(now_ms, dry_run=False, force=False):
+            done, seen = await judge(now_ms, dry_run=dry_run, force=force)
+            if not dry_run:
+                rows.append((clock.t, next(s for s in seen if s["market_id"] == "520")))
+            return done, seen
+        bot.live_redeem_pass = watched
+
+        async def tick():
+            before = bot.live_redeem_task
+            bot.live_redeem_tick()
+            if bot.live_redeem_task is not before:
+                await bot.live_redeem_task
+            clock.t += bot.LIVE_REDEEM_TICK_SECONDS
+
+        span = re.compile(r"(\d+)～(\d+) 分钟后的下一轮")
+        bot.live_last_redeem = clock.t  # (a round just ran)
+        bot.live_redeem_soon("520")  # its window settled in the bot's favour: named, a round within 20 s
+        failed: list = []  # (when, the note, still named) of each try the chain refused
+        while chain.refused < 4:
+            if chain.refused == 3:
+                bot.live_redeem_noted = -1e9  # (the hourly ⚠️'s hour over: the fourth failure's own ⚠️ is sent)
+            n, at = chain.refused, clock.t
+            await tick()
+            if chain.refused > n:
+                failed.append((at, bot.live_errors[-1], "520" in bot.live_redeem_first))
+            assert clock.t < 1_000_000 + 3 * 3600, failed
+        assert [round(b[0] - a[0]) for a, b in zip(failed, failed[1:])] == [600, 600, 600], failed  # the usual rounds, none brought
+        # the first three: named, each retry by the next round inside the bound its text gave (unchanged)
+        failure = "领取 window 520 失败：RPC 错误：execution reverted"
+        for k, (at, note, named) in enumerate(failed[:3]):
+            assert note.endswith(f"{failure}（交易没发出，{'1～11' if k == 0 else '5～15'} 分钟后的下一轮再试）"), (k, note)
+            lo, hi = (int(x) * 60 for x in span.search(note).groups())
+            assert named and lo <= failed[k + 1][0] - at <= hi, (k, named, failed[k + 1][0] - at)
+        # the fourth: its market back in the rotation — the note, the check and the ⚠️ say the wait and the turn, with no latest
+        tf, note, named = failed[3]
+        assert not named and bot.live_redeem_unsent == {"live:redeemed:520:1": 4}, (named, bot.live_redeem_unsent)
+        assert span.search(note) is None, ("no latest said once unnamed", note)
+        turn = f"每轮最多读 {bot.LIVE_REDEEM_READS} 个市场，5 分钟后起轮到读它的市场时"
+        assert note.endswith(f"{failure}（交易没发出，{turn}再试）"), note
+        alert = "⚠️ 自动领取：1 个已结算的持仓没领成（window 520：RPC 错误：execution reverted），{}自动再试。/live redeem check 查看原因"
+        assert sent == [("redeem:fail", alert.format("1～11 分钟后的下一轮")), ("redeem:fail", alert.format(turn))], sent
+        report = await bot.live_redeem_report(bot.market.now_ms())
+        line = next(x for x in report.split("\n") if failure in x)
+        assert line.endswith(f"（交易没发出，{turn}再试）") and span.search(line) is None, line
+        # the chain has it a second after: the next round fills its reads before reaching it (这一轮读满了), the one after redeems
+        # it — 20 minutes on, past the 15 the text used to promise, after the 5 it says; the same rounds as ever
+        chain.ready = tf + 1
+        rows.clear()
+        while chain.at is None:
+            await tick()
+            assert clock.t < tf + 3600, rows
+        assert [(round(t - tf), r["kind"], r.get("error", "")) for t, r in rows] == [(600, "unread", "这一轮读满了，下一轮再看"),
+                                                                                   (1200, "redeemed", "")], rows
+        assert round(chain.at - tf) == 1200 and len(chain.redeemed) == 1 and chain.refused == 4, (chain.at - tf, chain.redeemed)
+        assert bot.live_redeem_unsent == {} and "live:redeemed:520:1" not in bot.live_redeem_notes, bot.live_redeem_unsent
+    finally:
+        L.time = plain_time
+
+
+asyncio.run(unsent_retry_text())
 print("AUDIT_XREVIEW_OK")
