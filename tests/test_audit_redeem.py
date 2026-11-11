@@ -1357,4 +1357,71 @@ async def negrisk_amount():
 asyncio.run(negrisk_amount())
 
 
+# --- RDM-MARKS-PERMANENT --------------------------------------------------------------------------------------------------------
+class LongHash(T["FakeChain"]):
+    """test_trading's FakeChain with a real-length transaction hash (its 0xredeem is too short to show a cut)."""
+    TX = "0x" + "5e" * 32
+
+    async def redeem(self, cid, index_set, amount, neg, yb):
+        await super().redeem(cid, index_set, amount, neg, yb)
+        return self.TX
+
+
+async def marks_permanent():
+    """RDM-MARKS-PERMANENT: a redeemed / lost mark skips its position for good (1.131.3: no second redeem of a row Predict still
+    lists, no re-read of every listed loser) — and that stays. But nothing could lift a wrong lost mark (one market read), the
+    check cut the hash to 14 characters with no age and no market id, and said 过 10 分钟还在 for ever. The check now says the
+    whole hash, the mark's age and the market (lost rows too), its conclusion goes by the age, and /live redeem forget <市场号>
+    lifts that market's LOST marks (the next round judges it again: a loser re-marked, a winner redeemed once) — never a kept
+    one (a second redeem would pay nothing)."""
+    bot = await ready_bot()
+    fake, chain = bot.live.api, LongHash()
+    bot.live.chain = chain
+    fake.markets.update({"101": mk(101, won=2), "102": mk(102, won=2)})
+    fake.positions_rows = [held(101, 2, 100), held(102, 1, 40)]
+    reads, market = [], fake.market
+
+    async def counting(mid):
+        reads.append(str(mid))
+        return await market(mid)
+    fake.market = counting
+    done = await bot.live_redeem(NOW)
+    assert done == [f"💵 已领取 window 101 Down 100 份：{LongHash.TX}"] and bot.store.get("live:redeemed:102:1")["lost"] is True, done
+    lost = bot.store.get("live:redeemed:102:1")
+    reads.clear()
+    assert await bot.live_redeem(NOW + 10 * MIN) == [] and reads == [] and len(chain.redeemed) == 1, reads  # still for good: no read, no 2nd redeem
+    # the check: the whole hash, the age, the market — by the age, list lag or a look on bscscan
+    report = await bot.live_redeem_report(NOW + 2 * MIN)
+    assert "结论：有持仓已经发过领取交易并上链，Predict 还列着：可能只是列表没更新，过半小时再查" in report, report
+    before = bot.store.items("live:")
+    report = await bot.live_redeem_report(NOW + 40 * MIN)
+    assert bot.store.items("live:") == before, "the check writes nothing"
+    assert f"window 101 / Down 100 份（市场 101，40 分前领取，交易 {LongHash.TX}）" in report, report  # (before: （交易 0x5e5e5e5e5e5e…）)
+    assert "输掉的（不再读市场；判断错了可发 /live redeem forget <市场号> 重新判断）：" in report and "window 102 / Up 40 份（市场 102，40 分前判定）" in report, report
+    assert "结论：有 1 个持仓 40 分前就发过领取交易并上链，Predict 一直还列着：在 bscscan.com 打开上面的交易哈希" in report and "列表没更新" not in report, report
+    assert (lost.get("status"), lost.get("winner"), lost.get("how")) == ("RESOLVED", "Down", "outcomes.status"), lost  # the read a lost mark rests on
+    # forget: only lost marks, only that market (10 is not 101 / 102), nothing sent
+    sent = notices(bot)
+    assert (await bot.live_action("redeem", ["forget"], NOW)).startswith("用法：/live redeem forget <市场号>")
+    assert await bot.live_action("redeem", ["forget", "10"], NOW) == "市场 10 没有领取记录"
+    answer = await bot.live_action("redeem", ["forget", "101"], NOW)
+    assert "没有清除" in answer and "已清除" not in answer and bot.store.get("live:redeemed:101:2")["tx"] == LongHash.TX, answer  # a kept mark stays
+    answer = await bot.live_action("redeem", ["forget", "102"], NOW)
+    assert answer.startswith("已清除市场 102 的 1 条“输掉的”记录") and bot.store.get("live:redeemed:102:1") is None, answer
+    assert len(chain.redeemed) == 1 and sent == [], "forget sends nothing"
+    # the next round judges 102 again: still lost — marked again, no transaction, 101 not read
+    reads.clear()
+    assert await bot.live_redeem(NOW + 50 * MIN) == [] and reads == ["102"] and bot.store.get("live:redeemed:102:1")["lost"] is True, reads
+    # a wrong lost mark: forgotten, and Predict now names Up — redeemed once, then never again
+    await bot.live_action("redeem", ["forget", "102"], NOW)
+    fake.markets["102"] = mk(102, won=1)
+    done = await bot.live_redeem(NOW + 60 * MIN)
+    assert done == [f"💵 已领取 window 102 Up 40 份：{LongHash.TX}"] and [i for _, i, *_ in chain.redeemed] == [2, 1], (done, chain.redeemed)
+    assert await bot.live_redeem(NOW + 70 * MIN) == [] and len(chain.redeemed) == 2
+    print("RDM_MARKS_PERMANENT_OK")
+
+
+asyncio.run(marks_permanent())
+
+
 print("AUDIT_REDEEM_OK")

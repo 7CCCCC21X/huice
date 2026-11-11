@@ -1658,6 +1658,7 @@ class LiveBot(core.Bot):
     #                                     a named result without the settled word (it may be a proposal still) twelve times this long (1.150.0)
     LIVE_REDEEM_NOTE_SECONDS = 3600  # a failed redeem reaches Telegram at most this often
     REDEEM_REPORT_LINES = 6          # /live redeem check: the positions listed per kind (the rest counted)
+    LIVE_REDEEM_KEPT_GRACE_MS = 30 * 60_000  # a row Predict still lists this long after its mined redeem is no list lag: the check says to look (1.150.0)
     REDEEM_CHECK_WAIT_SECONDS = 60   # /live redeem check waits this long at most for a round that holds the redeem lock, then answers without its dry run (1.150.0)
     LIVE_REDEEM_MIN_BNB_WEI = 5 * 10 ** 14  # under 0.0005 BNB no redeem goes out (one costs about 0.0002): one note, not a failure per position
     LIVE_NOTE_SECONDS = 600     # the same failure is announced at most this often
@@ -4406,6 +4407,35 @@ class LiveBot(core.Bot):
                     "fields": "缺字段", "unclear": "结算读不出", "kept": "已领仍列着", "open": "未结算", "lost": "输掉的", "unread": "没读到市场"}
     REDEEM_SENT = "live:redeem-sent:"  # + <market>:<index set>: a redeem transaction signed (and broadcast, or about to be) but not yet booked
 
+    async def live_redeem_forget(self, words: list[str]) -> str:
+        """/live redeem forget <市场号>…: the LOST marks of those markets lifted, so the next round reads the market again and
+        judges afresh — a loser is marked again (no transaction), a winner redeemed once.
+
+        1.150.0 (audit RDM-MARKS-PERMANENT): nothing could lift a mark. A lost mark rests on one market read, so a winner Predict
+        named wrong in that read stayed 输掉的 for good. A kept mark (a mined redeem) is NOT lifted: a second redeem of the same
+        position would pay nothing on a binary market (the first burnt the whole balance) and only cost gas — the website
+        claims what the chain still holds. Under the redeem lock, so it never falls between a round's transaction and its mark.
+        The key's trailing colon keeps market 50 from matching 501."""
+        mids = [w for w in words if w.isdigit()]
+        if not mids:
+            return "用法：/live redeem forget <市场号>（市场号见 /live redeem check）：清除这个市场“输掉的”记录，下一轮重新读市场、重新判断输赢"
+        lines = []
+        async with self.redeem_lock():
+            for mid in mids:
+                marks = [(k, v) for k, v in self.store.items(f"live:redeemed:{mid}:") if isinstance(v, dict)]
+                lost = [k for k, v in marks if v.get("lost")]
+                kept = [k for k, v in marks if not v.get("lost")]
+                if lost:
+                    self.store.delete_keys(lost)
+                    lines.append(f"已清除市场 {mid} 的 {len(lost)} 条“输掉的”记录：下一轮自动领取（或 /live redeem）会重新读这个市场、"
+                                 "重新判断——输的再记下，赢的领取一次")
+                if kept:
+                    lines.append(f"市场 {mid} 有 {len(kept)} 条已发过领取交易的记录，没有清除：同一个持仓再发一次领取多半一分钱不付、"
+                                 "白付 gas；链上若还有这份持仓，到 Predict 网站上领取")
+                if not marks:
+                    lines.append(f"市场 {mid} 没有领取记录")
+        return "\n".join(lines)
+
     def redeem_lock(self) -> asyncio.Lock:
         lock = getattr(self, "live_redeem_lock", None)
         if lock is None:
@@ -4656,9 +4686,14 @@ class LiveBot(core.Bot):
                 seen.append({**entry, **booked[key]})
                 continue
             mark = self.store.get(key)
+            # 1.150.0 (audit RDM-MARKS-PERMANENT): a mark is for good — what stops a second redeem of a row Predict still lists and
+            # a re-read of every listed loser (1.131.3) — but it is said in full (the whole hash, its age, the market id: the
+            # check cut the hash to 14 characters and said 过 10 分钟还在 for ever), and a lost one can be lifted by the owner
+            # (/live redeem forget <市场号>: live_redeem_forget). Never lifted automatically, never into a second redeem.
             if mark:
                 seen.append({**entry, "kind": "lost" if mark.get("lost") else "kept", "tx": str(mark.get("tx") or ""),
-                             "paid": mark.get("paid")})  # (RDM-PAYOUT-UNCHECKED) "0": mined, but it paid nothing
+                             "paid": mark.get("paid"),  # (RDM-PAYOUT-UNCHECKED) "0": mined, but it paid nothing
+                             "marked_at": int(mark.get("at") or 0)})
                 continue
             unsettled.add(mid)
             if key in out:  # (RDM-RECEIPT-POLL, RDM-RESTART-MID-SEND) a transaction out for it, no receipt yet: nothing sent beside it
@@ -4716,7 +4751,9 @@ class LiveBot(core.Bot):
             won = resolved.get("split") or (resolved.get("index") is not None and index_set == int(resolved["index"]) + 1)
             if not won:
                 if resolved.get("index") is not None and not dry_run:  # resolved against it: worth nothing, never read again
-                    self.store.put(key, {"at": now_ms, "lost": True, "amount": str(amount), "title": entry["title"]})
+                    self.store.put(key, {"at": now_ms, "lost": True, "amount": str(amount), "title": entry["title"],
+                                         "status": info.status, "winner": str(resolved.get("name") or ""),
+                                         "how": str(resolved.get("how") or "")})  # (RDM-MARKS-PERMANENT) the read it rests on
                 seen.append({**entry, "kind": "lost"})
                 continue
             entry["value"] = entry["shares"] * (0.5 if resolved.get("split") else 1.0)
@@ -4916,7 +4953,11 @@ class LiveBot(core.Bot):
         listed = {"claimable": ("可领取", self.REDEEM_REPORT_LINES), "waiting": ("领取失败、等重试", self.REDEEM_REPORT_LINES),
                   "sent": ("领取交易已发出、还没确认上链（下一轮先查回执，不会再发）", self.REDEEM_REPORT_LINES),
                   "fields": ("缺字段", self.REDEEM_REPORT_LINES), "unclear": ("Predict 的结算读不出（机器人不会去领）", self.REDEEM_REPORT_LINES),
-                  "kept": ("已发过领取交易、Predict 还列着", 3), "open": ("未结算", 3), "unread": ("这次没读到市场", 2)}
+                  "kept": ("已发过领取交易、Predict 还列着", 3), "open": ("未结算", 3), "unread": ("这次没读到市场", 2),
+                  "lost": ("输掉的（不再读市场；判断错了可发 /live redeem forget <市场号> 重新判断）", 3)}  # (RDM-MARKS-PERMANENT)
+        # (RDM-MARKS-PERMANENT) a mark's age, the market id and the whole hash — the 14 characters the check printed could not be
+        # looked up, and a row still listed hours after its redeem read like one listed a minute after it
+        marked = lambda s: f"市场 {s.get('market_id')}，{core.age_text((now_ms - int(s.get('marked_at') or now_ms)) / 1000)}"
         for kind, (label, cap) in listed.items():
             items = [s for s in seen if s["kind"] == kind]
             if not items:
@@ -4927,8 +4968,8 @@ class LiveBot(core.Bot):
                          "waiting": f"：{s.get('error') or '?'}（{max(1, int(float(s.get('left') or 0) / 60))} 分钟后再试）",
                          "sent": f"（交易 {s.get('tx')}，{int(s.get('age_ms') or 0) // 60_000} 分钟前发出" + (f"；{s['error']}" if s.get("error") else "") + "）",
                          "fields": f"：{s.get('error')}", "unclear": f"：{s.get('error')}（市场状态 {s.get('status')}）",
-                         "kept": f"（交易 {s.get('tx', '')[:14]}…" + ("，没领到 USDT" if s.get("paid") == "0" else "") + "）",  # (RDM-PAYOUT-UNCHECKED)
-                         "open": f"（市场状态 {s.get('status')}）", "unread": f"：{s.get('error')}"}[kind]
+                         "kept": f"（{marked(s)}领取，交易 {s.get('tx') or '?'}" + ("，没领到 USDT" if s.get("paid") == "0" else "") + "）",  # (RDM-PAYOUT-UNCHECKED)
+                         "open": f"（市场状态 {s.get('status')}）", "unread": f"：{s.get('error')}", "lost": f"（{marked(s)}判定）"}[kind]
                 lines.append(f"  · {s['title']} / {s['outcome']} {s['shares']:g} 份{extra}")
             if len(items) > cap:
                 lines.append(f"  …另有 {len(items) - cap} 个")
@@ -4951,7 +4992,18 @@ class LiveBot(core.Bot):
             why = ("有领取交易已经发出、还没确认上链（见上）：下一轮先查它的回执，上链了就记为已领取，不会再发一次；"
                    "一小时后还没上链、节点里也查不到它，才重新领取")
         elif n("kept"):
-            why = "有持仓已经发过领取交易并上链，Predict 还列着：可能只是列表没更新；过 10 分钟还在，就把这条发我"
+            # (RDM-MARKS-PERMANENT) by the marks' age: "过 10 分钟还在" was said for ever, of a mark a minute or a week old
+            kept = [s for s in seen if s["kind"] == "kept"]
+            empty = [s for s in kept if s.get("paid") == "0"]
+            old = [int(s.get("marked_at") or now_ms) for s in kept if now_ms - int(s.get("marked_at") or now_ms) >= self.LIVE_REDEEM_KEPT_GRACE_MS]
+            if empty:
+                why = (f"有 {len(empty)} 个持仓的领取交易上链了，但没领到 USDT（见上）：链上多半已经没有这份持仓（之前领过）；"
+                       "Predict 网站上若还显示可领取，到网站上领取，并把这条发我")
+            elif old:
+                why = (f"有 {len(old)} 个持仓 {core.age_text((now_ms - min(old)) / 1000)}就发过领取交易并上链，Predict 一直还列着："
+                       "在 bscscan.com 打开上面的交易哈希，看持仓账户有没有收到 USDT；没收到就到 Predict 网站上领取，并把这条发我")
+            else:
+                why = "有持仓已经发过领取交易并上链，Predict 还列着：可能只是列表没更新，过半小时再查"
         elif n("fields"):
             why = "有已结算的持仓缺字段，没法领取：把这条发我"
         elif n("unclear"):  # 1.150.0 (RDM-OPEN-SHAPES): never 结算后自动领取 for half an answer
@@ -5039,6 +5091,8 @@ class LiveBot(core.Bot):
             asyncio.create_task(later(), name=f"live-{action}")
             if action == "redeem" and words[1:2] == ["check"]:
                 return "领取自检中，结果随后发来"
+            if action == "redeem" and words[1:2] == ["forget"]:  # (RDM-MARKS-PERMANENT) it redeems nothing: not 领取中
+                return "清除记录中，结果随后发来"
             return {"check": "自检中，结果随后发来", "redeem": "领取中，结果随后发来", "fills": "持仓核对中，结果随后发来"}[action]
         return await self.live_action(action, req.args[1:], self.market.now_ms())
 
@@ -5082,6 +5136,8 @@ class LiveBot(core.Bot):
         if action == "redeem":
             if words[:1] == ["check"]:  # 1.131.4: why the resolved positions are (not) redeemed, read-only
                 return await self.live_redeem_report(now_ms)
+            if words[:1] == ["forget"]:  # 1.150.0 (RDM-MARKS-PERMANENT): a lost mark lifted by the owner; nothing sent
+                return await self.live_redeem_forget(words[1:])
             if not self.live.ready:
                 await self.live_ensure_ready()
                 if not self.live.ready:
@@ -5668,7 +5724,7 @@ class LiveBot(core.Bot):
             lines.append("\n最近错误：\n" + "\n".join(self.live_errors[-3:]))
         if last := (self.store.get("live:test") or {}).get("text"):
             lines.append("\n最近挂单测试：" + str(last).split("\n")[0].removeprefix("🧪 挂单测试 ") + "…（/live test 重跑）")
-        lines.append("\n/live mode off|pause|on｜pause｜resume｜cancel all｜redeem｜redeem check｜check｜orders｜positions｜test [市场] [份数] [价格¢]")
+        lines.append("\n/live mode off|pause|on｜pause｜resume｜cancel all｜redeem｜redeem check｜redeem forget <市场号>｜check｜orders｜positions｜test [市场] [份数] [价格¢]")
         if getattr(self, "preopen", None) is not None:
             # no html.escape here: the /live reply is sent with Bot.tell's to_html, which escapes the whole text once; escaping the
             # status too showed "&amp;lt;" etc. for any &, < or > in it (e.g. a remote error in "最近问题：")
