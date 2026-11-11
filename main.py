@@ -15556,6 +15556,10 @@ class Bot:
         self.sim_follow_timers: dict[str, asyncio.TimerHandle] = {}  # book key -> the express look due when a follow's settle runs out (sim_follow_wake)
         self.sigma_calib_cache: dict[str, tuple[float, int]] = {}  # card key -> (σ factor, windows measured): sigma_calib
         self.sim_taker_seen: dict[str, int] = {}  # taker slot -> when (ms) its side was first buyable in the run of looks that still finds it so (SIM_TAKER_HOLD_SECONDS)
+        # market -> {"end": its end (ms), "up" / "down": {price level in that side's terms: [shares the paper takers bought there and
+        # the earlier resting orders were credited, shares the order resting on that side now was credited]}}: what the paper fills have
+        # already taken of the asks the book still shows (sim_paper_book)
+        self.sim_paper_used: dict[str, dict] = {}
         self.sim_unpriced_since: dict[str, int] = {}  # market -> when (ms) a step first found it unpriced with an order resting (sim_unpriced_reason)
         self.sim_step_ms: dict[str, int] = {}  # the last decision phase, by part (for /diag)
         self.sim_step_info: dict[str, int] = {}  # ...and its size: markets judged, records held
@@ -18331,6 +18335,97 @@ class Bot:
             day = dt.datetime.fromtimestamp(base.close_ms / 1000, offset).date().isoformat()
             self.note_outcome(symbol, day, base.value, base.source)
 
+    def sim_paper(self) -> bool:
+        """Whether the trader's buys are paper ones now: filled by the bot's own rules (a taker at once from the book it
+        saw, a resting order as sellers show: sim_open, sim_fill), nothing sent to Predict. Always here; the real trader
+        only with LIVE=off (LiveBot.sim_paper)."""
+        return True
+
+    def sim_paper_book(self, mk: SimMarket, side: str, resting: bool = False) -> PredictBook:
+        """The book a paper buy of ``side`` is filled from: mk.book less the shares paper fills already took at each of
+        that side's price levels (sim_paper_used), a level bought out left out — mk.book itself when nothing was taken,
+        and always in real trading.
+
+        1.150.0 (audit SIM-PAPER-TAKER-REBUY): a paper buy changes nothing on Predict, so the asks it "took" are in every
+        later book. The taker bought them again at each look — the step's every few seconds, the express lane's a tenth of
+        a second after every price push, on the very same snapshot — until SIM_TAKER_MAX_SHARES: one 100-share ask became
+        a 300-share position, a 10-share one thirty buys of 10. With SIM_WAYS=both the one ask a resting order was
+        presumed filled from was bought by the taker as well. And a floor order, placed at its price wherever the asks
+        stand (SIM_MAKER_FLOOR_CENTS), was credited the asks under it, became a position, and the next one in its slot
+        was credited the same asks again. On thin books the paper volume, P&L, EV and markouts were those of one bet
+        counted several times over, and the shares that never existed used up the caps (SIM_GROUP_USD, the per-side
+        counts) the real chances then met.
+
+        The rule is the resting order's own (maker_fill: the most ever seen, never a sum of looks — one seller is seen
+        again on every look), kept per price level and across the paper fills: what they took at a price stays out of
+        what that level shows, for as long as the book shows the level at all. More shares offered there than were taken
+        are new and can be bought (SIM_TAKER_MAX_SHARES' one buy after another, from depth that is really left); the same
+        ones are not bought twice. A look that finds the level gone forgets it (sim_paper_seen): what is offered at that
+        price later is another seller's.
+
+        ``resting`` is the view of the order resting on that side now (sim_fill): what it was credited itself stays in —
+        its own sightings are its "most ever seen" to handle (taken out as well, a level grown from 40 to 100 would
+        credit it 60, not 100) — and everything else is out: the takers' buys and what the resting orders before it were
+        credited (sim_paper_rested).
+
+        Kept in memory: after a restart the asks still showing can be bought once more. Real trading reads its fills
+        from Predict, and its book is the real one."""
+        used = (self.sim_paper_used.get(mk.market) or {}).get(side) if self.sim_paper() else None
+        if not used:
+            return mk.book
+        kept, cut = [], False
+        for p, q in (mk.book.asks if side == "up" else mk.book.bids):  # 涨 / Yes buys the asks, 跌 / No the bids (side_levels)
+            took = used.get(round(float(p), 6) if side == "up" else round(1 - float(p), 6))
+            gone = (took[0] + (0.0 if resting else took[1])) if took else 0.0
+            if gone <= 1e-9:
+                kept.append((p, q))
+                continue
+            cut = True
+            left = round(float(q) - gone, 6)
+            if left > 1e-9:
+                kept.append((p, D(str(left))))
+        if not cut:
+            return mk.book
+        return dataclasses.replace(mk.book, **{"asks" if side == "up" else "bids": tuple(kept)})
+
+    def sim_paper_took(self, mk: SimMarket, side: str, levels: Iterable, resting: bool = False) -> None:
+        """Remember what a paper fill took of ``side``'s asks (sim_paper_used): ``levels`` [(price in the side's terms,
+        shares)] — a taker's as its quote walked them, the resting order's (``resting``) as sim_fill credited them."""
+        held = self.sim_paper_used.setdefault(mk.market, {"end": sim_end_ms(mk.settle), "up": {}, "down": {}})
+        for price, shares in levels:
+            if float(shares) > 1e-9:
+                held[side].setdefault(round(float(price), 6), [0.0, 0.0])[1 if resting else 0] += float(shares)
+
+    def sim_paper_rested(self, mk: SimMarket, side: str) -> None:
+        """A fresh paper order rests on ``side``: what the orders before it were credited there is theirs (positions
+        now), not a sighting of its own — counted with the takers' buys from here on, out of its view (sim_paper_book)."""
+        for took in ((self.sim_paper_used.get(mk.market) or {}).get(side) or {}).values():
+            took[0], took[1] = took[0] + took[1], 0.0
+
+    def sim_paper_seen(self, mk: SimMarket) -> None:
+        """A look at a market's book, for what its paper fills took there (sim_paper_used): a price level the book no
+        longer shows is forgotten — the shares bought there on paper are gone from Predict too, and what is offered at
+        that price later is new. A level still showing keeps what was taken from it, however its size has moved since."""
+        held = self.sim_paper_used.get(mk.market)
+        if held is None:
+            return
+        held["end"] = sim_end_ms(mk.settle)
+        for side in ("up", "down"):
+            if held[side]:
+                shown = {round(p, 6) for p, q in side_levels(mk.book, side) if q > 1e-9}
+                held[side] = {price: took for price, took in held[side].items() if price in shown}
+        if not held["up"] and not held["down"]:
+            del self.sim_paper_used[mk.market]
+
+    def sim_paper_spent(self, mk: SimMarket, side: str, cap: float) -> float:
+        """Shares the book still shows at or under ``cap`` on ``side`` that paper fills already took (what sim_paper_book
+        leaves out there), for the pages' words; 0 in real trading."""
+        book = self.sim_paper_book(mk, side)
+        if book is mk.book:
+            return 0.0
+        under = lambda b: sum(q for p, q in side_levels(b, side) if p <= cap + 1e-9)
+        return max(under(mk.book) - under(book), 0.0)
+
     def sim_open(self, mk: SimMarket, side: str, now_ms: int, maker: BookEdge | None = None,
                  taker: dict | None = None, shares: float | None = None) -> dict:
         """A paper buy of SIM_SHARES of one side, with everything it was decided on (entry snapshot: the model's inputs,
@@ -18370,11 +18465,23 @@ class Bot:
 
     def sim_fill(self, trade: dict, mk: SimMarket, now_ms: int) -> None:
         """A resting order against the book as it stands now: more shares presumed filled when sellers show at or
-        through its price (with a snapshot of what was seen, the model's view and its sources at that moment)."""
-        credited, seen = maker_fill(trade, mk.book)
+        through its price (with a snapshot of what was seen, the model's view and its sources at that moment). The
+        sellers are the book's less what other paper fills already have of them (sim_paper_book, 1.150.0: with
+        SIM_WAYS=both one 100-share ask at the order's price was bought by the taker and credited to the order too);
+        what the order is credited is in turn not there for a taker, nor for the next order in its slot."""
+        side = trade["side"]
+        credited, seen = maker_fill(trade, self.sim_paper_book(mk, side, resting=True))
         trade["queue_min"] = min(float(trade.get("queue_min", trade.get("queue_ahead", 0.0))), seen["queue_now"])
         if credited <= float(trade["shares"]) + 1e-9:
             return
+        # the newly credited shares, taken from the cheapest asks at or under its price that paper fills have not used yet
+        left, took = credited - float(trade["shares"]), []
+        for p, q in side_levels(self.sim_paper_book(mk, side), side):
+            if left <= 1e-9 or p > float(trade["price"]) + 1e-9:
+                break
+            took.append((p, min(q, left)))
+            left -= min(q, left)
+        self.sim_paper_took(mk, side, took, resting=True)
         fair = mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up
         trade["fills"].append({"at": now_ms, "shares": credited - float(trade["shares"]), "fair": fair, "fair_up": mk.fair_up,
                                "how": "推定成交", "seen": seen, "book": book_snapshot(mk.book), **self.evidence_of(mk)})
@@ -18778,7 +18885,8 @@ class Bot:
                     capped = f"（公平价 {cents(fair + cut)} 按上限 {cents(fair)} 计）" if cut > 0 else ""
                     cap = self.sim_taker_cap(mk, side, bps)
                     room, taken = self.sim_taker_room(trades, mk, side, self.sim_taker_want(mk, side, cap))
-                    q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
+                    # (on paper the asks less what paper fills already took, as the trader's own look: sim_paper_book, 1.150.0)
+                    q = taker_quote(self.sim_paper_book(mk, side), side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
                     held = trades.get(f"{mk.market}|{side}|吃")
                     if cap <= 0:
                         parts.append(f"{name}：无封顶价（公平价 {cents(fair)} 留不出 {cents(max(mk.need, self.sim_taker_bar(mk)))}）{capped}")
@@ -18787,7 +18895,9 @@ class Bot:
                                                     self.sim_taker_full_text(trades, mk, side, taken) if c.sim_taker_max_shares > 0 else
                                                     f"已有{sim_status(held)}（每边只吃一次）"))
                     elif q is None or q["got"] < SIM_MIN_SHARES - 1e-9:
-                        parts.append(f"{name}：封顶 {cents(cap)}{capped}，之下没有卖单")
+                        spent = self.sim_paper_spent(mk, side, cap)  # the asks there are the ones a paper fill already bought
+                        parts.append(f"{name}：封顶 {cents(cap)}{capped}，" + (f"之下的卖单已被模拟交易买过（{spent:g} 份），等新的卖单"
+                                                                          if spent >= SIM_MIN_SHARES - 1e-9 else "之下没有卖单"))
                     else:
                         q, hold = self.sim_taker_pick(mk, trades, side, q, now_ms)  # the count the caps take, or why none
                         parts.append(f"{name}：封顶 {cents(cap)}{capped}，可买 {q['got']:g} 份" + (f"（已吃 {taken:g} 份，上限 {c.sim_taker_max_shares:g}）" if taken > 0 else "")
@@ -18833,7 +18943,9 @@ class Bot:
             ask = levels[0][0] if levels else None
             room, taken = self.sim_taker_room(trades, mk, side, self.sim_taker_want(mk, side, cap))
             held = trades.get(f"{mk.market}|{side}|吃")
-            q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
+            # 1.150.0: on paper the asks less what paper fills already took (sim_paper_book), as the trader's own look — the card
+            # would otherwise read 可买 N 份 for shares it bought a look ago and will not buy again
+            q = taker_quote(self.sim_paper_book(mk, side), side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
             got = float(q["got"]) if q and q["got"] >= SIM_MIN_SHARES - 1e-9 else 0.0
             block = ""
             if cap <= 0:
@@ -18845,7 +18957,9 @@ class Bot:
             elif ask is None:
                 block = "没有卖单"
             elif not got and ask <= cap + 1e-9:
-                block = f"封顶 {cents(cap)} 之下只有零星卖单（不足 1 份）"
+                spent = self.sim_paper_spent(mk, side, cap)
+                block = (f"封顶 {cents(cap)} 之下的卖单已被模拟交易买过（{spent:g} 份），等新的卖单" if spent >= SIM_MIN_SHARES - 1e-9
+                         else f"封顶 {cents(cap)} 之下只有零星卖单（不足 1 份）")
             gap = round(ask - cap, 6) if ask is not None and cap > 0 else None
             if why and not block:
                 block = why  # 1.138.0: under the headline's reason the sides are not buyable — no "可买 N 份" beside "不吃单"
@@ -19146,12 +19260,13 @@ class Bot:
         SIM_TAKER_SWEEP_SHARES — every share the asks at or under the cap show, up to that many and never fewer than
         the per-buy count: at a fair price of 50¢ the asks at 20¢ and 30¢ both clear the bar, so both are taken in one
         order rather than the 20¢ ones now and the 30¢ ones a step later (if still there). A thin book is bought as
-        before (the order asks for the per-buy count, the rest of it waits at the cap in real trading)."""
+        before (the order asks for the per-buy count, the rest of it waits at the cap in real trading). On paper the
+        asks are the book's less what paper fills already took of them (sim_paper_book, 1.150.0)."""
         base = self.sim_taker_shares(mk)
         sweep = self.config.sim_taker_sweep
         if sweep <= 0 or cap <= 0:
             return base
-        visible = sum(q for p, q in side_levels(mk.book, side) if p <= cap + 1e-9)
+        visible = sum(q for p, q in side_levels(self.sim_paper_book(mk, side), side) if p <= cap + 1e-9)
         return min(max(base, min(visible, sweep)), self.sim_order_cap(mk))  # a daily crypto market sweeps no more than a buy
 
     def sim_taker_room(self, trades: dict[str, dict], mk: SimMarket, side: str, want: float | None = None) -> tuple[float, float]:
@@ -19649,6 +19764,9 @@ class Bot:
             if best > price + 1e-9:
                 return (f"挂 {cents(price)}，最低卖价 {cents(best)}（高出 {cents(best - price)}）：要有人卖到挂价或更低才算成交；"
                         f"现在公平价 {cents(fair)}")
+            if not any(p <= price + 1e-9 for p, _ in side_levels(self.sim_paper_book(mk, trade["side"], resting=True), trade["side"])):
+                # 1.150.0: every such seller is one another paper fill already has (sim_fill credits none of them again)
+                return f"盘口卖到挂价的卖单已被模拟交易买过，不再重复算成交；现在公平价 {cents(fair)}"
             return f"盘口有卖到挂价的卖单，已按看到的数量推定成交；现在公平价 {cents(fair)}"
         if status != "filled":
             return ""
@@ -19952,9 +20070,16 @@ class Bot:
             if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
                 self.sim_taker_unseen(mk)  # a look that cannot judge the market breaks its takers' runs (SIM_TAKER_HOLD_SECONDS)
                 continue  # positions filled in other kinds (SIM_MARKETS narrowed) still settle below; resting ones are withdrawn
+            self.sim_paper_seen(mk)  # the asks paper fills took that this book no longer shows are forgotten (1.150.0)
             self.sim_quote(mk, trades, now_ms, changed)
             self.sim_take(mk, trades, now_ms, changed)
         self.sim_taker_seen = {tid: at for tid, at in self.sim_taker_seen.items() if tid.rsplit("|", 2)[0] in markets}  # gone markets forgotten
+        if self.sim_paper_used:
+            # ...and what paper fills took on a market that is over (nothing more is bought there). Until then it is kept
+            # through the looks that do not price the market (a quote missing for a moment, a card on hold): its asks are
+            # still the ones already bought when it is priced again
+            self.sim_paper_used = {market: held for market, held in self.sim_paper_used.items()
+                                   if (now_ms < held["end"] if held["end"] is not None else market in markets)}
         t2 = time.monotonic()
         opened, rekeys, unpriced = {tid for tid, _ in changed}, [], set()
         freed: dict[str, dict] = {}  # market -> a record withdrawn below by a rule: its slot is quoted again in this look (sim_requote_freed)
@@ -20072,6 +20197,8 @@ class Bot:
                 trades[new_tid] = trades.pop(tid)
                 changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]
             trades[tid] = self.sim_open(mk, side, now_ms, maker=maker, shares=count)
+            if not isinstance(trades[tid].get("live"), dict):
+                self.sim_paper_rested(mk, side)  # 1.150.0: a paper order is not credited the asks the orders before it in the slot were
             # 1.150.0 (audit SIM-FOLLOW-SETTLE-GONE): a fresh order starts without a settle clock. The slot's clock (market|side) is
             # cleared only by a look that finds its order in place (sim_requote_reason: move None); an order that ended while one
             # ran — withdrawn at the settle or for its edge, filled — left it behind, and the next order in the slot would take it
@@ -20172,7 +20299,9 @@ class Bot:
             # what this side may still take (SIM_TAKER_MAX_SHARES), 0 with an order in flight; the count asked for is every
             # ask under the cap (SIM_TAKER_SWEEP_SHARES) or the per-buy count
             room, _ = self.sim_taker_room(trades, mk, side, self.sim_taker_want(mk, side, cap))
-            q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
+            # 1.150.0 (audit SIM-PAPER-TAKER-REBUY): on paper the asks are the book's less what paper fills already took of
+            # them (sim_paper_book); in real trading the book as read
+            q = taker_quote(self.sim_paper_book(mk, side), side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
             if q and q["got"] >= SIM_MIN_SHARES - 1e-9:  # under a share is dust, not a trade: the slot stays free
                 quotes.append((round(fair - q["cost"], 4), side, q))
         self.sim_taker_looked(mk, {side for _, side, _ in quotes}, now_ms)  # the runs of looks that find each side buyable
@@ -20192,6 +20321,10 @@ class Bot:
             trades[new_tid] = trades.pop(tid)
             changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]
         trades[tid] = self.sim_open(mk, side, now_ms, taker=q)
+        if trades[tid].get("status") == "filled" and not isinstance(trades[tid].get("live"), dict):
+            # a paper buy, filled here and now: Predict's book stays as it was, so the asks it took are remembered — the
+            # next look (and a resting order's presumed fill) does not get them again. A real order is filled by Predict
+            self.sim_paper_took(mk, side, q["levels"])
         changed.append((tid, trades[tid]))
 
     def sim_taker_looked(self, mk: SimMarket, buyable: set[str], now_ms: int) -> None:
@@ -20242,6 +20375,7 @@ class Bot:
         if quiet:
             return q, quiet
         bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
+        book = self.sim_paper_book(mk, side)  # the asks the smaller counts are quoted on: as ``q`` was (on paper less what paper fills took, 1.150.0)
         room, full = self.sim_side_room(trades, mk, side)  # SIM_AFTER_HOURS_MAX_SHARES: what the side may still hold after hours
         if full:
             return q, full
@@ -20253,7 +20387,7 @@ class Bot:
             return q, full
         if q["want"] > min(room, mroom, uroom) + 1e-9:
             left = min(room, mroom, uroom)
-            smaller = taker_quote(mk.book, side, float(math.floor(left + 1e-9)), bps, q["cap"])
+            smaller = taker_quote(book, side, float(math.floor(left + 1e-9)), bps, q["cap"])
             if not smaller or smaller["got"] < SIM_MIN_SHARES - 1e-9:
                 return q, (f"这张卡未结算窗口的资金只剩 {left:g} 份的额度，封顶价之下买不到一份" if uroom < min(room, mroom)
                            else f"这一边只剩 {left:g} 份额度（加密日涨跌每边上限），封顶价之下买不到一份" if mroom < room
@@ -20266,7 +20400,7 @@ class Bot:
 
         def quote(n: int) -> dict | None:
             if n not in quotes:
-                quotes[n] = taker_quote(mk.book, side, float(n), bps, q["cap"])
+                quotes[n] = taker_quote(book, side, float(n), bps, q["cap"])
             return quotes[n]
 
         def fits(n: int) -> bool:  # the paper cap alone while searching; the real-trading limits are counted once, below
@@ -20424,6 +20558,7 @@ class Bot:
                 if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
                     self.sim_taker_unseen(mk)
                     continue
+                self.sim_paper_seen(mk)  # as the step: the asks paper fills took that this book no longer shows are forgotten
                 self.sim_express_rest(mk, trades, now_ms, changed)
                 if self.config.sim_ways != "taker":
                     self.sim_quote(mk, trades, now_ms, changed, express=True)

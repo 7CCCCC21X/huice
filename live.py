@@ -1584,6 +1584,11 @@ class LiveBot(core.Bot):
             self.live_notify(f"🛑 {why}；今天不再开新仓，已请求撤掉挂单（以 Predict 的确认为准）。/live resume 可手动恢复。", key="kill")
 
     # --- opening: the paper record becomes an order to place ----------------------------------------------------------
+    def sim_paper(self) -> bool:
+        """Paper buys only with LIVE=off (sim_open below). Otherwise the fills are Predict's and the book is the real one:
+        what earlier paper fills took of it (Bot.sim_paper_book, 1.150.0) is never taken out of a real decision."""
+        return self.config.live_mode == "off"
+
     def sim_open(self, mk: core.SimMarket, side: str, now_ms: int, maker: Any = None, taker: dict | None = None,
                  shares: float | None = None) -> dict:
         trade = super().sim_open(mk, side, now_ms, maker, taker, shares)

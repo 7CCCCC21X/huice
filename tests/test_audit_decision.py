@@ -1261,4 +1261,240 @@ FLOOR_CASES = (floor_pick, floor_paper_looks, floor_left_cut, floor_real_limits)
 for floor_case in FLOOR_CASES:
     asyncio.run(floor_case())
 
+# --- SIM-PAPER-TAKER-REBUY: the asks a paper fill took are not there for the paper trader's later looks ---------------------------
+# A paper buy changes nothing on Predict, so the asks it "took" are in every later book. On the DEFAULT settings (SIM_WAYS=taker,
+# SIM_TAKER_MAX_SHARES 300, SIM_TAKER_SWEEP_SHARES 300, SIM_TAKER_HOLD_SECONDS 0) the taker bought them again at every look — the
+# step's on each freshly read book, the express lane's a tenth of a second after every price push on the very same snapshot — until
+# 300 shares were held: one 100-share ask a 300-share position, a 10-share one thirty buys of 10. With SIM_WAYS=both the one ask a
+# resting order was presumed filled from was bought by the taker as well, and the asks a floor order was credited went to the next
+# floor order in its slot again. Paper volume, P&L, EV and markouts on thin books were one bet counted several times, and the
+# shares that never existed used up the caps. Real trading reads its fills from Predict: nothing changes there.
+PAPER = "hsi-paper-rebuy"
+PAPER_UP, PAPER_REST = f"{PAPER}|up|吃", f"{PAPER}|up|挂"
+PAPER_SETTLE = {"key": "HSI", "target": "2026-11-10", "line": 24600.0, "close_ms": NOW + 4 * 3600_000}
+PAPER_ENV = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"}  # the trader's defaults
+PAPER_BOTH = {"SIM_WAYS": "both", "SIM_MAKER_POINTS": "off", "SIM_MAKER_SESSION": "off"}  # resting orders too, on any market
+PAPER_BIDS = (("0.50", "300"),)
+
+
+def paper_mk(asks, read: int, bids=PAPER_BIDS, fair: float = 0.70, **more) -> m.SimMarket:
+    """The 恒指 daily card, 涨 worth ``fair`` (at 70¢ a taker pays up to 59¢), its book read at ``read``."""
+    b = m.PredictBook("HSI", PAPER, "601", "t", tuple((D(p), D(q)) for p, q in bids), tuple((D(p), D(q)) for p, q in asks), read, 200)
+    return m.SimMarket(PAPER, "恒生指数", "close", "HSI", fair, b, 0.03, more.pop("hold", ""), ("涨", "跌"), PAPER_SETTLE, {}, **more)
+
+
+def paper_bot(**env):
+    """The paper trader on its default settings (plus ``env``); its markets are world["markets"]. (the bot, the world)."""
+    bot, world = m.Bot(m.Config.from_env({**PAPER_ENV, **env}), m.Store(":memory:"), SelfFM(NOW), None), {"markets": []}
+    bot.sim_markets = lambda now, only=None: world["markets"]
+    return bot, world
+
+
+async def paper_look(bot, world, ms: int, *markets, express: bool = False) -> None:
+    """One look ``ms`` after NOW over ``markets``: the step, or (``express``) the lane a pushed book or price starts."""
+    at = NOW + ms
+    bot.market.now, world["markets"] = at, list(markets)
+    if express:
+        await bot.sim_express("HSI")
+    else:
+        bot.sim_ran = -1e9
+        await bot.sim_step(at)
+
+
+def paper_held(bot, side: str = "up") -> tuple:
+    """(the shares the bot's records hold on ``side``, the records that hold some)."""
+    rows = [t for t in bot.sim_trades().values() if t["side"] == side and float(t["shares"]) > 0]
+    return sum(float(t["shares"]) for t in rows), len(rows)
+
+
+def paper_ways(bot) -> tuple:
+    """(the 涨 shares the takers bought, the 涨 shares the resting orders were credited)."""
+    held = lambda maker: sum(float(t["shares"]) for t in bot.sim_trades().values() if t["side"] == "up" and bool(t.get("maker")) == maker)
+    return held(False), held(True)
+
+
+async def paper_thin_ask():
+    """A book that only ever offers 100 shares (or 10) under the taker's cap, on the default settings: bought once — by the
+    step on freshly read books that still show the ask, and by the express lane on one snapshot never read again."""
+    for express in (False, True):
+        bot, world = paper_bot()
+        c = bot.config
+        assert (c.sim_ways, c.sim_taker_max_shares, c.sim_taker_sweep, c.sim_taker_hold) == ("taker", 300.0, 300.0, 0.0), "the defaults"
+        snapshot = paper_mk([("0.55", "100")], NOW)
+        for i in range(4):
+            ms = 200 * (i + 1) if express else 5_000 * i
+            await paper_look(bot, world, ms, snapshot if express else paper_mk([("0.55", "100")], NOW + ms), express=express)
+        assert paper_held(bot) == (100.0, 1), (express, paper_held(bot))  # before the fix: (300.0, 3)
+        assert bot.sim_trades()[PAPER_UP]["fills"][0]["levels"] == [[0.55, 100.0]]
+    bot, world = paper_bot()
+    ten = paper_mk([("0.55", "10")], NOW)
+    for i in range(40):  # forty price pushes over eight seconds, the book never read again
+        await paper_look(bot, world, 200 * (i + 1), ten, express=True)
+    assert paper_held(bot) == (10.0, 1), paper_held(bot)  # before the fix: (300.0, 30) — thirty times what the book ever showed
+    # the pages say what the trader does: the ask is one it bought, not 可买 10 份 for ever (the card's 卖1 is still that ask)
+    gap = bot.sim_taker_gap(ten, bot.sim_trades(), NOW + 9_000)
+    up = gap["sides"][0]
+    assert (up["ask"], up["got"], up["block"]) == (0.55, 0.0, "封顶 59.0¢ 之下的卖单已被模拟交易买过（10 份），等新的卖单") and gap["state"] != "ready", gap
+    world["markets"] = [ten]
+    row = next(r for r in bot.sim_checks(NOW + 9_000) if r["market"] == PAPER)
+    assert row["taker"].startswith("涨：封顶 59.0¢，之下的卖单已被模拟交易买过（10 份），等新的卖单；"), row["taker"]
+    assert bot.sim_taker_gap(ten, {}, NOW)["sides"][0]["block"] != "", "the bot's own memory, whatever records it is shown"
+    fresh, _ = paper_bot()  # a trader that has bought nothing sees the ask as ever
+    gap = fresh.sim_taker_gap(ten, {}, NOW)
+    assert gap["state"] == "ready" and gap["text"] == "可吃单：吃涨 封顶 59.0¢，可买 10 份", gap
+
+
+async def paper_new_sellers():
+    """What is offered beyond what was bought is new and is bought (SIM_TAKER_MAX_SHARES' one buy after another, from depth
+    that is really left): a level that grew, another level, a level that went from the book and is offered again. What was
+    bought stays bought however the level's size moves, for as long as the book shows the level."""
+    bot, world = paper_bot()
+    walked = lambda: bot.sim_trades()[PAPER_UP]["fills"][0]["levels"]  # the latest buy's (the earlier ones moved to 吃#n)
+    looks = (
+        ([("0.55", "100")], (100.0, 1), [[0.55, 100.0]]),
+        ([("0.55", "150")], (150.0, 2), [[0.55, 50.0]]),                  # 50 more offered at 55¢: those 50
+        ([("0.55", "150"), ("0.56", "80")], (230.0, 3), [[0.56, 80.0]]),  # a seller at 56¢: his 80, at 56¢ (not the 55¢ ones again)
+        ([("0.55", "150"), ("0.56", "80")], (230.0, 3), [[0.56, 80.0]]),  # nothing new
+        ([("0.55", "40"), ("0.56", "80")], (230.0, 3), [[0.56, 80.0]]),   # the 55¢ level smaller: what is left of it was bought
+        ([("0.55", "150"), ("0.56", "80")], (230.0, 3), [[0.56, 80.0]]),  # ...and back at its size: the most ever seen, once
+        ([("0.62", "500")], (230.0, 3), [[0.56, 80.0]]),                  # both levels gone from the book: forgotten
+        ([("0.55", "100"), ("0.62", "500")], (300.0, 4), [[0.55, 70.0]]))  # 100 at 55¢ again, another seller's: the side's last 70
+    for i, (asks, held, levels) in enumerate(looks):
+        await paper_look(bot, world, 5_000 * i, paper_mk(asks, NOW + 5_000 * i))
+        assert paper_held(bot) == held and walked() == levels, (i, asks, paper_held(bot), walked())
+        if i >= 5:
+            assert bot.sim_paper_used.get(PAPER, {}).get("up") == ({0.55: [150.0, 0.0], 0.56: [80.0, 0.0]}, None, {0.55: [70.0, 0.0]})[i - 5], (i, bot.sim_paper_used)
+    # a deep level is bought buy after buy as before (the per-buy count: SIM_TAKER_SWEEP_SHARES off) — and once the 250 at 55¢
+    # are used up the third buy goes on to the 56¢ ones, as the real order would (before the fix: 100 at 55¢ three times)
+    deep, world = paper_bot(SIM_TAKER_SWEEP_SHARES="0")
+    for i in range(5):
+        await paper_look(deep, world, 5_000 * i, paper_mk([("0.55", "250"), ("0.56", "2000")], NOW + 5_000 * i))
+    buys = [t["fills"][0]["levels"] for t in sorted(deep.sim_trades().values(), key=lambda t: t["opened"])]
+    assert buys == [[[0.55, 100.0]], [[0.55, 100.0]], [[0.55, 50.0], [0.56, 50.0]]] and paper_held(deep) == (300.0, 3), buys
+
+
+async def paper_down_side():
+    """跌 is bought from the bids (a 45¢ bid is 跌 offered at 55¢): the same rule there."""
+    bot, world = paper_bot()
+    down = lambda ms, *bids: paper_mk([("0.50", "300")], NOW + ms, bids=bids, fair=0.30)
+    for i in range(4):
+        await paper_look(bot, world, 5_000 * i, down(5_000 * i, ("0.45", "100")))
+    assert paper_held(bot, "down") == (100.0, 1) and paper_held(bot) == (0.0, 0), paper_held(bot, "down")  # before the fix: (300.0, 3)
+    assert bot.sim_trades()[f"{PAPER}|down|吃"]["fills"][0]["levels"] == [[0.55, 100.0]] and bot.sim_paper_used[PAPER]["down"] == {0.55: [100.0, 0.0]}
+    await paper_look(bot, world, 20_000, down(20_000, ("0.40", "300")))                     # the 45¢ bid gone (60¢ is over the cap)
+    await paper_look(bot, world, 25_000, down(25_000, ("0.45", "100"), ("0.40", "300")))    # ...and another one there
+    assert paper_held(bot, "down") == (200.0, 2), paper_held(bot, "down")
+
+
+async def paper_both_ways():
+    """SIM_WAYS=both: an order rests at 55¢; then one seller offers 100 at 55¢, under the taker's cap too. Those 100 shares are
+    credited once — to the taker in the step (it takes before the fills are judged), to the resting order in the express lane
+    (which judges the fills first) — not to both (before the fix: 200 in that look, and the taker's 100 again at the next)."""
+    quiet = lambda ms: paper_mk([("0.62", "300")], NOW + ms, bids=(("0.55", "500"),))   # the ask over the taker's cap: an order rests
+    offer = lambda ms, size: paper_mk([("0.55", size)], NOW + ms, bids=(("0.54", "500"),))
+    for express, ways in ((False, (100.0, 0.0)), (True, (0.0, 100.0))):
+        bot, world = paper_bot(**PAPER_BOTH)
+        await paper_look(bot, world, 0, quiet(0))
+        rest = bot.sim_trades()[PAPER_REST]
+        assert (rest["status"], rest["price"], rest["order"]) == ("resting", 0.55, 100.0) and paper_ways(bot) == (0.0, 0.0), rest
+        await paper_look(bot, world, 1_000, offer(1_000, "100"), express=express)
+        assert paper_ways(bot) == ways, (express, paper_ways(bot))
+        if not express:  # the order still rests there (its 买1 moved a second ago: SIM_MAKER_FOLLOW_SETTLE_SECONDS): why it has nothing
+            rest = bot.sim_trades()[PAPER_REST]
+            assert rest["status"] == "resting" and rest["shares"] == 0.0 and rest["price"] == 0.55, rest
+            assert bot.sim_wait(rest, offer(1_000, "100"), NOW + 1_000) == "盘口卖到挂价的卖单已被模拟交易买过，不再重复算成交；现在公平价 70.0¢"
+        for i in range(3):  # ...and the looks after it, of both lanes, on books that still show the 100
+            await paper_look(bot, world, 2_000 + 1_500 * i, offer(2_000 + 1_500 * i, "100"), express=bool(i % 2))
+        assert paper_ways(bot) == ways, (express, paper_ways(bot))
+    # a part fill and more sellers: 40 offered — the resting order has them (the express lane); the level grows to 100 — the 60
+    # new ones go to the taker (the step), the order keeps its 40: its own sighting is not taken out of what it saw
+    bot, world = paper_bot(**PAPER_BOTH)
+    await paper_look(bot, world, 0, quiet(0))
+    await paper_look(bot, world, 1_000, offer(1_000, "40"), express=True)
+    assert paper_ways(bot) == (0.0, 40.0) and bot.sim_paper_used[PAPER]["up"] == {0.55: [0.0, 40.0]}, (paper_ways(bot), bot.sim_paper_used)
+    await paper_look(bot, world, 1_500, offer(1_500, "40"), express=True)
+    assert paper_ways(bot) == (0.0, 40.0), paper_ways(bot)  # before the fix the taker had bought the same 40 by now
+    await paper_look(bot, world, 2_000, offer(2_000, "100"))
+    assert paper_ways(bot) == (60.0, 40.0) and bot.sim_trades()[PAPER_UP]["fills"][0]["levels"] == [[0.55, 60.0]], paper_ways(bot)
+    await paper_look(bot, world, 2_500, offer(2_500, "100"), express=True)
+    assert paper_ways(bot) == (60.0, 40.0) and bot.sim_paper_used[PAPER]["up"] == {0.55: [60.0, 40.0]}, (paper_ways(bot), bot.sim_paper_used)
+    # a resting order alone (SIM_WAYS=maker) is credited as ever: the most it ever saw, and a level that grew in full
+    solo, world = paper_bot(**{**PAPER_BOTH, "SIM_WAYS": "maker"})
+    await paper_look(solo, world, 0, quiet(0))
+    for ms, size, credited in ((1_000, "40", 40.0), (1_500, "40", 40.0), (2_000, "100", 100.0)):
+        await paper_look(solo, world, ms, offer(ms, size), express=True)
+        assert paper_ways(solo) == (0.0, credited), (ms, paper_ways(solo))
+
+
+async def paper_next_order():
+    """One resting order after another on the same asks. A floor order (SIM_MAKER_FLOOR_SHARES: 100 × 1¢ by default, on a side with
+    no bid to follow) is placed at its price wherever the asks stand: 100 offered at 1¢ fill it, it becomes a position, and the
+    next floor order takes the slot — at the asks the last one was credited. They are credited once (before the fix: to every
+    second look's fresh order, 300 shares in six looks of one 100-share ask); what is offered beyond them goes to the new order."""
+    bot, world = paper_bot(SIM_WAYS="maker", SIM_MAKER_POINTS="off", SIM_MAKER_SESSION="off")
+    cheap = lambda ms, size: paper_mk([("0.01", size)], NOW + ms, bids=(), fair=0.30)
+    for i in range(6):
+        await paper_look(bot, world, 5_000 * i, cheap(5_000 * i, "100"))
+    rest = bot.sim_trades()[PAPER_REST]
+    assert paper_ways(bot) == (0.0, 100.0), (paper_ways(bot), sorted(bot.sim_trades()))  # before the fix: (0.0, 300.0)
+    assert (rest["status"], rest["price"], rest["shares"], rest.get("floor")) == ("resting", 0.01, 0.0, True), rest
+    assert bot.sim_wait(rest, cheap(25_000, "100"), NOW + 25_000) == "盘口卖到挂价的卖单已被模拟交易买过，不再重复算成交；现在公平价 30.0¢"
+    await paper_look(bot, world, 30_000, cheap(30_000, "150"))
+    assert paper_ways(bot) == (0.0, 150.0) and bot.sim_trades()[PAPER_REST]["shares"] == 50.0, paper_ways(bot)
+    await paper_look(bot, world, 35_000, cheap(35_000, "150"), express=True)
+    assert paper_ways(bot) == (0.0, 150.0), paper_ways(bot)
+
+
+async def paper_memory():
+    """What was bought is remembered through the looks that do not judge the market (a quote missing for a moment, the card on
+    hold) and forgotten when the market is over."""
+    bot, world = paper_bot()
+    ask = lambda ms, **more: paper_mk([("0.55", "100")], NOW + ms, **more)
+    await paper_look(bot, world, 0, ask(0))
+    await paper_look(bot, world, 5_000)                               # the card has no odds for a look: the market is not priced
+    await paper_look(bot, world, 10_000, ask(10_000, hold="行情过期"))  # ...then it holds
+    for ms in (15_000, 20_000):                                       # ...and is judged again, on a book that still shows the ask
+        await paper_look(bot, world, ms, ask(ms), express=ms == 20_000)
+    assert paper_held(bot) == (100.0, 1), paper_held(bot)  # before the fix: (300.0, 3)
+    assert bot.sim_paper_used == {PAPER: {"end": PAPER_SETTLE["close_ms"], "up": {0.55: [100.0, 0.0]}, "down": {}}}, bot.sim_paper_used
+    await paper_look(bot, world, PAPER_SETTLE["close_ms"] - NOW + 1_000)
+    assert bot.sim_paper_used == {} and paper_held(bot) == (100.0, 1), bot.sim_paper_used
+
+
+def paper_thin_card(read: int) -> m.SimMarket:
+    """clock_card's market 501 with only 100 shares offered at 58¢."""
+    card = clock_card("501", read)
+    return m.dataclasses.replace(card, book=m.dataclasses.replace(card.book, asks=((D("0.58"), D("100")),)))
+
+
+async def paper_real_trading():
+    """With LIVE=off the real trader's bot (the one that runs whenever a key is configured) is the paper trader: the same rule.
+    Real trading is as it was: its fills are Predict's and its book the real one — nothing a paper period remembered is taken
+    out of a real decision."""
+    clock, world = SelfFM(NOW), {"markets": []}
+    off = live.LiveBot(m.Config.from_env({**CLOCK_LIVE, "LIVE": "off", "SIM_TAKER_MAX_SHARES": "300"}), m.Store(":memory:"), clock, None)
+    off.live.api, off.live.chain = ClockApi(clock), StaleChain()
+    off.sim_markets = lambda now, only=None: world["markets"]
+    for i in range(3):
+        await clock_step(off, world, NOW + 5_000 * i, paper_thin_card(NOW + 5_000 * i))
+    held = [(t["status"], t["shares"], "live" in t) for t in off.sim_trades().values()]
+    assert held == [("filled", 100.0, False)] and off.live.api.tokens() == [], held  # before the fix: three paper buys of the 100
+    assert off.sim_paper() and off.config.live_mode == "off"
+    bot, api, world = await clock_bot(SIM_TAKER_MAX_SHARES="300")
+    assert not bot.sim_paper() and m.Bot.sim_paper(bot)
+    await clock_step(bot, world, NOW, paper_thin_card(NOW))
+    order = bot.sim_trades()["clock-card-501|up|吃"]
+    assert order["live"]["state"] == "open" and api.tokens() == ["5011"] and bot.sim_paper_used == {}, (order["live"], bot.sim_paper_used)
+    other = clock_card("502", NOW + 5_000)
+    bot.sim_paper_took(other, "up", [(0.58, 400.0)])  # as left by a paper period before LIVE was switched on
+    assert bot.sim_paper_book(other, "up") is other.book and bot.sim_paper_spent(other, "up", 0.59) == 0.0
+    assert "可买 100 份" in bot.sim_taker_gap(other, bot.sim_trades(), NOW + 5_000)["detail"]
+    await clock_step(bot, world, NOW + 5_000, paper_thin_card(NOW + 5_000), other)
+    assert api.tokens() == ["5011", "5021"], api.tokens()  # the real order on the asks the paper trader had "bought"
+
+
+PAPER_CASES = (paper_thin_ask, paper_new_sellers, paper_down_side, paper_both_ways, paper_next_order, paper_memory, paper_real_trading)
+for paper_case in PAPER_CASES:
+    asyncio.run(paper_case())
+
 print("AUDIT_DECISION_OK")
