@@ -1,5 +1,5 @@
 """Audit cluster live-a: regression tests for the verified findings fixed in this cluster (fakes only, offline)."""
-import asyncio, pathlib, sys, time
+import asyncio, dataclasses, pathlib, sys, time
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "tests"))
 import offline  # noqa: F401  (blocks real HTTP)
@@ -506,7 +506,138 @@ async def double_cancel():
     ended_once(bot, t, oid, n, T1 + 5_000)
 
 
+async def order_test_limits():
+    """LIVE-TEST-LIMITS: /live test — and the control endpoint's "test", which passes its request's "args" on — takes a share
+    count and a price from whoever asks, and readiness was all that stood before the signature: `/live test 恒生 1000 99` sent
+    a $990 buy across the book with LIVE_MAX_ORDER_USD at $5, under LIVE=pause, /live pause, today's loss stop and
+    LIVE_TRADING_ALLOWED=off alike (and under LIVE=off once /live check had signed in). Whatever the arguments, the test is
+    a resting order now: never at or above the best ask, worth LIVE_MAX_ORDER_USD at the most, and at a price that may trade
+    (at or above the best bid) only while a model order could open a position — the hard switch on, LIVE=on, no /live
+    pause, today's loss stop not tripped, room under LIVE_MAX_OPEN_USD. Under the hard switch the test is a minimum-size
+    order ($2 at the most) whatever LIVE_MAX_ORDER_USD is saved as: no saved setting decides what leaves there. What is
+    documented stays: the test without arguments ($1, under the best bid) in every mode — LIVE=pause is where it is run —
+    and the operator's own test at the bid while the bot trades."""
+    WEI = T["WEI"]
+    ASK = 58.0  # ¢: the card below bids 55¢ and asks 58¢
+    card = lambda: hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)
+    AT_BID = ("恒生", "100", "55")  # $55 at the best bid: it may trade (within make_bot's caps, $100 an order and $250 open)
+    today = m.beijing_day(NOW / 1000)
+
+    def orders(bot):  # what the bot sent to Predict: (USDT offered, shares, price in ¢) per order
+        return [(int(b["data"]["order"]["makerAmount"]) / WEI, int(b["data"]["order"]["takerAmount"]) / WEI, int(b["data"]["pricePerShare"]) * 100 / WEI)
+                for b in (c[1] for c in bot.live.api.calls if c[0] == "create")]
+
+    async def attempt(bot, *args, page=False, cards=None):
+        """One order test, by /live test or (page) by the control page's request: (ok, the answer, the order it sent or None)."""
+        world["markets"] = cards or [card()]
+        before = len(orders(bot))
+        if page:  # the request as the web handler hands it on once the key is checked; the page's own button sends no "args"
+            got = await bot.control_action({"action": "test", "args": list(args)} if args else {"action": "test"})
+            ok, text = got["ok"], got["message"]
+        else:
+            text = await bot.live_action("test", list(args), NOW)
+            ok = None
+        sent = orders(bot)[before:]
+        assert len(sent) <= 1, sent
+        return ok, text, (sent[0] if sent else None)
+
+    def refused(got, *words):  # nothing signed, nothing sent; "❌" is what makes the page report a failure
+        ok, text, sent = got
+        assert sent is None and text.startswith("❌") and ok is not True and all(w in text for w in words), (ok, text, sent)
+
+    def went(got, usd, shares, cents, *words):  # sent as asked, listed, withdrawn, its final state read
+        ok, text, sent = got
+        assert sent == (usd, shares, cents) and ok is not False, (ok, text, sent)
+        assert text.startswith("🧪 挂单测试") and "1/4 下单成功" in text and "3/4 撤单：已撤" in text and all(w in text for w in words), text
+
+    # every stop at once, as the audit ran it: the hard switch (it caps the mode at pause), /live pause, today's loss stop; the
+    # caps at $5 an order and $10 open
+    bot = make_bot(LIVE_TRADING_ALLOWED="off", LIVE_MAX_ORDER_USD="5", LIVE_MAX_OPEN_USD="10")
+    await bot.live_prepare()
+    await bot.live_action("pause", [], NOW)
+    bot.store.put("live:killed", {"day": today, "why": "触发日亏损上限", "at": NOW})
+    assert bot.live.ready and (bot.config.live_mode, bot.config.live_allowed) == ("pause", False) and bot.live_paused() and bot.live_killed()
+    refused(await attempt(bot, "恒生", "1000", "99"))  # the audit's order: $990 across the book
+    refused(await attempt(bot, "恒生", "1000", "99", page=True))  # ...and by a hand-made request to the control endpoint
+    refused(await attempt(bot, "恒生", "1000", "54"), "LIVE_TRADING_ALLOWED=off", "$2（")  # $540 a cent under the bid: it would rest, but it is no test
+    refused(await attempt(bot, "恒生", "2", "55"), "LIVE_TRADING_ALLOWED=off", "可能成交")  # $1.10 at the bid: small enough, but it may trade
+    refused(await attempt(bot, "恒生", "2", "57"), "LIVE_TRADING_ALLOWED=off", "可能成交")  # ...as between the bid and the ask
+    refused(await attempt(bot, "恒生", "2", "58"), "最低卖价")  # $1.16 at the ask is a purchase all the same
+    assert not orders(bot) and bot.store.get("live:test") is None and bot.live_status(NOW)["last_test"] == ""  # a refusal is no test result
+    went(await attempt(bot), 1.0, 50, 2.0)  # the test without arguments goes on under every stop: 2¢ × 50 = $1, far under the bid
+    went(await attempt(bot, page=True), 1.0, 50, 2.0)  # the page's button
+    went(await attempt(bot, "恒生", "100", "1"), 1.0, 100, 1.0)  # README's own example: 100 shares at 1¢
+    last = bot.store.get("live:test")["text"]
+    refused(await attempt(bot, "恒生", "1000", "99"))
+    assert bot.store.get("live:test")["text"] == last  # the last test's result stays on the page
+    # the hard switch's bound is no saved setting: the page raises LIVE_MAX_ORDER_USD (it may, whatever the switch says), and the
+    # test stays a minimum-size order under the bid
+    assert bot.control_set({"LIVE_MAX_ORDER_USD": "1000000"})["ok"] and bot.config.live_max_order_usd == 1_000_000 and not bot.config.live_allowed
+    refused(await attempt(bot, "恒生", "1000", "54", page=True), "LIVE_TRADING_ALLOWED=off", "$2（")
+    went(await attempt(bot, "恒生", "4", "30"), 1.2, 4, 30.0)  # Predict's minimum at 30¢, well under the bid
+    went(await attempt(bot, "恒生", "200", "1"), 2.0, 200, 1.0)  # $2 to the cent
+    refused(await attempt(bot, "恒生", "201", "1"), "LIVE_TRADING_ALLOWED=off", "$2（")
+
+    # LIVE=on, nothing stopped: the ask and LIVE_MAX_ORDER_USD hold; the operator's own test at the bid goes out, and says it may trade
+    on = make_bot()
+    await on.live_prepare()
+    went(await attempt(on, *AT_BID), 55.0, 100, 55.0, "可能成交")
+    went(await attempt(on, "恒生", "100", "57"), 57.0, 100, 57.0, "可能成交")  # between the bid and the ask
+    refused(await attempt(on, "恒生", "100", "58"), "最低卖价")  # at the ask it would trade at once
+    refused(await attempt(on, "恒生", "1", "100"), "最低卖价")  # README's example with its two numbers swapped: 99¢ (the tick's ceiling) × 2 shares
+    refused(await attempt(on, "恒生", "1000", "57"), "LIVE_MAX_ORDER_USD $100")  # $570
+    went(await attempt(on, "恒生", "200", "50"), 100.0, 200, 50.0)  # LIVE_MAX_ORDER_USD to the cent
+    refused(await attempt(on, "恒生", "201", "50"), "LIVE_MAX_ORDER_USD $100")  # ...and 50¢ over it
+    # each stop by itself keeps a test that may trade in; the test under the bid goes on; /live resume lifts both stops, as for the model
+    await on.live_action("pause", ["看看"], NOW)
+    refused(await attempt(on, *AT_BID), "已暂停（看看")
+    went(await attempt(on), 1.0, 50, 2.0)
+    await on.live_action("resume", [], NOW)
+    went(await attempt(on, *AT_BID), 55.0, 100, 55.0, "可能成交")
+    on.store.put("live:killed", {"day": today, "why": "今日已结算亏损 −$60.00 达到 LIVE_MAX_DAILY_LOSS_USD $50", "at": NOW})
+    refused(await attempt(on, *AT_BID), "今日停止开新仓")
+    went(await attempt(on), 1.0, 50, 2.0)
+    await on.live_action("resume", [], NOW)
+    went(await attempt(on, *AT_BID), 55.0, 100, 55.0, "可能成交")
+    paused = make_bot(LIVE="pause")
+    await paused.live_prepare()
+    refused(await attempt(paused, *AT_BID), "LIVE=pause")
+    went(await attempt(paused), 1.0, 50, 2.0)  # (test_trading pins this one: "it is how the mode is meant to be used")
+    hard = make_bot(LIVE_TRADING_ALLOWED="off")
+    await hard.live_prepare()
+    hard.config = hard.live.config = dataclasses.replace(hard.config, live_mode="on")  # the hard switch alone: the mode forced on in memory
+    refused(await attempt(hard, *AT_BID), "LIVE_TRADING_ALLOWED=off")
+    went(await attempt(hard), 1.0, 50, 2.0)
+    off = make_bot(LIVE="off")
+    world["markets"] = [card()]
+    assert "未就绪" in await off.live_action("test", list(AT_BID), NOW) and not orders(off)  # paper only: not even signed in
+    await off.live_action("check", [], NOW)  # /live check signs in whatever the mode
+    assert off.live.ready and off.config.live_mode == "off"
+    refused(await attempt(off, *AT_BID), "LIVE=off")
+    went(await attempt(off), 1.0, 50, 2.0)
+    # the smallest LIVE_MAX_ORDER_USD the setting takes ($1) still fits the test without arguments, at either price it takes
+    least = make_bot(LIVE="pause", LIVE_MAX_ORDER_USD="1")
+    await least.live_prepare()
+    went(await attempt(least), 1.0, 50, 2.0)
+    went(await attempt(least, cards=[hsi(0.70, [("0.02", "300")], [("0.05", "400")], NOW)]), 1.0, 100, 1.0)  # a 2¢ bid: 1¢ × 100
+    refused(await attempt(least, "恒生", "4", "30"), "LIVE_MAX_ORDER_USD $1")  # $1.20
+    # LIVE_MAX_OPEN_USD: the model's resting order holds $55 of $100 — a test that may trade has the other $45, the $1 test goes on
+    full = make_bot(SIM_WAYS="maker", LIVE_MAX_OPEN_USD="100")
+    await full.live_prepare()
+    world["markets"] = [card()]
+    await full.live_prefetch(NOW)
+    await step(full, NOW, card())
+    assert abs(full.live_exposure(full.sim_trades()) - 55.0) < 1e-9 and orders(full) == [(55.0, 100, 55.0)], (full.live_exposure(full.sim_trades()), orders(full))
+    refused(await attempt(full, *AT_BID), "LIVE_MAX_OPEN_USD $100")
+    went(await attempt(full, "恒生", "80", "55"), 44.0, 80, 55.0, "可能成交")
+    went(await attempt(full), 1.0, 50, 2.0)
+    # all in all: no order of any of these bots was worth more than its LIVE_MAX_ORDER_USD, none was priced at the ask or above
+    for b, cap in ((bot, 2), (on, 100), (paused, 100), (hard, 2), (off, 100), (least, 1), (full, 100)):
+        assert orders(b) and all(usd <= cap + 1e-9 and cents < ASK for usd, _, cents in orders(b)), orders(b)
+
+
 asyncio.run(place_timeout_race())
 asyncio.run(account_check_rpc_down())
 asyncio.run(double_cancel())
+asyncio.run(order_test_limits())
 print("AUDIT_LIVE_A_OK")

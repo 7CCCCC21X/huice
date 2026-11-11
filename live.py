@@ -4033,12 +4033,16 @@ class LiveBot(core.Bot):
     # --- the order test: a tiny resting order, listed, cancelled ------------------------------------------------------------
     LIVE_TEST_SHARES = 5.0  # the floor; the exchange's minimum order value usually asks for more (50 shares at 2¢)
     LIVE_TEST_PRICE = 0.02  # never above this, and always under the best bid: it rests, it does not trade
+    LIVE_TEST_HARD_USD = 2.0  # LIVE_TRADING_ALLOWED=off: the most a test is worth, whatever is saved (a minimum order at any price is under it)
 
     async def live_test(self, args: list[str], now_ms: int) -> str:
         """The real order path checked end to end with a dollar or so locked for minutes at most: a LIMIT buy far
         under the market (it rests; it is withdrawn at once; it expires in ten minutes by itself), then the open-order
         list, the cancel and the final state, each step reported with what Predict answered. Arguments: a market name
-        to pick it, a share count, a price in cents (a price at or above the best bid may trade)."""
+        to pick it, a share count, a price in cents (a price at or above the best bid may trade). The arguments are
+        held to the limits like any real order (1.150.0, live_test_hold): never at or above the best ask, worth
+        LIVE_MAX_ORDER_USD at the most (LIVE_TEST_HARD_USD under the hard switch), and at a price that may trade only
+        while a model order could open."""
         if not self.live.ready:
             return f"未就绪：{self.live.not_ready_why}"
         words = [a.strip() for a in args if a and a.strip()]
@@ -4072,6 +4076,28 @@ class LiveBot(core.Bot):
         shares = max(shares_given if shares_given is not None else self.LIVE_TEST_SHARES, least)
         sized = (f"（{shares_given:g} 份不足 Predict 最低订单金额 ${MIN_ORDER_USD:g}，改为 {shares:g} 份）"
                  if shares_given is not None and shares > shares_given else "")
+        # 1.150.0: the share count and the price are the operator's (the control endpoint passes its request's "args" on as
+        # well), and readiness was all that stood before the signature: `/live test 恒生 1000 99` sent a $990 buy across the
+        # book with LIVE_MAX_ORDER_USD at $5 — under LIVE=pause, /live pause, today's loss stop and LIVE_TRADING_ALLOWED=off
+        # alike. The test is a resting order, and stays one whatever the arguments: (1) never at or above the best ask — that
+        # trades at once: a purchase no record holds, not a test (`恒生 100 1` typed as `恒生 1 100` was one); (2) worth
+        # LIVE_MAX_ORDER_USD at the most, like every real order — and LIVE_TEST_HARD_USD while LIVE_TRADING_ALLOWED=off: the
+        # cap is a saved setting (the page raises it), and under the hard switch no saved setting decides what leaves; (3) at
+        # a price that may trade (at or above the best bid) only while a model order could open a position (live_test_hold).
+        # The test without arguments — 2¢ at the most, under the best bid, $1 — passes all three in every mode: LIVE=pause is
+        # where it is meant to be run
+        c = self.config
+        best_ask, notional = float(mk.book.ask[0]), price * shares
+        if price >= best_ask - 1e-9:
+            return (f"❌ {mk.item}：测试价 {core.cents(price)} 不低于盘口最低卖价 {core.cents(best_ask)}，会立刻成交。挂单测试只挂单、不吃单："
+                    "给一个低于最低卖价的价格，或不给价格（自动挂在最高买价之下）")
+        most = c.live_max_order_usd if c.live_allowed else min(c.live_max_order_usd, self.LIVE_TEST_HARD_USD)
+        if notional > most + 1e-9:
+            limit = f"LIVE_MAX_ORDER_USD ${most:g}" if most == c.live_max_order_usd else f"${most:g}（部署变量 LIVE_TRADING_ALLOWED=off 时挂单测试的上限）"
+            return f"❌ 测试单 {core.cents(price)}×{shares:g} 份 = ${notional:,.2f}，超过 {limit}：减少份数或降低价格（不给份数和价格时约 $1）"
+        if caution and (why := self.live_test_hold(notional)):
+            return (f"❌ {why}：测试价 {core.cents(price)} 不低于盘口最高买价 {core.cents(best_bid)}，可能成交。"
+                    "这时挂单测试只能挂在最高买价之下（不给价格即可）")
         try:
             amounts = limit_amounts(True, to_wei(price), to_wei(shares))
             order = build_order(self.live.wallet, outcome["token"], amounts["maker"], amounts["taker"], info.fee_bps, int(now_ms // 1000) + 600)
@@ -4113,6 +4139,25 @@ class LiveBot(core.Bot):
         except Exception as error:
             lines.append(f"4/4 查询最终状态失败：{core.clean_error(error) or type(error).__name__}")
         return self.live_test_done(record, lines)
+
+    def live_test_hold(self, notional: float) -> str:
+        """Why an order test at a price that may trade is not sent now: the operator's stops and caps a model order of
+        its value would answer to before it opened a position — the hard switch, the mode, /live pause, today's loss stop
+        (the same flags live_room reads), LIVE_MAX_OPEN_USD. "" when none holds. A test under the best bid is not asked:
+        it rests, and is what LIVE=pause is there for."""
+        c = self.config
+        if not c.live_allowed:
+            return "部署变量 LIVE_TRADING_ALLOWED=off（硬开关），不开新仓"
+        if c.live_mode != "on":
+            return f"LIVE={c.live_mode}，" + ("只记账" if c.live_mode == "off" else "不开新仓")
+        if paused := self.live_paused():
+            return f"真实交易已暂停（{paused}；/live resume 恢复）"
+        if killed := self.live_killed():
+            return f"今日停止开新仓（{killed}）"
+        exposure = self.live_exposure(self.sim_trades())
+        if exposure + notional > c.live_max_open_usd + 1e-9:
+            return f"持仓+挂单 ${exposure:,.2f} 加本单 ${notional:,.2f} 超过 LIVE_MAX_OPEN_USD ${c.live_max_open_usd:g}"
+        return ""
 
     def live_test_done(self, record: dict, lines: list[str]) -> str:
         text = "\n".join(lines)
