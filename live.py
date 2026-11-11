@@ -1343,6 +1343,7 @@ class LiveBot(core.Bot):
         self.live_step_ms: dict[str, int] = {}  # the last step's phases (预取 / 决策 / 下单 / 同步), for /diag
         self.live_fill_tasks: set = set()   # the fills reads of orders confirmed removed, beside the lane (live_fills_later)
         self.live_placing: set[str] = set()     # records whose order is being sent right now: the step and the express lane never both
+        self.live_cancels: set[str] = set()     # order ids one path is removing right now, the request to Predict's final word (live_cancel): never two at once
         self.live_last_signin = -1e9
         self.live_positions: tuple[list[dict], float] = ([], 0.0)
         self.live_positions_cut = False  # the last positions read for a reconciliation came cut at the page cap
@@ -1963,9 +1964,11 @@ class LiveBot(core.Bot):
             LOG.info("停止前等在途的下单/撤单请求应答：%.1f 秒", time.monotonic() - started)
 
     def live_cancels_unsent(self, skip: Any = ()) -> dict[str, dict]:
-        """The records whose cancel is decided but not sent yet (state cancelling, an order id known), by tid."""
+        """The records whose cancel is decided but not sent yet (state cancelling, an order id known), by tid. Not one whose
+        removal another path has on its way right now (live_cancels, 1.150.0): its cancel_sent is only set once Predict answers."""
         return {tid: t for tid, t in self.sim_trades().items() if tid not in skip and isinstance(t.get("live"), dict)
                 and t["live"].get("state") == "cancelling" and not t["live"].get("cancel_sent") and tid not in self.live_placing
+                and str(t["live"].get("order_id") or "") not in self.live_cancels
                 and (t["live"].get("order_id") or not t["live"].get("hash"))}  # 1.138.1: one never sent (no id, no hash) is closed at once too
 
     async def sim_express_after(self, now_ms: int) -> None:
@@ -2238,7 +2241,19 @@ class LiveBot(core.Bot):
         st.update(state="done", final="failed", error=why)
         st["events"].append({"at": now_ms, "what": why})
         trade.update(status="cancelled", unfilled=float(trade.get("order") or 0), note=why)
-        st["rekeyed"] = self.live_rekey(tid, trade)
+        # 1.150.0: a record failed by a path that still holds its slot key while it lives at tid#n already — failed before by
+        # another path (two paths ended one order: a cancel's final read beside another's, a read answered after the record was
+        # finished), or withdrawn (and moved) while this path waited on Predict — is not moved again. It was: the attempt stored
+        # twice (slot#1 and slot#2, one object under both keys), and when a fresh order had taken the slot meanwhile
+        # (LIVE_TAKER_RETRY_SECONDS may be as short as 1 s) sim_rekey's replace of sim:<slot> deleted THAT live order's record —
+        # resting on Predict with no record, its fills booked nowhere, outside LIVE_MAX_OPEN_USD. Saved where it lives instead
+        # (the callers write nothing more under the key they hold). Only this very object at its numbered key counts as moved:
+        # a copy saved back at the slot with an old "rekeyed" is moved as before
+        moved = st.get("rekeyed")
+        if moved and moved != tid and self.sim_trades().get(moved) is trade:
+            self.sim_save([(moved, trade)])
+        else:
+            st["rekeyed"] = self.live_rekey(tid, trade)
         wait = self.config.live_retry if retry is None else retry
         self.live_backoff[(trade["market"], trade["side"], "挂" if trade.get("maker") else "吃")] = (time.monotonic() + wait, why)
         self.live_note_error(f"{trade['item']} {trade['label']}：{why}")
@@ -3115,16 +3130,27 @@ class LiveBot(core.Bot):
             return  # a fresh order may take Predict a moment to show on its reads: the looks only count after a minute
         # Predict has answered "no such order" this many looks in a row, a minute or more after the placement: a removal is
         # still asked for (if it exists after all, it must not fill — and the answer says whether it did), then the record ends
+        oid = str(st["order_id"])
+        if oid in self.live_cancels:
+            return  # 1.150.0: another path is removing this very order right now (live_cancel: withdrawn meanwhile): its answer ends the record
+        self.live_cancels.add(oid)
         try:
             result = await self.live.api.remove_orders([st["order_id"]])
         except Exception as error:
             st["last_error"] = core.clean_error(error) or type(error).__name__
             return  # the removal could not be asked for: again next look, the order stays reserved meanwhile
+        finally:
+            self.live_cancels.discard(oid)
         if st["order_id"] in (result.get("removed") or []):
             st["events"].append({"at": now_ms, "what": f"连续 {self.LIVE_MISSES} 次查不到这张单，补发的撤单请求撤掉了它（它其实还在）"})
             self.live_finish(tid, trade, {"status": "CANCELLED"}, mk, now_ms)
-            return
-        self.live_unknown(tid, trade, f"连续 {self.LIVE_MISSES} 次查不到这张单，补发的撤单请求也未确认", now_ms)
+        else:
+            self.live_unknown(tid, trade, f"连续 {self.LIVE_MISSES} 次查不到这张单，补发的撤单请求也未确认", now_ms)
+        moved = st.get("rekeyed")
+        if moved and moved != tid and self.sim_trades().get(moved) is trade:
+            # 1.150.0: withdrawn by the lane — and moved to tid#n — while this removal was on its way (the lane left the order to it,
+            # live_cancels): what it answered is saved where the record lives now; the sync writes only under the key it holds
+            self.sim_save([(moved, trade)])
 
     async def live_taker_due(self, tid: str, trade: dict, by_id: dict, mk: Any, now_ms: int) -> None:
         """A taker's LIMIT order still open: the rest is cancelled after LIVE_TAKER_WAIT_SECONDS, and sooner when the
@@ -3182,9 +3208,34 @@ class LiveBot(core.Bot):
             # used to skip it for the single-order read, which may lag the list (or not know a removed order), and the
             # fills the list showed were lost with their reservation (1.83.0)
             self.live_apply(tid, trade, listed, mk, now_ms)
+        # 1.150.0: one path at a time removes an order and reads Predict's final word on it. The step's sync, every express pass that
+        # changed anything (live_cancels_unsent is global: any key's lane sends every unsent cancel), /live cancel and the emergency
+        # stop beside the step all reach the same withdrawn record, outside sim_lock, and cancel_sent is only set once Predict
+        # answers — so two paths sent two removals. The second answer ("noop": the first had taken the order off) overwrote the
+        # first's confirmation, and that path's single-order read, which may not know a just-removed order, put the finished record
+        # back to "unknown": its $ reserved again, the side blocked for minutes, a false ❓ alert. A taker's attempt was failed twice
+        # and stored at slot#1 and slot#2; a second final read answering after a fresh taker had taken the slot deleted that live
+        # order's record (live_fail). The other path leaves the order to this one: what the list showed is applied above, the
+        # answers here end the record — or leave it "cancelling", its cancel unsent, for the next pass when the request fails
+        oid = str(st["order_id"])
+        if oid in self.live_cancels:
+            return
+        self.live_cancels.add(oid)
+        try:
+            await self.live_cancel_order(tid, trade, listed, mk, now_ms)
+        finally:
+            self.live_cancels.discard(oid)
+
+    async def live_cancel_order(self, tid: str, trade: dict, listed: dict | None, mk: Any, now_ms: int) -> None:
+        """live_cancel's removal request and Predict's final word on the order, the order claimed by this path (live_cancels).
+        A record another path ended while an answer was on its way (the fills of a list completing it, an order's own record
+        read beside this) stays as that path left it: the answer changes nothing."""
+        st = trade["live"]
         if not st.get("cancel_sent"):
             st.setdefault("cancel_sent_at", self.market.now_ms())  # the first request's time, off the clock (live_latency: 决定→撤单发出)
             result = await self.live.api.remove_orders([st["order_id"]])
+            if st.get("state") != "cancelling":
+                return  # 1.150.0: ended meanwhile
             gone_now = st["order_id"] in result["removed"]
             st["cancel_sent"], st["cancel_confirmed"] = now_ms, bool(gone_now)
             if gone_now:
@@ -3204,6 +3255,8 @@ class LiveBot(core.Bot):
             self.live_cancel_again(st, now_ms, "撤单请求发出后仍在盘口，再发一次")  # still listed: its fills count while it rests
             return
         final = await self.live.api.order(st["order_id"], st.get("hash", ""))
+        if st.get("state") != "cancelling":
+            return  # 1.150.0: ended meanwhile
         order = float(trade.get("order") or 0)
         if final is not None and not order_final(final, order) and not st.get("cancel_confirmed"):
             self.live_apply(tid, trade, final, mk, now_ms)  # Predict still shows it open and did not confirm the removal: wait —
@@ -3434,7 +3487,12 @@ class LiveBot(core.Bot):
             if not isinstance(st, dict) or st.get("state") != "done" or t.get("status") in {"settled", "expired"}:
                 continue
             row = by_id.get(str(st.get("order_id") or "-")) or by_hash.get(str(st.get("hash") or "-").lower())
-            if row is None or (at_ms is not None and at_ms < core.trade_updated(t)):
+            # 1.150.0: ...nor does a list of a look that began before Predict confirmed the record's removal (cancel_done_at, off the
+            # clock as the answer came). An express pass stamps its events with the time the pass began, before its cancel's round
+            # trip: a step that began a moment after it, its list read by Predict before that removal, found the record "ended
+            # earlier" and still listed — the cancelled order was taken back (a false ⚠️ alert, its $ reserved and the side held
+            # again) and removed a second time
+            if row is None or (at_ms is not None and at_ms < max(core.trade_updated(t), int(st.get("cancel_done_at") or 0))):
                 continue
             st.pop("final", None)
             st.pop("error", None)
@@ -4151,8 +4209,11 @@ class LiveBot(core.Bot):
         after = self.sim_trades()
         states = [after.get(tid, t)["live"] for tid, t in targets.items()]
         confirmed = sum(s.get("state") == "done" for s in states)
-        sent = sum(s.get("state") == "cancelling" and bool(s.get("cancel_sent")) for s in states)
-        unsent = sum(s.get("state") == "cancelling" and not s.get("cancel_sent") for s in states)
+        # 1.150.0: a removal another path has on its way (the step's sync, an express pass: live_cancels) is sent, its answer awaited —
+        # this command's own pass left that order to it (live_cancel), and its cancel_sent is only set once Predict answers
+        flying = lambda s: str(s.get("order_id") or "") in self.live_cancels
+        sent = sum(s.get("state") == "cancelling" and (bool(s.get("cancel_sent")) or flying(s)) for s in states)
+        unsent = sum(s.get("state") == "cancelling" and not s.get("cancel_sent") and not flying(s) for s in states)
         if list_error:
             # the open list could not be read: the cancels with an order id went out by id all the same (live_cancel_blind)
             note = f"账户挂单列表读取失败（{list_error}）：撤单改按订单号直接发送" + ("，未发出的下一轮重试" if unsent else "")

@@ -213,6 +213,300 @@ async def account_check_rpc_down():
     assert "低于撤单线" in t["live"]["cancel_why"] and not sent(bot, n, "create") and not bot.live.ready, t["live"].get("cancel_why")
 
 
+async def double_cancel():
+    """LIVE-DOUBLE-CANCEL: the step's sync, every express pass that changed anything (on any key: live_cancels_unsent is
+    global), /live cancel and the emergency stop all reach one withdrawn record side by side (the sync and the lanes run
+    outside sim_lock), and cancel_sent was set only once Predict answered: two removals went out for one order. The second
+    answer ("noop") undid the first's confirmation, and that path's single-order read — which may not know a just-removed
+    order — put the finished record back to "unknown" (its $ reserved, the side blocked, a false ❓ alert); a taker's attempt
+    was failed twice (stored at slot#1 and slot#2), and a second final read answering after a fresh taker had taken the slot
+    deleted that live order's record: resting on Predict with no record. One path at a time now removes an order and reads
+    Predict's final word on it (live_cancels). Every case here is ordered by the fake's own events — which request has
+    reached Predict, which answer is let go — never by the clock."""
+    book_, market_json = T["book"], T["market_json"]
+    A50 = "ftse-china-a50-up-or-down-on-october-5-2026"
+    BIDS, ASKS = [("0.55", "300")], [("0.58", "400")]
+    WAIT = 20  # seconds a request may take to show up before the test gives up (a guard against hanging, never a timing)
+    card = lambda fair, at, asks=ASKS: hsi(fair, BIDS, asks, at)  # fair 70¢: a 55¢ bid worth joining, a 58¢ ask worth taking; 40¢: the bid's edge gone
+
+    def a50(at):  # a second card on its own key (its own express lane), market 202: a chance there is something a pass changes
+        return m.SimMarket(A50, "富时A50", "close", "A50", 0.85, book_(BIDS, ASKS, at, slug=A50, key="A50", mid="202"), 0.03, "", ("涨", "跌"),
+                           {"key": "A50", "target": "2026-10-05", "line": 14000.0, "close_ms": T["CLOSE"]},
+                           {"basis": {"fair_up": 0.85, "ref": 14000.0}, "sources": [{"what": "A50期货", "source": "sina"}], "proxy": None})
+
+    class Held:
+        """Predict's answers to one kind of call, let go by the test: the n-th matching call marks ``came[n]`` and waits for
+        ``go[n]`` — its answer ready (the call processed as it arrived: a removal has taken the order off the book, a second
+        one finds nothing, "noop"), or, with ``before``, the request still on its way (processed only once let go)."""
+        def __init__(self, api, name, match=lambda *a, **k: True, n=2, before=False):
+            self.came, self.go = [asyncio.Event() for _ in range(n)], [asyncio.Event() for _ in range(n)]
+            real, count = getattr(api, name), 0
+
+            async def call(*a, **k):
+                nonlocal count
+                if count >= n or not match(*a, **k):
+                    return await real(*a, **k)
+                i, count = count, count + 1
+                out = None if before else await real(*a, **k)
+                self.came[i].set()
+                await self.go[i].wait()
+                return await real(*a, **k) if before else out
+            setattr(api, name, call)
+
+    async def until(task, event):
+        """``task`` through, or the call ``event`` marks come (the second path sent a request of its own): whichever is first."""
+        mark = asyncio.ensure_future(event.wait())
+        await asyncio.wait({task, mark}, return_when=asyncio.FIRST_COMPLETED, timeout=WAIT)
+        mark.cancel()
+        assert task.done() or event.is_set(), "neither through nor waiting on Predict"
+
+    def unknown_once_removed(api):  # GET /orders/{hash} does not know a just-removed order (the case live_cancel's own comments allow)
+        known = api.order
+        async def order(oid, hash_=""):
+            row = api.closed.get(str(oid))
+            return None if row is not None and row.get("status") == "CANCELLED" else await known(oid, hash_)
+        api.order = order
+
+    def a50_pass(bot, at):  # an express pass on ANOTHER key that changes something (a chance on A50): it sends every unsent cancel, whatever its key
+        bot.market.now, world["markets"] = at, [*world["markets"][:1], a50(at)]
+        return bot.sim_express("A50")
+
+    def hsi_pass(bot, at, fair):  # the HSI lane, on a push that moved the fair price
+        bot.market.now, world["markets"] = at, [card(fair, at)]
+        return bot.sim_express("HSI")
+
+    events = lambda t: [e["what"] for e in t["live"]["events"]]
+    said = lambda t, word: sum(word in what for what in events(t))
+    removals = lambda bot, oid, n: [c for c in bot.live.api.calls[n:] if c == ("remove", [oid])]
+    keys = lambda bot, tid: sorted(k for k in bot.sim_trades() if k == tid or k.startswith(tid + "#"))
+    stored = lambda bot, tid: sorted(k for k, _ in bot.store.items("sim:") if k == f"sim:{tid}" or k.startswith(f"sim:{tid}#"))
+    saved = lambda bot, t: (bot.store.get("sim:" + next(k for k, v in bot.sim_trades().items() if v is t)) or {}).get("live") or {}  # the record as the store holds it, where it lives
+
+    async def resting(ways, **env):
+        """A real order resting on HSI (market 101); A50's market (202) known to the bot too, nothing on it yet."""
+        bot = make_bot(SIM_WAYS=ways, **env)
+        bot.live.api.markets["202"] = market_json("202")
+        await bot.live_prepare()
+        await bot.live.market("202")
+        world["markets"] = [card(0.70, NOW)]
+        await bot.live_prefetch(NOW)
+        await step(bot, NOW, card(0.70, NOW))
+        tid = f"{HSI_SLUG}|up|{'挂' if ways == 'maker' else '吃'}"
+        t = bot.sim_trades()[tid]
+        oid = t["live"]["order_id"]
+        assert t["live"]["state"] == "open" and sorted(bot.live.api.open) == [oid], (t["live"]["state"], sorted(bot.live.api.open))
+        return bot, tid, t, oid, len(bot.live.api.calls)
+
+    def ended_once(bot, t, oid, n, at):
+        """One removal asked for, the record ended on its confirmation and left so: never "unknown", nothing left claimed."""
+        st = t["live"]
+        assert removals(bot, oid, n) == [("remove", [oid])], removals(bot, oid, n)
+        assert (st["state"], st.get("cancel_confirmed")) == ("done", True), (st["state"], st.get("cancel_confirmed"), events(t)[-4:])
+        assert not said(t, "状态未知") and (said(t, "撤单请求已发送"), said(t, "订单结束")) == (1, 1), events(t)
+        assert "状态未知" not in bot.live_room(bot.sim_trades(), card(0.70, at), "up", 0.55, 100) and not bot.live_cancels
+        assert (saved(bot, t).get("state"), saved(bot, t).get("events")) == ("done", st["events"]), (saved(bot, t).get("state"), st["state"])  # ...and saved so
+
+    # (1) a maker whose edge is gone (fair 70¢ → 40¢ under its 55¢ bid): withdrawn by the step, its sync's removal on its way when an
+    # express pass on another key ends — the pass sent the same cancel, and its "noop" and a read that does not know the removed
+    # order made the finished record "unknown"
+    bot, tid, t, oid, n = await resting("maker", SIM_MAKER_EXIT_CENTS="5")
+    unknown_once_removed(bot.live.api)
+    rm = Held(bot.live.api, "remove_orders", lambda ids: list(ids) == [oid])
+    T1 = NOW + 5_000
+    stepping = asyncio.create_task(step(bot, T1, card(0.40, T1)))
+    await asyncio.wait_for(rm.came[0].wait(), WAIT)
+    unsent = [x for x in bot.live_cancels_unsent().values() if x is t]  # (judged now, while the removal is on its way)
+    lane = asyncio.create_task(a50_pass(bot, T1 + 300))
+    await until(lane, rm.came[1])
+    rm.go[0].set(); await stepping
+    rm.go[1].set(); await lane
+    await bot.live_fills_wait()
+    ended_once(bot, t, oid, n, T1 + 300)
+    assert not unsent, "a cancel on its way to Predict is not an unsent one: no lane picks it up"
+    assert any(k.startswith(A50) and v["live"].get("order_id") in bot.live.api.open for k, v in bot.sim_trades().items()), sorted(bot.sim_trades())  # the pass's own order went out as usual
+
+    # (2) ...and the other way round: withdrawn by the HSI lane, its removal on its way when a step's sync reaches the record
+    bot, tid, t, oid, n = await resting("maker", SIM_MAKER_EXIT_CENTS="5")
+    unknown_once_removed(bot.live.api)
+    rm = Held(bot.live.api, "remove_orders", lambda ids: list(ids) == [oid])
+    lane = asyncio.create_task(hsi_pass(bot, T1, 0.40))
+    await asyncio.wait_for(rm.came[0].wait(), WAIT)
+    stepping = asyncio.create_task(step(bot, T1 + 300, card(0.40, T1 + 300)))
+    await until(stepping, rm.came[1])
+    rm.go[0].set(); await lane
+    rm.go[1].set(); await stepping
+    await bot.live_fills_wait()
+    ended_once(bot, t, oid, n, T1 + 300)
+
+    # (3) a taker's unfilled rest at LIVE_TAKER_WAIT_SECONDS: the step's sync removes it while a pass on another key ends — the attempt
+    # was failed twice, stored at slot#1 AND slot#2 (one object under both keys, two rows in the store). (4) the worst case: the
+    # second path's final read answered only after the short wait (LIVE_TAKER_RETRY_SECONDS, 1 s at the least) had let a fresh taker
+    # take the slot — the late second failure deleted that live order's record
+    for fresh_first in (False, True):
+        bot, tid, t, oid, n = await resting("taker")
+        rm = Held(bot.live.api, "remove_orders", lambda ids: list(ids) == [oid])
+        T1 = NOW + 61_000
+        stepping = asyncio.create_task(step(bot, T1, card(0.70, T1, [("0.75", "400")])))  # nothing under the cap on HSI now: the timer alone ends the rest
+        await asyncio.wait_for(rm.came[0].wait(), WAIT)
+        lane = asyncio.create_task(a50_pass(bot, T1 + 300))
+        await until(lane, rm.came[1])
+        rm.go[0].set(); await stepping
+        assert keys(bot, tid) == [f"{tid}#1"] and t["live"]["final"] == "failed", (keys(bot, tid), t["live"].get("final"))
+        fresh = None
+        if fresh_first:  # the short wait over, the chance back: the slot (its first attempt at #1) takes a fresh taker
+            way = (t["market"], t["side"], "吃")
+            bot.live_backoff[way] = (time.monotonic() - 1, bot.live_backoff[way][1])
+            await step(bot, T1 + 2_000, card(0.70, T1 + 2_000))
+            fresh = bot.sim_trades().get(tid)
+            assert fresh is not None and fresh is not t and fresh["live"]["state"] == "open" and fresh["live"]["order_id"] in bot.live.api.open, keys(bot, tid)
+        rm.go[1].set(); await lane
+        trades = bot.sim_trades()
+        slot = [tid, f"{tid}#1"] if fresh_first else [f"{tid}#1"]
+        assert removals(bot, oid, n) == [("remove", [oid])] and said(t, "吃单未成交") == 1, (removals(bot, oid, n), events(t))
+        assert keys(bot, tid) == slot and stored(bot, tid) == [f"sim:{k}" for k in slot], (keys(bot, tid), stored(bot, tid))
+        recorded = {str(x["live"].get("order_id")) for x in trades.values() if isinstance(x.get("live"), dict)}
+        assert len(bot.live.api.open) == 1 + fresh_first and set(bot.live.api.open) <= recorded, (sorted(bot.live.api.open), sorted(recorded))  # every order resting on Predict has its record
+        assert trades.get(tid) is fresh and trades[f"{tid}#1"] is t and not bot.live_cancels
+    # ...and whatever path fails that attempt once more now, the fresh order at its slot (a read answered late, by the key it held):
+    # the attempt stays at #1, the fresh order's record is never replaced by it (sim_rekey's replace of sim:<slot>)
+    bot.live_fail(tid, t, "吃单未成交（又一次）", T1 + 3_000, retry=1)
+    trades = bot.sim_trades()
+    assert trades.get(tid) is fresh and trades.get(f"{tid}#1") is t and keys(bot, tid) == [tid, f"{tid}#1"], keys(bot, tid)
+    assert stored(bot, tid) == [f"sim:{tid}", f"sim:{tid}#1"] and saved(bot, t).get("events") == t["live"]["events"], stored(bot, tid)  # saved where it lives
+    assert ((bot.store.get(f"sim:{tid}") or {}).get("live") or {}).get("order_id") == fresh["live"]["order_id"], bot.store.get(f"sim:{tid}")
+
+    # (5) /live cancel all (the emergency stop) while a pass has the same cancel on its way: one removal, and the reply counts that
+    # request as sent and awaiting Predict's word — not "尚未发出"
+    bot, tid, t, oid, n = await resting("maker")
+    ls = Held(bot.live.api, "orders", n=1)
+    rm = Held(bot.live.api, "remove_orders", lambda ids: list(ids) == [oid])
+    T1 = NOW + 5_000
+    bot.market.now = T1
+    asking = asyncio.create_task(bot.live_cancel_command(["all"], T1))  # withdraws the order, then reads the open list
+    await asyncio.wait_for(ls.came[0].wait(), WAIT)
+    lane = asyncio.create_task(a50_pass(bot, T1 + 100))
+    await asyncio.wait_for(rm.came[0].wait(), WAIT)
+    ls.go[0].set()
+    await until(asking, rm.came[1])
+    rm.go[0].set(); await lane
+    rm.go[1].set()
+    reply = await asking
+    await bot.live_fills_wait()
+    assert "1 笔撤单请求已发送、待确认" in reply and "尚未发出" not in reply and reply.startswith("⏳"), reply
+    ended_once(bot, t, oid, n, T1 + 100)
+    assert abs(bot.live_reserved(t)) < 1e-9, bot.live_reserved(t)  # its fills read (nothing filled): nothing reserved
+
+    # (6) an order Predict's reads lost (the open list and the single-order read) though it still rests: the third look asks for its
+    # removal all the same (live_track) — on its way when the lane withdraws the record: that removal is the one, and its "removed"
+    # ends the record (the lane's own "noop" and empty read made it "unknown")
+    async def lost():
+        bot, tid, t, oid, n = await resting("maker", SIM_MAKER_EXIT_CENTS="5")
+        async def no_rows(status="OPEN", **params): return []
+        async def no_row(o, hash_=""): return None
+        bot.live.api.orders, bot.live.api.order = no_rows, no_row
+        for at in (NOW + 80_000, NOW + 100_000):  # two looks, a minute and more after the placement
+            await step(bot, at, card(0.70, at))
+        assert bot.live_misses.get(tid) == 2 and t["live"]["state"] == "open", (bot.live_misses, t["live"]["state"])
+        return bot, tid, t, oid, len(bot.live.api.calls), NOW + 120_000
+
+    bot, tid, t, oid, n, T3 = await lost()
+    rm = Held(bot.live.api, "remove_orders", lambda ids: list(ids) == [oid])
+    stepping = asyncio.create_task(step(bot, T3, card(0.70, T3)))
+    await asyncio.wait_for(rm.came[0].wait(), WAIT)
+    lane = asyncio.create_task(hsi_pass(bot, T3 + 300, 0.40))
+    await until(lane, rm.came[1])
+    rm.go[0].set(); await stepping
+    rm.go[1].set(); await lane
+    await bot.live_fills_wait()
+    assert removals(bot, oid, n) == [("remove", [oid])] and t["live"]["state"] == "done", (removals(bot, oid, n), t["live"]["state"])
+    assert not said(t, "状态未知") and said(t, "补发的撤单请求撤掉了它") == 1 and not bot.live_cancels, events(t)
+    assert (saved(bot, t).get("state"), saved(bot, t).get("events")) == ("done", t["live"]["events"]), saved(bot, t).get("state")  # saved at tid#n, where the lane's withdrawal moved it meanwhile
+    # ...and the other way round: the lane's removal on its way when the third look's read comes back empty — left to the lane's
+    bot, tid, t, oid, n, T3 = await lost()
+    rd = Held(bot.live.api, "order", n=1)
+    rm = Held(bot.live.api, "remove_orders", lambda ids: list(ids) == [oid])
+    stepping = asyncio.create_task(step(bot, T3, card(0.70, T3)))
+    await asyncio.wait_for(rd.came[0].wait(), WAIT)  # the sync at its read of the record, still open
+    lane = asyncio.create_task(hsi_pass(bot, T3 + 300, 0.40))
+    await asyncio.wait_for(rm.came[0].wait(), WAIT)  # withdrawn by the lane meanwhile, its removal sent
+    rd.go[0].set()
+    await until(stepping, rm.came[1])
+    rm.go[0].set(); await lane
+    rm.go[1].set(); await stepping
+    await bot.live_fills_wait()
+    ended_once(bot, t, oid, n, T3 + 300)
+
+    # (7) a list Predict read before the removal, in a step that began after the lane's pass did (the pass stamps its events with
+    # its own start): the record, ended on Predict's confirmation meanwhile, was taken back ("重新出现在开放订单列表": a false alert,
+    # its $ reserved and the side held again) and removed a second time
+    bot, tid, t, oid, n = await resting("maker", SIM_MAKER_EXIT_CENTS="5")
+    rm = Held(bot.live.api, "remove_orders", lambda ids: list(ids) == [oid], before=True)  # the lane's removal still on its way to Predict...
+    ls = Held(bot.live.api, "orders", n=1)  # ...when Predict reads the step's list: the order is on it
+    E = NOW + 5_000
+    lane = asyncio.create_task(hsi_pass(bot, E, 0.40))
+    await asyncio.wait_for(rm.came[0].wait(), WAIT)
+    stepping = asyncio.create_task(step(bot, E + 50, card(0.40, E + 50)))
+    await asyncio.wait_for(ls.came[0].wait(), WAIT)
+    bot.market.now = E + 200  # the clock when Predict confirms the removal
+    rm.go[1].set()  # (a second removal, should one be sent, goes straight through)
+    rm.go[0].set(); await lane
+    ls.go[0].set(); await stepping
+    await bot.live_fills_wait()
+    ended_once(bot, t, oid, n, E + 200)
+    assert not said(t, "重新出现") and abs(bot.live_reserved(t)) < 1e-9 and t["live"]["cancel_done_at"] == E + 200, (events(t), bot.live_reserved(t))
+    # ...while a list of a later look that still shows the order (a removal answered but not done) takes the record back as before,
+    # and the order is removed again
+    bot.live.api.open[oid] = {**bot.live.api.closed.pop(oid), "status": "OPEN"}
+    for at in (E + 65_000, E + 70_000):  # the idle re-read of the list, then the step that cancels what it took back
+        await step(bot, at, card(0.40, at))
+    await bot.live_fills_wait()
+    assert said(t, "重新出现") == 1 and t["live"]["state"] == "done" and oid not in bot.live.api.open, (events(t), sorted(bot.live.api.open))
+    assert len(removals(bot, oid, n)) == 2 and not bot.live_cancels, removals(bot, oid, n)
+
+    # (8) the order's own record, read by the step beside the lane's removal (live_track: the list did not show the order), ends the
+    # record while the removal's answer is on its way: that answer changes nothing more (it ended the record a second time; a
+    # taker's attempt was failed twice)
+    bot, tid, t, oid, n = await resting("maker", SIM_MAKER_EXIT_CENTS="5")
+    async def no_rows(status="OPEN", **params): return []
+    bot.live.api.orders = no_rows
+    rd = Held(bot.live.api, "order", n=1, before=True)  # the step's read on its way to Predict: the lane's removal gets there first...
+    rm = Held(bot.live.api, "remove_orders", lambda ids: list(ids) == [oid])  # ...and its answer is the slower of the two
+    T1 = NOW + 20_000
+    stepping = asyncio.create_task(step(bot, T1, card(0.70, T1)))
+    await asyncio.wait_for(rd.came[0].wait(), WAIT)
+    lane = asyncio.create_task(hsi_pass(bot, T1 + 300, 0.40))
+    await asyncio.wait_for(rm.came[0].wait(), WAIT)
+    rd.go[0].set(); await stepping
+    assert t["live"]["state"] == "done" and said(t, "订单结束") == 1, (t["live"]["state"], events(t))
+    rm.go[0].set(); rm.go[1].set(); await lane
+    await bot.live_fills_wait()
+    assert removals(bot, oid, n) == [("remove", [oid])] and t["live"]["state"] == "done" and said(t, "订单结束") == 1 and not bot.live_cancels, events(t)
+    # ...nor does the final read after a removal Predict did not confirm ("noop": the order had ended on Predict's side already)
+    bot, tid, t, oid, n = await resting("maker", SIM_MAKER_EXIT_CENTS="5")
+    bot.live.api.closed[oid] = {**bot.live.api.open.pop(oid), "status": "CANCELLED"}
+    rd = Held(bot.live.api, "order", before=True)  # the step's read of the order (live_track) and the lane's final read, both on their way
+    stepping = asyncio.create_task(step(bot, T1, card(0.70, T1)))
+    await asyncio.wait_for(rd.came[0].wait(), WAIT)
+    lane = asyncio.create_task(hsi_pass(bot, T1 + 300, 0.40))
+    await asyncio.wait_for(rd.came[1].wait(), WAIT)
+    rd.go[0].set(); await stepping
+    rd.go[1].set(); await lane
+    assert removals(bot, oid, n) == [("remove", [oid])] and t["live"]["state"] == "done" and said(t, "订单结束") == 1 and not bot.live_cancels, events(t)
+
+    # (9) a removal request that fails leaves the order to the next pass: nothing stays claimed, the cancel goes out again
+    bot, tid, t, oid, n = await resting("maker", SIM_MAKER_EXIT_CENTS="5")
+    real = bot.live.api.remove_orders
+    async def refused(ids): raise m.RemoteError("HTTP 502: bad gateway")
+    bot.live.api.remove_orders = refused
+    await hsi_pass(bot, T1, 0.40)
+    assert t["live"]["state"] == "cancelling" and not t["live"].get("cancel_sent") and not bot.live_cancels, t["live"]
+    bot.live.api.remove_orders = real
+    await step(bot, T1 + 5_000, card(0.40, T1 + 5_000))
+    await bot.live_fills_wait()
+    ended_once(bot, t, oid, n, T1 + 5_000)
+
+
 asyncio.run(place_timeout_race())
 asyncio.run(account_check_rpc_down())
+asyncio.run(double_cancel())
 print("AUDIT_LIVE_A_OK")
