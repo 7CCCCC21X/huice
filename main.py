@@ -18883,17 +18883,20 @@ class Bot:
                     name = mk.sides[0 if side == "up" else 1]
                     fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: judged at the limit when the card says more
                     capped = f"（公平价 {cents(fair + cut)} 按上限 {cents(fair)} 计）" if cut > 0 else ""
-                    cap = self.sim_taker_cap(mk, side, bps)
+                    base = self.sim_taker_cap(mk, side, bps)
+                    cap = self.sim_taker_self_cap(trades, mk, side, base)  # as the trader: under our own real buy of the other side
                     room, taken = self.sim_taker_room(trades, mk, side, self.sim_taker_want(mk, side, cap))
                     # (on paper the asks less what paper fills already took, as the trader's own look: sim_paper_book, 1.150.0)
                     q = taker_quote(self.sim_paper_book(mk, side), side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
                     held = trades.get(f"{mk.market}|{side}|吃")
-                    if cap <= 0:
+                    if base <= 0:
                         parts.append(f"{name}：无封顶价（公平价 {cents(fair)} 留不出 {cents(max(mk.need, self.sim_taker_bar(mk)))}）{capped}")
                     elif room < SIM_MIN_SHARES - 1e-9 and held is not None:
                         parts.append(f"{name}：" + (f"已有{sim_status(held)}，等它结束" if sim_in_flight(held) else
                                                     self.sim_taker_full_text(trades, mk, side, taken) if c.sim_taker_max_shares > 0 else
                                                     f"已有{sim_status(held)}（每边只吃一次）"))
+                    elif cap < base - 1e-9 and (q is None or q["got"] < SIM_MIN_SHARES - 1e-9) and any(p <= base + 1e-9 for p, _ in side_levels(mk.book, side)):
+                        parts.append(f"{name}：{self.sim_taker_self_text(cap)}")  # buyable but for our own order (audit SIM-SELF-MATCH)
                     elif q is None or q["got"] < SIM_MIN_SHARES - 1e-9:
                         spent = self.sim_paper_spent(mk, side, cap)  # the asks there are the ones a paper fill already bought
                         parts.append(f"{name}：封顶 {cents(cap)}{capped}，" + (f"之下的卖单已被模拟交易买过（{spent:g} 份），等新的卖单"
@@ -18938,7 +18941,10 @@ class Bot:
             model = mk.fair_up if side == "up" else 1 - mk.fair_up
             fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: judged at the limit when the card says more
             capped = f"（公平价 {cents(model)} 按上限 {cents(fair)} 计）" if cut > 0 else ""
-            cap = self.sim_taker_cap(mk, side, bps)
+            # 1.150.0 (audit SIM-SELF-MATCH): the trader's own cap (sim_take), a cent under our own real buy of the other side
+            # while one is not off the book — the card read 可吃单 … 可买 N 份 for our own order, which the trader never takes
+            base = self.sim_taker_cap(mk, side, bps)
+            cap = self.sim_taker_self_cap(trades, mk, side, base)
             levels = side_levels(mk.book, side)
             ask = levels[0][0] if levels else None
             room, taken = self.sim_taker_room(trades, mk, side, self.sim_taker_want(mk, side, cap))
@@ -18948,7 +18954,7 @@ class Bot:
             q = taker_quote(self.sim_paper_book(mk, side), side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
             got = float(q["got"]) if q and q["got"] >= SIM_MIN_SHARES - 1e-9 else 0.0
             block = ""
-            if cap <= 0:
+            if base <= 0:
                 block = f"公平价 {cents(model)}{'（按上限 ' + cents(fair) + ' 计）' if cut > 0 else ''} 留不出 {cents(need)}"
             elif room < SIM_MIN_SHARES - 1e-9 and held is not None:
                 block = (f"已有{sim_status(held)}，等它结束" if sim_in_flight(held)
@@ -18956,6 +18962,8 @@ class Bot:
                          else f"已有{sim_status(held)}（每边只吃一次）")
             elif ask is None:
                 block = "没有卖单"
+            elif not got and cap < base - 1e-9 and ask <= base + 1e-9:
+                block = self.sim_taker_self_text(cap)  # buyable but for our own order: said, not shown as a 1¢ gap
             elif not got and ask <= cap + 1e-9:
                 spent = self.sim_paper_spent(mk, side, cap)
                 block = (f"封顶 {cents(cap)} 之下的卖单已被模拟交易买过（{spent:g} 份），等新的卖单" if spent >= SIM_MIN_SHARES - 1e-9
@@ -19345,18 +19353,29 @@ class Bot:
         Counted conservatively: any order not finished at Predict (pending, placing, open, cancelling, unknown — a pending
         one may be sent first), and a finished one whose cancel Predict confirmed after the book was read (the book may
         still show it). Paper records have no "live" state and are not counted: paper trading is unchanged. Only lowers
-        the cap: the taker buys less or nothing, never more."""
+        the cap: the taker buys less or nothing, never more.
+        Not only a maker (review of the first fix): a real taker is a LIMIT order too, and what it did not fill rests on
+        the book at its limit until LIVE_TAKER_WAIT_SECONDS or live_taker_stale cancels it — in the step's sync, after
+        this decision, and never in the express lane: the same race. Its level is the limit the order was signed at
+        (live.want.limit, else its cap — as LiveBot.live_unit_cap), not the record's price (a taker's is average + fee)."""
         other = "down" if side == "up" else "up"
         for t in trades_of_market(trades, mk.market):
             st = t.get("live")
-            if t.get("side") != other or not t.get("maker") or not isinstance(st, dict):
+            if t.get("side") != other or not isinstance(st, dict):
                 continue
             if max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0) <= 1e-9:
                 continue  # nothing of it left to rest
             done = int(st.get("cancel_done_ms") or 0)
             if st.get("state") not in (None, "done") or (done and int(getattr(mk.book, "fetched_ms", 0) or 0) <= done):
-                cap = min(cap, round(1 - float(t.get("price") or 0) - 0.01, 6))  # Predict's cent tick: strictly under our level
+                want = st.get("want") if isinstance(st.get("want"), dict) else {}
+                level = float((t.get("price") if t.get("maker") else want.get("limit") or want.get("cap") or t.get("cap") or t.get("price")) or 0)
+                cap = min(cap, round(1 - level - 0.01, 6))  # Predict's cent tick: strictly under our level
         return cap
+
+    @staticmethod
+    def sim_taker_self_text(cap: float) -> str:
+        """Why a side shows nothing to take while sim_taker_self_cap holds its cap down (the order check and 距吃单)."""
+        return f"另一边自己的真实买单还没撤完，{cents(cap + 0.01)} 及以上的卖单不吃（其中有自己的单），之下没有卖单"
 
     def sim_deep_book(self, mk: SimMarket) -> bool:
         """Whether this market's book is quoted on under the deep-bid mode (SIM_MAKER_DEEP_CENTS, on the chosen markets

@@ -161,6 +161,53 @@ assert sbot.sim_taker_self_cap(m.TradeMap({"a": {**own_up, "shares": 50.0}}), x,
 assert sbot.sim_taker_self_cap(m.TradeMap({"a": own_up}), x, "up", 0.59) == 0.59  # the same side is the maker logic's business
 # a 跌 maker at 45¢ rests as an ask at 55¢: the 涨 taker stays under 55¢
 assert sbot.sim_taker_self_cap(m.TradeMap({"a": {**own_up, "side": "down", "price": 0.45}}), x, "up", 0.70) == 0.54
+# (review of the first fix) a real TAKER is a LIMIT order too: what it did not fill rests at its limit until the sync cancels
+# it. Our 吃涨 asked 50 at a 60¢ limit, 10 filled, 40 rest as a 60¢ bid — the only bid of the book. Its level is the signed
+# limit (live.want.limit, else the cap), not the record's price (average + fee). Before: 吃跌 40 shares at 40¢, all our own.
+own_rest = {**own_up, "label": "吃涨", "maker": False, "shares": 10.0, "price": 0.6096, "cap": 0.61, "opened": NOW - 20_000,
+            "live": {"state": "open", "order_id": "8", "placed_at": NOW - 20_000, "answered_ms": NOW - 19_000,
+                     "want": {"maker": False, "limit": 0.60, "cap": 0.61, "shares": 50.0}}}
+
+
+def self_take_rest(bids, rec):
+    sbot.sim_paper_used.clear()  # (sbot buys on paper: what the cases above "took" of these asks is not this case's matter)
+    changed = []
+    sbot.sim_take(self_mk(bids), m.TradeMap({f"{SELF}|up|吃": dict(rec)}), NOW, changed)
+    return [t for _, t in changed]
+
+
+assert self_take_rest([("0.60", "40")], own_rest) == [], self_take_rest([("0.60", "40")], own_rest)
+(tk,) = self_take_rest([("0.62", "30"), ("0.60", "40")], own_rest)  # someone's 62¢ bid above our rest: only it
+assert tk["label"] == "吃跌" and tk["cap"] <= 0.39 + 1e-9 and tk["shares"] <= 30 + 1e-9, (tk["cap"], tk["shares"])
+rest_cap = lambda rec: sbot.sim_taker_self_cap(m.TradeMap({"a": rec}), x, "down", 0.59)
+assert rest_cap(own_rest) == 0.39, rest_cap(own_rest)  # the signed limit 60¢, not the 60.96¢ cost
+for state in ("pending", "placing", "cancelling", "unknown"):
+    assert rest_cap({**own_rest, "live": {**own_rest["live"], "state": state}}) == 0.39, state
+assert rest_cap({**own_rest, "live": {"state": "open", "want": {"cap": 0.61}}}) == 0.38  # no limit recorded: the cap it was signed under
+assert rest_cap({**own_rest, "live": {"state": "open"}}) == 0.38  # nor a want: the record's cap
+assert rest_cap({**own_rest, "shares": 50.0}) == 0.59  # all filled: nothing rests
+rest_done = lambda at: {**own_rest, "status": "filled", "live": {**own_rest["live"], "state": "done", "cancel_done_ms": at}}
+assert rest_cap(rest_done(x.book.fetched_ms + 1)) == 0.39 and rest_cap(rest_done(x.book.fetched_ms - 1)) == 0.59
+# the 距吃单 card and the order check use the trader's own cap: no "可吃单 … 可买 N 份" for shares the trader never takes
+for rec, tid, size in ((own_up, f"{SELF}|up|挂", "50"), (own_rest, f"{SELF}|up|吃", "40")):
+    held = m.TradeMap({tid: dict(rec)})
+    sbot.sim_paper_used.clear()
+    gap = sbot.sim_taker_gap(self_mk([("0.60", size)]), held, NOW)
+    down = next(s for s in gap["sides"] if s["side"] == "down")
+    assert gap["state"] != "ready" and gap["label"] != "吃跌" and "可买" not in gap["text"] + gap["detail"], (gap["state"], gap["text"])  # before: ready, 吃跌 可买
+    assert not down["got"] and "自己的" in down["block"] and "40.0¢" in down["block"], down
+    gap = sbot.sim_taker_gap(self_mk([("0.61", "30"), ("0.60", size)]), held, NOW)  # someone's 61¢ bid above ours: that much, under our level
+    down = next(s for s in gap["sides"] if s["side"] == "down")
+    assert gap["state"] == "ready" and down["cap"] <= 0.39 + 1e-9 and 0 < down["got"] <= 30 + 1e-9, (gap["state"], gap["text"])
+    sbot.sim_trades, sbot.sim_markets = (lambda held=held: held), (lambda now_ms, size=size: [self_mk([("0.60", size)])])
+    try:
+        (row,) = sbot.sim_checks(NOW)
+    finally:
+        del sbot.sim_trades, sbot.sim_markets
+    assert "自己的" in row["taker"] and "可买" not in row["taker"], row["taker"]
+sbot.sim_paper_used.clear()
+gap = sbot.sim_taker_gap(self_mk([("0.60", "50")]), m.TradeMap({}), NOW)  # someone else's bid: the card as before
+assert gap["state"] == "ready" and "可买 50 份" in gap["text"], gap["text"]
 
 # --- SIM-BLOCK-NOTE-WRITES: a refusal whose countdown ticks ("N 秒后再试") is noted once per window, not on every look ----------
 bmk = self_mk([("0.60", "50")])
