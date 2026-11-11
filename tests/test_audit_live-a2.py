@@ -404,4 +404,234 @@ async def live_latefill_active():
 
 asyncio.run(live_latefill_active())
 
+
+async def live_taker_fee_double():
+    """LIVE-TAKER-FEE-DOUBLE: a taker's record is costed at Predict's average price plus the fee per share (live_apply), but
+    Predict takes that fee out of the shares bought, not in USDT (the signed order gives price × shares at most). The minute's
+    positions check trims the record to the shares held (份数校正) — and since 1.122.0 kept price × shares whole over the fewer
+    shares, so the fee was counted twice: the shares gone and their worth still in the cost. Every trimmed taker's P&L, a win's
+    and a loss's alike, was low by fee × the shares bought ($0.84 on 100 shares at 58¢) in the journal, the exposure and the
+    day's loss figure. A trimmed taker now costs the money it spent — its average price × the shares it bought — never above
+    the cost it had and never by lowering its per-share price; a maker's cost is kept, as before."""
+    L = T["L"]
+    slot = f"{HSI_SLUG}|up|吃"
+    mkt = lambda at, ask="0.58", fair=0.70, bid="0.55": hsi(fair, [(bid, "300")], [(ask, "400")], at)
+    taken = lambda price, shares, bps=200: bps / 10_000 * min(price, 1 - price) * shares / price  # the exchange's BUY fee, out of the shares
+    holding = lambda n, **more: [{"market": {"id": 101, "title": "恒生指数"}, "outcome": {"name": "Up", "indexSet": 1, "onChainId": "1011"},
+                                  "amount": str(L.to_wei(round(n, 6))), **more}]
+    cost = lambda t: float(t["price"]) * float(t["shares"])
+    see = lambda bot: [(k, "挂" if t.get("maker") else "吃", t["status"], t.get("shares"), t.get("price"), t.get("avg"), t.get("fee_shares"))
+                       for k, t in bot.sim_trades().items() if isinstance(t.get("live"), dict)]
+    rec = lambda bot, oid: next(t for t in bot.sim_trades().values() if isinstance(t.get("live"), dict) and t["live"].get("order_id") == oid)
+    slot_order = lambda bot: str(((bot.sim_trades().get(slot) or {}).get("live") or {}).get("order_id") or "")  # the order in the taker's slot now
+
+    async def trim(bot, at):
+        """Two of the minute's positions checks: the same shortfall standing a minute later, the records are trimmed."""
+        await bot.live_late_fills(at)
+        await bot.live_late_fills(at + 65_000)
+
+    def noted(bot):
+        """The 份数校正 notices from here on (the administrator's Telegram line), as they would be sent."""
+        notes = []
+        bot.live_notify = lambda text, key="": notes.append(text) if text.startswith("📐 份数校正") else None
+        return notes
+
+    async def taker(price, fair=0.70, bid="0.55", average=True, **env):
+        """A taker of 100 shares, filled whole at ``price`` and read back: (bot, its record)."""
+        bot = make_bot(SIM_WAYS="taker", **env)
+        bot.notes = noted(bot)
+        await bot.live_prepare(); fake = bot.live.api
+        await bot.live_prefetch(NOW)
+        await step(bot, NOW, mkt(NOW, str(price), fair, bid))
+        signed = [b for k, b in fake.calls if k == "create"][-1]["data"]["order"]
+        assert int(signed["makerAmount"]) == round(price * 100) * WEI and int(signed["takerAmount"]) == 100 * WEI and signed["side"] == 0, signed
+        fake.fill(bot.sim_trades()[slot]["live"]["order_id"], 100, done=True, price=price if average else None)
+        await step(bot, NOW + 10_000, mkt(NOW + 10_000, str(price), fair, bid))
+        t = bot.sim_trades()[slot]
+        fee = 0.02 * min(price, 1 - price)
+        assert not t.get("maker") and t["shares"] == 100 and t["live"]["state"] == "done" and t["status"] == "filled", see(bot)
+        assert abs(t["avg"] - price) < 1e-9 and abs(t["fee"] - fee) < 1e-9 and abs(t["price"] - price - fee) < 1e-9, see(bot)  # as before
+        return bot, t
+
+    def day(bot, t, up, at):
+        """The day's settled P&L (the loss stop's figure) with this record settled on ``up`` — a copy: the record stays open."""
+        done = {**t, "live": dict(t["live"]), "revisions": []}
+        bot.sim_settle(done, up, "测试", at, "Predict 最终结果")
+        return bot.live_daily_pnl({"x": done}, at)
+
+    # (a) the finding: 100 shares at 58¢ — $58.00 leaves the account (the order signed for no more), 98.551724 shares arrive. Trimmed
+    # to the holding, the record costs the $58.00 spent (before: $58.84 — the fee as the shares gone and again as money): a loss
+    # books −$58.00 and a win the shares held less $58.00, the cash that really moved (before: both $0.84 lower)
+    bot, t = await taker(0.58)
+    held = round(100 - taken(0.58, 100), 6)
+    assert abs(held - 98.551724) < 1e-9 and abs(cost(t) - 58.84) < 1e-9 and abs(bot.live_reserved(t) - 58.84) < 1e-9
+    bot.live.api.positions_rows = holding(held)
+    await bot.live_late_fills(NOW + 75_000)  # seen once: not yet
+    assert bot.sim_trades()[slot]["shares"] == 100 and abs(cost(bot.sim_trades()[slot]) - 58.84) < 1e-9, see(bot)
+    await bot.live_late_fills(NOW + 140_000)
+    t = bot.sim_trades()[slot]
+    assert abs(t["shares"] - held) < 1e-6 and abs(t["fee_shares"] - (100 - held)) < 1e-6 and t["status"] == "filled", see(bot)
+    assert abs(cost(t) - 58.00) < 1e-3, ("a trimmed taker costs the USDT it spent, not that plus the fee again", cost(t), see(bot))
+    assert abs(t["avg"] - 0.58) < 1e-9 and abs(t["fee"] - 0.0084) < 1e-9, see(bot)  # the fill's own average and fee per share stay as read
+    assert abs(bot.live_reserved(t) - 58.00) < 1e-3 and abs(bot.live_exposure(bot.sim_trades()) - 58.00) < 1e-3, bot.live_reserved(t)
+    assert abs(day(bot, t, 0.0, NOW + 600_000) + 58.00) < 1e-3, ("a loss is the money spent", day(bot, t, 0.0, NOW + 600_000))
+    assert abs(day(bot, t, 1.0, NOW + 600_000) - (held - 58.00)) < 1e-3, ("a win is the shares held less the money spent", day(bot, t, 1.0, NOW + 600_000))
+    what = [e["what"] for e in t["live"]["events"] if e["what"].startswith("按 Predict 持仓校正份数：100 → 98.5517")]
+    assert len(what) == 1 and "成本 $58.84 → $58.00" in what[0] and "不再另算进成本" in what[0], t["live"]["events"]
+    assert len(bot.notes) == 1 and bot.notes[0].endswith("1 笔记录按比例改为持有的份数（吃单的手续费就是少掉的这些份额，不再另算进成本：成本共减 $0.84）"), bot.notes
+    await trim(bot, NOW + 210_000)  # explained now: nothing more moves
+    assert abs(bot.sim_trades()[slot]["shares"] - held) < 1e-6 and abs(cost(bot.sim_trades()[slot]) - 58.00) < 1e-3, see(bot)
+    # ...and the day's loss stop still trips on the money really lost: $58.00 against a $57.90 line
+    stop = make_bot(SIM_WAYS="taker", LIVE_MAX_DAILY_LOSS_USD="57.9")
+    lost = {**t, "live": dict(t["live"]), "revisions": []}
+    stop.sim_settle(lost, 0.0, "测试", NOW + 600_000, "Predict 最终结果")
+    stop.market.now = NOW + 600_000
+    stop.live_check_kill({"x": lost}, NOW + 600_000)
+    assert stop.live_killed().startswith("今日已结算亏损 −$58.00"), stop.live_killed()
+
+    # (b) the cheap side and the dear side: the fee is the same rate × min(p, 1 − p) of the shares — 2 of 100 at 25¢, half a share at 80¢
+    for price, fair, bid in ((0.25, 0.45, "0.20"), (0.80, 0.97, "0.30")):
+        bot, t = await taker(price, fair, bid)
+        held = round(100 - taken(price, 100), 6)
+        bot.live.api.positions_rows = holding(held)
+        await trim(bot, NOW + 75_000)
+        t = bot.sim_trades()[slot]
+        assert abs(t["shares"] - held) < 1e-6 and abs(cost(t) - price * 100) < 1e-3, (price, cost(t), see(bot))
+        assert abs(day(bot, t, 0.0, NOW + 600_000) + price * 100) < 1e-3 and abs(day(bot, t, 1.0, NOW + 600_000) - (held - price * 100)) < 1e-3, price
+
+    # (c) Predict's record states no average price: the fill is costed at the order's limit (待对账) — trimmed, at the limit × the
+    # shares bought, the most the signed order could take ($58.00), not that plus the fee
+    bot, t = await taker(0.58, average=False)
+    assert t["cost_confirmed"] is False and abs(cost(t) - 58.84) < 1e-9, see(bot)
+    bot.live.api.positions_rows = holding(98.551724)
+    await trim(bot, NOW + 75_000)
+    assert abs(bot.sim_trades()[slot]["shares"] - 98.551724) < 1e-6 and abs(cost(bot.sim_trades()[slot]) - 58.00) < 1e-3, see(bot)
+
+    # (d) the holding first shows a part of the fee gone (the list following late), the rest a few minutes on: cut by less than
+    # its fee the record is never cheaper than the money spent, nor dearer than its price × the shares left — and it ends at the
+    # money spent (the shares bought are those held and every share cut, not the last trim's alone)
+    bot, t = await taker(0.58)
+    bot.live.api.positions_rows = holding(98.551724 + 0.9)
+    await trim(bot, NOW + 75_000)
+    t = bot.sim_trades()[slot]
+    assert abs(t["shares"] - 99.451724) < 1e-6 and 58.00 - 1e-3 <= cost(t) <= 0.5884 * 99.451724 + 1e-3, (cost(t), see(bot))
+    bot.live.api.positions_rows = holding(98.551724)
+    await trim(bot, NOW + 215_000)
+    t = bot.sim_trades()[slot]
+    assert abs(t["shares"] - 98.551724) < 1e-6 and abs(t["fee_shares"] - 1.448276) < 1e-6 and abs(cost(t) - 58.00) < 1e-3, (cost(t), see(bot))
+
+    # (e) a maker's record is as before (1.122.0): no fee in its price — the money spent is kept, over the shares held
+    bot = make_bot(SIM_WAYS="maker")
+    notes = noted(bot)
+    await bot.live_prepare(); fake = bot.live.api
+    await bot.live_prefetch(NOW)
+    await step(bot, NOW, mkt(NOW))
+    mslot = f"{HSI_SLUG}|up|挂"
+    fake.fill(bot.sim_trades()[mslot]["live"]["order_id"], 100, done=True)
+    await step(bot, NOW + 10_000, mkt(NOW + 10_000))
+    t = bot.sim_trades()[mslot]
+    assert t["maker"] and t["shares"] == 100 and t["price"] == 0.55 and t["live"]["state"] == "done", see(bot)
+    fake.positions_rows = holding(98)
+    await trim(bot, NOW + 75_000)
+    t = bot.sim_trades()[mslot]
+    assert abs(t["shares"] - 98) < 1e-9 and abs(cost(t) - 55.00) < 1e-3 and abs(t["price"] - 0.561224) < 1e-6, see(bot)
+    assert not any("成本 $" in e["what"] for e in t["live"]["events"]), t["live"]["events"]
+    assert len(notes) == 1 and notes[0].endswith("1 笔记录按比例改为持有的份数（成本不变）"), notes
+
+    # (f) a maker and a taker on the outcome (SIM_WAYS=both): the taker's 1.448276 shares of fee are spread over both records in
+    # proportion. The maker's cost is kept ($55.00); the taker, cut by half its fee only, costs no less than the $58.00 it spent
+    # and no more than its price × the shares left (before: $58.84 — the two records $0.84 over what was spent)
+    bot = make_bot(SIM_WAYS="both")
+    notes = noted(bot)
+    await bot.live_prepare(); fake = bot.live.api
+    await bot.live_prefetch(NOW)
+    await step(bot, NOW, mkt(NOW))
+    trades = bot.sim_trades()
+    assert trades[mslot]["live"]["order_id"] and trades[slot]["live"]["order_id"], see(bot)
+    fake.fill(trades[mslot]["live"]["order_id"], 100, done=True)
+    fake.fill(trades[slot]["live"]["order_id"], 100, done=True, price=0.58)
+    await step(bot, NOW + 10_000, mkt(NOW + 10_000))
+    fake.positions_rows = holding(200 - taken(0.58, 100))
+    await trim(bot, NOW + 75_000)
+    mk_, tk_ = bot.sim_trades()[mslot], bot.sim_trades()[slot]
+    assert abs(mk_["shares"] + tk_["shares"] - 198.551724) < 1e-5 and abs(mk_["shares"] - tk_["shares"]) < 1e-6, see(bot)
+    assert abs(cost(mk_) - 55.00) < 1e-3, ("a maker's cost is kept", cost(mk_), see(bot))
+    assert 58.00 - 1e-3 <= cost(tk_) <= 0.5884 * tk_["shares"] + 1e-3, ("never cheaper than spent, nor dearer than its price", cost(tk_), see(bot))
+    assert len(notes) == 1 and "2 笔记录按比例改为持有的份数（吃单的手续费就是少掉的这些份额，不再另算进成本：成本共减 $" in notes[0] and notes[0].endswith("；挂单的成本不变）"), notes
+
+    # (g) the default flow (SIM_TAKER_MAX_SHARES): a second taker on the outcome after the first was trimmed. Its fee's shortfall
+    # is spread over both records; the first — already at the money it spent — is cut in shares, not in cost, and the second is
+    # never cheaper than the $55.00 it spent: together no less than what left the account (before: $1.74 over it)
+    bot, t1 = await taker(0.58, SIM_TAKER_MAX_SHARES="200")
+    fake, oid1 = bot.live.api, t1["live"]["order_id"]
+    fake.positions_rows = holding(98.551724)
+    await trim(bot, NOW + 75_000)
+    assert abs(cost(rec(bot, oid1)) - 58.00) < 1e-3, see(bot)
+    at = NOW + 150_000
+    for _ in range(40):  # the asks come down to 55¢: the side buys again (its holds and waits first)
+        await step(bot, at, mkt(at, "0.55", bid="0.50"))
+        if slot_order(bot) not in ("", oid1):
+            break
+        at += 5_000
+    oid2 = slot_order(bot)
+    assert oid2 not in ("", oid1) and float(rec(bot, oid2)["order"]) == 100 and not rec(bot, oid2).get("maker"), see(bot)
+    fake.fill(oid2, 100, done=True, price=0.55)
+    await step(bot, at + 5_000, mkt(at + 5_000, "0.55", bid="0.50"))
+    assert rec(bot, oid2)["shares"] == 100 and abs(rec(bot, oid2)["price"] - 0.559) < 1e-9 and abs(rec(bot, oid1)["shares"] - 98.551724) < 1e-6, see(bot)
+    fake.positions_rows = holding(98.551724 + 100 - taken(0.55, 100))
+    await trim(bot, at + 70_000)
+    first, second = rec(bot, oid1), rec(bot, oid2)
+    assert abs(first["shares"] + second["shares"] - (198.551724 - taken(0.55, 100))) < 1e-5 and first["shares"] < 98.551724 - 0.5, see(bot)
+    assert abs(cost(first) - 58.00) < 1e-3, ("the record already at the money it spent is not cut cheaper", cost(first), see(bot))
+    assert 55.00 - 1e-3 <= cost(second) <= 0.559 * second["shares"] + 1e-3, (cost(second), see(bot))
+
+    # (h) a taker's fill its own record never showed, booked from the holding (撤单后的补记): the shares are those the account
+    # holds — already net of the fee — at the position's average plus the fee, the record's own "average" still its limit.
+    # Trimmed with a second taker's shortfall, such a record is neither costed cheaper per share (the shares it bought are not
+    # known: the rule would take a fee off shares that carry none — position at 58¢) nor dearer in all than it was (its limit
+    # is far over what the position says it paid — position at 40¢)
+    for average in (0.58, 0.40):
+        bot = make_bot(SIM_WAYS="taker", LIVE_TAKER_WAIT_SECONDS="5", SIM_TAKER_MAX_SHARES="200")
+        await bot.live_prepare(); fake = bot.live.api
+        await bot.live_prefetch(NOW)
+        await step(bot, NOW, mkt(NOW))
+        oid1, at = bot.sim_trades()[slot]["live"]["order_id"], NOW
+        for _ in range(8):  # the taker wait over: the order is withdrawn, nothing filled as far as its record says
+            at += 5_000
+            await step(bot, at, mkt(at))
+            await bot.live_fills_wait()
+            if rec(bot, oid1)["live"]["state"] == "done":
+                break
+        assert rec(bot, oid1)["status"] == "cancelled" and rec(bot, oid1)["shares"] == 0, see(bot)
+        fake.positions_rows = holding(98.551724, avgPrice=str(average))  # ...but the account holds its 100 shares less the fee
+        await bot.live_late_fills(at + 70_000)
+        t1 = rec(bot, oid1)
+        fee = 0.02 * min(average, 1 - average)
+        assert t1["status"] == "filled" and abs(t1["shares"] - 98.551724) < 1e-6 and t1["live"]["adopted"]["by"].startswith("按 Predict 持仓均价"), see(bot)
+        assert abs(t1["price"] - average - fee) < 1e-9 and abs(t1["avg"] - 0.58) < 1e-9 and not t1.get("fee_shares"), see(bot)
+        price1, cost1 = float(t1["price"]), cost(t1)
+        bot.live_backoff.clear()  # (the short wait after a taker that filled nothing runs on the real clock)
+        at += 75_000
+        for _ in range(40):
+            await step(bot, at, mkt(at, "0.55", bid="0.50"))
+            if slot_order(bot) not in ("", oid1):
+                break
+            at += 5_000
+        oid2 = slot_order(bot)
+        assert oid2 not in ("", oid1) and float(rec(bot, oid2)["order"]) == 100, see(bot)
+        fake.fill(oid2, 100, done=True, price=0.55)
+        await step(bot, at + 5_000, mkt(at + 5_000, "0.55", bid="0.50"))
+        assert rec(bot, oid2)["shares"] == 100 and abs(rec(bot, oid1)["shares"] - 98.551724) < 1e-6 and abs(rec(bot, oid1)["price"] - price1) < 1e-9, see(bot)
+        fake.positions_rows = holding(98.551724 + 100 - taken(0.55, 100))
+        await trim(bot, at + 70_000)
+        t1, t2 = rec(bot, oid1), rec(bot, oid2)
+        assert abs(t1["shares"] + t2["shares"] - (198.551724 - taken(0.55, 100))) < 1e-5 and t1["shares"] < 98.551724 - 0.5, see(bot)
+        assert t1["price"] >= price1 - 1e-9, ("a record booked from the holding is not costed cheaper per share", average, t1["price"], price1)
+        assert cost(t1) <= cost1 + 1e-3, ("...nor dearer in all than it was", average, cost(t1), cost1)
+        assert 55.00 - 1e-3 <= cost(t2) <= 0.559 * t2["shares"] + 1e-3, (average, cost(t2), see(bot))
+    print("LIVE_TAKER_FEE_DOUBLE_OK")
+
+
+asyncio.run(live_taker_fee_double())
+
 print("AUDIT_LIVE_A2_OK")

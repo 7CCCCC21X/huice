@@ -2757,8 +2757,10 @@ class LiveBot(core.Bot):
         fee in shares: 97.74 bought, 96.30 held) — the records are trimmed to the holding, in proportion, when no order
         with fills is still working there, the shortfall is within LIVE_TRIM_MAX and the same shortfall stands a minute
         later (the positions list follows the matching a little late); a position's payout is then exactly the shares
-        held (the cost, price with the fee times the shares bought, stays right within a cent). A list that cannot be
-        read, or came cut at the page cap, changes nothing."""
+        held, and its cost the money spent, over the fewer shares: a maker's price × shares, kept (1.122.0); a taker's
+        average price × the shares it bought — the fee its price carries was paid in the shares cut, not in USDT
+        (1.150.0: left in the cost as well, it was counted twice). A list that cannot be read, or came cut at the page
+        cap, changes nothing."""
         if now_ms - self.live_late_checked < self.LIVE_LATE_FILLS_MS:
             return
         self.live_late_checked = now_ms
@@ -2953,17 +2955,41 @@ class LiveBot(core.Bot):
                 continue
             self.live_trim_seen.pop(k, None)
             scale = got / total
+            fee_off = 0.0  # what the takers' costs go down by: the fee they carried in USDT beside the shares cut (the notice says it)
             for tid, t in recs:
                 before = float(t["shares"])
                 after = round(before * scale, 6)
+                cut = float(t.get("fee_shares") or 0)  # the shares earlier trims took off this record
                 t["shares"] = after
-                t["fee_shares"] = round(float(t.get("fee_shares") or 0) + before - after, 6)
+                t["fee_shares"] = round(cut + before - after, 6)
+                what = f"按 Predict 持仓校正份数：{before:g} → {after:g}（账户在这一边共持有 {got:g} 份，比记录的 {total:g} 份少 {short:g} 份：手续费以份额扣除）"
                 if after > 0:
-                    t["price"] = round(float(t["price"]) * before / after, 6)  # 1.122.0: the money spent is the same, over fewer shares
-                t["live"]["events"].append({"at": now_ms, "what": f"按 Predict 持仓校正份数：{before:g} → {after:g}（账户在这一边共持有 {got:g} 份，比记录的 {total:g} 份少 {short:g} 份：手续费以份额扣除）"})
+                    price = float(t["price"])
+                    keep = price * before / after  # 1.122.0: the money spent is the same, over fewer shares
+                    if not t.get("maker"):
+                        # 1.150.0: ...but a taker's price × shares is not the money it spent. live_apply costs it at the average
+                        # plus the fee per share, and Predict takes that fee out of the shares bought — the very shares cut here —
+                        # not in USDT: a fill costs average × shares, never more than the order signed for (100 shares at 58¢:
+                        # $58.00 left the account, which holds 98.55 of them). Kept whole over the fewer shares, the fee was counted
+                        # twice — the shares gone AND their worth still in the cost ($58.84): every trimmed taker's P&L, a win's
+                        # and a loss's alike, came out low by the fee (−$0.84 per 100 shares at 58¢, up to 2% of the money in: the
+                        # journal, the EV comparison, the exposure and the day's loss figure). The money a taker spent is its
+                        # average price × the shares it bought (those held now and every share cut off it): the cost goes there —
+                        # never above the cost the record had, and never by lowering its per-share price (the 1.119.1 rule): a
+                        # record cut by less than its own fee (the shortfall is spread in proportion over the outcome's records)
+                        # keeps the rest of the fee in its cost, dear rather than cheap, and one whose shares were booked from
+                        # the holding, already net of the fee, gives up no more than the shares cut are worth.
+                        keep = min(keep, max(price, float(t.get("avg") or price) * (before + cut) / after))
+                        if price * before - keep * after >= 0.005:
+                            fee_off += price * before - keep * after
+                            what += f"；成本 ${price * before:,.2f} → ${keep * after:,.2f}（吃单的手续费就是少掉的这些份额，不再另算进成本）"
+                    t["price"] = round(keep, 6)
+                t["live"]["events"].append({"at": now_ms, "what": what})
                 self.sim_save([(tid, t)])
+            costs = "（成本不变）" if fee_off < 0.005 else (f"（吃单的手续费就是少掉的这些份额，不再另算进成本：成本共减 ${fee_off:,.2f}"
+                                                           + ("；挂单的成本不变" if any(t.get("maker") for _, t in recs) else "") + "）")
             self.live_notify(f"📐 份数校正：{recs[0][1]['item']} {recs[0][1]['label']}：账户持有 {got:g} 份，记录 {total:g} 份，少的 {short:g} 份是手续费以份额扣除；"
-                             f"{len(recs)} 笔记录按比例改为持有的份数（成本不变）", key=f"trim:{k[0]}:{k[1]}")
+                             f"{len(recs)} 笔记录按比例改为持有的份数{costs}", key=f"trim:{k[0]}:{k[1]}")
 
     async def live_undo_preopen_adoptions(self, live: list[tuple[str, dict]], key_of: Any, busy: set, po: dict, now_ms: int) -> None:
         """A backfill that was the pre-open mode's fill, undone (1.131.5): the order's own record, read again once the
