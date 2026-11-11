@@ -5439,10 +5439,18 @@ class LiveBot(core.Bot):
         lines = await self.live_prepare()
         if self.config.live_mode == "pause":
             LOG.warning("LIVE=pause：已登录 Predict，可自检、挂单测试、撤单；不开新仓。%s", "｜".join(lines))
-            self.live_notify("🧪 真实交易处于 LIVE=pause：不开新仓，可自检和挂单测试；确认无误后把 LIVE 改成 on。\n" + "\n".join(lines), key="start")
+            start = "🧪 真实交易处于 LIVE=pause：不开新仓，可自检和挂单测试；确认无误后把 LIVE 改成 on。\n" + "\n".join(lines)
         else:
             LOG.warning("LIVE=on：模拟交易的决定会真实下单。%s", "｜".join(lines))
-            self.live_notify("💰 真实交易已启动\n" + "\n".join(lines), key="start")
+            start = "💰 真实交易已启动\n" + "\n".join(lines)
+
+        # 1.150.0 (XR-STARTUP-NOTICE-LOST): sent once Telegram's start-up check passed (Bot.after_hello). Telegram out of
+        # reach at this start no longer crash-loops the process (CTRL-TELEGRAM-STARTUP), so a notice tried right here
+        # failed once and was gone for good; 1.149.0's first good start after the outage still sent it.
+        async def start_notice() -> None:
+            if await self.after_hello():
+                self.live_notify(start, key="start")
+        self.deliver("live:start-notice", start_notice)
         self.live_redeem_loop_task = asyncio.create_task(self.live_redeem_loop(), name="live-redeem-loop")  # 1.131.4: whatever the paper trader does
         return await super().run()
 

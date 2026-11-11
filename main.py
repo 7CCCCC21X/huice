@@ -24987,6 +24987,20 @@ class Bot:
         self.telegram_ok = True
         return None
 
+    async def after_hello(self) -> bool:
+        """True once Telegram's start-up check passed in this process (telegram_ok), waiting for it; False when the bot
+        stops first. 1.150.0 (XR-STARTUP-NOTICE-LOST): the one-off start notices (the saved page settings this start
+        dropped, LiveBot's LIVE=pause / 真实交易已启动) wait here for the commands loop's hello instead of being tried
+        once while Telegram is out of reach (CTRL-TELEGRAM-STARTUP keeps the bot running then): a failed send is not
+        retried, and the store was already rewritten at __init__ (CTRL-PRUNE), so no later start would report the drop
+        — the administrator would never learn that a page value fell back to the environment's. Polls once a second
+        (the stop wakes it at once, so drain_deliveries never hangs on it); with Telegram up it returns at once."""
+        while not self.telegram_ok:
+            if self.stopping.is_set():
+                return False
+            await self.wait(1)
+        return True
+
     async def commands_loop(self) -> None:
         # 1.150.0 (CTRL-TELEGRAM-STARTUP): Telegram was out of reach when the process started (run): the start-up check
         # is tried again here, backing off like the poll below, while the rest of the bot already runs. Not one update
@@ -25072,7 +25086,10 @@ class Bot:
         if not self.config.admin_id:
             LOG.warning("ADMIN_USER_ID 尚未配置：只能使用 /id；没有任何自动订阅")
         elif self.control_dropped:  # 1.150.0 (CTRL-PRUNE): saved settings dropped at this start reach the administrator, not only the log
-            self.deliver("notice:control-dropped", functools.partial(self.tell, self.config.admin_id, 0, self.control_dropped_text()))
+            async def dropped_notice() -> None:  # 1.150.0 (XR-STARTUP-NOTICE-LOST): sent once Telegram's start-up check passed (after_hello)
+                if await self.after_hello():
+                    await self.tell(self.config.admin_id, 0, self.control_dropped_text())
+            self.deliver("notice:control-dropped", dropped_notice)
         if warning := calendar_warning(self.config.holidays, dt.datetime.now(BEIJING).date()):
             LOG.warning("%s", warning)
         loop = asyncio.get_running_loop()

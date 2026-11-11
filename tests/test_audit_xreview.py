@@ -476,4 +476,112 @@ def stock_close_recalc():
 
 driver_windows_perf()
 stock_close_recalc()
+
+
+async def startup_notice_lost():
+    """XR-STARTUP-NOTICE-LOST: with Telegram out of reach at the start the bot now runs on (CTRL-TELEGRAM-STARTUP), and the one-off
+    start notices — the saved page settings this start dropped (CTRL-PRUNE, already removed from the store at __init__) and
+    LiveBot's 🧪 LIVE=pause / 💰 真实交易已启动 — were tried once during the outage, failed (Bot.tell swallows it) and were never sent
+    again. They now wait for the start-up check to pass and go out once Telegram is back; a stop during the outage ends them."""
+    import logging, socket, time
+    WEI = 10 ** 18
+    dns = lambda: m._net_error(socket.gaierror(-3, "Temporary failure in name resolution"))
+
+    class Market(m.Binance):
+        def now_ms(self): return int(time.time() * 1000)
+        async def sync_clock(self): pass
+        async def prices(self): return {"UNITREEUSDT": {"symbol": "UNITREEUSDT", "price": "73.13", "time": self.now_ms()}}
+        async def get(self, path, **p): return []
+
+    class Tg:
+        def __init__(self):
+            self.down, self.calls, self.sent = dns, [], []
+        async def call(self, method, payload=None, timeout=15):
+            self.calls.append(method)
+            if self.down is not None:
+                raise self.down()
+            if method == "getWebhookInfo": return {"url": ""}
+            if method == "getMe": return {"username": "AuditBot"}
+            if method == "getUpdates":
+                await asyncio.sleep(0.02)
+                return []
+            return True
+        async def send(self, chat, thread, text, reply_markup=None, parse_mode=None):
+            if self.down is not None:
+                raise self.down()
+            self.sent.append((chat, text))
+
+    class Api:
+        def __init__(self):
+            self.jwt, self.jwt_exp, self.auth_error, self.lookup = "t", 0, "", ""
+        async def ensure_auth(self): pass
+        async def remove_orders(self, ids): return {"removed": [], "noop": list(ids)}
+        async def orders(self, status="OPEN", **params): return []
+        async def order(self, oid, hash_=""): return None
+        async def positions(self): return []
+
+    class Chain:
+        async def usdt_balance(self, owner=None): return 500 * WEI
+        async def bnb_balance(self, owner=None): return 10 ** 17
+        async def allowance(self, key, owner=None): return 10 ** 30
+
+    quiet = {"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "SYMBOLS": "UNITREEUSDT", "BASELINE_MODE": "manual", "HSI_FUTURES": "off",
+             "KOSPI_INDEX": "off", "SSE_INDEX": "off", "PREDICT": "off", "BNB_TOUCH": "off", "SIM": "off", "PROBABILITY": "off",
+             "WEB": "off", "POLL_SECONDS": "3", "STATE_DB": ":memory:"}
+
+    async def until(cond, seconds=8.0):
+        end = time.monotonic() + seconds
+        while not cond() and time.monotonic() < end:
+            await asyncio.sleep(0.01)
+        return cond()
+
+    async def scenario(cls, env, saved, recover=True, live=False):
+        tg = Tg()
+        cfg = m.Config.from_env({**quiet, **env})
+        store = m.Store(":memory:")
+        store.put("control:env", saved)
+        store.put("subscriptions", {"42:0": {"chat": 42, "thread": 0, "active": True}})
+        bot = cls(cfg, store, Market(cfg), tg)
+        if live:
+            bot.live.api, bot.live.chain = Api(), Chain()
+        assert bot.control_dropped, "a saved value that no longer validates is dropped at __init__"
+        real_wait = bot.wait
+
+        async def wait(seconds):  # the commands loop's back-off cut to a moment
+            if asyncio.current_task().get_name() == "commands":
+                seconds = min(seconds, 0.02)
+            await real_wait(seconds)
+        bot.wait = wait
+        runner = asyncio.create_task(bot.run())
+        assert await until(lambda: bot.last_cycle > 0 or runner.done()) and not runner.done(), "run() is not blocked by Telegram"
+        await asyncio.sleep(0.3)
+        assert not tg.sent
+        if recover:
+            tg.down = None  # Telegram answers again
+            assert await until(lambda: bot.telegram_ok and "getUpdates" in tg.calls)
+            await until(lambda: any("网页控制台保存的设置" in t for _, t in tg.sent)
+                        and (not live or any(t.startswith("🧪 真实交易处于 LIVE=pause") for _, t in tg.sent)), 5)
+            await asyncio.sleep(0.3)
+        t0 = time.monotonic()
+        bot.stopping.set()
+        assert await asyncio.wait_for(runner, 30) == 0
+        assert time.monotonic() - t0 < 10, "a notice waiting for Telegram never holds the shutdown"
+        return tg.sent
+
+    logging.disable(logging.WARNING)
+    try:
+        sent = await scenario(m.Bot, {}, {"SIM_EDGE_CENTS": "12", "SIM_SECONDS": "2"})
+        dropped = [t for c, t in sent if "网页控制台保存的设置" in t]
+        assert len(dropped) == 1 and "SIM_SECONDS" in dropped[0] and sent[0][0] == 42, sent
+        assert await scenario(m.Bot, {}, {"SIM_SECONDS": "2"}, recover=False) == []  # stopped while still down: nothing, no hang
+        sent = await scenario(L.LiveBot, {"LIVE": "pause", "SIM": "on", "PREDICT": "on", "PREDICT_WS": "off", "BINANCE_WS": "off",
+                                          "HL_WS": "off", "PREDICT_PRIVATE_KEY": "a" * 64, "PREDICT_API_KEY": "k", "PREOPEN_MARKETS": "btc,eht"},
+                              {"PREOPEN_15M": "on", "LIVE_MAX_ORDER_USD": "5"}, live=True)
+        assert len([t for c, t in sent if t.startswith("🧪 真实交易处于 LIVE=pause")]) == 1, sent
+        assert len([t for c, t in sent if "网页控制台保存的设置" in t and "PREOPEN_15M" in t]) == 1, sent
+    finally:
+        logging.disable(logging.NOTSET)
+
+
+asyncio.run(startup_notice_lost())
 print("AUDIT_XREVIEW_OK")
