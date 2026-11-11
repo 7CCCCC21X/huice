@@ -1728,7 +1728,9 @@ class LiveBot(core.Bot):
         self.live_redeem_unsent: dict[str, int] = {}         # position key -> its redeems in a row that never left (TxNotSent): LIVE_REDEEM_UNSENT_PULLS (1.150.0)
         self.live_redeem_read_round: dict[str, int] = {}     # market id -> the number of the redeem round that last read it (this process's rounds): the longest unread are read first (1.150.0)
         self.live_redeem_first: dict[str, float] = {}        # market id -> when a win there asked for a round (live_redeem_soon): read ahead of the rotation, once (1.150.0)
-        self.live_redeem_noted = -1e9                        # the last failed redeem told on Telegram (LIVE_REDEEM_NOTE_SECONDS)
+        self.live_redeem_noted = -1e9                        # the last never-sent failed redeem told on Telegram (LIVE_REDEEM_NOTE_SECONDS)
+        self.live_redeem_untold: dict[str, dict] = {}        # position key -> a sent redeem that failed, not told yet (the next ⚠️; 1.150.0)
+        self.live_redeem_notes: dict[str, str] = {}          # position key, or gas / cut / unclear / round / loop -> its problem line (the check, 1.150.0)
         self.live_redeem_again_n = 0                         # early rounds in a row asked for by live_redeem_again (0 again once a round looked, 1.150.0)
         self.live_redeem_whole_at = time.monotonic()         # when a round last looked at the positions with no rate limit cutting it (the start counts)
         self.live_redeem_stuck_noted = -1e9                  # ...and when no such look for LIVE_REDEEM_STUCK_SECONDS was last told (hourly at most)
@@ -2923,7 +2925,7 @@ class LiveBot(core.Bot):
             try:
                 self.live_redeem_tick()
             except Exception as error:
-                self.live_note_error(f"自动领取计时出错：{core.clean_error(error) or type(error).__name__}")
+                self.live_redeem_note("loop", f"自动领取计时出错：{core.clean_error(error) or type(error).__name__}")
             await self.wait(self.LIVE_REDEEM_TICK_SECONDS)
 
     async def live_redeem_round(self, now_ms: int) -> None:
@@ -2945,12 +2947,12 @@ class LiveBot(core.Bot):
         except RedeemUnread as error:  # the list itself: nothing judged, nothing sent
             text = core.clean_error(error) or type(error).__name__
             self.live_redeem_last = {"at": now_ms, "error": f"读取持仓失败：{text}"}
-            self.live_note_error(f"领取结算失败：{text}")
+            self.live_redeem_note("round", f"领取结算失败：{text}")
             self.live_redeem_again()
         except Exception as error:  # in the middle of the pass: the usual cadence
             text = core.clean_error(error) or type(error).__name__
             self.live_redeem_last = {"at": now_ms, "error": f"这一轮中途出错：{text}"}
-            self.live_note_error(f"领取结算失败：{text}")
+            self.live_redeem_note("round", f"领取结算失败：{text}")
         else:
             if (self.live_redeem_last or {}).get("limited"):
                 self.live_redeem_again()  # the rate limit ended the market reads: the ones left once the cooldown is over, not ten minutes on
@@ -4472,6 +4474,21 @@ class LiveBot(core.Bot):
             lock = self.live_redeem_lock = asyncio.Lock()
         return lock
 
+    REDEEM_NOTES_KEPT = 20  # the redeem's own problem lines kept (live_redeem_note); /live redeem check shows the last three
+
+    def live_redeem_note(self, key: str, text: str) -> None:
+        """A redeem problem: its line in /live's 最近错误 (live_errors) and in the redeem's own short list (live_redeem_notes: one
+        line per position — or per cause: gas, cut, unclear, round, loop — the newest last), which /live redeem check shows as
+        最近的领取问题. 1.150.0 (audit RDM-NOTE-THROTTLE): the check took its lines from live_errors, ten lines shared with every
+        order failure — ten unfilled taker orders pushed a redeem failure out — and a failure stayed listed after its position
+        was redeemed. A line here goes once its cause has (live_redeem_pass)."""
+        self.live_note_error(text)
+        notes = self.__dict__.setdefault("live_redeem_notes", {})
+        notes.pop(key, None)
+        notes[key] = f"{core.stamp(self.market.now_ms(), seconds=False)} {text}"
+        while len(notes) > self.REDEEM_NOTES_KEPT:
+            del notes[next(iter(notes))]
+
     async def live_redeem(self, now_ms: int, manual: bool = False) -> list[str]:
         """Positions on markets Predict has resolved: the winning outcome's shares are redeemed for USDT on-chain
         (once per market and outcome); the lines say what was done. A position whose redeem failed waits
@@ -4508,7 +4525,7 @@ class LiveBot(core.Bot):
         if paid == 0:
             line = (f"⚠️ 领取交易上链了，但没领到 USDT：{shares}（交易 {tx}）。链上已经没有这份持仓：多半已在网站上领过，"
                     "或之前的一笔领取已经到账；网站上若还显示可领取，把这条发我")
-            self.live_note_error(line)
+            self.live_redeem_note(key, line)
             fields = {"kind": "kept", "tx": str(tx), "paid": "0"}
         else:
             line = f"💵 已领取 {shares}" + (f"，到账 ${from_wei(paid):,.2f}" if paid else "") + f"：{tx}"
@@ -4556,6 +4573,8 @@ class LiveBot(core.Bot):
                     errors.pop(key, None)
                     unsent_runs.pop(key, None)
                     self.live_redeem_failed.pop(key, None)
+                    self.__dict__.setdefault("live_redeem_untold", {}).pop(key, None)  # (RDM-NOTE-THROTTLE) booked: nothing left to tell or list
+                    self.__dict__.setdefault("live_redeem_notes", {}).pop(key, None)
                     booked[key] = self.live_redeem_booked(key, tx, paid, int(str(note.get("amount") or "0")), title,
                                                           str(note.get("outcome") or ""), now_ms, done, sent_key)
                     continue
@@ -4565,8 +4584,9 @@ class LiveBot(core.Bot):
                     self.live_redeem_failed.setdefault(key, time.monotonic())
                     errors[key] = text
                     unsent_runs.pop(key, None)
-                    self.live_note_error(f"领取 {title} 失败：{text}（一小时后再试）")
+                    self.live_redeem_note(key, f"领取 {title} 失败：{text}（一小时后再试）")
                     booked[key] = {"kind": "failed", "error": text, "unsent": False, "pulled": False}
+                    self.__dict__.setdefault("live_redeem_untold", {})[key] = {"title": title, **booked[key]}  # (RDM-NOTE-THROTTLE) its gas spent: told
                     continue
             if age_ms < self.LIVE_REDEEM_RETRY_SECONDS * 1000:
                 out[key] = {**note, "age_ms": age_ms}
@@ -4580,7 +4600,7 @@ class LiveBot(core.Bot):
                 out[key] = {**note, "age_ms": age_ms, "error": "节点里还在排队，没上链"}
                 continue
             self.store.delete_keys([sent_key])  # an hour on, never mined and unknown to the node: let go — redeemed again below
-            self.live_note_error(f"领取 {title} 的交易 {tx} 一小时没上链、节点里也查不到：重新领取")
+            self.live_redeem_note(key, f"领取 {title} 的交易 {tx} 一小时没上链、节点里也查不到：重新领取")
         return booked, out
 
     async def live_negrisk_amount(self, outcome: dict, info: MarketInfo, index_set: int, listed: int) -> int:
@@ -4659,6 +4679,8 @@ class LiveBot(core.Bot):
         read_errors: dict[str, str] = {}
         limited = False
         errors = self.__dict__.setdefault("live_redeem_errors", {})
+        untold = self.__dict__.setdefault("live_redeem_untold", {})  # (RDM-NOTE-THROTTLE) position key -> a sent redeem that failed, not yet told
+        notes = self.__dict__.setdefault("live_redeem_notes", {})    # (RDM-NOTE-THROTTLE) the redeem's own problem lines (live_redeem_note)
         # 1.150.0: the markets go by how long ago this process read them here — never yet first, then by the round of their last read,
         # the newest positions first among equals. By the newest positions alone (1.131.3) a capped round spent its LIVE_REDEEM_READS
         # on the same newest markets every round for as long as they stayed unresolved (or their read kept failing), so a resolved
@@ -4864,12 +4886,16 @@ class LiveBot(core.Bot):
                         first[mid] = time.monotonic()  # (RDM-SOON-NO-TARGET) still named: the pulled retry reads it first
                 else:
                     unsent_runs.pop(key, None)
-                self.live_note_error(f"领取 {entry['title']} 失败：{text}" + ("（交易没发出，5 分钟后再试）" if pulled else "（交易没发出，下一轮再试，最迟约 10 分钟）" if unsent
-                                                                         else "（一小时后再试）"))
+                self.live_redeem_note(key, f"领取 {entry['title']} 失败：{text}" + ("（交易没发出，5 分钟后再试）" if pulled else "（交易没发出，下一轮再试，最迟约 10 分钟）" if unsent
+                                                                                   else "（一小时后再试）"))
                 seen.append({**entry, "kind": "failed", "error": text, "unsent": unsent, "pulled": pulled})
+                if not unsent:  # (RDM-NOTE-THROTTLE) sent and failed — its gas spent, its hour's wait: told at the next notice
+                    untold[key] = {"title": entry["title"], "error": text, "unsent": False, "pulled": False}
                 continue
             errors.pop(key, None)
             unsent_runs.pop(key, None)
+            untold.pop(key, None)  # (RDM-NOTE-THROTTLE) redeemed: nothing left to tell or list for it
+            notes.pop(key, None)
             seen.append({**entry, **self.live_redeem_booked(key, str(tx), getattr(tx, "payout", None), amount, entry["title"],
                                                             str(outcome.get("name") or ""), now_ms, done, sent_key)})
         if dry_run:
@@ -4880,6 +4906,15 @@ class LiveBot(core.Bot):
             del unsent_runs[gone]
         for gone in set(first) - unsettled:
             del first[gone]  # a name with nothing left to judge there (redeemed, lost, or not listed): forgotten
+        # (RDM-NOTE-THROTTLE) a problem line goes once its cause has: a position no longer listed (its own line), the gas, the
+        # cut list, the unreadable settlements, a failed round (this one looked); a failure not yet told, once no longer listed
+        listed = {f"live:redeemed:{s['market_id']}:{s['index_set']}" for s in seen}
+        found = {s["kind"] for s in seen}
+        over = {"round", "loop"} | ({"gas"} if not low_gas else set()) | ({"cut"} if not cut else set()) | ({"unclear"} if "unclear" not in found else set())
+        for gone in [k for k in notes if k in over or (k.startswith("live:redeemed:") and k not in listed)]:
+            del notes[gone]
+        for gone in [k for k in untold if k not in listed]:
+            del untold[gone]
         if pull:  # (RDM-UNSENT-RETRY-GRID) the next round at the end of the soonest such wait, a second after it
             left = min(self.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - self.live_redeem_failed[k]) for k in pull)
             self.live_redeem_pull(max(0.0, left) + 1)
@@ -4894,24 +4929,46 @@ class LiveBot(core.Bot):
             # own hour (LIVE_NOTE_EVERY), started only once a chat was given it, given back when no chat took it.
             if time.monotonic() - self.live_gas_noted >= self.LIVE_REDEEM_RETRY_SECONDS:
                 self.live_gas_noted = time.monotonic()
-                self.live_note_error(text)
+                self.live_redeem_note("gas", text)
             self.live_notify(text, key="redeem:gas")  # 1.131.4: told on Telegram, not only in the log
-        failed = [s for s in seen if s["kind"] == "failed"]
-        if failed and time.monotonic() - getattr(self, "live_redeem_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
-            when = "5 分钟后" if failed[0].get("pulled") else "下一轮（最迟约 10 分钟）" if failed[0].get("unsent") else "一小时后"
-            again = f"{when}自动再试" if self.config.live_auto_redeem else "自动领取关着，不会自己再试：发 /live redeem 再领"  # (RDM-CHECK-VERDICT)
-            if self.live_notify(f"⚠️ 自动领取：{len(failed)} 个已结算的持仓没领成（{failed[0]['title']}：{failed[0]['error']}），"
-                                f"{again}。/live redeem check 查看原因", key="redeem:fail"):
-                # (RDM-NOTIFY-GATES) its hour only once a chat was given it — and given back when none took it
-                before, self.live_redeem_noted = getattr(self, "live_redeem_noted", -1e9), time.monotonic()
-                self.live_note_given_back("redeem:fail", lambda before=before: setattr(self, "live_redeem_noted", before))
+        # 1.150.0 (audit RDM-NOTE-THROTTLE): one hourly clock for every failed redeem, and the notice named the first alone (its
+        # title, error and retry time): a harmless never-sent failure took the hour, and a redeem SENT and failed minutes later
+        # — its gas spent, an hour's wait — was never pushed; two failures in one round were told with the first one's retry.
+        # A sent-and-failed redeem is now told at the next notice (redeem:fail: one every LIVE_NOTE_SECONDS at most); the
+        # never-sent ones, routine for windows redeemed seconds after their result, keep their hour; each notice names up to
+        # three, each with its own retry.
+        soft = [s for s in seen if s["kind"] == "failed" and s.get("unsent")]
+        if untold or (soft and time.monotonic() - getattr(self, "live_redeem_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS):
+            items, auto = [*untold.values(), *soft], self.config.live_auto_redeem
+            when = lambda s: ("5 分钟后" if s.get("pulled") else "下一轮（最迟约 10 分钟）" if s.get("unsent") else "一小时后") + "自动再试"
+            manual = "自动领取关着，不会自己再试：发 /live redeem 再领"  # (RDM-CHECK-VERDICT)
+            if len(items) == 1:
+                text = f"⚠️ 自动领取：1 个已结算的持仓没领成（{items[0]['title']}：{items[0]['error']}），{when(items[0]) if auto else manual}"
+            else:
+                text = (f"⚠️ 自动领取：{len(items)} 个已结算的持仓没领成（"
+                        + "；".join(f"{s['title']}：{s['error']}" + (f"，{when(s)}" if auto else "") for s in items[:3])
+                        + (f"；另有 {len(items) - 3} 个" if len(items) > 3 else "") + "）" + ("" if auto else f"，{manual}"))
+            if self.live_notify(text + "。/live redeem check 查看原因", key="redeem:fail") is not False:
+                # (RDM-NOTIFY-GATES) told once a chat was given it — and all given back when none took it (False: no chat given
+                # it; a stand-in that answers nothing counts as told, as before)
+                carried, before = dict(untold), getattr(self, "live_redeem_noted", -1e9)
+                untold.clear()
+                if soft:
+                    self.live_redeem_noted = time.monotonic()
+
+                def undo(carried: dict = carried, before: float = before, soft: bool = bool(soft)) -> None:
+                    for k, v in carried.items():
+                        untold.setdefault(k, v)
+                    if soft:
+                        self.live_redeem_noted = before
+                self.live_note_given_back("redeem:fail", undo)
         if cut and time.monotonic() - getattr(self, "live_cut_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
             # 1.150.0 (RDM-POSITIONS-CUT): a list longer than even the redeem's own read — told once an hour on its own timer (a bare
             # key would come back every LIVE_NOTE_SECONDS, a round or two), not only in the summary nobody asks for
             self.live_cut_noted = time.monotonic()
             text = (f"⚠️ 自动领取：Predict 的持仓列表超过 {cut} 条，只读到前 {cut} 条，后面的持仓没检查（可能有赢的没领）："
                     "先到 Predict 网站核对、手动领取。/live redeem check 查看")
-            self.live_note_error(text)
+            self.live_redeem_note("cut", text)
             self.live_notify(text, key="redeem:cut")
         # (RDM-OPEN-SHAPES) a settlement read half: remembered from the round that first met it while it stays so (or unread), told
         # once it has stood LIVE_REDEEM_UNCLEAR_SECONDS — twelve times that for a named result without the settled word, which a
@@ -4928,7 +4985,7 @@ class LiveBot(core.Bot):
             s = stood[0]
             text = (f"⚠️ 自动领取：{len(stood)} 个持仓 Predict 的结算读不出（{s['title']}：{s['error']}，市场状态 {s['status']}），"
                     "机器人不会去领、也不记成输：先到 Predict 网站手动领取，并把 /live redeem check 的回答发我")
-            self.live_note_error(text)
+            self.live_redeem_note("unclear", text)
             self.live_notify(text, key="redeem:unclear")
         counts: dict[str, int] = {}
         for s in seen:
@@ -5021,11 +5078,11 @@ class LiveBot(core.Bot):
             started = f"（{core.stamp(since, seconds=False)} 起，已 {max(0, int((self.market.now_ms() - since) / 60_000))} 分钟）" if since else ""
             lines.append(f"结论：有一轮领取正在进行{started}：它把领取交易逐个发出、每个等上链（最多 120 秒）后才结束；"
                          "这次没有逐个查看持仓，等 /live 不再显示“正在领取”再发 /live redeem check")
-            recent = [e for e in self.live_errors if "领取" in e or "⛽" in e][-3:]
+            recent = list(getattr(self, "live_redeem_notes", {}).values())[-3:]  # (RDM-NOTE-THROTTLE) the redeem's own list
             if recent:
                 lines.append("最近的领取问题：\n" + "\n".join("  " + e for e in recent))
             return "\n".join(lines)
-        recent = [e for e in self.live_errors if "领取" in e or "⛽" in e][-3:]
+        recent = list(getattr(self, "live_redeem_notes", {}).values())[-3:]  # (RDM-NOTE-THROTTLE) the redeem's own list, not live_errors
         try:
             async with lock:
                 _, seen = await self.live_redeem_pass(now_ms, dry_run=True)

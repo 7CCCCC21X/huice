@@ -2055,4 +2055,57 @@ async def notify_gates():
 asyncio.run(notify_gates())
 
 
+# --- RDM-NOTE-THROTTLE ----------------------------------------------------------------------------------------------------------
+async def note_throttle():
+    """RDM-NOTE-THROTTLE: one hourly clock for every failed redeem, and the ⚠️ named the first alone: a harmless never-sent
+    failure took the hour, and a redeem SENT and failed minutes later (its gas spent) was never pushed; two failures in a round
+    were told with the first's retry time. And the check's 最近的领取问题 came from live_errors — ten lines shared with every order
+    failure — so ten unfilled orders pushed it out, and an old failure stayed listed after its position was redeemed. A sent
+    failure is now told at the next notice (one every ten minutes at most), the never-sent ones keep their hour, each item its
+    own retry; the redeem keeps its own problem lines, gone once their cause is."""
+    chain = Picky({cond(501): ("unsent", "RPC 错误：execution reverted")})
+    bot = await told_bot({}, chain=chain)  # (the administrator's chat: no subscription)
+    fake = bot.live.api
+    fake.positions_rows = [held(501)]
+    fake.markets.update({str(mid): mk(mid, won=1) for mid in range(501, 507)})
+    warned = lambda: [text for _, _, text in bot.telegram.sent if text.startswith("⚠️ 自动领取")]
+
+    async def round_at(minutes):
+        bot.live_noted["redeem:fail"] = bot.live_noted.get("redeem:fail", -1e9) - 601  # (ten minutes pass for the notice's own clock)
+        await told_round(bot, NOW + minutes * MIN)
+        return warned()
+    # (1) a redeem that never left: told, its five minutes
+    assert await round_at(0) == ["⚠️ 自动领取：1 个已结算的持仓没领成（window 501：RPC 错误：execution reverted），5 分钟后自动再试。/live redeem check 查看原因"]
+    # (2) ten minutes on: 501 goes out; 502 is SENT and fails — told, though a never-sent one took the hour
+    chain.refuse = {cond(502): ("sent", "交易失败（已回滚）：0xbad")}
+    bot.live_redeem_failed.clear()
+    fake.positions_rows.append(held(502))
+    assert (await round_at(10))[1:] == ["⚠️ 自动领取：1 个已结算的持仓没领成（window 502：交易失败（已回滚）：0xbad），一小时后自动再试。/live redeem check 查看原因"]  # (before: none)
+    # (3) more never-sent failures within the hour: their hour holds, nothing more
+    chain.refuse[cond(503)] = ("unsent", "RPC 错误：execution reverted")
+    fake.positions_rows.append(held(503))
+    assert len(await round_at(20)) == 2
+    # (4) a never-sent and a sent failure in one round: both named, each with its own retry
+    chain.refuse.update({cond(504): ("unsent", "RPC 错误：execution reverted"), cond(505): ("sent", "交易失败（已回滚）：0xe5")})
+    fake.positions_rows += [held(504), held(505)]
+    last = (await round_at(30))[2:]
+    assert last == ["⚠️ 自动领取：2 个已结算的持仓没领成（window 505：交易失败（已回滚）：0xe5，一小时后自动再试；"
+                    "window 504：RPC 错误：execution reverted，5 分钟后自动再试）。/live redeem check 查看原因"], last
+    # (5) the check's problem lines: kept through ten order failures; gone once the positions are redeemed
+    for k in range(10):
+        bot.live_note_error(f"吃涨 {k} 吃单未成交（不在盘口）")
+    report = await bot.live_redeem_report(NOW + 31 * MIN)
+    assert "最近的领取问题：" in report and "领取 window 505 失败：交易失败（已回滚）：0xe5（一小时后再试）" in report, report  # (before: pushed out)
+    chain.refuse.clear()
+    bot.live_redeem_failed.clear()
+    assert len(await bot.live_redeem(NOW + 40 * MIN)) == 4  # 502…505
+    report = await bot.live_redeem_report(NOW + 41 * MIN)
+    assert "最近的领取问题" not in report and "领取 window 50" not in report, report  # (before: the old failures, still listed)
+    assert bot.live_redeem_untold == {} and bot.live_redeem_notes == {}, (bot.live_redeem_untold, bot.live_redeem_notes)
+    print("RDM_NOTE_THROTTLE_OK")
+
+
+asyncio.run(note_throttle())
+
+
 print("AUDIT_REDEEM_OK")
