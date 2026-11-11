@@ -568,6 +568,28 @@ def resting_orders(pair: dict, now_ms: int) -> int:
     return sum(1 for o in (pair.get("orders") or {}).values() if o.get("state") in MAY_REST)
 
 
+def awaiting_finals(pair: dict, now_ms: int, days: int = 3) -> int:
+    """The pair's withdrawn orders whose final fills are still unread ("removed"), its window within unverified_outcomes'
+    ``days``; none for an accounted pair.
+
+    1.150.0 (Audit XR-PRELATE-CRASHED): PRE-LATE-FILL ends an order off the book only by a read made LATE_FILL_MS after it
+    left, and leaves that read to the cancellation loop (remove_pairs skips launch_reconcile while finals_wait is ahead).
+    A crashed controller — still attached, alive False — has no loop: an operator's withdrawal on it (/preopen pause, /live
+    cancel all, the emergency stop: withdraw_all) leaves its orders "removed", and with the mode then off nothing ever read
+    them — the wind-down start (LiveBot.preopen_leftovers) counted only orders that may rest (resting_orders, MAY_REST),
+    which "removed" is not. Their pairs stayed unaccounted and their outcomes in unverified_outcomes for 3 days: the model
+    trader's positions check held those outcomes all that time (live_late_fills skipped a genuine late fill of its own
+    there past its 2-day window — exposure, P&L and the day's loss stop missed it; live_unexplained kept an unknown order
+    reserved), where 1.149.0 read the records at the withdrawal. Counted here as well, they start a wind-down controller
+    that only reads (nothing new goes out, nothing is left to cancel): its loop reads each record once LATE_FILL_MS has
+    passed, the pair is accounted, it stops itself (wound_up) and, nothing left, is not started again. Should Predict's
+    reads keep failing it stops after FINALS_WAIT_MS and the apply its stop calls starts it again — reads only, until a read
+    succeeds, the give-up (a read past start + GIVE_UP_MS ends the order) or the window leaves this span."""
+    if pair.get("accounted") or int(pair.get("start_ms") or 0) < now_ms - days * core.DAY_MS:
+        return 0
+    return sum(1 for o in (pair.get("orders") or {}).values() if o.get("state") == "removed")
+
+
 def counts_against(pair: dict) -> bool:
     """Whether a withdrawn record counts against its window's MAX_ATTEMPTS: one that ended by its own failure (a side not
     confirmed, a side ended unfilled — an external cancel, a deferred refusal — the market's status) does; one withdrawn

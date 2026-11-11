@@ -242,4 +242,81 @@ def ev_sigma_levels():
 
 
 ev_sigma_levels()
+
+
+async def prelate_crashed():
+    """XR-PRELATE-CRASHED: PRE-LATE-FILL leaves the final read of an order off the book to the cancellation loop, which a
+    crashed controller (attached, alive False) lacks. An operator's withdrawal on it (/preopen pause) left its orders
+    "removed", and with the mode off preopen_leftovers counted only orders that may rest: no wind-down controller ever read
+    them, their outcomes held the model trader's positions check for 3 days. Now they start one, which reads them a minute
+    on, accounts the pairs and stops itself — and is not started again."""
+    import tempfile, types
+    import preopen as P
+    import test_preopen as TP
+    with tempfile.TemporaryDirectory() as folder:
+        db = str(pathlib.Path(folder) / "x.preopen.sqlite3")
+        rows = [TP.market(at=TP.NOW + k * 15 * 60_000, mid=200 + k) for k in (1, 2, 3)]
+        env = dict(PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="1440", PREOPEN_SHARES="10", PREOPEN_DB=db)
+        ctl, api, clock = TP.controller(rows, **env)
+        for r in rows:
+            await ctl.place_pair(P.candidate(r, TP.NOW, ctl.owner.config, ctl.settings))
+        ctl.alive = False  # crashed with its orders still resting; still attached
+        bot = L.LiveBot.__new__(L.LiveBot)
+        bot.preopen, bot.store, bot.market = ctl, m.Store(":memory:"), types.SimpleNamespace(now_ms=lambda: clock.ms)
+        await bot.cmd_preopen(m.Request("/preopen", ["pause"], 1, 0, 1))
+        await asyncio.gather(*list(ctl.settling.values()), return_exceptions=True)
+        states = {o["state"] for x in ctl.ledger.rows.values() for o in x["orders"].values()}
+        assert states == {"removed"}, states
+        ctl.ledger.close()
+        clock.ms += 5 * 60_000  # no loop on a dead controller: still unread minutes on
+        assert len(P.unverified_outcomes(P.read_rows(db), clock.ms)) == 6
+        off = L.LiveBot.__new__(L.LiveBot)
+        off.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "STATE_DB": ":memory:", "LIVE": "on",
+                                        "PREDICT_PRIVATE_KEY": "a" * 64, "PREOPEN_15M": "off", "PREOPEN_DB": db})
+        off.market = types.SimpleNamespace(now_ms=lambda: clock.ms)
+        assert off.preopen_leftovers() == 6, off.preopen_leftovers()  # was 0: nothing would ever read them with the mode off
+        # preopen_apply with the mode off starts a wind-down controller for them
+        made = []
+
+        class FakeCtl:
+            def __init__(self, owner):
+                self.owner, self.settings, self.alive, self.stop, self.error, self.winding = owner, owner.config.preopen, True, asyncio.Event(), "", ""
+                self.ledger = types.SimpleNamespace(close=lambda: None)
+                made.append(self)
+
+            def wind_down(self, reason):
+                self.winding = reason
+
+            async def run(self):
+                try:
+                    await self.stop.wait()
+                finally:
+                    self.alive = False
+        off.stopping, off.preopen, off.preopen_task, off.preopen_factory, off.preopen_lock = asyncio.Event(), None, None, FakeCtl, asyncio.Lock()
+        off.preopen_tidied = 1e18  # (no archive pass in this check)
+        await off.preopen_apply()
+        assert len(made) == 1 and made[0].winding == "预挂模式关着，但上次还有挂单没撤完", [c.winding for c in made]
+        made[0].stop.set()
+        await asyncio.gather(off.preopen_task, return_exceptions=True)
+        # the real wind-down controller over the same file: reads them a minute on, accounts the pairs, stops itself
+        ctl2, _, _ = TP.controller(rows, **env)
+        ctl2.owner.market.now_ms = lambda: clock.ms
+        ctl2.api = ctl2.cancel_api = api
+        api.ctl = ctl2
+        ctl2.adopt()
+        ctl2.wind_down("预挂模式关着，但上次还有挂单没撤完")
+        task = asyncio.create_task(ctl2.cancellation_loop())
+        await asyncio.sleep(0.3)
+        clock.ms += P.LATE_FILL_MS + 1000
+        await asyncio.wait_for(ctl2.stop.wait(), 10)
+        task.cancel()
+        await asyncio.gather(task, *list(ctl2.settling.values()), return_exceptions=True)
+        live_rows = list(ctl2.ledger.rows.values())
+        assert {o["state"] for x in live_rows for o in x["orders"].values()} == {"final"}
+        assert all(x.get("accounted") for x in live_rows) and not P.unverified_outcomes(live_rows, clock.ms)
+        ctl2.ledger.close()
+        assert off.preopen_leftovers() == 0  # nothing left: not started again
+
+
+asyncio.run(prelate_crashed())
 print("AUDIT_XREVIEW_OK")

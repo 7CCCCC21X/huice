@@ -5209,8 +5209,11 @@ class LiveBot(core.Bot):
 
     def preopen_leftovers(self) -> int:
         """Orders the pre-open mode's records say may still rest while the mode is off (1.141.0) — a stop in the middle of a
-        withdrawal, a crash, an older version's 12-second cut: a controller is started to wind them down."""
-        from preopen import read_rows, resting_orders
+        withdrawal, a crash, an older version's 12-second cut: a controller is started to wind them down. 1.150.0 (Audit
+        XR-PRELATE-CRASHED): also the withdrawn orders whose final fills are still unread (preopen.awaiting_finals) — an
+        operator's withdrawal on a crashed controller, which has no loop to read them a minute on: the wind-down controller
+        reads them, else their outcomes held the model trader's positions check for 3 days."""
+        from preopen import awaiting_finals, read_rows, resting_orders
         try:
             rows = read_rows(self.config.preopen.db)
         except Exception as error:
@@ -5219,7 +5222,7 @@ class LiveBot(core.Bot):
         if not rows:
             return 0
         now = self.market.now_ms()
-        return sum(resting_orders(p, now) for p in rows)
+        return sum(resting_orders(p, now) + awaiting_finals(p, now) for p in rows)
 
     def preopen_start(self, wind_down: str = "") -> None:
         from preopen import Controller
