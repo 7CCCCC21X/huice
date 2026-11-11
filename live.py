@@ -123,6 +123,11 @@ def from_wei(value: Any) -> float:
     return int(value) / WEI
 
 
+def bnb_text(wei: Any) -> str:
+    """BNB from wei with the decimals it needs, seven at most — a redeem's gas is a few hundred-thousandths (GAS-STATS)."""
+    return f"{from_wei(wei):.7f}".rstrip("0").rstrip(".")
+
+
 PRICE_TICK_WEI = 10 ** 16  # Predict prices carry at most two decimals (whole cents): the API refuses a third
 
 
@@ -1029,11 +1034,24 @@ class TxPending(core.RemoteError):
 class TxReverted(core.RemoteError):
     """A transaction that was mined and reverted (receipt status 0): its gas is spent and nothing more will come of it — a
     new attempt is a new transaction (1.150.0, audit RDM-RESTART-MID-SEND: the redeem's sent note is dropped). Its text
-    (交易失败（已回滚）：<hash>) and its class (a RemoteError) read as before for every caller."""
+    (交易失败（已回滚）：<hash>) and its class (a RemoteError) read as before for every caller. ``fee``: what it cost the
+    signer in wei by its receipt (Chain.receipt_fee; None when the receipt does not say — GAS-STATS)."""
 
-    def __init__(self, message: str, tx_hash: str = ""):
+    def __init__(self, message: str, tx_hash: str = "", fee: int | None = None):
         super().__init__(message)
         self.tx_hash = tx_hash
+        self.fee = fee
+
+
+class Sent(str):
+    """A transaction Chain.send signed: its hash (a str, as before), with ``gas_price`` — the price per gas it was signed with,
+    what its fee is reckoned at when the receipt states no effectiveGasPrice (1.150.0, GAS-STATS)."""
+    gas_price: int | None = None
+
+    def __new__(cls, tx_hash: str, gas_price: int | None = None):
+        made = super().__new__(cls, tx_hash)
+        made.gas_price = gas_price
+        return made
 
 
 # PayoutRedemption, as both SDKs' ABIs declare it: on the conditional tokens contracts (redeemer, collateral, parent indexed;
@@ -1044,12 +1062,14 @@ PAYOUT_ADAPTER_TOPIC = "0x9140a6a270ef945260c03894b3c6b3b2695e9d5101feef0ff24fec
 
 class Redeemed(str):
     """A mined redeem: its transaction hash (a str, as before), with ``payout`` — the USDT (wei) it paid the account by its
-    receipt's PayoutRedemption, None when the receipt does not say (1.150.0, audit RDM-PAYOUT-UNCHECKED)."""
+    receipt's PayoutRedemption, None when the receipt does not say (1.150.0, audit RDM-PAYOUT-UNCHECKED) — and ``fee``, the
+    BNB (wei) its gas cost the signer by the same receipt, None when it does not say (1.150.0, GAS-STATS)."""
     payout: int | None = None
+    fee: int | None = None
 
-    def __new__(cls, tx_hash: str, payout: int | None = None):
+    def __new__(cls, tx_hash: str, payout: int | None = None, fee: int | None = None):
         made = super().__new__(cls, tx_hash)
-        made.payout = payout
+        made.payout, made.fee = payout, fee
         return made
 
 
@@ -1123,7 +1143,8 @@ class Chain:
     async def send(self, to: str, data: bytes, value: int = 0, sent: Any = None) -> str:
         """A transaction from the signing wallet (to the Kernel account, which executes it, for a Predict account);
         the hash once the node accepted it. ``sent`` (a coroutine function): told the transaction's hash once it is signed,
-        before it is broadcast — no broadcast if it raises."""
+        before it is broadcast — no broadcast if it raises. The hash given and returned is a Sent: a str carrying the gas
+        price signed with (1.150.0, GAS-STATS)."""
         if self.wallet.predict_account:
             execution = bytes.fromhex(to[2:]) + value.to_bytes(32, "big") + data  # target ‖ value ‖ calldata
             data = self.encode("execute(bytes32,bytes)", ["bytes32", "bytes"], [bytes(32), execution])
@@ -1142,7 +1163,7 @@ class Chain:
             tx = {"chainId": self.wallet.chain_id, "nonce": nonce, "gasPrice": gas_price, "gas": gas, "to": to,
                   "value": value, "data": "0x" + data.hex()}
             raw = self.wallet.sign_transaction(tx)
-            tx_hash = "0x" + _eth()[5].keccak(raw).hex()  # a transaction's hash is the keccak of its signed bytes
+            tx_hash = Sent("0x" + _eth()[5].keccak(raw).hex(), gas_price)  # a transaction's hash is the keccak of its signed bytes
             if sent is not None:
                 # 1.150.0 (audit RDM-RESTART-MID-SEND, RDM-RECEIPT-POLL): the caller's note of this transaction, on disk before
                 # it is broadcast — a stop from here on (a deploy, a crash), a receipt that did not come in time or an answer
@@ -1175,7 +1196,7 @@ class Chain:
                 if any(word in said for word in TX_REFUSED):
                     raise TxNotSent(str(error), error.retry_after) from error  # refused: nothing broadcast, nothing spent
                 raise
-            return str(answer) if answer else tx_hash  # (a node answering null: the hash of what it was given)
+            return Sent(str(answer), gas_price) if answer else tx_hash  # (a node answering null: the hash of what it was given)
 
     RECEIPT_POLL_SECONDS = 3.0  # the receipt is asked for this often while a sent transaction is awaited (Chain.wait)
 
@@ -1199,11 +1220,30 @@ class Chain:
                 pause = max(pause, float(error.retry_after or 0))
             if isinstance(receipt, dict) and receipt.get("blockNumber"):
                 if int(str(receipt.get("status") or "0x0"), 16) != 1:
-                    raise TxReverted(f"交易失败（已回滚）：{tx_hash}", tx_hash)  # (a RemoteError, the same words: RDM-RESTART-MID-SEND)
+                    # (a RemoteError, the same words: RDM-RESTART-MID-SEND) with what its gas cost all the same (GAS-STATS)
+                    raise TxReverted(f"交易失败（已回滚）：{tx_hash}", tx_hash, self.receipt_fee(receipt, getattr(tx_hash, "gas_price", None)))
                 return receipt
             await asyncio.sleep(max(0.0, min(pause, deadline - time.monotonic())))
         raise TxPending(f"交易 {tx_hash} 在 {int(timeout)} 秒内未上链" + (f"（回执读取失败：{core.brief_error(trouble, 80)}）" if trouble else ""),
                         tx_hash)  # (a RemoteError: every caller's except as before)
+
+    @staticmethod
+    def receipt_fee(receipt: Any, signed_price: Any = None) -> int | None:
+        """What a mined transaction cost the signer, in wei, read off its receipt alone (no request): gasUsed ×
+        effectiveGasPrice, or × ``signed_price`` (the price it was signed with: Sent.gas_price) where the receipt states no
+        price. None when it cannot be told — no receipt, no gasUsed, a field that is no quantity: never taken for 0
+        (1.150.0, GAS-STATS: the owner asked what the redeems cost a day)."""
+        def quantity(value: Any) -> int | None:  # a JSON-RPC quantity ("0x…"), or our own whole number
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value if value >= 0 else None
+            text = str(value or "").strip().lower()
+            return int(text, 16) if re.fullmatch(r"0x[0-9a-f]{1,64}", text) else None
+        if not isinstance(receipt, dict):
+            return None
+        used = quantity(receipt.get("gasUsed"))
+        price = quantity(receipt.get("effectiveGasPrice"))
+        price = quantity(signed_price) if price is None else price
+        return used * price if used is not None and price is not None else None
 
     async def receipt(self, tx_hash: str) -> dict | None:
         """One look at a sent transaction: its receipt once mined, None while it is not (no waiting); a failed read raises."""
@@ -1317,7 +1357,8 @@ class Chain:
     async def redeem(self, condition_id: str, index_set: int, amount: int, neg_risk: bool, yield_bearing: bool, sent: Any = None) -> Redeemed:
         """Redeem a resolved position: the conditional tokens contract for a standard market (index set 1 or 2), the
         multi-outcome adapter (an amount per outcome) for a neg-risk one. The transaction hash once mined, with what it
-        paid (Redeemed.payout, from the receipt: no extra request). ``sent``: Chain.send's, told the hash before broadcast."""
+        paid (Redeemed.payout) and what its gas cost (Redeemed.fee), both from the receipt: no extra request. ``sent``:
+        Chain.send's, told the hash before broadcast."""
         condition = bytes.fromhex(condition_id.removeprefix("0x"))
         target = self.redeem_target(neg_risk, yield_bearing)
         if neg_risk:
@@ -1340,7 +1381,7 @@ class Chain:
                                                      ["address", "bytes32", "bytes32", "uint256[]"],
                                                      [self.addresses["USDT"], bytes(32), condition, [index_set]]), sent=sent)
         receipt = await self.wait(tx)
-        return Redeemed(tx, self.redeem_payout(receipt, target, neg_risk))
+        return Redeemed(tx, self.redeem_payout(receipt, target, neg_risk), self.receipt_fee(receipt, getattr(tx, "gas_price", None)))
 
 
 # --- the trader: wallet, API and chain together, with their readiness ---------------------------------------------------
@@ -4444,6 +4485,8 @@ class LiveBot(core.Bot):
                     "sent": "已发出待确认", "fields": "缺字段", "unclear": "结算读不出", "kept": "已领仍列着", "open": "未结算", "lost": "输掉的",
                     "unread": "没读到市场"}
     REDEEM_SENT = "live:redeem-sent:"  # + <market>:<index set>: a redeem transaction signed (and broadcast, or about to be) but not yet booked
+    REDEEM_GAS = "live:redeem-gas"     # what the redeem transactions mined in the last 24 hours cost: {"fees": [[at ms, fee wei, 1 if it reverted], …]}
+    REDEEM_GAS_KEPT = 1000             # ...this many at most (a few hundred a day): one small record, rewritten with each (1.150.0, GAS-STATS)
 
     async def live_redeem_forget(self, words: list[str]) -> str:
         """/live redeem forget <市场号>…: the LOST marks of those markets lifted, so the next round reads the market again and
@@ -4517,18 +4560,46 @@ class LiveBot(core.Bot):
                 self.live_redeem_last = {**self.live_redeem_last, "manual": True}
             return done
 
+    def live_redeem_fees(self, now_ms: int) -> list[list[int]]:
+        """The redeem transactions mined in the last 24 hours, oldest first: [at ms, what its gas cost in wei, 1 if it reverted]
+        (REDEEM_GAS; an entry that is no such list is passed over)."""
+        record = self.store.get(self.REDEEM_GAS)
+        rows = record.get("fees") if isinstance(record, dict) else None
+        if not isinstance(rows, list):
+            return []
+        return [[r[0], r[1], 1 if len(r) > 2 and r[2] else 0] for r in rows
+                if isinstance(r, list) and len(r) >= 2 and all(isinstance(x, int) and not isinstance(x, bool) for x in r[:2])
+                and now_ms - r[0] < core.DAY_MS]
+
+    def live_redeem_fee_pair(self, fee: int, now_ms: int, reverted: bool = False) -> tuple[str, dict]:
+        """REDEEM_GAS with one more transaction's fee, as a (key, record) pair: written by the caller in the same store
+        transaction as what it books (the mark, the sent note's going), so a fee is never counted twice or lost between them.
+        The entries over a day old go; REDEEM_GAS_KEPT at most."""
+        fees = [*self.live_redeem_fees(now_ms), [now_ms, int(fee), 1 if reverted else 0]]
+        return self.REDEEM_GAS, {"fees": fees[-self.REDEEM_GAS_KEPT:]}
+
+    def live_redeem_gas_day(self, now_ms: int) -> tuple[int, int, int]:
+        """(redeem transactions mined in the last 24 hours, what their gas cost in wei, how many of them reverted)."""
+        fees = self.live_redeem_fees(now_ms)
+        return len(fees), sum(f[1] for f in fees), sum(f[2] for f in fees)
+
     def live_redeem_booked(self, key: str, tx: str, paid: int | None, amount: int, title: str, outcome: str, now_ms: int,
-                           done: list[str], sent_key: str = "") -> dict:
+                           done: list[str], sent_key: str = "", fee: int | None = None) -> dict:
         """A mined redeem (status 1) booked: the mark (and the sent note gone, in the same transaction), the line said and
-        pushed — 💵 with what it paid, or the words for one that paid nothing (RDM-PAYOUT-UNCHECKED). Its seen fields."""
+        pushed — 💵 with what it paid, or the words for one that paid nothing (RDM-PAYOUT-UNCHECKED). Its seen fields.
+
+        1.150.0 (GAS-STATS): the owner asked what a day of redeems costs in gas and how long the signer's BNB lasts — nothing
+        kept that. ``fee`` (its receipt's gasUsed × effectiveGasPrice: Chain.receipt_fee, no request) goes on the mark
+        (fee_wei) and into REDEEM_GAS, in the same store transaction; None (a receipt that does not say) writes neither."""
         # 1.150.0 (audit RDM-PAYOUT-UNCHECKED): 💵 已领取 was said, and the position closed for good, on a mined receipt alone —
         # the payout never looked at. A redeem of a balance already gone (claimed on the website a moment before, or by an
         # earlier transaction the bot did not book) is mined with status 1 and pays nothing, yet read as paid. The receipt
         # in hand says what was paid (its PayoutRedemption: no extra request). The mark is written whatever the payout — a
         # zero left unmarked would be redeemed again, for nothing, every round Predict still lists the row — but a zero is
         # said as such, not as 💵; a payout the receipt does not state (None) reads as before.
-        mark = {"at": now_ms, "tx": str(tx), "amount": str(amount), "title": title, **({"paid": str(paid)} if paid is not None else {})}
-        self.store.replace([sent_key] if sent_key else [], [(key, mark)])
+        mark = {"at": now_ms, "tx": str(tx), "amount": str(amount), "title": title, **({"paid": str(paid)} if paid is not None else {}),
+                **({"fee_wei": str(fee)} if fee is not None else {})}
+        self.store.replace([sent_key] if sent_key else [], [(key, mark), *([self.live_redeem_fee_pair(fee, now_ms)] if fee is not None else [])])
         shares = f"{title} {outcome} {from_wei(amount):g} 份"
         if paid == 0:
             line = (f"⚠️ 领取交易上链了，但没领到 USDT：{shares}（交易 {tx}）。链上已经没有这份持仓：多半已在网站上领过，"
@@ -4565,6 +4636,7 @@ class LiveBot(core.Bot):
                 self.store.delete_keys([sent_key])  # (unreadable: says nothing)
                 continue
             tx, title, age_ms = str(note["tx"]), str(note.get("title") or "?"), max(0, now_ms - int(note.get("at") or now_ms))
+            signed = note.get("gas_price")  # (GAS-STATS) the price it was signed with: its fee where the receipt states none
             try:
                 receipt = await chain.receipt(tx)
             except Exception as error:  # unknown: nothing is sent for it this round
@@ -4584,10 +4656,11 @@ class LiveBot(core.Bot):
                     self.__dict__.setdefault("live_redeem_untold", {}).pop(key, None)  # (RDM-NOTE-THROTTLE) booked: nothing left to tell or list
                     self.__dict__.setdefault("live_redeem_notes", {}).pop(key, None)
                     booked[key] = self.live_redeem_booked(key, tx, paid, int(str(note.get("amount") or "0")), title,
-                                                          str(note.get("outcome") or ""), now_ms, done, sent_key)
+                                                          str(note.get("outcome") or ""), now_ms, done, sent_key, Chain.receipt_fee(receipt, signed))
                     continue
                 if status == 0:  # mined and reverted: its gas spent, nothing more to come of it — the failure's hour
-                    self.store.delete_keys([sent_key])
+                    fee = Chain.receipt_fee(receipt, signed)  # (GAS-STATS) counted with the note's going, in one store transaction
+                    self.store.replace([sent_key], [self.live_redeem_fee_pair(fee, now_ms, reverted=True)] if fee is not None else [])
                     text = f"交易失败（已回滚）：{tx}"
                     self.live_redeem_failed.setdefault(key, time.monotonic())
                     errors[key] = text
@@ -4877,9 +4950,12 @@ class LiveBot(core.Bot):
 
             async def note_sent(tx_hash: str, sent_key: str = sent_key, title: str = entry["title"], name: str = str(outcome.get("name") or ""),
                                 neg: bool = info.neg_risk, yb: bool = info.yield_bearing) -> None:
-                """(RDM-RESTART-MID-SEND) the hash on disk before the broadcast, as an order's is (live_place): no note, no transaction."""
-                self.store.put(sent_key, {"at": now_ms, "tx": tx_hash, "amount": str(amount), "title": title, "outcome": name,
-                                          "neg_risk": neg, "yield_bearing": yb, "maker": self.live.wallet.maker})
+                """(RDM-RESTART-MID-SEND) the hash on disk before the broadcast, as an order's is (live_place): no note, no transaction.
+                (GAS-STATS) with the gas price it was signed with (Sent.gas_price): its fee once a later round reads its receipt."""
+                signed = getattr(tx_hash, "gas_price", None)
+                self.store.put(sent_key, {"at": now_ms, "tx": str(tx_hash), "amount": str(amount), "title": title, "outcome": name,
+                                          "neg_risk": neg, "yield_bearing": yb, "maker": self.live.wallet.maker,
+                                          **({"gas_price": int(signed)} if isinstance(signed, int) else {})})
                 if not await asyncio.to_thread(self.store.flush):
                     raise TxNotSent(f"领取记录没写进数据库（{self.store.write_error or '超时'}），交易没发出")
             try:
@@ -4887,8 +4963,11 @@ class LiveBot(core.Bot):
                 more = {"sent": note_sent} if isinstance(self.live.chain, Chain) else {}
                 tx = await self.live.chain.redeem(info.condition_id, index_set, amount, info.neg_risk, info.yield_bearing, **more)
             except Exception as error:
-                if isinstance(error, (TxNotSent, TxReverted)) and self.store.get(sent_key):
-                    self.store.delete_keys([sent_key])  # nothing left the bot, or it was mined and failed: no transaction to look up
+                # (GAS-STATS) a redeem mined and reverted cost its gas all the same: counted, with its note's going (one transaction)
+                gas_paid = [self.live_redeem_fee_pair(error.fee, now_ms, reverted=True)] if isinstance(error, TxReverted) and error.fee is not None else []
+                if isinstance(error, (TxNotSent, TxReverted)) and (self.store.get(sent_key) or gas_paid):
+                    # nothing left the bot, or it was mined and failed: no transaction to look up
+                    self.store.replace([sent_key] if self.store.get(sent_key) else [], gas_paid)
                 if isinstance(error, TxNotSent) and "insufficient funds" in str(error).lower():
                     # 1.150.0 (audit RDM-UNSENT-AS-SENT): the node refused the transaction for its gas — the wallet's shortage,
                     # not this position's failure (the 0.0005 floor is judged once a round, on a fixed figure: a round that
@@ -4925,7 +5004,7 @@ class LiveBot(core.Bot):
             untold.pop(key, None)  # (RDM-NOTE-THROTTLE) redeemed: nothing left to tell or list for it
             notes.pop(key, None)
             seen.append({**entry, **self.live_redeem_booked(key, str(tx), getattr(tx, "payout", None), amount, entry["title"],
-                                                            str(outcome.get("name") or ""), now_ms, done, sent_key)})
+                                                            str(outcome.get("name") or ""), now_ms, done, sent_key, getattr(tx, "fee", None))})
         if dry_run:
             return done, seen
         for gone in set(read_round) - unsettled:
@@ -4953,7 +5032,9 @@ class LiveBot(core.Bot):
         claimable = [s for s in seen if s["kind"] == "claimable"]
         if low_gas and claimable:
             short = f"签名钱包的 BNB 不够付领取交易的 gas（节点拒收：{gas_refused}）" if gas_refused else "签名钱包的 BNB 不足 0.0005"  # (RDM-UNSENT-AS-SENT)
-            text = (f"⛽ {short}，{len(claimable)} 个已结算的持仓（约 ${sum(s['value'] for s in claimable):,.2f}）等着领取：暂不自动领取。"
+            mined, spent, _ = self.live_redeem_gas_day(now_ms)  # (GAS-STATS) what one redeem costs, when the last day's receipts say
+            text = (f"⛽ {short}，{len(claimable)} 个已结算的持仓（约 ${sum(s['value'] for s in claimable):,.2f}）等着领取：暂不自动领取"
+                    + (f"（近 24 小时每笔领取平均 gas {bnb_text(spent // mined)} BNB）" if mined else "") + "。"
                     f"往 {self.live.wallet.signer} 转一点 BNB（BNB 链）后自动恢复")
             # 1.150.0 (audit RDM-NOTIFY-GATES): the hour was started before the notice was asked for — with LIVE_NOTIFY off, no chat
             # subscribed, the chat /pause'd or its one sendMessage refused, nothing reached the owner and the next ⛽ came an hour
@@ -5118,6 +5199,14 @@ class LiveBot(core.Bot):
         else:
             lines.append(f"签名钱包 {wallet.signer}（付 gas）：BNB {from_wei(bnb):.5f}"
                          + ("｜⛽ 不足 0.0005，领取交易发不出去" if bnb < self.LIVE_REDEEM_MIN_BNB_WEI else "｜够付 gas"))
+        mined, spent, reverted = self.live_redeem_gas_day(now_ms)
+        if mined:
+            # 1.150.0 (GAS-STATS): what a day of redeems costs and how far the signer's BNB goes — the receipts' own figures
+            # (REDEEM_GAS: no request here); no line before the first redeem with a fee on record
+            each = spent // mined
+            lines.append(f"近 24 小时领取 {mined} 笔" + (f"（其中 {reverted} 笔回滚，gas 照付）" if reverted else "")
+                         + f"，gas 共 {bnb_text(spent)} BNB（每笔平均 {bnb_text(each)} BNB）"
+                         + (f"；签名钱包 BNB 余额约够 {bnb // each} 笔" if bnb is not None and each > 0 else ""))
         if wallet.predict_account:
             lines.append(f"持仓账户 {wallet.maker}（Predict 账户：领取由签名钱包经它的 Kernel 合约执行，领到的 USDT 进这个账户）")
         if not ready:

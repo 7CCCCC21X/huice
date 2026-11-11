@@ -2417,4 +2417,112 @@ async def gas_min_value():
 asyncio.run(gas_min_value())
 
 
+# --- GAS-STATS ------------------------------------------------------------------------------------------------------------------
+GWEI = 10 ** 9
+
+
+def receipt_of(gas_used, price=None, status="0x1"):
+    """A mined receipt stating its gasUsed and (unless None) its effectiveGasPrice."""
+    return {"blockNumber": "0x10", "status": status, "logs": [], "gasUsed": hex(gas_used), **({"effectiveGasPrice": hex(price)} if price is not None else {})}
+
+
+async def gas_stats():
+    """GAS-STATS (the owner: how much gas a day, how long the signer's BNB lasts): nothing kept what a redeem cost. Each redeem
+    transaction's fee — its receipt's gasUsed × effectiveGasPrice (× the price it was signed with where the receipt states none),
+    read off the receipt the redeem fetches anyway, not one request more — goes on the position's mark (fee_wei) and into a
+    rolling 24-hour record, a reverted one's too (its gas spent all the same). /live redeem check says 近 24 小时领取 N 笔，gas
+    共 X BNB（每笔平均 Y BNB）；签名钱包 BNB 余额约够 Z 笔 and the ⛽ notice names the average. Nothing on record: no line, the
+    texts as before."""
+    # (a) the fee off a receipt: never a guess
+    fee = L.Chain.receipt_fee
+    assert fee(receipt_of(200_000, GWEI)) == 200_000 * GWEI and fee(receipt_of(150_000), 2 * GWEI) == 300_000 * GWEI
+    assert fee(receipt_of(150_000)) is None and fee(MINED, GWEI) is None and fee(None, GWEI) is None
+    assert fee({"gasUsed": "21000", "effectiveGasPrice": "0x1"}) is None and fee({"gasUsed": "0x5208", "effectiveGasPrice": True}) is None
+    # (b) two redeems through the REAL Chain: each fee on its mark and in the record — the same requests as ever
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows = [held(821), held(822)]
+    fake.markets.update({"821": mk(821, won=1), "822": mk(822, won=1)})
+    bot.live.chain = QuickChain(bot.live.wallet)
+    bot.live.balance = (1000 * WEI, 10 ** 17, time.time())
+    with node_for(eth_getTransactionReceipt=receipt_of(200_000, GWEI)) as node:
+        assert len(await bot.live_redeem(NOW)) == 2
+    assert node.methods() == ["eth_getTransactionCount", "eth_gasPrice", "eth_estimateGas", "eth_sendRawTransaction", "eth_getTransactionReceipt"] * 2, node.methods()
+    assert bot.store.get("live:redeemed:821:1")["fee_wei"] == bot.store.get("live:redeemed:822:1")["fee_wei"] == str(200_000 * GWEI)  # (before: no fee)
+    assert bot.live_redeem_fees(NOW) == [[NOW, 200_000 * GWEI, 0]] * 2, bot.live_redeem_fees(NOW)
+    # (c) a receipt stating no effectiveGasPrice: the price the transaction was signed with (eth_gasPrice's answer)
+    fake.positions_rows, fake.markets["823"] = [held(823)], mk(823, won=1)
+    with node_for(eth_gasPrice=hex(2 * GWEI), eth_getTransactionReceipt=receipt_of(150_000)):
+        assert len(await bot.live_redeem(NOW + 10 * MIN)) == 1
+    assert bot.store.get("live:redeemed:823:1")["fee_wei"] == str(300_000 * GWEI)
+    # (d) a receipt that came after the wait (the sent note, RDM-RECEIPT-POLL): booked by the next round with its fee — the note
+    #     keeping the price it was signed with, for a receipt that states none
+    fake.positions_rows, fake.markets["824"] = [held(824)], mk(824, won=1)
+    with node_for(eth_getTransactionReceipt=None):
+        assert await bot.live_redeem(NOW + 20 * MIN) == []
+    assert bot.store.get("live:redeem-sent:824:1")["gas_price"] == GWEI
+    with node_for(eth_getTransactionReceipt=receipt_of(100_000)) as node:
+        assert len(await bot.live_redeem(NOW + 30 * MIN)) == 1 and "eth_sendRawTransaction" not in node.methods()
+    assert bot.store.get("live:redeemed:824:1")["fee_wei"] == str(100_000 * GWEI)
+    # (e) reverted — seen by the wait, and by a note's receipt: no mark, the gas counted all the same (as reverted)
+    fake.positions_rows, fake.markets["825"] = [held(825)], mk(825, won=1)
+    with node_for(eth_getTransactionReceipt=receipt_of(50_000, GWEI, status="0x0")):
+        assert await bot.live_redeem(NOW + 40 * MIN) == []
+    assert bot.store.get("live:redeemed:825:1") is None and bot.live_redeem_last["counts"] == {"failed": 1}
+    fake.positions_rows, fake.markets["826"] = [held(826)], mk(826, won=1)
+    with node_for(eth_getTransactionReceipt=None):
+        await bot.live_redeem(NOW + 50 * MIN)
+    with node_for(eth_getTransactionReceipt=receipt_of(60_000, GWEI, status="0x0")):
+        assert await bot.live_redeem(NOW + 60 * MIN) == []
+    assert bot.store.get("live:redeem-sent:826:1") is None and bot.store.get("live:redeemed:826:1") is None
+    assert [f[1:] for f in bot.live_redeem_fees(NOW + 60 * MIN)] == [[200_000 * GWEI, 0]] * 2 + [
+        [300_000 * GWEI, 0], [100_000 * GWEI, 0], [50_000 * GWEI, 1], [60_000 * GWEI, 1]], bot.live_redeem_fees(NOW + 60 * MIN)
+    # (f) the texts: the check's line under the signer's BNB (0.1 BNB: 659 more at the average); the ⛽ notice with the average
+    with node_for():
+        report = await bot.live_redeem_report(NOW + 70 * MIN)
+    lines = report.split("\n")
+    at = next(i for i, line in enumerate(lines) if line.startswith("近 24 小时"))
+    assert lines[at] == "近 24 小时领取 6 笔（其中 2 笔回滚，gas 照付），gas 共 0.00091 BNB（每笔平均 0.0001517 BNB）；签名钱包 BNB 余额约够 659 笔", lines[at]
+    assert lines[at - 1].startswith("签名钱包 ") and "BNB 0.10000｜够付 gas" in lines[at - 1], lines[at - 1]
+    sent = notices(bot)
+    bot.live.balance = (1000 * WEI, 10 ** 13, time.time())
+    fake.positions_rows, fake.markets["827"] = [held(827)], mk(827, won=1)
+    with node_for():
+        assert await bot.live_redeem(NOW + 80 * MIN) == []
+    assert [text for k, text in sent if k == "redeem:gas"] == [
+        "⛽ 签名钱包的 BNB 不足 0.0005，1 个已结算的持仓（约 $10.00）等着领取：暂不自动领取（近 24 小时每笔领取平均 gas 0.0001517 BNB）。"
+        f"往 {bot.live.wallet.signer} 转一点 BNB（BNB 链）后自动恢复"], sent
+    # (g) the last 24 hours only — a day on, the older fees leave the line, and the record at its next write; at most REDEEM_GAS_KEPT
+    assert bot.live_redeem_gas_day(NOW + 24 * 60 * MIN + 15 * MIN) == (3, 210_000 * GWEI, 2)
+    later = NOW + 2 * 24 * 60 * MIN
+    assert bot.live_redeem_gas_day(later) == (0, 0, 0)
+    bot.live.balance = (1000 * WEI, 10 ** 17, time.time())
+    with node_for(eth_getTransactionReceipt=receipt_of(100_000, GWEI)):
+        assert len(await bot.live_redeem(later)) == 1
+    assert bot.store.get(L.LiveBot.REDEEM_GAS) == {"fees": [[later, 100_000 * GWEI, 0]]}, bot.store.get(L.LiveBot.REDEEM_GAS)
+    bot.REDEEM_GAS_KEPT = 3
+    for i in range(4):
+        bot.store.put(*bot.live_redeem_fee_pair(i + 1, later + i))
+    assert [f[1] for f in bot.live_redeem_fees(later + 5)] == [2, 3, 4]
+    bot.store.put(L.LiveBot.REDEEM_GAS, {"fees": [["x", 1], [later, True], 5, [later]]})  # (an unreadable record: passed over)
+    assert bot.live_redeem_fees(later) == [] and bot.live_redeem_gas_day(later) == (0, 0, 0)
+    # (h) nothing on record (a stand-in chain, a receipt that does not say): no mark field, no record, no line, the ⛽ as before
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["831"] = [held(831)], mk(831, won=1)
+    assert len(await bot.live_redeem(NOW)) == 1 and "fee_wei" not in bot.store.get("live:redeemed:831:1")
+    assert bot.store.get(L.LiveBot.REDEEM_GAS) is None and "近 24 小时" not in await bot.live_redeem_report(NOW + MIN)
+    sent = notices(bot)
+    bot.live.chain.bnb = 10 ** 13
+    await bot.live.refresh_balance()
+    fake.positions_rows, fake.markets["832"] = [held(832)], mk(832, won=1)
+    assert await bot.live_redeem(NOW + 10 * MIN) == []
+    assert [text for k, text in sent if k == "redeem:gas"] == [
+        f"⛽ 签名钱包的 BNB 不足 0.0005，1 个已结算的持仓（约 $10.00）等着领取：暂不自动领取。往 {bot.live.wallet.signer} 转一点 BNB（BNB 链）后自动恢复"], sent
+    print("GAS_STATS_OK")
+
+
+asyncio.run(gas_stats())
+
+
 print("AUDIT_REDEEM_OK")
