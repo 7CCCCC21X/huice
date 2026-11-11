@@ -1544,4 +1544,236 @@ PAPER_CASES = (paper_thin_ask, paper_new_sellers, paper_down_side, paper_both_wa
 for paper_case in PAPER_CASES:
     asyncio.run(paper_case())
 
+# --- SIM-TOUCH-DECIDED-HOLD, the review of its fix: the orders that exist when the book's hold begins -----------------------------
+# That fix handed the trader the card's 定局 hold. A held card opens nothing — and an order already resting on it stands unjudged
+# (sim_requote_reason: the fair price itself is in doubt), which no first-touch order had done in this state before: the trader
+# had no such hold, and the exit line (SIM_MAKER_EXIT_CENTS, 5¢) judged the order at every look. A 挂90k rests at 80¢; the book's
+# bid goes to 92¢ (it reads "90k first is settled") while BTC falls and the model's own price for it goes to 70¢. Before that fix
+# the bid was cancelled within a look; with it the bid stayed, 10¢ over the model, for SIM_NO_ODDS_WITHDRAW_MINUTES (half an hour;
+# for good at 0) and was filled when the 92¢ bid was swept — the book wrong, the model right; with LIVE on, a real order. And a
+# resting-order decision an API cooldown had held back went out when the cooldown ended, into a book that had turned meanwhile:
+# the real trader's send-time re-check asks the resting orders' rules, which let a held card's order stand (a 挂70k at 10¢ sent
+# into asks at 2¢, beside a taker the same re-check voided).
+# Each line alike — the book in the terms of the order's own side: (BTC, bids, asks) when the order is placed (its side worth
+# 94¢), when the book reads settled with 7.5¢ of edge left, with the edge gone (worth 70¢), and when the settled bid is swept
+import itertools  # noqa: E402
+
+HOLD_ENV = {**TOUCH_ENV, "SIM_MARKETS": "touch", "SIM_WAYS": "maker", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off"}  # the defaults otherwise
+HOLD_OPEN, HOLD_SETTLED = ((("0.80", "500"),), (("0.97", "500"),)), ((("0.92", "300"), ("0.80", "500")), (("0.97", "500"),))
+HOLD_SWEPT = ((("0.70", "500"),), (("0.75", "300"),))
+HOLD_BTC = {"up": (88_800, 87_500, 84_000), "down": (71_200, 72_500, 76_000)}  # 70k + 20k × the worth of "90k first"
+HOLD_GONE = "净优势降到 -10.0¢，低于撤单线 5.0¢"
+
+
+def hold_set(bot, ms: int, btc: int, book, side: str = "up", low_first: bool = False, sigma_age: int = 0) -> m.SimMarket:
+    """BTC at ``btc`` at NOW + ``ms``, the path read clear up to a minute before, σ measured ``sigma_age`` ms ago, and Predict's
+    book showing ``book`` (bids, asks) on ``side`` of the card ("up": 90k first; "down": 70k first, its complement), whichever
+    outcome Predict lists first (``low_first``: "$70,000" — touch_book turns that book over). The trader's view of the market."""
+    at, flip = NOW + ms, lambda levels: tuple((1 - D(p), D(q)) for p, q in levels)
+    bids, asks = (tuple((D(p), D(q)) for p, q in levels) for levels in book)
+    if (side == "down") != low_first:  # the book as Predict keeps it: its first outcome's
+        bids, asks = flip(asks), flip(bids)
+    touch = bot.touches[TSPEC.key]
+    touch.price, touch.priced_ms, touch.sigma, touch.sigma_ms = D(btc), at, 0.45, at - sigma_age
+    bot.store.put(f"touch:{TSPEC.slug}", {"kind": "clear", "through": at - 60_000, "start": touch.start_ms})
+    bot.predict.info[TSPEC.slug] = {"outcomes": ["$70,000", "$90,000"] if low_first else ["$90,000", "$70,000"], "created_ms": touch.start_ms}
+    bot.predict.books[TSPEC.key] = m.PredictBook(TSPEC.key, TSPEC.slug, "501", "BTC", bids, asks, at)
+    bot.market.now = at
+    (mk,) = [x for x in bot.sim_markets(at) if x.key == TSPEC.key]
+    return mk
+
+
+async def hold_look(bot, ms: int, btc: int, book, side: str = "up", lane: bool = False, **more) -> m.SimMarket:
+    """One look of the trader at NOW + ``ms`` on that market (hold_set): the step's, or the express lane's (``lane``)."""
+    mk = hold_set(bot, ms, btc, book, side, **more)
+    if lane:
+        await bot.sim_express(TSPEC.key)
+    else:
+        bot.sim_ran = -1e9
+        await bot.sim_step(NOW + ms)
+    if isinstance(bot, live.LiveBot):
+        await bot.live_fills_wait()
+    return mk
+
+
+def hold_bot(**env):
+    bot = m.Bot(m.Config.from_env({**HOLD_ENV, **env}), m.Store(":memory:"), SelfFM(NOW), None)
+    bot.touches.setdefault(TSPEC.key, m.TouchMarket(bot.store, TSPEC))
+    return bot
+
+
+def hold_orders(bot) -> dict:
+    """Every record's (status, price, shares filled, why it was withdrawn), by its key less the market."""
+    return {tid.partition("|")[2]: (t["status"], t["price"], t["shares"], (t.get("withdrawn") or {}).get("why", "")) for tid, t in bot.sim_trades().items()}
+
+
+async def hold_exit_line():
+    """The paper trader, each line, by the step and by the express lane: an order resting when the book turns is judged as it
+    was before the trader had the hold — it stands while its edge does, goes at the exit line, and nothing is opened meanwhile."""
+    for side, lane in itertools.product(("up", "down"), (False, True)):
+        bot, (placed, left, gone) = hold_bot(), HOLD_BTC[side]
+        resting, pulled = {f"{side}|挂": ("resting", 0.80, 0.0, "")}, {f"{side}|挂#1": ("cancelled", 0.80, 0.0, HOLD_GONE)}
+        mk = await hold_look(bot, 0, placed, HOLD_OPEN, side, lane)
+        assert mk.hold == "" and hold_orders(bot) == resting, (side, lane, mk.hold, hold_orders(bot))
+        mk = await hold_look(bot, 60_000, left, HOLD_SETTLED, side, lane)  # the book reads settled, the model 87.5¢: the card holds
+        assert "先触当作定局" in mk.hold and bot.sim_maker_gate(mk, NOW + 60_000).startswith("卡片暂不建议"), (side, lane, mk.hold)
+        assert hold_orders(bot) == resting, (side, lane, hold_orders(bot))  # 7.5¢ of edge left: it stands, as before either fix
+        mk = hold_set(bot, 120_000, gone, HOLD_SETTLED, side)  # the model 70¢, 10¢ under the bid; the book still reads settled
+        why = bot.sim_requote_reason(bot.sim_trades()[f"{TSPEC.slug}|{side}|挂"], mk, NOW + 120_000)
+        assert "先触当作定局" in mk.hold and why == HOLD_GONE, (side, lane, mk.hold, why)  # before: "" — the held card's order stood
+        (row,) = [r for r in bot.sim_why(mk, bot.sim_trades(), NOW + 120_000)["maker"]["sides"] if r["side"] == side]
+        assert row["text"].endswith(f"；下一轮撤掉：{HOLD_GONE}"), row["text"]  # the card's own line on the order: before, no word of it
+        await hold_look(bot, 120_000, gone, HOLD_SETTLED, side, lane)
+        assert hold_orders(bot) == pulled, (side, lane, hold_orders(bot))  # before: still resting, for the half hour
+        await hold_look(bot, 121_000, gone, HOLD_SETTLED, side, lane)  # ...and nothing takes its place while the card holds
+        await hold_look(bot, 125_000, gone, HOLD_SWEPT, side, lane)  # the settled bid swept, sellers at 75¢: through the 80¢ it bid
+        assert hold_orders(bot) == pulled, (side, lane, hold_orders(bot))  # before: ("filled", 0.80, 100.0, "") — bought 10¢ over the model
+
+
+async def hold_half_hour():
+    """What the exit line leaves is still ended by the half hour of a held card (SIM_NO_ODDS_WITHDRAW_MINUTES), as before."""
+    bot = hold_bot()
+    await hold_look(bot, 0, 88_800, HOLD_OPEN)
+    for minutes, want in ((1, "resting"), (30, "resting"), (31.5, "cancelled")):
+        await hold_look(bot, int(minutes * 60_000), 87_500, HOLD_SETTLED)
+        ((status, _, _, why),) = hold_orders(bot).values()
+        assert status == want and why.startswith("卡片暂不建议已超过 30 分钟（盘口已把 90k 先触当作定局") == (want == "cancelled"), (minutes, status, why)
+
+
+async def hold_other_reasons():
+    """Only the book's own hold: with the market's own reasons (σ not measured for a day — the same reading of the book or not)
+    the fair price itself is in doubt and a resting order stands, as on every other held card; and the side the book trades as
+    settled is read through Predict's outcome order."""
+    day = 25 * 3600_000
+    for book, lane in itertools.product((HOLD_SETTLED, HOLD_OPEN), (False, True)):
+        bot = hold_bot()
+        await hold_look(bot, 0, 88_800, HOLD_OPEN)
+        mk = await hold_look(bot, 60_000, 84_000, book, lane=lane, sigma_age=day)
+        assert mk.hold == "波动率超过一天未更新；暂不给建议" and mk.decided == "", (mk.hold, mk.decided)
+        assert bot.sim_requote_reason(bot.sim_trades()[f"{TSPEC.slug}|up|挂"], mk, NOW + 60_000) == "" and hold_orders(bot) == {"up|挂": ("resting", 0.80, 0.0, "")}
+    bot = hold_bot()
+    for side, low_first in itertools.product(("up", "down"), (False, True)):
+        settled = hold_set(bot, 0, HOLD_BTC[side][1], HOLD_SETTLED, side, low_first)
+        assert settled.decided == side and "先触当作定局" in settled.hold, (side, low_first, settled.decided, settled.hold)
+        assert settled.hold == bot.touch_payload(bot.touches[TSPEC.key], NOW)["predict"]["hold"]  # the card's words, as ever
+        open_ = hold_set(bot, 0, HOLD_BTC[side][1], HOLD_OPEN, side, low_first)
+        assert open_.decided == "" and open_.hold == "", (side, low_first, open_.decided, open_.hold)
+    assert hold_set(bot, 0, 87_500, HOLD_SETTLED).decided == "up"
+    bot.predict.books[TSPEC.key] = m.dataclasses.replace(bot.predict.books[TSPEC.key], fetched_ms=NOW - m.PREDICT_STALE_MS - 1)
+    (stale,) = [x for x in bot.sim_markets(NOW) if x.key == TSPEC.key]
+    assert stale.book.stale(NOW) and stale.hold == "" and stale.decided == ""  # a stale book decides nothing (and nothing is traded on one)
+
+
+class HoldApi(StaleApi):
+    """Predict as the real trader's client sees it, with the BTC first-touch market (501: "$90,000" its first outcome) and the
+    client's own cooldown (blocked_until: nothing is sent before it)."""
+    def __init__(self):
+        super().__init__()
+        self.blocked_until = 0.0
+        self.markets = {"501": {**self.markets["401"], "id": 501, "outcomes": [{"name": "$90,000", "indexSet": 1, "onChainId": "5011"},
+                                                                              {"name": "$70,000", "indexSet": 2, "onChainId": "5012"}]}}
+
+    def sent(self) -> list:
+        """Every order sent so far: (the line its outcome names, its price in cents)."""
+        rows = sorted((*self.open.values(), *self.closed.values()), key=lambda row: int(row["id"]))
+        return [("90k" if row["order"]["tokenId"] == "5011" else "70k", round(int(row["order"]["makerAmount"]) * 100 / int(row["order"]["takerAmount"])))
+                for row in rows]
+
+
+async def hold_live_bot(**env):
+    """The real trader over the stand-ins (LIVE=on with the SDK test suite's key, never a real one), signed in, the first-touch
+    market's details read. (the bot, the API)."""
+    bot = live.LiveBot(m.Config.from_env({**HOLD_ENV, "LIVE": "on", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, "PREDICT_API_KEY": "k", **env}),
+                       m.Store(":memory:"), SelfFM(NOW), None)
+    bot.live.api, bot.live.chain = HoldApi(), StaleChain()
+    await bot.live_prepare()
+    assert bot.live.ready, bot.live.ready_error
+    bot.touches.setdefault(TSPEC.key, m.TouchMarket(bot.store, TSPEC))
+    await bot.live.market("501")
+    return bot, bot.live.api
+
+
+async def hold_real_resting():
+    """The same looks with LIVE on: the real bid is cancelled on Predict at the look that finds its edge gone (before: left
+    open for the half hour), by the step's sync or by the express lane."""
+    for side, lane in itertools.product(("up", "down"), (False, True)):
+        bot, api = await hold_live_bot()
+        (placed, left, gone), line = HOLD_BTC[side], "90k" if side == "up" else "70k"
+        await hold_look(bot, 0, placed, HOLD_OPEN, side)
+        await hold_look(bot, 60_000, left, HOLD_SETTLED, side, lane)
+        assert api.sent() == [(line, 80)] and sorted(api.open) == ["101"] and api.calls == [("create", "101")], (side, lane, api.calls)
+        await hold_look(bot, 120_000, gone, HOLD_SETTLED, side, lane)
+        assert api.calls == [("create", "101"), ("remove", ["101"])] and not api.open, (side, lane, api.calls)  # before: no cancel
+        ((status, _, _, why),) = hold_orders(bot).values()
+        assert status == "cancelled" and why == HOLD_GONE, (side, lane, status, why)
+        await hold_look(bot, 125_000, gone, HOLD_SETTLED, side, lane)
+        assert api.sent() == [(line, 80)], (side, lane, api.sent())  # nothing new under the hold
+
+
+async def hold_real_lost_side():
+    """A real bid on the side the book then trades as lost — 挂70k at 5¢, "70k first" then offered at 8¢ — with the bids it had
+    joined gone from under it (its own 100 shares are what is left at 5¢, the next bids at 1¢: what a touch does to that side).
+    The 买1 rule takes it off once that has held SIM_MAKER_FOLLOW_SETTLE_SECONDS, as it did before the trader had the hold —
+    and nothing follows it down to 1¢ now, the card holding (before that fix a new bid went there). Before: left on Predict,
+    the best bid of the side the book called lost, for the half hour."""
+    bot, api = await hold_live_bot()
+    joined, alone = ((("0.05", "2000"),), (("0.12", "3000"),)), ((("0.05", "100"), ("0.01", "5000")), (("0.08", "3000"),))
+    await hold_look(bot, 0, 84_000, joined, "down")  # 70k first worth 30¢
+    assert api.sent() == [("70k", 5)] and sorted(api.open) == ["101"], api.calls
+    mk = await hold_look(bot, 10_000, 84_000, alone, "down")
+    assert "盘口已把 90k 先触当作定局" in mk.hold and sorted(api.open) == ["101"], (mk.hold, api.calls)  # the settle's clock starts
+    await hold_look(bot, 13_000, 84_000, alone, "down")
+    ((status, _, _, why),) = hold_orders(bot).values()
+    assert (status, why) == ("cancelled", "买1 移到 1.0¢，改跟") and api.calls == [("create", "101"), ("remove", ["101"])] and not api.open, (status, why, api.calls)
+    await hold_look(bot, 16_000, 84_000, alone, "down")
+    assert api.sent() == [("70k", 5)], api.sent()
+
+
+async def hold_real_unsent():
+    """A resting-order decision made on an open book and held back by an API cooldown (a 429 answered to another request between
+    the decision and its send); five seconds on the cooldown ends. Sent when the book is as it was; void when the book has turned
+    and the card holds — the bid on the side the book trades as lost (before: a real 挂70k at 10¢ into asks at 2¢, while the taker
+    decided beside it was voided), and the one on the other side too: no hold lets a new order out. By the send itself, or by the
+    step that comes first."""
+    low_open, low_lost = ((("0.10", "2000"),), (("0.12", "3000"),)), ((("0.01", "2000"),), (("0.02", "3000"),))
+    for ways, side, btc, first, then, turned, by_step in (
+            ("maker", "down", (84_000, 84_000), low_open, low_lost, True, False),  # 70k first worth 30¢: bid 10¢; then offered at 2¢
+            ("both", "down", (84_000, 84_000), low_open, low_lost, True, False),   # ...with the taker at 12¢ beside it
+            ("maker", "down", (84_000, 84_000), low_open, low_lost, True, True),
+            ("maker", "up", (88_800, 87_500), HOLD_OPEN, HOLD_SETTLED, True, False),  # 90k first bid 80¢; the book's bid 92¢, 7.5¢ of edge left
+            ("maker", "up", (88_800, 87_500), HOLD_OPEN, HOLD_SETTLED, True, True),
+            ("maker", "down", (84_000, 84_000), low_open, low_open, False, False),  # the book as it was: the decision goes out
+            ("maker", "up", (88_800, 87_500), HOLD_OPEN, HOLD_OPEN, False, True)):
+        bot, api = await hold_live_bot(SIM_WAYS=ways, SIM_TAKER_HOLD_SECONDS="0")
+        line, send = "90k" if side == "up" else "70k", bot.sim_after_decide
+
+        async def cooled(now_ms, api=api, send=send):
+            api.blocked_until = m.time.monotonic() + 3600
+            await send(now_ms)
+        bot.sim_after_decide = cooled
+        await hold_look(bot, 0, btc[0], first, side)
+        bot.sim_after_decide = send
+        waiting = {t["label"]: (t["live"]["state"], t["maker"]) for t in bot.sim_trades().values()}
+        assert waiting == {f"挂{line}": ("pending", True), **({f"吃{line}": ("pending", False)} if ways == "both" else {})} and api.sent() == [], (ways, side, waiting)
+        api.blocked_until = 0.0
+        if by_step:
+            mk = await hold_look(bot, 5_000, btc[1], then, side)
+        else:
+            mk = hold_set(bot, 5_000, btc[1], then, side)
+            await bot.live_place_pending(NOW + 5_000)
+        assert ("盘口已把 90k 先触当作定局" in mk.hold) == turned and (turned or mk.hold == ""), (ways, side, mk.hold)
+        if not turned:
+            assert api.sent() == [(line, 10 if side == "down" else 80)], (ways, side, by_step, api.sent())
+            continue
+        assert api.sent() == [], (ways, side, by_step, api.sent())  # before: [("70k", 10)] / [("90k", 80)] — a real order under the hold
+        notes = {t["label"]: (t["status"], t.get("note") or (t.get("withdrawn") or {}).get("why", "")) for t in bot.sim_trades().values()}
+        assert all(status == "cancelled" and "卡片暂不建议（盘口已把 90k 先触当作定局" in note for status, note in notes.values()), notes
+        if not by_step:
+            assert notes[f"挂{line}"][1].endswith("5 秒前的挂单决定作废") and (ways != "both" or notes[f"吃{line}"][1].endswith("5 秒前的吃单决定作废")), notes
+
+
+HOLD_CASES = (hold_exit_line, hold_half_hour, hold_other_reasons, hold_real_resting, hold_real_lost_side, hold_real_unsent)
+for hold_case in HOLD_CASES:
+    asyncio.run(hold_case())
+
 print("AUDIT_DECISION_OK")

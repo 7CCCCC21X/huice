@@ -10910,6 +10910,9 @@ class SimMarket:
     lunch: bool = False      # a daily card: its underlying is in its lunch break (in_session is False then: the after-hours rules apply)
     move: float | None = None  # a daily card: ln(effective / reference), the day's move so far — the proxy's after hours (1.120.0)
     sigma_day: float = 0.0   # ...and the whole day's σ it is measured against (sim_against_move)
+    decided: str = ""        # a first-touch market whose ``hold`` is the book's alone (Bot.touch_hold): the way Predict's book already
+    # trades the question as settled against the model's fair price — "up" (the high line first) / "down". No hold lets an order be
+    # opened; under the others one already resting stands, under this one it is judged as on a card that holds nothing (sim_requote_reason)
 
 
 class LazyEvidence(Mapping):
@@ -17715,30 +17718,37 @@ class Bot:
             return flip_book(book), ""
         return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
 
-    def touch_hold(self, touch: "TouchMarket", odds: "TouchOdds | str", book: PredictBook | None, now_ms: int) -> str:
-        """Why no trade is suggested on a first-touch market ("" = it may be): one answer for the web card (touch_payload)
-        and for SimMarket.hold (sim_markets: the paper and the real trader, the express lane, the edge alerts) — the
-        market's own reasons (advice_problem), or Predict's book (``book``, priced as "high barrier first": touch_book)
-        already trading the question as settled (book_decided) while the model's fair price is not there: still open by
-        its path check, or decided the other way. A stale book decides nothing here (nothing is suggested or bought on
-        one anyway).
+    def touch_hold(self, touch: "TouchMarket", odds: "TouchOdds | str", book: PredictBook | None, now_ms: int) -> tuple[str, str]:
+        """(why no trade is suggested on a first-touch market — "" = it may be —, the way the book trades the question
+        as settled when that is the reason: "up" the high line first, "down" the low one, else ""). One answer for the
+        web card (touch_payload) and for SimMarket.hold / .decided (sim_markets: the paper and the real trader, the
+        express lane, the edge alerts) — the market's own reasons (advice_problem), or Predict's book (``book``, priced
+        as "high barrier first": touch_book) already trading the question as settled (book_decided) while the model's
+        fair price is not there: still open by its path check, or decided the other way. A stale book decides nothing
+        here (nothing is suggested or bought on one anyway).
         1.150.0 (audit SIM-TOUCH-DECIDED-HOLD): the book_decided check stood in touch_payload alone, and sim_markets gave
         the trader advice_problem by itself. A wick through a line that comes back inside within its own minute is not
         seen by the path check until its next scan (peek skips the minute still forming: SCAN_SECONDS later, up to
         SCAN_STALE_MS while the kline reads fail and pushed trades keep the price fresh). Through that window the card
         said 定局 and held, while the trader — README: what the card holds back is never bought — took the side the book
         offered at a cent or two because it had lost (300 shares on paper, a real order with LIVE on), rested bids on
-        it, and the Telegram alerts announced it as 新机会 whatever SIM_MARKETS said."""
+        it, and the Telegram alerts announced it as 新机会 whatever SIM_MARKETS said.
+        The book's hold is told apart from the market's own (the review of that fix) for the orders that exist when it
+        begins. It keeps new orders out, as every hold does; but a held card's resting order also stands unjudged
+        (sim_requote_reason), and handed this hold as one more of those, an order resting when the book turned was no
+        longer withdrawn at the exit line when the model's own price fell under it — the rule that had judged it until
+        then — and a decision an API cooldown had held back went out into the settled book when the cooldown ended
+        (LiveBot.live_taker_recheck)."""
         if not isinstance(odds, TouchOdds):
-            return ""
+            return "", ""
         hold = touch.advice_problem(now_ms)
         if not hold and book is not None and not book.stale(now_ms):
             decided = book_decided(book)
             if (decided == "up" and odds.fair_upper < 0.9) or (decided == "down" and odds.fair_upper > 0.1):
                 low, high = touch.spec.label(touch.spec.low), touch.spec.label(touch.spec.high)
-                hold = (f"盘口已把 {high if decided == 'up' else low} 先触当作定局（{'买价 ≥90¢' if decided == 'up' else '卖价 ≤10¢'}），"
-                        "模型尚未核验到这次触线；待核验，暂不给建议")
-        return hold
+                return (f"盘口已把 {high if decided == 'up' else low} 先触当作定局（{'买价 ≥90¢' if decided == 'up' else '卖价 ≤10¢'}），"
+                        "模型尚未核验到这次触线；待核验，暂不给建议"), decided
+        return hold, ""
 
     def touch_payload(self, touch: "TouchMarket", now_ms: int) -> dict:
         """Web card for a first-touch market: 涨 = the high barrier first, 跌 = the low one first."""
@@ -17749,7 +17759,7 @@ class Bot:
         out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
         book, why = self.touch_book(spec)
         odds = touch.odds(now_ms)
-        hold = self.touch_hold(touch, odds, book, now_ms)  # the very answer sim_markets hands the trader (SimMarket.hold)
+        hold = self.touch_hold(touch, odds, book, now_ms)[0]  # the very answer sim_markets hands the trader (SimMarket.hold)
         if book is not None:
             ok = isinstance(odds, TouchOdds)
             swing = touch.model_swing(now_ms) if ok else 0.0
@@ -18255,11 +18265,14 @@ class Bot:
             if isinstance(odds, TouchOdds) and book is not None:
                 low, high = spec.label(spec.low), spec.label(spec.high)
                 # the hold is the card's, whole (touch_hold, 1.150.0): the market's own reasons and the book already trading
-                # the question as settled — advice_problem alone let the trader buy what the card was holding back
+                # the question as settled — advice_problem alone let the trader buy what the card was holding back; that it is
+                # the book's alone goes with it (decided: the orders already resting are still judged, sim_requote_reason)
+                hold, decided = self.touch_hold(touch, odds, book, now_ms)
                 out.append(SimMarket(spec.slug, f"{spec.symbol.removesuffix('USDT')} 先触 {low}/{high}", "touch", spec.key,
                                      odds.fair_upper, book, self.edge_need(touch.model_swing(now_ms)),
-                                     self.touch_hold(touch, odds, book, now_ms), (high, low), {"deadline": spec.deadline_ms},
-                                     self.evidence(lambda touch=touch: self.market_evidence("touch", now_ms, touch=touch))))
+                                     hold, (high, low), {"deadline": spec.deadline_ms},
+                                     self.evidence(lambda touch=touch: self.market_evidence("touch", now_ms, touch=touch)),
+                                     decided=decided))
         for mkt in self.updowns.values():
             if only is not None and mkt.spec.key != only:
                 continue
@@ -19504,7 +19517,8 @@ class Bot:
         (SIM_MAKER_MIN_BID; either for SIM_MAKER_FOLLOW_SETTLE_SECONDS: sim_follow_settled). "" while it may stand. On a
         stale or crossed book the rules that read the book wait for a fresh one; those that need the fair price alone —
         the exit line, after hours the after-hours bar — are judged all the same (1.150.0), and a held card's order
-        stands (sim_unpriced_reason)."""
+        stands (sim_unpriced_reason) — but for a first-touch market held by its book alone (mk.decided): an order
+        resting there is judged as on a card that holds nothing, and a decision not yet sent is void."""
         c = self.config
         if not trade.get("maker") or mk is None:
             return ""
@@ -19528,8 +19542,26 @@ class Bot:
         stale_ms = SIM_WINDOW_STALE_WITHDRAW_MS if (trade.get("settle") or {}).get("window") else SIM_STALE_WITHDRAW_MS
         if mk.book.stale(now_ms) and now_ms - mk.book.fetched_ms > stale_ms:  # no pricing basis: not left for someone with one to fill
             return f"盘口断流超过 {stale_ms // 1000} 秒，撤单" if stale_ms < 120_000 else f"盘口断流超过 {stale_ms // 60_000} 分钟，撤单"
-        if mk.hold:
+        if mk.hold and not mk.decided:
             return ""  # the fair price itself is in doubt: the order stands (sim_unpriced_reason withdraws it in time)
+        # 1.150.0 (audit SIM-TOUCH-DECIDED-HOLD, the review of its fix): not so on a first-touch market held by its book alone
+        # (mk.decided: the book trades the question as settled, the model's price is not there). Until that fix the trader had no
+        # such hold and an order resting there was judged by everything below; handed the hold as one more reason to let it stand,
+        # a 挂90k at 80¢ stayed on Predict under a book bidding 92¢ while BTC fell and the model's own price went to 70¢ — for
+        # SIM_NO_ODDS_WITHDRAW_MINUTES (half an hour; for good at 0) where the exit line had cancelled it within a look — and was
+        # filled when the 92¢ bid was swept: the book wrong, the model right, the bid 10¢ over the model. That hold is there to
+        # keep new orders out; it is no ground to stop judging the ones already resting. Withdrawals only, so never more than
+        # before that fix: nothing is placed while the card holds (sim_maker_gate, sim_requote_freed, sim_express_look), and the
+        # half hour still ends what these rules leave
+        if mk.decided and (trade["live"] if isinstance(trade.get("live"), dict) else {}).get("state") == "pending":
+            # ...and a real order still waiting to be sent (pending: held back by a cooldown, a sign-in) is no resting order but
+            # a new one, and under this hold it does not go out, as none is decided (sim_maker_gate). The real trader's send-time
+            # re-check asks this function about a decision that waited (LiveBot.live_taker_recheck), and "a held card's order
+            # stands" sent it: a 挂70k at 10¢ decided on an open book and held back five seconds by an API cooldown, the book
+            # meanwhile trading "90k first" as settled, went out into asks at 2¢ — the side the card held back, while the taker
+            # beside it was voided. (One whose request is on its way — placing — lands as the order resting before the book
+            # turned did, and is judged as that one is. Under the other holds a waiting decision is sent as before: unchanged.)
+            return f"卡片暂不建议（{mk.hold}）"
         side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)
         fair, _ = self.sim_fair(mk, side)  # the edge as the order was judged: at most SIM_MAX_FAIR_CENTS
         edge = fair - price
@@ -20576,6 +20608,12 @@ class Bot:
             for mk in self.sim_markets_for(key, now_ms):  # this key's markets alone: the other cards and ladders are not priced for it
                 if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
                     self.sim_taker_unseen(mk)
+                    if mk.decided and self.sim_in_scope(mk) and not (mk.book.stale(now_ms) or book_crossed(mk.book)):
+                        # 1.150.0 (audit SIM-TOUCH-DECIDED-HOLD, the review of its fix): a first-touch market held by its book alone
+                        # opens nothing, but its resting orders are still judged by this look (sim_requote_reason), as they were
+                        # before the trader was handed that hold: an edge gone is acted on at the push that shows it, not at the
+                        # step's next turn
+                        self.sim_express_rest(mk, trades, now_ms, changed)
                     continue
                 self.sim_paper_seen(mk)  # as the step: the asks paper fills took that this book no longer shows are forgotten
                 self.sim_express_rest(mk, trades, now_ms, changed)
