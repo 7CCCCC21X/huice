@@ -970,4 +970,81 @@ async def receipt_poll():
 asyncio.run(receipt_poll())
 
 
+# --- RDM-PAYOUT-UNCHECKED -------------------------------------------------------------------------------------------------------
+TOKENS_TOPIC = "0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d"   # keccak of both SDK ABIs' PayoutRedemption
+ADAPTER_TOPIC = "0x9140a6a270ef945260c03894b3c6b3b2695e9d5101feef0ff24fec960cfd3224"
+
+
+def pad(address):
+    return "0x" + "0" * 24 + address[2:].lower()
+
+
+def payout_log(contract, redeemer, payout, cid, neg_risk=False, index_sets=(1,), amounts=(0, 0)):
+    """A PayoutRedemption as the contract emits it: the tokens contract's (redeemer, collateral, parent indexed; data
+    conditionId, indexSets, payout) or the adapter's (redeemer, conditionId indexed; data amounts, payout)."""
+    if neg_risk:
+        data = L.Chain.encode("x(uint256[],uint256)", ["uint256[]", "uint256"], [list(amounts), payout])[4:]
+        return {"address": contract, "topics": [ADAPTER_TOPIC, pad(redeemer), cid], "data": "0x" + data.hex()}
+    data = L.Chain.encode("x(bytes32,uint256[],uint256)", ["bytes32", "uint256[]", "uint256"], [bytes.fromhex(cid[2:]), list(index_sets), payout])[4:]
+    return {"address": contract, "topics": [TOKENS_TOPIC, pad(redeemer), pad(L.ADDRESSES[56]["USDT"]), "0x" + "00" * 32], "data": "0x" + data.hex()}
+
+
+async def payout_unchecked():
+    """RDM-PAYOUT-UNCHECKED: 💵 已领取 was said, and the position closed for good, on a mined receipt alone — a redeem of a balance
+    already gone (claimed on the website a moment before, an earlier transaction the bot did not book) is mined and pays nothing,
+    yet read as paid. The payout is read from the receipt the redeem has anyway (its PayoutRedemption for this account, from the
+    contract called: no extra request): a zero is said as such (and still marked: unmarked it would be redeemed again, for
+    nothing); a payout says 到账 $X; a receipt that says nothing reads as before."""
+    ct, adapter = L.ADDRESSES[56]["CONDITIONAL_TOKENS"], L.ADDRESSES[56]["NEG_RISK_ADAPTER"]
+    other = "0x" + "77" * 20
+
+    async def one_round(mid, logs, neg=False, rounds=1):
+        bot = await ready_bot()
+        fake = bot.live.api
+        fake.positions_rows, fake.markets[str(mid)] = [held(mid)], {**mk(mid, won=1), "isNegRisk": neg}
+        bot.live.chain = L.Chain("https://rpc.invalid", bot.live.wallet)
+        sent = notices(bot)
+        with node_for(eth_getTransactionReceipt={**MINED, "logs": logs}) as node:
+            done = await bot.live_redeem(NOW)
+            for i in range(1, rounds):
+                assert await bot.live_redeem(NOW + i * 10 * MIN) == []
+        txs = [keccak_of(p[0]) for meth, p in node.log if meth == "eth_sendRawTransaction"]
+        return bot, done, sent, txs
+
+    maker = (await ready_bot()).live.wallet.maker
+    # (a) mined, paid nothing (a decoy: another redeemer's event, 999 USDT) — said, not 💵; marked; never sent again
+    bot, done, sent, txs = await one_round(801, [payout_log(ct, other, 999 * WEI, cond(801)), payout_log(ct, maker, 0, cond(801))], rounds=3)
+    assert len(txs) == 1 and len(done) == 1 and "💵" not in done[0] and "没领到 USDT" in done[0] and txs[0] in done[0], done  # (before: 💵 已领取 …)
+    assert [text for _, text in sent] == done and "没领到 USDT" in bot.live_errors[-1], (sent, bot.live_errors[-1:])
+    assert bot.store.get("live:redeemed:801:1") == {"at": NOW, "tx": txs[0], "amount": str(10 * WEI), "title": "window 801", "paid": "0"}
+    assert bot.live_redeem_last["counts"] == {"kept": 1}, bot.live_redeem_last
+    with node_for():
+        report = await bot.live_redeem_report(NOW + 31 * MIN)
+    assert "没领到 USDT" in report, report
+    # (b) paid: 到账 $X in the 💵 line
+    bot, done, sent, txs = await one_round(802, [payout_log(ct, maker, 10 * WEI, cond(802), index_sets=(1,))])
+    assert done == [f"💵 已领取 window 802 Up 10 份，到账 $10.00：{txs[0]}"] and bot.store.get("live:redeemed:802:1")["paid"] == str(10 * WEI), done
+    # (c) a receipt that says nothing: the line and the mark as before (None is never 0)
+    bot, done, sent, txs = await one_round(803, [])
+    assert done == [f"💵 已领取 window 803 Up 10 份：{txs[0]}"] and "paid" not in bot.store.get("live:redeemed:803:1"), done
+    # (d) multi-outcome: the adapter's event (the tokens contract's own one names the adapter as redeemer and pays it — not ours)
+    bot, done, sent, txs = await one_round(804, [payout_log(ct, adapter, 10 * WEI, cond(804)),
+                                                 payout_log(adapter, maker, 0, cond(804), neg_risk=True, amounts=(10 * WEI, 0))], neg=True)
+    assert len(done) == 1 and "没领到 USDT" in done[0], done
+    bot, done, sent, txs = await one_round(805, [payout_log(adapter, maker, 10 * WEI, cond(805), neg_risk=True, amounts=(10 * WEI, 0))], neg=True)
+    assert done == [f"💵 已领取 window 805 Up 10 份，到账 $10.00：{txs[0]}"], done
+    # the decoder: the event's last FIELD (a last-word reading gives the index set 2, or the amount 0)
+    chain = L.Chain("https://rpc.invalid", L.Wallet(KEY, 56, PA))
+    receipt = {"logs": [payout_log(ct, PA, 40 * WEI, cond(1), index_sets=(2,))]}
+    assert chain.redeem_payout(receipt, ct, False) == 40 * WEI and chain.redeem_payout(receipt, adapter, False) is None
+    receipt = {"logs": [payout_log(adapter, PA, 60 * WEI, cond(1), neg_risk=True, amounts=(60 * WEI, 0))]}
+    assert chain.redeem_payout(receipt, adapter, True) == 60 * WEI and chain.redeem_payout(receipt, ct, False) is None
+    assert chain.redeem_payout({"logs": [{"address": ct, "topics": [TOKENS_TOPIC, pad(PA)], "data": "0x12"}]}, ct, False) is None
+    assert chain.redeem_payout({"status": "0x1"}, ct, False) is None and chain.redeem_payout(None, ct, False) is None
+    print("RDM_PAYOUT_UNCHECKED_OK")
+
+
+asyncio.run(payout_unchecked())
+
+
 print("AUDIT_REDEEM_OK")

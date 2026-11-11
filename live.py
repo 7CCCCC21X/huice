@@ -1026,6 +1026,23 @@ class TxPending(core.RemoteError):
         self.tx_hash = tx_hash
 
 
+# PayoutRedemption, as both SDKs' ABIs declare it: on the conditional tokens contracts (redeemer, collateral, parent indexed;
+# data conditionId, indexSets, payout) and on the multi-outcome adapters (redeemer, conditionId indexed; data amounts, payout)
+PAYOUT_TOKENS_TOPIC = "0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d"
+PAYOUT_ADAPTER_TOPIC = "0x9140a6a270ef945260c03894b3c6b3b2695e9d5101feef0ff24fec960cfd3224"
+
+
+class Redeemed(str):
+    """A mined redeem: its transaction hash (a str, as before), with ``payout`` — the USDT (wei) it paid the account by its
+    receipt's PayoutRedemption, None when the receipt does not say (1.150.0, audit RDM-PAYOUT-UNCHECKED)."""
+    payout: int | None = None
+
+    def __new__(cls, tx_hash: str, payout: int | None = None):
+        made = super().__new__(cls, tx_hash)
+        made.payout = payout
+        return made
+
+
 class RedeemUnread(core.RemoteError):
     """A redeem round could not read the account's positions (the key's rate-limit cooldown, a 429, a 5xx, a timeout):
     no position was judged and nothing was sent — the one failure of a round after which looking again soon is safe
@@ -1219,21 +1236,40 @@ class Chain:
                 break  # the next ones would fail the same way (no gas, wrong key); say so once
         return out
 
-    async def redeem(self, condition_id: str, index_set: int, amount: int, neg_risk: bool, yield_bearing: bool) -> str:
+    def redeem_payout(self, receipt: Any, contract: str, neg_risk: bool) -> int | None:
+        """The USDT (wei) a mined redeem paid the account: its receipt's PayoutRedemption emitted by ``contract`` (the one the
+        redeem called) for this account as the redeemer — the event's last field, never the data's last word (that is an
+        index set or an amount). None when there is no such log or it cannot be read: never taken for 0. A multi-outcome
+        receipt also carries the tokens contract's event with the adapter as the redeemer: the filter leaves it out."""
+        try:
+            topic = PAYOUT_ADAPTER_TOPIC if neg_risk else PAYOUT_TOKENS_TOPIC
+            redeemer = "0x" + "0" * 24 + self.wallet.maker[2:].lower()
+            for log in (receipt.get("logs") or []) if isinstance(receipt, dict) else []:
+                topics = [str(t).lower() for t in (log.get("topics") or [])] if isinstance(log, dict) else []
+                if len(topics) < 2 or topics[0] != topic or topics[1] != redeemer or str(log.get("address") or "").lower() != contract.lower():
+                    continue
+                types = ["uint256[]", "uint256"] if neg_risk else ["bytes32", "uint256[]", "uint256"]
+                return int(_eth()[4].decode(types, bytes.fromhex(str(log.get("data") or "0x").removeprefix("0x")))[-1])
+        except Exception:  # an odd log: says nothing (None), never stops the redeem's bookkeeping
+            return None
+        return None
+
+    async def redeem(self, condition_id: str, index_set: int, amount: int, neg_risk: bool, yield_bearing: bool) -> Redeemed:
         """Redeem a resolved position: the conditional tokens contract for a standard market (index set 1 or 2), the
-        multi-outcome adapter (an amount per outcome) for a neg-risk one. The transaction hash once mined."""
+        multi-outcome adapter (an amount per outcome) for a neg-risk one. The transaction hash once mined, with what it
+        paid (Redeemed.payout, from the receipt: no extra request)."""
         condition = bytes.fromhex(condition_id.removeprefix("0x"))
         if neg_risk:
-            adapter = self.addresses[("YIELD_BEARING_" if yield_bearing else "") + "NEG_RISK_ADAPTER"]
+            target = self.addresses[("YIELD_BEARING_" if yield_bearing else "") + "NEG_RISK_ADAPTER"]
             amounts = [amount, 0] if index_set == 1 else [0, amount]
-            tx = await self.send(adapter, self.encode("redeemPositions(bytes32,uint256[])", ["bytes32", "uint256[]"], [condition, amounts]))
+            tx = await self.send(target, self.encode("redeemPositions(bytes32,uint256[])", ["bytes32", "uint256[]"], [condition, amounts]))
         else:
-            tokens = self.addresses[("YIELD_BEARING_" if yield_bearing else "") + "CONDITIONAL_TOKENS"]
-            tx = await self.send(tokens, self.encode("redeemPositions(address,bytes32,bytes32,uint256[])",
+            target = self.addresses[("YIELD_BEARING_" if yield_bearing else "") + "CONDITIONAL_TOKENS"]
+            tx = await self.send(target, self.encode("redeemPositions(address,bytes32,bytes32,uint256[])",
                                                      ["address", "bytes32", "bytes32", "uint256[]"],
                                                      [self.addresses["USDT"], bytes(32), condition, [index_set]]))
-        await self.wait(tx)
-        return tx
+        receipt = await self.wait(tx)
+        return Redeemed(tx, self.redeem_payout(receipt, target, neg_risk))
 
 
 # --- the trader: wallet, API and chain together, with their readiness ---------------------------------------------------
@@ -4426,7 +4462,8 @@ class LiveBot(core.Bot):
                      "shares": from_wei(amount), "market_id": mid, "index_set": index_set}
             mark = self.store.get(key)
             if mark:
-                seen.append({**entry, "kind": "lost" if mark.get("lost") else "kept", "tx": str(mark.get("tx") or "")})
+                seen.append({**entry, "kind": "lost" if mark.get("lost") else "kept", "tx": str(mark.get("tx") or ""),
+                             "paid": mark.get("paid")})  # (RDM-PAYOUT-UNCHECKED) "0": mined, but it paid nothing
                 continue
             unsettled.add(mid)
             failed_at = self.live_redeem_failed.get(key)
@@ -4522,12 +4559,27 @@ class LiveBot(core.Bot):
                                                                          else "（一小时后再试）"))
                 seen.append({**entry, "kind": "failed", "error": text, "unsent": unsent, "pulled": pulled})
                 continue
-            self.store.put(key, {"at": now_ms, "tx": tx, "amount": str(amount), "title": entry["title"]})
+            # 1.150.0 (audit RDM-PAYOUT-UNCHECKED): 💵 已领取 was said, and the position closed for good, on a mined receipt alone —
+            # the payout never looked at. A redeem of a balance already gone (claimed on the website a moment before, or by an
+            # earlier transaction the bot did not book) is mined with status 1 and pays nothing, yet read as paid. The receipt
+            # in hand says what was paid (its PayoutRedemption: no extra request). The mark is written whatever the payout — a
+            # zero left unmarked would be redeemed again, for nothing, every round Predict still lists the row — but a zero is
+            # said as such, not as 💵; a payout the receipt does not state (None) reads as before.
+            paid = getattr(tx, "payout", None)
+            self.store.put(key, {"at": now_ms, "tx": str(tx), "amount": str(amount), "title": entry["title"],
+                                 **({"paid": str(paid)} if paid is not None else {})})
             errors.pop(key, None)
             unsent_runs.pop(key, None)
-            line = f"💵 已领取 {entry['title']} {outcome.get('name') or ''} {from_wei(amount):g} 份：{tx}"
+            shares = f"{entry['title']} {outcome.get('name') or ''} {from_wei(amount):g} 份"
+            if paid == 0:
+                line = (f"⚠️ 领取交易上链了，但没领到 USDT：{shares}（交易 {tx}）。链上已经没有这份持仓：多半已在网站上领过，"
+                        "或之前的一笔领取已经到账；网站上若还显示可领取，把这条发我")
+                self.live_note_error(line)
+                seen.append({**entry, "kind": "kept", "tx": str(tx), "paid": "0"})
+            else:
+                line = f"💵 已领取 {shares}" + (f"，到账 ${from_wei(paid):,.2f}" if paid else "") + f"：{tx}"
+                seen.append({**entry, "kind": "redeemed", "tx": str(tx)})
             done.append(line)
-            seen.append({**entry, "kind": "redeemed", "tx": tx})
             self.live_notify(line)
         if dry_run:
             return done, seen
@@ -4677,7 +4729,8 @@ class LiveBot(core.Bot):
                 extra = {"claimable": f"，约 ${float(s.get('value') or 0):,.2f}",
                          "waiting": f"：{s.get('error') or '?'}（{max(1, int(float(s.get('left') or 0) / 60))} 分钟后再试）",
                          "fields": f"：{s.get('error')}", "unclear": f"：{s.get('error')}（市场状态 {s.get('status')}）",
-                         "kept": f"（交易 {s.get('tx', '')[:14]}…）", "open": f"（市场状态 {s.get('status')}）", "unread": f"：{s.get('error')}"}[kind]
+                         "kept": f"（交易 {s.get('tx', '')[:14]}…" + ("，没领到 USDT" if s.get("paid") == "0" else "") + "）",  # (RDM-PAYOUT-UNCHECKED)
+                         "open": f"（市场状态 {s.get('status')}）", "unread": f"：{s.get('error')}"}[kind]
                 lines.append(f"  · {s['title']} / {s['outcome']} {s['shares']:g} 份{extra}")
             if len(items) > cap:
                 lines.append(f"  …另有 {len(items) - cap} 个")
