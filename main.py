@@ -1855,7 +1855,7 @@ class Binance:
     def __init__(self, config: Config):
         self.config = config
         self.cached: dict[str, Baseline] = {}
-        self.at_cache: dict[tuple[str, int], tuple[D, str]] = {}
+        self.at_cache: dict[tuple[str, int, tuple[str, ...]], tuple[D, str]] = {}  # (symbol, instant, kinds asked) -> price_at's answer
         self.offset_ms = 0
         self.clock_checked = 0.0
         self.blocked_until = 0.0
@@ -1914,17 +1914,22 @@ class Binance:
             self.stream.seed(rows)
         return rows
 
-    async def price_at(self, symbol: str, at_ms: int) -> tuple[D, str]:
+    async def price_at(self, symbol: str, at_ms: int, kinds: tuple[str, ...] = ("成交价", "标记价")) -> tuple[D, str]:
         """The contract price at the instant ``at_ms``: close of the 1-minute candle ending then.
 
         Thin contracts may have no trade in that minute, so the mark-price candle is the fallback.
         Returns (price, "成交价" | "标记价"). Cached per symbol and instant.
+        1.150.0 (audit FEED-MARK-VS-LAST): ``kinds`` narrows the candles asked — ("标记价",) is Binance's mark price at
+        that instant whether the minute traded or not: what a quote that stands on the mark is compared with
+        (Bot.contract_anchor). Each kind asked of an instant is cached beside the others.
         """
-        key = (symbol, at_ms)
+        key = (symbol, at_ms, tuple(kinds))
         if key in self.at_cache:
             return self.at_cache[key]
         start = at_ms - 60_000
         for path, kind in (("/fapi/v1/klines", "成交价"), ("/fapi/v1/markPriceKlines", "标记价")):
+            if kind not in kinds:
+                continue
             rows = await self.get(path, symbol=symbol, interval="1m", startTime=start, endTime=at_ms - 1, limit=1)
             if not isinstance(rows, list) or not rows or not isinstance(rows[0], list) or len(rows[0]) < 6:
                 continue
@@ -1935,7 +1940,7 @@ class Binance:
                 result = number(row[4], "币安收盘时刻价格"), kind
             except (ValueError, TypeError, decimal.InvalidOperation):
                 continue
-            self.at_cache = {k: v for k, v in self.at_cache.items() if k[0] != symbol}  # one instant per symbol
+            self.at_cache = {k: v for k, v in self.at_cache.items() if k[0] != symbol or k[1] == at_ms}  # one instant per symbol
             self.at_cache[key] = result
             return result
         raise ValueError(f"币安没有 {stamp(at_ms, seconds=False)}（北京时间）那一分钟的 K 线")
@@ -15622,6 +15627,11 @@ class Bot:
         self.speed_pool: ThreadPoolExecutor | None = None  # /speed's requests (1.145.0), likewise
         self.reference_state: dict[str, dict] = {}  # per background feed: last success, last error, duration
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
+        # 1.150.0 (audit FEED-MARK-VS-LAST), the contract cards: which candle a symbol's anchor above is — (that close,
+        # "成交价" | "标记价": the closing minute did not trade); none recorded for the close = 成交价 — and Binance's MARK
+        # price at that same close, what a quote that stands on the mark is compared with (contract_anchor)
+        self.anchor_kinds: dict[str, tuple[int, str]] = {}
+        self.anchor_marks: dict[str, tuple[int, D]] = {}
         self.close_print_why: dict[str, str] = {}  # symbol -> why today's closing print could not be noted (note_live_close)
         self.kospi_anchor_note, self.kospi_anchor_error = "", ""
         self.pred_last: dict[str, int] = {}  # index -> ms of the last saved prediction snapshot
@@ -16207,10 +16217,26 @@ class Bot:
         for symbol, ticker in self.config.tickers.items():
             self.note_live_close(symbol, ticker, now_ms)
             close_ms = self.odds_base(symbol, now_ms)[0]
-            if close_ms and self.anchors.get(symbol, (0,))[0] != close_ms and self.retry_ok(symbol):
-                with contextlib.suppress(Exception):
-                    price, _ = await self.market.price_at(symbol, close_ms)
-                    self.anchors[symbol] = (close_ms, price)
+            # 1.150.0 (audit FEED-MARK-VS-LAST): the candle's kind is kept (it was dropped here), and the mark candle of the
+            # same minute is read too — one more request per symbol and close, none when the minute did not trade (the
+            # anchor is that candle then). The card's quote is the last trade while it is fresh and Binance's mark price
+            # otherwise (Quote.parse); each is compared with its own kind at the close (contract_anchor). A mark candle that
+            # could not be read is asked again with the next attempt (retry_ok: one a minute); the trade candle in hand is not
+            anchored = self.anchors.get(symbol, (0,))[0] == close_ms
+            marked = self.anchor_marks.get(symbol, (0,))[0] == close_ms
+            if close_ms and not (anchored and marked) and self.retry_ok(symbol):
+                if not anchored:
+                    with contextlib.suppress(Exception):
+                        price, kind = await self.market.price_at(symbol, close_ms)
+                        self.anchors[symbol], self.anchor_kinds[symbol] = (close_ms, price), (close_ms, kind)
+                        anchored = True
+                if anchored:
+                    with contextlib.suppress(Exception):
+                        if self.anchor_kinds.get(symbol) == (close_ms, "标记价"):
+                            mark = self.anchors[symbol][1]
+                        else:
+                            mark, _ = await self.market.price_at(symbol, close_ms, ("标记价",))
+                        self.anchor_marks[symbol] = (close_ms, mark)
             if self.vols.due(symbol):
                 # The stock's own exchange sessions (close to close, opens kept so the opening gap and the in-session
                 # part split as for the indices) – not Binance's 24-hour candles, which mix in nights and weekends.
@@ -16966,7 +16992,7 @@ class Bot:
             quote = (self.snapshots.get(symbol) or {}).get("quote")
             if quote:
                 cards.append((symbol, f"{NAMES.get(symbol, symbol)}｜{symbol}",
-                              lambda now, symbol=symbol, quote=quote: self.contract_odds(symbol, quote.price, now, quote.timestamp_ms)))
+                              lambda now, symbol=symbol, quote=quote: self.contract_odds(symbol, quote.price, now, quote.timestamp_ms, quote.source)))
         for key, title, odds_of in cards:
             raw = odds_of(now_ms)
             if not isinstance(raw, CloseOdds) or now_ms - self.pred_last.get(key, -PRED_EVERY_MS) < PRED_EVERY_MS:
@@ -17310,8 +17336,38 @@ class Bot:
             note += f"（交易所日K未取得：{brief_error(self.vol_errors[symbol], 50)}）"
         return sigma, note
 
-    def contract_odds(self, symbol: str, price: D, now_ms: int, quote_ms: int = 0) -> CloseOdds | str | None:
-        """quote_ms: when the Binance price was quoted (0 = just now); an old one cannot map the move."""
+    def contract_anchor(self, symbol: str, source: str) -> tuple[tuple[int, D] | None, str, str]:
+        """(the Binance price at the reference close that a quote of ``source`` — Quote.source: "last" | "mark" — is
+        compared with, that anchor's kind, "" or why nothing is suggested from the pair yet).
+        1.150.0 (audit FEED-MARK-VS-LAST): like with like. A contract card's quote is the last trade while that is fresh
+        (MAX_PRICE_AGE_SECONDS) and Binance's mark price once it is not (Quote.parse); its anchor was the trade candle of
+        the closing minute, the kind dropped. So a thin contract's mark was divided by a trade, and the gap between the
+        two kinds at the close read as a move of the stock since: with the mark 0.29% from the closing trade the 涨 fair
+        price went 50.0¢ → 53.8¢ the moment the last trade turned 120 s old, nothing having traded, the express lane
+        woken, 300 shares bought on paper at 42¢. As the KR200 proxy has it (kr200_price: 两边同口径), a quote on the mark
+        is now compared with the mark candle of that same minute (refresh_odds_inputs reads it beside the trade candle).
+        While that candle is not read yet (a failed request, asked again a minute later) the trade candle still gives
+        the estimate, said so and with nothing suggested from it — the reason returned becomes CloseOdds.warn, as an
+        approximate HSI anchor's does.
+        The other way round is left as it was: a closing minute without a trade has no trade candle (price_at's anchor
+        is its mark candle then), so a fresh trade can only be compared with that mark, as before — the pair now named in
+        the card's note and marked approximate in the evidence. Holding it would silence the card for two minutes after
+        every trade on such a night, for a gap no larger than the one a trade ÷ trade estimate carries at either end."""
+        anchor = self.anchors.get(symbol)
+        if anchor is None:
+            return None, "", ""
+        kind = "标记价" if self.anchor_kinds.get(symbol) == (anchor[0], "标记价") else "成交价"
+        if source == "mark" and kind == "成交价":
+            mark = self.anchor_marks.get(symbol)
+            if mark is not None and mark[0] == anchor[0]:
+                return mark, "标记价", ""
+            return anchor, kind, "币安现价是标记价（最新成交已过期），收盘时刻的标记价尚未取到、锚点暂用成交价：口径不同，估算只是近似"
+        return anchor, kind, ""
+
+    def contract_odds(self, symbol: str, price: D, now_ms: int, quote_ms: int = 0, source: str = "last") -> CloseOdds | str | None:
+        """quote_ms: when the Binance price was quoted (0 = just now); an old one cannot map the move. source: which
+        price it is (Quote.source: "last" | "mark") — after hours it is compared with its own kind at the close
+        (contract_anchor)."""
         ticker = self.config.tickers.get(symbol)
         if not self.config.probability or not ticker:
             return None
@@ -17319,7 +17375,7 @@ class Bot:
         base_ms, base_value, base_label = self.odds_base(symbol, now_ms)
         if not base_ms:
             return "缺少带收盘时刻的交易所收盘价"
-        anchor = self.anchors.get(symbol)
+        anchor, anchor_kind, waiting = self.contract_anchor(symbol, source)
         info = STOCK_MARKETS[ticker.market]
         holidays = self.config.holidays.get(ticker.market, frozenset())
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
@@ -17359,11 +17415,18 @@ class Bot:
             return f"币安行情已 {(now_ms - quote_ms) // 1000} 秒未更新，暂不输出新概率"
         remaining, target = session_remaining(ticker.market, now_ms, close_date, holidays)
         move = percent(price, anchor[1])
-        return close_odds(NAMES.get(symbol, symbol), base_value, base_value * price / anchor[1], sigma, remaining, target,
+        # 1.150.0 (audit FEED-MARK-VS-LAST): with the mark on either side both kinds are named (a trade against a trade reads
+        # as it always did); a mark quote still waiting for its mark candle: the estimate is shown with the reason, and
+        # nothing is suggested from it (contract_anchor)
+        named = source == "mark" or anchor_kind == "标记价"
+        pair = (f"币安 {'标记价' if source == 'mark' else '最新成交'} {fmt_price(price)} / 收盘时刻 {anchor_kind} {fmt_price(anchor[1])}"
+                if named else f"币安 {fmt_price(price)} / 收盘时刻 {fmt_price(anchor[1])}")
+        odds = close_odds(NAMES.get(symbol, symbol), base_value, base_value * price / anchor[1], sigma, remaining, target,
                           price_tick(ticker.market, base_value), base_label,
-                          f"币安 {fmt_price(price)} / 收盘时刻 {fmt_price(anchor[1])} → {move:+.3f}%"
+                          f"{pair} → {move:+.3f}%"
                           + (f"｜{live_why}，暂用币安" if live_why else ""), sigma_note, unit, mode="盘后",  # 1.120.3: a proxy estimate, as the index cards' are labelled
                           sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
+        return dataclasses.replace(odds, warn=waiting) if waiting else odds
 
     HSI_PRINT_MS = 5 * 60_000  # the first futures print this soon after the 16:10 cash close is its anchor
 
@@ -17613,7 +17676,8 @@ class Bot:
             snapshot = self.snapshots.get(symbol) or {}
             quote = snapshot.get("quote")
             thunks.append((f"{NAMES.get(symbol, symbol)}｜{symbol}",
-                           lambda symbol=symbol, quote=quote: self.contract_odds(symbol, quote.price, now_ms, quote.timestamp_ms) if quote else "等待行情"))
+                           lambda symbol=symbol, quote=quote: (self.contract_odds(symbol, quote.price, now_ms, quote.timestamp_ms, quote.source)
+                                                               if quote else "等待行情")))
         items = [(title, thunk()) for title, thunk in thunks if only is None or self.predict_key(title) == only]
         return [(title, self.settle_on_strike(title, odds)) for title, odds in items if odds is not None]
 
@@ -18118,13 +18182,21 @@ class Bot:
                     sources.append(price_evidence(f"{info.name if info else ''}现货", live.source, code, "最新价", live.last,
                                                   live.quoted_ms, live.fetched_ms))
             else:
-                quote, anchor = (self.snapshots.get(symbol) or {}).get("quote"), self.anchors.get(symbol)
+                quote = (self.snapshots.get(symbol) or {}).get("quote")
                 if quote is not None:
                     kind = "最新成交价" if quote.source == "last" else "标记价"
+                    # 1.150.0 (audit FEED-MARK-VS-LAST): the anchor the odds are mapped from is the quote's own kind at the
+                    # close where there is one (contract_anchor: the mark candle for a quote on the mark) — named when the
+                    # mark is on either side, and marked approximate when the two are not of one kind
+                    anchor, anchor_kind, _ = self.contract_anchor(symbol, quote.source)
+                    unlike = anchor is not None and (quote.source == "mark") != (anchor_kind == "标记价")
+                    note = "收盘时刻的币安价格"
+                    if anchor is not None and (quote.source == "mark" or anchor_kind == "标记价"):
+                        note = f"收盘时刻的币安{anchor_kind}" + (f"（现价是{kind}，口径不同）" if unlike else "")
                     sources.append(price_evidence("币安合约", "币安 U 本位合约", symbol, kind, quote.price, quote.timestamp_ms))
                     proxy = {"proxy": f"币安 {symbol} 合约", "price": float(quote.price), "quoted_ms": quote.timestamp_ms,
                              "anchor": float(anchor[1]) if anchor else None, "anchor_ms": anchor[0] if anchor else 0,
-                             "anchor_note": "收盘时刻的币安价格", "approx": False}
+                             "anchor_note": note, "approx": unlike}
         return {"basis": basis, "sources": sources, "proxy": proxy}
 
     def market_evidence(self, kind: str, now_ms: int, **parts: Any) -> dict:
@@ -22354,8 +22426,9 @@ class Bot:
     def kospi_line200(self, now_ms: int) -> str:
         return self.kospi.line200(now_ms, self.config.color_style, self.hl.quotes.get("KR200"), self.hl.notes.get("KR200", ""))
 
-    def context_lines(self, symbol: str, now_ms: int, price: D | None = None) -> list[str]:
-        """Market-context lines for an alert: HSI futures for Hong Kong-listed underlyings, Hyperliquid quote."""
+    def context_lines(self, symbol: str, now_ms: int, price: D | None = None, source: str = "last") -> list[str]:
+        """Market-context lines for an alert: HSI futures for Hong Kong-listed underlyings, Hyperliquid quote. ``source``:
+        which Binance price ``price`` is (Quote.source), for the odds line (contract_anchor)."""
         lines = []
         ticker = self.config.tickers.get(symbol)
         if self.config.hsi_futures and ticker and ticker.market == "hk" and self.hsi.quote:
@@ -22369,7 +22442,7 @@ class Bot:
         if price is not None and symbol in self.hl.quotes:
             lines.append(self.hl_line(symbol, price))
         if price is not None:  # Model odds for the next close, so each alert carries its own read.
-            lines.append(self.odds_row(self.contract_odds(symbol, price, now_ms)))
+            lines.append(self.odds_row(self.contract_odds(symbol, price, now_ms, source=source)))
         return [line for line in lines if line]
 
     def references_for(self, symbol: str, now_ms: int) -> dict[str, Baseline]:
@@ -22446,7 +22519,7 @@ class Bot:
                 rows.extend(self.reference_status(kind, symbol, quote.price, now_ms))
             if symbol in self.config.hl_tickers:
                 rows.append(self.hl_line(symbol, quote.price))
-            rows.append(self.odds_row(self.contract_odds(symbol, quote.price, now_ms)))
+            rows.append(self.odds_row(self.contract_odds(symbol, quote.price, now_ms, source=quote.source)))
             lines.extend(tree(rows))
         used = tuple(dict.fromkeys(STOCK_MARKETS[t.market].currency for t in self.config.tickers.values()))
         lines.append("\n💱 " + self.fx.summary(used or ("CNY", "HKD", "KRW")))
@@ -22576,7 +22649,7 @@ class Bot:
                     continue
                 render = functools.partial(self.render_alert, symbol, quote, base, change, threshold, plan.reason,
                                            self.references_for(symbol, current_ms),
-                                           self.context_lines(symbol, current_ms, quote.price))
+                                           self.context_lines(symbol, current_ms, quote.price, quote.source))
                 self.deliver(state_key, functools.partial(self.deliver_alert, sub_id, sub, symbol, render, plan, passive,
                                                           quote, base, settings))
 

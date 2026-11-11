@@ -480,8 +480,10 @@ async def run():
     odds = m.close_odds("SK 海力士", D("1768000"), D("1781705"), 0.03, 1.0, dt.date(2026, 9, 29), D("1000"), "09-25 14:30·Naver KRX",
                         "币安 1,300 / 收盘时刻 1,290 → +0.775%", "σ")
     ev = kbot.close_evidence("SK 海力士｜SKHYNIXUSDT", odds, sat)
+    # 1.150.0 (audit FEED-MARK-VS-LAST): the quote stands on the mark while the only anchor in hand is the closing minute's trade
+    # candle — two kinds, recorded as the approximation it is (this used to be pinned as an exact anchor, "收盘时刻的币安价格")
     assert ev["proxy"] == {"proxy": "币安 SKHYNIXUSDT 合约", "price": 1300.0, "quoted_ms": sat - 2000, "anchor": 1290.0, "anchor_ms": base_ms,
-                           "anchor_note": "收盘时刻的币安价格", "approx": False}, ev["proxy"]
+                           "anchor_note": "收盘时刻的币安成交价（现价是标记价，口径不同）", "approx": True}, ev["proxy"]
     assert ev["sources"][0]["source"] == "韩交所000660·Naver KRX" and ev["sources"][1]["type"] == "标记价" and not ev["basis"]["direct"]
     # an evidence failure never stops a trade: the failure is the record
     assert sbot.evidence(lambda: 1 / 0) == {"error": "division by zero"}

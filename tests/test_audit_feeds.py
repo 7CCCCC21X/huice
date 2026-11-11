@@ -1138,4 +1138,196 @@ async def feed_close_book_orient() -> None:
 
 asyncio.run(feed_close_book_orient())
 
+
+# FEED-MARK-VS-LAST: after hours a contract card's fair price is "exchange close × Binance now ÷ Binance at the close".
+# The quote is the last trade while that is fresh (120 s) and Binance's MARK price once it is not; the anchor was the
+# closing minute's trade candle, its kind dropped. So a thin contract's mark was divided by a trade, and the gap between
+# the two kinds at the close read as a move of the stock: the fair price jumped the moment the last trade turned 120 s
+# old, nothing having traded, and the paper trader (the real one follows it) bought on the jump. A quote on the mark is
+# now compared with the mark candle of that same minute, read beside the trade candle; until it is read the estimate is
+# flagged and nothing is traded on it. (A closing minute without a trade has no trade candle: a fresh trade is still
+# compared with its mark candle, as before, the pair now named — see Bot.contract_anchor.)
+async def feed_mark_vs_last() -> None:
+    import datetime as dt
+    D = m.D
+    SYM = "HK0625USDT"
+    TITLE = f"{m.NAMES[SYM]}｜{SYM}"
+    BJ = lambda day, hour, minute: int(dt.datetime(2026, 9, day, hour, minute, tzinfo=m.BEIJING).timestamp() * 1000)
+    CLOSE, NOW = BJ(23, 16, 10), BJ(23, 20, 0)  # a Wednesday: the HK close, and an evening hour after it
+    TRADES, MARKS = "/fapi/v1/klines", "/fapi/v1/markPriceKlines"
+
+    class Binance(m.Binance):
+        """The real class (price_at's choice of candle, its cache); only the REST rows are made up: the closing minute's
+        trade candle (close, volume) and mark candle (None: the read fails)."""
+        def __init__(self, config, trade=("38.02", "120"), mark="38.10"):
+            super().__init__(config)
+            self.now, self.trade, self.mark, self.asked = NOW, trade, mark, []
+
+        def now_ms(self): return self.now
+
+        async def sync_clock(self): pass
+
+        async def get(self, path, **p):
+            self.asked.append((path, p.get("startTime")))
+            start = p["startTime"]
+            if path == TRADES and p["interval"] == "1m":
+                return [[start, "38.00", "38.05", "37.98", self.trade[0], self.trade[1], start + 59_999]]
+            if path == MARKS and self.mark is not None:
+                return [[start, "38.05", "38.12", "38.04", self.mark, "0", start + 59_999]]
+            raise m.RemoteError(f"HTTP 500: {path}")
+
+    async def world(**candles):
+        """The bot under its default settings on the evening of 09-23: the stock closed at 38.00 HKD at 16:10, the anchors
+        read by the real refresh_odds_inputs → Binance.price_at."""
+        cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "STATE_DB": ":memory:"})
+        bot = m.Bot(cfg, m.Store(":memory:"), Binance(cfg, **candles), None)
+        bot.stocks.closes[SYM] = m.StockMarket.baseline(cfg.tickers[SYM], m.STOCK_MARKETS["hk"], "腾讯", dt.date(2026, 9, 23),
+                                                        D("38.00"), D("38.10"))
+        for symbol in cfg.symbols:
+            bot.vols.refreshed[symbol] = 1e18  # no daily-bar read here: σ is the configured prior
+        await bot.refresh_odds_inputs(NOW)
+        return bot, bot.market
+
+    def quote(bot, last_age_s, mark, last="38.02", at=NOW):
+        """Binance's row as the stream pushes it: the last trade that old, the mark price of this second."""
+        bot.market.now = at
+        row = {"symbol": SYM, "price": last, "time": at - last_age_s * 1000, "markPrice": mark, "markTime": at, "indexPrice": "37.80"}
+        if isinstance((bot.snapshots.get(SYM) or {}).get("quote"), m.Quote):
+            bot.price_pushed("futures", SYM, row)  # between two samples: the push replaces the quote
+        else:
+            bot.snapshots[SYM] = {"quote": m.Quote.parse(row, SYM, at, bot.config.max_age)}
+        return bot.snapshots[SYM]["quote"]
+
+    def card(bot, at=NOW):
+        odds = dict(bot.odds_items(at))[TITLE]
+        assert isinstance(odds, m.CloseOdds), odds
+        return odds
+
+    # --- an ordinary evening: the closing minute traded (38.02); Binance's mark stood at 38.10 then, 0.21% above ---------
+    bot, market = await world()
+    assert bot.anchors[SYM] == (CLOSE, D("38.02"))  # the trade candle, as before
+    looked: list = []
+    bot.priced = lambda keys: looked.append(sorted(keys))
+    q = quote(bot, 60, "38.10")
+    fresh = card(bot)
+    assert q.source == "last" and fresh.effective == D("38") and abs(fresh.fair_up - 0.5) < 1e-4 and not fresh.warn, fresh
+    assert fresh.proxy_note == "币安 38.02 / 收盘时刻 38.02 → +0.000%", fresh.proxy_note  # a trade against a trade reads as ever
+    # 70 s on nothing has traded and nothing has moved — the last trade and the mark are where they were at the close —
+    # but the last trade is now 130 s old, so the quote is the mark: 38.10 against the 38.10 of the close is no move
+    # (it was divided by the 38.02 trade: +0.21%, 涨 52.8¢)
+    q = quote(bot, 130, "38.10", at=NOW + 70_000)
+    quiet = card(bot, NOW + 70_000)
+    assert q.source == "mark" and q.price == D("38.10") and looked == [[SYM]], (q, looked)  # (the trader still looks: the quote's kind changed)
+    assert quiet.effective == D("38") and quiet.fair_up == fresh.fair_up and not quiet.warn, (quiet.effective, quiet.fair_up, quiet.warn)
+    assert quiet.proxy_note == "币安 标记价 38.1 / 收盘时刻 标记价 38.1 → +0.000%", quiet.proxy_note
+    # the mark really moves: its own move since the close, +0.079%, not +0.289% (涨 51.0¢, was 53.8¢)
+    q = quote(bot, 131, "38.13", at=NOW + 71_000)
+    moved = card(bot, NOW + 71_000)
+    assert moved.effective == D("38.00") * D("38.13") / D("38.10") and 0.509 < moved.fair_up < 0.512 and not moved.warn, (moved.effective, moved.fair_up)
+    assert moved.proxy_note == "币安 标记价 38.13 / 收盘时刻 标记价 38.1 → +0.079%", moved.proxy_note
+    assert bot.odds_row(moved) in bot.context_lines(SYM, NOW + 71_000, q.price, q.source)  # an alert's odds line is that card's
+    bot.snapshots[SYM]["baseline"] = m.Baseline(D("38.02"), "k", "币安合约成交价@港交所收盘时刻", NOW + 86_400_000, CLOSE)
+    assert bot.odds_row(moved) in bot.status("1:0")  # ...so is /status's
+    bot.record_predictions(NOW + 71_000)  # ...and so is the snapshot /calib scores
+    saved = bot.store.get(f"pred:{SYM}:{NOW + 71_000}")
+    assert abs(saved["up_raw"] - moved.fair_up) < 1e-12 and saved["proxy"] == moved.proxy_note and not saved["warn"], saved
+    # the next trade: the quote is a trade again, compared with the trade candle
+    q = quote(bot, 1, "38.13", last="38.05", at=NOW + 80_000)
+    traded = card(bot, NOW + 80_000)
+    assert q.source == "last" and traded.effective == D("38.00") * D("38.05") / D("38.02") and not traded.warn, traded
+    # the anchors: both candles of the closing minute, one request each, never again for that close
+    assert bot.anchor_marks[SYM] == (CLOSE, D("38.10")) and bot.anchor_kinds[SYM] == (CLOSE, "成交价")
+    assert market.asked == [(TRADES, CLOSE - 60_000), (MARKS, CLOSE - 60_000)], market.asked
+    bot.anchor_tries.clear()
+    await bot.refresh_odds_inputs(NOW + 90_000)
+    assert len(market.asked) == 2, market.asked
+
+    # --- the paper trader under the defaults (takers, after hours, 10¢ bar), 涨 offered at 42¢ × 300 --------------------
+    async def trader(last_age_s, mark_now, **candles):
+        """One look of the paper trader with that quote: (the card's odds, its market as the trader sees it, the trades)."""
+        bot, market = await world(**candles)
+        quote(bot, last_age_s, mark_now)
+        odds = card(bot)
+        slug = m.predict_slug(bot.config.predict_slugs[SYM], odds.target)
+        bot.predict.books[SYM] = m.PredictBook(SYM, slug, "901", "t", ((D("0.38"), D("100")),), ((D("0.42"), D("300")),), NOW)
+
+        async def details(mid):
+            return {"outcomes": ["Up", "Down"], "status": "REGISTERED", "resolved": None}
+        bot.predict.market_details = details
+        (mk,) = [x for x in bot.sim_markets(NOW) if x.key == SYM]
+        bot.sim_ran = -1e9
+        await bot.sim_step(NOW)
+        return odds, mk, sorted((t["label"], t["status"], t["shares"]) for t in bot.sim_trades().values())
+
+    odds, mk, trades = await trader(60, "38.13")
+    assert abs(odds.fair_up - 0.5) < 1e-4 and not mk.hold and trades == [], (odds.fair_up, trades)
+    # the last trade turns 120 s old, the mark 0.29% above it as it nearly was at the close: no chance has opened
+    # (the 53.8¢ of mark ÷ trade cleared the bar: 300 shares of 涨 were bought at 42¢)
+    odds, mk, trades = await trader(200, "38.13")
+    assert 0.509 < odds.fair_up < 0.512 and not mk.hold and trades == [], (odds.fair_up, mk.hold, trades)
+    # a move of the mark itself is traded as before (+1.05% since the close: 涨 64¢)
+    odds, mk, trades = await trader(200, "38.50")
+    assert odds.fair_up > 0.62 and not mk.hold and trades == [("吃涨", "filled", 300.0)], (odds.fair_up, mk.hold, trades)
+    assert mk.evidence["proxy"] == {"proxy": f"币安 {SYM} 合约", "price": 38.5, "quoted_ms": NOW, "anchor": 38.10, "anchor_ms": CLOSE,
+                                    "anchor_note": "收盘时刻的币安标记价", "approx": False}, mk.evidence["proxy"]
+    assert mk.evidence["sources"][-1]["type"] == "标记价", mk.evidence["sources"]
+    # the mark candle of the close not read (the request failed): the trade candle still gives an estimate — the 53.8¢
+    # — but it is flagged and nothing is bought on it
+    odds, mk, trades = await trader(200, "38.13", mark=None)
+    assert 0.535 < odds.fair_up < 0.54 and "口径不同" in odds.warn and mk.hold == odds.warn and trades == [], (odds.fair_up, mk.hold, trades)
+    assert mk.evidence["proxy"]["approx"] and mk.evidence["proxy"]["anchor_note"] == "收盘时刻的币安成交价（现价是标记价，口径不同）", mk.evidence["proxy"]
+
+    # --- the mark candle cannot be read: a mark quote waits for it (flagged meanwhile), and it alone is asked again ------
+    bot, market = await world(mark=None)
+    assert bot.anchors[SYM] == (CLOSE, D("38.02")) and SYM not in bot.anchor_marks
+    quote(bot, 60, "38.13")
+    assert not card(bot).warn  # a trade against the trade candle needs no mark
+    quote(bot, 130, "38.13", at=NOW + 70_000)
+    waiting = card(bot, NOW + 70_000)
+    assert "口径不同" in waiting.warn and "尚未取到" in waiting.warn, waiting.warn
+    assert waiting.proxy_note == "币安 标记价 38.13 / 收盘时刻 成交价 38.02 → +0.289%", waiting.proxy_note
+    market.mark = "38.10"
+    await bot.refresh_odds_inputs(NOW + 70_000)  # within the minute: not asked yet (retry_ok)
+    assert SYM not in bot.anchor_marks and len(market.asked) == 2, market.asked
+    bot.anchor_tries.clear()                     # a minute later: the mark candle alone
+    await bot.refresh_odds_inputs(NOW + 70_000)
+    assert bot.anchor_marks[SYM] == (CLOSE, D("38.10")) and [path for path, _ in market.asked] == [TRADES, MARKS, MARKS], market.asked
+    assert not card(bot, NOW + 70_000).warn and card(bot, NOW + 70_000).effective == D("38.00") * D("38.13") / D("38.10")
+
+    # --- the closing minute did not trade: its mark candle is the anchor (price_at's fallback), no second request for it ---
+    bot, market = await world(trade=("38.02", "0"))
+    assert bot.anchors[SYM] == bot.anchor_marks[SYM] == (CLOSE, D("38.10")) and bot.anchor_kinds[SYM] == (CLOSE, "标记价")
+    assert market.asked == [(TRADES, CLOSE - 60_000), (MARKS, CLOSE - 60_000)], market.asked
+    q = quote(bot, 200, "38.10")
+    marked = card(bot)
+    assert q.source == "mark" and marked.effective == D("38") and not marked.warn, marked  # the mark against the mark, as before
+    assert marked.proxy_note == "币安 标记价 38.1 / 收盘时刻 标记价 38.1 → +0.000%", marked.proxy_note
+    # a fresh trade there has no trade candle to be compared with: left as it was — against that mark candle, and not
+    # held (that would silence the card for two minutes after every trade of such a night) — but the pair is named and
+    # a trade's record says its anchor is of the other kind
+    q = quote(bot, 5, "38.10", at=NOW + 1_000)
+    other = card(bot, NOW + 1_000)
+    assert q.source == "last" and other.effective == D("38.00") * D("38.02") / D("38.10") and not other.warn, other
+    assert other.proxy_note == "币安 最新成交 38.02 / 收盘时刻 标记价 38.1 → -0.210%", other.proxy_note
+    assert bot.close_evidence(TITLE, other, NOW + 1_000)["proxy"] == {
+        "proxy": f"币安 {SYM} 合约", "price": 38.02, "quoted_ms": NOW + 1_000 - 5_000, "anchor": 38.10, "anchor_ms": CLOSE,
+        "anchor_note": "收盘时刻的币安标记价（现价是最新成交价，口径不同）", "approx": True}
+
+    # --- Binance.price_at: the kinds asked, each cached beside the other; a new instant drops the old one's -------------
+    b = Binance(bot.config)
+    assert await b.price_at(SYM, CLOSE) == (D("38.02"), "成交价") and await b.price_at(SYM, CLOSE, ("标记价",)) == (D("38.10"), "标记价")
+    assert await b.price_at(SYM, CLOSE) == (D("38.02"), "成交价") and await b.price_at(SYM, CLOSE, ("标记价",)) == (D("38.10"), "标记价")
+    assert [path for path, _ in b.asked] == [TRADES, MARKS] and {k[1] for k in b.at_cache} == {CLOSE}, (b.asked, b.at_cache)
+    await b.price_at(SYM, CLOSE + 60_000)
+    assert {k[1] for k in b.at_cache} == {CLOSE + 60_000}, b.at_cache
+    b.mark = None
+    try:
+        await b.price_at(SYM, CLOSE + 60_000, ("标记价",))
+        assert False, "a mark candle that cannot be read is no price"
+    except m.RemoteError:
+        pass
+
+
+asyncio.run(feed_mark_vs_last())
+
 print("AUDIT_FEEDS_OK")
