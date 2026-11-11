@@ -1467,4 +1467,158 @@ async def feed_hsi_futures_stale() -> None:
 
 asyncio.run(feed_hsi_futures_stale())
 
+
+# FEED-HSI-SPOT-AFTER-CLOSE: after the 16:10 cash close, until the day's dated bar is in (it counts from 16:25), the cash
+# index on the HSI quote IS the day's close: the after-hours card's reference — which every trade opened on the next
+# session's market keeps as its settlement line — and, from 16:15, the provisional outcome the day's own trades are
+# pre-settled on. spot_problem looked at the figure's time only while the session ran, and the refresh kept a newer timed
+# figure only then as well. So at the 16:10 refresh etnet's own index — standing since 16:00 through the auction, or stuck
+# since 15:50 — took the place of the timed feeds' close and passed for it, as Tencent's 15-minute-delayed feed did. A
+# figure printed before the closing auction's random end (16:08–16:10) is no close: the card waits and says what for,
+# nothing is recorded from it, and the timed feeds are asked again every round. In session, once the bar is in, and for
+# the page's futures block, everything is as it was.
+async def feed_hsi_spot_after_close() -> None:
+    import datetime as dt, json
+    D = m.D
+
+    def at(hour: int, minute: int, second: int = 0, day: int = 30, month: int = 9) -> int:  # Wednesday 2026-09-30 (10-01: a holiday)
+        return int(dt.datetime(2026, month, day, hour, minute, second, tzinfo=m.BEIJING).timestamp() * 1000)
+
+    PREV, CLOSE, AUCTION, STUCK = D("24510.09"), D("24595.00"), D("24550.00"), D("24400.00")
+    waits = "恒指收盘价待确认（现货报价停在 09-30 15:50，早于 09-30 16:08 起的随机收市，日 K 未出）"
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "STATE_DB": ":memory:",
+                             "KOSPI_INDEX": "off", "SSE_INDEX": "off"})
+    hk = cfg.holidays["hk"]
+
+    # --- spot_problem itself: after the close, the day's bar not in, the figure must come from the close ---------------------
+    h = m.IndexFutures(True, hk)
+    h.dated_close = lambda day: PREV if day == dt.date(2026, 9, 29) else None
+    fut = m.FuturesQuote("恒指期货(10/2026)日市", D("24600"), D("24520"), None, None, None, at(16, 12), "etnet",
+                         fetched_ms=at(16, 12), session="日市")
+
+    def cash(value, when, source="腾讯"):
+        return h.with_spot(fut, m.IndexQuote("恒生指数", value, PREV, None, None, None, when, source))
+
+    assert h.spot_problem(cash(STUCK, at(15, 50)), at(16, 20)) == waits, h.spot_problem(cash(STUCK, at(15, 50)), at(16, 20))
+    assert "停在 09-30 15:57" in h.spot_problem(cash(D("24480"), at(15, 57)), at(16, 12))  # Tencent's feed, 15 minutes behind
+    assert "停在 09-30 10:05" in h.spot_problem(cash(D("24700"), at(10, 5)), at(16, 40))   # any figure of the day passed
+    assert "停在 09-30 16:07" in h.spot_problem(cash(AUCTION, at(16, 7, 59)), at(16, 12))  # the auction has not matched yet
+    assert h.spot_problem(cash(AUCTION, 0), at(16, 12)) == "恒指收盘价待确认（现货报价时间未知，09-30 日 K 未出）"
+    # a print from the auction's random end (16:08–16:10) or later is the close: that evening, and until the next open
+    for when, now in ((at(16, 8), at(16, 12)), (at(16, 9, 40), at(21, 0)), (at(16, 9, 40), at(12, 0, day=1, month=10)),
+                      (at(16, 9, 40), at(9, 0, day=2, month=10))):
+        assert h.spot_problem(cash(CLOSE, when, "新浪"), now) == "", (m.stamp(when), m.stamp(now))
+    # in session nothing changed (the auction keeps its ten minutes), nor once the dated bar is in (the reference then)
+    assert h.spot_problem(cash(AUCTION, at(15, 59, 58)), at(16, 9)) == ""
+    h.dated_close = lambda day: {dt.date(2026, 9, 29): PREV, dt.date(2026, 9, 30): CLOSE}.get(day)
+    assert h.spot_problem(cash(D("24700"), at(10, 5)), at(16, 40)) == ""
+    # a half day closes at 12:10: the same two minutes
+    half = m.IndexFutures(True, hk)
+    eve = lambda hour, minute, second=0: at(hour, minute, second, day=24, month=12)
+    assert "早于 12-24 12:08 起的随机收市" in half.spot_problem(cash(AUCTION, eve(12, 7)), eve(12, 15))
+    assert half.spot_problem(cash(CLOSE, eve(12, 8, 30)), eve(12, 15)) == ""
+
+    # --- the real refresh path through the 16:10 close -----------------------------------------------------------------------
+    # etnet's 恒生指數現貨 block has been stuck at 24,400 since 15:50 (its futures block moves on); Eastmoney's timed index
+    # follows the market, stands at 24,550 through the auction and prints the close, 24,595, at 16:09:30
+    feed = {"em_down": False}
+
+    class Clock:
+        now = 0
+
+        def now_ms(self):
+            return self.now
+
+    clock = Clock()
+
+    def page(now: int) -> bytes:
+        last = 24600 + (min(now, at(16, 30)) // 1000) % 41  # the day session's block: moving until 16:30
+        return (f"""<div><h3>恒生指數期貨(10/2026)</h3><span>日市</span><div>&#9650;{last:,} +80 (+0.33%) 高水50</div>
+<div>最高: 24,650 最低: 24,500 前收市: 24,520 開市: 24,530</div></div>
+<div>恒生指數現貨 &#9660;{STUCK:,.2f} -110.09 (-0.45%) 前收市: {PREV:,.2f} 開市: 24,520</div>""").encode()
+
+    def eastmoney(now: int) -> tuple:
+        if now < at(16, 0):
+            return D("24500") + D((now - at(15, 50)) // 60_000), now
+        return (CLOSE, at(16, 9, 30)) if now >= at(16, 9, 30) else (AUCTION, at(16, 0))
+
+    async def fake_get(url, timeout=15, headers=None):
+        if "etnet" in url:
+            return page(clock.now)
+        if "100.HSI" in url and not feed["em_down"]:
+            value, when = eastmoney(clock.now)
+            return json.dumps({"data": {"f43": float(value), "f60": float(PREV), "f86": when // 1000, "f58": "恒生指数"}}).encode()
+        raise m.RemoteError("HTTP 502")  # Eastmoney's futures, the Sina CFD, Sina's and Tencent's index: down
+
+    real_get, real_health = m.http_get, m.SOURCE_HEALTH
+    m.http_get, m.SOURCE_HEALTH = fake_get, m.SourceHealth()
+    try:
+        store = m.Store(":memory:")
+        store.put("anchor:HSI", [at(16, 10), "24600", "16:10 现货收市时", "10/2026", at(16, 10, 1), at(16, 10, 1)])
+        bot = m.Bot(cfg, store, clock, None)
+        bot.hsi_daily.daily = {dt.date(2026, 9, 29): PREV}
+        hsi = bot.hsi
+
+        async def look(now: int, force: bool = True):
+            """One refresh at ``now``: (the card's odds, the settlement line a trade opened now would keep; None: no market)."""
+            clock.now = now
+            await hsi.refresh(now, force=force)
+            odds = bot.hsi_odds(now)
+            if isinstance(odds, m.CloseOdds):
+                slug = m.predict_slug(cfg.predict_slugs["HSI"], odds.target)
+                bot.predict.books["HSI"] = m.PredictBook("HSI", slug, "902", "t", ((D("0.45"), D("50")),), ((D("0.47"), D("50")),), now)
+            lines = [mk.settle["line"] for mk in bot.sim_markets(now) if mk.key == "HSI"]
+            return odds, (lines[0] if lines else None)
+
+        for now in (at(15, 50), at(15, 56), at(16, 2), at(16, 9, 57)):  # the session: the futures page, then the timed index
+            await look(now)
+            clock.now = now + 1000
+            await hsi.refresh_spot(now + 1000)
+        q = hsi.quote
+        assert (q.source, q.spot, q.spot_source, q.spot_time) == ("etnet", CLOSE, "东方财富", at(16, 9, 30)), q
+        assert isinstance(bot.hsi_odds(at(16, 9, 58)), m.CloseOdds)
+        # 16:10:01, the close refresh (cash_close_due). The page's stuck figure took the timed close's place here and stayed:
+        # the reference until the bar (24,400), the line of every trade opened meanwhile, from 16:15 the day's outcome
+        odds, line = await look(at(16, 10, 1), force=False)
+        q = hsi.quote
+        assert (q.source, q.spot, q.spot_source, q.spot_time) == ("etnet", CLOSE, "东方财富", at(16, 9, 30)), q
+        assert isinstance(odds, m.CloseOdds) and odds.mode == "盘后" and odds.ref == CLOSE and not odds.warn, odds
+        assert line == float(CLOSE), line
+        # a round in which no timed feed answers: the page figure is all there is, and it is not the close. The card waits
+        feed["em_down"] = True
+        odds, line = await look(at(16, 10, 21))
+        assert hsi.quote.spot == STUCK and hsi.spot_problem(hsi.quote, at(16, 10, 21)) == waits, hsi.quote
+        assert odds == waits + "，暂不输出概率" and line is None and waits in hsi.spot_error, (odds, line, hsi.spot_error)
+        clock.now = at(16, 16)
+        bot.record_predictions(at(16, 16))  # ...and no outcome is written from it (it was, from 16:15 on)
+        assert store.get("outcome:HSI:2026-09-30") is None, store.get("outcome:HSI:2026-09-30")
+        # the timed feed is back: it is asked again in that very round; its close prices the card and is the outcome so far
+        feed["em_down"] = False
+        odds, line = await look(at(16, 16, 2))
+        assert isinstance(odds, m.CloseOdds) and odds.ref == CLOSE and line == float(CLOSE), (odds, line)
+        bot.record_predictions(at(16, 16, 2))
+        assert store.get("outcome:HSI:2026-09-30") == float(CLOSE), store.get("outcome:HSI:2026-09-30")
+        assert store.get("outsrc:HSI:2026-09-30")["source"] == "东方财富 实时（日K未出）", store.get("outsrc:HSI:2026-09-30")
+        # 16:40, the futures shut: the page's futures block stands as it did (FEED-ETNET-CLOSED-BLOCK asks which day the
+        # page is, and it is the day's) — its cash figure alone is not the close, and the timed one stays the reference
+        odds, line = await look(at(16, 40))
+        q = hsi.quote
+        own = hsi.dated(m.parse_etnet_futures(page(at(16, 40)), at(16, 40), hk), at(16, 40))
+        assert own.spot == STUCK and own.spot_source == "etnet" and own.quoted_ms == at(16, 30), own
+        assert hsi.futures_problem(own, at(16, 40)) == "" and hsi.spot_problem(own, at(16, 40)) == waits
+        assert q.source == "etnet" and q.quoted_ms == at(16, 30) and (q.spot, q.spot_source) == (CLOSE, "东方财富"), q
+        assert isinstance(odds, m.CloseOdds) and odds.ref == CLOSE and line == float(CLOSE), (odds, line)
+        # the dated bar arrives: it is the reference and the outcome, whatever the page shows (as before)
+        bot.hsi_daily.daily[dt.date(2026, 9, 30)] = D("24595.31")
+        feed["em_down"] = True
+        odds, line = await look(at(16, 41))
+        assert hsi.quote.spot == STUCK and isinstance(odds, m.CloseOdds) and odds.ref == D("24595.31") and line == 24595.31, (odds, line)
+        bot.record_predictions(at(16, 41))
+        assert store.get("outcome:HSI:2026-09-30") == 24595.31, store.get("outcome:HSI:2026-09-30")
+    finally:
+        m.http_get, m.SOURCE_HEALTH = real_get, real_health
+
+
+asyncio.run(feed_hsi_spot_after_close())
+
 print("AUDIT_FEEDS_OK")

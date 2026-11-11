@@ -2879,6 +2879,7 @@ class IndexFutures:
 
     SPOT_KEEP_SECONDS = 5 * 60
     LUNCH = (dt.time(12, 0), dt.time(13, 0))  # cash and futures day sessions both pause 12:00–13:00
+    CLOSE_RANDOM_MS = 2 * 60_000  # the closing auction fixes the close at a random moment of its last two minutes (16:08–16:10; 12:08–12:10 on a half day)
 
     @staticmethod
     def parse_futures(source: str, raw: bytes, now_ms: int, holidays: frozenset = frozenset()) -> FuturesQuote:
@@ -2945,14 +2946,19 @@ class IndexFutures:
             # the latest 16:10 anchor. The page's own cash index tells its day: its 前收市 must be the dated close
             # before the latest cash close (spot_problem's closed-market branch; it passes while that close is
             # unknown). A refused etnet page only falls through to Eastmoney / the CFD.
-            spot_why = self.spot_problem(q, now_ms)
+            # (as_close=False: only the page's day is asked here. Whether its cash figure can stand for that day's
+            # close — 1.150.0, FEED-HSI-SPOT-AFTER-CLOSE — is the reference's matter and leaves the futures block as it was.)
+            spot_why = self.spot_problem(q, now_ms, as_close=False)
             if spot_why:
                 why = f"etnet 页面不是最近交易日的（{spot_why}）"
         return why
 
-    def spot_problem(self, q: FuturesQuote, now_ms: int) -> str:
+    def spot_problem(self, q: FuturesQuote, now_ms: int, as_close: bool = True) -> str:
         """Why q's cash index cannot be used now ("" when it can). During the cash session it must be today's and
         have printed within index_stale_ms (3 minutes in continuous trading, 10 in the closing auction; lunch aside).
+        After the cash close, until that day's dated close is known, the figure stands for the close itself: it must
+        have printed in the closing auction's random end or later (``as_close=False`` leaves this one check out, for
+        futures_problem, which only asks which day the page is).
         Its previous close must be the dated close of the session before (when that is known): otherwise the figure
         belongs to another day, e.g. yesterday's page."""
         if q.spot is None:
@@ -2971,6 +2977,30 @@ class IndexFutures:
                 return f"恒指现货停在 {stamp(when, seconds=False)}，已超 {limit // 60_000} 分钟未更新"
         else:
             day = hk_cash_close_date(now_ms, self.holidays)
+            if as_close and self.dated_close(day) is None:
+                # 1.150.0 (audit FEED-HSI-SPOT-AFTER-CLOSE): until that day's dated bar is in (it counts from 16:25, when
+                # its sources answer), this figure IS the day's close: hsi_odds' reference — which every trade opened on
+                # the next session's market keeps as its settlement line, never corrected locally — and the provisional
+                # outcome the day's own trades are pre-settled on (record_predictions; with LIVE on that pre-settlement
+                # counts towards the daily-loss stop). The time checks above end with the session, so after 16:10 any
+                # figure of the day passed for the close: etnet's own index, standing since 16:00 through the auction,
+                # took the place of the timed feeds' close at the 16:10 refresh (below, a newer timed figure is kept
+                # only while the session runs); an index block stuck since 15:50, or Tencent's 15-minute-delayed feed,
+                # stayed for as long as the bar was out. The fair price was unharmed (a ratio); the line and the
+                # outcome were off by the auction's move, or by the whole stall. The close is fixed at the auction's
+                # random end, so a figure printed before that window is not the close, whatever the clock says now —
+                # what the KOSPI, Composite and stock closes already ask (kospi_odds, sse_close, note_live_close).
+                # Refused, the card says what it waits for and refresh() asks the timed feeds afresh every round;
+                # nothing changes in session, nor once the dated bar is in. (etnet's own index prints no time and is
+                # dated by its first sighting — dated(): a page first read after the close, on a restart, passes as
+                # before, whatever its age, until the dated bar settles it.)
+                fixed_from = (int(dt.datetime.combine(day, CALENDAR.close_time("hk", day), BEIJING).timestamp() * 1000)
+                              - self.CLOSE_RANDOM_MS)
+                if q.spot_time <= 0:
+                    return f"恒指收盘价待确认（现货报价时间未知，{day:%m-%d} 日 K 未出）"
+                if q.spot_time < fixed_from:
+                    return (f"恒指收盘价待确认（现货报价停在 {stamp(q.spot_time, seconds=False)}，早于 "
+                            f"{stamp(fixed_from, seconds=False)} 起的随机收市，日 K 未出）")
         before = hk_previous_day(day, self.holidays)
         expected = self.dated_close(before)
         if expected is not None and q.spot_prev is not None:
@@ -3161,6 +3191,9 @@ class IndexFutures:
         if (self.cash_open(now_ms) and prev is not None and prev.spot is not None and prev.spot_source != quote.source
                 and prev.spot_time > (quote.spot_time if quote.spot is not None else 0)):
             # the 3-second cash index is newer than the one on the futures page: keep it
+            # (while the session runs only: after the close refresh_spot reads the timed feeds no more, so a figure kept
+            # here would never be looked at again. A page figure from before the close's random end is refused by
+            # spot_problem below instead — 1.150.0, FEED-HSI-SPOT-AFTER-CLOSE — and the timed feeds are asked afresh.)
             quote = dataclasses.replace(quote, spot=prev.spot, spot_prev=prev.spot_prev, spot_source=prev.spot_source,
                                         spot_ms=prev.spot_time, water=None)
         why = self.spot_problem(quote, now_ms)
