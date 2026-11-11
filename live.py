@@ -814,12 +814,15 @@ class PredictApi:
     ORDERS_PAGE = 50      # orders per page (the API pages with first / after and answers a cursor)
     ORDERS_PAGES_MAX = 20  # ...and this many pages at most in one read (1000 orders)
 
-    async def paged(self, path: str, query: dict, stop_ids: set | None = None, max_pages: int | None = None) -> tuple[list[dict], bool]:
+    async def paged(self, path: str, query: dict, stop_ids: set | None = None, max_pages: int | None = None,
+                    cap: int | None = None) -> tuple[list[dict], bool]:
         """Every page of a list (first / after, the cursor the answer gives): (rows, complete). Not complete when the
         page cap was reached with a cursor still on offer — the caller must not take the list for the whole truth — or
-        when the read stopped on purpose (1.137.1): ``stop_ids`` all seen, or ``max_pages`` read."""
+        when the read stopped on purpose (1.137.1): ``stop_ids`` all seen, or ``max_pages`` read. ``cap`` (1.150.0) is
+        this one read's own page cap in place of ORDERS_PAGES_MAX (the redeem's read of the positions: positions_read)."""
         rows, after, seen = [], "", set()
-        pages = self.ORDERS_PAGES_MAX if not max_pages else max(1, min(self.ORDERS_PAGES_MAX, int(max_pages)))
+        limit = self.ORDERS_PAGES_MAX if not cap else max(1, int(cap))
+        pages = limit if not max_pages else max(1, min(limit, int(max_pages)))
         for _ in range(pages):
             q = {**query, "first": self.ORDERS_PAGE}
             if after:
@@ -873,6 +876,15 @@ class PredictApi:
     async def positions(self) -> list[dict]:
         rows, self.positions_complete = await self.paged("/positions", {})  # every page: a long list cut short would hide positions (and redemptions)
         return rows
+
+    async def positions_read(self, pages: int) -> tuple[list[dict], bool]:
+        """The positions read ``pages`` pages deep at most, with this read's own answer: (rows, whole). The redeem's read
+        (1.150.0, audit RDM-POSITIONS-CUT): positions() stops at ORDERS_PAGES_MAX (20 pages, 1000 rows at 50 a page) and
+        the bot never burns a losing token, so on a busy account the list outgrows that — and a winner listed past the
+        cut was never seen by any redeem round, while the check concluded 赢的都领完了. ORDERS_PAGES_MAX stays as it is
+        for the open-order reads and the once-a-minute positions readers (twenty pages already cost seconds), and
+        positions_complete stays theirs: this read neither raises their cap nor writes their flag."""
+        return await self.paged("/positions", {}, cap=pages)
 
 
 def order_hash_of(row: dict) -> str:
@@ -1397,6 +1409,8 @@ class LiveBot(core.Bot):
     LIVE_REDEEM_SECONDS = 600   # resolved positions are looked for this often...
     LIVE_REDEEM_SOON_SECONDS = 20  # ...and this soon after a real position settled in the bot's favour (live_redeem_soon: the USDT back for the next quotes)
     LIVE_REDEEM_READS = 40      # markets read a redeem round at most, the longest unread first (1.150.0; the rest the next rounds): never a flood on the rate limit the orders share
+    LIVE_REDEEM_PAGES = 200     # the redeem's own read of the positions, this many pages at most (10,000 rows at 50 a page: positions_read, 1.150.0);
+    #                             a list longer still is said (the round's summary, /live redeem check, one notice an hour), never taken for the whole
     LIVE_REDEEM_RETRY_SECONDS = 3600  # a position whose redeem failed (gas, a revert) is tried again after this long, not every look...
     LIVE_REDEEM_UNSENT_RETRY_SECONDS = 300  # ...one whose transaction never left (TxNotSent: not resolved on-chain yet, an RPC blip) after this long
     LIVE_REDEEM_TICK_SECONDS = 5     # the automatic redeem's own timer (live_redeem_loop): rounds whatever the paper trader does
@@ -1451,6 +1465,8 @@ class LiveBot(core.Bot):
         self.live_redeem_noted = -1e9                        # the last failed redeem told on Telegram (LIVE_REDEEM_NOTE_SECONDS)
         self.live_redeem_loop_task: asyncio.Task | None = None
         self.live_gas_noted = -1e9
+        self.live_redeem_cut = 0          # the last redeem pass's own positions read: 0 = whole, else the rows it read of a longer list (1.150.0)
+        self.live_cut_noted = -1e9        # ...and when such a cut list was last told on Telegram (an hour apart, as the gas)
         self.live_step_ms: dict[str, int] = {}  # the last step's phases (预取 / 决策 / 下单 / 同步), for /diag
         self.live_fill_tasks: set = set()   # the fills reads of orders confirmed removed, beside the lane (live_fills_later)
         self.live_placing: set[str] = set()     # records whose order is being sent right now: the step and the express lane never both
@@ -4110,7 +4126,22 @@ class LiveBot(core.Bot):
         cap, a failed read, a rate limit), fields (no index set on the position, no condition on the market), kept
         (redeemed before, still listed). ``dry_run`` (/live redeem check): nothing sent, written or announced — the
         markets the next round would read, whose turn it leaves as it was."""
-        rows = await self.live.api.positions()
+        # 1.150.0 (audit RDM-POSITIONS-CUT): the redeem's own read, LIVE_REDEEM_PAGES deep, and its own answer whether the list
+        # came whole. It read api.positions() — ORDERS_PAGES_MAX pages, 1000 rows at 50 a page — and never looked at whether
+        # that was the whole list: the bot never burns a losing token, so on the pre-open mode's account the list grows by
+        # hundreds of rows a day, and a winner listed past the cut was never seen by any round (the ten-minute one, the one a
+        # win brings, /live redeem) while the round said 持仓 1000 个：输掉的 1000 and the check 赢的都领完了. The answer is
+        # taken from this read itself, never from api.positions_complete: that flag is shared with the once-a-minute readers
+        # (live_late_fills, /live fills, live_unexplained), which keep their twenty pages and their flag. A list longer even
+        # than this read is said — live_redeem_cut, the round's summary, the check, one notice an hour — never taken whole.
+        read = getattr(self.live.api, "positions_read", None)
+        if callable(read):
+            rows, whole = await read(self.LIVE_REDEEM_PAGES)
+        else:  # a client without it (a stand-in): its own read and flag
+            rows = await self.live.api.positions()
+            whole = bool(getattr(self.live.api, "positions_complete", True))
+        cut = 0 if whole else len(rows)
+        self.live_redeem_cut = cut  # (the dry run's for live_redeem_report, read under the same lock right after it)
         self.live_positions = (rows, time.time())
         done: list[str] = []
         seen: list[dict] = []
@@ -4231,10 +4262,18 @@ class LiveBot(core.Bot):
             self.live_redeem_noted = time.monotonic()
             self.live_notify(f"⚠️ 自动领取：{len(failed)} 个已结算的持仓没领成（{failed[0]['title']}：{failed[0]['error']}），"
                              f"{'5 分钟' if failed[0].get('unsent') else '一小时'}后自动再试。/live redeem check 查看原因", key="redeem:fail")
+        if cut and time.monotonic() - getattr(self, "live_cut_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
+            # 1.150.0 (RDM-POSITIONS-CUT): a list longer than even the redeem's own read — told once an hour on its own timer (a bare
+            # key would come back every LIVE_NOTE_SECONDS, a round or two), not only in the summary nobody asks for
+            self.live_cut_noted = time.monotonic()
+            text = (f"⚠️ 自动领取：Predict 的持仓列表超过 {cut} 条，只读到前 {cut} 条，后面的持仓没检查（可能有赢的没领）："
+                    "先到 Predict 网站核对、手动领取。/live redeem check 查看")
+            self.live_note_error(text)
+            self.live_notify(text, key="redeem:cut")
         counts: dict[str, int] = {}
         for s in seen:
             counts[s["kind"]] = counts.get(s["kind"], 0) + 1
-        self.live_redeem_last = {"at": now_ms, "counts": counts, "low_gas": low_gas, "error": ""}
+        self.live_redeem_last = {"at": now_ms, "counts": counts, "low_gas": low_gas, "error": "", "cut": cut}
         return done, seen
 
     @classmethod
@@ -4246,8 +4285,10 @@ class LiveBot(core.Bot):
             return str(last["error"])
         counts = last.get("counts") or {}
         text = "，".join(f"{label} {counts[k]}" for k, label in cls.REDEEM_KINDS.items() if counts.get(k))
+        cut = int(last.get("cut") or 0)  # 1.150.0 (RDM-POSITIONS-CUT): the counts are of the part read — said, so 输掉的 N reads for what it is
         return (f"持仓 {sum(counts.values())} 个" + (f"：{text}" if text else "")
-                + ("；签名钱包 BNB 不足，领取交易发不出去" if last.get("low_gas") and counts.get("claimable") else ""))
+                + ("；签名钱包 BNB 不足，领取交易发不出去" if last.get("low_gas") and counts.get("claimable") else "")
+                + (f"；⚠️ 持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查" if cut else ""))
 
     def live_redeem_status_line(self) -> str:
         """/live: the automatic redeem in a line — on or off, the last round, whether one is running."""
@@ -4284,9 +4325,11 @@ class LiveBot(core.Bot):
             return "\n".join(lines)
         async with self.redeem_lock():
             _, seen = await self.live_redeem_pass(now_ms, dry_run=True)
+            cut = int(getattr(self, "live_redeem_cut", 0) or 0)  # this dry run's own read (1.150.0): set by the pass, under the same lock
         n = lambda kind: sum(1 for s in seen if s["kind"] == kind)
         value = sum(float(s.get("value") or 0) for s in seen if s["kind"] == "claimable")
-        lines.append(f"持仓 {len(seen)} 个：" + ("，".join(f"{label} {n(k)}" for k, label in self.REDEEM_KINDS.items() if n(k)) or "没有"))
+        lines.append(f"持仓 {len(seen)} 个：" + ("，".join(f"{label} {n(k)}" for k, label in self.REDEEM_KINDS.items() if n(k)) or "没有")
+                     + (f"（⚠️ 持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查）" if cut else ""))
         listed = {"claimable": ("可领取", self.REDEEM_REPORT_LINES), "waiting": ("领取失败、等重试", self.REDEEM_REPORT_LINES),
                   "fields": ("缺字段", self.REDEEM_REPORT_LINES), "kept": ("已发过领取交易、Predict 还列着", 3), "open": ("未结算", 3), "unread": ("这次没读到市场", 2)}
         for kind, (label, cap) in listed.items():
@@ -4325,6 +4368,10 @@ class LiveBot(core.Bot):
             why = "现在没有可领取的：赢的都领完了，剩下的还没结算，结算后自动领取"
         else:
             why = "现在没有可领取的：赢的都领完了，其余是输掉的"
+        if cut:
+            # 1.150.0 (RDM-POSITIONS-CUT): the part read says nothing of the rest — the cut first, and never 赢的都领完了 on it
+            head = f"持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查：后面可能还有赢的没领，先到 Predict 网站核对、手动领取"
+            why = head + ("；读到的这部分里没有可领取的" if "赢的都领完了" in why else "；" + why)
         lines.append("结论：" + why)
         recent = [e for e in self.live_errors if "领取" in e or "⛽" in e][-3:]
         if recent:
@@ -4447,7 +4494,8 @@ class LiveBot(core.Bot):
             if lines:
                 return "\n".join(lines)
             last = self.live_redeem_last
-            head = "这次没有领取" if (last.get("counts") or {}).get("claimable") else "没有可领取的已结算持仓"
+            head = ("这次没有领取" if (last.get("counts") or {}).get("claimable")
+                    else "读到的持仓里没有可领取的" if last.get("cut") else "没有可领取的已结算持仓")  # 1.150.0: a cut list is no all-clear
             return f"{head}：{self.live_redeem_summary(last)}。/live redeem check 看原因"
         if action == "check":
             lines = await self.live_prepare()
