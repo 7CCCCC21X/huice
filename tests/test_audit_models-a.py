@@ -968,4 +968,315 @@ nv.priced_ms = NVO_MON[1]
 nv.save({"kind": "high", "time": NVO_MON[0], "hi": 210.5, "lo": 184.5})
 assert nv.advice_problem(at) == "" and nv.odds(at) == m.TouchOdds(0.0, 1.0, 0.0)
 
+
+# --- MOD-NVDA-CLOSE-RESTING: NVDA 先触 $160 / $210 advises in the regular session only. From the bell on the price in hand is
+# the closing print — Yahoo's regular-session trade knows nothing of the after hours, Binance's index is refused out of the
+# session — while the stock trades on, and the card holds: "按收盘价报价会被知道盘后行情的人吃掉". That hold kept new orders
+# away; the resting order placed in the session stood under it. An order under a hold is not judged (sim_requote_reason), the
+# rules that end a quote with its session are the daily cards' (SIM_MAKER_SESSION, SIM_OPEN_QUIET_MINUTES), and the one rule
+# left was the generic clock of SIM_NO_ODDS_WITHDRAW_MINUTES: 30 minutes by default, never at 0. NVDA's results come out some
+# twenty minutes after the bell — the bid stood through them at the close's fair price, on Predict too with LIVE on. Now a
+# resting order on a US stock's first-touch card goes at the first look after the session's end (Bot.sim_stock_touch_closed),
+# whatever that setting says, and the next one is the next session's, on a price of that session. Real Bot and LiveBot: the
+# card's own reads of a stand-in Yahoo, Predict's book, the trader's step and express lane, the real order on a stand-in
+# Predict ----
+NVC_DAY = dt.date(2026, 11, 18)                      # a Wednesday
+NVC_CLOSE = m.us_session(NVC_DAY)[1]                 # its closing bell: 16:00 ET
+NVC_NEXT = m.us_session(dt.date(2026, 11, 19))[0]    # Thursday's opening bell: 09:30 ET
+NVC_ENV = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_MARKETS": "touch",
+           "SIM_WAYS": "maker", "SIM_MAKER_POINTS": "off"}  # the finding's two choices (先触价, 挂单), and no waiting for Predict's points
+# ...the rest at its default: 100 shares a resting order, the 10¢ bar, SIM_MAKER_SESSION on, SIM_NO_ODDS_WITHDRAW_MINUTES 30
+NVC_WHY = "美股已收盘：盘前盘后的价格不算数、但会影响开盘价，按收盘价挂着的单会被知道盘后行情的人吃掉，收盘即撤（开盘后再挂）"
+NVC_TID = f"{NVDA.slug}|up|挂"  # the resting order on "$210 first", the card's 涨 side
+_nvc_clock = _Clock(NVC_CLOSE)
+
+
+def _nvc_stock(now: int) -> float:
+    """NVDA's regular-session price: 190.00 all Wednesday; Thursday opens 8% lower (the results came out after Wednesday's bell)."""
+    return 190.0 if now < NVC_NEXT else 174.8
+
+
+def _nvc_daily(today: dt.date) -> list:
+    """A year of finished sessions before ``today``: closes 190.00 and 195.32 in turn (±2.8% a day: σ 44%), Wednesday's 190.00."""
+    days = [d for d in (NVC_DAY - dt.timedelta(days=n) for n in range(365, -2, -1)) if m.us_session(d)]
+    closes = [190.0 * (1.028 if (days.index(NVC_DAY) - i) % 2 else 1.0) for i in range(len(days))]
+    return [(m.us_session(d)[0], c * 0.999, c * 1.005, c * 0.995, c) for d, c in zip(days, closes) if d < today]
+
+
+async def _nvc_yahoo(url: str, extra: object = None, record: bool = True) -> bytes:
+    """Yahoo's chart on the test's clock: the daily bars, and the 1-minute chart of the session running — the stock's trade
+    2 s old — or, between two sessions, of the one just finished: its minutes, and its closing print as the last trade
+    whatever the stock does after hours (includePrePost=false; regularMarketPrice is the regular session's)."""
+    q, now = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query)), _nvc_clock.now
+    assert "/NVDA?" in url and q.get("interval") in ("1m", "1d"), url
+    if q["interval"] == "1d":
+        return _nvo_chart(_nvc_daily(m.et_date(now)))
+    day = m.et_date(now)
+    while not m.us_session(day) or m.us_session(day)[0] > now:
+        day -= dt.timedelta(days=1)  # no session today, or not yet: the last one before
+    opened, closed = m.us_session(day)
+    price = _nvc_stock(min(now, closed - 1))
+    return _nvo_chart([(o, price, price + 0.1, price - 0.1, price) for o in range(opened, min(now, closed), 60_000)], price,
+                      now // 1000 - 2 if now < closed else closed // 1000)
+
+
+async def _nvc_silent(url: str, extra: object = None, record: bool = True) -> bytes:
+    raise m.RemoteError("HTTP 502: Bad Gateway")
+
+
+def _nvc_bot(now: int, cls: type = m.Bot, **env: str) -> tuple:
+    """A real Bot (or LiveBot) that rests orders on the first-touch markets, its NVDA card reading the stand-in Yahoo."""
+    _nvc_clock.now = now
+    bot = cls(m.Config.from_env({**NVC_ENV, **env}), m.Store(":memory:"), _nvc_clock, None)
+    card = bot.touches["NVDA-2027"]
+    assert isinstance(card, m.StockTouchMarket) and bot.config.sim_markets == frozenset({"touch"}), bot.config.sim_markets
+    for key, touch in bot.touches.items():
+        if key != "NVDA-2027":
+            touch.refresh = _nv_idle  # the crypto first-touch cards read Binance: not this test's business
+    bot.predict.info[NVDA.slug] = {"outcomes": ["$160", "$210"], "created_ms": NV_CREATED}
+    return bot, card
+
+
+async def _nvc_feeds(bot: m.Bot, card: m.StockTouchMarket, now: int, bid: float, ask: float, read: bool = True, scan: bool = False) -> None:
+    """The feeds at ``now``: Yahoo read by the card (``read``; ``scan``: the daily bars too — the cadence is the test's, not
+    the machine's), the first-touch round, and Predict's book of the market — "$210 first" bid and offered at ``bid`` /
+    ``ask``, 500 shares each (Predict lists "$160" first: the book it sends is that side's, the complement)."""
+    _nvc_clock.now = now
+    card.times["price"] = -1e9 if read else time.monotonic()
+    if scan:
+        card.times["scan"] = -1e9
+    await bot.refresh_touch(now)
+    bot.predict.books["NVDA-2027"] = m.PredictBook("NVDA-2027", NVDA.slug, "77", "t", ((D(f"{1 - ask:.2f}"), D("500")),),
+                                                   ((D(f"{1 - bid:.2f}"), D("500")),), now, None)
+
+
+async def _nvc_look(bot: m.Bot, card: m.StockTouchMarket, now: int, bid: float, ask: float, read: bool = True, scan: bool = False,
+                    express: bool = True) -> dict:
+    """The feeds at ``now`` (_nvc_feeds), then the trader's step and (``express``) its express lane; the records after them."""
+    await _nvc_feeds(bot, card, now, bid, ask, read, scan)
+    bot.sim_ran = -1e9  # the step is due (its timer is the machine's)
+    await bot.sim_step(now)
+    if express:
+        await bot.sim_express("NVDA-2027")
+    return {tid: (t["status"], t["price"], t["shares"]) for tid, t in bot.sim_trades().items()}
+
+
+async def _nvc_paper() -> None:
+    """1. the finding's case on paper, from two minutes before Wednesday's bell to Thursday's first minute."""
+    at = NVC_CLOSE - 120_000
+    bot, card = _nvc_bot(at)
+    c = bot.config
+    assert (c.sim_ways, c.sim_no_odds_withdraw, c.sim_maker_session, c.sim_shares, c.sim_edge) == ("maker", 30, True, 100.0, 0.1)
+    # 15:58:00, the session running: NVDA 190.00, "$210 first" worth 60¢ and bid 44¢ / offered 47¢ on Predict. The resting
+    # order joins the bid, and rests there to the session's last millisecond
+    got = await _nvc_look(bot, card, at, 0.44, 0.47)
+    fair = _mk(bot, "NVDA-2027", at).fair_up
+    assert got == {NVC_TID: ("resting", 0.44, 0.0)} and 0.59 < fair < 0.61 and 0.43 < card.sigma < 0.45, (got, fair, card.sigma)
+    assert (card.price, card.priced_ms, card.advice_problem(at)) == (D("190.0000"), at - 2_000, ""), (card.price, card.advice_problem(at))
+    for at in (NVC_CLOSE - 60_000, NVC_CLOSE - 1):
+        assert await _nvc_look(bot, card, at, 0.44, 0.47) == {NVC_TID: ("resting", 0.44, 0.0)} and _mk(bot, "NVDA-2027", at).hold == "", at
+    # 16:00:00.000, the bell. The card's price is the closing print from here to Thursday's first trade, and it holds for
+    # that. The page's 为什么挂 row says what the next look does with the order, and the step does it (the express lane
+    # passes a held card by): withdrawn, as the strategy's own doing, the slot free — and nothing put in its place.
+    # (Before: left where it was, under the hold, until 16:30:00)
+    await _nvc_feeds(bot, card, NVC_CLOSE, 0.44, 0.47)
+    mk = _mk(bot, "NVDA-2027", NVC_CLOSE)
+    assert mk.hold.startswith("美股休市中：盘前盘后的价格不算数") and abs(mk.fair_up - fair) < 0.001 and (card.price, card.priced_ms) == (D("190.0000"), NVC_CLOSE), mk.hold
+    fair = mk.fair_up  # ...and so is the fair price, all night: no trading time passes, and nothing the card reads moves
+    said = bot.sim_why(mk, bot.sim_trades(), NVC_CLOSE)["maker"]["sides"][0]["text"]
+    assert said.startswith("挂单中：44.0¢×100 份") and said.endswith("；下一轮撤掉：" + NVC_WHY), said
+    got = await _nvc_look(bot, card, NVC_CLOSE, 0.44, 0.47, read=False, express=False)
+    assert got == {NVC_TID + "#1": ("cancelled", 0.44, 0.0)}, got
+    rec = bot.sim_trades()[NVC_TID + "#1"]
+    assert rec["withdrawn"] == {"at": NVC_CLOSE, "why": NVC_WHY, "unfilled": 100.0, "rule": True} and rec["note"] == f"撤单：{NVC_WHY}，一份都没成交", rec
+    assert bot.sim_unpriced_since == {}  # nothing is left for the generic clock to time
+    # ...16:00:05; 16:20, the results: the stock −8% after hours, which the card cannot see (190.00, the close) and Predict's
+    # book can — "$210 first", worth 30¢ now, bid 14¢ / offered 16¢: sellers 28¢ through where the order had rested; 16:31;
+    # overnight; Thursday before the bell. Nothing fills, nothing rests, nothing is placed.
+    # (Before: filled at 16:20, 100 shares at 44¢ of a side worth 30¢ — and with no such seller, withdrawn only at 16:30)
+    after = m.first_touch(174.8, 160.0, 210.0, card.sigma, 0.0, card.remaining_years(NVC_CLOSE)).fair_upper
+    assert 0.29 < after < 0.31 and 0.13 < 0.44 - after < 0.15, after
+    for at, bid, ask in ((NVC_CLOSE + 5_000, 0.44, 0.47), (NVC_CLOSE + 20 * 60_000, 0.14, 0.16), (NVC_CLOSE + 31 * 60_000, 0.14, 0.16),
+                         (NVC_CLOSE + 6 * 3600_000, 0.14, 0.16), (NVC_NEXT - 1, 0.14, 0.16)):
+        got = await _nvc_look(bot, card, at, bid, ask, scan=at > NVC_CLOSE + 3600_000)
+        mk = _mk(bot, "NVDA-2027", at)
+        assert got == {NVC_TID + "#1": ("cancelled", 0.44, 0.0)} and mk.hold.startswith("美股休市中：") and mk.fair_up == fair, (at - NVC_CLOSE, got, mk.hold)
+        assert (card.price, card.priced_ms) == (D("190.0000"), NVC_CLOSE) and "卡片暂不建议（美股休市中：" in bot.sim_maker_gate(mk, at), at - NVC_CLOSE
+    # Thursday 09:30:00: the session runs, the price in hand is still Wednesday's close (MOD-NVDA-OPEN-GAP's hold): nothing
+    # yet. 09:30:30, Yahoo's first read of the session — 174.80, "$210 first" worth 30¢: the next order goes on that price
+    for at in (NVC_NEXT, NVC_NEXT + 5_000):
+        got = await _nvc_look(bot, card, at, 0.14, 0.16, read=False)
+        assert got == {NVC_TID + "#1": ("cancelled", 0.44, 0.0)} and _mk(bot, "NVDA-2027", at).hold.startswith("美股已开盘，现价还是开盘前的"), (at - NVC_NEXT, got)
+    at = NVC_NEXT + 30_000
+    got = await _nvc_look(bot, card, at, 0.14, 0.16)
+    mk = _mk(bot, "NVDA-2027", at)
+    assert (card.price, card.priced_ms, mk.hold) == (D("174.8000"), at - 2_000, "") and abs(mk.fair_up - after) < 0.001, (card.price, mk.hold, mk.fair_up)
+    assert got == {NVC_TID: ("resting", 0.14, 0.0), NVC_TID + "#1": ("cancelled", 0.44, 0.0)}, got
+
+
+async def _nvc_whatever(minutes: str, silent: bool) -> None:
+    """2. the same order under another SIM_NO_ODDS_WITHDRAW_MINUTES — 0: 不撤, the one that left it up all night — and, ``silent``,
+    with Yahoo silent after its read of 15:58 and the first look after the bell at 16:06: the card shows no odds by then (its
+    last read is over five minutes old) and the trader has no SimMarket for the record. It goes at that look all the same.
+    (Before: at 16:30, at 18:00, never; with Yahoo silent at 16:36 — 概率暂缺已超过 30 分钟 — or never)"""
+    bot, card = _nvc_bot(NVC_CLOSE - 120_000, SIM_NO_ODDS_WITHDRAW_MINUTES=minutes)
+    assert bot.config.sim_no_odds_withdraw == int(minutes)
+    assert await _nvc_look(bot, card, NVC_CLOSE - 120_000, 0.44, 0.47) == {NVC_TID: ("resting", 0.44, 0.0)}
+    at = NVC_CLOSE + (360_000 if silent else 0)
+    if silent:
+        m.fetch_source = _nvc_silent
+    try:
+        got = await _nvc_look(bot, card, at, 0.44, 0.47)
+    finally:
+        m.fetch_source = _nvc_yahoo
+    assert got == {NVC_TID + "#1": ("cancelled", 0.44, 0.0)} and bot.sim_trades()[NVC_TID + "#1"]["withdrawn"]["why"] == NVC_WHY, (minutes, silent, got)
+    priced = [x for x in bot.sim_markets(at) if x.key == "NVDA-2027"]
+    assert (priced == [] and card.odds(at).startswith("Yahoo 行情停在 ")) if silent else priced[0].hold.startswith("美股休市中："), (minutes, silent, card.odds(at))
+
+
+async def _nvc_session_hold() -> None:
+    """3. in the session nothing changes: a hold that may pass leaves the order to the generic clock, as before. Wednesday
+    11:00, the order resting; Yahoo goes silent. Its last read five minutes old, the odds pause and the order stands unpriced —
+    for SIM_NO_ODDS_WITHDRAW_MINUTES from the first look that finds it so (11:06), then withdrawn in that rule's words."""
+    t0 = m.et_wall_ms(NVC_DAY, 11, 0)
+    bot, card = _nvc_bot(t0)
+    assert await _nvc_look(bot, card, t0, 0.44, 0.47) == {NVC_TID: ("resting", 0.44, 0.0)}
+    m.fetch_source = _nvc_silent
+    try:
+        for minutes, status in ((4, "resting"), (6, "resting"), (20, "resting"), (35.9, "resting"), (36.1, "cancelled")):
+            at = t0 + int(minutes * 60_000)
+            got = await _nvc_look(bot, card, at, 0.44, 0.47)
+            assert [(s, p) for s, p, _ in got.values()] == [(status, 0.44)], (minutes, got)
+            assert (minutes < 5) == any(x.key == "NVDA-2027" for x in bot.sim_markets(at)), minutes  # priced for five minutes after the last read
+    finally:
+        m.fetch_source = _nvc_yahoo
+    assert bot.sim_trades()[NVC_TID + "#1"]["withdrawn"]["why"] == "概率暂缺已超过 30 分钟，撤单", bot.sim_trades()[NVC_TID + "#1"]["withdrawn"]
+
+
+_nv_fetch = m.fetch_source
+m.fetch_source = _nvc_yahoo
+asyncio.run(_nvc_paper())
+for minutes, silent in (("0", False), ("120", False), ("30", True), ("0", True)):
+    asyncio.run(_nvc_whatever(minutes, silent))
+asyncio.run(_nvc_session_hold())
+
+# 4. the rule itself, on a record by hand — no SimMarket at all: read from the record's own kind and key. Closed is closed:
+#    from the bell to the next bell to the millisecond, a weekend, a holiday, the 13:00 bell of an early close
+bot, card = _nvc_bot(NVC_CLOSE)
+rec = {"market": NVDA.slug, "slug": NVDA.slug, "key": "NVDA-2027", "kind": "touch", "maker": True, "status": "resting", "side": "up",
+       "order": 100.0, "shares": 0.0, "price": 0.44, "settle": {"deadline": NVDA.deadline_ms}}
+half = m.et_wall_ms(dt.date(2026, 11, 27), 13, 0)  # the day after Thanksgiving closes at 13:00 ET
+assert m.us_session(dt.date(2026, 11, 26)) is None and m.us_session(dt.date(2026, 11, 27))[1] == half
+for at, closed in ((NVC_CLOSE - 1, False), (NVC_CLOSE, True), (NVC_NEXT - 1, True), (NVC_NEXT, False),
+                   (m.et_wall_ms(dt.date(2026, 11, 21), 11, 0), True),   # a Saturday
+                   (m.et_wall_ms(dt.date(2026, 11, 26), 11, 0), True),   # Thanksgiving
+                   (half - 1, False), (half, True), (m.et_wall_ms(dt.date(2026, 11, 27), 15, 0), True)):
+    assert bot.sim_withdraw_reason(rec, None, at) == (NVC_WHY if closed else ""), (at, bot.sim_withdraw_reason(rec, None, at))
+# not a taker's record; not the crypto first-touch cards, which trade around the clock
+assert bot.sim_withdraw_reason({**rec, "maker": False}, None, NVC_CLOSE) == ""
+for key in ("BNB-2027", "BTC-2027"):
+    spec = bot.touches[key].spec
+    assert type(bot.touches[key]) is m.TouchMarket and spec.deadline_ms > NVC_NEXT
+    assert bot.sim_withdraw_reason({**rec, "market": spec.slug, "slug": spec.slug, "key": key, "settle": {"deadline": spec.deadline_ms}}, None, NVC_CLOSE) == ""
+# a reason that applied before is given in its own words, as it was: the market over, the trader no longer resting orders
+assert bot.sim_withdraw_reason(rec, None, NVDA.deadline_ms + 1) == "已到结束时间，等结果出来：不开新单，挂单撤掉"
+assert _nvc_bot(NVC_CLOSE, SIM_WAYS="taker")[0].sim_withdraw_reason(rec, None, NVC_CLOSE) == "模拟交易已改为只吃单"
+# only where the card itself holds — between two sessions, every state of its path check (the table above ran on a card that
+# knows nothing yet: its creation unread) but a line reached. Decided, it holds nothing (the after hours move nothing either)
+# and the order is left to the result, as before
+assert card.start_ms == 0 and card.advice_problem(NVC_CLOSE) == "开盘时间未知，无法核验此前是否已触线；暂不给建议"
+card.start_ms = NV_CREATED
+for kind, closed in ((None, True), ("clear", True), ("ambiguous", True), ("low", False), ("high", False)):
+    if kind:
+        card.save({"kind": kind, "through": m.et_wall_ms(NVC_DAY, 0, 0), "time": m.et_wall_ms(NVC_DAY, 10, 0), "hi": 211.0, "lo": 159.0})
+    assert card.history.get("kind") == kind and bool(card.advice_problem(NVC_CLOSE)) is closed, (kind, card.advice_problem(NVC_CLOSE))
+    assert bot.sim_withdraw_reason(rec, None, NVC_CLOSE) == (NVC_WHY if closed else "") and bot.sim_withdraw_reason(rec, None, NVC_CLOSE - 1) == "", kind
+
+
+# 5. the real trader: the order is a real one on Predict — a BUY of 100 "$210" at 44¢ that expires with the market, in 2027 —
+#    and the cancel goes out in the bell's own look, so nothing is there for the results to hit. (Before: open on Predict
+#    until the look at 16:30.) The SDK test suite's key (tests/test_trading.py: never a real one) and a stand-in Predict
+class _NvcPredict:
+    """Predict as the real trader sees it (tests/test_trading.py's FakeApi, trimmed): the market, our own orders."""
+    def __init__(self):
+        self.jwt, self.jwt_exp, self.auth_error, self.lookup = "t", 0, "", ""
+        self.open, self.closed, self.calls, self.next_id = {}, {}, [], 100
+
+    async def ensure_auth(self): pass
+
+    async def market(self, mid):
+        return {"id": int(mid), "status": "REGISTERED", "isNegRisk": False, "isYieldBearing": False, "feeRateBps": 200, "conditionId": "0x" + "ab" * 32,
+                "outcomes": [{"name": "$160", "indexSet": 1, "onChainId": f"{mid}1"}, {"name": "$210", "indexSet": 2, "onChainId": f"{mid}2"}]}
+
+    async def create_order(self, body):
+        self.next_id += 1
+        oid, data = str(self.next_id), body["data"]
+        self.calls.append(("create", oid))
+        self.open[oid] = {"id": oid, "status": "OPEN", "amount": data["order"]["takerAmount"], "amountFilled": "0", "strategy": data["strategy"],
+                          "pricePerShare": data["pricePerShare"], "order": {**data["order"]}}
+        return {"order_id": oid, "hash": data["order"]["hash"], "code": None}
+
+    async def remove_orders(self, ids):
+        self.calls.append(("remove", list(ids)))
+        removed = [i for i in ids if i in self.open]
+        for i in removed:
+            self.closed[i] = {**self.open.pop(i), "status": "CANCELLED"}
+        return {"removed": removed, "noop": [i for i in ids if i not in removed]}
+
+    async def orders(self, status="OPEN", **params):
+        return [dict(r) for r in (self.open.values() if status == "OPEN" else self.closed.values()) if r["status"] == status]
+
+    async def order(self, oid, hash_=""):
+        row = self.open.get(oid) or self.closed.get(oid) or next((r for r in (*self.open.values(), *self.closed.values()) if hash_ and r["order"]["hash"] == hash_), None)
+        return dict(row) if row is not None else None
+
+    async def positions(self): return []
+
+
+class _NvcChain:
+    async def account_owner(self, account): return "0x8fd379246834eac74B8419FfdA202CF8051F7A03"
+    async def usdt_balance(self, owner=None): return 1000 * 10 ** 18
+    async def bnb_balance(self, owner=None): return 10 ** 17
+    async def allowance(self, key, owner=None): return 10 ** 30
+
+
+def _nvc_pending(lb: object, decided: int) -> dict:
+    """A real resting order decided at ``decided`` and not sent yet (held back by a cooldown, a sign-in): 挂210 at 44¢."""
+    return {"v": 2, "market": NVDA.slug, "slug": NVDA.slug, "item": "NVDA 先触 160/210", "kind": "touch", "key": "NVDA-2027", "side": "up", "label": "挂210",
+            "maker": True, "status": "resting", "shares": 0.0, "order": 100.0, "price": 0.44, "fills": [], "revisions": [], "opened": decided,
+            "settle": {"deadline": NVDA.deadline_ms}, "version": {"sim_shares": lb.config.sim_shares},
+            "live": {"state": "pending", "want": {"maker": True}, "events": [{"at": decided, "what": "决定下单"}]}}
+
+
+async def _nvc_live() -> None:
+    at = NVC_CLOSE - 120_000
+    lb, card = _nvc_bot(at, cls=L.LiveBot, LIVE="on", PREDICT_PRIVATE_KEY="0x" + "a" * 64, PREDICT_API_KEY="k")
+    api = lb.live.api = _NvcPredict()
+    lb.live.chain = _NvcChain()
+    await lb.live_prepare()
+    assert lb.live.ready, lb.live.ready_error
+    for at in (NVC_CLOSE - 120_000, NVC_CLOSE - 60_000, NVC_CLOSE - 1_000):  # 15:58:00 the order goes out; it rests on Predict to the bell
+        assert await _nvc_look(lb, card, at, 0.44, 0.47) == {NVC_TID: ("resting", 0.44, 0.0)}, at - NVC_CLOSE
+        live = lb.sim_trades()[NVC_TID]["live"]
+        assert (live["state"], live["order_id"]) == ("open", "101") and api.calls == [("create", "101")] and list(api.open) == ["101"], (live["state"], api.calls)
+    order = api.open["101"]
+    assert (order["strategy"], order["pricePerShare"], order["order"]["tokenId"], order["order"]["side"]) == ("LIMIT", str(44 * 10 ** 16), "772", 0), order
+    assert order["order"]["takerAmount"] == str(100 * 10 ** 18) and int(order["order"]["expiration"]) == NVDA.deadline_ms // 1000 + 7200  # Predict keeps it until then
+    # a resting order decided three seconds ago and held back goes out while the session runs (the send-time re-check)...
+    assert lb.live_taker_recheck(_nvc_pending(lb, at - 3_000), at) == ("", False)
+    # 16:00:00: withdrawn by the step, the cancel sent and confirmed by its own sync. The results at 16:20 find no order
+    got = await _nvc_look(lb, card, NVC_CLOSE, 0.44, 0.47, express=False)
+    assert got == {NVC_TID + "#1": ("cancelled", 0.44, 0.0)} and api.calls == [("create", "101"), ("remove", ["101"])] and not api.open, (got, api.calls)
+    rec = lb.sim_trades()[NVC_TID + "#1"]
+    assert (rec["live"]["state"], rec["live"]["final"], rec["live"]["cancel_why"], rec["withdrawn"]["why"]) == ("done", "cancelled", NVC_WHY, NVC_WHY), rec["live"]
+    assert api.closed["101"]["status"] == "CANCELLED" and api.closed["101"]["amountFilled"] == "0"
+    # ...and not once the bell has rung: decided at 15:59:58, sent at 16:00:01 — void, no new order on the close
+    assert lb.live_taker_recheck(_nvc_pending(lb, NVC_CLOSE - 2_000), NVC_CLOSE + 1_000) == (f"盘口变了：{NVC_WHY}，3 秒前的挂单决定作废", False)
+    for at, bid, ask in ((NVC_CLOSE + 5_000, 0.44, 0.47), (NVC_CLOSE + 20 * 60_000, 0.14, 0.16), (NVC_CLOSE + 31 * 60_000, 0.14, 0.16)):
+        assert await _nvc_look(lb, card, at, bid, ask) == got and api.calls == [("create", "101"), ("remove", ["101"])] and not api.open, (at - NVC_CLOSE, api.calls)
+
+
+asyncio.run(_nvc_live())
+m.fetch_source = _nv_fetch
+
 print("AUDIT_MODELS_A_OK")

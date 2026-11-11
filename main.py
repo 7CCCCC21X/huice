@@ -10749,8 +10749,10 @@ class StockTouchMarket(TouchMarket):
     one, cannot be ordered from it: a manual check) and the running session's minutes as they come. Advice only while
     the regular session runs: between sessions the last trade is the price, but the stock trades on after hours — a
     quote on the close is a free option for whoever saw the after-hours move (the fair price moves some 3.7¢ a 1% move
-    between the lines), and a held card's resting orders are withdrawn after SIM_NO_ODDS_WITHDRAW_MINUTES. 1.150.0: and
-    in the session only on a price of that session, no more than PRICE_STALE_MS old by its own time (advice_problem)."""
+    between the lines), so an order resting at the close is withdrawn at it (Bot.sim_stock_touch_closed, 1.150.0; until
+    then only once the hold had lasted SIM_NO_ODDS_WITHDRAW_MINUTES — the half hour NVDA's results come out in).
+    1.150.0: and in the session only on a price of that session, no more than PRICE_STALE_MS old by its own time
+    (advice_problem)."""
     PRICE_SECONDS = StockRangeMarket.PRICE_SECONDS
     CLOSED_PRICE_SECONDS = StockRangeMarket.CLOSED_PRICE_SECONDS
     CLOSE_PRINT_MS = StockRangeMarket.CLOSE_PRINT_MS
@@ -18507,10 +18509,12 @@ class Bot:
     def sim_withdraw_reason(self, trade: dict, mk: SimMarket | None, now_ms: int | None = None) -> str:
         """Why a resting paper order is withdrawn now rather than left to the result: the trader no longer places such
         orders (SIM_WAYS, SIM_MARKETS, a kind that is taker-only such as the price ladders), the market is in its
-        last minutes (SIM_QUIET_MINUTES), or what is left of the order is a fraction of a share that never fills
-        (SIM_MAKER_DUST_SHARES, 1.118.0). "" while it stands."""
+        last minutes (SIM_QUIET_MINUTES), what is left of the order is a fraction of a share that never fills
+        (SIM_MAKER_DUST_SHARES, 1.118.0), or it rests on a US stock's first-touch card between two sessions
+        (sim_stock_touch_closed, 1.150.0). "" while it stands."""
         kind = str(trade.get("kind") or "")
-        quiet = self.sim_quiet(trade.get("settle") or (mk.settle if mk is not None else None), self.market.now_ms() if now_ms is None else now_ms)
+        now = self.market.now_ms() if now_ms is None else now_ms
+        quiet = self.sim_quiet(trade.get("settle") or (mk.settle if mk is not None else None), now)
         if quiet:
             return quiet
         if trade.get("maker") and trade.get("status") == "resting" and float(trade.get("shares") or 0) > 1e-9:
@@ -18527,7 +18531,39 @@ class Bot:
             return f"详细选项已排除{trade.get('item') or trade.get('key')}"
         if (kind == "range" and not RANGE_SIM_MAKERS) or (mk is not None and not mk.makers):
             return f"{SIM_KINDS.get(kind, kind)}只做吃单"
-        return ""
+        return self.sim_stock_touch_closed(trade, now)  # last: where one of the reasons above applies, its words stand as they did
+
+    def sim_stock_touch_closed(self, trade: dict, now_ms: int) -> str:
+        """Why a resting order on a US stock's first-touch card (StockTouchMarket: NVDA 先触 $160 / $210) is withdrawn as
+        soon as the regular session is over — at the step's first look after the bell (a 13:00 early close too), and at
+        any look between two sessions (a restart overnight, a weekend) — whatever SIM_NO_ODDS_WITHDRAW_MINUTES says
+        (1.150.0). The card stops advising at the close, and its hold says why: the price in hand is the closing print
+        and stays so until the next open (Yahoo's regular-session trade knows nothing of the after hours; Binance's
+        index is refused out of the session), while the stock trades on — a quote on the close is a free option for
+        whoever saw the after-hours move. But the hold only kept new orders away. The one already resting stood under
+        it unjudged (sim_requote_reason: no exit line, no 买1 followed), and the rules that end a quote with its session
+        are the daily cards' alone (SIM_MAKER_SESSION wants in_session False — a first-touch market's is None — and
+        sim_open_quiet / sim_against_move are kind "close" only), so it stood until sim_unpriced_reason's clock ran
+        out: 30 minutes by default, 60 or 120 on the control page's presets, all night at 0. NVDA reports some twenty
+        minutes after the bell: the bid was still up, at the close's fair price, when the results came out — on Predict
+        too with LIVE on, where a resting order lives until it is cancelled (its own expiry is the market's deadline).
+        That clock's grace is for a hold that passes (a feed's hiccup is not worth a cancel and a new order); this one
+        is on the calendar and lasts until the next open, so the wait bought nothing — the daily cards' orders go at
+        their close as well (SIM_MAKER_SESSION, on by default). Read from the record's own kind and key, not from
+        ``mk``: the order goes just the same when the card shows no odds (Yahoo silent after hours: no SimMarket), and
+        a resting order decided before the bell and held back past it (a cooldown, a sign-in) is voided at the send
+        (LiveBot.live_taker_recheck asks sim_withdraw_reason). Only where the card itself holds (advice_problem) —
+        between two sessions that is every state of it but a line already reached: decided, the after hours move
+        nothing and the order is left to the result, as before — so nothing takes the order's place (sim_maker_gate):
+        it is one cancel a day, never a cancel and a new order, and the next order is the next session's, on a price
+        of that session. The crypto first-touch cards (they trade around the clock) and a taker's record are left as
+        they were. "" otherwise."""
+        if not trade.get("maker") or trade.get("kind") != "touch":
+            return ""
+        card = self.touches.get(str(trade.get("key") or ""))
+        if not isinstance(card, StockTouchMarket) or us_session_state(now_ms)[0] == "交易中" or not card.advice_problem(now_ms):
+            return ""
+        return "美股已收盘：盘前盘后的价格不算数、但会影响开盘价，按收盘价挂着的单会被知道盘后行情的人吃掉，收盘即撤（开盘后再挂）"
 
     @staticmethod
     def sim_own_resting(trades: dict[str, dict], market: str, side: str, book: PredictBook | None = None) -> tuple[float, float | None]:
