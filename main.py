@@ -637,7 +637,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_MAKER_FLOOR_MARKETS", "托底单只做这些市场（详细选项）", "逗号分隔的市场代码；在“托底单份数”卡片展开详细选项点选，空 = 范围内的所有市场"),
     ("SIM_MAKER_DEEPER", "买1 不够门槛时跟更深的买价", "开 = 跟买1 的净优势不够门槛（或不超过模型误差）时，挂到下面第一个够门槛的买价档位（买2、买3…，同样要有“买1 至少多少份”那么多别人的单），等有人砸穿买1 时接；涨、跌两边各按各的；关 = 只跟买1，不够就不挂"),
     ("SIM_MAKER_EXIT_CENTS", "挂单撤单线（¢/份）", "0～50：挂着的单净优势降到这个数以下就撤掉（不会高于触发门槛）；0 = 不撤"),
-    ("SIM_MAKER_FOLLOW_SETTLE_SECONDS", "买1 变了多久才改跟（秒）", "0～60：有效买1 移开、低价挂单被顶、击穿单下面的买单变了，新位置要连续保持这么多秒才撤了改挂；做市机器人每半秒撤了重挂一遍的盘口，不等一下就会跟着它反复撤挂、每次都排到队尾；0 = 一变就改。优势没了的撤单不受它影响"),
+    ("SIM_MAKER_FOLLOW_SETTLE_SECONDS", "买1 变了多久才改跟（秒）", "0～60：有效买1 移开或没了、低价挂单被顶、击穿单下面的买单变了，新位置要连续保持这么多秒才撤了改挂；做市机器人每半秒撤了重挂一遍的盘口，不等一下就会跟着它反复撤挂、每次都排到队尾；0 = 一变就改。优势没了的撤单不受它影响"),
     ("SIM_MAKER_SESSION", "只在标的开盘时段挂单", "开 = 指数/个股日涨跌的挂单只在标的开盘时段挂着，开盘前、收盘后全部撤掉；加密市场不受影响"),
     ("SIM_MAKER_SPREAD_CENTS", "挂单价差上限（¢）", "0～99：平时只在买卖价差不超过这个数的双边盘口挂单；0 = 不限，价差再宽、只有单边的盘口也跟有效买1 挂（门槛不变）"),
     ("SIM_MAKER_DEEP_CENTS", "低价挂单模式（¢/份）", "0～90：按挂价算净优势不低于这个数（不低于触发门槛）的单挂在最高买价之上 1¢、排在最前，多付 1¢ 换先成交；有人（至少 1 份）挂到它之上或同价就撤了重挂到他之上 1¢，挂价留不足这个数就原地不动；价差超过上限的盘口也挂、只挂这种单，在那种盘口上净优势降到它 1¢ 以下撤掉；不分时段，盘后另要满足盘后门槛；0 = 关"),
@@ -808,7 +808,7 @@ class Config:
     # Predict's minimum order value: FLOOR_MIN_USD) rests at SIM_MAKER_FLOOR_CENTS, for a seller dumping into the empty side; 0 = none (1.105.0)
     sim_maker_floor: float = 0.01     # SIM_MAKER_FLOOR_CENTS / 100: the floor order's price
     sim_maker_exit: float = 0.05      # SIM_MAKER_EXIT_CENTS / 100: a resting order is withdrawn when its edge falls under this; 0 = never
-    sim_maker_follow_settle: float = 2.0  # SIM_MAKER_FOLLOW_SETTLE_SECONDS: a re-quote (the 买1 moved, a deep-bid order pushed off the front,
+    sim_maker_follow_settle: float = 2.0  # SIM_MAKER_FOLLOW_SETTLE_SECONDS: a re-quote (the 买1 moved or gone, a deep-bid order pushed off the front,
     # a sweep order's bids changed) waits until the new place has held this long; 0 = at once
     sim_maker_session: bool = True    # SIM_MAKER_SESSION: a daily card's resting orders only while its underlying trades (withdrawn before the open)
     sim_maker_deep_only: bool = False  # SIM_MAKER_DEEP_ONLY: with the deep-bid mode on, only its orders are placed (no joining the 买1 queue)
@@ -11132,6 +11132,8 @@ def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
 
 
 SIM_MAKER_FOLLOW = 0.01  # a resting order follows the valid 买1 once it has moved this far (1¢) from the order's price
+SIM_FOLLOW_GONE = -1.0  # where a valid 买1 that is gone "is", for the settle clock (Bot.sim_follow_settled): over a cent from every price, so the
+#                         clock starts anew when the 买1 goes and when one is there again a cent or more from the order (1.150.0)
 FLOOR_MIN_USD = 1.0  # a floor order is at least this much (Predict's minimum order value, live.MIN_ORDER_USD): 100 shares at 1¢
 SIM_MAKER_MODE_SLACK = 0.01  # under the after-hours / deep-bid modes a resting order is kept while its edge is within a cent under the mode's bar
 SIM_MAKER_DEEP_STEP = 0.01  # a deep-bid order goes this far above the best bid: at the front of the book, filled before the queue there
@@ -19365,9 +19367,10 @@ class Bot:
         """Why a resting order is withdrawn to be placed afresh when the chance returns (its slot is freed when nothing
         filled): the underlying is about to open or has just opened (SIM_OPEN_QUIET_MINUTES), is not in session
         (SIM_MAKER_SESSION), its edge fell under the exit line (SIM_MAKER_EXIT_CENTS), the valid 买1 is gone or has moved
-        (SIM_MAKER_MIN_BID). "" while it may stand. On a stale or crossed book the rules that read the book wait for a
-        fresh one; those that need the fair price alone — the exit line, after hours the after-hours bar — are judged
-        all the same (1.150.0), and a held card's order stands (sim_unpriced_reason)."""
+        (SIM_MAKER_MIN_BID; either for SIM_MAKER_FOLLOW_SETTLE_SECONDS: sim_follow_settled). "" while it may stand. On a
+        stale or crossed book the rules that read the book wait for a fresh one; those that need the fair price alone —
+        the exit line, after hours the after-hours bar — are judged all the same (1.150.0), and a held card's order
+        stands (sim_unpriced_reason)."""
         c = self.config
         if not trade.get("maker") or mk is None:
             return ""
@@ -19446,10 +19449,32 @@ class Bot:
             # "gone" and was voided at the send, or withdrawn by the express lane before it ever reached Predict)
             own = own_on_book(trade, mk.book)
             level = maker_level(mk.book, side, max(c.sim_maker_min_bid, SIM_MAKER_FRONT_MIN) if deep_order else c.sim_maker_min_bid, own, price)
+            key = f"{trade.get('market')}|{side}"  # the slot's settle clock (sim_follow_settled)
             if level is None:
                 if floor_order:
                     return ""  # still nothing to follow: the floor order is what rests here
-                return f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟" if c.sim_maker_min_bid > 0 else ""  # nobody else bids: a deep-bid order stays
+                if c.sim_maker_min_bid <= 0:
+                    return ""  # nobody else bids: a deep-bid order stays
+                # 1.150.0 (audit SIM-FOLLOW-SETTLE-GONE): the valid 买1 gone waits for the settle as a move does — "nowhere" is a place
+                # too (SIM_FOLLOW_GONE): the clock starts at the first look that finds it gone, starts anew when a 买1 is back a cent
+                # or more from the order, and is cleared by one back at the order's price (move None, below). This branch returned at
+                # once, never reaching the clock, and with the settle on the express lane acts on every re-quote reason
+                # (sim_express_acts): ONE push without SIM_MAKER_MIN_BID shares besides ours on any level — the stack pulled for the
+                # moment before it is re-posted, the very case the settle was made for (the 11-04 recording happened to keep a
+                # 111-share stub at 1¢, so its gaps read as moves), or a thin 买1 half sold — cancelled the real order; a floor order
+                # took the slot and followed the stack back after the settle: two cancels and two placements a flicker, the queue
+                # place lost each time (such a book replayed at a quarter second of API latency: 12 cancels and 11 placements in
+                # 20 s, the order off the book for 18 of them — on the rate limit every order and cancel shares).
+                # Gone for the whole settle it is withdrawn as before, by the lane's own timer when no push comes (sim_follow_wake);
+                # the edge gone, the market's end and every other withdrawal are judged above, at once as ever; with the settle at 0
+                # this one is too.
+                # Not for a decision Predict does not hold yet (pending; placing: its request may still be held back before it goes
+                # out): it has no queue place to keep, and the send-time re-check (LiveBot.live_taker_recheck) must go on voiding
+                # it — waiting there would SEND an order whose 买1 is gone
+                st = trade.get("live") if isinstance(trade.get("live"), dict) else {}
+                if st.get("state") not in ("pending", "placing") and not self.sim_follow_settled(key, SIM_FOLLOW_GONE, now_ms, mk.key):
+                    return ""
+                return f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟"
             move: tuple[float, str] | None = None  # (the place the order would move to, why), to go once that place has held (sim_follow_settled)
             if not deep_order:
                 if abs(level[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
@@ -19481,7 +19506,6 @@ class Bot:
                         move = (target, f"买1 被顶到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
                 elif price - target >= SIM_MAKER_FOLLOW - 1e-9:
                     move = (target, f"买1 移到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
-            key = f"{trade.get('market')}|{side}"
             if move is None:
                 if not self.sim_follow_readonly:
                     self.sim_follow_since.pop(key, None)
@@ -19494,7 +19518,8 @@ class Bot:
         (the clock starts when it is first seen, again when the place changes; 0 = at once). A market maker on the 11-04
         SK 海力士 15 分 book pulled and re-posted its three-level stack every half second, the 买1 a cent or two away each
         time and gone for a moment in between: an order following every look would have been withdrawn and placed again
-        all day, last in the queue each time (1.104.3)."""
+        all day, last in the queue each time (1.104.3). ``target`` SIM_FOLLOW_GONE: the valid 买1 gone, a place like any
+        other — the order is withdrawn once it has been gone that long (1.150.0; it was withdrawn at the first such look)."""
         settle = self.config.sim_maker_follow_settle
         if settle <= 0:
             return True
@@ -20047,6 +20072,12 @@ class Bot:
                 trades[new_tid] = trades.pop(tid)
                 changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]
             trades[tid] = self.sim_open(mk, side, now_ms, maker=maker, shares=count)
+            # 1.150.0 (audit SIM-FOLLOW-SETTLE-GONE): a fresh order starts without a settle clock. The slot's clock (market|side) is
+            # cleared only by a look that finds its order in place (sim_requote_reason: move None); an order that ended while one
+            # ran — withdrawn at the settle or for its edge, filled — left it behind, and the next order in the slot would take it
+            # over: "gone" is one place for every order (SIM_FOLLOW_GONE), so its first look at a one-push gap would find the 买1
+            # "gone for long" and withdraw it at once
+            self.sim_follow_since.pop(f"{mk.market}|{side}", None)
             changed.append((tid, trades[tid]))
             refused.add(side)  # 1.138.0: the other side in the same look — the card showed both 可挂, the second waited for the next look
 

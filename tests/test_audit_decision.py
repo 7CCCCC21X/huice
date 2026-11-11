@@ -894,4 +894,206 @@ CLOCK_CASES = (clock_stale_book, clock_hold_run, clock_taker_rest, clock_behind_
 for clock_case in CLOCK_CASES:
     asyncio.run(clock_case())
 
+# --- SIM-FOLLOW-SETTLE-GONE: a valid 买1 that is gone waits for the follow settle as one that moved does -------------------------
+# SIM_MAKER_FOLLOW_SETTLE_SECONDS (2 by default) is there for the market maker that pulls and re-posts its stack every half second,
+# "the 买1 a cent or two away each time and gone for a moment in between": a resting order is not to be withdrawn and placed again,
+# last in the queue, at every look. Only a 买1 that MOVED went through its clock. The gap itself — no level left holding
+# SIM_MAKER_MIN_BID (100) shares besides ours, or a thin 买1 half sold — gave "买1 不足 100 份，不跟" at once, and with the settle
+# on the express lane acts on every re-quote reason: ONE such push cancelled the real order, a floor order took the slot and
+# followed the stack back two seconds later — two cancels and two placements a flicker. (The 1.104.3 recording kept a 111-share
+# stub at 1¢, which made its gaps moves: the empty side never ran.)
+FOLLOW_STACK = (("0.55", "300"), ("0.54", "60"))  # 买1 55¢ × 300 of others; the 60 at 54¢ are under SIM_MAKER_MIN_BID: nothing to follow
+FOLLOW_FULL = (("0.55", "400"), ("0.54", "60"))   # ...with our own 100 behind the 300, as Predict's book shows them
+FOLLOW_ALONE = (("0.55", "100"), ("0.54", "60"))  # the 300 pulled: our 100 alone at 55¢
+FOLLOW_EMPTY = (("0.54", "60"),)                  # the same gap as the paper trader sees it (its order is on no book)
+FOLLOW_WHY = "买1 不足 100 份，不跟"
+FOLLOW_UP, FOLLOW_CLOCK = f"{STALE}|up|挂", f"{STALE}|up"
+
+
+async def follow_look(bot, world, ms: int, bids, fair: float = 0.70, step: bool = False, asks=(("0.62", "100"),)) -> None:
+    """One look ``ms`` after NOW at the 恒指 card (fair price ``fair``) with these bids: a pushed book through the express lane
+    (PredictStream.book → feed.updated → sim_express), or the step."""
+    at = NOW + ms
+    bot.market.now, world["markets"] = at, [stale_mk(fair, at, bids=bids, asks=asks)]
+    if step:
+        bot.sim_ran = -1e9
+        await bot.sim_step(at)
+    else:
+        await bot.sim_express("HSI")
+    if isinstance(bot, live.LiveBot):
+        await bot.live_fills_wait()
+
+
+async def follow_bot(real: bool = True, **env):
+    """The real trader (LIVE=on with the SDK test suite's key, never a real one; Predict and the chain are the stand-ins) or the
+    paper one, on the DEFAULT maker settings — SIM_MAKER_MIN_BID 100, the settle 2 s, a floor order of 100 × 1¢, the 5¢ exit line —
+    with its 55¢ × 100 跟买1 placed by a step behind 300 of others, the fair price 70¢. (the bot, Predict's stand-in, the world)."""
+    world = {"markets": []}
+    if real:
+        bot = live.LiveBot(m.Config.from_env({**STALE_ENV, "LIVE": "on", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, "PREDICT_API_KEY": "k", **env}),
+                           m.Store(":memory:"), SelfFM(NOW), None)
+        bot.live.api, bot.live.chain = StaleApi(), StaleChain()
+        await bot.live_prepare()
+        assert bot.live.ready, bot.live.ready_error
+    else:
+        bot = stale_bot(**env)
+    bot.sim_markets = lambda now, only=None: world["markets"]
+    await follow_look(bot, world, 0, FOLLOW_STACK, step=True)
+    order = bot.sim_trades()[FOLLOW_UP]
+    assert (order["status"], order["price"], order["order"], order.get("floor")) == ("resting", 0.55, 100.0, None), order
+    if real:
+        assert order["live"]["state"] == "open" and bot.live.api.calls == [("create", "101")], (order["live"]["state"], bot.live.api.calls)
+    return bot, (bot.live.api if real else None), world
+
+
+def follow_records(bot) -> dict:
+    """The bot's records in short: slot -> (status, price, why it was withdrawn)."""
+    return {k.removeprefix(STALE + "|"): (t["status"], t["price"], (t.get("withdrawn") or {}).get("why", "")) for k, t in bot.sim_trades().items()}
+
+
+async def follow_gone_flicker():
+    """A push without the others' 300 cancels nothing, and neither does a stack pulled and re-posted for ten seconds."""
+    bot, api, world = await follow_bot()
+    c = bot.config
+    assert (c.sim_maker_min_bid, c.sim_maker_follow_settle, c.sim_maker_floor_shares, c.sim_maker_exit) == (100.0, 2.0, 100.0, 0.05), "the defaults"
+    untouched = lambda: (api.calls, sorted(api.open), bot.sim_trades()[FOLLOW_UP]["live"]["state"]) == ([("create", "101")], ["101"], "open")
+    await follow_look(bot, world, 5_000, FOLLOW_ALONE)  # before the fix: ("remove", ["101"]), and a 1¢ floor order "102" in its place
+    assert untouched(), (api.calls, follow_records(bot))
+    assert bot.sim_follow_since == {FOLLOW_CLOCK: (m.SIM_FOLLOW_GONE, NOW + 5_000)}, bot.sim_follow_since  # gone since this look
+    await follow_look(bot, world, 5_200, FOLLOW_FULL)   # re-posted at the order's price 0.2 s later: there is nothing to wait for
+    assert untouched() and bot.sim_follow_since == {}, (api.calls, bot.sim_follow_since)
+    await follow_look(bot, world, 5_600, (("0.55", "180"), ("0.54", "60")))  # a thin 买1 half sold (80 of the 300 left) is the same look
+    await follow_look(bot, world, 5_900, FOLLOW_FULL)
+    assert untouched() and bot.sim_follow_since == {}, (api.calls, bot.sim_follow_since)
+    # the 11-04 market maker without its 1¢ stub — 0.2 s gone, 0.3 s back, twenty times (before the fix: some thirty cancels and
+    # as many placements in these ten seconds)
+    for i in range(20):
+        await follow_look(bot, world, 6_000 + i * 500, FOLLOW_ALONE)
+        await follow_look(bot, world, 6_200 + i * 500, FOLLOW_FULL)
+    assert untouched() and bot.sim_follow_since == {}, (api.calls, bot.sim_follow_since)
+    # gone, then back a cent higher, turn about: neither place holds, so the order stays — as a 买1 a cent back and forth always did
+    for i in range(12):
+        await follow_look(bot, world, 17_000 + i * 250, FOLLOW_ALONE if i % 2 == 0 else (("0.56", "300"), ("0.55", "100"), ("0.54", "60")))
+    assert untouched(), (api.calls, follow_records(bot))
+
+
+async def follow_gone_for_good():
+    """Gone and not back: withdrawn once that has held for the settle — no sooner, and once — for the reason it always gave; the
+    floor order takes the slot then. The step waits as the lane does."""
+    bot, api, world = await follow_bot()
+    for ms in (5_000, 6_000, 6_900):
+        await follow_look(bot, world, ms, FOLLOW_ALONE)
+        assert api.calls == [("create", "101")], (ms, api.calls)
+    await follow_look(bot, world, 7_100, FOLLOW_ALONE)
+    old = bot.sim_trades()[f"{FOLLOW_UP}#1"]
+    assert api.calls[:2] == [("create", "101"), ("remove", ["101"])], api.calls
+    assert old["withdrawn"]["why"] == FOLLOW_WHY and old["withdrawn"]["at"] == NOW + 7_100 and old["live"]["final"] == "cancelled", (old["withdrawn"], old["live"])
+    # the floor order takes the slot: in the pass that confirmed the cancel — a book still showing our cancelled 100 is no 买1 to
+    # join (sim_own_resting, which goes by the wall clock, not this test's) — or else on the next book; then it rests, nothing to follow
+    for ms in (7_400, 7_700):
+        await follow_look(bot, world, ms, (("0.54", "60"), *((("0.01", "100"),) if "102" in api.open else ())))
+    floor = bot.sim_trades()[FOLLOW_UP]
+    assert api.calls == [("create", "101"), ("remove", ["101"]), ("create", "102")] and sorted(api.open) == ["102"], api.calls
+    assert floor.get("floor") and floor["price"] == 0.01 and floor["live"]["state"] == "open", (floor["price"], floor["live"]["state"])
+    # the paper trader's step: the gap one step finds is no withdrawal (before the fix: withdrawn, a floor order in its place in
+    # the same look); one found again four seconds later starts its own clock; two seconds of it are a withdrawal
+    paper, _, pworld = await follow_bot(real=False)
+    await follow_look(paper, pworld, 5_000, FOLLOW_EMPTY, step=True)
+    assert follow_records(paper) == {"up|挂": ("resting", 0.55, "")}, follow_records(paper)
+    await follow_look(paper, pworld, 6_000, FOLLOW_STACK, step=True)
+    await follow_look(paper, pworld, 10_000, FOLLOW_EMPTY, step=True)
+    assert follow_records(paper) == {"up|挂": ("resting", 0.55, "")} and paper.sim_follow_since == {FOLLOW_CLOCK: (m.SIM_FOLLOW_GONE, NOW + 10_000)}, \
+        (follow_records(paper), paper.sim_follow_since)
+    await follow_look(paper, pworld, 12_000, FOLLOW_EMPTY, step=True)
+    assert follow_records(paper) == {"up|挂#1": ("cancelled", 0.55, FOLLOW_WHY), "up|挂": ("resting", 0.01, "")}, follow_records(paper)
+
+
+async def follow_gone_at_once():
+    """What does not wait, as before: an order whose edge is gone, a decision Predict does not hold yet, and the settle at 0."""
+    bot, api, world = await follow_bot()
+    await follow_look(bot, world, 5_000, FOLLOW_ALONE, fair=0.58)  # the 买1 gone AND 3¢ of edge left, under the 5¢ exit line
+    assert api.calls[:2] == [("create", "101"), ("remove", ["101"])] and follow_records(bot)["up|挂#1"] == ("cancelled", 0.55, "净优势降到 3.0¢，低于撤单线 5.0¢"), \
+        (api.calls, follow_records(bot))
+    # a decision held back before the send (a cooldown, a sign-in), its 买1 gone by then: voided by the send-time re-check as ever —
+    # waiting for the settle there would SEND an order whose 买1 is gone — and one whose request is in flight is withdrawn at once
+    bot, api, world = await follow_bot()
+    joined = stale_mk(0.70, NOW, bids=FOLLOW_STACK)
+    unsent = bot.sim_open(joined, "up", NOW, maker=bot.sim_maker_reason(joined, {}, NOW)[0], shares=100)
+    assert unsent["live"]["state"] == "pending" and unsent["price"] == 0.55
+    bot.market.now, world["markets"] = NOW + 5_000, [stale_mk(0.70, NOW + 5_000, bids=(("0.55", "40"), ("0.54", "60")))]
+    assert bot.live_taker_recheck(unsent, NOW + 5_000) == (f"盘口变了：{FOLLOW_WHY}，5 秒前的挂单决定作废", False), bot.live_taker_recheck(unsent, NOW + 5_000)
+    unsent["live"]["state"] = "placing"
+    assert bot.sim_requote_reason(unsent, world["markets"][0], NOW + 5_000) == FOLLOW_WHY and bot.sim_follow_since == {}, bot.sim_follow_since
+    # SIM_MAKER_FOLLOW_SETTLE_SECONDS=0: nothing waits — the lane leaves every follow to the step, which withdraws at its look
+    bot, api, world = await follow_bot(SIM_MAKER_FOLLOW_SETTLE_SECONDS="0")
+    await follow_look(bot, world, 5_000, FOLLOW_ALONE)
+    assert api.calls == [("create", "101")], api.calls
+    await follow_look(bot, world, 5_100, FOLLOW_ALONE, step=True)
+    assert api.calls[:2] == [("create", "101"), ("remove", ["101"])] and follow_records(bot)["up|挂#1"] == ("cancelled", 0.55, FOLLOW_WHY), \
+        (api.calls, follow_records(bot))
+
+
+async def follow_gone_fresh_order():
+    """A fresh order starts without a clock. "Gone" is one place for every order, so the clock left running when the slot's last
+    order ended — withdrawn at the settle, or filled while its 买1 was gone — would make the next order's first gap "gone for
+    long": withdrawn at that one push."""
+    bot, api, world = await follow_bot(SIM_MAKER_FLOOR_SHARES="0")  # no floor order: nothing takes the slot between the two orders
+    for ms in (5_000, 6_000, 7_100):
+        await follow_look(bot, world, ms, FOLLOW_ALONE)
+    assert api.calls == [("create", "101"), ("remove", ["101"])] and follow_records(bot) == {"up|挂#1": ("cancelled", 0.55, FOLLOW_WHY)}, \
+        (api.calls, follow_records(bot))
+    await follow_look(bot, world, 12_000, FOLLOW_STACK, step=True)  # the stack is back: the step places the next order
+    assert api.calls[2:] == [("create", "102")] and bot.sim_trades()[FOLLOW_UP]["live"]["state"] == "open", api.calls
+    await follow_look(bot, world, 12_300, FOLLOW_ALONE)  # its first look is a one-push gap (taking the old clock over: ("remove", ["102"]))
+    assert api.calls[2:] == [("create", "102")] and sorted(api.open) == ["102"], api.calls
+    assert bot.sim_follow_since == {FOLLOW_CLOCK: (m.SIM_FOLLOW_GONE, NOW + 12_300)}, bot.sim_follow_since
+    # the paper trader: its order fills while the 买1 is gone (a seller through 55¢), the stack comes back, the next order's first
+    # look is a gap
+    paper, _, pworld = await follow_bot(real=False, SIM_MAKER_FLOOR_SHARES="0")
+    await follow_look(paper, pworld, 5_000, FOLLOW_EMPTY)
+    await follow_look(paper, pworld, 6_900, (("0.53", "40"),), asks=(("0.54", "500"),))
+    assert follow_records(paper) == {"up|挂": ("filled", 0.55, "")}, follow_records(paper)
+    await follow_look(paper, pworld, 8_000, FOLLOW_STACK)
+    await follow_look(paper, pworld, 8_300, FOLLOW_EMPTY)
+    assert follow_records(paper) == {"up|挂#1": ("filled", 0.55, ""), "up|挂": ("resting", 0.55, "")}, follow_records(paper)
+
+
+async def follow_gone_others():
+    """The same branch serves every resting order that follows a 买1 — one waiting at 买2, a deep-bid order over the 买1 — and the
+    card's look (sim_why), which reads the clock and never starts it: it names the withdrawal once the settle has run out."""
+    gap = lambda ms: stale_mk(0.70, NOW + ms, bids=FOLLOW_EMPTY)
+    for name, record, env in (("跟买2", {**bid55, "price": 0.50, "join_level": 2}, {}),
+                              ("买1 之上 1¢", {**bid55, "price": 0.56, "deep": True}, {"SIM_MAKER_DEEP_CENTS": "10"})):
+        judge = stale_bot(**env)
+        got = [judge.sim_requote_reason(record, gap(ms), NOW + ms) for ms in (1_000, 2_900, 3_000)]
+        assert got == ["", "", FOLLOW_WHY], (name, got)  # before the fix: the reason at the first look
+    paper, _, pworld = await follow_bot(real=False)
+    row = lambda ms: next(r["text"] for r in paper.sim_why(gap(ms), paper.sim_trades(), NOW + ms)["maker"]["sides"] if r["side"] == "up")
+    assert row(5_000) == "挂单中：55.0¢×100 份（跟买1）" and paper.sim_follow_since == {}, (row(5_000), paper.sim_follow_since)  # the card's look starts no clock
+    await follow_look(paper, pworld, 5_000, FOLLOW_EMPTY)  # ...the lane's does
+    assert row(6_900) == "挂单中：55.0¢×100 份（跟买1）" and row(7_000) == f"挂单中：55.0¢×100 份（跟买1）；下一轮撤掉：{FOLLOW_WHY}", (row(6_900), row(7_000))
+    assert paper.sim_follow_since == {FOLLOW_CLOCK: (m.SIM_FOLLOW_GONE, NOW + 5_000)} and follow_records(paper) == {"up|挂": ("resting", 0.55, "")}, \
+        (paper.sim_follow_since, follow_records(paper))
+
+
+async def follow_gone_timer():
+    """With no push after the gap the lane looks again by itself when the settle has run out (sim_follow_wake, as after a move):
+    a 买1 really gone is withdrawn right then, not by the step up to five seconds later."""
+    paper, _, pworld = await follow_bot(real=False, SIM_MAKER_FOLLOW_SETTLE_SECONDS="0.3")
+    paper.predict.books["HSI"] = stale_mk(0.70, NOW).book  # the feed holds the key: a timer is armed for it
+    await follow_look(paper, pworld, 5_000, FOLLOW_EMPTY)
+    assert "HSI" in paper.sim_follow_timers and follow_records(paper) == {"up|挂": ("resting", 0.55, "")}, (paper.sim_follow_timers, follow_records(paper))
+    paper.market.now, pworld["markets"] = NOW + 6_000, [stale_mk(0.70, NOW + 6_000, bids=FOLLOW_EMPTY)]  # past the settle when the timer fires
+    for _ in range(100):  # the timer fires 0.4 s on, by the loop's clock (the rest of the wait is for a slow machine)
+        await asyncio.sleep(0.05)
+        if f"{FOLLOW_UP}#1" in paper.sim_trades():
+            break
+    assert follow_records(paper) == {"up|挂#1": ("cancelled", 0.55, FOLLOW_WHY), "up|挂": ("resting", 0.01, "")} and "HSI" not in paper.sim_follow_timers, \
+        (follow_records(paper), paper.sim_follow_timers)
+
+
+FOLLOW_CASES = (follow_gone_flicker, follow_gone_for_good, follow_gone_at_once, follow_gone_fresh_order, follow_gone_others, follow_gone_timer)
+for follow_case in FOLLOW_CASES:
+    asyncio.run(follow_case())
+
 print("AUDIT_DECISION_OK")
