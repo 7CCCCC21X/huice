@@ -1728,6 +1728,7 @@ class LiveBot(core.Bot):
         self.live_redeem_unsent: dict[str, int] = {}         # position key -> its redeems in a row that never left (TxNotSent): LIVE_REDEEM_UNSENT_PULLS (1.150.0)
         self.live_redeem_read_round: dict[str, int] = {}     # market id -> the number of the redeem round that last read it (this process's rounds): the longest unread are read first (1.150.0)
         self.live_redeem_first: dict[str, float] = {}        # market id -> when a win there asked for a round (live_redeem_soon): read ahead of the rotation, once (1.150.0)
+        self.live_redeem_small: dict[str, float] = {}        # position key -> the per-share payout of a resolved winner left under LIVE_REDEEM_MIN_USD: judged again with no market read (1.150.0)
         self.live_redeem_noted = -1e9                        # the last never-sent failed redeem told on Telegram (LIVE_REDEEM_NOTE_SECONDS)
         self.live_redeem_untold: dict[str, dict] = {}        # position key -> a sent redeem that failed, not told yet (the next ⚠️; 1.150.0)
         self.live_redeem_notes: dict[str, str] = {}          # position key, or gas / cut / unclear / round / loop -> its problem line (the check, 1.150.0)
@@ -4439,8 +4440,9 @@ class LiveBot(core.Bot):
             self.live_fail(tid, trade, f"吃单未成交（{st.get('cancel_why') or status or '不在盘口'}）", now_ms, retry=self.config.live_taker_retry)
 
     # --- redeeming resolved positions -------------------------------------------------------------------------------------
-    REDEEM_KINDS = {"redeemed": "领了", "claimable": "可领取", "failed": "领取失败", "waiting": "失败等重试", "sent": "已发出待确认",
-                    "fields": "缺字段", "unclear": "结算读不出", "kept": "已领仍列着", "open": "未结算", "lost": "输掉的", "unread": "没读到市场"}
+    REDEEM_KINDS = {"redeemed": "领了", "claimable": "可领取", "small": "小额暂不领", "failed": "领取失败", "waiting": "失败等重试",
+                    "sent": "已发出待确认", "fields": "缺字段", "unclear": "结算读不出", "kept": "已领仍列着", "open": "未结算", "lost": "输掉的",
+                    "unread": "没读到市场"}
     REDEEM_SENT = "live:redeem-sent:"  # + <market>:<index set>: a redeem transaction signed (and broadcast, or about to be) but not yet booked
 
     async def live_redeem_forget(self, words: list[str]) -> str:
@@ -4631,11 +4633,12 @@ class LiveBot(core.Bot):
     async def live_redeem_pass(self, now_ms: int, dry_run: bool = False, force: bool = False) -> tuple[list[str], list[dict]]:
         """One look at the account's positions, the markets read the longest ago first (never yet: first of all; the
         newest positions first among equals): (the redeemed lines, each position judged). Kinds:
-        redeemed (now), claimable (resolved in its favour, not redeemed now: ``dry_run``, or no gas), failed (this
-        round), waiting (a failed redeem's back-off), lost, open (not resolved), unread (its market not read: the round's
-        cap, a failed read, a rate limit), fields (no index set on the position, no condition on the market), kept
-        (redeemed before, still listed). ``dry_run`` (/live redeem check): nothing sent, written or announced — the
-        markets the next round would read, whose turn it leaves as it was."""
+        redeemed (now), claimable (resolved in its favour, not redeemed now: ``dry_run``, or no gas), small (resolved in
+        its favour, worth less than LIVE_REDEEM_MIN_USD: left as it is), failed (this round), waiting (a failed redeem's
+        back-off), lost, open (not resolved), unread (its market not read: the round's cap, a failed read, a rate limit),
+        fields (no index set on the position, no condition on the market), kept (redeemed before, still listed).
+        ``dry_run`` (/live redeem check): nothing sent, written or announced — the markets the next round would read,
+        whose turn it leaves as it was."""
         # 1.150.0 (audit RDM-POSITIONS-CUT): the redeem's own read, LIVE_REDEEM_PAGES deep, and its own answer whether the list
         # came whole. It read api.positions() — ORDERS_PAGES_MAX pages, 1000 rows at 50 a page — and never looked at whether
         # that was the whole list: the bot never burns a losing token, so on the pre-open mode's account the list grows by
@@ -4711,6 +4714,16 @@ class LiveBot(core.Bot):
         # rotation; a real round that reads it drops the name (one read ahead per win, never a standing priority). Kept while its
         # redeem never left and that retry is pulled (LIVE_REDEEM_UNSENT_PULLS): the retry at the wait's end reads it first too.
         first = self.__dict__.setdefault("live_redeem_first", {})
+        # 1.150.0 (GAS-MIN-VALUE): the owner's floor on what a redeem transaction is worth sending for. A few hundred redeems a day,
+        # each paid in BNB by the signer, and many of them pay the pre-open mode's ten-share wins: with LIVE_REDEEM_MIN_USD > 0 a
+        # resolved winner worth less (shares × the payout per share, as below) is neither redeemed — by the automatic round or by
+        # /live redeem — nor counted as claimable (the ⛽ note, the gas verdicts), nor marked: it stays the owner's, shown as
+        # 小额暂不领, and the first round after the setting is lowered or cleared (or the position grows past it) redeems it.
+        # Such a winner is remembered with its payout per share (a resolved market's result does not change), so the rounds after
+        # judge it with no market read: left unread it would come back to the rotation for good, a read every round taken from
+        # the markets still to be judged. 0 (the default): none of this — every winner as before.
+        floor = float(self.config.live_redeem_min_usd or 0)
+        small = self.__dict__.setdefault("live_redeem_small", {})
         # 1.150.0 (audit RDM-ROUND-LOCK-STALL): the winners are redeemed one after another, each waiting up to 120 s for its receipt
         # under the redeem lock — with a node that takes the transactions and mines none (a stuck nonce, an underpriced gas price)
         # a round of N winners held the lock N × two minutes and sent N transactions into the same stuck queue. After one receipt
@@ -4791,6 +4804,10 @@ class LiveBot(core.Bot):
             if not index_set:
                 seen.append({**entry, "kind": "fields", "error": unreadable or "持仓没写 indexSet，分不出是哪一边"})
                 continue
+            per_share = small.get(key) if floor > 0 else None
+            if per_share is not None and entry["shares"] * per_share < floor:  # (GAS-MIN-VALUE) a small winner judged before: no read
+                seen.append({**entry, "value": entry["shares"] * per_share, "kind": "small"})
+                continue
             if mid not in markets:
                 if limited or len(markets) >= self.LIVE_REDEEM_READS:
                     seen.append({**entry, "kind": "unread", "error": "限流，这一轮不再读" if limited else "这一轮读满了，下一轮再看"})
@@ -4841,6 +4858,11 @@ class LiveBot(core.Bot):
             entry["value"] = entry["shares"] * (0.5 if resolved.get("split") else 1.0)
             if not info.condition_id:
                 seen.append({**entry, "kind": "fields", "error": "市场没写 conditionId，领取交易填不出来"})
+                continue
+            if floor > 0 and entry["value"] < floor:  # (GAS-MIN-VALUE) under the owner's floor: left, unmarked, never claimable
+                if not dry_run:
+                    small[key] = 0.5 if resolved.get("split") else 1.0
+                seen.append({**entry, "kind": "small"})
                 continue
             if dry_run or low_gas or held or gas_unread:  # (RDM-GAS-STALE) no BNB figure to send on: none sent blind
                 # 1.150.0 (audit RDM-CHECK-FORGETS-FAILURE): with its back-off over, a position whose last redeem failed was 可领取 with
@@ -4912,6 +4934,9 @@ class LiveBot(core.Bot):
             del unsent_runs[gone]
         for gone in set(first) - unsettled:
             del first[gone]  # a name with nothing left to judge there (redeemed, lost, or not listed): forgotten
+        left_small = {f"live:redeemed:{s['market_id']}:{s['index_set']}" for s in seen if s["kind"] == "small"}
+        for gone in set(small) - left_small:
+            del small[gone]  # (GAS-MIN-VALUE) over the floor now, redeemed, or no longer listed: judged afresh if it comes back
         # (RDM-NOTE-THROTTLE) a problem line goes once its cause has: a position no longer listed (its own line), the gas, the
         # cut list, the unreadable settlements, a failed round (this one looked); a failure not yet told, once no longer listed
         listed = {f"live:redeemed:{s['market_id']}:{s['index_set']}" for s in seen}
@@ -5142,7 +5167,12 @@ class LiveBot(core.Bot):
         value = sum(float(s.get("value") or 0) for s in seen if s["kind"] == "claimable")
         lines.append(f"持仓 {len(seen)} 个：" + ("，".join(f"{label} {n(k)}" for k, label in self.REDEEM_KINDS.items() if n(k)) or "没有")
                      + (f"（⚠️ 持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查）" if cut else ""))
-        listed = {"claimable": ("可领取", self.REDEEM_REPORT_LINES), "waiting": ("领取失败、等重试", self.REDEEM_REPORT_LINES),
+        small = [s for s in seen if s["kind"] == "small"]  # (GAS-MIN-VALUE) under the owner's LIVE_REDEEM_MIN_USD: its count and total
+        small_value = sum(float(s.get("value") or 0) for s in small)
+        floor = float(c.live_redeem_min_usd or 0)
+        listed = {"claimable": ("可领取", self.REDEEM_REPORT_LINES),
+                  "small": (f"小额暂不领（低于 ${floor:g}，LIVE_REDEEM_MIN_USD；{len(small)} 个共约 ${small_value:,.2f}）", self.REDEEM_REPORT_LINES),
+                  "waiting": ("领取失败、等重试", self.REDEEM_REPORT_LINES),
                   "sent": ("领取交易已发出、还没确认上链（下一轮先查回执，不会再发）", self.REDEEM_REPORT_LINES),
                   "fields": ("缺字段", self.REDEEM_REPORT_LINES), "unclear": ("Predict 的结算读不出（机器人不会去领）", self.REDEEM_REPORT_LINES),
                   "kept": ("已发过领取交易、Predict 还列着", 3), "open": ("未结算", 3), "unread": ("这次没读到市场", 2),
@@ -5159,6 +5189,7 @@ class LiveBot(core.Bot):
                 extra = {"claimable": f"，约 ${float(s.get('value') or 0):,.2f}"  # (RDM-CHECK-FORGETS-FAILURE) a failure remembered past its back-off
                                       + (f"｜上次领取失败：{s['error']}（{'下一轮自动再试' if c.live_auto_redeem else '自动领取关着，发 /live redeem 再试'}）"
                                          if s.get("error") else ""),
+                         "small": f"，约 ${float(s.get('value') or 0):,.2f}",
                          "waiting": f"：{s.get('error') or '?'}（" + (f"{max(1, int(float(s.get('left') or 0) / 60))} 分钟后再试）" if c.live_auto_redeem
                                                                        else "自动领取关着：发 /live redeem 再试）"),  # (RDM-CHECK-VERDICT)
                          "sent": f"（交易 {s.get('tx')}，{int(s.get('age_ms') or 0) // 60_000} 分钟前发出" + (f"；{s['error']}" if s.get("error") else "") + "）",
@@ -5216,14 +5247,19 @@ class LiveBot(core.Bot):
                                "在 bscscan.com 打开上面的交易哈希，看持仓账户有没有收到 USDT；没收到就到 Predict 网站上领取，并把这条发我")
             else:
                 reasons.append("有持仓已经发过领取交易并上链，Predict 还列着：可能只是列表没更新，过半小时再查")
-        settled = not reasons  # nothing to say but that the rest is open or lost
+        settled = not reasons  # nothing to say but that the rest is open or lost (or left small by the owner's floor)
         if settled:
-            reasons = ["现在没有可领取的：赢的都领完了，" + (("剩下的还没结算，结算后" + ("自动领取" if auto else "发 /live redeem 手动领（自动领取关着）"))
-                                                        if n("open") else "其余是输掉的")]
+            rest = (("剩下的还没结算，结算后" + ("自动领取" if auto else "发 /live redeem 手动领（自动领取关着）")) if n("open")
+                    else "其余是输掉的" if n("lost") or not small else "")
+            reasons = ["现在没有可领取的：" + ("赢的除小额暂不领的（见下）以外都领完了" if small else "赢的都领完了") + (f"，{rest}" if rest else "")]
         if cut:
             # 1.150.0 (RDM-POSITIONS-CUT): the part read says nothing of the rest — the cut first, and never 赢的都领完了 on it
             head = f"持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查：后面可能还有赢的没领，先到 Predict 网站核对、手动领取"
             reasons = [head + "；读到的这部分里没有可领取的"] if settled else [head + "；" + reasons[0], *reasons[1:]]
+        if small:
+            # 1.150.0 (GAS-MIN-VALUE): left by the owner's own setting — said last, after whatever needs doing, and never under 赢的都领完了
+            reasons.append(f"有 {len(small)} 个赢了的持仓价值低于 ${floor:g}（共约 ${small_value:,.2f}），按 LIVE_REDEEM_MIN_USD 暂不领取、不花 gas；"
+                           "没有记成已领或输掉：这项调低或清零后" + ("下一轮自动领取就领" if auto else "发 /live redeem 就领（自动领取关着）"))
         lines.append("结论：" + reasons[0])
         lines.extend(f"另外：{r}" for r in reasons[1:])
         if recent:

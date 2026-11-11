@@ -2313,4 +2313,108 @@ async def answer_lost():
 asyncio.run(answer_lost())
 
 
+# --- GAS-MIN-VALUE --------------------------------------------------------------------------------------------------------------
+def split_mk(mid):
+    """A two-outcome market resolved 50/50 (both outcomes WON): a share of either side pays half."""
+    raw = mk(mid, status="RESOLVED")
+    raw["outcomes"] = [{**o, "status": "WON"} for o in raw["outcomes"]]
+    return raw
+
+
+def reads_of(fake) -> list:
+    """The market ids ``fake`` (a FakeApi) is asked for from now on, in order."""
+    asked, plain = [], fake.market
+
+    async def market(mid):
+        asked.append(str(mid))
+        return await plain(mid)
+    fake.market = market
+    return asked
+
+
+async def gas_min_value():
+    """GAS-MIN-VALUE (the owner: how much gas a day, how to spend less): LIVE_REDEEM_MIN_USD — 0 by default (off: every winner
+    redeemed as before), on the control page like the other LIVE_* settings. Above 0, a resolved winner worth less (shares × the
+    payout per share) is not redeemed by the automatic round nor by /live redeem, never marked and never claimable (no ⛽ for it):
+    /live redeem check lists it as 小额暂不领 with its count and total. Later rounds judge it without reading its market again;
+    once the setting is cleared (or the position grows past it) the next round redeems it — once."""
+    # (a) the setting: off by default, 0～1000, offered and saved on the control page
+    base = T["base"]
+    assert m.Config.from_env(base).live_redeem_min_usd == 0 and m.Config.from_env({**base, "LIVE_REDEEM_MIN_USD": "1.5"}).live_redeem_min_usd == 1.5
+    for bad in ("-1", "1001", "abc"):
+        try:
+            m.Config.from_env({**base, "LIVE_REDEEM_MIN_USD": bad})
+            assert False, bad
+        except ValueError as error:
+            assert "LIVE_REDEEM_MIN_USD" in str(error), error
+    assert "LIVE_REDEEM_MIN_USD" in m.CONTROL_KEY_SET and m.CONTROL_FORMS["LIVE_REDEEM_MIN_USD"]["kind"] == "number"
+    bot = await ready_bot()
+    assert bot.control_value("LIVE_REDEEM_MIN_USD") == "0"
+    result = bot.control_set({"LIVE_REDEEM_MIN_USD": "5"})
+    assert result["ok"] and bot.config.live_redeem_min_usd == 5 and bot.store.get("control:env") == {"LIVE_REDEEM_MIN_USD": "5"}, result
+    # (b) a $5 floor: the $3 winner and the 50/50 one (8 shares, $4) are left — no transaction, no mark; the $10 winner redeemed
+    fake = bot.live.api
+    fake.positions_rows = [held(701, shares=3), held(702, shares=10), held(703, index_set=2, shares=8)]
+    fake.markets.update({"701": mk(701, won=1), "702": mk(702, won=1), "703": split_mk(703)})
+    sent = notices(bot)
+    done = await bot.live_redeem(NOW)
+    assert len(done) == 1 and "window 702" in done[0] and [cid for cid, *_ in bot.live.chain.redeemed] == [cond(702)], done  # (before: all three)
+    assert bot.live_redeem_last["counts"] == {"redeemed": 1, "small": 2}, bot.live_redeem_last
+    assert bot.store.get("live:redeemed:701:1") is None and bot.store.get("live:redeemed:703:2") is None, "never marked"
+    assert bot.live_redeem_small == {"live:redeemed:701:1": 1.0, "live:redeemed:703:2": 0.5}, bot.live_redeem_small
+    assert bot.live_redeem_summary(bot.live_redeem_last) == "持仓 3 个：领了 1，小额暂不领 2"
+    # (c) the rounds after judge them with no market read; /live redeem leaves them as well
+    fake.positions_rows = [held(701, shares=3), held(703, index_set=2, shares=8)]  # (702 redeemed: no longer listed)
+    asked = reads_of(fake)
+    assert await bot.live_redeem(NOW + 10 * MIN) == [] and asked == [], asked
+    answer = await bot.live_action("redeem", [], NOW + 11 * MIN)
+    assert answer == "没有可领取的已结算持仓：持仓 2 个：小额暂不领 2。/live redeem check 看原因" and asked == [], (answer, asked)
+    assert len(bot.live.chain.redeemed) == 1 and bot.live_redeem_last["counts"] == {"small": 2}
+    # (d) the check: their own kind with the count and the total — never 可领取, never a plain 赢的都领完了
+    report = await bot.live_redeem_report(NOW + 12 * MIN)
+    assert "持仓 2 个：小额暂不领 2" in report and "小额暂不领（低于 $5，LIVE_REDEEM_MIN_USD；2 个共约 $7.00）：" in report, report
+    assert "  · window 701 / Up 3 份，约 $3.00" in report and "  · window 703 / Down 8 份，约 $4.00" in report, report
+    assert "可领取：" not in report and "下一轮自动领取会领" not in report and asked == [], report
+    assert verdict_of(report) == ("结论：现在没有可领取的：赢的除小额暂不领的（见下）以外都领完了",
+                                  ["有 2 个赢了的持仓价值低于 $5（共约 $7.00），按 LIVE_REDEEM_MIN_USD 暂不领取、不花 gas；"
+                                   "没有记成已领或输掉：这项调低或清零后下一轮自动领取就领"]), report
+    # (e) no BNB: no ⛽ for small winners alone; with a claimable one beside them, the ⛽ counts that one alone
+    bot.live.chain.bnb = 10 ** 13
+    await bot.live.refresh_balance()
+    assert await bot.live_redeem(NOW + 20 * MIN) == [] and not [k for k, _ in sent if k == "redeem:gas"], sent
+    fake.positions_rows.append(held(704, shares=20))
+    fake.markets["704"] = mk(704, won=1)
+    assert await bot.live_redeem(NOW + 30 * MIN) == []
+    gas = [text for k, text in sent if k == "redeem:gas"]
+    assert len(gas) == 1 and "，1 个已结算的持仓（约 $20.00）等着领取" in gas[0], gas
+    report = await bot.live_redeem_report(NOW + 31 * MIN)
+    assert verdict_of(report)[0].startswith("结论：签名钱包的 BNB 不够付 gas") and "可领取：\n  · window 704 / Up 20 份，约 $20.00\n" in report, report
+    # (f) a position grown past the floor is read again and redeemed; the setting cleared, the last one is — each once
+    bot.live.chain.bnb = 10 ** 17
+    await bot.live.refresh_balance()
+    fake.positions_rows = [held(701, shares=6), held(703, index_set=2, shares=8), held(704, shares=20)]
+    asked.clear()
+    assert len(await bot.live_redeem(NOW + 40 * MIN)) == 2 and asked == ["701", "704"], asked  # (703: 8 × ½ = $4, still small)
+    assert sorted(cid for cid, *_ in bot.live.chain.redeemed) == sorted([cond(702), cond(701), cond(704)])
+    assert bot.live_redeem_last["counts"] == {"redeemed": 2, "small": 1} and bot.live_redeem_small == {"live:redeemed:703:2": 0.5}
+    assert bot.control_set({"LIVE_REDEEM_MIN_USD": None})["ok"] and bot.config.live_redeem_min_usd == 0 and bot.store.get("control:env") == {}
+    fake.positions_rows = [held(703, index_set=2, shares=8)]
+    asked.clear()
+    done = await bot.live_redeem(NOW + 50 * MIN)
+    assert len(done) == 1 and "已领取 window 703 Down 8 份" in done[0] and asked == ["703"] and bot.live_redeem_small == {}, (done, asked)
+    assert bot.live.chain.redeemed[-1][:2] == (cond(703), 2) and bot.store.get("live:redeemed:703:2")["tx"] == "0xredeem"
+    assert await bot.live_redeem(NOW + 60 * MIN) == [] and len(bot.live.chain.redeemed) == 4, "never twice"
+    # (g) 0 (the default): the same positions redeemed as before, no 小额 words anywhere
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows = [held(711, shares=3), held(713, index_set=2, shares=8)]
+    fake.markets.update({"711": mk(711, won=1), "713": split_mk(713)})
+    assert len(await bot.live_redeem(NOW)) == 2 and bot.live_redeem_last["counts"] == {"redeemed": 2} and bot.live_redeem_small == {}
+    assert "小额" not in await bot.live_redeem_report(NOW + MIN)
+    print("GAS_MIN_VALUE_OK")
+
+
+asyncio.run(gas_min_value())
+
+
 print("AUDIT_REDEEM_OK")

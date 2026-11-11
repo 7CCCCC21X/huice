@@ -660,6 +660,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_RETRY_SECONDS", "下单失败后回避（秒）", "10～86400：Predict 拒绝、发送出错之后"),
     ("LIVE_TAKER_RETRY_SECONDS", "吃单没成交后回避（秒）", "1～3600：吃单一份没成交（到时撤掉、公平价变了撤掉）或发送前复核作废之后，同一市场同一边多久内不再吃单；机会还在就按这个短间隔再试"),
     ("LIVE_AUTO_REDEEM", "自动领取已结算持仓", "开 = 市场结算后自动在链上领取赢的一边：每 10 分钟查一次持仓，预挂或策略的单按 Predict 结果赢了约 20 秒内就领（签名钱包需有 BNB 付 gas）"),
+    ("LIVE_REDEEM_MIN_USD", "小额赢单暂不领取（$）", "0～1000：已结算、赢了的持仓，价值（份数 × 每份赔付）低于这个数的先不领：自动领取和 /live redeem 都跳过，省下这笔领取交易的 gas；/live redeem check 里单列为“小额暂不领”（个数和合计金额）；不记成已领或输掉，调低或清零后（或这份持仓加到够数）下一轮就领；0 = 都领（默认）"),
     ("LIVE_NOTIFY", "真实订单的 Telegram 通知", "开 = 真实下单、成交、撤单、失败都发 Telegram 通知；关了也照发 ⛽ 签名钱包没 gas、⚠️ 领取没领成、缺字段领不了这几条（没有订阅时发到管理员私聊）"),
     ("LIVE_ORPHAN_CANCEL", "自动撤掉无记录的挂单", "开 = 账户上本机器人没有记录、却挂在本机器人做过的市场上的挂单（丢失跟踪的单：重启、改设置或撤单没撤成留下的，成交了也没人记账），连续 2 分钟还在就自动撤掉并通知；没做过的市场上的挂单当作手动单，只报不撤。关 = 只报不撤，/live cancel account 手动撤"),
     ("PREOPEN_15M", "开盘前预挂（15 分钟市场）", "开 = 15 分钟场次一发布就在涨跌两边各挂一张 post-only 买单，开场前撤掉（PREOPEN.md）；需要 LIVE=on。改动即时生效：开就启动，关就撤单停下，改参数先撤单再按新参数重启。预挂的预留计入持仓+挂单上限，当日盈亏计入日亏损停机线"),
@@ -852,6 +853,8 @@ class Config:
     live_max_open_usd: float = 500.0   # LIVE_MAX_OPEN_USD: filled positions plus resting orders, at cost
     live_max_daily_loss_usd: float = 200.0  # LIVE_MAX_DAILY_LOSS_USD: realised loss per Beijing day that stops new orders; 0 = no limit
     live_auto_redeem: bool = True      # LIVE_AUTO_REDEEM: redeem resolved positions for USDT on-chain
+    live_redeem_min_usd: float = 0.0   # LIVE_REDEEM_MIN_USD: a resolved winner worth less than this is left unredeemed (its gas saved),
+    #                                    unmarked — redeemed once the setting is lowered or cleared; 0 = every winner (1.150.0)
     live_notify: bool = True           # LIVE_NOTIFY: Telegram lines for orders, fills and failures
     live_orphan_cancel: bool = True    # LIVE_ORPHAN_CANCEL: an unrecorded open order on one of the bot's own markets is withdrawn after two minutes (1.136.2)
     web_control_key: str = field(default="", repr=False)  # WEB_CONTROL_KEY: the control page's secret; "" = the page is read-only
@@ -1065,6 +1068,7 @@ class Config:
             live_max_open_usd=parse_bounded(e, "LIVE_MAX_OPEN_USD", "500", 1, 100_000_000),
             live_max_daily_loss_usd=parse_bounded(e, "LIVE_MAX_DAILY_LOSS_USD", "200", 0, 100_000_000),
             live_auto_redeem=not off(e.get("LIVE_AUTO_REDEEM", "on")),
+            live_redeem_min_usd=parse_bounded(e, "LIVE_REDEEM_MIN_USD", "0", 0, 1000),
             live_notify=not off(e.get("LIVE_NOTIFY", "on")),
             live_orphan_cancel=not off(e.get("LIVE_ORPHAN_CANCEL", "on")),
             web_control_key=control_key, env={k: v for k, v in e.items() if isinstance(k, str) and isinstance(v, str)},
@@ -11501,6 +11505,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "LIVE_RETRY_SECONDS": {"kind": "number", "group": "高级", "presets": ["60", "300", "600", "1800"], "unit": "秒"},
     "LIVE_TAKER_RETRY_SECONDS": {"kind": "number", "group": "高级", "presets": ["10", "30", "60", "120"], "unit": "秒"},
     "LIVE_AUTO_REDEEM": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
+    "LIVE_REDEEM_MIN_USD": {"kind": "number", "group": "高级", "presets": ["0", "0.5", "1", "2", "5"], "unit": "$", "zero": "都领"},
     "LIVE_NOTIFY": {"kind": "choice", "group": "高级", "options": [["on", "开"], ["off", "关"]]},
     "LIVE_ORPHAN_CANCEL": {"kind": "choice", "group": "风控", "options": [["on", "开"], ["off", "关"]]},
 }
@@ -23454,7 +23459,8 @@ class Bot:
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,
                   "LIVE_RETRY_SECONDS": str(c.live_retry), "LIVE_TAKER_RETRY_SECONDS": str(c.live_taker_retry),
-                  "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_NOTIFY": flag(c.live_notify), "LIVE_ORPHAN_CANCEL": flag(c.live_orphan_cancel)}
+                  "LIVE_AUTO_REDEEM": flag(c.live_auto_redeem), "LIVE_REDEEM_MIN_USD": plain(c.live_redeem_min_usd),
+                  "LIVE_NOTIFY": flag(c.live_notify), "LIVE_ORPHAN_CANCEL": flag(c.live_orphan_cancel)}
         return values.get(key, "")
 
     def control_records(self, trades: dict[str, dict], history: int = 200) -> list[dict]:
