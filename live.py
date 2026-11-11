@@ -1730,13 +1730,16 @@ class LiveBot(core.Bot):
         for t in trades.values():
             if not isinstance(t.get("live"), dict) or t.get("status") != "settled":
                 continue
-            shares = float(t["shares"])
             if int(t.get("settled") or 0) >= since:
-                total += (float(t["payout"]) - float(t["price"])) * shares
-            else:  # settled before today: the payout's change today (its revisions carry their own time), when it is a loss
-                moved = sum(float(r.get("to") or 0) - float(r.get("from") or 0) for r in t.get("revisions") or ()
+                total += (float(t["payout"]) - float(t["price"])) * float(t["shares"])
+            elif revisions := t.get("revisions"):  # settled before today: the payout's change today (its revisions carry
+                # their own time), when it is a loss. 1.150.0: only a record that has revisions is looked at — the stop's figure
+                # is asked several times a second (the pre-open's withdrawing(), every step, every send) over every settled
+                # record ever kept, and a generator plus a float for each old record without one cost it ~4.6x the 1.149.0 sum;
+                # a record without revisions adds nothing (min(0, 0) × shares), so the figure is the same
+                moved = sum(float(r.get("to") or 0) - float(r.get("from") or 0) for r in revisions
                             if isinstance(r, dict) and int(r.get("at") or 0) >= since)
-                total += min(0.0, moved) * shares
+                total += min(0.0, moved) * float(t["shares"])
         return total
 
     def live_check_kill(self, trades: dict[str, dict], now_ms: int) -> None:

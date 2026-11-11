@@ -319,4 +319,42 @@ async def prelate_crashed():
 
 
 asyncio.run(prelate_crashed())
+
+
+def daily_pnl_perf():
+    """XR-DAILY-PNL-PERF: live_daily_pnl (the daily loss stop's figure, asked ~3 times a second by the running pre-open's
+    withdrawing() and on every step and send) read shares and walked a generator over the revisions of EVERY live record settled
+    before today — the store keeps them all, ~4.6x the 1.149.0 cost per call. An old record without revisions adds nothing, so it
+    is not looked at any more (shares never read), and the figure stays: today's records, today's corrections' losses only."""
+    class Counted(dict):
+        reads = 0
+
+        def __getitem__(self, k):
+            if k == "shares":
+                Counted.reads += 1
+            return super().__getitem__(k)
+
+    now, day = 1_762_800_000_000, 86_400_000  # 2025-11-11 02:40 Beijing
+    bot = L.LiveBot.__new__(L.LiveBot)
+    old = lambda **kw: Counted(live={"state": "done"}, status="settled", settled=now - 3 * day, payout=1.0, price=0.5, shares=10.0, **kw)
+    trades = {f"old{i}": old() for i in range(1000)}
+    trades["old_empty"] = old(revisions=[])
+    assert bot.live_daily_pnl(trades, now) == 0.0
+    assert Counted.reads == 0, f"shares read {Counted.reads} times for old records without revisions"
+    # the figure itself: a record settled today (-4), an old one corrected today 1 -> 0 (-6), one corrected in the bot's favour
+    # today (not counted), one corrected yesterday (not counted)
+    rec = lambda settled, payout, shares, revisions=None: dict(live={"state": "done"}, status="settled", settled=settled,
+                                                               payout=payout, price=0.5 if revisions else 0.4, shares=shares,
+                                                               **({"revisions": revisions} if revisions else {}))
+    trades.update({
+        "today": rec(now - 60_000, 0.0, 10.0),
+        "lost": rec(now - day, 0.0, 6.0, [{"at": now - 60_000, "from": 1.0, "to": 0.0}]),
+        "gained": rec(now - day, 1.0, 6.0, [{"at": now - 60_000, "from": 0.0, "to": 1.0}]),
+        "yday": rec(now - 2 * day, 0.0, 6.0, [{"at": now - day, "from": 1.0, "to": 0.0}]),
+    })
+    got = bot.live_daily_pnl(trades, now)
+    assert abs(got - (-4.0 - 6.0)) < 1e-9, got
+
+
+daily_pnl_perf()
 print("AUDIT_XREVIEW_OK")
