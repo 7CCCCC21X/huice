@@ -21759,9 +21759,10 @@ class Bot:
             out += [(key, getattr(mkt.spec, "name", key)) for key, mkt in table.items()]
         return out
 
-    def edge_target(self, words: list[str]) -> tuple[str, str]:
+    def edge_target(self, words: list[str], saved: dict[str, float] | None = None) -> tuple[str, str]:
         """The bar an /edge command addresses, from its words: nothing = the default; a section; a market (its key, an
-        alias, or part of its card's name), optionally followed by one of its levels. Returns (bar key, shown name)."""
+        alias, or part of its card's name), optionally followed by one of its levels. Returns (bar key, shown name).
+        With `saved` (the bars already set: /edge … off) a level names the bar saved under it, see below."""
         if not words:
             return "default", "默认"
         text = " ".join(words)
@@ -21783,6 +21784,14 @@ class Bot:
             if found:
                 key, name = found[0]
                 if rest:
+                    # CTRL-EDGE-LEVEL (follow-up): bars saved before the fix below keep their key exactly as typed
+                    # ("level:ETH-HIT-11|4500", "level:HSI|300m"); /edge and /status still list them, but the stricter
+                    # parsing below no longer produces those keys, so "/edge … off" could not take them away one by one
+                    # (only /edge 清空 could, with every valid bar). Taking a bar away needs no check: with the saved bars
+                    # given, the level as typed names the bar saved under exactly that spelling, on any market.
+                    typed = f"level:{key}|{edge_level_norm(' '.join(rest))}"
+                    if saved is not None and typed in saved:
+                        return typed, f"{name} {' '.join(rest)}"
                     # CTRL-EDGE-LEVEL: edge_bar finds a level's bar by the card's own label (level_label on a price
                     # ladder: 4500 -> "4.5k"; usd_short on a cap ladder: 1.234B -> "1.23b"), so a level typed any other
                     # way ("4500", "130000", "1.234b") was saved, confirmed and listed, yet never matched a card; and a
@@ -21796,7 +21805,8 @@ class Bot:
                     spell = lambda v: edge_level_norm(level_label(v) if key in self.ranges else usd_short(v))
                     level = spell(D(match.group(1)) * {"": 1, "k": 10 ** 3, "m": 10 ** 6, "b": 10 ** 9}[match.group(2)])
                     known = [spell(row.target) for row in self.predict.ladders.get(key) or []]
-                    if known and level not in known:
+                    # (a saved bar of a level the market has dropped since can still be taken away)
+                    if known and level not in known and f"level:{key}|{level}" not in (saved or ()):
                         raise ValueError(f"「{name}」没有「{' '.join(rest)}」这一档；现有档位：" + "、".join(dict.fromkeys(known)))
                     return f"level:{key}|{level}", f"{name} {' '.join(rest)}"
                 return f"key:{key}", name
@@ -21847,13 +21857,17 @@ class Bot:
                                  "单位 ¢，0.5～50") from None
             if not 0.5 <= cents <= 50:
                 raise ValueError("门槛范围 0.5～50¢")
-        key, name = self.edge_target(args[:-1])
         if off:
+            key, name = self.edge_target(args[:-1], bars)  # also a bar saved under the level as typed (never matched a card)
             if key not in bars:
                 return f"ℹ️ {name} 没有单独的门槛，无需取消。\n" + self.edge_text()
             bars.pop(key, None); names.pop(key, None)
             self.update_settings(edge_bars=bars, edge_names=names)
             return f"✅ 已取消 {name} 的单独门槛。\n" + self.edge_text()
+        key, name = self.edge_target(args[:-1])
+        stale = self.edge_target(args[:-1], bars)[0]  # the same level saved as typed before CTRL-EDGE-LEVEL: this bar
+        if stale != key:                              # replaces it (else both are listed under the one name)
+            bars.pop(stale, None); names.pop(stale, None)
         bars[key] = round(cents, 2); names[key] = name
         self.update_settings(edge_bars=bars, edge_names=names)
         what = "默认门槛" if key == "default" else f"{name} 的提醒门槛"

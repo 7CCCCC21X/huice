@@ -281,6 +281,50 @@ def ctrl_edge_level():
 ctrl_edge_level()
 
 
+def ctrl_edge_level_stale():
+    """CTRL-EDGE-LEVEL (follow-up): the bars the bug saved before the fix (the level as typed: "…|4500", a level on a
+    market without levels) are still in the settings and listed by /edge; "/edge … off" takes each away on its own (it
+    was refused, or answered 无需取消, and only /edge 清空 removed them, with every valid bar), and setting the level again
+    replaces the dead bar. A bar of a level the market has dropped since can be taken away too."""
+    bot = m.Bot(m.Config.from_env(base), m.Store(":memory:"), FM(NOW), None)
+    D = m.D
+    ask = lambda *args: bot.cmd_edge(m.Request("/edge", list(args), 1, 0, 1))
+    old = {"level:HSI|300m": 4.0, "level:ETH-HIT-11|4500": 3.0, "key:HSI": 5.0}
+    old_names = {"level:HSI|300m": "恒生指数 300m", "level:ETH-HIT-11|4500": "ETH 11月价格 4500", "key:HSI": "恒生指数"}
+    bot.update_settings(edge_bars=dict(old), edge_names=dict(old_names))
+    reply = ask("恒指", "300m", "off")
+    assert reply.startswith("✅ 已取消") and "300m" not in reply.split("用法")[0].split("\n", 1)[1], reply
+    assert bot.edge_bars()[0] == {"level:ETH-HIT-11|4500": 3.0, "key:HSI": 5.0}, bot.edge_bars()
+    reply = ask("ETH", "11月", "4500", "off")
+    assert reply.startswith("✅ 已取消"), reply
+    assert bot.edge_bars() == ({"key:HSI": 5.0}, {"key:HSI": "恒生指数"}), bot.edge_bars()
+    assert ask("ETH", "11月", "4500", "off").startswith("ℹ️")  # nothing left under either spelling
+    try:
+        ask("恒指", "300m", "off"); assert False, "no such bar: a level on a market without levels is still refused"
+    except ValueError as e:
+        assert "没有档位" in str(e), e
+    # setting the level again replaces the dead bar: one bar, in the card's spelling
+    bot.update_settings(edge_bars=dict(old), edge_names=dict(old_names))
+    assert ask("ETH", "11月", "4500", "2").startswith("✅")
+    assert bot.edge_bars()[0] == {"level:HSI|300m": 4.0, "level:ETH-HIT-11|4.5k": 2.0, "key:HSI": 5.0}, bot.edge_bars()
+    assert "level:ETH-HIT-11|4500" not in bot.edge_bars()[1]
+    try:
+        ask("恒指", "300m", "4"); assert False, "setting a level on a market without levels stays refused"
+    except ValueError as e:
+        assert "没有档位" in str(e) and bot.edge_bars()[0]["level:HSI|300m"] == 4.0, e
+    # the market drops the level (its rows no longer list 4500): the bar can still be taken away, typed either way
+    bot.predict.ladders["ETH-HIT-11"] = [m.LadderRow(D(t), str(i), f"${t}", None) for i, t in enumerate((4000, 5000))]
+    assert ask("ETH", "11月", "4500", "off").startswith("✅") and "level:ETH-HIT-11|4.5k" not in bot.edge_bars()[0]
+    try:
+        ask("ETH", "11月", "4500", "3"); assert False, "a level the market does not list cannot be set"
+    except ValueError as e:
+        assert "现有档位" in str(e), e
+    assert bot.edge_bars()[0] == {"level:HSI|300m": 4.0, "key:HSI": 5.0}, bot.edge_bars()
+
+
+ctrl_edge_level_stale()
+
+
 def ctrl_prune():
     """CTRL-PRUNE: control_prune guessed the saved value to blame from the error text (cut to 280 characters) and gave up
     when it named no saved key — a failed int(), the timing keys past the cut, an environment variable made invalid by the
