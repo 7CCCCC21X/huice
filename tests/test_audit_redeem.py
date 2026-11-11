@@ -633,4 +633,71 @@ async def open_shapes():
 asyncio.run(open_shapes())
 
 
+# --- RDM-YB-NEGRISK-APPROVAL ----------------------------------------------------------------------------------------------------
+KEY, PA = T["KEY"], T["PA"]
+SEL_APPROVED = L.Chain.encode("isApprovedForAll(address,address)", ["address", "address"], [PA, PA])[:4]
+SEL_SET = L.Chain.encode("setApprovalForAll(address,bool)", ["address", "bool"], [PA, True])[:4]
+# both SDKs' address tables, as data (predict_sdk constants.py / @predictdotfun/sdk Constants.js)
+SDK = {56: {"CONDITIONAL_TOKENS": "0x22DA1810B194ca018378464a58f6Ac2B10C9d244", "NEG_RISK_CONDITIONAL_TOKENS": "0x22DA1810B194ca018378464a58f6Ac2B10C9d244",
+            "YIELD_BEARING_CONDITIONAL_TOKENS": "0x9400F8Ad57e9e0F352345935d6D3175975eb1d9F",
+            "YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS": "0xF64b0b318AAf83BD9071110af24D24445719A07F"},
+       97: {"CONDITIONAL_TOKENS": "0x2827AAef52D71910E8FBad2FfeBC1B6C2DA37743", "NEG_RISK_CONDITIONAL_TOKENS": "0x2827AAef52D71910E8FBad2FfeBC1B6C2DA37743",
+            "YIELD_BEARING_CONDITIONAL_TOKENS": "0x38BF1cbD66d174bb5F3037d7068E708861D68D7f",
+            "YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS": "0x26e865CbaAe99b62fbF9D18B55c25B5E079A93D5"}}
+
+
+class ApprovalChain(L.Chain):
+    """The REAL check_approvals / set_approvals over a chain where nothing is approved: every isApprovedForAll read and every
+    setApprovalForAll sent is recorded as (tokens contract, operator)."""
+    def __init__(self, wallet):
+        super().__init__("https://rpc.invalid", wallet)
+        self.reads, self.sets = [], []
+
+    async def call(self, to, data):
+        if data[:4] == SEL_APPROVED:
+            self.reads.append((to.lower(), "0x" + data[4 + 32 + 12:4 + 64].hex()))
+        return b"\x00" * 32  # nothing approved, no allowance
+
+    async def send(self, to, data, value=0, **kw):
+        if data[:4] == SEL_SET:
+            self.sets.append((to.lower(), "0x" + data[4 + 12:4 + 32].hex()))
+        return "0x" + "11" * 32
+
+    async def wait(self, tx_hash, timeout=120.0):
+        return {"blockNumber": "0x1", "status": "0x1", "logs": []}
+
+
+async def yb_negrisk_approval():
+    """RDM-YB-NEGRISK-APPROVAL: on the yield-bearing track all three outcome-token approvals were read and set on
+    YIELD_BEARING_CONDITIONAL_TOKENS; both SDKs put the multi-outcome exchange and the adapter on the track's multi-outcome
+    tokens, YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS — a different contract on chains 56 and 97. --approve signed two grants
+    neither SDK sends (and never the one a yield-bearing multi-outcome redeem needs), --live-check read OK for it. The steps
+    now name the SDKs' pairs; the labels, the USDT steps and the standard track (one address) are as they were."""
+    assert SDK[56]["YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS"].lower() != SDK[56]["YIELD_BEARING_CONDITIONAL_TOKENS"].lower()
+    for chain_id in (56, 97):
+        for account in ("", PA):
+            for yb in (True, False):
+                chain = ApprovalChain(L.Wallet(KEY, chain_id, account))
+                a = L.ADDRESSES[chain_id]
+                p = "YIELD_BEARING_" if yb else ""
+                pairs = [(SDK[chain_id][p + "CONDITIONAL_TOKENS"].lower(), a[p + "CTF_EXCHANGE"].lower()),
+                         (SDK[chain_id][p + "NEG_RISK_CONDITIONAL_TOKENS"].lower(), a[p + "NEG_RISK_CTF_EXCHANGE"].lower()),
+                         (SDK[chain_id][p + "NEG_RISK_CONDITIONAL_TOKENS"].lower(), a[p + "NEG_RISK_ADAPTER"].lower())]
+                word = "收益型" if yb else ""
+                assert [label for label, _, _ in chain.approval_steps(yb)] == [
+                    f"{word}结果代币 → 交易所", f"{word}结果代币 → 多结果交易所", f"{word}结果代币 → 多结果适配器",
+                    f"{word}USDT 额度 → 交易所", f"{word}USDT 额度 → 多结果交易所"]
+                assert [ok for _, ok in await chain.check_approvals(yb)] == [False] * 5
+                assert chain.reads == pairs, (chain_id, account, yb, chain.reads)  # (before: the yield-bearing track read 0x9400… three times)
+                steps = await chain.set_approvals(yb)
+                assert [outcome.startswith("已完成") for _, outcome in steps] == [True] * 5, steps
+                assert chain.sets == pairs, (chain_id, account, yb, chain.sets)
+        assert L.ADDRESSES[chain_id]["NEG_RISK_CONDITIONAL_TOKENS"] == SDK[chain_id]["NEG_RISK_CONDITIONAL_TOKENS"]
+        assert L.tokens_key(True, False) in L.ADDRESSES[chain_id] and L.tokens_key(True, True) in L.ADDRESSES[chain_id]
+    print("RDM_YB_NEGRISK_APPROVAL_OK")
+
+
+asyncio.run(yb_negrisk_approval())
+
+
 print("AUDIT_REDEEM_OK")

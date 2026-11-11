@@ -74,6 +74,7 @@ ADDRESSES: dict[int, dict[str, str]] = {
          "NEG_RISK_CTF_EXCHANGE": "0x365fb81bd4A24D6303cd2F19c349dE6894D8d58A",
          "NEG_RISK_ADAPTER": "0xc3Cf7c252f65E0d8D88537dF96569AE94a7F1A6E",
          "CONDITIONAL_TOKENS": "0x22DA1810B194ca018378464a58f6Ac2B10C9d244",
+         "NEG_RISK_CONDITIONAL_TOKENS": "0x22DA1810B194ca018378464a58f6Ac2B10C9d244",  # (the SDKs' own key: the same contract on this track)
          "YIELD_BEARING_CTF_EXCHANGE": "0x6bEb5a40C032AFc305961162d8204CDA16DECFa5",
          "YIELD_BEARING_NEG_RISK_CTF_EXCHANGE": "0x8A289d458f5a134bA40015085A8F50Ffb681B41d",
          "YIELD_BEARING_NEG_RISK_ADAPTER": "0x41dCe1A4B8FB5e6327701750aF6231B7CD0B2A40",
@@ -85,6 +86,7 @@ ADDRESSES: dict[int, dict[str, str]] = {
          "NEG_RISK_CTF_EXCHANGE": "0xd690b2bd441bE36431F6F6639D7Ad351e7B29680",
          "NEG_RISK_ADAPTER": "0x285c1B939380B130D7EBd09467b93faD4BA623Ed",
          "CONDITIONAL_TOKENS": "0x2827AAef52D71910E8FBad2FfeBC1B6C2DA37743",
+         "NEG_RISK_CONDITIONAL_TOKENS": "0x2827AAef52D71910E8FBad2FfeBC1B6C2DA37743",
          "YIELD_BEARING_CTF_EXCHANGE": "0x8a6B4Fa700A1e310b106E7a48bAFa29111f66e89",
          "YIELD_BEARING_NEG_RISK_CTF_EXCHANGE": "0x95D5113bc50eD201e319101bbca3e0E250662fCC",
          "YIELD_BEARING_NEG_RISK_ADAPTER": "0xb74aea04bdeBE912Aa425bC9173F9668e6f11F99",
@@ -1065,9 +1067,16 @@ class Chain:
         """(label, kind, spender) for one market track, as the SDK's setApprovals sets them."""
         prefix = "YIELD_BEARING_" if yield_bearing else ""
         ct, ex, nex, adapter = (prefix + k for k in ("CONDITIONAL_TOKENS", "CTF_EXCHANGE", "NEG_RISK_CTF_EXCHANGE", "NEG_RISK_ADAPTER"))
+        # 1.150.0 (audit RDM-YB-NEGRISK-APPROVAL): the multi-outcome exchange and the adapter are operators on the track's
+        # MULTI-OUTCOME outcome tokens (both SDKs: _ctf_key(is_neg_risk=True, …) / getCtfIdentifier(true, …)). All three steps
+        # named the binary tokens contract — the same address on the standard track, but on the yield-bearing one
+        # YIELD_BEARING_CONDITIONAL_TOKENS (0x9400…) instead of YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS (0xF64b…): --approve
+        # signed two grants neither SDK sends and never the one a yield-bearing multi-outcome redeem needs, and --live-check
+        # read OK for it (or MISSING on an account the website had approved correctly). The binary step stays on ``ct``.
+        nct = tokens_key(True, yield_bearing)
         word = "收益型" if yield_bearing else ""
-        return [(f"{word}结果代币 → 交易所", f"1155:{ct}", ex), (f"{word}结果代币 → 多结果交易所", f"1155:{ct}", nex),
-                (f"{word}结果代币 → 多结果适配器", f"1155:{ct}", adapter),
+        return [(f"{word}结果代币 → 交易所", f"1155:{ct}", ex), (f"{word}结果代币 → 多结果交易所", f"1155:{nct}", nex),
+                (f"{word}结果代币 → 多结果适配器", f"1155:{nct}", adapter),
                 (f"{word}USDT 额度 → 交易所", "20", ex), (f"{word}USDT 额度 → 多结果交易所", "20", nex)]
 
     async def check_approvals(self, yield_bearing: bool = False) -> list[tuple[str, bool]]:
