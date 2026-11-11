@@ -270,4 +270,73 @@ async def round_void():
 asyncio.run(round_void())
 
 
+# --- RDM-UNSENT-RETRY-GRID ------------------------------------------------------------------------------------------------------
+async def unsent_retry_grid():
+    """RDM-UNSENT-RETRY-GRID: a redeem that never left (TxNotSent: the chain a moment behind Predict's result, an RPC blip) waits
+    five minutes and the bot said 5 分钟后自动再试 — but nothing brought a round when the wait ended: the retry came with the next
+    ten-minute round (up to fifteen when another round came inside the wait). For its first three such failures in a row the
+    position now brings the next round to the end of its wait (the shared pull: never later than a round already due, never
+    inside the key's cooldown); then the usual rounds, and the text says so. A sent failure, low gas and the check pull nothing."""
+    bot = await ready_bot()
+    fake, chain, key = bot.live.api, bot.live.chain, "live:redeemed:500:1"
+    fake.positions_rows, fake.markets["500"] = [held(500)], mk(500, won=1)
+    chain.fail_unsent = "RPC 错误：execution reverted"
+    sent = notices(bot)
+    # (a) the first try never left: the next round at the wait's end, five minutes on — not the ten-minute round
+    bot.live_last_redeem = time.monotonic()  # (as the tick stamps it when the round starts)
+    assert await bot.live_redeem(NOW) == [] and chain.redeemed == []
+    assert 295 < due(bot) <= 302, due(bot)
+    assert bot.live_errors[-1].endswith("（交易没发出，5 分钟后再试）") and bot.live_redeem_unsent == {key: 1}, (bot.live_errors[-1:], bot.live_redeem_unsent)
+    assert [k for k, _ in sent] == ["redeem:fail"] and "5 分钟后自动再试" in sent[0][1], sent
+    # (b) another round inside the wait (a win elsewhere) finds it waiting: the pull to the wait's end stands
+    bot.live_last_redeem = time.monotonic()
+    assert await bot.live_redeem(NOW + MIN) == [] and bot.live_redeem_last["counts"] == {"waiting": 1}, bot.live_redeem_last
+    assert 290 < due(bot) <= 302, due(bot)
+    # (c) /live redeem check moves nothing
+    stamp = bot.live_last_redeem
+    await bot.live_redeem_report(NOW + MIN + 1000)
+    assert bot.live_last_redeem == stamp
+    # (d) the second and third such failures in a row pull too; the fourth waits for the usual round, and says so
+    for runs in (2, 3, 4):
+        bot.live_redeem_failed.clear()  # (the wait over)
+        bot.live_last_redeem = time.monotonic()
+        assert await bot.live_redeem(NOW + runs * 6 * MIN) == [] and bot.live_redeem_unsent == {key: runs}, bot.live_redeem_unsent
+        if runs <= bot.LIVE_REDEEM_UNSENT_PULLS:
+            assert 295 < due(bot) <= 302 and bot.live_errors[-1].endswith("（交易没发出，5 分钟后再试）"), (runs, due(bot), bot.live_errors[-1:])
+    assert due(bot) > 595 and bot.live_errors[-1].endswith("（交易没发出，下一轮再试，最迟约 10 分钟）"), (due(bot), bot.live_errors[-1:])
+    bot.live_last_redeem = time.monotonic()
+    assert await bot.live_redeem(NOW + 30 * MIN) == [] and bot.live_redeem_last["counts"] == {"waiting": 1} and due(bot) > 595, "past the bound: not even from the wait"
+    # (e) it goes out: the run of failures forgotten
+    chain.fail_unsent = ""
+    bot.live_redeem_failed.clear()
+    done = await bot.live_redeem(NOW + 40 * MIN)
+    assert len(done) == 1 and bot.live_redeem_unsent == {} and [cid for cid, *_ in chain.redeemed] == [cond(500)], (done, bot.live_redeem_unsent)
+    # (f) a sent failure (its gas paid, its transaction may yet be mined): the hour's wait, nothing pulled
+    fake.positions_rows.append(held(501)); fake.markets["501"] = mk(501, won=1)
+    chain.fail = "交易失败（已回滚）"
+    bot.live_last_redeem = time.monotonic()
+    assert await bot.live_redeem(NOW + 50 * MIN) == [] and due(bot) > 595 and bot.live_errors[-1].endswith("（一小时后再试）"), (due(bot), bot.live_errors[-1:])
+    assert bot.live_redeem_unsent == {}
+    # (g) low gas: nothing tried, nothing pulled
+    chain.fail = ""
+    fake.positions_rows.append(held(502)); fake.markets["502"] = mk(502, won=1)
+    chain.bnb = 10 ** 13
+    await bot.live.refresh_balance()
+    bot.live_last_redeem = time.monotonic()
+    assert await bot.live_redeem(NOW + 51 * MIN) == [] and bot.live_redeem_last["counts"].get("claimable") == 1 and due(bot) > 595, bot.live_redeem_last
+    # (h) the key cooling when the wait ends: the pulled round after the cooldown, not into it
+    chain.bnb = 10 ** 17
+    await bot.live.refresh_balance()
+    chain.fail_unsent = "HTTP 503: Service Unavailable"
+    bot.live_redeem_failed.clear()
+    fake.blocked_until = time.monotonic() + 400
+    bot.live_last_redeem = time.monotonic()
+    assert await bot.live_redeem(NOW + 52 * MIN) == []
+    assert 429 <= due(bot) <= 431, due(bot)
+    print("RDM_UNSENT_RETRY_GRID_OK")
+
+
+asyncio.run(unsent_retry_grid())
+
+
 print("AUDIT_REDEEM_OK")

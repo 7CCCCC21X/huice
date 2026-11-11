@@ -1419,6 +1419,7 @@ class LiveBot(core.Bot):
     #                             a list longer still is said (the round's summary, /live redeem check, one notice an hour), never taken for the whole
     LIVE_REDEEM_RETRY_SECONDS = 3600  # a position whose redeem failed (gas, a revert) is tried again after this long, not every look...
     LIVE_REDEEM_UNSENT_RETRY_SECONDS = 300  # ...one whose transaction never left (TxNotSent: not resolved on-chain yet, an RPC blip) after this long
+    LIVE_REDEEM_UNSENT_PULLS = 3  # ...and for its first this many such failures in a row a round is brought to the end of that wait (1.150.0); then the next round
     LIVE_REDEEM_TICK_SECONDS = 5     # the automatic redeem's own timer (live_redeem_loop): rounds whatever the paper trader does
     LIVE_REDEEM_AGAIN_SECONDS = 30   # a round that could not look (the key cooling, the list unread, not signed in) or that a rate limit cut short:
     #                                  the next one this long after the key's cooldown ends, not LIVE_REDEEM_SECONDS on (live_redeem_again, 1.150.0)...
@@ -1471,6 +1472,7 @@ class LiveBot(core.Bot):
         self.live_redeem_lock = asyncio.Lock()               # one redeem round at a time (the command beside the automatic round)
         self.live_redeem_last: dict = {}                     # the last round (automatic or /live redeem): when, what it found, or why it could not look
         self.live_redeem_errors: dict[str, str] = {}         # position key -> why its last redeem failed (/live redeem check)
+        self.live_redeem_unsent: dict[str, int] = {}         # position key -> its redeems in a row that never left (TxNotSent): LIVE_REDEEM_UNSENT_PULLS (1.150.0)
         self.live_redeem_read_round: dict[str, int] = {}     # market id -> the number of the redeem round that last read it (this process's rounds): the longest unread are read first (1.150.0)
         self.live_redeem_noted = -1e9                        # the last failed redeem told on Telegram (LIVE_REDEEM_NOTE_SECONDS)
         self.live_redeem_again_n = 0                         # early rounds in a row asked for by live_redeem_again (0 again once a round looked, 1.150.0)
@@ -4228,6 +4230,15 @@ class LiveBot(core.Bot):
         read_round = self.__dict__.setdefault("live_redeem_read_round", {})
         this_round = max(read_round.values(), default=0) + 1
         unsettled: set[str] = set()  # the markets of the positions with no redeemed / lost mark: only their turn is remembered
+        # 1.150.0 (audit RDM-UNSENT-RETRY-GRID): a redeem that never left (TxNotSent: the chain a moment behind Predict's result, an
+        # RPC blip) waits LIVE_REDEEM_UNSENT_RETRY_SECONDS and was promised 5 分钟后 — but nothing brought a round when that wait
+        # ended: the retry was the next ten-minute round, up to fifteen minutes when another win's round came inside the wait and
+        # restarted the clock. For its first LIVE_REDEEM_UNSENT_PULLS such failures in a row a position now brings the next round
+        # to the end of its wait (live_redeem_pull: the min, never inside the key's cooldown) — again from a round that finds it
+        # still waiting, so another round coming first does not spend the pull. Then the usual rounds: a position the chain keeps
+        # refusing does not double the rounds for good. A sent failure (its gas paid; its transaction may yet be mined) pulls nothing.
+        unsent_runs = self.__dict__.setdefault("live_redeem_unsent", {})
+        pull: list[str] = []
         market_of = lambda r: str((r.get("market") if isinstance(r.get("market"), dict) else {}).get("id") or r.get("marketId") or "")
         for row in sorted(rows, key=lambda r: (read_round.get(market_of(r), 0), -self.position_time(r))):
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
@@ -4251,6 +4262,8 @@ class LiveBot(core.Bot):
             failed_at = self.live_redeem_failed.get(key)
             if failed_at is not None and time.monotonic() - failed_at < self.LIVE_REDEEM_RETRY_SECONDS:
                 seen.append({**entry, "kind": "waiting", "left": self.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - failed_at), "error": errors.get(key, "")})
+                if 1 <= unsent_runs.get(key, 0) <= self.LIVE_REDEEM_UNSENT_PULLS:
+                    pull.append(key)  # a round inside its wait: the pull to the wait's end stands
                 continue
             if not index_set:
                 seen.append({**entry, "kind": "fields", "error": "持仓没写 indexSet，分不出是哪一边"})
@@ -4299,11 +4312,21 @@ class LiveBot(core.Bot):
                 text = core.clean_error(error) or type(error).__name__
                 self.live_redeem_failed[key] = time.monotonic() - self.LIVE_REDEEM_RETRY_SECONDS + wait
                 errors[key] = text
-                self.live_note_error(f"领取 {entry['title']} 失败：{text}" + ("（交易没发出，5 分钟后再试）" if unsent else "（一小时后再试）"))
-                seen.append({**entry, "kind": "failed", "error": text, "unsent": unsent})
+                pulled = False
+                if unsent:
+                    pulled = (runs := unsent_runs.get(key, 0) + 1) <= self.LIVE_REDEEM_UNSENT_PULLS
+                    unsent_runs[key] = runs
+                    if pulled:
+                        pull.append(key)
+                else:
+                    unsent_runs.pop(key, None)
+                self.live_note_error(f"领取 {entry['title']} 失败：{text}" + ("（交易没发出，5 分钟后再试）" if pulled else "（交易没发出，下一轮再试，最迟约 10 分钟）" if unsent
+                                                                         else "（一小时后再试）"))
+                seen.append({**entry, "kind": "failed", "error": text, "unsent": unsent, "pulled": pulled})
                 continue
             self.store.put(key, {"at": now_ms, "tx": tx, "amount": str(amount), "title": entry["title"]})
             errors.pop(key, None)
+            unsent_runs.pop(key, None)
             line = f"💵 已领取 {entry['title']} {outcome.get('name') or ''} {from_wei(amount):g} 份：{tx}"
             done.append(line)
             seen.append({**entry, "kind": "redeemed", "tx": tx})
@@ -4312,6 +4335,11 @@ class LiveBot(core.Bot):
             return done, seen
         for gone in set(read_round) - unsettled:
             del read_round[gone]  # every position on it settled here (redeemed, lost) before this round, or no longer held: forgotten
+        for gone in [k for k in unsent_runs if k.split(":")[2] not in unsettled]:  # (key: live:redeemed:<market>:<index set>)
+            del unsent_runs[gone]
+        if pull:  # (RDM-UNSENT-RETRY-GRID) the next round at the end of the soonest such wait, a second after it
+            left = min(self.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - self.live_redeem_failed[k]) for k in pull)
+            self.live_redeem_pull(max(0.0, left) + 1)
         claimable = [s for s in seen if s["kind"] == "claimable"]
         if low_gas and claimable and time.monotonic() - self.live_gas_noted >= self.LIVE_REDEEM_RETRY_SECONDS:
             self.live_gas_noted = time.monotonic()
@@ -4322,8 +4350,9 @@ class LiveBot(core.Bot):
         failed = [s for s in seen if s["kind"] == "failed"]
         if failed and time.monotonic() - getattr(self, "live_redeem_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
             self.live_redeem_noted = time.monotonic()
+            when = "5 分钟后" if failed[0].get("pulled") else "下一轮（最迟约 10 分钟）" if failed[0].get("unsent") else "一小时后"
             self.live_notify(f"⚠️ 自动领取：{len(failed)} 个已结算的持仓没领成（{failed[0]['title']}：{failed[0]['error']}），"
-                             f"{'5 分钟' if failed[0].get('unsent') else '一小时'}后自动再试。/live redeem check 查看原因", key="redeem:fail")
+                             f"{when}自动再试。/live redeem check 查看原因", key="redeem:fail")
         if cut and time.monotonic() - getattr(self, "live_cut_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
             # 1.150.0 (RDM-POSITIONS-CUT): a list longer than even the redeem's own read — told once an hour on its own timer (a bare
             # key would come back every LIVE_NOTE_SECONDS, a round or two), not only in the summary nobody asks for
