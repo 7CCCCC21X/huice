@@ -1698,4 +1698,181 @@ try:
 finally:
     m.http_get, m.SOURCE_HEALTH = _sh_get, _sh_health
 asyncio.run(stale_hold_nvda())
+
+
+# --- XR-SELFCAP-GHOST-CLOCK: SIM-SELF-MATCH's ghost clause read by the time the book's levels were taken (FEED-FETCHED-MS) ----------
+# sim_taker_self_cap (SIM-SELF-MATCH) keeps a taker's cap a cent under our own real buy of the other side, and still counts one whose
+# cancel Predict confirmed after the book was read (the book may still show it). "Read" was the book's fetched_ms, which FEED-FETCHED-MS
+# made the book's age alone: an unchanged re-send (refresh_age) and the heartbeat (touch) restart it over the same old levels
+# (book_restarted), and a REST read asked before the confirmation is stamped with its landing after it. On such a book the maker side
+# (sim_own_resting, ghost_unsure) took the cancelled order as maybe still shown, while the taker side released the cap and bought it: a
+# real LIMIT order sized on liquidity gone at Predict, and 距吃单 / the order check read 可买 for it. Now read by book_content_ms, the
+# time the levels were taken, as sim_own_order / ghost_unsure / own_on_book read it.
+def selfcap_ghost_clock():
+    """Our real 涨 bid 60¢ × 50, the book's only bid, was withdrawn and Predict confirmed the cancel at t0 (a 挂涨; or what a 吃涨 at a
+    60¢ LIMIT did not fill, 40 of 50); the fair 涨 is 30¢, so the 跌 taker's cap is 59¢ and a book whose levels were taken before t0
+    shows our cancelled bid as a 40¢ "ask" of 跌."""
+    now = NOW
+    bot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_TAKER_HOLD_SECONDS": "0"}), m.Store(":memory:"), T["FM"](now), None)
+    slug, t0 = "hsi-selfcap-ghost", now - 2_000
+    done = {"state": "done", "final": "cancelled", "order_id": "9", "answered_ms": now - 50_000, "answered_at": now - 50_000,
+            "cancel_sent_at": t0 - 120, "cancel_done_at": t0, "cancel_done_ms": t0}
+    maker = {"v": 2, "market": slug, "slug": slug, "item": "恒生指数", "kind": "close", "key": "HSI", "side": "up", "label": "挂涨",
+             "maker": True, "status": "cancelled", "shares": 0.0, "order": 50.0, "price": 0.60, "fills": [], "revisions": [],
+             "opened": now - 60_000, "withdrawn": {"at": t0 - 150, "why": "撤单线", "rule": True}, "live": done}
+    rest = {**maker, "label": "吃涨", "maker": False, "status": "filled", "shares": 10.0, "price": 0.6096, "cap": 0.61,
+            "live": {**done, "want": {"maker": False, "limit": 0.60, "cap": 0.61, "shares": 50.0}}}
+    ours, asks = ((D("0.60"), D("50")),), ((D("0.62"), D("40")),)
+    card = lambda book: m.SimMarket(slug, "恒生指数", "close", "HSI", 0.30, book, 0.02, "", ("涨", "跌"), T["SETTLE_HSI"])
+    pushed = m.PredictBook("HSI", slug, "1", "t", ours, asks, t0 - 1_000, 200, content_ms=t0 - 1_000)  # a changed push of before t0
+    restamped = {"re-sent unchanged / heartbeat after the confirmation": m.book_restarted(pushed, t0 + 500),  # refresh_age, touch
+                 "REST read asked before the confirmation, landing after it": m.PredictBook("HSI", slug, "1", "t", ours, asks, t0 + 300, 200,
+                                                                                             content_ms=t0 - 200)}
+    for rec, tid in ((maker, f"{slug}|up|挂#1"), (rest, f"{slug}|up|吃")):
+        trades = lambda: m.TradeMap({tid: {**rec, "live": dict(rec["live"])}})
+
+        def take(book):
+            bot.sim_paper_used.clear()  # (a paper Bot: what an earlier case "took" of these asks is not this case's matter)
+            changed: list = []
+            bot.sim_take(card(book), trades(), now, changed)
+            return [(t["label"], t["shares"]) for _, t in changed if not t["maker"]]
+
+        for what, book in restamped.items():
+            what = (rec["label"], what)
+            assert book.fetched_ms > t0 >= m.book_content_ms(book) and not book.stale(now), (what, book.fetched_ms, m.book_content_ms(book))
+            if rec["maker"]:  # the maker side (FEED-FETCHED-MS) reads this very book as maybe still showing the cancelled order ...
+                assert m.ghost_unsure(trades()[tid], book) and m.Bot.sim_own_resting(trades(), slug, "up", book) == (50.0, 0.6), what
+            # ... and so does the taker side now: the cap a cent under our old level, nothing bought from the ghost
+            cap = bot.sim_taker_self_cap(trades(), card(book), "down", 0.59)
+            assert cap == 0.39, (what, cap)  # before: 0.59
+            assert take(book) == [], (what, take(book))  # before: [('吃跌', 50.0)], "bought" from our own cancelled bid
+            # the 距吃单 card and the order check use the trader's cap: no 可吃单 / 可买 for the ghost's shares
+            bot.sim_paper_used.clear()
+            gap = bot.sim_taker_gap(card(book), trades(), now)
+            down = next(s for s in gap["sides"] if s["side"] == "down")
+            assert gap["state"] != "ready" and "可买" not in gap["text"] + gap["detail"], (what, gap["state"], gap["text"])  # before: ready, 可买 50 份
+            assert not down["got"] and down["block"] == bot.sim_taker_self_text(0.39) and "40.0¢" in down["block"], (what, down)
+            bot.sim_trades, bot.sim_markets = trades, (lambda now_ms, book=book: [card(book)])
+            try:
+                (row,) = bot.sim_checks(now)
+            finally:
+                del bot.sim_trades, bot.sim_markets
+            assert "自己的" in row["taker"] and "可买" not in row["taker"], (what, row["taker"])  # before: 跌：封顶 59.0¢，可买 50 份
+        # the same levels not restamped hold the cap, as SIM-SELF-MATCH made them; a book whose levels were taken after the
+        # confirmation (the push that drops our bid, a REST read asked after it) releases it: what bids there is somebody else's
+        assert bot.sim_taker_self_cap(trades(), card(pushed), "down", 0.59) == 0.39 and take(pushed) == []
+        after = m.PredictBook("HSI", slug, "1", "t", ((D("0.55"), D("30")),), asks, t0 + 300, 200, content_ms=t0 + 300)
+        assert bot.sim_taker_self_cap(trades(), card(after), "down", 0.59) == 0.59 and take(after) == [("吃跌", 30.0)], take(after)
+        # a book built without content_ms (its levels' time is its fetched_ms): SIM-SELF-MATCH's own comparison, unchanged
+        plain = lambda at: m.PredictBook("HSI", slug, "1", "t", ours, asks, at, 200)
+        assert [bot.sim_taker_self_cap(trades(), card(plain(at)), "down", 0.59) for at in (t0 - 1, t0, t0 + 1)] == [0.39, 0.39, 0.59]
+        # never more than the fetched_ms reading allowed: whatever the two stamps (levels taken no later than the book is stamped)
+        for content in (t0 - 1, t0, t0 + 1):
+            for fetched in (t0 - 1, t0, t0 + 1, t0 + 500):
+                if fetched >= content:
+                    bk = m.PredictBook("HSI", slug, "1", "t", ours, asks, fetched, 200, content_ms=content)
+                    assert bot.sim_taker_self_cap(trades(), card(bk), "down", 0.59) <= (0.39 if fetched <= t0 else 0.59), (content, fetched)
+
+
+async def selfcap_ghost_clock_live(how: str) -> tuple[list, list]:
+    """The same end to end: the real trader (LiveBot over test_trading's stand-ins and the SDK test suite's key: nothing real is
+    contacted) and the real PredictStream, the books' stamps and live_cancel's cancel_done_ms on one clock. Our real 挂涨 rests at
+    60¢ × 50 (SIM_WAYS=both, the 均衡 / 进取 presets), the book's only bid. At T a changed push shows it while the fair 涨 has fallen
+    to 30¢: the express lane withdraws it and Predict confirms the cancel 100 ms later. At T+300 the server re-sends the same levels
+    or the heartbeat comes (``how``; "" nothing comes); at T+400 a price move wakes the express lane. Returns the 跌 taker records
+    and the orders sent after the cancel."""
+    import json
+    real_time = m.time
+
+    class Clock:  # main's and live's wall clock in the test's hands; monotonic moved on with it
+        def __init__(self, ms): self.ms, self.skew = ms, 0.0
+        def time(self): return (self.ms + 0.5) / 1000  # int(time.time() * 1000) is self.ms exactly
+        def monotonic(self): return real_time.monotonic() + self.skew
+        def pass_ms(self, ms): self.ms, self.skew = self.ms + ms, self.skew + ms / 1000
+        def __getattr__(self, name): return getattr(real_time, name)
+
+    class Ws:  # the connection the heartbeat is answered on
+        async def send(self, text): pass
+
+    async def looked(feed):  # the express looks a push started, to their end
+        while feed.express_tasks:
+            await asyncio.gather(*list(feed.express_tasks))
+            await asyncio.sleep(0)
+
+    clock = Clock(NOW)
+    m.time = L.time = clock
+    try:
+        # the settings as deployed but for the resting orders' sessions (SIM_WAYS=both: the 均衡 / 进取 presets); not make_bot's,
+        # whose resting orders rest as placed (SIM_MAKER_EXIT_CENTS=0): this one has to be withdrawn by the bot's own look
+        bot = L.LiveBot(m.Config.from_env({**T["base"], "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+                                           "SIM_WAYS": "both", "SIM_MARKETS": "all", "SIM_MAKER_SESSION": "off", "LIVE": "on",
+                                           "PREDICT_PRIVATE_KEY": T["KEY"], "PREDICT_API_KEY": "k", "LIVE_MAX_ORDER_USD": "100",
+                                           "LIVE_MAX_OPEN_USD": "250", "LIVE_MAX_DAILY_LOSS_USD": "50"}), m.Store(":memory:"), T["FM"](NOW), None)
+        bot.market.now_ms = lambda: clock.ms  # the market clock: the same one
+        bot.live.api, bot.live.chain = T["FakeApi"](), T["FakeChain"]()
+        bot.live.api.markets["101"] = T["market_json"]("101")
+        api, feed, stream = bot.live.api, bot.predict, bot.predict.stream
+        cancel = api.remove_orders
+
+        async def remove_orders(ids):  # Predict confirms a cancel 100 ms after it goes out
+            clock.pass_ms(100)
+            return await cancel(ids)
+        api.remove_orders = remove_orders
+        fair = {"up": 0.62}
+        bot.sim_markets = lambda now_ms: [m.SimMarket(HSI_SLUG, "恒生指数", "close", "HSI", fair["up"], feed.books["HSI"], 0.03, "", ("涨", "跌"),
+                                                      T["SETTLE_HSI"], {"basis": {"fair_up": fair["up"], "ref": 24600.0}, "proxy": None,
+                                                                        "sources": [{"what": "恒指期货", "source": "etnet"}]})]
+        # the book as last read (somebody's 58¢ × 10 then): the push at T is a change
+        feed.books["HSI"] = m.PredictBook("HSI", HSI_SLUG, "101", "t", ((D("0.58"), D("10")),), ((D("0.62"), D("40")),), clock.ms - 2_000, 200)
+        await bot.live_prepare()
+        await bot.live_prefetch(clock.ms)
+        assert bot.live.ready, bot.live.ready_error
+        await bot.live.market("101")  # its outcome tokens and fee in hand: a decision can go out at once
+        stream.subscribed = {"101": ("HSI", False)}
+        stream.ws, stream.connected_at, stream.last_frame = Ws(), clock.monotonic(), clock.monotonic()
+        # our real 挂涨 at 60¢ × 50, placed a minute ago, open on Predict
+        api.open["9"] = {"id": "9", "status": "OPEN", "amount": str(50 * T["WEI"]), "amountFilled": "0", "strategy": "LIMIT",
+                         "order": {"tokenId": "1011", "hash": "0x" + "9" * 64}}
+        bot.store.put(f"sim:{HSI_SLUG}|up|挂", {
+            "v": 2, "market": HSI_SLUG, "slug": HSI_SLUG, "item": "恒生指数", "kind": "close", "key": "HSI", "side": "up", "label": "挂涨",
+            "maker": True, "status": "resting", "shares": 0.0, "order": 50.0, "price": 0.60, "fills": [], "revisions": [],
+            "opened": clock.ms - 60_000, "settle": T["SETTLE_HSI"], "fair": 0.70, "edge": 0.10, "version": bot.sim_version(),
+            "queue_ahead": 0.0, "queue_min": 0.0,
+            "live": {"state": "open", "order_id": "9", "hash": "0x" + "9" * 64, "answered_ms": clock.ms - 59_000, "answered_at": clock.ms - 59_000,
+                     "placed_at": clock.ms - 59_500, "sent_at": clock.ms - 59_500, "attempt": 1, "events": [],
+                     "want": {"maker": True, "side": "up", "shares": 50.0, "price": 0.60, "token": "1011", "outcome": "Up", "index_set": 1,
+                              "fee_bps": 200, "neg_risk": False, "yield_bearing": False, "condition_id": "0x" + "ab" * 32}}})
+        levels = {"bids": [["0.60", "50"]], "asks": [["0.62", "40"]]}
+        fair["up"], t0 = 0.30, clock.ms
+        stream.book("101", {"version": 7, **levels})  # T: the change, our bid on it; the fair 涨 has fallen to 30¢
+        await looked(feed)
+        (ghost,) = [t for t in bot.sim_trades().values() if (t.get("live") or {}).get("order_id") == "9"]
+        assert (ghost["status"], ghost["live"]["state"], ghost["live"]["cancel_done_ms"]) == ("cancelled", "done", t0 + 100), ghost["live"]
+        assert [c[0] for c in api.calls] == ["remove"], api.calls  # withdrawn by the bot's own look; nothing taken meanwhile (SIM-SELF-MATCH)
+        sent = len(api.calls)
+        clock.pass_ms(t0 + 300 - clock.ms)
+        if how == "heartbeat":
+            await stream.handle(stream.ws, json.dumps({"type": "M", "topic": m.PREDICT_WS_HEARTBEAT, "data": 1}))
+        elif how == "resend":
+            stream.book("101", {"version": 8, **levels})
+            await looked(feed)
+        book = feed.books["HSI"]
+        assert (m.book_content_ms(book), book.fetched_ms) == (t0, t0 + 300 if how else t0), (how, m.book_content_ms(book) - t0, book.fetched_ms - t0)
+        clock.pass_ms(100)
+        await bot.sim_express("HSI")  # T+400: a price move wakes the express lane on the book as stored
+        await looked(feed)
+        takers = [(t["label"], t["price"], t["order"]) for t in bot.sim_trades().values() if not t.get("maker") and t["side"] == "down"]
+        orders = [(c[0], c[1]["data"]["order"]["tokenId"], round(int(c[1]["data"]["order"]["makerAmount"]) / int(c[1]["data"]["order"]["takerAmount"]), 2))
+                  if c[0] == "create" else c for c in api.calls[sent:]]
+        return takers, orders
+    finally:
+        m.time = L.time = real_time
+
+
+selfcap_ghost_clock()
+for how in ("resend", "heartbeat", ""):
+    takers, orders = asyncio.run(selfcap_ghost_clock_live(how))
+    assert (takers, orders) == ([], []), (how, takers, orders)
+    # before ("resend", "heartbeat"): ([('吃跌', 0.408, 100.0)], [('create', '1012', 0.4)]) — a real LIMIT BUY of 跌 (token 1012) at
+    # 40¢ × 100, sized and priced on our own cancelled 60¢ bid; with nothing re-stamped ("") nothing was bought before either
 print("AUDIT_XREVIEW_OK")

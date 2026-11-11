@@ -20282,7 +20282,17 @@ class Bot:
         Not only a maker (review of the first fix): a real taker is a LIMIT order too, and what it did not fill rests on
         the book at its limit until LIVE_TAKER_WAIT_SECONDS or live_taker_stale cancels it — in the step's sync, after
         this decision, and never in the express lane: the same race. Its level is the limit the order was signed at
-        (live.want.limit, else its cap — as LiveBot.live_unit_cap), not the record's price (a taker's is average + fee)."""
+        (live.want.limit, else its cap — as LiveBot.live_unit_cap), not the record's price (a taker's is average + fee).
+        1.150.0 (audit XR-SELFCAP-GHOST-CLOCK): "after the book was read" is when the book's levels were taken
+        (book_content_ms: a REST read's request, a changed push's arrival — FEED-FETCHED-MS), as sim_own_order, ghost_unsure
+        and own_on_book read it, not its fetched_ms, which is the book's age: an unchanged re-send (refresh_age) and the
+        heartbeat (touch) restart that over the same old levels, and a REST read asked before the confirmation is stamped
+        with its landing after it. On such a book the maker side took our cancelled order as maybe still shown
+        (ghost_unsure) while this cap let the taker buy it: a real LIMIT order sized on liquidity gone at Predict, left
+        resting at its limit, and 距吃单 / the order check said 可买 for it. The cap now stays a cent under our old level
+        until a book whose levels were taken after the confirmation comes — a changed push, or a REST read asked after it
+        (on a pushed market that stays as it is, the cold round's: PREDICT_COLD_POLL_SECONDS). Fewer takers in that
+        moment, never more."""
         other = "down" if side == "up" else "up"
         for t in trades_of_market(trades, mk.market):
             st = t.get("live")
@@ -20291,7 +20301,8 @@ class Bot:
             if max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0) <= 1e-9:
                 continue  # nothing of it left to rest
             done = int(st.get("cancel_done_ms") or 0)
-            if st.get("state") not in (None, "done") or (done and int(getattr(mk.book, "fetched_ms", 0) or 0) <= done):
+            # 1.150.0 (audit XR-SELFCAP-GHOST-CLOCK): the time the book's levels were taken, not its age (fetched_ms)
+            if st.get("state") not in (None, "done") or (done and book_content_ms(mk.book) <= done):
                 want = st.get("want") if isinstance(st.get("want"), dict) else {}
                 level = float((t.get("price") if t.get("maker") else want.get("limit") or want.get("cap") or t.get("cap") or t.get("price")) or 0)
                 cap = min(cap, round(1 - level - 0.01, 6))  # Predict's cent tick: strictly under our level
