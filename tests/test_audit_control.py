@@ -1399,4 +1399,166 @@ async def ctrl_telegram_startup():
 
 
 asyncio.run(ctrl_telegram_startup())
+
+
+async def ctrl_sources_off():
+    """CTRL-SOURCES-OFF: SOURCES_OFF (README: 永不询问的行情源) was kept by host name, and only by the callers that list
+    their sources through SOURCE_HEALTH.order / enabled. (1) Tencent's hosts are qt.gtimg.cn and web.ifzq.gtimg.cn: the
+    word "tencent" is in neither, so SOURCES_OFF=tencent switched nothing off — while /diag, which filters by name, stopped
+    probing 腾讯. (2) The callers that name a URL themselves (the index daily closes, the index σ bars, the KRX close check,
+    the anchors' 5-minute bars, the US stocks' Yahoo chart) asked a switched-off host all the same: with the deployment's
+    SOURCES_OFF=eastmoney the HSI daily close went to push2his.eastmoney.com whenever Tencent failed or lagged behind the
+    close (the HSI σ bars when Tencent and Yahoo both failed), and /diag listed that host as failing. Now a token covers
+    its hosts, and fetch_source itself refuses a switched-off host: no request, the host's health untouched, the caller
+    passing on as it does past a source that failed."""
+    import datetime as dt
+    D, health = m.D, m.SOURCE_HEALTH
+    at = lambda hour, minute: int(dt.datetime(2026, 11, 10, hour, minute, tzinfo=m.BEIJING).timestamp() * 1000)  # a Tuesday
+    day = lambda d: dt.date(2026, 11, d)
+    sh, hk, kr = m.StockTicker("sh", "688836"), m.StockTicker("hk", "02513"), m.StockTicker("kr", "000660")
+    names = lambda sources: [source[0] for source in health.order(sources)]
+    asked, answers = [], {}
+
+    async def feeds(url, timeout=15, headers=None):  # a host with no answer set fails as an unreachable one does
+        host = m.SourceHealth.host(url)
+        asked.append(host)
+        if host in answers:
+            return answers[host]
+        raise m.RemoteError("HTTP 502")
+
+    async def refused(call):  # the call ends as a source that did not answer, naming the switch
+        try:
+            await call()
+        except m.RemoteError as error:
+            return "SOURCES_OFF" in str(error)
+        return False
+
+    class Market(FM):
+        async def prices(self): return {}
+
+    real, m.http_get = m.http_get, feeds
+    try:
+        health.hosts.clear()
+        # (1) a token switches off exactly what /diag hides under its name: every source the bot lists, name against host
+        listed = [*m.CnIndex.SSE_SOURCES, *m.CnIndex.DAILY_SOURCES, *m.CnIndex.A50_SOURCES, *m.IndexFutures.FUTURES_SOURCES,
+                  *m.IndexFutures.SPOT_SOURCES, *m.KospiIndex.SOURCES, *m.KospiIndex.SOURCES_200]
+        for ticker in (sh, hk, kr):
+            listed += [*m.StockMarket.sources(ticker), *m.StockMarket.live_sources(ticker), *m.StockMarket.vol_sources(ticker)]
+        for token, name in m.SourceHealth.NAMES.items():
+            health.off = frozenset({token})
+            assert any(name in source[0] for source in listed), token
+            wrong = [(source[0], source[1]) for source in listed if (name in source[0]) != health.disabled(source[1])]
+            assert not wrong, (token, wrong)  # was: tencent switched off none of 腾讯 / 腾讯日K
+        health.off = frozenset({"tencent"})
+        assert health.disabled("https://qt.gtimg.cn/q=sh000001") and health.disabled("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=hkHSI,day,,,10,")
+        assert names(m.CnIndex.SSE_SOURCES) == ["新浪", "东方财富"] and names(m.IndexFutures.SPOT_SOURCES) == ["东方财富", "新浪"]
+        assert names(m.CnIndex.DAILY_SOURCES) == ["东方财富日K", "新浪日K", "Yahoo日K"] and names(m.StockMarket.sources(sh)) == ["东方财富", "新浪"]
+        assert names(m.StockMarket.live_batch_sources([sh, hk])) == ["新浪"] and names(m.StockMarket.vol_sources(hk)) == ["东方财富"]
+        # ...the URLs named outside those lists too, each by its own token and by no other
+        direct = {"sina": (m.IndexFutures.CFD_FIVE_MINUTES, m.CnIndex.A50_SINA_FIVE_MINUTES), "eastmoney": (m.CnIndex.A50_MINUTES, m.CnIndex.A50_FIVE_MINUTES),
+                  "naver": (m.KospiIndex.DAILY_URL,), "yahoo": (m.KospiIndex.YAHOO_URL, *m.YAHOO_CHART)}
+        for token, urls in direct.items():
+            health.off = frozenset({token})
+            assert all(health.disabled(url) for url in urls), token
+            health.off = frozenset(m.SourceHealth.NAMES) - {token}
+            assert not any(health.disabled(url) for url in urls), token
+        health.off = frozenset(m.SourceHealth.NAMES)  # all six off: what is none of them is asked as before (fetch_source carries these too)
+        assert not [url for url in (*m.TOUCH_SPOT, m.GECKO, "https://api.dexscreener.com/latest/dex/pairs/bsc/x") if health.disabled(url)]
+
+        # (2) fetch_source refuses a switched-off host itself, for a refresh and for a probe: nothing sent, nothing recorded
+        health.off = frozenset({"eastmoney"})
+        for record in (True, False):
+            assert await refused(lambda: m.fetch_source("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=100.HSI", record=record))
+        assert asked == [] and health.hosts == {}, (asked, health.hosts)  # was: asked, and listed in /diag as failing
+        answers["qt.gtimg.cn"] = b"ok"  # (what test_diag pins: eastmoney off leaves Tencent on)
+        assert await m.fetch_source("https://qt.gtimg.cn/q=sh000001") == b"ok" and asked == ["qt.gtimg.cn"]
+        asked.clear(); answers.clear()
+
+        # (3) the deployment's SOURCES_OFF=eastmoney. The HSI daily close at 16:30, the day's bar due: Tencent answers
+        # without it, so the fallbacks are asked — Yahoo, which has it; Eastmoney, listed between the two, is passed over
+        now = at(16, 30)
+        bot = m.Bot(m.Config.from_env({**base, "SOURCES_OFF": "eastmoney"}), m.Store(":memory:"), Market(now), None)
+        assert health.off == {"eastmoney"} and [kind for kind, _ in bot.hsi_daily.sources] == ["tencent", "eastmoney", "yahoo"]
+        for kind, url in bot.hsi_daily.sources:
+            assert health.disabled(url) is (kind == "eastmoney"), kind
+        answers["web.ifzq.gtimg.cn"] = json.dumps({"data": {"hkHSI": {"day": [["2026-11-06", "26000", "26100"], ["2026-11-09", "26100", "26150"]]}}}).encode()
+        stamps = [int(dt.datetime(2026, 11, d, 9, 30, tzinfo=m.BEIJING).timestamp()) for d in (9, 10)]
+        answers["query1.finance.yahoo.com"] = json.dumps({"chart": {"result": [{"meta": {"gmtoffset": 28800}, "timestamp": stamps, "indicators": {
+            "quote": [{"open": [26100.0, 26150.0], "close": [26151.0, 26300.0]}]}}]}}).encode()
+        assert await bot.hsi_daily.refresh(now) == ""
+        assert asked == ["web.ifzq.gtimg.cn", "query1.finance.yahoo.com"], asked  # was: push2his.eastmoney.com between the two
+        assert bot.hsi_daily.daily == {day(6): D("26100"), day(9): D("26150"), day(10): D("26300")}, bot.hsi_daily.daily
+        assert bot.hsi_daily.ranks == {day(6): 0, day(9): 0, day(10): 2}, bot.hsi_daily.ranks  # each source keeps its own rank
+        assert health.hosts == {} and health.lines() == [], health.hosts
+        # ...and with nothing answering: the closes in hand stand, the reason names the switch, Eastmoney has no failure on record
+        asked.clear(); answers.clear()
+        bot.hsi_daily.refreshed = -1e9
+        why = await bot.hsi_daily.refresh(now)
+        assert asked == ["web.ifzq.gtimg.cn", "query1.finance.yahoo.com"], asked
+        assert why == "tencent: HTTP 502；eastmoney: SOURCES_OFF 已关闭此源；yahoo: HTTP 502" and len(bot.hsi_daily.daily) == 3, why
+        assert sorted(health.hosts) == ["query1.finance.yahoo.com", "web.ifzq.gtimg.cn"], health.hosts
+        # the index σ bars (HSI: Tencent, else Yahoo, else Eastmoney), nothing answering: no Eastmoney host in the whole round
+        asked.clear(); health.hosts.clear()
+        await bot.refresh_odds_inputs(now)
+        assert "web.ifzq.gtimg.cn" in asked and not [host for host in asked if "eastmoney" in host], asked
+        assert bot.vols.errors["HSI"].endswith("eastmoney: SOURCES_OFF 已关闭此源"), bot.vols.errors
+        assert not [host for host in health.hosts if "eastmoney" in host], health.hosts
+
+        # (4) the other callers that name their URL: Naver's KRX close check and KOSPI chart, Sina's 5-minute bars of the two
+        # anchors, Yahoo's ^KS11 and the US stocks' chart (either host). Switched off, none is asked; each call ends as it
+        # does when its source fails — the incoming close stands, the lookup says why
+        bot.apply_config(m.Config.from_env({**base, "SOURCES_OFF": "naver,sina,yahoo"}))
+        assert health.off == {"naver", "sina", "yahoo"}
+        asked.clear(); health.hosts.clear()
+        incoming = (day(9), D("100000"), D("99000"))
+        assert await bot.stocks.krx_official(kr, *incoming, now, "Yahoo") == (*incoming, "Yahoo")
+        assert "SOURCES_OFF" in bot.stocks.notes["000660"], bot.stocks.notes  # /diag's caveat: the close went without the KRX check
+        nvda = next(card for card in bot.touches.values() if isinstance(card, m.StockTouchMarket))
+        assert await refused(lambda: bot.hsi.cfd_bar_at(at(16, 10)))
+        assert await refused(lambda: bot.cn.a50_sina_five_minute_at(day(10)))
+        assert await refused(lambda: nvda.chart(interval="1m", range="1d", includePrePost="false"))
+        bot.kospi.daily_refreshed = -1e9
+        why = await bot.kospi.refresh_daily(now)
+        assert why == "Yahoo: SOURCES_OFF 已关闭此源；Naver: SOURCES_OFF 已关闭此源" and bot.kospi.daily == {}, why
+        assert asked == [] and health.hosts == {}, (asked, health.hosts)  # was: polling.finance.naver.com, gu.sina.cn, query1 / query2.finance.yahoo.com, fchart.stock.naver.com
+
+        # (5) SOURCES_OFF=tencent from end to end, the session running: /diag probes no 腾讯 (as before), /speed times none
+        # (was: 上证实时 and 恒指现货 still did) and no round asks a Tencent host (was: every one of these asked it first)
+        morning = at(11, 0)
+        tbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "EXCHANGE_TICKERS": "UNITREEUSDT=sh:688836",
+                                        "WEB_PORT": "8080", "SOURCES_OFF": "tencent"}), m.Store(":memory:"), Market(morning), None)
+        assert health.off == {"tencent"}
+        probes = [probe[1] for probe in tbot.diag_probes(morning)]
+        timed = [source[0] for feed in tbot.speed_feeds(morning) for source in feed["sources"]]
+        assert any("新浪" in name for name in probes) and not [name for name in probes if "腾讯" in name], probes
+        assert "新浪" in timed and not [name for name in timed if "腾讯" in name], timed
+        asked.clear(); health.hosts.clear()
+        await tbot.cn.refresh(morning, force=True)            # the Composite, the A50, the Composite's daily bars
+        await tbot.stocks.refresh_live(morning, force=True)   # the stocks' live batch
+        await tbot.hsi.refresh(morning, force=True)           # the HSI futures page
+        await tbot.hsi.refresh_spot(morning)                  # the HSI cash index
+        await tbot.hsi_daily.refresh(morning)                 # the HSI daily close
+        await tbot.refresh_odds_inputs(morning)               # the stock's and the indices' σ bars
+        hosts = set(asked)
+        assert {"hq.sinajs.cn", "push2.eastmoney.com", "push2his.eastmoney.com", "money.finance.sina.com.cn", "query1.finance.yahoo.com"} <= hosts, hosts
+        assert not [host for host in hosts if "gtimg" in host or "qq.com" in host], hosts
+
+        # (6) /diag's list of the hosts moved to the back: a host that was cooling when it was switched off is no longer
+        # listed as one "still tried when nothing else answers"; switched on again, its cooldown is where it was
+        health.off = frozenset()
+        health.hosts.clear()
+        for _ in range(health.FAILS):
+            health.record("https://push2his.eastmoney.com/x", "HTTP 502")
+        assert len(health.lines()) == 1 and "push2his.eastmoney.com" in health.lines()[0], health.lines()
+        health.off = frozenset({"eastmoney"})
+        assert health.lines() == [] and names(m.CnIndex.A50_SOURCES) == ["新浪CFD"]
+        health.off = frozenset()
+        assert len(health.lines()) == 1 and names(m.CnIndex.A50_SOURCES) == ["东方财富", "新浪CFD", "东方财富K线"], health.lines()
+    finally:
+        m.http_get = real
+        health.off = frozenset()
+        health.hosts.clear()
+
+
+asyncio.run(ctrl_sources_off())
 print("AUDIT_CONTROL_OK")

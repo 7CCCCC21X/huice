@@ -1587,15 +1587,21 @@ class SourceHealth:
                         # behind for an hour; a recovered preferred feed is back as soon as any request to it succeeds
 
     NAMES = {"eastmoney": "东方财富", "sina": "新浪", "tencent": "腾讯", "yahoo": "Yahoo", "naver": "Naver", "etnet": "etnet"}  # SOURCES_OFF token -> the name in /diag
+    # 1.150.0 (audit CTRL-SOURCES-OFF): the host-name parts a token stands for besides its own word. Tencent's quotes come
+    # from qt.gtimg.cn and web.ifzq.gtimg.cn (gu.qq.com is only their Referer), so the word "tencent" is in no host the
+    # bot asks: SOURCES_OFF=tencent was accepted, /diag stopped probing 腾讯 (it filters by name) and /speed went on timing
+    # it, while every round still asked Tencent first — the Composite, the stocks' live batch, the daily bars, the σ bars
+    HOSTS = {"tencent": ("gtimg.cn", "qq.com")}
 
     def __init__(self) -> None:
         self.hosts: dict[str, list] = {}  # host -> [consecutive failures, cool until (monotonic), last error]
         self.off: frozenset = frozenset()  # SOURCES_OFF: tokens of the hosts never asked (Bot.apply_config keeps it current)
 
     def disabled(self, url: str) -> bool:
-        """Whether SOURCES_OFF names this URL's host (a token is part of the host name: eastmoney, sina, tencent…)."""
+        """Whether SOURCES_OFF names this URL's host: the token is part of the host name (eastmoney, sina, yahoo, naver,
+        etnet), or one of the parts HOSTS lists for it is (tencent: gtimg.cn, qq.com)."""
         host = self.host(url).lower()
-        return any(token in host for token in self.off)
+        return any(part in host for token in self.off for part in (token, *self.HOSTS.get(token, ())))
 
     def enabled(self, sources: Any) -> list:
         """``sources`` ((name, url, ...) tuples) without the ones switched off, in the order given."""
@@ -1633,9 +1639,11 @@ class SourceHealth:
         return sorted(self.enabled(sources), key=rank)
 
     def lines(self) -> list[str]:
+        """/diag's list of the hosts moved to the back. Not a host switched off since it last failed: it is no longer
+        "tried when nothing else answers", and its cooldown (up to an hour) would keep it listed as if it were."""
         now = time.monotonic()
         return [f"  ⏸️ {host}：连续失败 {n} 次，排到最后还剩 {int(until - now)} 秒｜{brief_error(error, 60)}"
-                for host, (n, until, error) in sorted(self.hosts.items()) if until > now]
+                for host, (n, until, error) in sorted(self.hosts.items()) if until > now and not self.disabled(host)]
 
 
 SOURCE_HEALTH = SourceHealth()
@@ -1643,7 +1651,22 @@ SOURCE_HEALTH = SourceHealth()
 
 async def fetch_source(url: str, extra: dict[str, str] | None = None, record: bool = True) -> bytes:
     """GET one quote-feed URL with a browser UA and the short feed timeout, recording the host's health
-    (``record=False`` for a diagnostic probe, which must not reorder the sources the live refresh uses)."""
+    (``record=False`` for a diagnostic probe, which must not reorder the sources the live refresh uses).
+    A host SOURCES_OFF names is never asked, by a refresh or by a probe: the call fails like a source that did not
+    answer, and the host's health is left as it was."""
+    if SOURCE_HEALTH.disabled(url):
+        # 1.150.0 (audit CTRL-SOURCES-OFF): the switch is kept here, where every request to a quote source passes. Until
+        # now only the callers that list their sources through SOURCE_HEALTH.order / enabled kept it. The ones that name
+        # a URL themselves went on asking a host the operator had switched off (README: 永不询问): the index daily closes
+        # (DailyCloses, KospiIndex.refresh_daily), the index σ bars, the KRX close check (krx_official), the anchors'
+        # 5-minute bars (cfd_bar_at, a50_sina_five_minute_at) and the US stocks' Yahoo chart. With the deployment's
+        # SOURCES_OFF=eastmoney that was the HSI daily close whenever Tencent failed, or answered without the day's bar
+        # after the close, and the HSI σ bars when Tencent and Yahoo both failed: a request refused, or left to time out
+        # (SOURCE_TIMEOUT) inside the HSI round, and the host listed in /diag as failing. Every one of those callers
+        # already takes a failed request as "this source has nothing" — the next source, the data in hand, or a pause —
+        # so a switched-off one is passed over the same way. Not recorded: it is no failure of the host (/diag would
+        # list it as cooling), and nothing was learnt that should clear one either.
+        raise RemoteError("SOURCES_OFF 已关闭此源")
     try:
         raw = await http_get(url, timeout=SOURCE_TIMEOUT, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **(extra or {})})
     except (RemoteError, TimeoutError, OSError) as error:
