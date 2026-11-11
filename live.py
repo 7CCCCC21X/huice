@@ -1026,6 +1026,16 @@ class TxPending(core.RemoteError):
         self.tx_hash = tx_hash
 
 
+class TxReverted(core.RemoteError):
+    """A transaction that was mined and reverted (receipt status 0): its gas is spent and nothing more will come of it — a
+    new attempt is a new transaction (1.150.0, audit RDM-RESTART-MID-SEND: the redeem's sent note is dropped). Its text
+    (交易失败（已回滚）：<hash>) and its class (a RemoteError) read as before for every caller."""
+
+    def __init__(self, message: str, tx_hash: str = ""):
+        super().__init__(message)
+        self.tx_hash = tx_hash
+
+
 # PayoutRedemption, as both SDKs' ABIs declare it: on the conditional tokens contracts (redeemer, collateral, parent indexed;
 # data conditionId, indexSets, payout) and on the multi-outcome adapters (redeemer, conditionId indexed; data amounts, payout)
 PAYOUT_TOKENS_TOPIC = "0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d"
@@ -1110,9 +1120,10 @@ class Chain:
         return bool(await self.call_uint(self.addresses[token_key], "isApprovedForAll(address,address)", ["address", "address"],
                                          [owner or self.wallet.maker, self.addresses[operator_key]]))
 
-    async def send(self, to: str, data: bytes, value: int = 0) -> str:
+    async def send(self, to: str, data: bytes, value: int = 0, sent: Any = None) -> str:
         """A transaction from the signing wallet (to the Kernel account, which executes it, for a Predict account);
-        the hash once the node accepted it."""
+        the hash once the node accepted it. ``sent`` (a coroutine function): told the transaction's hash once it is signed,
+        before it is broadcast — no broadcast if it raises."""
         if self.wallet.predict_account:
             execution = bytes.fromhex(to[2:]) + value.to_bytes(32, "big") + data  # target ‖ value ‖ calldata
             data = self.encode("execute(bytes32,bytes)", ["bytes32", "bytes"], [bytes(32), execution])
@@ -1132,6 +1143,17 @@ class Chain:
                   "value": value, "data": "0x" + data.hex()}
             raw = self.wallet.sign_transaction(tx)
             tx_hash = "0x" + _eth()[5].keccak(raw).hex()  # a transaction's hash is the keccak of its signed bytes
+            if sent is not None:
+                # 1.150.0 (audit RDM-RESTART-MID-SEND, RDM-RECEIPT-POLL): the caller's note of this transaction, on disk before
+                # it is broadcast — a stop from here on (a deploy, a crash), a receipt that did not come in time or an answer
+                # lost on the way leaves its hash behind, and the next round asks for its receipt before anything is sent
+                # for that position again. No note, no broadcast.
+                try:
+                    await sent(tx_hash)
+                except TxNotSent:
+                    raise
+                except Exception as error:
+                    raise TxNotSent(f"交易记录没写下来，交易没发出（{core.clean_error(error) or type(error).__name__}）") from error
             # 1.150.0 (audit RDM-UNSENT-AS-SENT): the node's ANSWER to the raw transaction is told from a lost one. A refusal
             # (TX_REFUSED: no BNB for the gas, underpriced, a full pool) means it was never broadcast and cost nothing, yet it
             # counted as a sent failure — an hour's wait (README promised 5 分钟后再试 for 交易没发出去的) also when the wallet
@@ -1177,11 +1199,20 @@ class Chain:
                 pause = max(pause, float(error.retry_after or 0))
             if isinstance(receipt, dict) and receipt.get("blockNumber"):
                 if int(str(receipt.get("status") or "0x0"), 16) != 1:
-                    raise core.RemoteError(f"交易失败（已回滚）：{tx_hash}")
+                    raise TxReverted(f"交易失败（已回滚）：{tx_hash}", tx_hash)  # (a RemoteError, the same words: RDM-RESTART-MID-SEND)
                 return receipt
             await asyncio.sleep(max(0.0, min(pause, deadline - time.monotonic())))
         raise TxPending(f"交易 {tx_hash} 在 {int(timeout)} 秒内未上链" + (f"（回执读取失败：{core.brief_error(trouble, 80)}）" if trouble else ""),
                         tx_hash)  # (a RemoteError: every caller's except as before)
+
+    async def receipt(self, tx_hash: str) -> dict | None:
+        """One look at a sent transaction: its receipt once mined, None while it is not (no waiting); a failed read raises."""
+        found = await self.rpc("eth_getTransactionReceipt", [tx_hash])
+        return found if isinstance(found, dict) and found.get("blockNumber") else None
+
+    async def known(self, tx_hash: str) -> bool:
+        """Whether the node knows a transaction at all — pending in its pool or mined (eth_getTransactionByHash)."""
+        return bool(await self.rpc("eth_getTransactionByHash", [tx_hash]))
 
     def approval_steps(self, yield_bearing: bool) -> list[tuple[str, str, str]]:
         """(label, kind, spender) for one market track, as the SDK's setApprovals sets them."""
@@ -1254,20 +1285,23 @@ class Chain:
             return None
         return None
 
-    async def redeem(self, condition_id: str, index_set: int, amount: int, neg_risk: bool, yield_bearing: bool) -> Redeemed:
+    def redeem_target(self, neg_risk: bool, yield_bearing: bool) -> str:
+        """The contract a redeem calls: the track's multi-outcome adapter for a neg-risk market, its conditional tokens else."""
+        return self.addresses[("YIELD_BEARING_" if yield_bearing else "") + ("NEG_RISK_ADAPTER" if neg_risk else "CONDITIONAL_TOKENS")]
+
+    async def redeem(self, condition_id: str, index_set: int, amount: int, neg_risk: bool, yield_bearing: bool, sent: Any = None) -> Redeemed:
         """Redeem a resolved position: the conditional tokens contract for a standard market (index set 1 or 2), the
         multi-outcome adapter (an amount per outcome) for a neg-risk one. The transaction hash once mined, with what it
-        paid (Redeemed.payout, from the receipt: no extra request)."""
+        paid (Redeemed.payout, from the receipt: no extra request). ``sent``: Chain.send's, told the hash before broadcast."""
         condition = bytes.fromhex(condition_id.removeprefix("0x"))
+        target = self.redeem_target(neg_risk, yield_bearing)
         if neg_risk:
-            target = self.addresses[("YIELD_BEARING_" if yield_bearing else "") + "NEG_RISK_ADAPTER"]
             amounts = [amount, 0] if index_set == 1 else [0, amount]
-            tx = await self.send(target, self.encode("redeemPositions(bytes32,uint256[])", ["bytes32", "uint256[]"], [condition, amounts]))
+            tx = await self.send(target, self.encode("redeemPositions(bytes32,uint256[])", ["bytes32", "uint256[]"], [condition, amounts]), sent=sent)
         else:
-            target = self.addresses[("YIELD_BEARING_" if yield_bearing else "") + "CONDITIONAL_TOKENS"]
             tx = await self.send(target, self.encode("redeemPositions(address,bytes32,bytes32,uint256[])",
                                                      ["address", "bytes32", "bytes32", "uint256[]"],
-                                                     [self.addresses["USDT"], bytes(32), condition, [index_set]]))
+                                                     [self.addresses["USDT"], bytes(32), condition, [index_set]]), sent=sent)
         receipt = await self.wait(tx)
         return Redeemed(tx, self.redeem_payout(receipt, target, neg_risk))
 
@@ -4331,8 +4365,9 @@ class LiveBot(core.Bot):
             self.live_fail(tid, trade, f"吃单未成交（{st.get('cancel_why') or status or '不在盘口'}）", now_ms, retry=self.config.live_taker_retry)
 
     # --- redeeming resolved positions -------------------------------------------------------------------------------------
-    REDEEM_KINDS = {"redeemed": "领了", "claimable": "可领取", "failed": "领取失败", "waiting": "失败等重试", "fields": "缺字段",
-                    "unclear": "结算读不出", "kept": "已领仍列着", "open": "未结算", "lost": "输掉的", "unread": "没读到市场"}
+    REDEEM_KINDS = {"redeemed": "领了", "claimable": "可领取", "failed": "领取失败", "waiting": "失败等重试", "sent": "已发出待确认",
+                    "fields": "缺字段", "unclear": "结算读不出", "kept": "已领仍列着", "open": "未结算", "lost": "输掉的", "unread": "没读到市场"}
+    REDEEM_SENT = "live:redeem-sent:"  # + <market>:<index set>: a redeem transaction signed (and broadcast, or about to be) but not yet booked
 
     def redeem_lock(self) -> asyncio.Lock:
         lock = getattr(self, "live_redeem_lock", None)
@@ -4358,6 +4393,97 @@ class LiveBot(core.Bot):
             finally:
                 self.live_redeem_since = 0
             return done
+
+    def live_redeem_booked(self, key: str, tx: str, paid: int | None, amount: int, title: str, outcome: str, now_ms: int,
+                           done: list[str], sent_key: str = "") -> dict:
+        """A mined redeem (status 1) booked: the mark (and the sent note gone, in the same transaction), the line said and
+        pushed — 💵 with what it paid, or the words for one that paid nothing (RDM-PAYOUT-UNCHECKED). Its seen fields."""
+        # 1.150.0 (audit RDM-PAYOUT-UNCHECKED): 💵 已领取 was said, and the position closed for good, on a mined receipt alone —
+        # the payout never looked at. A redeem of a balance already gone (claimed on the website a moment before, or by an
+        # earlier transaction the bot did not book) is mined with status 1 and pays nothing, yet read as paid. The receipt
+        # in hand says what was paid (its PayoutRedemption: no extra request). The mark is written whatever the payout — a
+        # zero left unmarked would be redeemed again, for nothing, every round Predict still lists the row — but a zero is
+        # said as such, not as 💵; a payout the receipt does not state (None) reads as before.
+        mark = {"at": now_ms, "tx": str(tx), "amount": str(amount), "title": title, **({"paid": str(paid)} if paid is not None else {})}
+        self.store.replace([sent_key] if sent_key else [], [(key, mark)])
+        shares = f"{title} {outcome} {from_wei(amount):g} 份"
+        if paid == 0:
+            line = (f"⚠️ 领取交易上链了，但没领到 USDT：{shares}（交易 {tx}）。链上已经没有这份持仓：多半已在网站上领过，"
+                    "或之前的一笔领取已经到账；网站上若还显示可领取，把这条发我")
+            self.live_note_error(line)
+            fields = {"kind": "kept", "tx": str(tx), "paid": "0"}
+        else:
+            line = f"💵 已领取 {shares}" + (f"，到账 ${from_wei(paid):,.2f}" if paid else "") + f"：{tx}"
+            fields = {"kind": "redeemed", "tx": str(tx)}
+        done.append(line)
+        self.live_notify(line)
+        return fields
+
+    async def live_redeem_sent(self, now_ms: int, done: list[str], errors: dict, unsent_runs: dict) -> tuple[dict[str, dict], dict[str, dict]]:
+        """Every redeem sent but not booked (its note, REDEEM_SENT), looked up by its receipt before anything is sent for that
+        position again: (booked or failed now — position key -> its seen fields; still out — position key -> its note).
+
+        1.150.0 (audit RDM-RECEIPT-POLL, RDM-RESTART-MID-SEND): nothing was recorded while a redeem transaction was out. A
+        receipt that did not come within the wait (or an answer to the raw transaction lost on the way) was booked as a
+        failure, the hash forgotten: no mark, no 💵 for a redeem that had paid, and an hour later — or at once after a restart
+        (every deploy: the back-offs live in memory), with Predict still listing the row — a second transaction that paid
+        nothing was the one announced 💵 (a neg-risk one: 没领成 for a position already paid). The hash is now noted on disk
+        before the broadcast (Chain.send's ``sent``), and each round asks for its receipt first — once per note, a BNB read,
+        never Predict's: status 1 is booked with THAT hash (whether Predict still lists the row or not), status 0 is the
+        failure it is (an hour), none leaves the position alone. Only a note an hour old whose transaction the node does not
+        know at all (never mined, not in its pool: dropped, or never broadcast) is let go — then the position is redeemed
+        again, never sooner."""
+        booked: dict[str, dict] = {}
+        out: dict[str, dict] = {}
+        chain = self.live.chain
+        for sent_key, note in self.store.items(self.REDEEM_SENT):
+            key = "live:redeemed:" + sent_key.removeprefix(self.REDEEM_SENT)
+            if not isinstance(note, dict) or not note.get("tx"):
+                self.store.delete_keys([sent_key])  # (unreadable: says nothing)
+                continue
+            tx, title, age_ms = str(note["tx"]), str(note.get("title") or "?"), max(0, now_ms - int(note.get("at") or now_ms))
+            try:
+                receipt = await chain.receipt(tx)
+            except Exception as error:  # unknown: nothing is sent for it this round
+                out[key] = {**note, "age_ms": age_ms, "error": f"回执没读到：{core.clean_error(error) or type(error).__name__}"}
+                continue
+            if receipt is not None:
+                try:
+                    status = int(str(receipt.get("status") or "0x0"), 16)
+                except ValueError:
+                    status = -1
+                if status == 1:
+                    neg, yb = bool(note.get("neg_risk")), bool(note.get("yield_bearing"))
+                    paid = chain.redeem_payout(receipt, chain.redeem_target(neg, yb), neg)
+                    errors.pop(key, None)
+                    unsent_runs.pop(key, None)
+                    self.live_redeem_failed.pop(key, None)
+                    booked[key] = self.live_redeem_booked(key, tx, paid, int(str(note.get("amount") or "0")), title,
+                                                          str(note.get("outcome") or ""), now_ms, done, sent_key)
+                    continue
+                if status == 0:  # mined and reverted: its gas spent, nothing more to come of it — the failure's hour
+                    self.store.delete_keys([sent_key])
+                    text = f"交易失败（已回滚）：{tx}"
+                    self.live_redeem_failed.setdefault(key, time.monotonic())
+                    errors[key] = text
+                    unsent_runs.pop(key, None)
+                    self.live_note_error(f"领取 {title} 失败：{text}（一小时后再试）")
+                    booked[key] = {"kind": "failed", "error": text, "unsent": False, "pulled": False}
+                    continue
+            if age_ms < self.LIVE_REDEEM_RETRY_SECONDS * 1000:
+                out[key] = {**note, "age_ms": age_ms}
+                continue
+            try:
+                known = await chain.known(tx)
+            except Exception as error:
+                out[key] = {**note, "age_ms": age_ms, "error": f"节点查不到它的状态：{core.clean_error(error) or type(error).__name__}"}
+                continue
+            if known:  # still in the node's pool: a second redeem could be mined beside it
+                out[key] = {**note, "age_ms": age_ms, "error": "节点里还在排队，没上链"}
+                continue
+            self.store.delete_keys([sent_key])  # an hour on, never mined and unknown to the node: let go — redeemed again below
+            self.live_note_error(f"领取 {title} 的交易 {tx} 一小时没上链、节点里也查不到：重新领取")
+        return booked, out
 
     async def live_redeem_pass(self, now_ms: int, dry_run: bool = False) -> tuple[list[str], list[dict]]:
         """One look at the account's positions, the markets read the longest ago first (never yet: first of all; the
@@ -4430,6 +4556,14 @@ class LiveBot(core.Bot):
         # the next round; the pending one keeps its hour (it may yet be mined: a second redeem would pay nothing).
         held = ""
         gas_refused = ""  # (RDM-UNSENT-AS-SENT) the node refused a redeem for the gas this round: the rest are 可领取 under the ⛽ note
+        # (RDM-RECEIPT-POLL, RDM-RESTART-MID-SEND) the redeems sent but not booked: each looked up by its receipt first (a real round;
+        # the dry run reads no chain and writes nothing: it shows them as they stand)
+        if dry_run:
+            booked = {}
+            out = {"live:redeemed:" + k.removeprefix(self.REDEEM_SENT): {**v, "age_ms": max(0, now_ms - int(v.get("at") or now_ms))}
+                   for k, v in self.store.items(self.REDEEM_SENT) if isinstance(v, dict) and v.get("tx")}
+        else:
+            booked, out = await self.live_redeem_sent(now_ms, done, errors, unsent_runs)
         market_of = lambda r: str((r.get("market") if isinstance(r.get("market"), dict) else {}).get("id") or r.get("marketId") or "")
         for row in sorted(rows, key=lambda r: (market_of(r) not in first, read_round.get(market_of(r), 0), -self.position_time(r))):
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
@@ -4460,12 +4594,21 @@ class LiveBot(core.Bot):
             key = f"live:redeemed:{mid}:{index_set}"
             entry = {"title": str(market.get("title") or market.get("question") or mid), "outcome": str(outcome.get("name") or index_set or "?"),
                      "shares": from_wei(amount), "market_id": mid, "index_set": index_set}
+            if key in booked:  # (RDM-RECEIPT-POLL) its sent transaction looked up this round: booked (or failed) above
+                if booked[key]["kind"] == "failed":
+                    unsettled.add(mid)
+                seen.append({**entry, **booked[key]})
+                continue
             mark = self.store.get(key)
             if mark:
                 seen.append({**entry, "kind": "lost" if mark.get("lost") else "kept", "tx": str(mark.get("tx") or ""),
                              "paid": mark.get("paid")})  # (RDM-PAYOUT-UNCHECKED) "0": mined, but it paid nothing
                 continue
             unsettled.add(mid)
+            if key in out:  # (RDM-RECEIPT-POLL, RDM-RESTART-MID-SEND) a transaction out for it, no receipt yet: nothing sent beside it
+                s = out[key]
+                seen.append({**entry, "kind": "sent", "tx": str(s.get("tx") or ""), "age_ms": int(s.get("age_ms") or 0), "error": str(s.get("error") or "")})
+                continue
             failed_at = self.live_redeem_failed.get(key)
             if failed_at is not None and time.monotonic() - failed_at < self.LIVE_REDEEM_RETRY_SECONDS:
                 seen.append({**entry, "kind": "waiting", "left": self.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - failed_at), "error": errors.get(key, "")})
@@ -4527,9 +4670,22 @@ class LiveBot(core.Bot):
             if dry_run or low_gas or held:
                 seen.append({**entry, "kind": "claimable"})
                 continue
+            sent_key = self.REDEEM_SENT + key.removeprefix("live:redeemed:")
+
+            async def note_sent(tx_hash: str, sent_key: str = sent_key, title: str = entry["title"], name: str = str(outcome.get("name") or ""),
+                                neg: bool = info.neg_risk, yb: bool = info.yield_bearing) -> None:
+                """(RDM-RESTART-MID-SEND) the hash on disk before the broadcast, as an order's is (live_place): no note, no transaction."""
+                self.store.put(sent_key, {"at": now_ms, "tx": tx_hash, "amount": str(amount), "title": title, "outcome": name,
+                                          "neg_risk": neg, "yield_bearing": yb, "maker": self.live.wallet.maker})
+                if not await asyncio.to_thread(self.store.flush):
+                    raise TxNotSent(f"领取记录没写进数据库（{self.store.write_error or '超时'}），交易没发出")
             try:
-                tx = await self.live.chain.redeem(info.condition_id, index_set, amount, info.neg_risk, info.yield_bearing)
+                # (a stand-in chain without the note: its redeem as before)
+                more = {"sent": note_sent} if isinstance(self.live.chain, Chain) else {}
+                tx = await self.live.chain.redeem(info.condition_id, index_set, amount, info.neg_risk, info.yield_bearing, **more)
             except Exception as error:
+                if isinstance(error, (TxNotSent, TxReverted)) and self.store.get(sent_key):
+                    self.store.delete_keys([sent_key])  # nothing left the bot, or it was mined and failed: no transaction to look up
                 if isinstance(error, TxNotSent) and "insufficient funds" in str(error).lower():
                     # 1.150.0 (audit RDM-UNSENT-AS-SENT): the node refused the transaction for its gas — the wallet's shortage,
                     # not this position's failure (the 0.0005 floor is judged once a round, on a fixed figure: a round that
@@ -4559,28 +4715,10 @@ class LiveBot(core.Bot):
                                                                          else "（一小时后再试）"))
                 seen.append({**entry, "kind": "failed", "error": text, "unsent": unsent, "pulled": pulled})
                 continue
-            # 1.150.0 (audit RDM-PAYOUT-UNCHECKED): 💵 已领取 was said, and the position closed for good, on a mined receipt alone —
-            # the payout never looked at. A redeem of a balance already gone (claimed on the website a moment before, or by an
-            # earlier transaction the bot did not book) is mined with status 1 and pays nothing, yet read as paid. The receipt
-            # in hand says what was paid (its PayoutRedemption: no extra request). The mark is written whatever the payout — a
-            # zero left unmarked would be redeemed again, for nothing, every round Predict still lists the row — but a zero is
-            # said as such, not as 💵; a payout the receipt does not state (None) reads as before.
-            paid = getattr(tx, "payout", None)
-            self.store.put(key, {"at": now_ms, "tx": str(tx), "amount": str(amount), "title": entry["title"],
-                                 **({"paid": str(paid)} if paid is not None else {})})
             errors.pop(key, None)
             unsent_runs.pop(key, None)
-            shares = f"{entry['title']} {outcome.get('name') or ''} {from_wei(amount):g} 份"
-            if paid == 0:
-                line = (f"⚠️ 领取交易上链了，但没领到 USDT：{shares}（交易 {tx}）。链上已经没有这份持仓：多半已在网站上领过，"
-                        "或之前的一笔领取已经到账；网站上若还显示可领取，把这条发我")
-                self.live_note_error(line)
-                seen.append({**entry, "kind": "kept", "tx": str(tx), "paid": "0"})
-            else:
-                line = f"💵 已领取 {shares}" + (f"，到账 ${from_wei(paid):,.2f}" if paid else "") + f"：{tx}"
-                seen.append({**entry, "kind": "redeemed", "tx": str(tx)})
-            done.append(line)
-            self.live_notify(line)
+            seen.append({**entry, **self.live_redeem_booked(key, str(tx), getattr(tx, "payout", None), amount, entry["title"],
+                                                            str(outcome.get("name") or ""), now_ms, done, sent_key)})
         if dry_run:
             return done, seen
         for gone in set(read_round) - unsettled:
@@ -4718,6 +4856,7 @@ class LiveBot(core.Bot):
         lines.append(f"持仓 {len(seen)} 个：" + ("，".join(f"{label} {n(k)}" for k, label in self.REDEEM_KINDS.items() if n(k)) or "没有")
                      + (f"（⚠️ 持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查）" if cut else ""))
         listed = {"claimable": ("可领取", self.REDEEM_REPORT_LINES), "waiting": ("领取失败、等重试", self.REDEEM_REPORT_LINES),
+                  "sent": ("领取交易已发出、还没确认上链（下一轮先查回执，不会再发）", self.REDEEM_REPORT_LINES),
                   "fields": ("缺字段", self.REDEEM_REPORT_LINES), "unclear": ("Predict 的结算读不出（机器人不会去领）", self.REDEEM_REPORT_LINES),
                   "kept": ("已发过领取交易、Predict 还列着", 3), "open": ("未结算", 3), "unread": ("这次没读到市场", 2)}
         for kind, (label, cap) in listed.items():
@@ -4728,6 +4867,7 @@ class LiveBot(core.Bot):
             for s in items[:cap]:
                 extra = {"claimable": f"，约 ${float(s.get('value') or 0):,.2f}",
                          "waiting": f"：{s.get('error') or '?'}（{max(1, int(float(s.get('left') or 0) / 60))} 分钟后再试）",
+                         "sent": f"（交易 {s.get('tx')}，{int(s.get('age_ms') or 0) // 60_000} 分钟前发出" + (f"；{s['error']}" if s.get("error") else "") + "）",
                          "fields": f"：{s.get('error')}", "unclear": f"：{s.get('error')}（市场状态 {s.get('status')}）",
                          "kept": f"（交易 {s.get('tx', '')[:14]}…" + ("，没领到 USDT" if s.get("paid") == "0" else "") + "）",  # (RDM-PAYOUT-UNCHECKED)
                          "open": f"（市场状态 {s.get('status')}）", "unread": f"：{s.get('error')}"}[kind]
@@ -4749,6 +4889,9 @@ class LiveBot(core.Bot):
             why = "；".join(reasons)
         elif waiting:
             why = f"链上领取失败：{waiting[0].get('error') or '见下方'}；到时自动再试，一直失败就把这条发我"
+        elif n("sent"):  # (RDM-RECEIPT-POLL, RDM-RESTART-MID-SEND)
+            why = ("有领取交易已经发出、还没确认上链（见上）：下一轮先查它的回执，上链了就记为已领取，不会再发一次；"
+                   "一小时后还没上链、节点里也查不到它，才重新领取")
         elif n("kept"):
             why = "有持仓已经发过领取交易并上链，Predict 还列着：可能只是列表没更新；过 10 分钟还在，就把这条发我"
         elif n("fields"):

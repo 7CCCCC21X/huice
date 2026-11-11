@@ -1,6 +1,6 @@
 """Audit of the automatic redeem (自动领取): regression tests for the verified findings fixed here (fakes only, offline —
 never Predict, a BNB node or Telegram)."""
-import asyncio, json, pathlib, sys, time, urllib.parse
+import asyncio, json, pathlib, sys, tempfile, time, urllib.parse
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "tests"))
 import offline  # noqa: F401  (blocks real HTTP)
@@ -491,10 +491,12 @@ async def round_lock_stall():
     assert not any(bot.store.get(f"live:redeemed:{mid}:1") for mid in (501, 502, 503)), "no mark"
     assert "这一轮其余的先不发" in bot.live_redeem_summary(bot.live_redeem_last) and [k for k, _ in sent] == ["redeem:fail"], (bot.live_redeem_last, sent)
     assert "一小时后自动再试" in sent[0][1] and "在 0 秒内未上链" in sent[0][1], sent
-    # ...the node mining again: the next round sends the other two (the pending one waits its hour)
+    # ...the node mining again: the next round sends the other two, and the pending one is looked up by its receipt first and
+    # booked with its own transaction — never sent again (1.150.0, RDM-RECEIPT-POLL: it used to wait its hour unannounced, mined)
     node.mines = True
     done = await bot.live_redeem(NOW + 10 * MIN)
-    assert len(done) == 2 and len(node.sent) == 3 and bot.live_redeem_last["counts"] == {"redeemed": 2, "waiting": 1}, (done, bot.live_redeem_last)
+    assert len(done) == 3 and len(node.sent) == 3 and bot.live_redeem_last["counts"] == {"redeemed": 3}, (done, bot.live_redeem_last)
+    assert done[0].startswith("💵 已领取 window 501 Up 10 份：") and bot.live_redeem_failed == {}, (done, bot.live_redeem_failed)
     # control: a node that mines — every winner, one transaction each, as before
     bot = await ready_bot()
     fake = bot.live.api
@@ -1045,6 +1047,158 @@ async def payout_unchecked():
 
 
 asyncio.run(payout_unchecked())
+
+
+# --- RDM-RECEIPT-POLL (the deadline, the lost answer) + RDM-RESTART-MID-SEND: the sent note -------------------------------------
+class QuickChain(L.Chain):
+    """The REAL Chain whose receipt wait ends after ``wait_s`` (the real one polls 120 s) and polls every 10 ms."""
+    RECEIPT_POLL_SECONDS = 0.01
+
+    def __init__(self, wallet, wait_s=0.05):
+        super().__init__("https://rpc.invalid", wallet)
+        self.wait_s = wait_s
+
+    async def wait(self, tx_hash, timeout=120.0):
+        return await super().wait(tx_hash, timeout=self.wait_s if self.wait_s is not None else timeout)
+
+
+def make_bot_on(store, **env):
+    """make_bot over ``store`` (a database file: a new Store over the same file is the next process's)."""
+    plain = m.Store
+    m.Store = lambda path: store
+    try:
+        return make_bot(**env)
+    finally:
+        m.Store = plain
+
+
+async def sent_note():
+    """RDM-RECEIPT-POLL + RDM-RESTART-MID-SEND: nothing was recorded while a redeem transaction was out. A receipt that did not
+    come within the wait, or an answer to the raw transaction lost on the way, was booked as a failure with the hash forgotten
+    (no mark, no 💵, an hour later a second redeem paying nothing); a restart (every deploy) before the mark made the next
+    process redeem the still-listed position again — the empty second transaction announced 💵 (neg-risk: 没领成 for a paid
+    position). The hash is noted on disk before the broadcast, and every round asks for its receipt before anything is sent for
+    that position: status 1 is booked with THAT hash (listed or not), 0 is a failure, none leaves the position alone; only a
+    note an hour old whose transaction the node does not know at all is let go, and the position redeemed again."""
+    sends = lambda node: [keccak_of(p[0]) for meth, p in node.log if meth == "eth_sendRawTransaction"]
+    # (a) the receipt did not come in time: failed this round (its hour), the note kept; mined since — the next round books it
+    #     with ITS hash and what it paid, though Predict no longer lists the row; one transaction in all
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["901"] = [held(901)], mk(901, won=1)
+    bot.live.chain = QuickChain(bot.live.wallet)
+    sent = notices(bot)
+    with node_for(eth_getTransactionReceipt=None) as node:
+        assert await bot.live_redeem(NOW) == []
+    first = sends(node)
+    assert len(first) == 1 and bot.live_redeem_last["counts"] == {"failed": 1} and "在 0 秒内未上链" in bot.live_errors[-1], bot.live_errors[-1:]
+    note = bot.store.get("live:redeem-sent:901:1")
+    assert note["tx"] == first[0] and note["at"] == NOW and note["amount"] == str(10 * WEI) and not note["neg_risk"], note  # (before: nothing)
+    fake.positions_rows = []  # (redeemed: Predict lists it no more)
+    paid = {**MINED, "logs": [payout_log(L.ADDRESSES[56]["CONDITIONAL_TOKENS"], bot.live.wallet.maker, 10 * WEI, cond(901))]}
+    with node_for(eth_getTransactionReceipt=paid) as node:
+        done = await bot.live_redeem(NOW + 10 * MIN)
+    assert done == [f"💵 已领取 window 901 Up 10 份，到账 $10.00：{first[0]}"] and sends(node) == [], done  # (before: [] — no 💵, ever)
+    assert bot.store.get("live:redeemed:901:1")["tx"] == first[0] and bot.store.get("live:redeem-sent:901:1") is None
+    assert bot.live_redeem_failed == {} and bot.live_redeem_errors == {}, bot.live_redeem_failed
+    # (b) the answer to the raw transaction lost on the way (the node took it): failed (an hour, as before), the note kept with the
+    #     hash of the signed bytes; the next round finds it mined and books it — never a second transaction
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["902"] = [held(902)], mk(902, won=1)
+    bot.live.chain = QuickChain(bot.live.wallet)
+    with node_for(eth_sendRawTransaction=lambda params: m.RemoteError("网络错误 (TimeoutError: timed out)")) as node:
+        assert await bot.live_redeem(NOW) == []
+    raw = sends(node)
+    assert len(raw) == 1 and bot.store.get("live:redeem-sent:902:1")["tx"] == raw[0] and bot.live_errors[-1].endswith("（一小时后再试）")
+    with node_for() as node:
+        assert await bot.live_redeem(NOW + 10 * MIN) == [f"💵 已领取 window 902 Up 10 份：{raw[0]}"] and sends(node) == []
+    # (c) no receipt yet: nothing sent beside it — the hour, and while the node still has it in its pool after that; an hour on
+    #     and unknown to the node (dropped / never broadcast): let go, redeemed once more
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["903"] = [held(903)], mk(903, won=1)
+    bot.live.chain = QuickChain(bot.live.wallet)
+    with node_for(eth_getTransactionReceipt=None) as node:
+        await bot.live_redeem(NOW)
+        old = sends(node)[0]
+        bot.live_redeem_failed.clear()  # (as after a restart: the back-offs live in memory, the note on disk)
+        assert await bot.live_redeem(NOW + MIN) == [] and len(sends(node)) == 1
+        assert bot.live_redeem_last["counts"] == {"sent": 1}, bot.live_redeem_last
+        node.answers["eth_getTransactionByHash"] = {"hash": old}  # an hour on, still in the node's pool
+        assert await bot.live_redeem(NOW + 61 * MIN) == [] and len(sends(node)) == 1 and bot.live_redeem_last["counts"] == {"sent": 1}
+        report = await bot.live_redeem_report(NOW + 61 * MIN + 1000)
+        assert f"领取交易已发出、还没确认上链（下一轮先查回执，不会再发）：" in report and old in report and "节点里还在排队" not in report, report
+        assert "结论：有领取交易已经发出、还没确认上链" in report and bot.store.get("live:redeem-sent:903:1")["tx"] == old, report  # (the check reads no receipt, writes nothing)
+        node.answers["eth_getTransactionByHash"] = None  # dropped
+        node.answers["eth_getTransactionReceipt"] = lambda params: None if params[0] == old else MINED  # (the new one is mined)
+        node.answers["eth_getTransactionCount"] = "0x2"  # (the pending nonce moved on: a new transaction, not the same bytes again)
+        done = await bot.live_redeem(NOW + 62 * MIN)
+    assert len(sends(node)) == 2 and done == [f"💵 已领取 window 903 Up 10 份：{sends(node)[1]}"] and bot.store.get("live:redeem-sent:903:1") is None, (done, bot.live_redeem_last)
+    assert sends(node)[1] != old and "一小时没上链、节点里也查不到：重新领取" in bot.live_errors[-1], bot.live_errors[-2:]
+    # (d) a note whose transaction was mined and reverted: a failure (its hour), the note gone; a revert seen by the wait: the same
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["904"] = [held(904)], mk(904, won=1)
+    bot.live.chain = QuickChain(bot.live.wallet)
+    with node_for(eth_getTransactionReceipt=None):
+        await bot.live_redeem(NOW)
+    bot.live_redeem_failed.clear()
+    with node_for(eth_getTransactionReceipt={"blockNumber": "0x10", "status": "0x0"}) as node:
+        assert await bot.live_redeem(NOW + 10 * MIN) == [] and sends(node) == []
+    assert bot.live_redeem_last["counts"] == {"failed": 1} and "交易失败（已回滚）" in bot.live_errors[-1] and bot.store.get("live:redeem-sent:904:1") is None
+    assert "live:redeemed:904:1" in bot.live_redeem_failed and bot.store.get("live:redeemed:904:1") is None
+    bot.live_redeem_failed.clear()
+    with node_for(eth_getTransactionReceipt={"blockNumber": "0x10", "status": "0x0"}) as node:
+        assert await bot.live_redeem(NOW + 80 * MIN) == [] and len(sends(node)) == 1
+    assert bot.store.get("live:redeem-sent:904:1") is None and bot.live_errors[-1].endswith("（一小时后再试）")
+    # ...and a raw transaction the node refused (nothing left the bot): no note either
+    bot.live_redeem_failed.clear()
+    with node_for(eth_sendRawTransaction=refusal("replacement transaction underpriced")):
+        await bot.live_redeem(NOW + 90 * MIN)
+    assert bot.store.get("live:redeem-sent:904:1") is None and bot.live_errors[-1].endswith("（交易没发出，5 分钟后再试）")
+    # (e) a restart while the receipt was awaited: the next process finds the note and books the first transaction (standard), or
+    #     sends nothing and books it (neg-risk: before, a 没领成 for a paid position) — one transaction in all
+    for neg in (False, True):
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(pathlib.Path(folder) / "bot.sqlite3")
+            store1 = m.Store(path)
+            bot1 = make_bot_on(store1)
+            await bot1.live_prepare()
+            mid = "905" if not neg else "906"
+            bot1.live.api.positions_rows, bot1.live.api.markets[mid] = [held(mid)], {**mk(mid, won=1), "isNegRisk": neg}
+            bot1.live.chain = QuickChain(bot1.live.wallet, wait_s=None)  # the real 120 s wait, polled every 10 ms
+            with node_for(eth_getTransactionReceipt=None) as node:
+                task = asyncio.create_task(bot1.live_redeem(NOW))
+                while "eth_getTransactionReceipt" not in node.methods():
+                    await asyncio.sleep(0.01)
+                task.cancel()  # the deploy: the process stops mid-wait
+                try:
+                    await task
+                    assert False
+                except asyncio.CancelledError:
+                    pass
+            first = sends(node)
+            assert len(first) == 1 and store1.get(f"live:redeemed:{mid}:1") is None
+            store2 = m.Store(path)  # the next process, the same database file
+            bot2 = make_bot_on(store2)
+            await bot2.live_prepare()
+            bot2.live.api.positions_rows, bot2.live.api.markets[mid] = [held(mid)], {**mk(mid, won=1), "isNegRisk": neg}
+            bot2.live.chain = QuickChain(bot2.live.wallet)
+            sent = notices(bot2)
+            target = L.ADDRESSES[56]["NEG_RISK_ADAPTER" if neg else "CONDITIONAL_TOKENS"]
+            log = payout_log(target, bot2.live.wallet.maker, 10 * WEI, cond(mid), neg_risk=neg, amounts=(10 * WEI, 0))
+            with node_for(eth_getTransactionReceipt={**MINED, "logs": [log]}) as node:
+                done = await bot2.live_redeem(NOW + 30_000)
+            assert done == [f"💵 已领取 window {mid} Up 10 份，到账 $10.00：{first[0]}"] and sends(node) == [], (neg, done)  # (before: a 2nd transaction)
+            assert "eth_estimateGas" not in node.methods() and store2.get(f"live:redeemed:{mid}:1")["tx"] == first[0], node.methods()
+            assert not any("没领成" in text for _, text in sent), sent
+            store1.close()
+            store2.close()
+    print("RDM_RECEIPT_POLL_RESTART_MID_SEND_OK")
+
+
+asyncio.run(sent_note())
 
 
 print("AUDIT_REDEEM_OK")
