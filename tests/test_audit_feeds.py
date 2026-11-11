@@ -1330,4 +1330,141 @@ async def feed_mark_vs_last() -> None:
 
 asyncio.run(feed_mark_vs_last())
 
+
+# FEED-HSI-FUTURES-STALE: after the cash close the HSI card is priced from the futures alone (close × futures now ÷ futures
+# at 16:10), and while a futures session trades a quote stood for the market for ten minutes without a change
+# (futures_problem: LIVE_STALE_MS, a single stock's allowance; the cash index feeds: three). etnet's running block prints
+# no time and is dated by when its values were first seen. So (a) a page already frozen when the bot started was dated
+# "now", whatever its age, and (b) a page that froze priced the card for ten more minutes — both with nothing said, the
+# default after-hours taker (10¢ bar) buying on it. The estimate now stays on the card with the reason and nothing is
+# suggested from it (CloseOdds.warn → SimMarket.hold): until the block is seen to change after a start, and from three
+# minutes without a change. Which source is used, the card's figures and futures_problem's ten minutes are as they were.
+async def feed_hsi_futures_stale() -> None:
+    import datetime as dt
+    D = m.D
+
+    def at(hour: int, minute: int, second: int = 0) -> int:  # Wednesday 2026-09-23: the night session runs 17:15–03:00
+        return int(dt.datetime(2026, 9, 23, hour, minute, second, tzinfo=m.BEIJING).timestamp() * 1000)
+
+    CLOSE = at(16, 10)
+    feed = {"last": 24846}
+
+    def page() -> bytes:
+        """etnet in the night session: the running 夜市 block (opened from the day block's last) carries no time."""
+        last = feed["last"]
+        return (f"""<div><h3>恒生指數期貨(10/2026)</h3><span>日市</span><div>&#9650;24,610 +90 (+0.37%) 高水15</div>
+<div>最高: 24,650 最低: 24,500 前收市: 24,520 開市: 24,530</div></div>
+<div><h3>恒生指數期貨(10/2026)</h3><span>夜市</span><div>&#9650;{last:,} +{last - 24610} (+0.96%) 高水{last - 24595}</div>
+<div>最高: 24,900 最低: 24,600 前收市: 24,610 開市: 24,615</div></div>
+<div>恒生指數現貨 &#9650;24,595.00 +84.91 (+0.35%) 前收市: 24,510.09 開市: 24,520</div>""").encode()
+
+    async def fake_get(url, timeout=15, headers=None):
+        if "etnet" in url:
+            return page()
+        raise m.RemoteError("HTTP 502")  # Eastmoney and the Sina CFD are down: etnet alone prices the card
+
+    class Clock:
+        now = 0
+
+        def now_ms(self):
+            return self.now
+
+    def start() -> "m.Bot":
+        """The bot as it starts that evening under its default settings (takers, after hours, 10¢ bar): the HSI closed at
+        24,595, the futures printed 24,600 at 16:10 (the exact anchor, recorded that afternoon)."""
+        cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "STATE_DB": ":memory:"})
+        store = m.Store(":memory:")
+        store.put("anchor:HSI", [CLOSE, "24600", "16:10 现货收市时", "10/2026", CLOSE + 3_000, CLOSE + 3_000])
+        bot = m.Bot(cfg, store, Clock(), None)
+        bot.hsi_daily.daily = {dt.date(2026, 9, 23): D("24595.00")}
+
+        async def details(mid):
+            return {"outcomes": ["Up", "Down"], "status": "REGISTERED", "resolved": None}
+        bot.predict.market_details = details
+        return bot
+
+    async def card(bot, now):
+        """One refresh at ``now``: (the card's odds, its market as the trader sees it — 涨 offered at 55¢ × 300)."""
+        bot.market.now = now
+        await bot.hsi.refresh(now, force=True)
+        odds = bot.hsi_odds(now)
+        if not isinstance(odds, m.CloseOdds):
+            return odds, None
+        slug = m.predict_slug(bot.config.predict_slugs["HSI"], odds.target)
+        bot.predict.books["HSI"] = m.PredictBook("HSI", slug, "902", "t", ((D("0.50"), D("100")),), ((D("0.55"), D("300")),), now)
+        (mk,) = [x for x in bot.sim_markets(now) if x.key == "HSI"]
+        return odds, mk
+
+    async def trader(bot, now) -> list:
+        """One look of the paper trader (the real one follows it): the trades it has made so far."""
+        bot.sim_ran = -1e9
+        await bot.sim_step(now)
+        return sorted((t["label"], t["status"], t["shares"]) for t in bot.sim_trades().values())
+
+    real_get, real_health = m.http_get, m.SOURCE_HEALTH
+    m.http_get, m.SOURCE_HEALTH = fake_get, m.SourceHealth()
+    try:
+        # --- (a) the bot starts at 21:30 on a page that stands still (frozen since who knows when) -------------------------
+        bot = start()
+        odds, mk = await card(bot, at(21, 30))
+        q = bot.hsi.quote
+        # what the card shows is as it was: etnet's running block, dated by its first sighting, standing for the market
+        assert q.source == "etnet" and q.session == "夜市" and q.quoted_ms == at(21, 30) and not bot.hsi.futures_problem(q, at(21, 30)), q
+        assert 0.77 < odds.fair_up < 0.79 and odds.proxy_note.startswith("恒指期货 24,846 / 16:10 现货收市时 24,600 → +1.000%"), odds
+        # ...but nothing tells that block's age: no suggestion, no order (300 涨 were bought at 55¢ on this very look)
+        assert odds.warn == "恒指期货 etnet 页面启动后尚未见变动，报价时间无法确认" and mk.hold == odds.warn, (odds.warn, mk.hold)
+        assert await trader(bot, at(21, 30)) == []
+        # nine minutes on the page is as it was first read: still held (it passed until 21:40, and again after any restart)
+        odds, mk = await card(bot, at(21, 39))
+        assert bot.hsi.quote.quoted_ms == at(21, 30) and not bot.hsi.futures_problem(bot.hsi.quote, at(21, 39)), bot.hsi.quote
+        assert "尚未见变动" in odds.warn and mk.hold == odds.warn and await trader(bot, at(21, 39)) == [], (odds.warn, mk.hold)
+        # the page moves: a live one. The card suggests again and the trader takes the offer, as before
+        feed["last"] = 24850
+        odds, mk = await card(bot, at(21, 39, 2))
+        assert bot.hsi.quote.quoted_ms == at(21, 39, 2) and not odds.warn and not mk.hold, (odds.warn, mk.hold)
+        assert await trader(bot, at(21, 39, 2)) == [("吃涨", "filled", 300.0)]
+
+        # --- (b) a page that freezes while the bot runs: last seen to change at 21:00 ---------------------------------------
+        bot = start()
+        feed["last"] = 24840
+        await card(bot, at(20, 59, 58))
+        feed["last"] = 24846
+        odds, mk = await card(bot, at(21, 0))
+        assert bot.hsi.quote.quoted_ms == at(21, 0) and not odds.warn and not mk.hold, (odds.warn, mk.hold)
+        odds, mk = await card(bot, at(21, 3))  # three minutes: a short gap, as before
+        assert isinstance(odds, m.CloseOdds) and not odds.warn and not mk.hold, (odds, mk.hold)
+        # past three minutes without a change the futures are not just quiet (they print every few seconds): the estimate
+        # stays, nothing is suggested from it (the taker bought here; the card said nothing until 21:10)
+        odds, mk = await card(bot, at(21, 3, 1))
+        stuck = "恒指期货报价停在 09-23 21:00，已超 3 分钟未更新"
+        assert odds.warn == stuck and mk.hold == stuck and 0.77 < odds.fair_up < 0.79, (odds.warn, mk.hold, odds.fair_up)
+        assert await trader(bot, at(21, 3, 1)) == []
+        # the quote itself still stands for the market for futures_problem's ten minutes: same source, same figures
+        odds, mk = await card(bot, at(21, 10))
+        q = bot.hsi.quote
+        assert q.source == "etnet" and q.quoted_ms == at(21, 0) and not bot.hsi.futures_problem(q, at(21, 10)) and not bot.hsi.error, q
+        assert odds.warn == stuck and mk.hold == stuck and odds.proxy_note.startswith("恒指期货 24,846 / 16:10 现货收市时 24,600"), odds
+        # ...after which it is turned down as ever (no other source answering: the odds pause)
+        odds, mk = await card(bot, at(21, 10, 1))
+        assert odds == "恒指期货报价停在 09-23 21:00，已超 10 分钟未更新，暂不输出新概率" and mk is None, odds
+        assert await trader(bot, at(21, 10, 1)) == []
+        # it moves again: priced and traded as before
+        feed["last"] = 24852
+        odds, mk = await card(bot, at(21, 12))
+        assert isinstance(odds, m.CloseOdds) and not odds.warn and not mk.hold and bot.hsi.quote.quoted_ms == at(21, 12), odds
+        assert await trader(bot, at(21, 12)) == [("吃涨", "filled", 300.0)]
+
+        # --- a source with its own time (Eastmoney, the Sina CFD) is judged by that; lunch aside; nothing held while shut ---
+        timed = m.FuturesQuote("恒指主连", D("24846"), D("24610"), None, None, None, at(21, 0), "东方财富", fetched_ms=at(21, 3, 1))
+        assert bot.hsi.futures_hold(timed, at(21, 3)) == "" and bot.hsi.futures_hold(timed, at(21, 3, 1)) == stuck
+        noon = m.dataclasses.replace(timed, quoted_ms=at(11, 59))
+        assert bot.hsi.futures_hold(noon, at(13, 2)) == "" and "已超 3 分钟未更新" in bot.hsi.futures_hold(noon, at(13, 2, 1))
+        final = m.dataclasses.replace(timed, quoted_ms=at(16, 29))  # 16:50: between the day and the night session
+        assert m.hk_futures_session(at(16, 50), bot.hsi.holidays) == "休市" and bot.hsi.futures_hold(final, at(16, 50)) == ""
+    finally:
+        m.http_get, m.SOURCE_HEALTH = real_get, real_health
+
+
+asyncio.run(feed_hsi_futures_stale())
+
 print("AUDIT_FEEDS_OK")

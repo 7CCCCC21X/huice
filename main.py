@@ -2873,6 +2873,7 @@ class IndexFutures:
         self.spot_at = -1e9      # monotonic time of the last good cash-index read
         self.spot_error = ""
         self.seen: dict[tuple, tuple[tuple, int]] = {}  # untimed source -> (values, when first seen unchanged)
+        self.unmoved: set[tuple] = set()                  # untimed sources still showing the values of the bot's first read of them (futures_hold)
         self.still = Stillness()                          # when the cash index last changed, by source (closure_problem)
         self.dated_close: Any = lambda day: None         # dated daily closes, plugged in by the Bot
 
@@ -2930,7 +2931,8 @@ class IndexFutures:
 
     def futures_problem(self, q: FuturesQuote, now_ms: int) -> str:
         """Why q cannot stand for the futures now ("" when it can): while a session trades it must have moved within
-        10 minutes (the lunch break aside); while the market is shut it must come from the session that ended last."""
+        10 minutes (the lunch break aside); while the market is shut it must come from the session that ended last.
+        (A quote that stands may still be too still for the after-hours card to suggest anything from: futures_hold.)"""
         live = hk_futures_session(now_ms, self.holidays) in ("日市", "夜市")
         last_end = max(hk_session_end("日市", now_ms, self.holidays), hk_session_end("夜市", now_ms, self.holidays))
         why = quote_problem(q.quoted_ms, now_ms, live, last_end, self.LUNCH)
@@ -2998,6 +3000,13 @@ class IndexFutures:
         old = self.seen.get(key)
         if old is not None and old[0] == values:
             return old[1]
+        # 1.150.0 (audit FEED-HSI-FUTURES-STALE): only a change between two reads shows the page moving. The bot's first
+        # read shows nothing of the kind — a page frozen for an hour reads exactly like a live one — so its key is kept
+        # apart until its values change (futures_hold)
+        if old is None:
+            self.unmoved.add(key)
+        else:
+            self.unmoved.discard(key)
         self.seen[key] = (values, fetched_ms)
         return fetched_ms
 
@@ -3010,6 +3019,38 @@ class IndexFutures:
         if q.spot is not None and q.spot_source == q.source and not q.spot_ms:
             changes["spot_ms"] = self.observed(("spot", q.source), (q.spot, q.spot_prev), now_ms)
         return dataclasses.replace(q, **changes) if changes else q
+
+    def futures_hold(self, q: FuturesQuote, now_ms: int) -> str:
+        """Why q, though it stands for the futures by futures_problem, gives no suggestion on the after-hours card now
+        ("" when it may).
+
+        1.150.0 (audit FEED-HSI-FUTURES-STALE): after the cash close the futures alone move the HSI card's fair price
+        (about 3¢ per 0.1% near the money, against a 10¢ taker bar), and while a session trades futures_problem lets a
+        quote stand for ten minutes without a change — LIVE_STALE_MS, a single stock's allowance; the cash index feeds
+        were cut to three minutes in 1.75.0 for this very failure, the futures were not. etnet's running block prints
+        no time and is dated by when its values were first seen (observed). So a page that froze went on pricing the
+        card for ten minutes with nothing said, and a page already frozen when the bot started was dated "now", however
+        old it was, and did the same — the very thing that dating is there to prevent (a frozen page ages; it is not
+        "just now" at every look). On both the default after-hours taker bought.
+        So while a futures session trades (the lunch break aside) nothing is suggested from q — the estimate stays on
+        the card with the reason and the trader opens nothing (CloseOdds.warn → SimMarket.hold), as with an approximate
+        anchor — when
+        - q is an untimed block still showing what the bot's first read of it showed: nothing tells its age yet (a
+          live page changes within seconds); or
+        - q has not changed for INDEX_STALE_MS: the futures print every few seconds in both sessions, so three minutes
+          without a change is a stuck page or record (or a halted market), not a quiet one.
+        Only the suggestions are held: which source is used, what the card shows, futures_problem's ten minutes
+        (through a short etnet outage its last quote still keeps the card and its exact anchor; the sources behind a
+        still page are asked once it is turned down, as before) and the 16:10 anchor are as they were. A finished
+        session's block is dated from the calendar (parse_etnet_futures) and is not judged here: nothing is held while
+        the market is shut."""
+        if hk_futures_session(now_ms, self.holidays) not in ("日市", "夜市"):
+            return ""
+        key = ("futures", q.source)
+        if key in self.unmoved and self.seen[key][1] == q.quoted_ms:
+            return f"恒指期货 {q.source} 页面启动后尚未见变动，报价时间无法确认"
+        why = quote_problem(q.quoted_ms, now_ms, True, 0, self.LUNCH, INDEX_STALE_MS)
+        return f"恒指期货{why}" if why else ""
 
     def cash_close_due(self, now_ms: int) -> bool:
         """The first refresh after the 16:10 cash close is not left to the 60-second cadence: the futures price at
@@ -17581,7 +17622,11 @@ class Bot:
         odds = close_odds("恒生指数", ref, ref * used.last / anchor, sigma, remaining, target, D("0.01"), ref_note,
                           f"{label} {fmt(used.last)} / {anchor_note} {fmt(anchor)} → {percent(used.last, anchor):+.3f}%",
                           sigma_note, mode="盘后", sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
-        return dataclasses.replace(odds, warn="期货锚点是近似值，暂不给建议") if approximate else odds
+        # 1.150.0 (audit FEED-HSI-FUTURES-STALE): a futures quote that stands for the market (futures_problem: ten minutes
+        # without a change while a session trades) may still be too still to trade on — or, first read after a start, of
+        # no known age: the estimate is shown with the reason and nothing is suggested from it (futures_hold)
+        hold = "期货锚点是近似值，暂不给建议" if approximate else self.hsi.futures_hold(used, now_ms)
+        return dataclasses.replace(odds, warn=hold) if hold else odds
 
     A50_SOFT_STALE_MS = 60 * 60_000  # A50 silent longer than this: no odds at all (shorter: odds with a warning)
     HL_STALE_MS = 10 * 60_000  # an HL mark older than this (refresh failing) is not used for new probabilities
