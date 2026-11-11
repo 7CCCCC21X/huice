@@ -20125,12 +20125,6 @@ class Bot:
             self.sim_quote(mk, trades, now_ms, changed)
             self.sim_take(mk, trades, now_ms, changed)
         self.sim_taker_seen = {tid: at for tid, at in self.sim_taker_seen.items() if tid.rsplit("|", 2)[0] in markets}  # gone markets forgotten
-        if self.sim_paper_used:
-            # ...and what paper fills took on a market that is over (nothing more is bought there). Until then it is kept
-            # through the looks that do not price the market (a quote missing for a moment, a card on hold): its asks are
-            # still the ones already bought when it is priced again
-            self.sim_paper_used = {market: held for market, held in self.sim_paper_used.items()
-                                   if (now_ms < held["end"] if held["end"] is not None else market in markets)}
         t2 = time.monotonic()
         opened, rekeys, unpriced = {tid for tid, _ in changed}, [], set()
         freed: dict[str, dict] = {}  # market -> a record withdrawn below by a rule: its slot is quoted again in this look (sim_requote_freed)
@@ -20178,6 +20172,24 @@ class Bot:
                     trade["confirm"] = "local"
             if json.dumps(trade, sort_keys=True, default=str) != before:
                 changed.append((tid, trade))
+        if self.sim_paper_used:
+            # What paper fills took on a market that is over is forgotten (sim_paper_used) here, once the records above have had
+            # their look, and never while an order still rests there; until then it is kept through the looks that do not price
+            # the market (a quote missing for a moment, a card on hold): its asks are still the ones already bought when it is
+            # priced again. 1.150.0 (the review of the SIM-PAPER-TAKER-REBUY fix): it was forgotten before that loop, which
+            # judges an order still resting at its market's end one last time — its fills on this book (sim_fill), then its
+            # withdrawal (sim_withdraw_reason: sim_quiet) — so that order was filled from the book as read: the 100 at 55¢ a
+            # taker had bought a second before the end were credited to it as well, a floor order the asks the one before it in
+            # its slot had been credited. One ask counted twice again, in the step's first look past the end of a market still
+            # listed then with an order resting on it (an up/down card is priced for a minute past the end its records keep, the
+            # open of its last 1-minute candle); the express lane never forgets a market for its end, so the count hung on which
+            # lane looked first. And the end an order is withdrawn at is its own record's (sim_withdraw_reason), the one the
+            # memory goes by the card's (sim_paper_seen): should the card name an earlier one, the order rests on past it and is
+            # still not credited what another paper fill has. With the market over and no order resting there, no paper fill
+            # comes from its book again (sim_quiet opens none)
+            self.sim_paper_used = {market: held for market, held in self.sim_paper_used.items()
+                                   if (now_ms < held["end"] if held["end"] is not None else market in markets)
+                                   or any(t.get("status") == "resting" for t in trades_of_market(trades, market))}
         t3 = time.monotonic()
         self.sim_unpriced_since = {market: since for market, since in self.sim_unpriced_since.items() if market in unpriced}
         for tid in rekeys:

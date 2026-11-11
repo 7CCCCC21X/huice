@@ -1776,4 +1776,84 @@ HOLD_CASES = (hold_exit_line, hold_half_hour, hold_other_reasons, hold_real_rest
 for hold_case in HOLD_CASES:
     asyncio.run(hold_case())
 
+# --- SIM-PAPER-TAKER-REBUY, the review of its fix: the step's look at a market still listed past its end ---------------------------
+# That fix remembers what paper fills took of each market's asks (sim_paper_used) and forgets a market's once it is over. The step
+# forgot it before it judged the records — and an order still resting at its market's end is judged there one last time: its fills
+# on this book (sim_fill), then its withdrawal (sim_quiet). So in that one look the order was filled from the book as read: the 100
+# at 55¢ a taker had bought were credited to it as well, and a floor order was credited the asks the one before it in its slot had
+# been — the finding's double count again, once per market and side. It takes a market still listed past the end its records keep:
+# an up/down card's is the open of its last 1-minute candle (updown_settle), and the card is priced for the minute after it. The
+# express lane never forgets a market for its end, so the count hung on which lane looked first after the end.
+PAPER_END = 3600_000  # where the card's records put its end, ms after NOW
+
+
+def paper_card(asks, read: int, bids=PAPER_BIDS, fair: float = 0.70, end: int = PAPER_END) -> m.SimMarket:
+    """paper_mk's market as an up/down card whose end (the open of its last 1-minute candle) is ``end`` ms after NOW."""
+    return m.dataclasses.replace(paper_mk(asks, read, bids, fair), kind="updown", settle={"end": NOW + end})
+
+
+def paper_rests(bot) -> list:
+    """Every resting-order record's (status, shares credited, the first words of why it was withdrawn), sorted."""
+    return sorted((t["status"], t["shares"], (t.get("withdrawn") or {}).get("why", "")[:6]) for t in bot.sim_trades().values() if t.get("maker"))
+
+
+async def paper_end_taken():
+    """SIM_WAYS=both: an order rests at 55¢; a second before the card's end one seller offers 100 there and the step's taker
+    has them. The first look past the end — the step's or the express lane's — withdraws the order with nothing."""
+    quiet = lambda ms: paper_card([("0.62", "300")], NOW + ms, bids=(("0.55", "500"),))  # the ask over the taker's cap: an order rests
+    offer = lambda ms: paper_card([("0.55", "100")], NOW + ms, bids=(("0.54", "500"),))
+    for express in (False, True):
+        bot, world = paper_bot(SIM_MARKETS="all", **PAPER_BOTH)
+        await paper_look(bot, world, PAPER_END - 60_000, quiet(PAPER_END - 60_000))
+        await paper_look(bot, world, PAPER_END - 1_000, offer(PAPER_END - 1_000))
+        assert paper_ways(bot) == (100.0, 0.0) and paper_rests(bot) == [("resting", 0.0, "")], (paper_ways(bot), paper_rests(bot))
+        await paper_look(bot, world, PAPER_END + 1_500, offer(PAPER_END + 1_500), express=express)
+        # before: (100.0, 100.0) when that look was the step's — taker 100 and maker 100 of a book that only ever showed 100
+        assert paper_ways(bot) == (100.0, 0.0) and paper_rests(bot) == [("cancelled", 0.0, "已到结束时间")], (express, paper_ways(bot), paper_rests(bot))
+        await paper_look(bot, world, PAPER_END + 4_000, offer(PAPER_END + 4_000))  # the step after it: nothing more, the memory let go
+        assert paper_ways(bot) == (100.0, 0.0) and bot.sim_paper_used == {}, (express, paper_ways(bot), bot.sim_paper_used)
+
+
+async def paper_end_floor():
+    """SIM_WAYS=maker: a floor order (100 × 1¢) rests at the card's end on the asks the floor order before it in its slot was
+    credited (paper_next_order). Withdrawn with nothing, whichever lane looks first."""
+    cheap = lambda ms: paper_card([("0.01", "100")], NOW + ms, bids=(), fair=0.30)
+    for express in (False, True):
+        bot, world = paper_bot(SIM_WAYS="maker", SIM_MARKETS="all", SIM_MAKER_POINTS="off", SIM_MAKER_SESSION="off")
+        for i in range(6):
+            await paper_look(bot, world, 5_000 * i, cheap(5_000 * i))
+        assert paper_ways(bot) == (0.0, 100.0) and paper_rests(bot) == [("filled", 100.0, ""), ("resting", 0.0, "")], paper_rests(bot)
+        await paper_look(bot, world, PAPER_END + 2_000, cheap(PAPER_END + 2_000), express=express)
+        # before: (0.0, 200.0) when that look was the step's — the second floor order credited the first one's 100
+        assert paper_ways(bot) == (0.0, 100.0), (express, paper_ways(bot))
+        assert paper_rests(bot) == [("cancelled", 0.0, "已到结束时间"), ("filled", 100.0, "")], (express, paper_rests(bot))
+        await paper_look(bot, world, PAPER_END + 5_000, cheap(PAPER_END + 5_000))
+        assert paper_ways(bot) == (0.0, 100.0) and bot.sim_paper_used == {}, (express, paper_ways(bot), bot.sim_paper_used)
+
+
+async def paper_end_rests_on():
+    """The rule, whatever the order of the step's statements: what was taken on a market is not forgotten under an order that
+    still rests there. An order is withdrawn at the end its own record keeps (sim_withdraw_reason), the market's memory goes by
+    the card's (sim_paper_seen). Should the card name an earlier one by then, the order rests on past it — and is still not
+    credited what another paper fill has; once it is gone the memory goes too."""
+    later = PAPER_END + 600_000  # the end the orders' records keep
+    cheap = lambda ms, end: paper_card([("0.01", "100")], NOW + ms, bids=(), fair=0.30, end=end)
+    bot, world = paper_bot(SIM_WAYS="maker", SIM_MARKETS="all", SIM_MAKER_POINTS="off", SIM_MAKER_SESSION="off")
+    for i in range(6):
+        await paper_look(bot, world, 5_000 * i, cheap(5_000 * i, later))
+    for i, ms in enumerate((2_000, 5_000, 8_000)):  # the card over (no new order: sim_quiet), the second floor order resting on
+        await paper_look(bot, world, PAPER_END + ms, cheap(PAPER_END + ms, PAPER_END), express=i == 1)
+        # before: (0.0, 200.0) — the memory let go at the card's end while the order still rested there
+        assert paper_ways(bot) == (0.0, 100.0) and paper_rests(bot) == [("filled", 100.0, ""), ("resting", 0.0, "")], (i, paper_ways(bot), paper_rests(bot))
+    assert bot.sim_paper_used.get(PAPER, {}).get("up") == {0.01: [100.0, 0.0]}, bot.sim_paper_used
+    for ms in (1_000, 6_000):  # the order's own end
+        await paper_look(bot, world, later + ms, cheap(later + ms, PAPER_END))
+    assert paper_ways(bot) == (0.0, 100.0) and paper_rests(bot) == [("cancelled", 0.0, "已到结束时间"), ("filled", 100.0, "")], paper_rests(bot)
+    assert bot.sim_paper_used == {}, bot.sim_paper_used
+
+
+PAPER_END_CASES = (paper_end_taken, paper_end_floor, paper_end_rests_on)
+for paper_end_case in PAPER_END_CASES:
+    asyncio.run(paper_end_case())
+
 print("AUDIT_DECISION_OK")
