@@ -5228,6 +5228,9 @@ class LiveBot(core.Bot):
         # node that mines nothing, exactly when the owner needs it. It waits REDEEM_CHECK_WAIT_SECONDS at most (a healthy round
         # of a dozen winners ends within a minute or so), then answers with what it has, without the dry run. Never beside the
         # round: a second burst of reads on the key the orders share, and positions that round is redeeming called 可领取.
+        # What it says the round does covers both of its phases: its own read of a long positions list (up to LIVE_REDEEM_PAGES
+        # pages, RDM-POSITIONS-CUT) and its market reads hold the lock too, before anything is sent — 「它把领取交易逐个发出」
+        # alone was said of a round still reading.
         lock = self.redeem_lock()
         deadline = time.monotonic() + self.REDEEM_CHECK_WAIT_SECONDS
         while lock.locked() and time.monotonic() < deadline:
@@ -5235,8 +5238,8 @@ class LiveBot(core.Bot):
         if lock.locked():  # (no await between this test and the acquire below)
             since = int(getattr(self, "live_redeem_since", 0) or 0)
             started = f"（{core.stamp(since, seconds=False)} 起，已 {max(0, int((self.market.now_ms() - since) / 60_000))} 分钟）" if since else ""
-            lines.append(f"结论：有一轮领取正在进行{started}：它把领取交易逐个发出、每个等上链（最多 120 秒）后才结束；"
-                         "这次没有逐个查看持仓，等 /live 不再显示“正在领取”再发 /live redeem check")
+            lines.append(f"结论：有一轮领取正在进行{started}：它要读完持仓（持仓多时要读很多页）和市场，再把领取交易逐个发出、"
+                         "每个等上链（最多 120 秒）后才结束；这次没有逐个查看持仓，等 /live 不再显示“正在领取”再发 /live redeem check")
             recent = list(getattr(self, "live_redeem_notes", {}).values())[-3:]  # (RDM-NOTE-THROTTLE) the redeem's own list
             if recent:
                 lines.append("最近的领取问题：\n" + "\n".join("  " + e for e in recent))

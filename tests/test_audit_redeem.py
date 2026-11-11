@@ -2632,4 +2632,37 @@ async def gas_stats():
 asyncio.run(gas_stats())
 
 
+# --- RDM-ROUND-LOCK-STALL (follow-up: what the check says of a round that is still reading) ------------------------------------
+async def lock_while_reading():
+    """RDM-ROUND-LOCK-STALL with RDM-POSITIONS-CUT: the redeem's own read of the positions goes up to LIVE_REDEEM_PAGES pages, and
+    a round holds the redeem lock through it (and through its market reads) before anything is sent. A check that gave up waiting
+    said 「它把领取交易逐个发出、每个等上链（最多 120 秒）后才结束」 of a round that had sent nothing — still reading. It now says
+    what a round does in either phase: it reads the positions (many pages when they are many) and the markets, then sends."""
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["560"] = [held(560)], mk(560, won=1)
+    pages, plain = asyncio.Event(), fake.positions
+
+    async def long_list():  # (a list of many pages: the read not done yet)
+        await pages.wait()
+        return await plain()
+    fake.positions = long_list
+    bot.live_last_redeem = -1e9
+    bot.live_redeem_tick()
+    while not bot.redeem_lock().locked():
+        await asyncio.sleep(0)
+    bot.REDEEM_CHECK_WAIT_SECONDS = 0
+    report = await asyncio.wait_for(bot.live_redeem_report(NOW + MIN), 2)
+    verdict = next(line for line in report.split("\n") if line.startswith("结论："))
+    assert verdict.startswith("结论：有一轮领取正在进行（10-05 10:00 起，已 0 分钟）：它要读完持仓（持仓多时要读很多页）和市场，再把领取交易逐个发出"), verdict
+    assert bot.live.chain.redeemed == [], "nothing sent yet: the round is reading"
+    pages.set()
+    await bot.live_redeem_task
+    assert [cid for cid, *_ in bot.live.chain.redeemed] == [cond(560)], "then redeemed, once"
+    print("RDM_LOCK_WHILE_READING_OK")
+
+
+asyncio.run(lock_while_reading())
+
+
 print("AUDIT_REDEEM_OK")
