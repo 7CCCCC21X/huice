@@ -4,6 +4,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "tests"))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+import live as L
 
 # test_trading's fakes (FakeApi, make_bot, step, hsi …) without running its suites: only the definitions before "async def run()"
 _src = (ROOT / "tests" / "test_trading.py").read_text(encoding="utf-8").split("\nasync def run():")[0]
@@ -79,5 +80,75 @@ async def hash_read_error_409():
     assert t["live"]["state"] == "done" and bot.live_reserved(t) == 0, (t["live"]["state"], bot.live_reserved(t), t["live"].get("last_error"))
 
 
+async def sendrefused_reconcile():
+    """XR-SENDREFUSED-RECONCILE: an order waited past LIVE_PLACING_GRACE_MS for its request slot; the step's sync reads it by its
+    hash (live_reconcile while "placing", live_cancel's hash-only branch once withdrawn) and, while that read is on its way, the
+    in-slot check refuses it (a pause, a withdrawal: LIVE-SEND-AFTER-PAUSE) and the record ends unsent. The read answers "no such
+    order": the sync used to turn the ended record "unknown" — $ reserved, the side held, a false ❓ alert. "stale": no pause and
+    no withdrawal, the in-slot check refuses the decision as too old after the long wait — the same end, the same race."""
+    tid = f"{HSI_SLUG}|up|吃"
+
+    async def run(how):  # how: pause / withdraw (during the read) / withdrawn (before the sync) / stale (nothing: the decision aged)
+        bot = make_bot(SIM_WAYS="taker")
+        await bot.live_prepare()
+        api = bot.live.api
+        mk = hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)
+        world["markets"] = [mk]
+        await bot.live_prefetch(NOW)
+        async with bot.sim_lock:
+            trades, changed = bot.sim_trades(), []
+            bot.sim_take(mk, trades, NOW, changed)
+            bot.sim_save(changed)
+        slot, in_slot, read_out, read_go = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
+        real_create, real_order, sent = api.create_order, api.order, []
+
+        async def create(body):  # the wait for the client's request slot, then the check PredictApi.send makes there
+            in_slot.set()
+            await slot.wait()
+            check = L.ORDER_SEND_CHECK.get()
+            if check is not None and (why := check()):
+                raise L.SendRefused(why)
+            sent.append(body)
+            return await real_create(body)
+
+        async def order(oid, hash_=""):  # the sync's read by the hash: asked before Predict had anything, answered later
+            if not oid and not read_out.is_set():
+                read_out.set()
+                await read_go.wait()
+                return None
+            return await real_order(oid, hash_)
+        api.create_order, api.order = create, order
+        place = asyncio.create_task(bot.live_place_pending(NOW))
+        await asyncio.wait_for(in_slot.wait(), 5)
+        t = bot.sim_trades()[tid]
+        at = NOW + bot.LIVE_PLACING_GRACE_MS + 5_000
+        bot.market.now = at
+        withdraw = lambda: (bot.sim_withdraw(t, "测试撤单", at), t["withdrawn"].update(rule=True), bot.sim_save([(tid, t)]))
+        if how == "withdrawn":
+            async with bot.sim_lock:
+                withdraw()
+        sync = asyncio.create_task(bot.live_sync_orders({tid: t}, at))
+        await asyncio.wait_for(read_out.wait(), 5)
+        if how == "pause":
+            await bot.live_action("pause", ["测试暂停"], at)
+        elif how == "withdraw":
+            async with bot.sim_lock:
+                withdraw()
+        slot.set()
+        await place
+        after = (t["live"]["state"], t["live"].get("order_id"))
+        read_go.set()
+        await sync
+        return bot, t, sent, after
+
+    for how in ("pause", "withdraw", "withdrawn", "stale"):
+        bot, t, sent, after = await run(how)
+        st = t["live"]
+        assert not sent and after[0] == "done", (how, after)
+        assert st["state"] == "done" and bot.live_reserved(t) == 0, (how, st["state"], bot.live_reserved(t), st["events"][-1])
+        assert not any("状态未知" in e["what"] for e in st["events"]), (how, st["events"])
+
+
 asyncio.run(hash_read_error_409())
+asyncio.run(sendrefused_reconcile())
 print("AUDIT_XREVIEW_OK")

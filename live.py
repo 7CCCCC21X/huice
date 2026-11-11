@@ -3500,6 +3500,14 @@ class LiveBot(core.Bot):
                     raise
                 st["last_error"] = core.clean_error(error) or type(error).__name__
                 return self.live_unknown(tid, trade, f"下单后无法确认 Predict 是否收到，按哈希查询也出错（{st['last_error']}）", now_ms)
+            if row is None and st.get("state") != "placing":
+                # 1.150.0 (XR-SENDREFUSED-RECONCILE): the read is asked while the order still waits for its request slot, and the
+                # in-slot check (LIVE-SEND-AFTER-PAUSE: a pause, a withdrawal, or a decision that aged past the grace in that wait)
+                # can refuse it and end the record unsent before the answer comes back. "No such order" then says nothing about a
+                # record that already ended (or was taken on by another path): turning it "unknown" reserved its $ again, held its
+                # side and sent a false ❓ alert. Only an empty answer is ignored — an order Predict does hold is still adopted
+                # below whatever the state, so a record put back to pending (a 429's unsend) is never sent a second time
+                return
         if row is not None:
             # withdrawn meanwhile: found, it is cancelled next, never tracked as open
             st.update(state="cancelling" if trade.get("withdrawn") else "open", order_id=str(row.get("id") or ""),
@@ -3606,6 +3614,10 @@ class LiveBot(core.Bot):
                     raise
                 st["last_error"] = core.clean_error(error) or type(error).__name__
                 return self.live_unknown(tid, trade, f"撤单时按哈希查询出错（{st['last_error']}），下单是否送达未知", now_ms)
+            if row is None and (st.get("state") != "cancelling" or st.get("order_id")):
+                # 1.150.0 (XR-SENDREFUSED-RECONCILE): as in live_reconcile — the in-slot refusal ended the withdrawn record unsent
+                # (or another path got its order id) while the read was out; "no such order" says nothing about it any more
+                return
             if row is not None and row.get("id") is not None:
                 st["order_id"] = str(row.get("id"))
                 st["events"].append({"at": now_ms, "what": f"撤单前按哈希找到订单 #{st['order_id']}"})
