@@ -4821,6 +4821,7 @@ class LiveBot(core.Bot):
         # the next round; the pending one keeps its hour (it may yet be mined: a second redeem would pay nothing).
         held = ""
         gas_refused = ""  # (RDM-UNSENT-AS-SENT) the node refused a redeem for the gas this round: the rest are 可领取 under the ⛽ note
+        tried: set[str] = set()  # (RDM-MANUAL-BACKOFF) the positions whose redeem this pass tried: ``force`` never tries one twice
         # (RDM-RECEIPT-POLL, RDM-RESTART-MID-SEND) the redeems sent but not booked: each looked up by its receipt first (a real round;
         # the dry run reads no chain and writes nothing: it shows them as they stand)
         if dry_run:
@@ -4886,7 +4887,13 @@ class LiveBot(core.Bot):
             # per position per command; the automatic rounds keep the wait. Nothing beside a transaction still out (the sent note
             # above comes first), the gas floor and the marks as ever, and Chain.send's estimate refuses a redeem that would revert
             # before anything is spent. A failure here starts its wait afresh.
-            if not force and failed_at is not None and time.monotonic() - failed_at < self.LIVE_REDEEM_RETRY_SECONDS:
+            # The sent notes are read once, before the rows (``out``), and a position can be listed twice in one read (the list
+            # shifting while it is paged: PredictApi.paged keeps both rows). Forced, its second row passed the wait its first had
+            # just started — after an answer to the raw transaction lost on the way (the node may have taken it: its note kept) a
+            # second raw transaction went out, its note over the first one's (that hash never looked up again: no 💵 for it, the
+            # second paying nothing); after a revert, a second revert's gas. A position tried in this pass keeps the wait it set,
+            # as in the automatic round: one attempt per position per pass.
+            if (not force or key in tried) and failed_at is not None and time.monotonic() - failed_at < self.LIVE_REDEEM_RETRY_SECONDS:
                 seen.append({**entry, "kind": "waiting", "left": self.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - failed_at), "error": errors.get(key, "")})
                 continue
             if not index_set:
@@ -4973,6 +4980,7 @@ class LiveBot(core.Bot):
                                           **({"gas_price": int(signed)} if isinstance(signed, int) else {})})
                 if not await asyncio.to_thread(self.store.flush):
                     raise TxNotSent(f"领取记录没写进数据库（{self.store.write_error or '超时'}），交易没发出")
+            tried.add(key)
             try:
                 # (a stand-in chain without the note: its redeem as before)
                 more = {"sent": note_sent} if isinstance(self.live.chain, Chain) else {}

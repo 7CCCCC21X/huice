@@ -2665,4 +2665,50 @@ async def lock_while_reading():
 asyncio.run(lock_while_reading())
 
 
+# --- RDM-MANUAL-BACKOFF (follow-up: a position listed twice in one read) --------------------------------------------------------
+async def manual_backoff_twice_listed():
+    """RDM-MANUAL-BACKOFF: Predict's list can name a position twice in one read (it shifts while it is paged; the pages are not
+    de-duplicated), and the sent notes are read once, before the rows. Forced past the back-off by the owner's /live redeem, the
+    second row of a position whose redeem had just failed in the same pass was redeemed again: after an answer to the raw
+    transaction lost on the way (the node may have taken it) a second raw transaction went out, its note over the first one's —
+    that hash never looked up again, the second paying nothing; after a mined revert, a second revert's gas. A position tried in
+    a pass now keeps the wait it set, as in the automatic round: one attempt per position per command (the next command: once more)."""
+    sends = lambda node: [keccak_of(p[0]) for meth, p in node.log if meth == "eth_sendRawTransaction"]
+    # (a) the answer to the raw transaction lost on the way: one transaction, its note kept — the next round books THAT hash
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["910"] = [held(910), held(910)], mk(910, won=1)  # (the same row twice in one read)
+    bot.live.chain = QuickChain(bot.live.wallet)
+    raws = []
+
+    def raw(params):
+        raws.append(params[0])
+        return m.RemoteError("网络错误 (TimeoutError: timed out)") if len(raws) == 1 else keccak_of(params[0])
+    with node_for(eth_sendRawTransaction=raw) as node:
+        answer = await bot.cmd_live(req("redeem"))
+    assert len(sends(node)) == 1, (answer, node.methods())  # (before: 2 — the first one's note overwritten, 💵 for the second)
+    assert answer == "这次没有领取：持仓 2 个：领取失败 1，失败等重试 1。/live redeem check 看原因", answer
+    assert bot.store.get("live:redeem-sent:910:1")["tx"] == sends(node)[0] and bot.store.get("live:redeemed:910:1") is None
+    paid = {**MINED, "logs": [payout_log(L.ADDRESSES[56]["CONDITIONAL_TOKENS"], bot.live.wallet.maker, 10 * WEI, cond(910))]}
+    with node_for(eth_getTransactionReceipt=paid) as later:
+        done = await bot.live_redeem(NOW + 10 * MIN)
+    assert done == [f"💵 已领取 window 910 Up 10 份，到账 $10.00：{sends(node)[0]}"] and sends(later) == [], done
+    # (b) mined and reverted: one revert's gas, not two; the next command tries it once more; the automatic round waits, as ever
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["911"] = [held(911), held(911)], mk(911, won=1)
+    bot.live.chain = QuickChain(bot.live.wallet)
+    with node_for(eth_getTransactionReceipt={"blockNumber": "0x10", "status": "0x0"}) as node:
+        answer = await bot.cmd_live(req("redeem"))
+        assert len(sends(node)) == 1 and answer.startswith("这次没有领取：持仓 2 个：领取失败 1，失败等重试 1"), (answer, node.methods())  # (before: 2)
+        await bot.cmd_live(req("redeem"))
+        assert len(sends(node)) == 2, node.methods()
+        assert await bot.live_redeem(NOW + MIN) == [] and len(sends(node)) == 2 and bot.live_redeem_last["counts"] == {"waiting": 2}
+    assert bot.store.get("live:redeem-sent:911:1") is None and bot.store.get("live:redeemed:911:1") is None
+    print("RDM_MANUAL_BACKOFF_TWICE_LISTED_OK")
+
+
+asyncio.run(manual_backoff_twice_listed())
+
+
 print("AUDIT_REDEEM_OK")
