@@ -19754,7 +19754,13 @@ class Bot:
             trade["revisions"].append({"at": now_ms, "by": by, "from": trade["payout"], "to": payout, "note": note})
         if trade.get("maker") and float(trade["shares"]) < float(trade["order"]) - 1e-9:
             trade["unfilled"] = float(trade["order"]) - float(trade["shares"])
-        trade.update(status="settled", payout=payout, note=note, settled=trade.get("settled") or now_ms)
+        # the settlement's time is the first one's: a corrected result is a revision of the same settlement. 1.150.0: but never
+        # the time a record lapsed with nothing filled ("expired", stamped above) — no money was settled then. Such a record
+        # holds shares only when a real order's fill was read after the result (LiveBot.live_settle_late; a paper fill never
+        # comes that late): it is settled NOW. Kept at the lapse's time, a loss read after Beijing midnight was booked to the
+        # day before and counted by no day's loss stop (LiveBot.live_daily_pnl counts by this stamp).
+        settled = now_ms if trade["status"] == "expired" else trade.get("settled") or now_ms
+        trade.update(status="settled", payout=payout, note=note, settled=settled)
 
     SIM_CONFIRM_SECONDS = 600  # each market's final result is asked of Predict at most this often
     SIM_LOOKUPS_PER_STEP = 8   # old records without a market id: this many slugs looked up per step (side by side)
