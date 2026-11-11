@@ -234,4 +234,93 @@ many = m.sim_pruned_count([], [{**hsi, "status": "cancelled", "shares": 0.0, "op
                                for i in range(m.SIM_PRUNED_REASONS + 5)])
 assert len(many) == 1 and many[0]["n"] == m.SIM_PRUNED_REASONS + 5 and len(many[0]["reasons"]) == m.SIM_PRUNED_REASONS + 1 and many[0]["reasons"]["其他"] == 5, many
 
+# --- SIM-TOUCH-DECIDED-HOLD: a first-touch market's hold is one answer for the card, the trader and the edge alerts ---------------
+# BTC 先触 70k / 90k, the path verified clear up to a minute ago, BTC at 84,000: the model prices "90k first" at 70¢. Predict's
+# book already trades "90k first" as settled (its "$70,000" outcome 1¢ bid / 2¢ offered): a wick through 90,000 that came back
+# inside within its own minute, which the path check reads only at its next scan. The card held ("定局"); the trader, handed the
+# market's own reasons alone, bought 300 × "70k first" at 2¢ and rested a bid on it (a real order with LIVE on), and the
+# Telegram alerts announced it as 新机会 — the side the book priced at 2¢ because it had lost.
+import asyncio  # noqa: E402
+
+TSPEC = m.touch_spec("BTC-2027")
+TOUCH_ENV = {"TELEGRAM_BOT_TOKEN": "1:x", "PROBABILITY": "off"}  # the defaults otherwise: SIM_MARKETS=close, the edge alerts on
+TOUCH_TRADER = {**TOUCH_ENV, "SIM_MARKETS": "touch", "SIM_WAYS": "both", "SIM_TAKER_HOLD_SECONDS": "0", "SIM_MAKER_SESSION": "off",
+                "SIM_MAKER_POINTS": "off", "SIM_MAKER_MIN_BID": "0"}
+TOUCH_LOW = {"kind": "low", "time": NOW - 3_600_000, "hi": 70_400.0, "lo": 69_990.0}  # the path record of "70k first"
+
+
+def touch_set(bot, price: str, bid: str, ask: str, at: int = NOW, hist: dict | None = None) -> None:
+    """BTC at ``price`` now, σ fresh, the path record ``hist`` (default: clear, read up to a minute ago), and the book of
+    Predict's first outcome ("$70,000": touch_book turns it into the "90k first" side) at ``bid`` / ``ask``."""
+    touch = bot.touches[TSPEC.key]
+    touch.price, touch.priced_ms, touch.sigma, touch.sigma_ms = D(price), at, 0.45, at
+    bot.store.put(f"touch:{TSPEC.slug}", {**(hist or {"kind": "clear", "through": at - 60_000}), "start": touch.start_ms})
+    bot.predict.info[TSPEC.slug] = {"outcomes": ["$70,000", "$90,000"], "created_ms": touch.start_ms}
+    bot.predict.books[TSPEC.key] = m.PredictBook(TSPEC.key, TSPEC.slug, "501", "BTC", ((D(bid), D("2000")),), ((D(ask), D("3000")),), at)
+
+
+def touch_bot(env: dict, price: str, bid: str, ask: str, hist: dict | None = None):
+    bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), SelfFM(NOW), None)
+    bot.touches.setdefault(TSPEC.key, m.TouchMarket(bot.store, TSPEC))  # listed today; its line stays in TOUCH_SETTLED once it is decided
+    touch_set(bot, price, bid, ask, NOW, hist)
+    return bot
+
+
+def touch_views(bot, at: int = NOW):
+    """(the web card's hold, the SimMarket the trader and the alerts judge) of the BTC touch market."""
+    card = bot.touch_payload(bot.touches[TSPEC.key], at)
+    assert card["touch"]["hold"] == card["predict"]["hold"]
+    (mk,) = [x for x in bot.sim_markets(at) if x.key == TSPEC.key]
+    return card["predict"]["hold"], mk
+
+
+async def touch_step(bot) -> set:
+    """One express look and one step of the paper trader: the labels of the orders it opened."""
+    await bot.sim_express_look(TSPEC.key, NOW)
+    bot.sim_ran = -1e9
+    await bot.sim_step(NOW)
+    return {t["label"] for t in bot.sim_trades().values()}
+
+
+async def touch_decided_hold():
+    # the book trades "90k first" as settled (bid 98¢) against the model's 70¢ — and, the other way, "70k first" (90k first
+    # offered at 3¢) against the model's 30¢: the trader holds as the card does, takers and resting orders, step and express lane
+    for price, bid, ask, line in (("84000", "0.01", "0.02", "90k"), ("76000", "0.97", "0.98", "70k")):
+        bot = touch_bot(TOUCH_TRADER, price, bid, ask)
+        hold, mk = touch_views(bot)
+        assert f"盘口已把 {line} 先触当作定局" in hold and mk.hold == hold, (line, hold, mk.hold)  # before the fix: mk.hold == ""
+        assert [x.hold for x in bot.sim_markets_for(TSPEC.key, NOW)] == [hold]  # the express lane's view, the real trader's send-time re-check
+        assert bot.sim_in_scope(mk) and bot.sim_taker_gap(mk, bot.sim_trades(), NOW)["state"] != "ready"
+        assert bot.sim_maker_gate(mk, NOW).startswith("卡片暂不建议（盘口已把"), bot.sim_maker_gate(mk, NOW)
+        assert await touch_step(bot) == set(), bot.sim_trades()  # before: 吃70k × 300 at 2¢ and 挂70k × 100 at 1¢ (吃90k / 挂90k the other way)
+    # an open question (the "$70,000" outcome 10¢ / 12¢, "90k first" bid 88¢: under the 90¢ that reads as settled): no hold, it trades
+    bot = touch_bot(TOUCH_TRADER, "84000", "0.10", "0.12")
+    hold, mk = touch_views(bot)
+    assert hold == "" and mk.hold == "" and 0.6 < mk.fair_up < 0.8, (hold, mk.hold, mk.fair_up)
+    assert "吃70k" in await touch_step(bot), bot.sim_trades()
+    # our own path record against the book: "70k first" on record, the book trading "90k first" as settled — one of the two is
+    # wrong: held alike, nothing bought (before: 吃70k at 2¢ as a sure thing worth 95¢); the book agreeing (90k first offered at
+    # 3¢), the decided odds stand and nothing holds
+    bot = touch_bot(TOUCH_TRADER, "70500", "0.01", "0.02", TOUCH_LOW)
+    hold, mk = touch_views(bot)
+    assert "定局" in hold and mk.hold == hold and mk.fair_up == 0.0, (hold, mk.hold, mk.fair_up)
+    assert await touch_step(bot) == set(), bot.sim_trades()
+    hold, mk = touch_views(touch_bot(TOUCH_TRADER, "70500", "0.97", "0.98", TOUCH_LOW))
+    assert hold == "" and mk.hold == "" and mk.fair_up == 0.0, (hold, mk.hold)
+    # the Telegram edge alerts look at every priced card whatever SIM_MARKETS says (the defaults: 指数/个股日涨跌 alone): through the
+    # confirmation time nothing is announced on the held card (before: "🟢 新机会｜BTC 先触 70k/90k … 挂70k @ 1.0¢ … 也可以：吃70k
+    # @ 2.0¢"); on the open one the announcement comes as ever
+    for bid, ask, want in (("0.01", "0.02", []), ("0.10", "0.12", ["appear"])):
+        bot = touch_bot(TOUCH_ENV, "84000", bid, ask)
+        assert not bot.sim_in_scope(touch_views(bot)[1]) and bot.config.edge_alert
+        for at in (NOW, NOW + int(bot.config.edge_alert_confirm * 1000) + 1000):
+            bot.market.now, bot.edge_ran = at, -1e9
+            touch_set(bot, "84000", bid, ask, at)
+            await bot.edge_alerts(at)
+        kinds = [(st.get("alert") or {}).get("kind") for st in (bot.store.get("edgealerts", {}) or {}).values()]
+        assert [k for k in kinds if k] == want, (bid, ask, bot.store.get("edgealerts", {}))
+
+
+asyncio.run(touch_decided_hold())
+
 print("AUDIT_DECISION_OK")

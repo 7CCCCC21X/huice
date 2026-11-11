@@ -17677,6 +17677,31 @@ class Bot:
             return flip_book(book), ""
         return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
 
+    def touch_hold(self, touch: "TouchMarket", odds: "TouchOdds | str", book: PredictBook | None, now_ms: int) -> str:
+        """Why no trade is suggested on a first-touch market ("" = it may be): one answer for the web card (touch_payload)
+        and for SimMarket.hold (sim_markets: the paper and the real trader, the express lane, the edge alerts) — the
+        market's own reasons (advice_problem), or Predict's book (``book``, priced as "high barrier first": touch_book)
+        already trading the question as settled (book_decided) while the model's fair price is not there: still open by
+        its path check, or decided the other way. A stale book decides nothing here (nothing is suggested or bought on
+        one anyway).
+        1.150.0 (audit SIM-TOUCH-DECIDED-HOLD): the book_decided check stood in touch_payload alone, and sim_markets gave
+        the trader advice_problem by itself. A wick through a line that comes back inside within its own minute is not
+        seen by the path check until its next scan (peek skips the minute still forming: SCAN_SECONDS later, up to
+        SCAN_STALE_MS while the kline reads fail and pushed trades keep the price fresh). Through that window the card
+        said 定局 and held, while the trader — README: what the card holds back is never bought — took the side the book
+        offered at a cent or two because it had lost (300 shares on paper, a real order with LIVE on), rested bids on
+        it, and the Telegram alerts announced it as 新机会 whatever SIM_MARKETS said."""
+        if not isinstance(odds, TouchOdds):
+            return ""
+        hold = touch.advice_problem(now_ms)
+        if not hold and book is not None and not book.stale(now_ms):
+            decided = book_decided(book)
+            if (decided == "up" and odds.fair_upper < 0.9) or (decided == "down" and odds.fair_upper > 0.1):
+                low, high = touch.spec.label(touch.spec.low), touch.spec.label(touch.spec.high)
+                hold = (f"盘口已把 {high if decided == 'up' else low} 先触当作定局（{'买价 ≥90¢' if decided == 'up' else '卖价 ≤10¢'}），"
+                        "模型尚未核验到这次触线；待核验，暂不给建议")
+        return hold
+
     def touch_payload(self, touch: "TouchMarket", now_ms: int) -> dict:
         """Web card for a first-touch market: 涨 = the high barrier first, 跌 = the low one first."""
         spec = touch.spec
@@ -17686,12 +17711,7 @@ class Bot:
         out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
         book, why = self.touch_book(spec)
         odds = touch.odds(now_ms)
-        hold = touch.advice_problem(now_ms) if isinstance(odds, TouchOdds) else ""
-        if isinstance(odds, TouchOdds) and not hold and book is not None and not book.stale(now_ms):
-            decided = book_decided(book)
-            if (decided == "up" and odds.fair_upper < 0.9) or (decided == "down" and odds.fair_upper > 0.1):
-                hold = (f"盘口已把 {high if decided == 'up' else low} 先触当作定局（{'买价 ≥90¢' if decided == 'up' else '卖价 ≤10¢'}），"
-                        "模型尚未核验到这次触线；待核验，暂不给建议")
+        hold = self.touch_hold(touch, odds, book, now_ms)  # the very answer sim_markets hands the trader (SimMarket.hold)
         if book is not None:
             ok = isinstance(odds, TouchOdds)
             swing = touch.model_swing(now_ms) if ok else 0.0
@@ -18196,9 +18216,11 @@ class Bot:
             book, _ = self.touch_book(spec)
             if isinstance(odds, TouchOdds) and book is not None:
                 low, high = spec.label(spec.low), spec.label(spec.high)
+                # the hold is the card's, whole (touch_hold, 1.150.0): the market's own reasons and the book already trading
+                # the question as settled — advice_problem alone let the trader buy what the card was holding back
                 out.append(SimMarket(spec.slug, f"{spec.symbol.removesuffix('USDT')} 先触 {low}/{high}", "touch", spec.key,
                                      odds.fair_upper, book, self.edge_need(touch.model_swing(now_ms)),
-                                     touch.advice_problem(now_ms), (high, low), {"deadline": spec.deadline_ms},
+                                     self.touch_hold(touch, odds, book, now_ms), (high, low), {"deadline": spec.deadline_ms},
                                      self.evidence(lambda touch=touch: self.market_evidence("touch", now_ms, touch=touch))))
         for mkt in self.updowns.values():
             if only is not None and mkt.spec.key != only:
