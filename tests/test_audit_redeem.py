@@ -244,11 +244,8 @@ async def round_void():
     await bot.live.refresh_balance()
     fake.positions = down
     bot.live_last_redeem = stamp = time.monotonic()
-    try:
-        await bot.live_redeem_report(NOW)
-        assert False, "the check's read failed"
-    except m.RemoteError as error:
-        assert "HTTP 500" in str(error)
+    report = await bot.live_redeem_report(NOW)  # (RDM-CHECK-ABORT: the check answers with what it has; it used to raise here)
+    assert "结论：这次读不了持仓：HTTP 500" in report, report
     try:
         await bot.live_redeem(NOW)
         assert False, "/live redeem's read failed"
@@ -1675,6 +1672,108 @@ async def check_unreadies():
 
 
 asyncio.run(check_unreadies())
+
+
+# --- RDM-CHECK-ABORT ------------------------------------------------------------------------------------------------------------
+class Chat:
+    """Telegram as the bot sees it: every message kept as (chat, thread, text). A send whose text starts with one of ``refuse``
+    is refused once per listing (the RemoteError Telegram.send raises on a 429); ``down`` refuses every send."""
+    def __init__(self, refuse=(), down=False):
+        self.sent, self.tried, self.refuse, self.down = [], [], list(refuse), down
+
+    async def send(self, chat, thread, text, reply_markup=None, parse_mode=None):
+        self.tried.append((chat, thread, text))
+        hit = next((p for p in self.refuse if text.startswith(p)), None)
+        if self.down or hit is not None:
+            if hit is not None:
+                self.refuse.remove(hit)
+            raise m.RemoteError("Telegram: Too Many Requests: retry after 1", 1)
+        self.sent.append((chat, thread, text))
+
+
+ADMIN = 4242
+
+
+def dm(text):
+    """The administrator's private message ``text`` as Telegram delivers it."""
+    return {"message_id": 1, "date": int(time.time()), "chat": {"id": ADMIN, "type": "private"}, "from": {"id": ADMIN, "is_bot": False}, "text": text}
+
+
+async def in_background(bot, text):
+    """``text`` sent by the administrator while the bot's loops run (reference_tasks): the command's own background task and the
+    deliveries awaited — every text that reached the chat (bot.telegram, a Chat)."""
+    idle = asyncio.create_task(asyncio.sleep(3600))
+    bot.reference_tasks = [idle]
+    before = asyncio.all_tasks()
+    try:
+        await bot.process_message(dm(text))
+        for task in asyncio.all_tasks() - before:
+            if task.get_name().startswith("live-"):
+                await task
+        await bot.drain_deliveries()
+    finally:
+        idle.cancel()
+        bot.reference_tasks = []
+    return [t for _, _, t in bot.telegram.sent]
+
+
+async def check_abort():
+    """RDM-CHECK-ABORT: /live redeem check built its lines (the switches, the last round, the signer's BNB read on the chain)
+    and then ran the dry run with nothing round it: a positions read refused by the key's 20 s rate-limit cooldown (shared with
+    the pre-open mode's orders and cancels), a 5xx, or any failure inside the pass went out of the function, and the owner got
+    the one line 「/live redeem 失败：…」 — reading like a failed redeem, the ⛽ line that mattered thrown away. The check now
+    answers with what it has and why it could not look; nothing written, nothing announced, the lock released."""
+    bot = await ready_bot(ADMIN_USER_ID=str(ADMIN))
+    fake, chain = bot.live.api, bot.live.chain
+    chain.bnb = 10 ** 13  # 0.00001 BNB: under the 0.0005 floor (read on the chain: nothing asked of Predict)
+    last = {"at": NOW - 2 * MIN, "counts": {"claimable": 16, "open": 29, "unread": 3}, "low_gas": True, "error": ""}
+    bot.live_redeem_last = dict(last)
+    sent = notices(bot)
+    errors, failed, gas = list(bot.live_errors), dict(bot.live_redeem_failed), bot.live_gas_noted
+    plain = fake.positions
+
+    async def cooling():
+        raise m.RemoteError("Predict 接口限流冷却中（20 秒后重试）", 20)
+
+    async def down():
+        raise m.RemoteError("HTTP 500: Internal Server Error")
+
+    def broken(row):
+        return 1 // 0
+
+    cases = [(cooling, None, "这次读不了持仓：Predict 接口限流冷却中（20 秒后重试）。限流冷却过了再发一次 /live redeem check"),
+             (down, None, "这次读不了持仓：HTTP 500: Internal Server Error。稍后再发一次 /live redeem check；一直这样就把这条发我"),
+             (plain, broken, "这次查看持仓时出错：integer division or modulo by zero。稍后再发一次 /live redeem check")]
+    fake.positions_rows, fake.markets["500"] = [held(500)], mk(500, won=1)
+    for read, sort_key, why in cases:
+        fake.positions = read
+        if sort_key:
+            bot.position_time = sort_key  # (a failure inside the pass itself)
+        report = await bot.live_action("redeem", ["check"], NOW)  # (before: raised — the command answered 「/live redeem 失败：…」)
+        lines = report.split("\n")
+        assert lines[0].startswith("🔎 自动领取自检") and lines[1] == "开关：自动领取 开｜LIVE=on｜已就绪", report
+        assert "自动领取：开｜上一轮 2 分钟前：持仓 48 个：可领取 16，未结算 29，没读到市场 3；签名钱包 BNB 不足，领取交易发不出去" in report, report
+        assert f"签名钱包 {bot.live.wallet.signer}（付 gas）：BNB 0.00001｜⛽ 不足 0.0005，领取交易发不出去" in report, report
+        assert lines[-1].startswith("结论：" + why) and f"另外签名钱包的 BNB 不够付 gas，有可领取的也发不出领取交易：往 {bot.live.wallet.signer}" in lines[-1], lines[-1]
+        assert not bot.redeem_lock().locked() and "失败" not in lines[0]  # (the page reads a first line with 失败 as a failed action)
+        assert (bot.live_redeem_last, bot.live_errors, bot.live_redeem_failed, bot.live_gas_noted, sent) == (last, errors, failed, gas, []), "read-only"
+        bot.__dict__.pop("position_time", None)
+    # as the owner sends it, through Telegram: the placeholder, then the report — not 「/live redeem 失败：…」
+    fake.positions = down
+    bot.telegram = Chat()
+    texts = await in_background(bot, "/live redeem check")
+    assert len(texts) == 2 and texts[0] == "领取自检中，结果随后发来" and texts[1].startswith("🔎 自动领取自检"), texts
+    assert "结论：这次读不了持仓：HTTP 500: Internal Server Error" in texts[1] and "⛽ 不足 0.0005" in texts[1], texts
+    # unchanged: a real /live redeem that cannot read the list still says so; the list readable again: the whole report
+    bot.telegram = Chat()
+    assert await in_background(bot, "/live redeem") == ["领取中，结果随后发来", "/live redeem 失败：HTTP 500: Internal Server Error"]
+    fake.positions = plain
+    report = await bot.live_action("redeem", ["check"], NOW)
+    assert "持仓 1 个：可领取 1" in report and "结论：签名钱包的 BNB 不够付 gas" in report and "读不了持仓" not in report, report
+    print("RDM_CHECK_ABORT_OK")
+
+
+asyncio.run(check_abort())
 
 
 print("AUDIT_REDEEM_OK")

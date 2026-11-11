@@ -5006,9 +5006,28 @@ class LiveBot(core.Bot):
             if recent:
                 lines.append("最近的领取问题：\n" + "\n".join("  " + e for e in recent))
             return "\n".join(lines)
-        async with lock:
-            _, seen = await self.live_redeem_pass(now_ms, dry_run=True)
-            cut = int(getattr(self, "live_redeem_cut", 0) or 0)  # this dry run's own read (1.150.0): set by the pass, under the same lock
+        recent = [e for e in self.live_errors if "领取" in e or "⛽" in e][-3:]
+        try:
+            async with lock:
+                _, seen = await self.live_redeem_pass(now_ms, dry_run=True)
+                cut = int(getattr(self, "live_redeem_cut", 0) or 0)  # this dry run's own read (1.150.0): set by the pass, under the same lock
+        except Exception as error:
+            # 1.150.0 (audit RDM-CHECK-ABORT): a dry run that raised — the positions list not readable (the key's 20 s rate-limit
+            # cooldown, which the pre-open mode's orders and cancels share; a 5xx; a timeout), or any failure inside the pass — went
+            # out of this function, and the check answered one line, 「/live redeem 失败：…」: the switches, the last round and the
+            # signer's BNB gathered above (⛽ 不足 is read on the chain, nothing asked of Predict) were thrown away, and the line read
+            # like a failed redeem, though the check sends nothing. It answers now with what it has and why it could not look.
+            # Read-only as ever: nothing written, nothing announced; the lock is released before this (the try is outside it).
+            text = core.clean_error(error) or type(error).__name__
+            limited = bool(getattr(error, "retry_after", 0) or http_status(error) == 429)
+            why = (f"这次读不了持仓：{text}。" if isinstance(error, RedeemUnread) else f"这次查看持仓时出错：{text}。") + (
+                "限流冷却过了再发一次 /live redeem check" if limited else "稍后再发一次 /live redeem check；一直这样就把这条发我")
+            if bnb is not None and bnb < self.LIVE_REDEEM_MIN_BNB_WEI:
+                why += f"。另外签名钱包的 BNB 不够付 gas，有可领取的也发不出领取交易：往 {wallet.signer} 转一点 BNB（BNB 链，比如 0.005）"
+            lines.append("结论：" + why)
+            if recent:
+                lines.append("最近的领取问题：\n" + "\n".join("  " + e for e in recent))
+            return "\n".join(lines)
         n = lambda kind: sum(1 for s in seen if s["kind"] == kind)
         value = sum(float(s.get("value") or 0) for s in seen if s["kind"] == "claimable")
         lines.append(f"持仓 {len(seen)} 个：" + ("，".join(f"{label} {n(k)}" for k, label in self.REDEEM_KINDS.items() if n(k)) or "没有")
@@ -5084,7 +5103,6 @@ class LiveBot(core.Bot):
             head = f"持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查：后面可能还有赢的没领，先到 Predict 网站核对、手动领取"
             why = head + ("；读到的这部分里没有可领取的" if "赢的都领完了" in why else "；" + why)
         lines.append("结论：" + why)
-        recent = [e for e in self.live_errors if "领取" in e or "⛽" in e][-3:]
         if recent:
             lines.append("最近的领取问题：\n" + "\n".join("  " + e for e in recent))
         return "\n".join(lines)
