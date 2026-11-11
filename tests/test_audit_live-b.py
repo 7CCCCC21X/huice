@@ -416,8 +416,14 @@ async def live_pnl_display():
     assert "HTTP 400 a & <b>" in text, [l for l in text.split("\n") if "HTTP 400" in l]
     out = m.to_html(text)  # what Bot.tell sends for the Reply(html=True)
     assert "HTTP 400 a &amp; &lt;b&gt;" in out and "&amp;amp;" not in out and "&amp;lt;" not in out, [l for l in out.split("\n") if "HTTP 400" in l]
-    # a pre-open mode that is not running (crashed: alive False) does not count: the line keeps its old shape, no split
+    # a pre-open mode that is not running (crashed: alive False): its day's realised LOSS still counts against the stop (audit
+    # PRE-PNL-DROP — it counted 0 before, which is what this test first pinned), so the line still shows the sum and the split...
     bot.preopen.alive = False
+    text = bot.live_text(NOW)
+    assert "今日已结算盈亏 −$55.00（原策略 −$15.00 + 预挂 −$40.00）（上限 −$50）" in text, [l for l in text.split("\n") if "今日已结算盈亏" in l]
+    assert bot.live_status(NOW)["day_pnl"] == -55.0
+    # ...while a stopped mode's GAIN counts 0 (it never loosens the stop): the line keeps its plain shape, no split
+    bot.preopen.daily_pnl = lambda: 40.0
     text = bot.live_text(NOW)
     assert "今日已结算盈亏 −$15.00（上限 −$50）" in text and "原策略" not in text, [l for l in text.split("\n") if "今日已结算盈亏" in l]
     assert bot.live_status(NOW)["day_pnl"] == -15.0

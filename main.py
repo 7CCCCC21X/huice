@@ -838,7 +838,7 @@ class Config:
     # Real trading (live.py): LIVE=on sends every paper-trading decision to Predict as a real order.
     live: bool = False                 # LIVE=on or LIVE=pause: the real-trading module runs (live_mode says whether it opens positions)
     live_mode: str = "off"             # off | pause (wallet, sign-in, checks, the order test and cancels work; no new positions) | on
-    live_allowed: bool = True          # LIVE_TRADING_ALLOWED: the deployment's hard switch; off caps the mode at pause whatever the database saved
+    live_allowed: bool = True          # LIVE_TRADING_ALLOWED: the deployment's hard switch; anything but on/1/true/yes (unset = on) caps the mode at pause whatever the database saved
     live_key: str = field(default="", repr=False)  # PREDICT_PRIVATE_KEY: the signing wallet's private key (never logged)
     live_account: str = ""             # PREDICT_ACCOUNT: the Predict account (smart wallet / deposit address) the key controls; "" = the key's own address
     live_chain: int = 56               # PREDICT_CHAIN_ID: 56 = BNB mainnet, 97 = BNB testnet
@@ -894,7 +894,18 @@ class Config:
         live_mode = {"on": "on", "1": "on", "true": "on", "yes": "on", "pause": "pause", "paused": "pause", "test": "pause"}.get(
             e.get("LIVE", "off").strip().lower(), "off")
         live = live_mode != "off"
-        live_allowed = not off(e.get("LIVE_TRADING_ALLOWED", "on"))
+        # 1.150.0 (audit CTRL-LIVE-ALLOWED-FAILOPEN): the hard switch fails closed. It was read like the ordinary default-on
+        # switches (`not off(...)`): only off / 0 / false / no stopped real orders and every other value allowed them, so a
+        # stop typed as 关, 关闭, disabled, pause, stop, "of", a quoted "off", `off # why` or an emptied value left LIVE=on
+        # sending real orders — the mode shown as on, no 硬开关 line on /live or the page. It is the emergency stop (README:
+        # 紧急停止用它), typed by hand on the deployment in a hurry, and LIVE itself already reads an unknown word as off. Now
+        # only the variable left unset, or on / 1 / true / yes, allows real orders; anything else (set but empty too) caps
+        # the mode at pause exactly as off does. A word meant as "allowed" that is none of those costs a pause which /live,
+        # the page and the start-up notice put down to this switch (/live mode on answers how to lift it: 改成 on), never
+        # real orders the operator believed stopped. Not a ValueError: a crash loop at start-up would leave the resting
+        # orders and the pre-open quotes on the book with nobody watching, while pause keeps the sign-in, the cancels, the
+        # redeeming and the pre-open withdrawal at work.
+        live_allowed = str(e.get("LIVE_TRADING_ALLOWED", "on")).strip().lower() in {"on", "1", "true", "yes"}
         if live_mode == "on" and not live_allowed:
             live_mode = "pause"  # the hard switch: nothing the database saved can turn real orders on past it
         live_key, live_account = e.get("PREDICT_PRIVATE_KEY", "").strip(), e.get("PREDICT_ACCOUNT", "").strip()
@@ -1332,21 +1343,28 @@ HTTP_STATS = {"new": 0, "reused": 0, "retried": 0}  # connections opened / reuse
 
 
 def _pool_take(host: str, port: int, timeout: float, max_idle: float) -> tuple[Any, bool]:
-    """The most recently used pooled connection to host:port, when used within ``max_idle`` seconds (the older ones are
-    dropped with it: they are older still), else a new one. (connection, whether it came from the pool)."""
+    """The most recently used pooled connection to host:port, when used within ``max_idle`` seconds, else a new one.
+    On a miss only the pooled connections idle longer than KEEPALIVE_IDLE_SECONDS are dropped: the others stay for the
+    GETs. (connection, whether it came from the pool)."""
     with _POOL_LOCK:
-        rows = _POOL.get((host, port)) or []
-        while rows:
-            conn, last = rows.pop()
-            if time.monotonic() - last <= max_idle:
-                HTTP_STATS["reused"] += 1
-                if getattr(conn, "sock", None) is not None:
-                    conn.sock.settimeout(timeout)
-                return conn, True
-            conn.close()
-            for old, _ in rows:
-                old.close()
-            rows.clear()
+        rows = _POOL.get((host, port))
+        now = time.monotonic()
+        if rows and now - rows[-1][1] <= max_idle:
+            conn, _ = rows.pop()
+            HTTP_STATS["reused"] += 1
+            if getattr(conn, "sock", None) is not None:
+                conn.sock.settimeout(timeout)
+            return conn, True
+        # 1.150.0: a miss under the stricter POST limit (3 s: an order or a cancel to api.predict.fun, a Hyperliquid
+        # info read) used to close every pooled connection of the host, "they are older still". That holds only under
+        # the GET limit: connections idle 3-25 s are still good for a GET, and the next Predict book round had to open
+        # up to KEEPALIVE_PER_HOST of them anew (0.4-0.8 s each to a far host). The POST still gets a fresh connection;
+        # only those past the GET limit are dropped (rows stay oldest first: _pool_put appends).
+        if rows:
+            for old, last in rows:
+                if now - last > KEEPALIVE_IDLE_SECONDS:
+                    old.close()
+            rows[:] = [(old, last) for old, last in rows if now - last <= KEEPALIVE_IDLE_SECONDS]
         HTTP_STATS["new"] += 1
     return HTTPS_CONNECTION(host, port, timeout=timeout, context=SSL_CONTEXT), False
 
@@ -1576,15 +1594,21 @@ class SourceHealth:
                         # behind for an hour; a recovered preferred feed is back as soon as any request to it succeeds
 
     NAMES = {"eastmoney": "东方财富", "sina": "新浪", "tencent": "腾讯", "yahoo": "Yahoo", "naver": "Naver", "etnet": "etnet"}  # SOURCES_OFF token -> the name in /diag
+    # 1.150.0 (audit CTRL-SOURCES-OFF): the host-name parts a token stands for besides its own word. Tencent's quotes come
+    # from qt.gtimg.cn and web.ifzq.gtimg.cn (gu.qq.com is only their Referer), so the word "tencent" is in no host the
+    # bot asks: SOURCES_OFF=tencent was accepted, /diag stopped probing 腾讯 (it filters by name) and /speed went on timing
+    # it, while every round still asked Tencent first — the Composite, the stocks' live batch, the daily bars, the σ bars
+    HOSTS = {"tencent": ("gtimg.cn", "qq.com")}
 
     def __init__(self) -> None:
         self.hosts: dict[str, list] = {}  # host -> [consecutive failures, cool until (monotonic), last error]
         self.off: frozenset = frozenset()  # SOURCES_OFF: tokens of the hosts never asked (Bot.apply_config keeps it current)
 
     def disabled(self, url: str) -> bool:
-        """Whether SOURCES_OFF names this URL's host (a token is part of the host name: eastmoney, sina, tencent…)."""
+        """Whether SOURCES_OFF names this URL's host: the token is part of the host name (eastmoney, sina, yahoo, naver,
+        etnet), or one of the parts HOSTS lists for it is (tencent: gtimg.cn, qq.com)."""
         host = self.host(url).lower()
-        return any(token in host for token in self.off)
+        return any(part in host for token in self.off for part in (token, *self.HOSTS.get(token, ())))
 
     def enabled(self, sources: Any) -> list:
         """``sources`` ((name, url, ...) tuples) without the ones switched off, in the order given."""
@@ -1622,9 +1646,11 @@ class SourceHealth:
         return sorted(self.enabled(sources), key=rank)
 
     def lines(self) -> list[str]:
+        """/diag's list of the hosts moved to the back. Not a host switched off since it last failed: it is no longer
+        "tried when nothing else answers", and its cooldown (up to an hour) would keep it listed as if it were."""
         now = time.monotonic()
         return [f"  ⏸️ {host}：连续失败 {n} 次，排到最后还剩 {int(until - now)} 秒｜{brief_error(error, 60)}"
-                for host, (n, until, error) in sorted(self.hosts.items()) if until > now]
+                for host, (n, until, error) in sorted(self.hosts.items()) if until > now and not self.disabled(host)]
 
 
 SOURCE_HEALTH = SourceHealth()
@@ -1632,7 +1658,22 @@ SOURCE_HEALTH = SourceHealth()
 
 async def fetch_source(url: str, extra: dict[str, str] | None = None, record: bool = True) -> bytes:
     """GET one quote-feed URL with a browser UA and the short feed timeout, recording the host's health
-    (``record=False`` for a diagnostic probe, which must not reorder the sources the live refresh uses)."""
+    (``record=False`` for a diagnostic probe, which must not reorder the sources the live refresh uses).
+    A host SOURCES_OFF names is never asked, by a refresh or by a probe: the call fails like a source that did not
+    answer, and the host's health is left as it was."""
+    if SOURCE_HEALTH.disabled(url):
+        # 1.150.0 (audit CTRL-SOURCES-OFF): the switch is kept here, where every request to a quote source passes. Until
+        # now only the callers that list their sources through SOURCE_HEALTH.order / enabled kept it. The ones that name
+        # a URL themselves went on asking a host the operator had switched off (README: 永不询问): the index daily closes
+        # (DailyCloses, KospiIndex.refresh_daily), the index σ bars, the KRX close check (krx_official), the anchors'
+        # 5-minute bars (cfd_bar_at, a50_sina_five_minute_at) and the US stocks' Yahoo chart. With the deployment's
+        # SOURCES_OFF=eastmoney that was the HSI daily close whenever Tencent failed, or answered without the day's bar
+        # after the close, and the HSI σ bars when Tencent and Yahoo both failed: a request refused, or left to time out
+        # (SOURCE_TIMEOUT) inside the HSI round, and the host listed in /diag as failing. Every one of those callers
+        # already takes a failed request as "this source has nothing" — the next source, the data in hand, or a pause —
+        # so a switched-off one is passed over the same way. Not recorded: it is no failure of the host (/diag would
+        # list it as cooling), and nothing was learnt that should clear one either.
+        raise RemoteError("SOURCES_OFF 已关闭此源")
     try:
         raw = await http_get(url, timeout=SOURCE_TIMEOUT, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **(extra or {})})
     except (RemoteError, TimeoutError, OSError) as error:
@@ -1656,7 +1697,13 @@ async def pick_quote(sources: Any, parse: Any, problem: Any) -> tuple[Any, list[
         except Exception as error:
             notes.append(f"{name}: {clean_error(error) or type(error).__name__}")
             continue
-        why = problem(quote)
+        try:
+            why = problem(quote)
+        except Exception as error:
+            # 1.149.x: a check that cannot run (e.g. a field it divides by came as 0) must not abort the whole round:
+            # the later sources were never asked and the caller kept its old quote. The answer is passed over like a
+            # stale one (why is non-empty, so it is never returned as current) and the next source is tried.
+            why = f"无法校验：{clean_error(error) or type(error).__name__}"
         if not why:
             return quote, notes, ""
         notes.append(f"{name}: {why}")
@@ -1842,7 +1889,7 @@ class Binance:
     def __init__(self, config: Config):
         self.config = config
         self.cached: dict[str, Baseline] = {}
-        self.at_cache: dict[tuple[str, int], tuple[D, str]] = {}
+        self.at_cache: dict[tuple[str, int, tuple[str, ...]], tuple[D, str]] = {}  # (symbol, instant, kinds asked) -> price_at's answer
         self.offset_ms = 0
         self.clock_checked = 0.0
         self.blocked_until = 0.0
@@ -1901,17 +1948,22 @@ class Binance:
             self.stream.seed(rows)
         return rows
 
-    async def price_at(self, symbol: str, at_ms: int) -> tuple[D, str]:
+    async def price_at(self, symbol: str, at_ms: int, kinds: tuple[str, ...] = ("成交价", "标记价")) -> tuple[D, str]:
         """The contract price at the instant ``at_ms``: close of the 1-minute candle ending then.
 
         Thin contracts may have no trade in that minute, so the mark-price candle is the fallback.
         Returns (price, "成交价" | "标记价"). Cached per symbol and instant.
+        1.150.0 (audit FEED-MARK-VS-LAST): ``kinds`` narrows the candles asked — ("标记价",) is Binance's mark price at
+        that instant whether the minute traded or not: what a quote that stands on the mark is compared with
+        (Bot.contract_anchor). Each kind asked of an instant is cached beside the others.
         """
-        key = (symbol, at_ms)
+        key = (symbol, at_ms, tuple(kinds))
         if key in self.at_cache:
             return self.at_cache[key]
         start = at_ms - 60_000
         for path, kind in (("/fapi/v1/klines", "成交价"), ("/fapi/v1/markPriceKlines", "标记价")):
+            if kind not in kinds:
+                continue
             rows = await self.get(path, symbol=symbol, interval="1m", startTime=start, endTime=at_ms - 1, limit=1)
             if not isinstance(rows, list) or not rows or not isinstance(rows[0], list) or len(rows[0]) < 6:
                 continue
@@ -1922,7 +1974,7 @@ class Binance:
                 result = number(row[4], "币安收盘时刻价格"), kind
             except (ValueError, TypeError, decimal.InvalidOperation):
                 continue
-            self.at_cache = {k: v for k, v in self.at_cache.items() if k[0] != symbol}  # one instant per symbol
+            self.at_cache = {k: v for k, v in self.at_cache.items() if k[0] != symbol or k[1] == at_ms}  # one instant per symbol
             self.at_cache[key] = result
             return result
         raise ValueError(f"币安没有 {stamp(at_ms, seconds=False)}（北京时间）那一分钟的 K 线")
@@ -2876,11 +2928,13 @@ class IndexFutures:
         self.spot_at = -1e9      # monotonic time of the last good cash-index read
         self.spot_error = ""
         self.seen: dict[tuple, tuple[tuple, int]] = {}  # untimed source -> (values, when first seen unchanged)
+        self.unmoved: set[tuple] = set()                  # untimed sources still showing the values of the bot's first read of them (futures_hold)
         self.still = Stillness()                          # when the cash index last changed, by source (closure_problem)
         self.dated_close: Any = lambda day: None         # dated daily closes, plugged in by the Bot
 
     SPOT_KEEP_SECONDS = 5 * 60
     LUNCH = (dt.time(12, 0), dt.time(13, 0))  # cash and futures day sessions both pause 12:00–13:00
+    CLOSE_RANDOM_MS = 2 * 60_000  # the closing auction fixes the close at a random moment of its last two minutes (16:08–16:10; 12:08–12:10 on a half day)
 
     @staticmethod
     def parse_futures(source: str, raw: bytes, now_ms: int, holidays: frozenset = frozenset()) -> FuturesQuote:
@@ -2933,14 +2987,33 @@ class IndexFutures:
 
     def futures_problem(self, q: FuturesQuote, now_ms: int) -> str:
         """Why q cannot stand for the futures now ("" when it can): while a session trades it must have moved within
-        10 minutes (the lunch break aside); while the market is shut it must come from the session that ended last."""
+        10 minutes (the lunch break aside); while the market is shut it must come from the session that ended last.
+        (A quote that stands may still be too still for the after-hours card to suggest anything from: futures_hold.)"""
         live = hk_futures_session(now_ms, self.holidays) in ("日市", "夜市")
         last_end = max(hk_session_end("日市", now_ms, self.holidays), hk_session_end("夜市", now_ms, self.holidays))
-        return quote_problem(q.quoted_ms, now_ms, live, last_end, self.LUNCH)
+        why = quote_problem(q.quoted_ms, now_ms, live, last_end, self.LUNCH)
+        if (not why and not live and not self.cash_open(now_ms) and q.source == "etnet"
+                and q.spot is not None and q.spot_source == q.source):
+            # 1.149.x (audit FEED-ETNET-CLOSED-BLOCK): etnet prints no time, and parse_etnet_futures dates the block
+            # of a finished session from the calendar (hk_session_end), not from the page — so while the market is
+            # shut a page left on ANY older session (e.g. Friday's, read on Tuesday 08:00) would pass as "the
+            # session that ended last" and the after-hours card would be priced from that old futures price against
+            # the latest 16:10 anchor. The page's own cash index tells its day: its 前收市 must be the dated close
+            # before the latest cash close (spot_problem's closed-market branch; it passes while that close is
+            # unknown). A refused etnet page only falls through to Eastmoney / the CFD.
+            # (as_close=False: only the page's day is asked here. Whether its cash figure can stand for that day's
+            # close — 1.150.0, FEED-HSI-SPOT-AFTER-CLOSE — is the reference's matter and leaves the futures block as it was.)
+            spot_why = self.spot_problem(q, now_ms, as_close=False)
+            if spot_why:
+                why = f"etnet 页面不是最近交易日的（{spot_why}）"
+        return why
 
-    def spot_problem(self, q: FuturesQuote, now_ms: int) -> str:
+    def spot_problem(self, q: FuturesQuote, now_ms: int, as_close: bool = True) -> str:
         """Why q's cash index cannot be used now ("" when it can). During the cash session it must be today's and
         have printed within index_stale_ms (3 minutes in continuous trading, 10 in the closing auction; lunch aside).
+        After the cash close, until that day's dated close is known, the figure stands for the close itself: it must
+        have printed in the closing auction's random end or later (``as_close=False`` leaves this one check out, for
+        futures_problem, which only asks which day the page is).
         Its previous close must be the dated close of the session before (when that is known): otherwise the figure
         belongs to another day, e.g. yesterday's page."""
         if q.spot is None:
@@ -2959,11 +3032,41 @@ class IndexFutures:
                 return f"恒指现货停在 {stamp(when, seconds=False)}，已超 {limit // 60_000} 分钟未更新"
         else:
             day = hk_cash_close_date(now_ms, self.holidays)
+            if as_close and self.dated_close(day) is None:
+                # 1.150.0 (audit FEED-HSI-SPOT-AFTER-CLOSE): until that day's dated bar is in (it counts from 16:25, when
+                # its sources answer), this figure IS the day's close: hsi_odds' reference — which every trade opened on
+                # the next session's market keeps as its settlement line, never corrected locally — and the provisional
+                # outcome the day's own trades are pre-settled on (record_predictions; with LIVE on that pre-settlement
+                # counts towards the daily-loss stop). The time checks above end with the session, so after 16:10 any
+                # figure of the day passed for the close: etnet's own index, standing since 16:00 through the auction,
+                # took the place of the timed feeds' close at the 16:10 refresh (below, a newer timed figure is kept
+                # only while the session runs); an index block stuck since 15:50, or Tencent's 15-minute-delayed feed,
+                # stayed for as long as the bar was out. The fair price was unharmed (a ratio); the line and the
+                # outcome were off by the auction's move, or by the whole stall. The close is fixed at the auction's
+                # random end, so a figure printed before that window is not the close, whatever the clock says now —
+                # what the KOSPI, Composite and stock closes already ask (kospi_odds, sse_close, note_live_close).
+                # Refused, the card says what it waits for and refresh() asks the timed feeds afresh every round;
+                # nothing changes in session, nor once the dated bar is in. (etnet's own index prints no time and is
+                # dated by its first sighting — dated(): a page first read after the close, on a restart, passes as
+                # before, whatever its age, until the dated bar settles it.)
+                fixed_from = (int(dt.datetime.combine(day, CALENDAR.close_time("hk", day), BEIJING).timestamp() * 1000)
+                              - self.CLOSE_RANDOM_MS)
+                if q.spot_time <= 0:
+                    return f"恒指收盘价待确认（现货报价时间未知，{day:%m-%d} 日 K 未出）"
+                if q.spot_time < fixed_from:
+                    return (f"恒指收盘价待确认（现货报价停在 {stamp(q.spot_time, seconds=False)}，早于 "
+                            f"{stamp(fixed_from, seconds=False)} 起的随机收市，日 K 未出）")
         before = hk_previous_day(day, self.holidays)
         expected = self.dated_close(before)
-        if expected is not None and q.spot_prev is not None and abs(percent(q.spot_prev, expected)) > D("0.005"):
-            return (f"恒指现货的前收 {fmt(q.spot_prev)} 不是 {before:%m-%d} 收盘 {fmt(expected)}，"
-                    f"不是 {day:%m-%d} 的行情")
+        if expected is not None and q.spot_prev is not None:
+            if q.spot_prev <= 0:
+                # 1.149.x: a 前收 of 0 (an empty field, which _opt keeps as 0) cannot show which day the figure is.
+                # Refuse it rather than skip the check (skipping would let another day's page through); percent()
+                # would raise on it and abort the refresh round and every caller of spot_problem (hsi_odds).
+                return f"恒指现货的前收为 0，无法确认是 {day:%m-%d} 的行情"
+            if abs(percent(q.spot_prev, expected)) > D("0.005"):
+                return (f"恒指现货的前收 {fmt(q.spot_prev)} 不是 {before:%m-%d} 收盘 {fmt(expected)}，"
+                        f"不是 {day:%m-%d} 的行情")
         return ""
 
     def spot_still(self, q: FuturesQuote, now_ms: int) -> str:
@@ -2982,6 +3085,13 @@ class IndexFutures:
         old = self.seen.get(key)
         if old is not None and old[0] == values:
             return old[1]
+        # 1.150.0 (audit FEED-HSI-FUTURES-STALE): only a change between two reads shows the page moving. The bot's first
+        # read shows nothing of the kind — a page frozen for an hour reads exactly like a live one — so its key is kept
+        # apart until its values change (futures_hold)
+        if old is None:
+            self.unmoved.add(key)
+        else:
+            self.unmoved.discard(key)
         self.seen[key] = (values, fetched_ms)
         return fetched_ms
 
@@ -2994,6 +3104,38 @@ class IndexFutures:
         if q.spot is not None and q.spot_source == q.source and not q.spot_ms:
             changes["spot_ms"] = self.observed(("spot", q.source), (q.spot, q.spot_prev), now_ms)
         return dataclasses.replace(q, **changes) if changes else q
+
+    def futures_hold(self, q: FuturesQuote, now_ms: int) -> str:
+        """Why q, though it stands for the futures by futures_problem, gives no suggestion on the after-hours card now
+        ("" when it may).
+
+        1.150.0 (audit FEED-HSI-FUTURES-STALE): after the cash close the futures alone move the HSI card's fair price
+        (about 3¢ per 0.1% near the money, against a 10¢ taker bar), and while a session trades futures_problem lets a
+        quote stand for ten minutes without a change — LIVE_STALE_MS, a single stock's allowance; the cash index feeds
+        were cut to three minutes in 1.75.0 for this very failure, the futures were not. etnet's running block prints
+        no time and is dated by when its values were first seen (observed). So a page that froze went on pricing the
+        card for ten minutes with nothing said, and a page already frozen when the bot started was dated "now", however
+        old it was, and did the same — the very thing that dating is there to prevent (a frozen page ages; it is not
+        "just now" at every look). On both the default after-hours taker bought.
+        So while a futures session trades (the lunch break aside) nothing is suggested from q — the estimate stays on
+        the card with the reason and the trader opens nothing (CloseOdds.warn → SimMarket.hold), as with an approximate
+        anchor — when
+        - q is an untimed block still showing what the bot's first read of it showed: nothing tells its age yet (a
+          live page changes within seconds); or
+        - q has not changed for INDEX_STALE_MS: the futures print every few seconds in both sessions, so three minutes
+          without a change is a stuck page or record (or a halted market), not a quiet one.
+        Only the suggestions are held: which source is used, what the card shows, futures_problem's ten minutes
+        (through a short etnet outage its last quote still keeps the card and its exact anchor; the sources behind a
+        still page are asked once it is turned down, as before) and the 16:10 anchor are as they were. A finished
+        session's block is dated from the calendar (parse_etnet_futures) and is not judged here: nothing is held while
+        the market is shut."""
+        if hk_futures_session(now_ms, self.holidays) not in ("日市", "夜市"):
+            return ""
+        key = ("futures", q.source)
+        if key in self.unmoved and self.seen[key][1] == q.quoted_ms:
+            return f"恒指期货 {q.source} 页面启动后尚未见变动，报价时间无法确认"
+        why = quote_problem(q.quoted_ms, now_ms, True, 0, self.LUNCH, INDEX_STALE_MS)
+        return f"恒指期货{why}" if why else ""
 
     def cash_close_due(self, now_ms: int) -> bool:
         """The first refresh after the 16:10 cash close is not left to the 60-second cadence: the futures price at
@@ -3104,6 +3246,9 @@ class IndexFutures:
         if (self.cash_open(now_ms) and prev is not None and prev.spot is not None and prev.spot_source != quote.source
                 and prev.spot_time > (quote.spot_time if quote.spot is not None else 0)):
             # the 3-second cash index is newer than the one on the futures page: keep it
+            # (while the session runs only: after the close refresh_spot reads the timed feeds no more, so a figure kept
+            # here would never be looked at again. A page figure from before the close's random end is refused by
+            # spot_problem below instead — 1.150.0, FEED-HSI-SPOT-AFTER-CLOSE — and the timed feeds are asked afresh.)
             quote = dataclasses.replace(quote, spot=prev.spot, spot_prev=prev.spot_prev, spot_source=prev.spot_source,
                                         spot_ms=prev.spot_time, water=None)
         why = self.spot_problem(quote, now_ms)
@@ -5012,9 +5157,18 @@ class VolBook:
             sigma = math.sqrt((n * own ** 2 + ALT_TODAY_WEIGHT * sigma ** 2) / (n + ALT_TODAY_WEIGHT))
         return sigma, n
 
-    def get(self, key: str, prior_key: str, intraday: bool = False) -> tuple[float, str]:
+    def factor(self, key: str, mode: str) -> float:
+        """The SIGMA_CALIB factor get puts on key's σ in this mode (盘中 / 盘后): the measured one, or 1 while no day stands
+        behind it or it is within 0.005 of 1. 1.150.0: one rule for get and record_predictions — a snapshot divides out the
+        factor its σ really carried, not a stored one get skipped."""
+        factor, days = self.calib.get((key, mode), (1.0, 0))
+        return factor if days and abs(factor - 1) > 0.005 else 1.0
+
+    def get(self, key: str, prior_key: str, intraday: bool = False, calibrated: bool = True) -> tuple[float, str]:
         """Daily close-to-close σ. intraday=True: only the in-session part (today's opening gap has happened) — the
-        share the bars show, or until they do the prior share (INTRADAY_SHARE_PRIOR), never the whole day's."""
+        share the bars show, or until they do the prior share (INTRADAY_SHARE_PRIOR), never the whole day's.
+        calibrated=False: without SIGMA_CALIB's factor — the day σ the closes give, which the move a day has already made
+        is measured against (big_move_widen, 1.150.0)."""
         if key in self.overrides:
             sigma, note = self.overrides[key], "PROB_VOL 手动设定"
         else:
@@ -5027,11 +5181,12 @@ class VolBook:
             else:
                 sigma = math.sqrt((n * est ** 2 + PRIOR_WEIGHT * prior ** 2) / (n + PRIOR_WEIGHT))
                 note = f"{source} {n} 日 {est * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
-        factor, days = self.calib.get((key, "盘中" if intraday else "盘后"), (1.0, 0))
+        mode = "盘中" if intraday else "盘后"
+        factor = self.factor(key, mode) if calibrated else 1.0
         calib_note = ""
-        if days and abs(factor - 1) > 0.005:  # SIGMA_CALIB (1.106.1): the snapshots' residuals said σ was off by this much
+        if factor != 1.0:  # SIGMA_CALIB (1.106.1): the snapshots' residuals said σ was off by this much
             sigma *= factor
-            calib_note = f"；按 {days} 日快照残差校准 ×{factor:.2f}"
+            calib_note = f"；按 {self.calib[(key, mode)][1]} 日快照残差校准 ×{factor:.2f}"
         note += calib_note
         body = self.bodies.get(key)
         if intraday and key not in self.overrides and body is not None:
@@ -5041,7 +5196,7 @@ class VolBook:
             # 盘中 residuals ran 1.59 while its day σ looked right)
             prior_in = PRIOR_VOL[prior_key] * math.sqrt(INTRADAY_SHARE_PRIOR.get(prior_key) or INTRADAY_SHARE_BOUNDS[1])
             sigma_in = math.sqrt((body[1] * body[0] ** 2 + PRIOR_WEIGHT * prior_in ** 2) / (body[1] + PRIOR_WEIGHT))
-            if days and abs(factor - 1) > 0.005:
+            if factor != 1.0:
                 sigma_in *= factor
             return sigma_in, (f"{self.estimates.get(key, (0.0, 0, ''))[2] or '日K'} {body[1]} 日开盘到收盘 {body[0] * 100:.2f}% 与盘中先验 "
                               f"{prior_in * 100:.2f}% 加权（盘中直接估，不按份额扣跳空）{calib_note}")
@@ -5091,6 +5246,7 @@ async def predict_blocking(fn: Any, *args: Any) -> Any:
     return await asyncio.get_running_loop().run_in_executor(predict_pool(), fn, *args)
 PREDICT_BACKOFF_SECONDS = 20    # after a 429 without retry_after: how long every Predict request waits
 PREDICT_META_SECONDS = 600     # outcome names / status of a ladder market are re-read this often
+PREDICT_META_KEEP_SECONDS = 86400  # FEED-CACHE-GROWTH: a market no card follows any more loses its details/fee after a day untouched
 PREDICT_REWARD_SECONDS = 60    # price-ladder reward metadata is refreshed every minute
 PREDICT_REWARD_STALE_SECONDS = 120  # allows the normal refresh to finish across a 60-second alert confirmation
 PREDICT_POINTS_STALE_SECONDS = 3 * PREDICT_META_SECONDS  # other markets' points (read with the fee) are shown this long
@@ -5237,6 +5393,14 @@ class PredictBook:
     asks: tuple[tuple[D, D], ...]
     fetched_ms: int
     fee_bps: int | None = None  # the market's own taker fee rate (feeRateBps); None = not stated
+    # 1.150.0 (audit FEED-FETCHED-MS): when the levels were taken — a REST read's request time (Predict reads them somewhere
+    # between the request and its landing), a changed push's arrival; 0 = fetched_ms (a book built without it). fetched_ms
+    # is when the bot last knew the book current: a REST answer's landing, restarted by every unchanged re-send and
+    # heartbeat (PredictStream.refresh_age, touch). That is right for its age (stale, the 盘口断流 withdrawal, the page) and
+    # wrong for "was our order on it yet": levels taken before Predict answered an order (or confirmed its cancel) but
+    # stamped after it had our 100 taken out of a level that did not hold them — a brand-new real order withdrawn as
+    # "买1 不足" — or the cancelled order's ghost counted as somebody's 买1 (book_content_ms)
+    content_ms: int = 0
 
     @property
     def bid(self) -> tuple[D, D] | None:
@@ -5250,10 +5414,45 @@ class PredictBook:
         return now_ms - self.fetched_ms > PREDICT_STALE_MS
 
 
+def book_content_ms(book: Any) -> int:
+    """When ``book``'s levels were taken (PredictBook.content_ms; its fetched_ms when it carries none): what the events of
+    our own orders — Predict's answer, a cancel's confirmation — are compared with (own_on_book, own_unsure,
+    Bot.sim_own_resting), never the book's age."""
+    return int(getattr(book, "content_ms", 0) or getattr(book, "fetched_ms", 0) or 0)
+
+
+def book_restarted(book: "PredictBook", now_ms: int) -> "PredictBook":
+    """``book`` known current at ``now_ms`` (the same levels pushed again, the heartbeat: PredictStream.refresh_age,
+    touch): its age restarts, the time its levels were taken stays (FEED-FETCHED-MS) — pinned here, so that a book built
+    without a content_ms does not take the new stamp for it."""
+    return dataclasses.replace(book, fetched_ms=now_ms, content_ms=book_content_ms(book))
+
+
 def flip_book(book: "PredictBook") -> "PredictBook":
     """The complementary outcome's book: its bids are 1 − the asks, its asks 1 − the bids."""
     flip = lambda rows: tuple((D(1) - p, q) for p, q in rows)
     return dataclasses.replace(book, bids=flip(book.asks), asks=flip(book.bids))
+
+
+# The names an outcome is read as 涨 / Yes or 跌 / No by: the real trader's own (live.UP_WORDS / DOWN_WORDS, by which it
+# picks the token an order buys) — the two pairs are kept equal (tests/test_audit_feeds.py), so that the card and the
+# trader read a market's names the same way
+OUTCOME_UP_WORDS = frozenset({"yes", "up", "涨", "上涨", "higher", "above"})
+OUTCOME_DOWN_WORDS = frozenset({"no", "down", "跌", "下跌", "lower", "below"})
+
+
+def second_outcome_up(names: Any) -> bool:
+    """Whether a two-outcome market's names say its SECOND outcome is the 涨 / Yes side — so that the first, the one
+    Predict's book prices (market_details), is not: the one outcome named 涨 / Yes is the second, or (neither named so)
+    the one named 跌 / No is the first. Read as the real trader reads them for the token (live.outcome_for_side). False
+    for names that say neither way (the order of the outcomes is then all there is) and for anything but two names."""
+    if not isinstance(names, (list, tuple)) or len(names) != 2:
+        return False
+    words = [str(name or "").strip().lower() for name in names]
+    ups = [i for i, word in enumerate(words) if word in OUTCOME_UP_WORDS]
+    downs = [i for i, word in enumerate(words) if word in OUTCOME_DOWN_WORDS]
+    up = ups[0] if len(ups) == 1 else 1 - downs[0] if len(downs) == 1 else None
+    return up == 1
 
 
 @dataclass(frozen=True)
@@ -5636,11 +5835,17 @@ class PredictFeed:
         left = self.blocked_until - time.monotonic()
         if left > 0:
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
-        if url.startswith(PREDICT_REST):
-            self.calls += 1
-            if not self.rate_samples or time.monotonic() - self.rate_samples[-1][0] >= 1:
-                self.rate()  # sampled as the reads go, so /diag has a minute of them
         async with self.gate:
+            # 1.150.0: a cooldown that began while this request waited for its slot (another read's 429) is honoured here too,
+            # as live.py's send() does since 1.138.0: nothing queued behind the PREDICT_PARALLEL in flight goes out into it.
+            # Raised outside the try below, so the refusal itself does not push blocked_until further out; and counted only
+            # once it really goes out, so /diag's rate is the requests sent, not the ones refused
+            if (left := self.blocked_until - time.monotonic()) > 0:
+                raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
+            if url.startswith(PREDICT_REST):
+                self.calls += 1
+                if not self.rate_samples or time.monotonic() - self.rate_samples[-1][0] >= 1:
+                    self.rate()  # sampled as the reads go, so /diag has a minute of them
             try:
                 raw = await predict_blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
             except RemoteError as error:
@@ -5914,7 +6119,7 @@ class PredictFeed:
                 self.meta_errors.pop(market["id"], None)
             except (RemoteError, TimeoutError, OSError) as error:
                 self.meta_errors[market["id"]] = clean_error(error) or type(error).__name__
-        asked = time.monotonic()
+        asked, asked_ms = time.monotonic(), int(time.time() * 1000)  # asked_ms: the book's content time (refresh_one, FEED-FETCHED-MS)
         if self.market_settled((self.market_meta.get(market["id"]) or ({}, 0))[0]):
             # Predict has settled this level: it has no live book any more (asking gets HTTP 400) and the card needs none
             return LadderRow(target, market["id"], market["title"], None, "", market.get("question", "")), asked
@@ -5927,7 +6132,7 @@ class PredictFeed:
             return LadderRow(target, market["id"], market["title"], kept, clean_error(error) or type(error).__name__,
                              market.get("question", "")), asked
         fee = (self.market_meta.get(market["id"]) or ({}, 0))[0].get("fee_bps")
-        book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
+        book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee, content_ms=asked_ms)
         return LadderRow(target, market["id"], market["title"], book, "", market.get("question", "")), asked
 
     async def refresh_ladder(self, key: str, slug: str, only: set[str] | None = None, aged: bool = False) -> int:
@@ -6116,13 +6321,19 @@ class PredictFeed:
             if slug in self.want_info and slug not in self.info:
                 await self.market_info(slug, market["id"])
             fee = await self.market_fee(market["id"])
-            asked = time.monotonic()
+            # 1.150.0 (audit FEED-FETCHED-MS): the wall clock beside ``asked`` is the book's content time (content_ms). Predict
+            # reads the levels somewhere between this and the answer's landing, so a read asked before it answered our order
+            # (or confirmed its cancel) may not show the order (or may still show it) however late it lands. Stamped with
+            # its landing alone, such a read landing after Predict's answer passed for "read after it": our own 100 came
+            # out of a 买1 that did not hold them, and the lane withdrew the order it had just placed (own_on_book); the
+            # cancelled order's ghost counted as somebody's 买1 (Bot.sim_own_resting). The landing stays fetched_ms, its age
+            asked, asked_ms = time.monotonic(), int(time.time() * 1000)
             bids, asks, _ = await self.orderbook(market)
             if asked < self.book_asked.get(key, -1e18):
                 # a later request's book is stored already (the cold round's slow read landing after the hot round's): this
                 # answer would put the book back in time under a newer read time (1.83.2) — dropped, the express lane not woken
                 return 0
-            book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
+            book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee, content_ms=asked_ms)
             self.stream.note_rest(key, self.books.get(key), book)  # a pushed book replaced by a later REST read: compared (/diag)
             self.books[key] = book
             self.book_asked[key] = asked
@@ -6142,13 +6353,20 @@ class PredictFeed:
         finally:
             self.key_ms[key] = int((time.monotonic() - started) * 1000)
 
+    def round_due(self) -> bool:
+        """Whether a round is due: PREDICT_POLL_SECONDS since the last one began — refresh's own first test, which
+        Bot.refresh_books asks before it works out a round's hot set and targets (1.150.0). The 429 cooldown is no part
+        of it: a round that is due while the cooldown holds is refused by refresh ("failed", at once, without moving
+        ``refreshed``), so it stays due — and is refused again on every tick — until the cooldown ends."""
+        return time.monotonic() - self.refreshed >= self.config.predict_poll
+
     async def refresh(self, targets: dict[str, str], force: bool = False, hot: set[str] | None = None,
                       hot_rows: set[str] | None = None) -> Refreshed | bool:
         """targets: item key -> slug. False = not due yet. ``hot``: the keys refreshed every round (the daily cards, the
         markets with orders, those near a trade); the others only every PREDICT_COLD_POLL_SECONDS — a few dozen ladder
         levels nobody is near cost a round most of its time. None = every key, every round. ``hot_rows``: of a hot
         ladder, the market ids read every round (refresh_ladder); None = all of its levels."""
-        if not force and time.monotonic() - self.refreshed < self.config.predict_poll:
+        if not force and not self.round_due():
             return False
         if (left := self.blocked_until - time.monotonic()) > 0:
             return Refreshed("failed", f"Predict 接口限流，冷却 {int(left) + 1} 秒后再试（盘口暂按上次结果显示）")
@@ -6165,10 +6383,28 @@ class PredictFeed:
                 table.pop(key)
         self.slugs = dict(targets)
         keep = set(targets.values())  # yesterday's daily slugs are not kept around for ever
-        for table in (self.markets, self.market_lists, self.strikes, self.types, self.info):
+        # FEED-CACHE-GROWTH: category_raw too (strike() reads it only for the current slug and re-reads it when missing;
+        # /market writes it afresh right before reading it). A 5/15-minute window card gets a new slug every window, so
+        # without this the whole REST category answer of every past window stayed for the life of the process.
+        for table in (self.markets, self.market_lists, self.strikes, self.types, self.info, self.category_raw):
             for slug in [s for s in table if s not in keep]:
                 table.pop(slug, None)
         now = time.monotonic()
+        # FEED-CACHE-GROWTH: the market-id tables (details incl. rules, fee, the key that answered the orderbook, the
+        # last details failure) grew by one market per window too. A market some current card still follows (its book,
+        # a level of its ladder, its resolved market) is never dropped here; any other entry goes once nothing has
+        # refreshed it for PREDICT_META_KEEP_SECONDS (current markets are re-read every PREDICT_META_SECONDS, so a day
+        # untouched means a past window). Losing one costs a single REST read later, never a wrong answer.
+        live = ({str(book.market_id) for book in self.books.values()}
+                | {str(row.market_id) for rows in self.ladders.values() for row in rows or ()}
+                | {str(m[0]["id"]) for m in self.markets.values() if m and isinstance(m[0], dict) and m[0].get("id") is not None})
+        for table in (self.market_meta, self.fees):
+            for mid in [k for k, v in table.items() if k not in live and now - v[1] >= PREDICT_META_KEEP_SECONDS]:
+                table.pop(mid, None)
+        known = live | set(self.market_meta) | set(self.fees)
+        for table in (self.book_keys, self.meta_errors):
+            for mid in [k for k in table if k not in known]:
+                table.pop(mid, None)
         cold = getattr(self.config, "predict_cold_poll", 0) or 0
         wall = int(time.time() * 1000)
 
@@ -6231,8 +6467,10 @@ class PredictStream:
     round. The REST rounds go on unchanged: the stream is an accelerator, never the only source. Between the two the
     later read wins, as between two REST reads (book_asked): a REST answer asked for before the last push is dropped,
     one asked for after it replaces the pushed book and is compared with it (note_rest: a steady difference would be a
-    stream missing changes, shown in /diag). While the connection lives (its heartbeat echoed) every pushed book is as
-    current as it was, so its age restarts at each heartbeat and a quiet market's book is not stale for being quiet.
+    stream missing changes, shown in /diag). While the connection lives (its heartbeat echoed) every pushed book whose
+    topic still brings frames (heard within PREDICT_WS_SILENT_SECONDS) is as current as it was, so its age restarts at
+    each heartbeat and a quiet market's book is not stale for being quiet; a topic gone silent on a live connection gets
+    no such restart, and its book ages as a REST book whose reads fail does (touch, 1.149.x).
     Protocol (dev.predict.fun): JSON text frames; the client sends {"method": "subscribe" | "unsubscribe", "requestId":
     n, "params": [topic]}, answered by {"type": "R", "requestId": n, "success": bool, "error": {"code", "message"}};
     the server pushes {"type": "M", "topic", "data"}, a book as {"version", "marketId", "updateTimestampMs", "bids",
@@ -6249,6 +6487,8 @@ class PredictStream:
         self.versions: dict[str, int] = {}                # market id -> the last version applied (an older push is dropped)
         self.refused: dict[str, tuple[str, float]] = {}   # market id -> (the server's error, when): asked for again later
         self.live: set[str] = set()                       # market ids pushed at least once on this connection (their books are current)
+        self.heard: dict[str, float] = {}                 # market id -> monotonic time its topic last brought its book, a change or a re-send:
+        #                                                   the heartbeat restarts the age of a pushed book only while this is recent (touch)
         self.pushed: set[str] = set()                     # item keys whose stored (single) book is a push: a REST read replacing it is compared
         self.wake = asyncio.Event()                       # the wants changed: the subscriptions are brought in step
         self.request_id = 0
@@ -6310,7 +6550,7 @@ class PredictStream:
                 continue
             since = time.monotonic()
             self.ws, self.connected_at, self.last_frame, self.connects = ws, since, since, self.connects + 1
-            self.subscribed.clear(); self.pending.clear(); self.versions.clear(); self.live.clear(); self.pushed.clear()
+            self.subscribed.clear(); self.pending.clear(); self.versions.clear(); self.live.clear(); self.pushed.clear(); self.heard.clear()
             self.wake.set()
             LOG.info("Predict 推送已连接（第 %d 次），订阅 %d 个市场", self.connects, len(self.wanted))
             why = ""
@@ -6390,6 +6630,7 @@ class PredictStream:
             self.subscribed.pop(mid, None)
             self.versions.pop(mid, None)
             self.live.discard(mid)
+            self.heard.pop(mid, None)
 
     async def request(self, ws: Any, method: str, mid: str) -> None:
         self.request_id += 1
@@ -6439,7 +6680,8 @@ class PredictStream:
 
     def book(self, mid: str, data: Any) -> None:
         """A pushed book into the feed: the levels replace the stored book's (a side left out keeps its own), its age
-        restarts, the read time is now (a REST answer asked for earlier is dropped), the express lane is told."""
+        restarts, the read time is now (a REST answer asked for earlier is dropped), the express lane is told. New levels
+        are taken now (content_ms); the same levels again restart the age alone (refresh_age)."""
         target = self.subscribed.get(mid) or self.wanted.get(mid)
         if target is None or not isinstance(data, dict):
             self.dropped += 1
@@ -6467,13 +6709,15 @@ class PredictStream:
             # decide, not the version (1.104.4): with the version deciding, 7,427 pushes in six minutes were read as repeats
             # while the REST read found the book changed under them — the version does not count every change
             self.repeated += 1
+            self.heard[mid] = asked  # the topic still brings this market's book (touch)
             self.refresh_age(key, level, mid)
             return
         stamp = data.get("updateTimestampMs")
         if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and 0 < stamp <= now_ms + 60_000:
             self.lag.append(now_ms - int(stamp))
             del self.lag[:-300]
-        book = dataclasses.replace(old, bids=old.bids if bids is None else bids, asks=old.asks if asks is None else asks, fetched_ms=now_ms)
+        book = dataclasses.replace(old, bids=old.bids if bids is None else bids, asks=old.asks if asks is None else asks, fetched_ms=now_ms,
+                                   content_ms=now_ms)  # new levels: taken now (FEED-FETCHED-MS; a re-send or a heartbeat keeps this)
         if level:
             feed.ladder_rows[key][mid] = dataclasses.replace(row, book=book, error="")
             feed.row_asked.setdefault(key, {})[mid] = asked
@@ -6484,6 +6728,7 @@ class PredictStream:
             feed.errors.pop(key, None)
             self.pushed.add(key)
         self.live.add(mid)
+        self.heard[mid] = asked
         self.books += 1
         feed.updated(key)
 
@@ -6495,29 +6740,40 @@ class PredictStream:
         return f"，推送延迟中位 {ordered[len(ordered) // 2]} ms、最大 {ordered[-1]} ms（最近 {len(ordered)} 次更新）"
 
     def refresh_age(self, key: str, level: bool, mid: str) -> None:
-        """A market's stored book is as current as it was (its book pushed again unchanged): its age restarts."""
+        """A market's stored book is as current as it was (its book pushed again unchanged): its age restarts — not the
+        time its levels were taken (book_restarted, FEED-FETCHED-MS: the levels of before our order, pushed again after
+        Predict answered it, are still the levels of before it; own_on_book took our shares out of them)."""
         feed, now_ms = self.feed, int(time.time() * 1000)
         if level:
             row = (feed.ladder_rows.get(key) or {}).get(mid)
             if row is not None and row.book is not None and str(row.book.market_id) == str(mid):
-                feed.ladder_rows[key][mid] = dataclasses.replace(row, book=dataclasses.replace(row.book, fetched_ms=now_ms))
+                feed.ladder_rows[key][mid] = dataclasses.replace(row, book=book_restarted(row.book, now_ms))
         else:
             book = feed.books.get(key)
             if book is not None and str(book.market_id) == str(mid):
-                feed.books[key] = dataclasses.replace(book, fetched_ms=now_ms)
+                feed.books[key] = book_restarted(book, now_ms)
 
     def touch(self) -> None:
-        """The heartbeat says the connection lives: every book pushed on it is as current as it was, so its age restarts
-        (a market nobody traded on for two minutes is not stale for it, PREDICT_STALE_MS)."""
-        feed, now_ms = self.feed, int(time.time() * 1000)
+        """The heartbeat says the connection lives: every book pushed on it whose topic still brings frames is as current
+        as it was, so its age restarts (a market nobody traded on for two minutes is not stale for it, PREDICT_STALE_MS).
+        1.149.x (audit FEED-HEARTBEAT-FRESH): the heartbeat is the connection's, not the topic's. Restarting every book
+        ever pushed on the connection kept a topic gone quiet on a live connection (a subscription the server dropped, a
+        market paused) at age 0 for ever: with its REST reads failing as well (a 429 cool-down, "Market is closed") the
+        stale guard, the express lane's skip, the send-time re-check and the resting orders' 盘口断流 withdrawal all took
+        levels ten minutes old as current. A live topic re-sends its book every second or so (1.104.1, refresh_age), so
+        a market heard from within PREDICT_WS_SILENT_SECONDS (the connection's own silence limit, three heartbeats) is
+        restarted as before; a quiet one ages from its last restart and is stale PREDICT_STALE_MS later (at most 45 + 90
+        s after its last frame), and the hot REST round reads it again (pushing: its age is past PREDICT_PUSH_FRESH_MS)."""
+        feed, now_ms, mono = self.feed, int(time.time() * 1000), time.monotonic()
+        alive = {mid for mid, at in self.heard.items() if mid in self.live and mono - at <= PREDICT_WS_SILENT_SECONDS}
         for key, book in list(feed.books.items()):
-            if book.market_id in self.live:
-                feed.books[key] = dataclasses.replace(book, fetched_ms=now_ms)
+            if book.market_id in alive:
+                feed.books[key] = book_restarted(book, now_ms)  # its age alone: the levels are as old as they were (FEED-FETCHED-MS)
         for key, rows in list(feed.ladder_rows.items()):
             touched = False
             for mid, row in list(rows.items()):
-                if mid in self.live and row.book is not None:
-                    rows[mid] = dataclasses.replace(row, book=dataclasses.replace(row.book, fetched_ms=now_ms))
+                if mid in alive and row.book is not None:
+                    rows[mid] = dataclasses.replace(row, book=book_restarted(row.book, now_ms))
                     touched = True
             if touched:
                 feed.ladder_publish(key)
@@ -8304,6 +8560,15 @@ class UpDownMarket:
     CANDLE_GRACE_MS = 2_000        # and only this long after its minute ended
     PRICE_STALE_MS = TouchMarket.PRICE_STALE_MS
     SIGMA_STALE_MS = TouchMarket.SIGMA_STALE_MS
+    # 1.150.0: how old a price may be and still be traded on (price_problem); PRICE_STALE_MS above only pauses the odds
+    # shown. The odds take the price in hand as this instant's, with σ√τ counted from now: a standard deviation of the
+    # move since it was read shifts the fair price at the line by Φ(√(age / time left)) − ½, about 0.4·√(age / time
+    # left), whatever σ is. The share keeps that at 5.6¢ and the floor at 9¢ where the 15-minute cards stop ordering
+    # (90 s left), both under the 10¢ entry bar. Before, a 59-s-old price with four minutes left was 19¢ off per σ of
+    # unseen move, while Predict's book, which had seen it, looked mispriced on the stale side: the taker bought into it
+    TRADE_STALE_SHARE = 0.02       # a price read longer ago than this share of the time left to the end is not traded on...
+    TRADE_STALE_MIN_MS = 5_000     # ...in the last minutes one older than this (a push comes every second, a read behind a slow round in two or three)
+    PRICE_NAME = "币安价格"         # the live price, as that message names it (a 15-minute card's: 指数价 / 现货价)
 
     SIGMA_HALF_LIFE = 120          # σ: the last 30 days' hourly returns, a weight halving every five days back (1.106.1; a plain 30-day σ before)
     SIGMA_MODEL = 2                # the estimator's version, kept on each sample: the calibration counts samples of the current one alone
@@ -8453,12 +8718,30 @@ class UpDownMarket:
                    ((used * MODEL_SIGMA_ERROR, -0.5), (used / MODEL_SIGMA_ERROR, -0.5), (used, 0.0)))
 
 
+    def price_problem(self, now_ms: int) -> str:
+        """Why the price in hand is too old to trade on ("" while it is not): read longer ago than TRADE_STALE_SHARE of
+        the time left to the end, or than TRADE_STALE_MIN_MS in the last minutes. The odds stay on the card (only
+        PRICE_STALE_MS pauses those); nothing is suggested or bought from them (advice_problem) and a resting order is
+        withdrawn (SimMarket.price_problem, Bot.sim_requote_reason). 1.150.0: until then the one check was PRICE_STALE_MS
+        — a minute on a 15-minute card, five on a daily one — so while the price feed stalled (the stream silent or
+        reconnecting, the REST read in a rate-limit cooldown) and Predict's book went on moving, the trader kept buying
+        the side the stale price made look cheap from those who had seen the move."""
+        left = self.spec.end_ms + 60_000 - now_ms
+        limit = max(self.TRADE_STALE_MIN_MS, self.TRADE_STALE_SHARE * left)
+        age = now_ms - self.priced_ms
+        if age <= limit:
+            return ""
+        return (f"{self.PRICE_NAME} {math.ceil(age / 1000)} 秒未更新，超过离结束 {max(left, 0) / 60_000:.1f} 分钟时的上限 "
+                f"{math.floor(limit / 100 + 1e-6) / 10:g} 秒")  # (the age rounded up, the limit down: never "5 秒" against a limit of 5)
+
     def advice_problem(self, odds: UpDownOdds, now_ms: int) -> str:
         """Why no trade is suggested from these odds ("" when one may be)."""
         if odds.settled:
             return "已出结果，以 Predict 结算为准；不再给建议"
         if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
             return "波动率超过一天未更新；暂不给建议"
+        if stale := self.price_problem(now_ms):
+            return f"{stale}；暂不给建议"
         return ""
 
 
@@ -8643,6 +8926,7 @@ class IndexUpDownMarket(UpDownMarket):
     WORD = "指数"                 # the price, as the card's messages name it (指数价 / 现货价)
     SOURCE = "币安合约指数价"      # the price's source, as the card and the evidence name it
     PRICE_KIND = "指数价 i"       # the kind of price (price_evidence)
+    PRICE_NAME = "指数价"         # the price, as price_problem names it
     SOURCE_LINE = "币安合约指数 1 分钟 K"  # the candles the boundaries are read from
     PRICE_TEXT = "币安合约 {symbol} 指数价"  # the card's reference line
     SIGMA_TEXT = "币安合约 {symbol} 指数近 4 小时 1 分钟 K（近 1 小时权重过半，开盘首小时按开盘后的）"
@@ -8740,6 +9024,16 @@ class IndexUpDownMarket(UpDownMarket):
             if price is not None:
                 return price, f"交易所现价先行 {gap:+.2%}"
         return self.price, ""
+
+    def price_problem(self, now_ms: int) -> str:
+        """Why the index in hand is too old to trade on (UpDownMarket.price_problem: by its own time — the push's event
+        time, the read's), while the index is the price the odds are taken at. While the exchange quote leads it
+        (effective: LEAD_QUOTE=on) the odds are the quote's, whatever the index's age: how long that quote may go
+        unread stays LEAD_STALE_MS's business (15 s), as before. (The quote is stamped at the start of its polling
+        round and reaches the card at the card's own next round: by the two loops' cadence a few seconds old in
+        ordinary running, close to this rule's 5 s — it wants its real age measured before the rule is put on it.)
+        Once the quote leads no more, the index's age counts again."""
+        return "" if self.effective(now_ms)[1] else super().price_problem(now_ms)
 
     def lead_text(self, now_ms: int) -> str:
         """The exchange quote's part in the price now, for the card and the evidence; "" without one."""
@@ -8987,6 +9281,7 @@ class SpotWindowMarket(IndexUpDownMarket):
     WORD = "现货"
     SOURCE = "币安现货最新成交（Chainlink 取买卖一中间价）"
     PRICE_KIND = "最新成交"
+    PRICE_NAME = "现货价"
     SOURCE_LINE = "币安现货 1 分钟 K"
     PRICE_TEXT = "币安现货 {symbol} 价格"
     SIGMA_TEXT = "币安现货 {symbol} 近 4 小时 1 分钟 K（近 1 小时权重过半）"
@@ -10013,19 +10308,29 @@ def us_trading_years(now_ms: int, end_ms: int, intraday: float = 1.0) -> float:
 
 def deadline_from_text(texts: list[str], after_ms: int) -> int:
     """The deadline a market's title names, as 23:59 ET of that date: "by December 31", "by Dec. 31, 2026", "by (the end
-    of) December", "截止于 12 月 31 日", "2026-12-31". A date without a year is the first such date on or after after_ms (the
-    market's creation). The first text that names one wins; 0 when none does."""
+    of) December", "by December 2026" (a month with no day: its last one), "截止于 12 月 31 日", "2026-12-31". A date without
+    a year is the first such date on or after after_ms (the market's creation). The first text that names one wins; 0 when
+    none does."""
     since = et_date(after_ms) if after_ms else dt.date.today()
     # whole month words only: "before MARket close" and "by DECision of the committee" name no month
     month = (r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|"
              r"october|oct|november|nov|december|dec)\b\.?")
+    # 1.150.0: a day is one or two digits with no digit after them — the (?!\d) of the two month patterns. Without it a month
+    # followed by its year and no day lost both: in "by June 2027" and "by the end of December 2026" the year's "20" was the
+    # day and no year was left, so the deadline was the 20th of the creation year or the next. Ten days early, or a year:
+    # "by December 2027" read in November 2026 was 2026-12-20. The card priced to that end (the time left cut short: P(Yes)
+    # too low, the No side bought on an edge that was not there), closed its window there and settled its paper trades as
+    # No with the market still open, and a LADDER_DEADLINES pin of the true date matched no market. Now "by <month> <year>"
+    # is that month's last day, as "by <month>" is. A month and a year with no "by" ("June 2027", "in December 2026") name
+    # no deadline, as a month alone never did ("in January"): the next text decides, or the card waits for the pin — the
+    # last pattern's day stays required (were it optional, every month word would match: "the price may rise")
     patterns = [
         (r"(20\d\d)-(\d\d)-(\d\d)", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
         (r"(20\d\d)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
         (r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (0, int(g[0]), int(g[1]))),
-        (r"(?i)\b(?:by|before|until|through)\s+(?:the\s+)?(?:end\s+of\s+)?" + month + r"\s*(\d{1,2})?(?:st|nd|rd|th)?,?\s*(20\d\d)?",
+        (r"(?i)\b(?:by|before|until|through)\s+(?:the\s+)?(?:end\s+of\s+)?" + month + r"\s*(\d{1,2}(?!\d))?(?:st|nd|rd|th)?,?\s*(20\d\d)?",
          lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()[:3]], int(g[1]) if g[1] else 0)),
-        (r"(?i)\b" + month + r"\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(20\d\d)?",
+        (r"(?i)\b" + month + r"\s+(\d{1,2}(?!\d))(?:st|nd|rd|th)?,?\s*(20\d\d)?",
          lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()[:3]], int(g[1]))),
     ]
     for text in texts:
@@ -10818,7 +11123,10 @@ class StockTouchMarket(TouchMarket):
     one, cannot be ordered from it: a manual check) and the running session's minutes as they come. Advice only while
     the regular session runs: between sessions the last trade is the price, but the stock trades on after hours — a
     quote on the close is a free option for whoever saw the after-hours move (the fair price moves some 3.7¢ a 1% move
-    between the lines), and a held card's resting orders are withdrawn after SIM_NO_ODDS_WITHDRAW_MINUTES."""
+    between the lines), so an order resting at the close is withdrawn at it (Bot.sim_stock_touch_closed, 1.150.0; until
+    then only once the hold had lasted SIM_NO_ODDS_WITHDRAW_MINUTES — the half hour NVDA's results come out in).
+    1.150.0: and in the session only on a price of that session, no more than PRICE_STALE_MS old by its own time
+    (advice_problem)."""
     PRICE_SECONDS = StockRangeMarket.PRICE_SECONDS
     CLOSED_PRICE_SECONDS = StockRangeMarket.CLOSED_PRICE_SECONDS
     CLOSE_PRINT_MS = StockRangeMarket.CLOSE_PRINT_MS
@@ -10848,8 +11156,10 @@ class StockTouchMarket(TouchMarket):
         self.failures = {"price": "", "scan": ""}
         self.yahoo: tuple[D, int] | None = None  # (Yahoo's last trade, its time): the check on the index, the price when it is not live
         self.index_live = False  # the price in hand is Binance's futures index (note_index), not Yahoo's trade
+        self.index_seen: tuple[D, int] | None = None  # (the index as last delivered, when that value first came): standing still, it ages (note_index)
 
     INDEX_STALE_MS = 15_000      # 1.147.0: Binance's index older than this is not live: Yahoo's trade prices the card
+    INDEX_STILL_MS = 15_000      # 1.150.0: ...nor one whose value has not changed for this long, delivered every second though it is: a stalled index
     INDEX_MAX_GAP = 0.02         # ...nor an index further than this (ln) from Yahoo's trade: another instrument, a bad print
 
     @property
@@ -10862,9 +11172,24 @@ class StockTouchMarket(TouchMarket):
         """Binance's futures index of the stock (the 15-minute card's: pushed every second, read every second without the
         push), 1.147.0: while the regular session runs, fresh and within INDEX_MAX_GAP of Yahoo's trade, it is the price —
         Yahoo's 30-second reads lagged the stock by up to half a minute, a few cents of fair price between the lines.
-        True when it moved the price (the express lane looks then)."""
-        if (price is None or not price > 0 or self.yahoo is None or us_session_state(now_ms)[0] != "交易中"
-                or now_ms - at_ms > self.INDEX_STALE_MS or at_ms <= (self.priced_ms if self.index_live else 0)
+        True when it moved the price (the express lane looks then).
+        1.150.0: fresh by its value too, not by its delivery alone. A push's event time (a read's server time) is new
+        every second whether or not the index behind it moved, so an index stalled at one value while the stock went
+        on trading (its sources stuck; a closure the calendar does not know) passed as live for as long as it stayed
+        within INDEX_MAX_GAP of Yahoo's trade — and while it did, that trade, read every 30 s, priced nothing: ten
+        minutes of it with the stock up 1.9% were 6.4¢ of fair price, advised on. Now a value delivered unchanged for
+        over INDEX_STILL_MS (by the deliveries' own times) is refused: the price in hand is left to age, and the Yahoo
+        read that finds it over INDEX_STALE_MS old prices the card (refresh, as when the index goes quiet: half a
+        minute to a minute after the index last moved), as does each read after it — the standing value is not taken
+        back — until the index moves. Where the index stands still because the stock does (a halt), Yahoo's trade is
+        that same price: nothing is lost by it."""
+        if price is None or not price > 0 or now_ms - at_ms > self.INDEX_STALE_MS:
+            return False  # nothing, or a delivery come late (a stalled socket catching up): no news of the index as it is now
+        if self.index_seen is None or price != self.index_seen[0]:
+            self.index_seen = (price, at_ms)  # a new value — in the session or out of it, whichever price the card is on: its clock starts
+        if (self.yahoo is None or us_session_state(now_ms)[0] != "交易中"
+                or at_ms <= (self.priced_ms if self.index_live else 0)
+                or at_ms - self.index_seen[1] > self.INDEX_STILL_MS
                 or abs(math.log(float(price) / float(self.yahoo[0]))) > self.INDEX_MAX_GAP):
             return False
         moved = price != self.price
@@ -10980,6 +11305,28 @@ class StockTouchMarket(TouchMarket):
         if state != "交易中":
             return ("美股休市中：盘前盘后的价格不算数，但会影响开盘价，按收盘价报价会被知道盘后行情的人吃掉；"
                     + (f"北京时间 {stamp(opens, seconds=False)} 开盘后恢复" if opens else "开盘后恢复") + "；暂不给建议")
+        session = us_session(et_date(now_ms))
+        if session and self.price is not None and self.priced_ms < session[0]:
+            # 1.150.0: the session runs, and the price in hand is still from before its open — the close's: the hold above,
+            # for the same reason, until a price of this session is in. Yahoo's last trade is yesterday's until its first
+            # read of the new session (half a minute on any day; for as long as its reads fail, or answer with
+            # yesterday's chart), and Binance's index, the one price that knows the open, is refused (note_index) for
+            # standing over INDEX_MAX_GAP from that very close whenever the stock opens over 2% away — the mornings
+            # this card's rule is about. Nothing else held it: price_stale lets the close stand for the session's first
+            # half hour (the hit markets' rule: they advise on the last trade between sessions too), and minutes_ms is
+            # the time of the read, whatever day its bars are of. So a +4% open priced "$210 first" 15¢ under its worth
+            # with the suggestion on, and from the first second the taker bought the other side above its worth off a
+            # book that had the open in it; with Yahoo stuck, for thirty minutes, the alert sent as well. An index
+            # delivery stamped before the bell (taken in the session's first second) is a pre-market price too: the
+            # next one, a second later, is the session's.
+            return f"美股已开盘，现价还是开盘前的（停在 {stamp(self.priced_ms, seconds=False)}），今天的价格还没读到；暂不给建议"
+        if self.price is not None and now_ms - self.priced_ms > self.PRICE_STALE_MS:
+            # 1.150.0: the same later in the session — a price over five minutes old by its own time (PRICE_STALE_MS: what
+            # prices nothing on the crypto card) is not advised on. It is Yahoo's trade standing still while its reads go
+            # on answering (a stuck host; a halt): the index, once the stock is 2% from that trade, is refused for it
+            # exactly as at the open, and until now the trade was advised on for the half hour price_stale gives it
+            # (stuck at 10:05 with the stock up 2.5% by 10:20: 9¢ of fair price, to 10:35). The odds stay, as above.
+            return f"美股交易中，现价还停在 {stamp(self.priced_ms, seconds=False)}（超过 {self.PRICE_STALE_MS // 60_000} 分钟没更新）；暂不给建议"
         if now_ms - self.minutes_ms > self.MINUTES_STALE_MS:
             return "今天的 1 分钟 K 超过 5 分钟没读到；暂不给建议"
         if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
@@ -11028,6 +11375,8 @@ class SimMarket:
     lunch: bool = False      # a daily card: its underlying is in its lunch break (in_session is False then: the after-hours rules apply)
     move: float | None = None  # a daily card: ln(effective / reference), the day's move so far — the proxy's after hours (1.120.0)
     sigma_day: float = 0.0   # ...and the whole day's σ it is measured against (sim_against_move)
+    price_problem: str = ""  # an up/down card: why its price is too old to trade on now (UpDownMarket.price_problem; "" = fresh enough) —
+    #                          the card's ``hold`` says so too, and a resting order is withdrawn for it (sim_requote_reason, 1.150.0)
 
 
 class LazyEvidence(Mapping):
@@ -11207,14 +11556,61 @@ def sim_position(trade: Mapping) -> bool:
 def own_on_book(trade: Mapping, book: Any) -> float:
     """Our own unfilled shares a real resting order adds to the book's level at its price — 0 until Predict can have it there:
     not while pending or in flight (placing), and not on a book read before Predict's answer (1.138.0 / 1.138.1: a decision not
-    yet sent was taken out of the level it would join, so a 跟买1 on a thin 买1 saw the 买1 "gone" and was voided or withdrawn)."""
+    yet sent was taken out of the level it would join, so a 跟买1 on a thin 买1 saw the 买1 "gone" and was voided or withdrawn).
+    1.150.0 (audit FEED-FETCHED-MS): "read" is when the book's levels were taken (book_content_ms: a REST read's request, a
+    changed push's arrival), not its fetched_ms — a REST answer landing after Predict's, or the levels of before the order
+    pushed again after it, carried a later stamp over the same old levels, and the order just placed was withdrawn as
+    "买1 不足". A book whose levels were taken before the answer may show the order all the same (own_unsure)."""
     st = trade.get("live") if isinstance(trade.get("live"), Mapping) else None
     if st is None or st.get("state") in ("pending", "placing"):
         return 0.0
     answered = int(st.get("answered_at") or 0)
-    if answered and book is not None and int(getattr(book, "fetched_ms", 0) or 0) < answered:
+    if answered and book is not None and book_content_ms(book) < answered:
         return 0.0
     return max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0)
+
+
+def own_unsure(trade: Mapping, book: Any) -> bool:
+    """Whether ``book`` may show our real order although own_on_book counts none of it: the request is in flight
+    (placing), or Predict has answered it and the book's levels were taken before that answer — a push can beat the HTTP
+    answer, and a REST read asked before it may be served after the order went in. On such a book the order cannot be
+    told from somebody else's bid at its price: counted as ours it would be the 1.138.x withdrawal again, so it is not
+    (own_on_book) — and a deep-bid or sweep order, whose place is worked out from the best bid of anyone else, may then
+    be working it out from itself. It is held where it is (Bot.sim_requote_reason; FEED-FETCHED-MS): never moved up
+    ("a bid in front" — withdrawn, placed a cent higher, and that one again), and not moved down or sideways either
+    while the book shows a bid at its own price (its own shares, fewer than SIM_MAKER_MIN_BID, read as somebody's bid
+    right under the best ask — "join the valid 买1 below": withdrawn, placed where it was, withdrawn again). Over with
+    the next book whose levels were taken after the answer: a changed push, or a REST read asked after it (on a pushed
+    market that stays as it is, the cold round's). Never for an order not sent yet (pending: no book shows it)."""
+    st = trade.get("live") if isinstance(trade.get("live"), Mapping) else None
+    if st is None or book is None or st.get("state") == "pending":
+        return False
+    if st.get("state") == "placing":
+        return True
+    left = max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0)
+    return left > 1e-9 and own_on_book(trade, book) <= 1e-9  # sent, something left of it, and none of it counted: the book is from before the answer
+
+
+def ghost_unsure(trade: Mapping | None, book: Any) -> bool:
+    """The other side of own_unsure — whether ``book`` may NOT show our real order although Bot.sim_own_resting still
+    counts it there: Predict confirmed its cancel after the book's levels were taken (the ghost of 1.104.6, taken out of
+    the level at its price), and the bot has heard of that book since the cancel's request went out — its age restarted
+    by a push that arrived, a REST answer that landed, the same levels again. Such a book may be of before the cancel
+    reached Predict's book or of after it (the push of a cancel can beat its HTTP confirmation): what stands at the
+    order's price on it is the order still shown, or somebody else's bid, and a deep-bid order is not placed onto it
+    (Bot.sim_maker_reason; FEED-FETCHED-MS). A book last heard of before the request went out (a REST answer landed
+    earlier, the last push of before it) shows the order for certain: the ghost is taken out and the place it leaves is
+    used at once, as ever. Over with the next book whose levels were taken after the confirmation. The request's time on
+    the books' clock is the confirmation's (cancel_done_ms) less what the cancel took on the market clock
+    (cancel_sent_at → cancel_done_at); a record without those stamps is in doubt. Never for an order resting."""
+    st = trade.get("live") if isinstance(trade, Mapping) and isinstance(trade.get("live"), Mapping) else None
+    if st is None or book is None or trade.get("status") == "resting":
+        return False
+    done = int(st.get("cancel_done_ms") or 0)
+    if not done or book_content_ms(book) > done:
+        return False  # not cancelled, or a book taken after the confirmation: the order is off it
+    took = int(st["cancel_done_at"]) - int(st["cancel_sent_at"]) if st.get("cancel_sent_at") and st.get("cancel_done_at") else None
+    return took is None or int(getattr(book, "fetched_ms", 0) or 0) >= done - max(took, 0)
 
 
 def same_refusal(a: str, b: str) -> bool:
@@ -12328,6 +12724,12 @@ def own_levels(book: PredictBook, side: str) -> list[tuple[float, float]]:
     return [(round(1 - float(p), 6), float(q)) for p, q in book.asks]
 
 
+def bid_shares(book: PredictBook, side: str, price: float) -> float:
+    """The shares bid at ``price`` where a resting buy of ``side`` queues (own_levels: ours, when the book shows it, with
+    everybody else's); 0 when the book has no such level."""
+    return sum(q for p, q in own_levels(book, side) if abs(p - price) < 1e-9)
+
+
 def book_snapshot(book: PredictBook, depth: int = 5) -> dict:
     """The top of a book as evidence, priced as the 涨 / Yes side (as on the card), with when it was read."""
     return {"bids": [[float(p), float(q)] for p, q in book.bids[:depth]],
@@ -12959,7 +13361,7 @@ async function loadWhy(force){
   if(again)return loadWhy(true);
   if(last)render(last)}
 function whyRow(p){
-  if(!p||!p.market_id||!p.taker)return null;  // the books the trader prices: they carry its distance to a taker buy
+  if(!p||!p.market_id||!p.taker)return null;  // the books the trader prices: they carry its distance to a taker buy (with real trading set up only a stub of it, state off: the lines themselves are an account's orders and come with the key, in this row)
   const id="why#"+p.market_id,on=open.has(id),d=$("div","why"),h=$("button","whyh",(on?"▾ ":"▸ ")+"为什么挂 / 不挂单");
   h.type="button";h.setAttribute("aria-expanded",on?"true":"false");h.title="机器人在这个盘口现在挂什么、吃什么，两边各自为什么挂或不挂";
   h.addEventListener("click",e=>{e.stopPropagation();if(open.has(id))open.delete(id);else{open.add(id);loadWhy(true)}if(last)render(last)});
@@ -13104,7 +13506,9 @@ function priceLadderBook(c,it,L,live){
         if(maker&&!eligible){a.append($("span","pa","—"));a.title=r.bids==null&&r.asks==null?r.error||"Predict 暂无盘口":r.maker_note||r.points_note||"积分状态确认后才提示挂单优势";return a}
         if(!e){const nobook=r.bids==null&&r.asks==null;a.append($("span","pa",r.error?"⚠ 请核实":r.stale?"盘口过期":nobook?"—":r.fair==null?"模型暂缺":"暂无报价"));
           a.title=r.error||r.hold||(r.stale?"盘口过期，等待新盘口":nobook?"Predict 暂无盘口":r.fair==null?"模型价暂缺，等待行情或 σ":"等待有效盘口");return a}
-        if(ok){a.classList.add("pos");if(e.edge>=HOT)a.classList.add("hot")}
+        // 1.x (audit CTRL-LADDER-HOT): the red mark uses the same most-specific bar (level/card/section/global) as the card
+        // frame and the 机会条 above, so a red cell always means a framed card and a framed card always shows its red cell
+        if(ok){a.classList.add("pos");if(e.edge>=hotFor(it,r.label))a.classList.add("hot")}
         const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)),$("span","pv",sg(e.edge)));a.append(line);
         const tk=!maker&&r.taker&&(r.taker.state==="near"||r.taker.state==="ready")?r.taker:null;  // 距吃单, the trader's own distance
         if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(ok&&!maker&&e.short)a.append($("span","pwhy","深度不足"));
@@ -13576,7 +13980,7 @@ let sumOpen=true;try{sumOpen=localStorage.getItem("jrnsum")!=="0"}catch(e){}  //
 let anaOpen=false;try{anaOpen=localStorage.getItem("jrnana")==="1"}catch(e){}  // the analysis tables: folded unless opened by hand
 const base=location.pathname.replace(/\/journal\/?$/,"");
 document.getElementById("back").href=base;document.getElementById("ctl").href=base+"/control";
-document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";  // also right under /journal/
+document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";document.getElementById("mcsv").href=base+"/samples.csv";  // also right under /journal/ (CTRL-MCSV: the 导出模型样本 link too, else /journal/samples.csv 404s)
 function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
   if(MS_KEYS.has(k))return v?when(v):"—";if(k==="high_at")return v?when(v*1000):"—";if(CENT_KEYS.has(k))return cent(v);
   if(k==="sigma_daily"||k==="sigma"||k==="sigma_raw")return (v*100).toFixed(2)+"%";if(k==="history")return JSON.stringify(v);
@@ -14233,7 +14637,8 @@ function render(){
   $("authnote").textContent=data.enabled?"每次操作都会带上口令；口令只在环境变量里，页面不显示。":"未设置 WEB_CONTROL_KEY：只能查看，不能操作。";
   const L=data.live;
   const liveOn=!!L&&L.mode!=="off";
-  $("livestate").textContent=L?(L.mode==="off"?"LIVE=off：只记账":L.mode==="pause"?"LIVE=pause：只测试，不开新仓"+(L.ready?"":"｜未就绪："+L.ready_error):L.paused?"已暂停："+L.paused:L.killed?"今日停开新仓："+L.killed:L.ready?"LIVE=on：运行中":"未就绪："+L.ready_error):"未加载（没有私钥）";
+  // 1.150.0: a pause and today's loss stop side by side — the pause alone was shown, and 恢复, clicked to end it, lifts the stop as well
+  $("livestate").textContent=L?(L.mode==="off"?"LIVE=off：只记账":L.mode==="pause"?"LIVE=pause：只测试，不开新仓"+(L.ready?"":"｜未就绪："+L.ready_error):L.paused?"已暂停："+L.paused+(L.killed?"｜今日停开新仓："+L.killed:""):L.killed?"今日停开新仓："+L.killed:L.ready?"LIVE=on：运行中":"未就绪："+L.ready_error):"未加载（没有私钥）";
   $("livestate").className="state "+(L?(L.mode==="off"?"":L.mode==="pause"||L.paused||L.killed?"warn":L.ready?"on":"off"):"");
   if(L&&L.allowed===false)$("livestate").textContent+="｜硬开关 LIVE_TRADING_ALLOWED=off";
   $("modebtns").querySelectorAll("button").forEach(b=>{b.disabled=!L||!data.enabled;b.className=L&&b.dataset.mode===L.mode?"pri":""});
@@ -14388,7 +14793,7 @@ function renderLive(L,liveOn){const box=$("livelines");box.replaceChildren();
   box.append(...kvRow("占用","持仓+挂单 $"+L.exposure.toFixed(2)+"，上限 $"+L.caps.open,L.exposure>=L.caps.open*0.9?"warn":""));
   // the day's stop counts the pre-open mode's P&L with the model trader's (1.125.0): show that sum, and the split when non-zero
   const dayPnl=L.day_pnl??L.daily_pnl;
-  box.append(...kvRow("今日","已结算盈亏 "+money(dayPnl)+(L.preopen_pnl?"（原策略 "+money(L.daily_pnl)+" + 预挂 "+money(L.preopen_pnl)+"）":"")+(L.caps.daily_loss?"，亏损上限 $"+L.caps.daily_loss:"，亏损不设上限"),dayPnl<0?"bad":""));
+  box.append(...kvRow("今日","已结算盈亏 "+money(dayPnl)+(L.preopen_pnl?"（原策略 "+money(L.daily_pnl)+" + 预挂 "+money(L.preopen_pnl)+"）":"")+(L.caps.daily_loss?"，亏损上限 $"+L.caps.daily_loss+(L.loss_floor!=null?"（今天手动恢复过，停机线 "+money(L.loss_floor)+"）":""):"，亏损不设上限"),dayPnl<0?"bad":""));
   box.append(...kvRow("订单","挂单中 "+L.resting+"，未确认 "+L.unconfirmed+"，今日下单 "+L.placed_today+"，失败 "+L.failed_today,L.unconfirmed?"warn":""));
   if(L.synced_at)box.append(...kvRow("订单同步",L.synced_at,""));
   if(L.unknown_open&&L.unknown_open.length)box.append(...kvRow("注意","账户上有 "+L.unknown_open.length+" 张本机器人没有记录的挂单（#"+L.unknown_open.map(u=>u.id).join("、#")+"）：不计入这里的额度；“撤掉账户全部挂单”可一起撤","warn"))}
@@ -14401,7 +14806,7 @@ function renderTest(text){const box=$("testlines");box.replaceChildren();box.sty
 // the sticky bar: the mode, the counts, the limits, when the page last refreshed
 function renderBar(){const L=data.live,b=$("bar");b.replaceChildren();const liveOn=!!L&&L.mode!=="off";
   const chip=(k,v)=>{const s=el("span");s.append(el("span","k",k+" "),el("b","",String(v)));return s};
-  const mode=L?(L.mode==="off"?"LIVE=off 只记账":L.mode==="pause"?"LIVE=pause 不开仓":L.paused?"已暂停":L.killed?"今日停开新仓":L.ready?(L.gate?"LIVE=on 新单受限":"LIVE=on 运行中"):"LIVE=on 未就绪"):"纸面模拟";
+  const mode=L?(L.mode==="off"?"LIVE=off 只记账":L.mode==="pause"?"LIVE=pause 不开仓":L.paused?(L.killed?"已暂停｜今日停开新仓":"已暂停"):L.killed?"今日停开新仓":L.ready?(L.gate?"LIVE=on 新单受限":"LIVE=on 运行中"):"LIVE=on 未就绪"):"纸面模拟";
   b.append(el("span","state "+(L?(L.mode==="off"?"":L.mode==="pause"||L.paused||L.killed||(L.ready&&L.gate)?"warn":L.ready?"on":"off"):""),mode));
   b.append(chip("持仓",data.sim.open),chip("挂单中",data.sim.resting),chip("已结算",data.sim.settled+" 笔 "+money(data.sim.pnl)));
   if(liveOn)b.append(chip("持仓+挂单","$"+L.exposure.toFixed(2)+" / $"+L.caps.open),chip("今日",money(L.day_pnl??L.daily_pnl)),chip("未确认",L.unconfirmed),chip("对账",L.sync_age_s!=null?L.sync_age_s+" 秒前":"—"));
@@ -14439,6 +14844,8 @@ $("livebtns").addEventListener("click",e=>{const b=e.target.closest("button");if
   else if(a==="test"){if(confirm("在 Predict 上挂一张远离盘口的限价单（不高于 2¢，份数按 Predict 最低订单金额 $1 取，2¢ 时 50 份），确认它出现在盘口后立即撤掉，用来验证真实下单链路。最多锁定约 1 美元，极少数情况下可能成交。继续？"))act({action:"test"})}
   else if(a==="cancelall"){if(confirm("撤掉本策略在 Predict 上的全部真实挂单？已成交的份数继续持有；以 Predict 的确认为准，确认前额度仍占用。"))act({action:"cancel",id:"all"})}
   else if(a==="cancelaccount"){if(confirm("撤掉这个 Predict 账户上的全部挂单，包括手动单和本机器人没有记录的单？"))act({action:"cancel",id:"account"})}
+  // 1.150.0: 恢复 also lifts today's loss stop (as /live resume does): asked first while one stands — the button ends a pause too, and went straight through
+  else if(a==="resume"){const k=data&&data.live&&data.live.killed;if(!k||confirm("今日亏损停机正在生效（"+k+"）。\n\n点“恢复”会同时解除它：之后要再亏满一个 LIVE_MAX_DAILY_LOSS_USD 才会再次停机。不点的话，它到明天 0 点（北京时间）自动解除。继续？"))act({action:"resume"})}
   else act({action:a})});
 $("reset").addEventListener("click",()=>{if(confirm("清除网页上保存的全部设置，恢复为环境变量？真实交易模式也回到环境变量的 LIVE 值（回到 off 会撤掉未成交的真实挂单），挂着的单按恢复后的设置重新判断。"))act({action:"reset"})});
 $("reload").addEventListener("click",()=>{keyBad=false;load()});
@@ -14463,12 +14870,25 @@ def accepts_gzip(header_block: str) -> bool:
     return False
 
 
-def page_payload(payload: dict) -> dict:
+def page_payload(payload: dict, private: bool = False) -> dict:
     """odds_payload() as data.json carries it: the server's edge chips (four per book, eleven fields each) are left out of
     every book block. The page computes its own from the depth for the trade size the viewer picks and never reads them;
     /book, the alerts, the paper trader and the tests use the server's. Fetched every 10 seconds by every open tab, the
-    file is about 40% smaller without them (a quarter smaller after gzip). The payload given is left as it is."""
-    without = lambda block: {k: v for k, v in block.items() if k != "edges"}
+    file is about 40% smaller without them (a quarter smaller after gzip). The payload given is left as it is.
+    ``private`` (WebServer.account_private: a real account is behind the trader), 1.150.0: the trader's own lines are left
+    out as well. data.json needs the page link alone, and those lines are that account's orders and positions: 挂单 names a
+    resting order's side and price (挂涨 挂单中 55.0¢, 等待发送 before it is even sent); 距吃单 carries each side's filled
+    shares, an order in flight with its Predict id (真实订单 #… 已成交 x/y 份), 这一边持仓 N 份, the room left under the caps
+    (可买 N 份（已吃 M 份，上限 K）) and what the real-trading limits refuse (持仓+挂单 $… 已占满 LIVE_MAX_OPEN_USD, USDT
+    余额 $… 不够一份) — its state and every text of it follow the account, so none of it is kept; the paper-trading card's
+    nearest markets repeat the same texts. why.json, the same facts at length, has asked for the control key since 1.101.0,
+    while these were served to anyone holding the link. A book the trader prices keeps a 距吃单 stub (state off: the page
+    draws no line for it), so that its card still has the 为什么挂 / 不挂单 row: the keyed way to the same facts."""
+    def without(block: dict) -> dict:
+        out = {k: v for k, v in block.items() if k != "edges" and not (private and k == "maker")}
+        if private and "taker" in out:
+            out["taker"] = {"state": "off", "text": "", "private": True}
+        return out
     items = []
     for item in payload.get("items") or []:
         item = dict(item)
@@ -14477,6 +14897,8 @@ def page_payload(payload: dict) -> dict:
         ladder = item.get("ladder")
         if isinstance(ladder, dict) and isinstance(ladder.get("rows"), list):
             item["ladder"] = {**ladder, "rows": [without(row) if isinstance(row, dict) else row for row in ladder["rows"]]}
+        if private and item.get("kind") == "sim" and "near" in item:
+            item["near"] = []
         items.append(item)
     return {**payload, "items": items}
 
@@ -14556,8 +14978,13 @@ class WebServer:
             if len(parts) == 2:
                 return 200, "text/html; charset=utf-8", self.pages["page"]
             if parts[2] == "data.json":
-                return 200, "application/json; charset=utf-8", self.cached(
-                    "data.json", lambda: json.dumps(page_payload(self.bot.odds_payload()), ensure_ascii=False, default=str).encode("utf-8"))
+                # 1.150.0: this file needs the page link alone, so with a real account behind the trader it goes without
+                # the trader's own lines (page_payload: that account's resting orders and positions, card by card), as
+                # why.json, journal.json and control.json go behind the key. A body is cached per case: a copy built just
+                # before the first real order is never served after it.
+                private = self.account_private()
+                return 200, "application/json; charset=utf-8", self.cached("data.json?private" if private else "data.json", lambda: json.dumps(
+                    page_payload(self.bot.odds_payload(), private), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "journal":
                 return 200, "text/html; charset=utf-8", self.pages["journal"]
             if parts[2] == "journal.json":
@@ -14632,17 +15059,30 @@ class WebServer:
                 return last[:64]
         return peer_ip or "-"
 
+    def account_private(self) -> bool:
+        """A real account is behind the data: a real-trading key is configured, or the records hold real orders (a
+        database kept after the key was removed). Its account, orders, positions and trade records are then shown only
+        with the control key, and data.json, which the page link alone opens, goes without the trader's own lines
+        (page_payload)."""
+        return bool(getattr(self.bot.config, "live_key", "")) or self.bot.sim_has_real()
+
     def journal_locked(self) -> bool:
         """The review data (every trade with its fills, costs and real order records) needs the control key once a
         real-trading key is configured, or the records hold real orders (a database kept after the key was removed):
-        the page token alone shows the odds, never an account's activity."""
-        return bool(self.bot.config.web_control_key) and (bool(getattr(self.bot.config, "live_key", "")) or self.bot.sim_has_real())
+        the page token alone shows the odds, never an account's activity. 1.150.0: this holds with WEB_CONTROL_KEY unset
+        too (the data is then refused, see key_check), where before the lock was off and anyone with the page link read
+        the account's whole trade history."""
+        return self.account_private()
 
     def key_check(self, head: str, client: str) -> tuple[int, str] | None:
         """None when X-Control-Key carries the configured key; else (status, message), the failure counted."""
         configured = self.bot.config.web_control_key
         if not configured:
-            return None
+            # 1.150.0: no key to check. A paper bot's view-only console stays open; a real account's data fails closed
+            # (no failure counted: nobody guessed wrong, there is nothing to guess), since the page token alone must
+            # never show an account, its orders or its trades.
+            return None if not self.account_private() else (
+                403, "未设置 WEB_CONTROL_KEY：实盘账户的数据（账户、订单、持仓、交易记录）不对外显示，请在环境变量设置 WEB_CONTROL_KEY（12～64 个字符）后重启")
         now = time.monotonic()
         if now < self.control_global_lock_until:
             return 429, f"口令错误次数过多（全站），{int(self.control_global_lock_until - now) + 1} 秒后再试"
@@ -14685,8 +15125,8 @@ class WebServer:
                                           json.dumps({"ok": False, "locked": True, "message": message}, ensure_ascii=False).encode("utf-8"))
         full = lambda: (200, "application/json; charset=utf-8", self.cached(
             "control.json", lambda: json.dumps(self.bot.control_payload(), ensure_ascii=False, default=str).encode("utf-8")))
-        if not self.bot.config.web_control_key:
-            return full()  # no key configured: the page is view-only and says so
+        if not self.bot.config.web_control_key and not self.account_private():
+            return full()  # no key configured and no real account behind it: the page is view-only and says so
         if failed := self.key_check(head, client):
             return answer(*failed)
         return full()
@@ -15480,7 +15920,8 @@ def parse_close_entries(raw: str, now_ms: int, command: str = "/setclose") -> li
 
 class Bot:
     def __init__(self, config: Config, store: Store, market: Binance, telegram: Telegram):
-        config = self.control_config(config, store)  # the control page's saved changes, on top of the environment
+        # the control page's saved changes, on top of the environment; what no longer validates is dropped (run() says so)
+        config, self.control_dropped = self.control_config(config, store)
         self.config, self.store, self.market, self.telegram = config, store, market, telegram
         SOURCE_HEALTH.off = config.sources_off
         self.snapshots: dict[str, dict] = {}
@@ -15539,9 +15980,7 @@ class Bot:
                 continue  # a US stock's touch market (1.146.0): Yahoo's prices, nothing on Binance
             if isinstance(card, IndexUpDownMarket) and card.VENUE == "futures":  # a spot window (BTC 15分涨跌) is priced by its pair's trades
                 self.index_markets.setdefault(card.spec.symbol, []).append(card)
-                ticker = config.tickers.get(card.spec.symbol)  # LEAD_QUOTE: the stock's exchange quote (StockMarket.live_quote) leads the index
-                card.lead_code = ticker.code if ticker is not None else ""
-                card.lead_mode = config.lead_quote if ticker is not None else "off"
+                self.lead_route(card, config)  # LEAD_QUOTE: the stock's exchange quote (StockMarket.live_quote) leads the index
                 continue
             self.pair_markets.setdefault(("spot", card.spec.symbol), []).append(card)
         for rm in self.ranges.values():
@@ -15590,11 +16029,17 @@ class Bot:
         self.tally_gate = asyncio.Semaphore(3)  # ...three reads at a time
         self.sim_report_cache: dict[tuple, dict] = {}  # the last sim_report per arguments, while the records stand
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
+        self.edge_swept = False  # ...whose first look clears the delivery records an earlier version left above their stream's count (1.150.0)
         self.reference_pool: ThreadPoolExecutor | None = None
         self.diag_pool: ThreadPoolExecutor | None = None  # /diag's probes run here, not on the feeds' pool
         self.speed_pool: ThreadPoolExecutor | None = None  # /speed's requests (1.145.0), likewise
         self.reference_state: dict[str, dict] = {}  # per background feed: last success, last error, duration
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
+        # 1.150.0 (audit FEED-MARK-VS-LAST), the contract cards: which candle a symbol's anchor above is — (that close,
+        # "成交价" | "标记价": the closing minute did not trade); none recorded for the close = 成交价 — and Binance's MARK
+        # price at that same close, what a quote that stands on the mark is compared with (contract_anchor)
+        self.anchor_kinds: dict[str, tuple[int, str]] = {}
+        self.anchor_marks: dict[str, tuple[int, D]] = {}
         self.close_print_why: dict[str, str] = {}  # symbol -> why today's closing print could not be noted (note_live_close)
         self.kospi_anchor_note, self.kospi_anchor_error = "", ""
         self.pred_last: dict[str, int] = {}  # index -> ms of the last saved prediction snapshot
@@ -15629,6 +16074,9 @@ class Bot:
         self.last_log: dict[str, float] = {}
         self.command_notice: dict[int, float] = {}
         self.username = ""
+        self.telegram_ok = False  # the start-up check passed in this process (telegram_hello): commands are polled only then
+        self.hello_failures = 0   # its tries in a row that found Telegram out of reach, and (monotonic) the earliest moment
+        self.hello_next = 0.0     # of the next one: the commands loop's back-off
         self.handlers = {
             "/help": self.cmd_help, "/id": self.cmd_id, "/status": self.cmd_status, "/test": self.cmd_test,
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
@@ -16180,10 +16628,26 @@ class Bot:
         for symbol, ticker in self.config.tickers.items():
             self.note_live_close(symbol, ticker, now_ms)
             close_ms = self.odds_base(symbol, now_ms)[0]
-            if close_ms and self.anchors.get(symbol, (0,))[0] != close_ms and self.retry_ok(symbol):
-                with contextlib.suppress(Exception):
-                    price, _ = await self.market.price_at(symbol, close_ms)
-                    self.anchors[symbol] = (close_ms, price)
+            # 1.150.0 (audit FEED-MARK-VS-LAST): the candle's kind is kept (it was dropped here), and the mark candle of the
+            # same minute is read too — one more request per symbol and close, none when the minute did not trade (the
+            # anchor is that candle then). The card's quote is the last trade while it is fresh and Binance's mark price
+            # otherwise (Quote.parse); each is compared with its own kind at the close (contract_anchor). A mark candle that
+            # could not be read is asked again with the next attempt (retry_ok: one a minute); the trade candle in hand is not
+            anchored = self.anchors.get(symbol, (0,))[0] == close_ms
+            marked = self.anchor_marks.get(symbol, (0,))[0] == close_ms
+            if close_ms and not (anchored and marked) and self.retry_ok(symbol):
+                if not anchored:
+                    with contextlib.suppress(Exception):
+                        price, kind = await self.market.price_at(symbol, close_ms)
+                        self.anchors[symbol], self.anchor_kinds[symbol] = (close_ms, price), (close_ms, kind)
+                        anchored = True
+                if anchored:
+                    with contextlib.suppress(Exception):
+                        if self.anchor_kinds.get(symbol) == (close_ms, "标记价"):
+                            mark = self.anchors[symbol][1]
+                        else:
+                            mark, _ = await self.market.price_at(symbol, close_ms, ("标记价",))
+                        self.anchor_marks[symbol] = (close_ms, mark)
             if self.vols.due(symbol):
                 # The stock's own exchange sessions (close to close, opens kept so the opening gap and the in-session
                 # part split as for the indices) – not Binance's 24-hour candles, which mix in nights and weekends.
@@ -16325,9 +16789,10 @@ class Bot:
 
     def predict_mid(self, key: str, slug: str, now_ms: int) -> float | None:
         """The 涨 / Yes middle of the Predict book a card is compared with right now (None without a fresh book for
-        that very market)."""
-        book = self.predict.books.get(key)
-        if book is None or (slug and book.slug != slug) or book.stale(now_ms):
+        that very market, or with one the names say is not 涨's: close_book — /calib would score the model against the
+        other outcome's price)."""
+        book, _ = self.close_book(key, slug)
+        if book is None or book.stale(now_ms):
             return None
         return side_mid(book, "up")
 
@@ -16958,7 +17423,7 @@ class Bot:
             quote = (self.snapshots.get(symbol) or {}).get("quote")
             if quote:
                 cards.append((symbol, f"{NAMES.get(symbol, symbol)}｜{symbol}",
-                              lambda now, symbol=symbol, quote=quote: self.contract_odds(symbol, quote.price, now, quote.timestamp_ms)))
+                              lambda now, symbol=symbol, quote=quote: self.contract_odds(symbol, quote.price, now, quote.timestamp_ms, quote.source)))
         for key, title, odds_of in cards:
             raw = odds_of(now_ms)
             if not isinstance(raw, CloseOdds) or now_ms - self.pred_last.get(key, -PRED_EVERY_MS) < PRED_EVERY_MS:
@@ -16985,8 +17450,12 @@ class Bot:
                 "ref_raw": float(raw.ref), "up_raw": raw.fair_up, "strike": float(shown.ref) if shown.ref != raw.ref else None,
                 "move": raw.move, "beta": raw.beta, "sigma": raw.sigma_daily * raw.widen, "widen": raw.widen, "R": raw.remaining, "proxy": raw.proxy_note,
                 "trend": trend,  # ln(effective / the snapshot before's), about half an hour: the direction the price had been going (1.120.2)
-                "calib": self.vols.calib.get((key, raw.mode), (1.0, 0))[0],  # the factor in that σ: the residuals are taken on the raw one
-                "sigma_raw": raw.sigma_daily * raw.widen / self.vols.calib.get((key, raw.mode), (1.0, 0))[0],
+                # the factor in that σ — the one VolBook.get applied (1.150.0: not a stored one within 0.005 of 1 it skipped) — and
+                # the σ without it: the residuals are taken on the raw one. Raw now also on a big-move day: the widen is measured
+                # against the day σ before the factor (sigma_day in the card builders), so dividing the factor out leaves the σ
+                # the card would price with SIGMA_CALIB off
+                "calib": self.vols.factor(key, raw.mode),
+                "sigma_raw": raw.sigma_daily * raw.widen / self.vols.factor(key, raw.mode),
                 "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else "",
                 **(self.sse_alt(raw, shown) if key == "SSE" else {})})
         if time.time() - self.pred_pruned > 86400:  # the snapshots are kept PRED_KEEP_DAYS, not forever
@@ -17172,7 +17641,12 @@ class Bot:
             return None
         holidays = self.config.holidays.get("sh", frozenset())
         sigma, sigma_note = self.vols.get("SSE", "SSE")
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen). 1.150.0: the closes' own, before
+        # SIGMA_CALIB's factor — the calibrated one cancelled the 盘后 factor out of a big move's σ ahead (|move|·√R/1.5 whatever
+        # it was) while the snapshot still divided it out (its "raw" σ not raw: the factor fed on itself), and carried the 盘后
+        # factor into the in-session card (a factor 1.4 took KOSPI's in-session widen on a −3% day from 1.43 to 1.02). The card
+        # keeps it as CloseOdds.sigma_day, so sim_against_move's "N 个日 σ" is this σ too, as on the stock cards
+        sigma_day = self.vols.get("SSE", "SSE", calibrated=False)[0]
         close = self.cn.close
         if self.cn.sse_session(now_ms)[0]:
             # the session runs: only today's own, fresh print prices it (never a frozen or yesterday's quote, and
@@ -17318,8 +17792,38 @@ class Bot:
             note += f"（交易所日K未取得：{brief_error(self.vol_errors[symbol], 50)}）"
         return sigma, note
 
-    def contract_odds(self, symbol: str, price: D, now_ms: int, quote_ms: int = 0) -> CloseOdds | str | None:
-        """quote_ms: when the Binance price was quoted (0 = just now); an old one cannot map the move."""
+    def contract_anchor(self, symbol: str, source: str) -> tuple[tuple[int, D] | None, str, str]:
+        """(the Binance price at the reference close that a quote of ``source`` — Quote.source: "last" | "mark" — is
+        compared with, that anchor's kind, "" or why nothing is suggested from the pair yet).
+        1.150.0 (audit FEED-MARK-VS-LAST): like with like. A contract card's quote is the last trade while that is fresh
+        (MAX_PRICE_AGE_SECONDS) and Binance's mark price once it is not (Quote.parse); its anchor was the trade candle of
+        the closing minute, the kind dropped. So a thin contract's mark was divided by a trade, and the gap between the
+        two kinds at the close read as a move of the stock since: with the mark 0.29% from the closing trade the 涨 fair
+        price went 50.0¢ → 53.8¢ the moment the last trade turned 120 s old, nothing having traded, the express lane
+        woken, 300 shares bought on paper at 42¢. As the KR200 proxy has it (kr200_price: 两边同口径), a quote on the mark
+        is now compared with the mark candle of that same minute (refresh_odds_inputs reads it beside the trade candle).
+        While that candle is not read yet (a failed request, asked again a minute later) the trade candle still gives
+        the estimate, said so and with nothing suggested from it — the reason returned becomes CloseOdds.warn, as an
+        approximate HSI anchor's does.
+        The other way round is left as it was: a closing minute without a trade has no trade candle (price_at's anchor
+        is its mark candle then), so a fresh trade can only be compared with that mark, as before — the pair now named in
+        the card's note and marked approximate in the evidence. Holding it would silence the card for two minutes after
+        every trade on such a night, for a gap no larger than the one a trade ÷ trade estimate carries at either end."""
+        anchor = self.anchors.get(symbol)
+        if anchor is None:
+            return None, "", ""
+        kind = "标记价" if self.anchor_kinds.get(symbol) == (anchor[0], "标记价") else "成交价"
+        if source == "mark" and kind == "成交价":
+            mark = self.anchor_marks.get(symbol)
+            if mark is not None and mark[0] == anchor[0]:
+                return mark, "标记价", ""
+            return anchor, kind, "币安现价是标记价（最新成交已过期），收盘时刻的标记价尚未取到、锚点暂用成交价：口径不同，估算只是近似"
+        return anchor, kind, ""
+
+    def contract_odds(self, symbol: str, price: D, now_ms: int, quote_ms: int = 0, source: str = "last") -> CloseOdds | str | None:
+        """quote_ms: when the Binance price was quoted (0 = just now); an old one cannot map the move. source: which
+        price it is (Quote.source: "last" | "mark") — after hours it is compared with its own kind at the close
+        (contract_anchor)."""
         ticker = self.config.tickers.get(symbol)
         if not self.config.probability or not ticker:
             return None
@@ -17327,13 +17831,15 @@ class Bot:
         base_ms, base_value, base_label = self.odds_base(symbol, now_ms)
         if not base_ms:
             return "缺少带收盘时刻的交易所收盘价"
-        anchor = self.anchors.get(symbol)
+        anchor, anchor_kind, waiting = self.contract_anchor(symbol, source)
         info = STOCK_MARKETS[ticker.market]
         holidays = self.config.holidays.get(ticker.market, frozenset())
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         close_date = dt.datetime.fromtimestamp(base_ms / 1000, tz).date()
         sigma, sigma_note = self.stock_sigma(symbol, ticker.market)
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen) — before any SIGMA_CALIB factor, as
+        # the index cards' (1.150.0; a stock card has none today: index_sigma_calibs measures the index cards alone)
+        sigma_day = self.vols.get(symbol, ticker.market, calibrated=False)[0]
         unit = "" if ticker.same_unit else ((ref.currency if ref else "") or info.currency)
         live, live_why = self.stocks.live_quote(symbol, now_ms)
         closed_today = close_date == dt.datetime.fromtimestamp(now_ms / 1000, tz).date() and base_ms <= now_ms
@@ -17367,11 +17873,18 @@ class Bot:
             return f"币安行情已 {(now_ms - quote_ms) // 1000} 秒未更新，暂不输出新概率"
         remaining, target = session_remaining(ticker.market, now_ms, close_date, holidays)
         move = percent(price, anchor[1])
-        return close_odds(NAMES.get(symbol, symbol), base_value, base_value * price / anchor[1], sigma, remaining, target,
+        # 1.150.0 (audit FEED-MARK-VS-LAST): with the mark on either side both kinds are named (a trade against a trade reads
+        # as it always did); a mark quote still waiting for its mark candle: the estimate is shown with the reason, and
+        # nothing is suggested from it (contract_anchor)
+        named = source == "mark" or anchor_kind == "标记价"
+        pair = (f"币安 {'标记价' if source == 'mark' else '最新成交'} {fmt_price(price)} / 收盘时刻 {anchor_kind} {fmt_price(anchor[1])}"
+                if named else f"币安 {fmt_price(price)} / 收盘时刻 {fmt_price(anchor[1])}")
+        odds = close_odds(NAMES.get(symbol, symbol), base_value, base_value * price / anchor[1], sigma, remaining, target,
                           price_tick(ticker.market, base_value), base_label,
-                          f"币安 {fmt_price(price)} / 收盘时刻 {fmt_price(anchor[1])} → {move:+.3f}%"
+                          f"{pair} → {move:+.3f}%"
                           + (f"｜{live_why}，暂用币安" if live_why else ""), sigma_note, unit, mode="盘后",  # 1.120.3: a proxy estimate, as the index cards' are labelled
                           sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
+        return dataclasses.replace(odds, warn=waiting) if waiting else odds
 
     HSI_PRINT_MS = 5 * 60_000  # the first futures print this soon after the 16:10 cash close is its anchor
 
@@ -17493,7 +18006,8 @@ class Bot:
         holidays = self.hsi.holidays
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
         sigma, sigma_note = self.vols.get("HSI", "HSI")
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen) — before SIGMA_CALIB's factor (1.150.0, see sse_odds)
+        sigma_day = self.vols.get("HSI", "HSI", calibrated=False)[0]
         if self.hsi.cash_open(now_ms):
             # the cash session runs: only today's own, fresh index prices it (never yesterday's page or a frozen feed)
             why = self.hsi.spot_problem(q, now_ms) or self.hsi.spot_still(q, now_ms)
@@ -17526,7 +18040,11 @@ class Bot:
         odds = close_odds("恒生指数", ref, ref * used.last / anchor, sigma, remaining, target, D("0.01"), ref_note,
                           f"{label} {fmt(used.last)} / {anchor_note} {fmt(anchor)} → {percent(used.last, anchor):+.3f}%",
                           sigma_note, mode="盘后", sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
-        return dataclasses.replace(odds, warn="期货锚点是近似值，暂不给建议") if approximate else odds
+        # 1.150.0 (audit FEED-HSI-FUTURES-STALE): a futures quote that stands for the market (futures_problem: ten minutes
+        # without a change while a session trades) may still be too still to trade on — or, first read after a start, of
+        # no known age: the estimate is shown with the reason and nothing is suggested from it (futures_hold)
+        hold = "期货锚点是近似值，暂不给建议" if approximate else self.hsi.futures_hold(used, now_ms)
+        return dataclasses.replace(odds, warn=hold) if hold else odds
 
     A50_SOFT_STALE_MS = 60 * 60_000  # A50 silent longer than this: no odds at all (shorter: odds with a warning)
     HL_STALE_MS = 10 * 60_000  # an HL mark older than this (refresh failing) is not used for new probabilities
@@ -17543,7 +18061,8 @@ class Bot:
         if k is None:
             return "缺少 KOSPI"
         sigma, sigma_note = self.vols.get("KOSPI", "KOSPI")
-        sigma_day = sigma  # the whole day's σ: what the move already made is measured against (big_move_widen)
+        # the whole day's σ: what the move already made is measured against (big_move_widen) — before SIGMA_CALIB's factor (1.150.0, see sse_odds)
+        sigma_day = self.vols.get("KOSPI", "KOSPI", calibrated=False)[0]
         kst = dt.timezone(dt.timedelta(hours=9))
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
         holidays = self.config.holidays.get("kr", frozenset())
@@ -17621,7 +18140,8 @@ class Bot:
             snapshot = self.snapshots.get(symbol) or {}
             quote = snapshot.get("quote")
             thunks.append((f"{NAMES.get(symbol, symbol)}｜{symbol}",
-                           lambda symbol=symbol, quote=quote: self.contract_odds(symbol, quote.price, now_ms, quote.timestamp_ms) if quote else "等待行情"))
+                           lambda symbol=symbol, quote=quote: (self.contract_odds(symbol, quote.price, now_ms, quote.timestamp_ms, quote.source)
+                                                               if quote else "等待行情")))
         items = [(title, thunk()) for title, thunk in thunks if only is None or self.predict_key(title) == only]
         return [(title, self.settle_on_strike(title, odds)) for title, odds in items if odds is not None]
 
@@ -17642,10 +18162,16 @@ class Bot:
         tick = price_tick(ticker.market, strike) if ticker and "｜" in title else D("0.01")
         # A proxy-mapped estimate is "our close × proxy move": move it onto the settlement close too.
         effective = odds.effective if odds.direct else odds.effective * strike / odds.ref
+        # 1.150.0: the whole day's σ goes along (sigma_day). Left out, close_odds stored sigma_daily in its place — in session
+        # only the open-to-close part, after hours the σ with SIGMA_CALIB's 盘后 factor — and SIM_AGAINST_MOVE_SIGMAS, a count
+        # of whole-day σ (sim_against_move), measured the day's move against that whenever Predict's figure was known: early
+        # where that σ is the smaller one (a stock card in session: at 0.7–0.8 of the configured count), late where it is the
+        # larger (a 盘中 factor of 1.5, a 盘后 one of 1.4: a buy let into the move the rule was set to refuse, a resting bid
+        # kept). The widen goes as it is, so the prices are what they were (no big-move pass here: the σ note is not doubled)
         return dataclasses.replace(
             close_odds(odds.name, strike, effective, odds.sigma_daily, odds.remaining, odds.target, tick,
                        f"Predict 目标价（本地参考 {fmt(odds.ref)}·{odds.ref_note}）", odds.proxy_note, odds.sigma_note,
-                       odds.unit, odds.beta, odds.mode, widen=odds.widen), warn=odds.warn)
+                       odds.unit, odds.beta, odds.mode, sigma_day=odds.sigma_day, widen=odds.widen), warn=odds.warn)
 
     def odds_payload(self) -> dict:
         """JSON for the web page: one entry per item, numbers raw, text already plain."""
@@ -17697,7 +18223,10 @@ class Bot:
             except Exception as error:  # the cards stand without it
                 self.log_limited("maker-line", f"挂单判断计算失败：{clean_error(error) or type(error).__name__}")
                 makers = {}
-            for item in items:  # each priced book block says how far the trader is from taking it (距吃单), and what it rests (1.138.1)
+            # each priced book block says how far the trader is from taking it (距吃单), and what it rests (1.138.1). Both, and
+            # the nearest markets below, are built from the trader's orders and positions: with a real account behind it
+            # data.json leaves them out (page_payload, 1.150.0) — whatever else is added here of the trader's own must go the same way
+            for item in items:
                 ladder = item.get("ladder") if isinstance(item.get("ladder"), dict) else {}
                 for block in [item.get("predict"), *(ladder.get("rows") or [])]:
                     if isinstance(block, dict) and str(block.get("market_id") or "") in gaps:
@@ -17802,6 +18331,30 @@ class Bot:
                     "sigma_note": touch.SIGMA_NOTE, "left": touch.left_text(now_ms), "feed": touch.FEED, "model": touch.MODEL_NOTE,  # 1.146.0
                     "p_low": odds.lower, "p_high": odds.upper, "p_none": odds.none,
                     "error": touch.error, "hold": hold}}
+
+    def close_book(self, key: str, slug: str = "") -> tuple[PredictBook | None, str]:
+        """A daily index / stock card's book as 涨 — with ``slug``, that very market's (the finished day's book is no
+        book for the next day's card) — or (None, why) when the market's names say the book is not 涨's.
+        1.150.0 (audit FEED-CLOSE-BOOK-ORIENT): Predict's book prices the market's FIRST outcome, and these cards took it
+        for 涨 just as it came, while the real order's token (live.outcome_for_side) and the result (resolution_up) go
+        by the outcome names. On a market listed Down / No first every figure of the card would be the other outcome's:
+        the edges and the suggestion (the page, /book, /prob, the auction reminder), the paper fills (settled by the
+        name), a real order's price, limit and count, the market price /calib scores the model against. Such a book is
+        held — nothing compared, nothing traded — rather than turned over (flip_book, as updown_book does): no daily
+        market has been listed that way so far, so what its book really prices has never been seen, and trading one the
+        first day it shows up is the owner's call, not a default. The names are the ones the fee's refresh keeps
+        (PredictFeed.market_fee → market_meta, read before the book and every PREDICT_META_SECONDS): no request of its
+        own. Not read (the details failing) or saying neither way: the book as it comes, as before — a real order is
+        refused all the same, on the trader's own read of the names (a mismatch noted by outcome_for_side; names that
+        say neither way were refused already)."""
+        book = self.predict.books.get(key)
+        if book is None or (slug and book.slug != slug):
+            return None, ""
+        meta = (self.predict.market_meta.get(str(book.market_id)) or ({}, 0))[0]
+        names = (meta.get("outcomes") if isinstance(meta, dict) else None) or []
+        if second_outcome_up(names):
+            return None, f"盘口方向未确认（结果名称：{'、'.join(map(str, names))}，按名称第一个结果不是涨），暂不比较"
+        return book, ""
 
     def updown_book(self, spec: UpDownSpec) -> tuple[PredictBook | None, str]:
         """The book priced as "Up" (the card's 涨 side), whatever the market's outcome order — this market's: a daily
@@ -18102,13 +18655,21 @@ class Bot:
                     sources.append(price_evidence(f"{info.name if info else ''}现货", live.source, code, "最新价", live.last,
                                                   live.quoted_ms, live.fetched_ms))
             else:
-                quote, anchor = (self.snapshots.get(symbol) or {}).get("quote"), self.anchors.get(symbol)
+                quote = (self.snapshots.get(symbol) or {}).get("quote")
                 if quote is not None:
                     kind = "最新成交价" if quote.source == "last" else "标记价"
+                    # 1.150.0 (audit FEED-MARK-VS-LAST): the anchor the odds are mapped from is the quote's own kind at the
+                    # close where there is one (contract_anchor: the mark candle for a quote on the mark) — named when the
+                    # mark is on either side, and marked approximate when the two are not of one kind
+                    anchor, anchor_kind, _ = self.contract_anchor(symbol, quote.source)
+                    unlike = anchor is not None and (quote.source == "mark") != (anchor_kind == "标记价")
+                    note = "收盘时刻的币安价格"
+                    if anchor is not None and (quote.source == "mark" or anchor_kind == "标记价"):
+                        note = f"收盘时刻的币安{anchor_kind}" + (f"（现价是{kind}，口径不同）" if unlike else "")
                     sources.append(price_evidence("币安合约", "币安 U 本位合约", symbol, kind, quote.price, quote.timestamp_ms))
                     proxy = {"proxy": f"币安 {symbol} 合约", "price": float(quote.price), "quoted_ms": quote.timestamp_ms,
                              "anchor": float(anchor[1]) if anchor else None, "anchor_ms": anchor[0] if anchor else 0,
-                             "anchor_note": "收盘时刻的币安价格", "approx": False}
+                             "anchor_note": note, "approx": unlike}
         return {"basis": basis, "sources": sources, "proxy": proxy}
 
     def market_evidence(self, kind: str, now_ms: int, **parts: Any) -> dict:
@@ -18259,9 +18820,12 @@ class Bot:
                 # session's market, which Predict may not list yet, while the finished day's book is still cached until the
                 # next Predict refresh: judged against tomorrow's fair price its 1¢ asks looked like a bargain (10-08, three
                 # markets). So the slug comes from the card's target, not from the refresher's last target list.
+                # 1.150.0 (audit FEED-CLOSE-BOOK-ORIENT): and it must be 涨's — a market listed Down / No first is not priced,
+                # on paper or for real (close_book), as the other kinds' books are oriented by their names below
                 stem = self.config.predict_slugs.get(key)
-                slug, book = predict_slug(stem, odds.target) if stem else "", self.predict.books.get(key)
-                if not slug or book is None or book.slug != slug:
+                slug = predict_slug(stem, odds.target) if stem else ""
+                book = self.close_book(key, slug)[0] if slug else None
+                if book is None:
                     continue
                 name, _, symbol = title.partition("｜")
                 close_ms, _ = self.target_close(title, odds.target)
@@ -18297,7 +18861,8 @@ class Bot:
                 out.append(SimMarket(mkt.spec.slug, mkt.spec.name, "updown", mkt.spec.key, odds.fair_up, book,
                                      self.edge_need(mkt.model_swing(odds)), self.updown_hold(mkt, odds, now_ms)[0], ("涨", "跌"),
                                      self.updown_settle(mkt.spec),
-                                     self.evidence(lambda mkt=mkt, odds=odds: self.market_evidence("updown", now_ms, mkt=mkt, odds=odds))))
+                                     self.evidence(lambda mkt=mkt, odds=odds: self.market_evidence("updown", now_ms, mkt=mkt, odds=odds)),
+                                     price_problem="" if odds.settled else mkt.price_problem(now_ms)))
         for fm in self.flips.values():
             if only is not None and fm.spec.key != only:
                 continue
@@ -18553,10 +19118,12 @@ class Bot:
     def sim_withdraw_reason(self, trade: dict, mk: SimMarket | None, now_ms: int | None = None) -> str:
         """Why a resting paper order is withdrawn now rather than left to the result: the trader no longer places such
         orders (SIM_WAYS, SIM_MARKETS, a kind that is taker-only such as the price ladders), the market is in its
-        last minutes (SIM_QUIET_MINUTES), or what is left of the order is a fraction of a share that never fills
-        (SIM_MAKER_DUST_SHARES, 1.118.0). "" while it stands."""
+        last minutes (SIM_QUIET_MINUTES), what is left of the order is a fraction of a share that never fills
+        (SIM_MAKER_DUST_SHARES, 1.118.0), or it rests on a US stock's first-touch card between two sessions
+        (sim_stock_touch_closed, 1.150.0). "" while it stands."""
         kind = str(trade.get("kind") or "")
-        quiet = self.sim_quiet(trade.get("settle") or (mk.settle if mk is not None else None), self.market.now_ms() if now_ms is None else now_ms)
+        now = self.market.now_ms() if now_ms is None else now_ms
+        quiet = self.sim_quiet(trade.get("settle") or (mk.settle if mk is not None else None), now)
         if quiet:
             return quiet
         if trade.get("maker") and trade.get("status") == "resting" and float(trade.get("shares") or 0) > 1e-9:
@@ -18573,7 +19140,39 @@ class Bot:
             return f"详细选项已排除{trade.get('item') or trade.get('key')}"
         if (kind == "range" and not RANGE_SIM_MAKERS) or (mk is not None and not mk.makers):
             return f"{SIM_KINDS.get(kind, kind)}只做吃单"
-        return ""
+        return self.sim_stock_touch_closed(trade, now)  # last: where one of the reasons above applies, its words stand as they did
+
+    def sim_stock_touch_closed(self, trade: dict, now_ms: int) -> str:
+        """Why a resting order on a US stock's first-touch card (StockTouchMarket: NVDA 先触 $160 / $210) is withdrawn as
+        soon as the regular session is over — at the step's first look after the bell (a 13:00 early close too), and at
+        any look between two sessions (a restart overnight, a weekend) — whatever SIM_NO_ODDS_WITHDRAW_MINUTES says
+        (1.150.0). The card stops advising at the close, and its hold says why: the price in hand is the closing print
+        and stays so until the next open (Yahoo's regular-session trade knows nothing of the after hours; Binance's
+        index is refused out of the session), while the stock trades on — a quote on the close is a free option for
+        whoever saw the after-hours move. But the hold only kept new orders away. The one already resting stood under
+        it unjudged (sim_requote_reason: no exit line, no 买1 followed), and the rules that end a quote with its session
+        are the daily cards' alone (SIM_MAKER_SESSION wants in_session False — a first-touch market's is None — and
+        sim_open_quiet / sim_against_move are kind "close" only), so it stood until sim_unpriced_reason's clock ran
+        out: 30 minutes by default, 60 or 120 on the control page's presets, all night at 0. NVDA reports some twenty
+        minutes after the bell: the bid was still up, at the close's fair price, when the results came out — on Predict
+        too with LIVE on, where a resting order lives until it is cancelled (its own expiry is the market's deadline).
+        That clock's grace is for a hold that passes (a feed's hiccup is not worth a cancel and a new order); this one
+        is on the calendar and lasts until the next open, so the wait bought nothing — the daily cards' orders go at
+        their close as well (SIM_MAKER_SESSION, on by default). Read from the record's own kind and key, not from
+        ``mk``: the order goes just the same when the card shows no odds (Yahoo silent after hours: no SimMarket), and
+        a resting order decided before the bell and held back past it (a cooldown, a sign-in) is voided at the send
+        (LiveBot.live_taker_recheck asks sim_withdraw_reason). Only where the card itself holds (advice_problem) —
+        between two sessions that is every state of it but a line already reached: decided, the after hours move
+        nothing and the order is left to the result, as before — so nothing takes the order's place (sim_maker_gate):
+        it is one cancel a day, never a cancel and a new order, and the next order is the next session's, on a price
+        of that session. The crypto first-touch cards (they trade around the clock) and a taker's record are left as
+        they were. "" otherwise."""
+        if not trade.get("maker") or trade.get("kind") != "touch":
+            return ""
+        card = self.touches.get(str(trade.get("key") or ""))
+        if not isinstance(card, StockTouchMarket) or us_session_state(now_ms)[0] == "交易中" or not card.advice_problem(now_ms):
+            return ""
+        return "美股已收盘：盘前盘后的价格不算数、但会影响开盘价，按收盘价挂着的单会被知道盘后行情的人吃掉，收盘即撤（开盘后再挂）"
 
     @staticmethod
     def sim_own_resting(trades: dict[str, dict], market: str, side: str, book: PredictBook | None = None) -> tuple[float, float | None]:
@@ -18581,18 +19180,32 @@ class Bot:
         the resting one, else the latest whose cancel Predict confirmed after ``book`` was read (live_cancel's
         cancel_done_ms: the book may show the order until the next push, and the order that takes a cancelled one's
         place is decided on that very book — it must not join its own ghost as the valid 买1; 1.104.6). (0, None) when
-        there is none."""
+        there is none. 1.150.0 (audit FEED-FETCHED-MS): "read" is when the book's levels were taken (book_content_ms), not
+        its fetched_ms: a REST read asked before the confirmation and landing after it, or the old levels pushed again
+        after it, still show the order under a later stamp — the ghost then counted as somebody's 买1, and the next real
+        order joined a level holding 20 shares of others. Such a book may as well not show it any more (ghost_unsure):
+        what stands at its price may be somebody else's, and a deep-bid order is not placed onto it (sim_maker_reason)."""
+        t = Bot.sim_own_order(trades, market, side, book)
+        if t is None:
+            return 0.0, None
+        return max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0), float(t.get("price") or 0)
+
+    @staticmethod
+    def sim_own_order(trades: dict[str, dict], market: str, side: str, book: PredictBook | None = None) -> dict | None:
+        """The record sim_own_resting's shares and price are of: the real order resting on a market's side, else the
+        latest with shares unfilled whose cancel Predict confirmed after ``book``'s levels were taken; None when there
+        is none."""
         ghost = None
         for t in trades_of_market(trades, market):
             if t.get("side") != side or not t.get("maker") or not isinstance(t.get("live"), dict):
                 continue
-            own = max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0)
             if t.get("status") == "resting":
-                return own, float(t.get("price") or 0)
+                return t
             done = int(t["live"].get("cancel_done_ms") or 0)
-            if book is not None and done and book.fetched_ms <= done and own > 1e-9 and (ghost is None or done > ghost[0]):
-                ghost = (done, own, float(t.get("price") or 0))
-        return (ghost[1], ghost[2]) if ghost else (0.0, None)
+            if (book is not None and done and book_content_ms(book) <= done and float(t.get("order") or 0) - float(t.get("shares") or 0) > 1e-9
+                    and (ghost is None or done > int(ghost["live"]["cancel_done_ms"]))):
+                ghost = t
+        return ghost
 
     def sim_in_scope(self, mk: SimMarket) -> bool:
         """Whether the paper trader trades this market: its kind is on (SIM_MARKETS) and it is not left out by name (SIM_SKIP)."""
@@ -18665,7 +19278,7 @@ class Bot:
         deep_bar = self.sim_maker_mode(mk, True)[0] if front_ok or wide else c.sim_maker_deep  # the deep-bid orders' bar here: SIM_MAKER_DEEP_CENTS, or the after-hours bar when higher
         limit = self.sim_after_hours_price(mk)  # after hours only at or under SIM_AFTER_HOURS_MAX_PRICE_CENTS
         maker_bar = self.sim_maker_mode(mk)[0]  # an ordinary order's bar here (SIM_MAKER_DEEPER looks under 买1 for it)
-        cands, joined, dear, capped = [], None, None, []  # joined / dear / capped: what was passed over or cut, for the reason when nothing is left
+        cands, joined, dear, capped, ghosted = [], None, None, [], ""  # joined / dear / capped / ghosted: what was passed over or cut, for the reason when nothing is left
         for side, name in (("up", "涨"), ("down", "跌")):
             fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: a near-certain side is judged at the limit, no higher
             if cut > 0:
@@ -18699,6 +19312,26 @@ class Bot:
                     sides_seen[side] = {"why": f"只挂低价挂单：买1 之上 1¢ 和下面都留不出 {cents(deep_bar)}（跟买1 也只有 {cents(fair - level[0])}）"}
                     continue
             price, queued = (sweep[0], sweep[1]) if sweep else front if use_front else level
+            if ((use_front or sweep is not None) and own_price is not None and abs(price - own_price) < 1e-9
+                    and bid_shares(mk.book, side, price) >= SIM_MAKER_FRONT_MIN - 1e-9
+                    and ghost_unsure(self.sim_own_order(trades, mk.market, side, mk.book), mk.book)):
+                # 1.150.0 (audit FEED-FETCHED-MS): a deep-bid order goes a cent over the best bid of anyone else — onto an
+                # empty price. Here it would go onto a bid: at the very price of the order just cancelled, whose shares
+                # were taken out of this level (sim_own_resting) because the book's levels were taken before Predict
+                # confirmed the cancel — on a book the bot has heard of since the cancel went out (ghost_unsure). That
+                # bid is the cancelled order still shown — then this is the place — or somebody else's, the order
+                # already off the book (the push of a cancel can beat its HTTP confirmation) — then the place is a cent
+                # over it; the book cannot tell which. Placed here beside somebody's 100 it was "pushed off the front"
+                # on the next book, withdrawn, and placed here again, the level read the same way after every cancel: 8
+                # orders and 8 cancels in 30 s, until the cold round's read (before content_ms the next re-send ended
+                # the doubt within the lane's cooldown). So the side waits for a book taken after the confirmation — a
+                # changed push, a REST read asked after it — as the resting order waits on a book that may show itself
+                # (own_unsure, sim_requote_reason). Any other place (a cent over a bid above, down to another level, a
+                # price nobody stands at) is used at once, as ever, and so is this one on a book last heard of before
+                # the cancel went out: that one shows the order for certain
+                ghosted = f"刚撤的单（{cents(price)}）可能还在这份盘口上，分不清 {cents(price)} 的买单是它还是别人的，等撤单确认之后的盘口再挂"
+                sides_seen[side] = {"why": ghosted}
+                continue
             rank = 1
             if (c.sim_maker_deeper and not use_front and sweep is None and not wide
                     and (fair - price < maker_bar - 1e-9 or fair - price <= mk.need)):
@@ -18725,6 +19358,8 @@ class Bot:
                 return None, f"盘后只挂 {cents(limit)} 以下的，可挂的价位 {cents(dear)} 高于它"
             if joined is not None:
                 return None, f"只挂低价挂单：买1 之上 1¢ 的净优势不到 {cents(deep_bar)}（跟买1 也只有 {cents(joined)}）"
+            if ghosted:
+                return None, ghosted
             return None, f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟" if c.sim_maker_min_bid > 0 else "没有可跟的买价"
         if best.edge <= mk.need:
             return None, f"净优势 {cents(best.edge)} 不超过模型误差 {cents(mk.need)}" + cut_note
@@ -19398,6 +20033,12 @@ class Bot:
         stale_ms = SIM_WINDOW_STALE_WITHDRAW_MS if (trade.get("settle") or {}).get("window") else SIM_STALE_WITHDRAW_MS
         if mk.book.stale(now_ms) and now_ms - mk.book.fetched_ms > stale_ms:  # no pricing basis: not left for someone with one to fill
             return f"盘口断流超过 {stale_ms // 1000} 秒，撤单" if stale_ms < 120_000 else f"盘口断流超过 {stale_ms // 60_000} 分钟，撤单"
+        if mk.price_problem:
+            # 1.150.0: the card's own price is too old to trade on (its feed stalled while the book is fresh), and the card holds
+            # its suggestion for it. An order under a hold stands unjudged (the next line) — its edge not held against the exit
+            # line, a 买1 that fell away not followed — a bid left for whoever saw the move the card has not. It is withdrawn,
+            # as on a book gone stale, and placed afresh by the next look that has a fresh price
+            return f"{mk.price_problem}，撤单"
         if mk.hold or mk.book.stale(now_ms) or book_crossed(mk.book):
             return ""  # no fresh view of the market: the order stands
         side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)
@@ -19473,6 +20114,23 @@ class Bot:
                         move = (target, f"买1 被顶到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
                 elif price - target >= SIM_MAKER_FOLLOW - 1e-9:
                     move = (target, f"买1 移到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
+                if move is not None and own_unsure(trade, mk.book) and (
+                        move[0] > price + 1e-9 or bid_shares(mk.book, side, price) >= SIM_MAKER_FRONT_MIN - 1e-9):
+                    # 1.150.0 (audit FEED-FETCHED-MS): a book that may show this very order with none of it counted — its
+                    # levels taken before Predict's answer (a push beating the HTTP answer, a REST read in flight across
+                    # it), or the request still in flight. "The best bid of anyone else" may be the order itself. Up: "a
+                    # bid in front" — followed, it was withdrawn and placed a cent higher, and that one again (a sweep
+                    # order the same, over "the bid under the threshold"). Down: its own shares, fewer than
+                    # SIM_MAKER_MIN_BID (SIM_SHARES under it, an order a limit cut), read as somebody's bid with the best
+                    # ask a cent over it — no room in front, so "join the valid 买1 below": withdrawn, placed where it was,
+                    # and that one withdrawn at first sight (the settle's clock still held the place) — 24 orders and 24
+                    # cancels a minute while the order's own push stood as the book (before content_ms the next re-send
+                    # ended it inside the settle). So on such a book the order is never moved up, and not moved at all
+                    # while the book shows a bid at its price (SIM_MAKER_FRONT_MIN shares: less is dust the rule ignores
+                    # whoever it belongs to): held until a book taken after the answer tells the two apart. A move down
+                    # on a book with no bid at its price (the order is not on it: nothing of its own to mistake) and
+                    # every withdrawal above still go
+                    move = None
             key = f"{trade.get('market')}|{side}"
             if move is None:
                 if not self.sim_follow_readonly:
@@ -19754,7 +20412,13 @@ class Bot:
             trade["revisions"].append({"at": now_ms, "by": by, "from": trade["payout"], "to": payout, "note": note})
         if trade.get("maker") and float(trade["shares"]) < float(trade["order"]) - 1e-9:
             trade["unfilled"] = float(trade["order"]) - float(trade["shares"])
-        trade.update(status="settled", payout=payout, note=note, settled=trade.get("settled") or now_ms)
+        # the settlement's time is the first one's: a corrected result is a revision of the same settlement. 1.150.0: but never
+        # the time a record lapsed with nothing filled ("expired", stamped above) — no money was settled then. Such a record
+        # holds shares only when a real order's fill was read after the result (LiveBot.live_settle_late; a paper fill never
+        # comes that late): it is settled NOW. Kept at the lapse's time, a loss read after Beijing midnight was booked to the
+        # day before and counted by no day's loss stop (LiveBot.live_daily_pnl counts by this stamp).
+        settled = now_ms if trade["status"] == "expired" else trade.get("settled") or now_ms
+        trade.update(status="settled", payout=payout, note=note, settled=settled)
 
     SIM_CONFIRM_SECONDS = 600  # each market's final result is asked of Predict at most this often
     SIM_LOOKUPS_PER_STEP = 8   # old records without a market id: this many slugs looked up per step (side by side)
@@ -21379,6 +22043,18 @@ class Bot:
         self.edge_ran = time.monotonic()
         state = self.store.get("edgealerts", {})
         state = state if isinstance(state, dict) else {}
+        if not self.edge_swept:
+            # 1.150.0 (audit CTRL-EDGE-SEQ), once per start, before anything is observed or sent: until this version a ladder's
+            # idle maker stream was forgotten without its delivery records (edge_observe), and the stream that followed on
+            # that level counted from 1 under them — such levels are mute in the database this version starts on. A record
+            # above its stream's own count (no stream left: 0) can only come from such an earlier stream, so it is dropped;
+            # one at or under the count stays, so nothing is sent twice. The key ends with the subscription's chat:thread
+            # (subscription_key). Tried once: a start that cannot read them goes on without the repair.
+            self.edge_swept = True
+            count = lambda key: int((state.get(key.removeprefix("edgesent:").rsplit(":", 2)[0]) or {}).get("seq") or 0)
+            if stale := [key for key, got in self.store.items("edgesent:") if int(got or 0) > count(key)]:
+                self.store.delete_keys(stale)
+                LOG.info("优势提醒整理：清掉 %d 条旧版本留下的投递记录（编号高于所属提醒流现有的编号）", len(stale))
         before = json.dumps(state, sort_keys=True)
         costs = self.edge_costs()
         bars, _ = self.edge_bars()  # read once a round, not once a market
@@ -21442,7 +22118,17 @@ class Bot:
                 st["alert"]["offer"] = {**self.edge_note(mk, best, now_ms), "fair": mk.fair_up if best.side == "涨" else 1 - mk.fair_up}
             if maker_only:
                 st["alert"].update(maker_only=True, note=note)
-        if st.get("told") or st.get("pending") or st.get("alert") or any(now_ms - t < DAY_MS for t in st.get("last", {}).values()):
+        # 1.150.0 (audit CTRL-EDGE-SEQ): a stream that has announced (it has a count, seq) is kept for as long as its market
+        # is priced. edgesent:{market}:{sub} holds the last seq each subscription got, and edge_deliver and the digest skip
+        # every announcement numbered at or under it; those records go only together with the stream, a day after its
+        # market was last priced (edge_alerts). Every other stream keeps its last announcement and with it its record; a
+        # ladder's maker stream has its announcement taken back (points / eligibility coming and going: above, and in
+        # edge_alerts), and with nothing told, pending or announced and its last 新机会 a day old it was forgotten here.
+        # Its records were not, and the next stream on that level counted from 1 under them: its 新机会 and the 建议失效 /
+        # 方向反转 after it reached nobody until the count had passed the old one. The stream is kept rather than its
+        # records deleted at this point: a send still waiting on Telegram would write its seq back after the delete.
+        if (st.get("told") or st.get("pending") or st.get("alert") or st.get("seq")
+                or any(now_ms - t < DAY_MS for t in st.get("last", {}).values())):
             st["seen"] = now_ms - now_ms % 3_600_000
             state[market] = st
         else:
@@ -21718,33 +22404,50 @@ class Bot:
             return
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
         hour, minute = (int(x) for x in clock.split(":"))
-        due_at = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if local < due_at or local - due_at > dt.timedelta(milliseconds=self.REPORT_WINDOW_MS):
+        # 1.150.0: the catch-up window may run past Beijing midnight (a late SIM_DAILY_REPORT such as 23:30, with the bot
+        # down at the hour or Telegram refusing until after 00:00). Taking only today's due time cut the window at
+        # midnight: at 00:10 the due time became tonight's 23:30 and yesterday's report was lost for good. So the due time
+        # is the latest of today's and yesterday's that has passed (BEIJING has a fixed offset, so a day back is exact),
+        # and the report, its text and its record belong to that day, not to `local`.
+        today_due = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        due_at = today_due if today_due <= local else today_due - dt.timedelta(days=1)
+        if local - due_at > dt.timedelta(milliseconds=self.REPORT_WINDOW_MS):
             return
-        day_key = f"simreport:{local.date().isoformat()}"
+        report_day = due_at.date()
+        day_key = f"simreport:{report_day.isoformat()}"
         due = [(sub_id, sub) for sub_id, sub in self.subscriptions().items() if sub.get("active")
                and not self.store.get(f"{day_key}:{sub_id}") and not self.delivering(f"{day_key}:{sub_id}")]
         if not due:
             return
-        text = self.daily_report_text(now_ms)
+        # The review page's link carries the private page token, which (with WEB_CONTROL_KEY unset) opens control.json
+        # and the journal, real orders included. /web calls it private ("请勿转发"), so the unprompted daily push carries
+        # it only to the admin's private chat; group topics get the same report without it. /web and /sim still answer
+        # with the link wherever the admin types them. Each variant is built at most once per call.
+        texts: dict[bool, str] = {}
         for sub_id, sub in due:
             key = f"{day_key}:{sub_id}"
+            private = bool(self.config.admin_id) and (sub["chat"], sub["thread"]) == (self.config.admin_id, 0)
+            if private not in texts:
+                texts[private] = self.daily_report_text(now_ms, link=private, day=report_day)
+            text = texts[private]
             if not text:
                 self.store.put(key, {"skipped": now_ms})  # nothing to say today: the day is done for this subscription
                 continue
 
-            async def send(sub: dict = sub, key: str = key) -> None:
+            async def send(sub: dict = sub, key: str = key, text: str = text) -> None:
                 if await self.tell(sub["chat"], sub["thread"], text, html_mode=True):
                     self.store.put(key, self.market.now_ms())
             self.deliver(key, send)
 
-    def daily_report_text(self, now_ms: int) -> str:
+    def daily_report_text(self, now_ms: int, link: bool = True, day: dt.date | None = None) -> str:
         """The day's trading for Telegram (bold sentinels; send as HTML): what was ordered today and how it filled, the
         underlyings with the most records, what settled today and its P&L, the open positions with their unrealized P&L
-        at the books' middles, the lifetime, the resting orders' fill rate, and the review page's link. "" when there
-        is nothing to say: no record opened or settled today, no position held, no order resting."""
+        at the books' middles, the lifetime, the resting orders' fill rate, and (link) the review page's link. "" when there
+        is nothing to say: no record opened or settled today, no position held, no order resting. `day` (Beijing) is the
+        day reported, by default now_ms's; daily_report passes yesterday for a catch-up sent after midnight. Positions,
+        marks and the lifetime are always as of now_ms."""
         trades = list(self.sim_trades().values())
-        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+        today = day or dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         day_of = lambda ms: dt.datetime.fromtimestamp(int(ms or 0) / 1000, BEIJING).date()
         today_rows = [t for t in trades if day_of(t.get("opened")) == today]
         settled_rows = [t for t in trades if t["status"] == "settled" and day_of(t.get("settled")) == today]
@@ -21781,7 +22484,7 @@ class Bot:
                     + (f"｜收益率 {lifetime['roi'] * 100:+.1f}%" if lifetime["cost"] else ""))
         if makers["fill_rate"] is not None:
             body.append(f"挂单成交率 {makers['fill_rate'] * 100:.0f}%（{makers['placed']} 笔挂单；已结束的里有成交的占比）")
-        if self.config.web_port and self.web_token:
+        if link and self.config.web_port and self.web_token:  # link=False: a group copy (the token is private; daily_report)
             body.append(f"复盘页：{self.web_url()}/journal")
         title = "交易日报" if self.sim_has_real() else "模拟交易日报"
         return "\n".join([f"📒 {bold(title)} {today:%m-%d} {WEEKDAYS[today.weekday()]}", *tree(body)])
@@ -21796,7 +22499,7 @@ class Bot:
             unit = f" {odds.unit}" if odds.unit else ""
             rows = [f"昨收 {fmt(odds.ref)}{unit} → 现 {fmt(odds.effective)}{unit}（{percent(odds.effective, odds.ref):+.2f}%）",
                     f"模型 涨 {bold(cents(odds.fair_up))}｜跌 {bold(cents(odds.fair_down))}"]
-            book = self.predict.books.get(self.predict_key(title))
+            book, _ = self.close_book(self.predict_key(title))  # none for a market whose names say the book is not 涨's
             if book is not None and not book.stale(now_ms):
                 need = self.edge_need(model_swing(odds))
                 best = None if odds.warn else best_edge(book_edges(odds.fair_up, book, self.edge_costs()), need)
@@ -21903,9 +22606,10 @@ class Bot:
             out += [(key, getattr(mkt.spec, "name", key)) for key, mkt in table.items()]
         return out
 
-    def edge_target(self, words: list[str]) -> tuple[str, str]:
+    def edge_target(self, words: list[str], saved: dict[str, float] | None = None) -> tuple[str, str]:
         """The bar an /edge command addresses, from its words: nothing = the default; a section; a market (its key, an
-        alias, or part of its card's name), optionally followed by one of its levels. Returns (bar key, shown name)."""
+        alias, or part of its card's name), optionally followed by one of its levels. Returns (bar key, shown name).
+        With `saved` (the bars already set: /edge … off) a level names the bar saved under it, see below."""
         if not words:
             return "default", "默认"
         text = " ".join(words)
@@ -21927,9 +22631,30 @@ class Bot:
             if found:
                 key, name = found[0]
                 if rest:
-                    level = edge_level_norm(" ".join(rest))
-                    if not re.fullmatch(r"\d+(\.\d+)?[kmb]?", level):
+                    # CTRL-EDGE-LEVEL (follow-up): bars saved before the fix below keep their key exactly as typed
+                    # ("level:ETH-HIT-11|4500", "level:HSI|300m"); /edge and /status still list them, but the stricter
+                    # parsing below no longer produces those keys, so "/edge … off" could not take them away one by one
+                    # (only /edge 清空 could, with every valid bar). Taking a bar away needs no check: with the saved bars
+                    # given, the level as typed names the bar saved under exactly that spelling, on any market.
+                    typed = f"level:{key}|{edge_level_norm(' '.join(rest))}"
+                    if saved is not None and typed in saved:
+                        return typed, f"{name} {' '.join(rest)}"
+                    # CTRL-EDGE-LEVEL: edge_bar finds a level's bar by the card's own label (level_label on a price
+                    # ladder: 4500 -> "4.5k"; usd_short on a cap ladder: 1.234B -> "1.23b"), so a level typed any other
+                    # way ("4500", "130000", "1.234b") was saved, confirmed and listed, yet never matched a card; and a
+                    # market without levels (恒指 300m) got a bar that could never apply. Refuse the latter, and save
+                    # the typed number in the card's spelling; when the market's levels are known, it must be one.
+                    if key not in self.ranges and key not in self.caps:
+                        raise ValueError(f"「{name}」没有档位；去掉档位写 /edge {head} <¢>")
+                    match = re.fullmatch(r"(\d+(?:\.\d+)?)([kmb]?)", edge_level_norm(" ".join(rest)))
+                    if not match:
                         raise ValueError(f"档位「{' '.join(rest)}」看不懂；写成 300M、1B、120k 这样")
+                    spell = lambda v: edge_level_norm(level_label(v) if key in self.ranges else usd_short(v))
+                    level = spell(D(match.group(1)) * {"": 1, "k": 10 ** 3, "m": 10 ** 6, "b": 10 ** 9}[match.group(2)])
+                    known = [spell(row.target) for row in self.predict.ladders.get(key) or []]
+                    # (a saved bar of a level the market has dropped since can still be taken away)
+                    if known and level not in known and f"level:{key}|{level}" not in (saved or ()):
+                        raise ValueError(f"「{name}」没有「{' '.join(rest)}」这一档；现有档位：" + "、".join(dict.fromkeys(known)))
                     return f"level:{key}|{level}", f"{name} {' '.join(rest)}"
                 return f"key:{key}", name
         raise ValueError(f"找不到市场或栏目「{text}」。栏目：{'、'.join(self.EDGE_GROUPS.values())}；市场：" +
@@ -21979,13 +22704,17 @@ class Bot:
                                  "单位 ¢，0.5～50") from None
             if not 0.5 <= cents <= 50:
                 raise ValueError("门槛范围 0.5～50¢")
-        key, name = self.edge_target(args[:-1])
         if off:
+            key, name = self.edge_target(args[:-1], bars)  # also a bar saved under the level as typed (never matched a card)
             if key not in bars:
                 return f"ℹ️ {name} 没有单独的门槛，无需取消。\n" + self.edge_text()
             bars.pop(key, None); names.pop(key, None)
             self.update_settings(edge_bars=bars, edge_names=names)
             return f"✅ 已取消 {name} 的单独门槛。\n" + self.edge_text()
+        key, name = self.edge_target(args[:-1])
+        stale = self.edge_target(args[:-1], bars)[0]  # the same level saved as typed before CTRL-EDGE-LEVEL: this bar
+        if stale != key:                              # replaces it (else both are listed under the one name)
+            bars.pop(stale, None); names.pop(stale, None)
         bars[key] = round(cents, 2); names[key] = name
         self.update_settings(edge_bars=bars, edge_names=names)
         what = "默认门槛" if key == "default" else f"{name} 的提醒门槛"
@@ -22042,8 +22771,8 @@ class Bot:
         slug = self.predict.slugs.get(key)
         if not self.config.predict or not slug:
             return None
-        book, error = self.predict.books.get(key), self.predict.errors.get(key, "")
-        out: dict[str, Any] = {"url": predict_url(slug, self.config.predict_ref), "error": error}
+        book, why = self.close_book(key)  # held (why) when the market's names say the book is not 涨's: no depth, no edges
+        out: dict[str, Any] = {"url": predict_url(slug, self.config.predict_ref), "error": why or self.predict.errors.get(key, "")}
         if book is None:
             return out
         ok = isinstance(odds, CloseOdds)
@@ -22070,7 +22799,8 @@ class Bot:
                 continue
             shown += 1
             item = odds.get(title)
-            book, error = self.predict.books.get(key), self.predict.errors.get(key, "")
+            book, why = self.close_book(key)
+            error = why or self.predict.errors.get(key, "")
             lines.append("\n" + bold(f"📍 {title}"))
             url = predict_url(slug, self.config.predict_ref)
             rows = book_lines(book, error, item, now_ms, url, self.edge_costs(), self.config.predict_min_edge)
@@ -22102,46 +22832,130 @@ class Bot:
         return f"{self.config.web_base}{path}" if self.config.web_base else path
 
     # --- the control page (/p/<token>/control): settings while running, the real-trading switches ------------------
+    CONTROL_RISK_KEYS = ("LIVE", "LIVE_MAX_ORDER_USD", "LIVE_MAX_OPEN_USD", "LIVE_MAX_DAILY_LOSS_USD")  # control_prune keeps these first
+
     @staticmethod
     def control_prune(env: Mapping[str, str], saved: Mapping[str, str]) -> tuple[Config, dict[str, str]]:
         """The configuration from the environment with the saved control settings on top. A saved value that no longer
-        validates (a bound tightened since it was saved) is dropped and the rest kept — never the whole page's settings
-        for one bad one, and never a save refused for a key the user did not touch. (config, dropped key -> why)."""
-        saved, dropped = dict(saved), {}
-        while True:
-            try:
-                return Config.from_env({**env, **saved}), dropped
-            except ValueError as error:
-                text = clean_error(error)
-                bad = next((k for k in sorted(saved, key=len, reverse=True) if k in text), None)  # the message names its key
-                if bad is None:
-                    raise
-                dropped[bad] = text
-                saved.pop(bad)
+        validates (a bound tightened since it was saved, an environment variable changed under it) is dropped and the rest
+        kept — never the whole page's settings for one bad one. (config, dropped key -> why); raises only when the
+        environment itself does not validate.
+
+        1.150.0 (audit CTRL-PRUNE): the bad value is found by trial, no longer guessed from the error's text. The guess took
+        the longest saved key named in the message cut to 280 characters, and gave up when none was: a failed int() names
+        no key, the pre-open checks name a dozen keys in one message (546 characters, the timing keys past the cut), and
+        when a saved PREOPEN_15M=on is what makes the pre-open values count, the bad one can be an environment variable no
+        saved key names. Giving up made the start-up fall back to the bare environment — the saved LIVE=off and the lowered
+        LIVE_MAX_* limits gone, env LIVE=on trading for real again; and where the message named several saved keys, valid
+        ones were dropped first (the pre-open $ cap, AHEAD, the deeper levels). Now the saved values are laid on the
+        environment (valid by itself: the process would not have started) one at a time, each kept when the result still
+        validates. LIVE and the LIVE_MAX_* limits go first, so they stand whenever they are valid on their own; PREOPEN_15M
+        goes last, so a pre-open conflict leaves the mode off (preopen_apply winds its leftover orders down) rather than
+        quoting on values nobody chose; passes repeat while one keeps something more, so a pair valid only together
+        (PREOPEN_CANCEL_SECONDS raised along with PREOPEN_ENTRY_SECONDS) is kept. A few milliseconds, and only when the
+        saved values as a whole fail."""
+        try:
+            return Config.from_env({**env, **saved}), {}
+        except ValueError:
+            pass  # one value or more no longer fits: rebuilt below
+        rank = lambda key: 0 if key in Bot.CONTROL_RISK_KEYS else 2 if key == "PREOPEN_15M" else 1
+        order = sorted(saved, key=rank)  # stable: the others in their saved order
+        config, kept, why = Config.from_env(dict(env)), {}, {}
+        grown = True
+        while grown:
+            grown = False
+            for key in order:
+                if key in kept:
+                    continue
+                try:
+                    config = Config.from_env({**env, **kept, key: saved[key]})
+                except ValueError as error:
+                    why[key] = clean_error(error)
+                    continue
+                kept[key], grown = saved[key], True
+        return config, {key: why[key] for key in order if key not in kept}
 
     @staticmethod
-    def control_config(config: Config, store: Store) -> Config:
+    def control_config(config: Config, store: Store) -> tuple[Config, list[str]]:
         """The configuration with the control page's saved changes (control:env) applied on top of the environment;
-        saved values that no longer validate are dropped (and forgotten) with a warning, never a crash at start-up."""
+        saved values that no longer validate are dropped (and forgotten) with a warning, never a crash at start-up. Also
+        the lines naming what was dropped: run() tells the administrator (1.150.0: Railway's log was the only trace)."""
         saved = store.get("control:env")
         if not isinstance(saved, dict) or not saved:
-            return config
+            return config, []
         kept = {k: str(v) for k, v in saved.items() if k in CONTROL_KEY_SET}
         try:
             applied, dropped = Bot.control_prune(config.env, kept)
         except ValueError as error:
-            LOG.warning("网页控制台保存的设置无效，已忽略：%s", clean_error(error))
-            return config
+            # Not reached: the environment validated a moment ago (config). Should it ever be, the saved values cannot be
+            # weighed, so none is applied — and nothing may come out looser than they were: no real order (at most pause)
+            why = clean_error(error)
+            LOG.warning("网页控制台保存的设置无法验证，已全部忽略，真实交易最多 pause：%s", why)
+            return (dataclasses.replace(config, live_mode="pause") if config.live_mode == "on" else config,
+                    [f"全部 {len(kept)} 项（无法验证，真实交易最多 pause）：{brief_error(why, 160)}"])
         if dropped:
             LOG.warning("网页控制台保存的设置里有无效项，已忽略：%s", "；".join(f"{k}：{why}" for k, why in dropped.items()))
             store.put("control:env", {k: v for k, v in kept.items() if k not in dropped})  # the page shows what is in force
-        return dataclasses.replace(applied, env=config.env)  # env stays the environment itself, never the merged values
+        return (dataclasses.replace(applied, env=config.env),  # env stays the environment itself, never the merged values
+                [f"{k}={brief_error(kept[k], 40)}：{brief_error(why, 160)}" for k, why in dropped.items()])
+
+    def control_dropped_text(self) -> str:
+        """The administrator's note on the saved control settings this start dropped (control_config), with what is in force."""
+        value = self.control_value
+        lines = ["⚠️ 网页控制台保存的设置这次启动时有无效项，已删除（改按环境变量或默认值），其余保存的设置照常生效：",
+                 *(f"• {line}" for line in self.control_dropped)]
+        if any(line.startswith("PREOPEN_15M=") for line in self.control_dropped):
+            lines.append("开盘前预挂模式因此没有开启，还挂着的预挂单会撤掉；改好上面说的设置后在控制台或用 /preopen on 重新开启。")
+        lines.append(f"现在：真实交易模式 {value('LIVE')}，单笔上限 ${value('LIVE_MAX_ORDER_USD')}，持仓+挂单上限 ${value('LIVE_MAX_OPEN_USD')}，"
+                     f"日亏损停机线 ${value('LIVE_MAX_DAILY_LOSS_USD')}。请在控制台核对。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def lead_route(card: "IndexUpDownMarket", config: Config) -> None:
+        """A 15-minute index card's exchange quote as ``config`` has it, at the start and again whenever the configuration
+        changes (apply_config): the stock's code and LEAD_QUOTE's mode while the card's pair has an exchange ticker — in
+        SYMBOLS, or added for a stock card the pre-open mode quotes (Config.from_env) — else none and off. refresh_updown
+        hands a card its quote (note_lead) only while lead_code is set, and the pre-open mode's limit / halt guard judges
+        on that very quote (Controller.card_hold reads card.lead). A card whose ticker neither came nor went is left as it
+        is: on a routed card LEAD_QUOTE's mode stays refresh_updown's to set each round (it sees the price the change moves
+        and wakes the trader for it)."""
+        ticker = config.tickers.get(card.spec.symbol)
+        code = ticker.code if ticker is not None else ""
+        if code == card.lead_code:
+            return
+        card.lead_code, card.lead_mode = code, config.lead_quote if ticker is not None else "off"
+        if ticker is None:
+            card.lead = None  # its ticker gone: nothing reads a quote for it any more, the last one in hand must not stand
 
     def apply_config(self, config: Config) -> None:
-        """A changed configuration takes effect: every loop reads self.config at use."""
+        """A changed configuration takes effect: every loop reads self.config at use, and what the start built from a
+        setting the control page can change (the stock feed's tickers, the 15-minute stock cards' exchange quote, the index
+        cards' σ factors) is brought to the new configuration here, as a restart would build it."""
+        before = self.config
         self.config = config
         self.predict.config = config  # the orderbook feed keeps its own reference (PREDICT_POLL_SECONDS)
         SOURCE_HEALTH.off = config.sources_off  # the quote feeds read the switch from here
+        # 1.150.0 (audit CTRL-CONFIG-RUNTIME): three more things were built from the start-up configuration and kept it until
+        # the next restart. PREOPEN_15M / PREOPEN_MARKETS add the exchange ticker of a stock card the pre-open mode quotes
+        # whose pair is not in SYMBOLS (Config.from_env, 1.134.0: 智谱 by default; SK 海力士 / 宇树 where SYMBOLS leaves them
+        # out), for that mode's limit / halt guard. Switched on the page (改动即时生效), by /preopen on or by a reset, the
+        # mode began quoting the card for real while the stock feed went on asking for the start-up tickers alone and the
+        # card had no quote routed (lead_code, set once in __init__): the guard found no exchange quote — nothing to judge
+        # — so neither the limit rule nor the halt rule applied, and nothing said so (a stock never asked for is never in
+        # error). And SIGMA_CALIB reached the index cards' σ only at the next index close (note_outcome), up to a weekend
+        # away: VolBook.get applies whatever factors it holds.
+        self.stocks.config = config  # the stock feed: the tickers it asks for (refresh_live, refresh) and serves (live_quote)
+        # each 15-minute stock card's exchange quote, as __init__ routes it. A card that gains a ticker here is from then on
+        # also priced with LEAD_QUOTE by the model trader, exactly as after a restart (the window under way by note_lead's
+        # rule for a bot that came late: on the index alone, unless the stock has not traded since the window's start)
+        for cards in self.index_markets.values():
+            for card in cards:
+                self.lead_route(card, config)
+        if config.sigma_calib != before.sigma_calib:  # on a change of the switch alone: measuring reads every snapshot on disk
+            self.vols.calib = {}
+            if config.sigma_calib:
+                with contextlib.suppress(Exception):  # as at the start: the estimates alone until the next outcome measures again
+                    self.vols.calib = self.index_sigma_calibs()
 
     def control_value(self, key: str) -> str:
         """A control setting's value in force, as the variable would be written."""
@@ -22261,9 +23075,18 @@ class Bot:
     def control_set(self, values: dict) -> dict:
         """Save the settings given, validated together like the environment. None clears a saved value (the environment's
         applies again); so does "" — except for a CONTROL_CLEARABLE setting the environment gives a value: there "" is
-        saved, the empty choice (every market, nothing left out, every source on) standing over the environment's."""
-        saved = {k: str(v) for k, v in (self.store.get("control:env") or {}).items() if k in CONTROL_KEY_SET}
-        if str(values.get("LIVE") or "").strip().lower() == "on" and not self.config.live_allowed:
+        saved, the empty choice (every market, nothing left out, every source on) standing over the environment's.
+        1.150.0 (CTRL-PRUNE): the request on top of the other saved values validates as a whole or nothing is saved — a
+        saved value the user did not send is never dropped to let it through (PREOPEN_PRICE_CENTS=45 under saved levels
+        48x20,47x40 answered 已保存并生效 while the levels and PREOPEN_AHEAD_MINUTES were deleted). Only a saved value that
+        had stopped validating before this request (the saved values pruned alone, as at start-up) is dropped on the way,
+        and the answer names it: a stale value never blocks a save, /live mode off included."""
+        before_saved = {k: str(v) for k, v in (self.store.get("control:env") or {}).items() if k in CONTROL_KEY_SET}
+        saved = dict(before_saved)
+        # 1.150.0 (audit CTRL-LIVE-ALLOWED-FAILOPEN): refused for every word Config.from_env reads as LIVE=on, no longer the
+        # bare "on" alone — a hand-made request's LIVE=true / 1 / yes was saved under the hard switch (capped at pause while
+        # it stood) and turned real orders on at the restart that lifted the switch, nobody having chosen on then
+        if str(values.get("LIVE") or "").strip().lower() in {"on", "1", "true", "yes"} and not self.config.live_allowed:
             return {"ok": False, "message": "部署变量 LIVE_TRADING_ALLOWED=off 禁止真实下单（硬开关）：不能保存 LIVE=on"}
         changed = []
         for key, _, _ in CONTROL_KEYS:
@@ -22288,18 +23111,22 @@ class Bot:
         if unknown:
             return {"ok": False, "message": "不能在网页上改的变量：" + "、".join(str(k)[:40] for k in unknown[:5])}
         try:
-            config, dropped = self.control_prune(self.config.env, saved)
+            _, stale = self.control_prune(self.config.env, before_saved)  # what had stopped validating before this request
         except ValueError as error:
             return {"ok": False, "message": clean_error(error)}
-        if any(k in values for k in dropped):
-            return {"ok": False, "message": "；".join(why for k, why in dropped.items() if k in values)}
-        for key in dropped:  # a saved value that stopped validating since: dropped, the save goes on
+        stale = {k: why for k, why in stale.items() if k not in values}  # a key the request sends is the request's to decide
+        for key in stale:  # a saved value that stopped validating since: dropped, the save goes on
             saved.pop(key, None)
+        try:
+            config = Config.from_env({**self.config.env, **saved})
+        except ValueError as error:
+            return {"ok": False, "message": clean_error(error)}
         config = dataclasses.replace(config, env=self.config.env)
         before = {key: self.control_value(key) for key, _, _ in CONTROL_KEYS}
         self.store.put("control:env", saved)
         self.apply_config(config)
         words = [f"{key}={self.control_value(key)}（原 {before[key]}）" for key in changed if self.control_value(key) != before[key]]
+        words += [f"{key} 保存的值已失效、已删除，现在 {self.control_value(key)}（{brief_error(why, 80)}）" for key, why in stale.items()]
         return {"ok": True, "message": ("已保存并生效：" + "；".join(words)) if words else "已保存，设置没有变化。"}
 
     async def live_control(self, action: str, data: dict) -> dict:
@@ -22332,7 +23159,8 @@ class Bot:
             rows = odds.detail() if isinstance(odds, CloseOdds) else [f"概率暂缺：{odds}"]
             key = self.predict_key(title)
             if key in self.predict.slugs:
-                rows += book_lines(self.predict.books.get(key), self.predict.errors.get(key, ""), odds, now_ms, "",
+                book, why = self.close_book(key)
+                rows += book_lines(book, why or self.predict.errors.get(key, ""), odds, now_ms, "",
                                    self.edge_costs(), self.config.predict_min_edge)
             lines.extend(tree(rows))
         lines.append("\n⚠️ 目标日跳过周末和已配置的交易所假期（HOLIDAYS_*），每个假日按半天方差计入；σ 为历史估计；代理与结算标的之间有基差。")
@@ -22341,8 +23169,9 @@ class Bot:
     def kospi_line200(self, now_ms: int) -> str:
         return self.kospi.line200(now_ms, self.config.color_style, self.hl.quotes.get("KR200"), self.hl.notes.get("KR200", ""))
 
-    def context_lines(self, symbol: str, now_ms: int, price: D | None = None) -> list[str]:
-        """Market-context lines for an alert: HSI futures for Hong Kong-listed underlyings, Hyperliquid quote."""
+    def context_lines(self, symbol: str, now_ms: int, price: D | None = None, source: str = "last") -> list[str]:
+        """Market-context lines for an alert: HSI futures for Hong Kong-listed underlyings, Hyperliquid quote. ``source``:
+        which Binance price ``price`` is (Quote.source), for the odds line (contract_anchor)."""
         lines = []
         ticker = self.config.tickers.get(symbol)
         if self.config.hsi_futures and ticker and ticker.market == "hk" and self.hsi.quote:
@@ -22356,7 +23185,7 @@ class Bot:
         if price is not None and symbol in self.hl.quotes:
             lines.append(self.hl_line(symbol, price))
         if price is not None:  # Model odds for the next close, so each alert carries its own read.
-            lines.append(self.odds_row(self.contract_odds(symbol, price, now_ms)))
+            lines.append(self.odds_row(self.contract_odds(symbol, price, now_ms, source=source)))
         return [line for line in lines if line]
 
     def references_for(self, symbol: str, now_ms: int) -> dict[str, Baseline]:
@@ -22433,7 +23262,7 @@ class Bot:
                 rows.extend(self.reference_status(kind, symbol, quote.price, now_ms))
             if symbol in self.config.hl_tickers:
                 rows.append(self.hl_line(symbol, quote.price))
-            rows.append(self.odds_row(self.contract_odds(symbol, quote.price, now_ms)))
+            rows.append(self.odds_row(self.contract_odds(symbol, quote.price, now_ms, source=quote.source)))
             lines.extend(tree(rows))
         used = tuple(dict.fromkeys(STOCK_MARKETS[t.market].currency for t in self.config.tickers.values()))
         lines.append("\n💱 " + self.fx.summary(used or ("CNY", "HKD", "KRW")))
@@ -22445,7 +23274,20 @@ class Bot:
         threshold = D(settings["threshold"])
         self.last_cycle = time.time()
         try:
-            await self.market.sync_clock()
+            # FEED-SYNC-CLOCK: a failed re-sync (the /time read refused during a 418/429 cooldown that a klines or
+            # price_at read started, or one failed /time request) used to abort the whole cycle, so every contract
+            # snapshot showed the error for the rest of the cooldown although the pushed stream rows were fresh.
+            # The offset drifts by a few ms over minutes, so after a successful sync within the last hour the old
+            # offset is kept and the cycle goes on; clock_checked moves only on success, so the next cycle retries
+            # (and get() sends nothing while the cooldown lasts). Never synced (offset still 0, the raw local clock)
+            # or the last good sync over an hour old: the failure still aborts the cycle as before.
+            try:
+                await self.market.sync_clock()
+            except Exception as error:
+                checked = getattr(self.market, "clock_checked", 0.0) or 0.0
+                if not checked or time.monotonic() - checked >= 3600:
+                    raise
+                self.log_limited("clock", f"币安对时失败，沿用上次时钟偏移：{clean_error(error)}")
             rows = await self.market.prices()
             now_ms = self.market.now_ms()
         except Exception as error:
@@ -22550,7 +23392,7 @@ class Bot:
                     continue
                 render = functools.partial(self.render_alert, symbol, quote, base, change, threshold, plan.reason,
                                            self.references_for(symbol, current_ms),
-                                           self.context_lines(symbol, current_ms, quote.price))
+                                           self.context_lines(symbol, current_ms, quote.price, quote.source))
                 self.deliver(state_key, functools.partial(self.deliver_alert, sub_id, sub, symbol, render, plan, passive,
                                                           quote, base, settings))
 
@@ -23159,7 +24001,14 @@ class Bot:
 
     async def refresh_books(self, now_ms: int) -> Refreshed | bool:
         """The orderbook round: the hot keys every round, the cold ones now and then (PredictFeed.refresh); a round
-        that brought books wakes the trader at once (sim_wake) instead of leaving it to its own timer."""
+        that brought books wakes the trader at once (sim_wake) instead of leaving it to its own timer. False = not due
+        yet, asked of the feed before anything is worked out for the round."""
+        if not self.predict.round_due():
+            # 1.150.0 (audit CTRL-REFRESH-WAKE): this job is ticked every second (REFERENCE_TICK) and a round runs every
+            # PREDICT_POLL_SECONDS. The hot set (every market priced, each ladder level's taker gap and maker verdict)
+            # and the targets (every daily card's odds) were worked out on each tick, on the event loop, and handed to
+            # a feed that answered "not due" — nine times in ten at the default ten seconds
+            return False
         hot = rows = None
         if self.config.sim:
             try:
@@ -23167,7 +24016,15 @@ class Bot:
             except Exception as error:  # the round goes on with every key
                 self.log_limited("predict-hot", f"分级轮询计算失败：{clean_error(error) or type(error).__name__}")
         result = await self.predict.refresh(self.predict_targets(now_ms), hot=hot, hot_rows=rows)
-        if result is not False and self.config.sim:
+        # 1.150.0 (audit CTRL-REFRESH-WAKE): only a round that brought books (ok, partial) wakes the trader; "failed" —
+        # none came — does not. That is also the feed's answer, at once and without a request, to a round due while its
+        # 429 cooldown holds, on every one-second tick until the cooldown ends, and `result is not False` woke the trader
+        # on each of them: a look every SIM_STEP_MIN_SECONDS instead of every SIM_SECONDS on books that had not changed —
+        # the real trader reading its open orders again each time, on the same API key, just while Predict was limiting
+        # it. Nothing is lost: its own timer, a fair price that moved (note_job) and a book stored or pushed (the
+        # express lane) bring the trader as before, and the stream goes on following the hot set below — its pushes are
+        # the only books coming in meanwhile.
+        if isinstance(result, Refreshed) and result.status != "failed" and self.config.sim:
             self.sim_wake = True
         if result is not False:
             self.predict.stream.want(self.predict.stream_targets(hot, rows))  # the stream follows the round's hot set (1.86.0)
@@ -23460,6 +24317,11 @@ class Bot:
             if final is not None and spec.start_ms == old.end_ms and mkt.close_of("start") is None:
                 # the new market's line is the very candle that just settled the old one: kept at once, not read again
                 self.store.put(f"updown:{spec.slug}:start", {"open": spec.start_ms, "close": str(final), "read_ms": now_ms, "from": old.slug})
+            # the market just over is never a target again (mkt.spec moved on, predict_targets reads only the current slug;
+            # its outcome info is pruned from predict.info already): its slug would otherwise stay in want_info for ever,
+            # one per roll — ~2,500 a day with every 15-minute card on. Dropped here, at the roll, not by pruning
+            # want_info to the targets: a 15-minute card's next slug is not a target until WINDOW_LEAD_MS before its window
+            self.predict.want_info.discard(old.slug)
             self.predict.want_info.add(spec.slug)
             if isinstance(daily, WindowUpDownSpec) and (pruned := self.updown_prune(daily, now_ms)):
                 LOG.info("%s：清掉 %d 条 %d 天前的窗口价格记录", key, pruned, self.UPDOWN_KEEP_MS // DAY_MS)
@@ -23615,7 +24477,56 @@ class Bot:
         if isinstance(query, dict):  # A button tap is a live intent, so it is not age-filtered.
             await self.process_callback(query)
 
+    @staticmethod
+    def telegram_refused(error: RemoteError) -> bool:
+        """Whether Telegram itself refused the request — an HTTP 4xx (401 / 404: a wrong or revoked token; README's 对方拒绝)
+        or an answer that is not ok — rather than could not be asked: a network error (连不上), a 5xx, a 429 flood wait (any
+        answer that names a wait) and a body that is not JSON say nothing about this token."""
+        hit = re.match(r"HTTP (\d{3})", str(error))
+        status = int(hit.group(1)) if hit else 0
+        if error.retry_after or status == 429:
+            return False
+        return 400 <= status < 500 or str(error).startswith("Telegram:")
+
+    async def telegram_hello(self) -> RemoteError | None:
+        """The start-up check, one try: the token must not be bound to a webhook — it may belong to another service, and
+        this program never removes one (README 已有 Webhook) — and getMe names the bot (parse_request tells a group's
+        /cmd@otherbot from ours by it). None once it passed (telegram_ok). A reported webhook (ValueError) and Telegram's
+        own refusal (telegram_refused: a wrong or revoked token) raise, as they always did.
+        1.150.0 (CTRL-TELEGRAM-STARTUP): Telegram out of reach or out of order — DNS or the network failing, a 5xx, a
+        429 — is not a refusal: that error is returned instead of raised, and hello_next is the earliest moment of the
+        next try (the poll's back-off: 2 seconds doubling up to a minute, and never before a wait Telegram named)."""
+        try:
+            webhook = await self.telegram.call("getWebhookInfo")
+            if webhook.get("url"):
+                raise ValueError("该 Bot Token 已绑定 Webhook。请为本项目使用独立机器人，或在原服务移除 Webhook 后重试")
+            me = await self.telegram.call("getMe")
+        except RemoteError as error:
+            if self.telegram_refused(error):
+                raise
+            self.hello_failures += 1
+            self.hello_next = time.monotonic() + max(error.retry_after, min(60, 2 ** min(self.hello_failures, 6)))
+            return error
+        self.username = me.get("username", "")
+        self.telegram_ok = True
+        return None
+
     async def commands_loop(self) -> None:
+        # 1.150.0 (CTRL-TELEGRAM-STARTUP): Telegram was out of reach when the process started (run): the start-up check
+        # is tried again here, backing off like the poll below, while the rest of the bot already runs. Not one update
+        # is asked for before it passed — the username is what tells a group's /cmd@otherbot from ours — and a token
+        # bound to a webhook stays refused: that ValueError, like Telegram rejecting the token, ends this core loop, so
+        # run() exits 1 and the next start refuses before any loop, as it always did.
+        while not self.telegram_ok and not self.stopping.is_set():
+            await self.wait(max(0.0, self.hello_next - time.monotonic()))
+            if self.stopping.is_set():
+                return
+            down = await self.telegram_hello()
+            if down is not None:
+                self.log_limited("hello", f"Telegram 仍不可用（{clean_error(down)}）：命令和菜单暂停，继续重试")
+                continue
+            LOG.info("Telegram 已恢复 @%s：注册菜单，开始接收命令", self.username)
+            await self.register_menu()
         offset = int(self.store.get("telegram_offset", 0))
         failures = 0
         while not self.stopping.is_set():
@@ -23660,20 +24571,32 @@ class Bot:
         """The bot's life: 0 when it stopped on request (signal), 1 when a core loop ended on its own (the process
         exits so Railway restarts it; a bot that keeps answering commands but no longer samples prices must not live)."""
         # Refuse to silently remove a webhook that may belong to another service.
-        webhook = await self.telegram.call("getWebhookInfo")
-        if webhook.get("url"):
-            raise ValueError("该 Bot Token 已绑定 Webhook。请为本项目使用独立机器人，或在原服务移除 Webhook 后重试")
-        me = await self.telegram.call("getMe")
-        self.username = me.get("username", "")
-        LOG.info("Starting @%s; symbols=%s; administrator_configured=%s", self.username,
+        # 1.150.0 (CTRL-TELEGRAM-STARTUP): Telegram being out of reach at this moment (its API down, DNS or the egress
+        # failing: nothing about this token) used to abort the start right here, before any loop — no sampling, no
+        # feeds, no trader: the real orders resting on Predict neither synced, re-judged nor withdrawn, no kill switch,
+        # no redeem, no control page — and Railway restarted the process into the same failure for as long as the
+        # outage lasted (LiveBot starting and abandoning its pre-open mode each time). Everything else starts now, the
+        # way it already carries on when Telegram goes away while running (messages go out as soon as Telegram takes
+        # them: a send touches no webhook); the commands loop tries the check again and polls only once it passed. The
+        # refusals are unchanged: a reported webhook and a token Telegram rejects still stop the start before any loop
+        # (found only later, they end the commands loop: exit 1, and the next start refuses).
+        down = await self.telegram_hello()
+        if down is not None:
+            LOG.warning("启动时 Telegram 不可用（%s）：行情、交易和网页照常启动；命令和菜单暂停，后台重试，恢复后自动接上", clean_error(down))
+        LOG.info("Starting @%s; symbols=%s; administrator_configured=%s", self.username or "?",
                  ",".join(self.config.symbols), bool(self.config.admin_id))
         # which secrets are set, never their values (Railway logs are not a place for a key)
         LOG.info("secrets configured: telegram_token=%s predict_api_key=%s predict_private_key=%s predict_account=%s web_control_key=%s live=%s",
                  bool(self.config.token), bool(self.config.predict_api_key), bool(self.config.live_key), bool(self.config.live_account),
                  bool(self.config.web_control_key), self.config.live)
-        await self.register_menu()
+        if self.config.live_key and not self.config.web_control_key:
+            LOG.warning("PREDICT_PRIVATE_KEY 已配置但 WEB_CONTROL_KEY 未设置：控制台和复盘数据（账户、订单、交易记录）锁定，设置 WEB_CONTROL_KEY 后才显示")
+        if self.telegram_ok:  # (Telegram out of reach: the commands loop publishes the menu once the check passed, never on a token whose webhook is unknown)
+            await self.register_menu()
         if not self.config.admin_id:
             LOG.warning("ADMIN_USER_ID 尚未配置：只能使用 /id；没有任何自动订阅")
+        elif self.control_dropped:  # 1.150.0 (CTRL-PRUNE): saved settings dropped at this start reach the administrator, not only the log
+            self.deliver("notice:control-dropped", functools.partial(self.tell, self.config.admin_id, 0, self.control_dropped_text()))
         if warning := calendar_warning(self.config.holidays, dt.datetime.now(BEIJING).date()):
             LOG.warning("%s", warning)
         loop = asyncio.get_running_loop()

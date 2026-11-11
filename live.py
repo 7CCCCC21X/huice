@@ -59,7 +59,9 @@ ZERO_HASH = "0x" + "0" * 64
 PROTOCOL_NAME, PROTOCOL_VERSION = "predict.fun CTF Exchange", "1"
 KERNEL_NAME, KERNEL_VERSION = "Kernel", "0.3.1"
 FAR_FUTURE = 4102444800  # 2100-01-01: a LIMIT order without an expiry, as the SDKs build it
-TAKER_ORDER_SECONDS = 300  # a taker's LIMIT order expires five minutes after it is built (its rest is cancelled sooner)
+TAKER_ORDER_SECONDS = 300  # a taker's LIMIT order expires five minutes after it is built (its rest is cancelled sooner)...
+ORDER_END_GRACE_SECONDS = 60  # ...and no later than this long after its market's end, as a maker's does (order_expiry, 1.150.0)...
+ORDER_MIN_SECONDS = 120       # ...or this long after the order is decided / built, should that be later: none is signed for less
 API_TIMEOUT = 12
 RPC_TIMEOUT = 15
 MAX_UINT256 = 2 ** 256 - 1
@@ -247,6 +249,31 @@ def build_order(wallet: Wallet, token_id: str, maker_amount: int, taker_amount: 
             "maker": wallet.maker, "signer": wallet.maker, "taker": ZERO_ADDRESS, "tokenId": str(token_id),
             "makerAmount": str(maker_amount), "takerAmount": str(taker_amount), "expiration": str(int(expiration)),
             "nonce": "0", "feeRateBps": str(int(fee_bps)), "side": 0, "signatureType": 0}
+
+
+def order_expiry(end_ms: int | None, now_ms: int) -> int:
+    """The latest expiry (epoch seconds) a model order on a market that ends at ``end_ms`` is signed with:
+    ORDER_END_GRACE_SECONDS after that end, never under ORDER_MIN_SECONDS from ``now_ms``; FAR_FUTURE (no expiry) only
+    when the market's end is not known.
+
+    1.150.0: the signed expiry is the one bound on an order that needs nothing from this bot or from Predict's API —
+    past it the exchange contract no longer matches the order — so it is what is left when a cancel cannot get through:
+    the cancel endpoint erroring, the sign-in broken, a long 429 cooldown, the process or its host down across the end
+    (stopping cancels nothing: drain_orders). The strategy wants no order on a market past its end: sim_quiet withdraws
+    every one there whatever the settings ("a bid left on a finished market is a free option for whoever holds the
+    losing side") and live_send_block sends none from then on. Yet a maker was signed for two hours past the end, and a
+    taker for its five minutes wherever the end fell: with the removal failing, the bid stayed matchable all that time
+    after the result was public, for the losing side's holders to sell into — a loss of up to LIVE_MAX_ORDER_USD an
+    order. The pre-open mode signs its orders to expire before their start for the same reason (PREOPEN.md: 撤单失败时的
+    兜底). The grace keeps an order good for its market's whole life whatever the clocks (this bot's, the chain's): the
+    withdrawal at the end comes first, the expiry is what is left when that fails. The floor replaces the old fallback
+    to FAR_FUTURE (an expiry under two minutes away meant no expiry at all — with the grace above, every order decided
+    in a market's last minute): an order decided that late is valid two minutes. Nothing is sent at or after the end
+    (live_send_block), so an order has over a minute left when it goes out — what the pre-open mode asks of its own
+    (SEND_MIN_LEFT_MS)."""
+    if not end_ms:
+        return FAR_FUTURE
+    return max(int(end_ms) // 1000 + ORDER_END_GRACE_SECONDS, int(now_ms) // 1000 + ORDER_MIN_SECONDS)
 
 
 # --- the REST API (api.predict.fun/v1): sign-in, orders, positions -----------------------------------------------------
@@ -1098,8 +1125,9 @@ def parse_market(market: dict, default_fee: int) -> MarketInfo:
 
 def outcome_for_side(kind: str, side: str, outcomes: list[dict], touch_spec: Any = None) -> tuple[dict | None, str]:
     """The outcome (name, index set, token) a paper trade's side buys, and a note when it was assumed from the order
-    of the outcomes rather than read from their names. The card prices the 涨 / Yes / high-barrier side first; its 跌
-    is the other outcome, bought as its own token (never a sale of the first)."""
+    of the outcomes rather than read from their names — or, for a daily index / stock card (kind "close"), when the
+    names put the side at the other place than the book the card was priced from. The card prices the 涨 / Yes /
+    high-barrier side first; its 跌 is the other outcome, bought as its own token (never a sale of the first)."""
     if len(outcomes) != 2 or not all(o.get("token") for o in outcomes):
         return None, "市场不是两个结果，或缺少结果代币编号"
     names = [str(o.get("name") or "").strip().lower() for o in outcomes]
@@ -1109,16 +1137,30 @@ def outcome_for_side(kind: str, side: str, outcomes: list[dict], touch_spec: Any
         return (hits[0], "") if len(hits) == 1 else (None, f"结果名称无法对应触价线：{'、'.join(names)}")
     ups = [o for o, n in zip(outcomes, names) if n in UP_WORDS]
     downs = [o for o, n in zip(outcomes, names) if n in DOWN_WORDS]
+    hit = None  # the side's outcome by the names: the one named for it, else the other one of the pair
     if side == "up":
         if len(ups) == 1:
-            return ups[0], ""
-        if len(downs) == 1:
-            return next(o for o in outcomes if o is not downs[0]), ""
+            hit = ups[0]
+        elif len(downs) == 1:
+            hit = next(o for o in outcomes if o is not downs[0])
     else:
         if len(downs) == 1:
-            return downs[0], ""
-        if len(ups) == 1:
-            return next(o for o in outcomes if o is not ups[0]), ""
+            hit = downs[0]
+        elif len(ups) == 1:
+            hit = next(o for o in outcomes if o is not ups[0])
+    if hit is not None:
+        if kind == "close" and hit is not outcomes[0 if side == "up" else 1]:
+            # 1.150.0 (audit FEED-CLOSE-BOOK-ORIENT): a daily index / stock card reads Predict's book — which prices the
+            # market's FIRST outcome — as 涨 just as it comes (Bot.sim_markets; every other kind turns its book by the
+            # names: updown_book, touch_book, flip_yes_book, yes_book). On a market listed Down / No first the price, the
+            # limit, the cap and the count would all be worked out on the other outcome's book while the token bought is
+            # the one the name says, and with no note nothing refused the order: model and market agreeing at 68¢ for 涨
+            # read as a 38¢ edge, a real BUY of Up at 30¢ (the audit's replay; no market has been listed that way so
+            # far). The names say which token is which, and that the book is not this side's: noted, so never a real
+            # order (live_room). The card itself holds such a book once the feed has read the names (Bot.close_book);
+            # this is the trader's own read of them, for when the feed has not
+            return hit, f"卡片把第一个结果的盘口当作涨，但按名称第一个结果不是涨（结果名称：{'、'.join(names)}）"
+        return hit, ""
     if kind in {"close", "updown"}:  # a daily book prices its first outcome as 涨 (see resolution_up)
         return outcomes[0 if side == "up" else 1], f"按结果顺序推定（结果名称：{'、'.join(names)}）"
     return None, f"结果名称无法对应方向：{'、'.join(names)}"
@@ -1148,6 +1190,18 @@ class LiveTrader:
     @property
     def ready(self) -> bool:
         return not self.ready_error and not self.account_error and self.account_checked
+
+    @property
+    def signed_in(self) -> bool:
+        """Predict's sign-in succeeded: enough to follow the orders already out — read their fills, send their cancels —
+        which go through Predict's API alone (the sign-in names the order account, wallet.maker, as its signer: a session
+        Predict accepted is that account's). New orders need ``ready`` (live_room, live_send_block). 1.150.0: the order
+        management waited for ``ready`` too, whose on-chain account check is one BNB RPC read, made at a restart, /live
+        check, /live mode and the not-ready retries — a node that timed out once there kept every withdrawal (the edge
+        gone, the market's end, the loss stop, LIVE=off, a taker's rest) unsent and every fill unread until a retry a
+        minute later found the node answering again, for the whole outage when it did not; a withdrawn order then rested
+        where /live cancel all and the emergency stop no longer looked (they skip records already being cancelled)."""
+        return not self.ready_error
 
     @property
     def not_ready_why(self) -> str:
@@ -1342,7 +1396,7 @@ class LiveBot(core.Bot):
     LIVE_APPROVALS_SECONDS = 600
     LIVE_REDEEM_SECONDS = 600   # resolved positions are looked for this often...
     LIVE_REDEEM_SOON_SECONDS = 20  # ...and this soon after a real position settled in the bot's favour (live_redeem_soon: the USDT back for the next quotes)
-    LIVE_REDEEM_READS = 40      # markets read a redeem round at most, the newest positions first (the rest the next round): never a flood on the rate limit the orders share
+    LIVE_REDEEM_READS = 40      # markets read a redeem round at most, the longest unread first (1.150.0; the rest the next rounds): never a flood on the rate limit the orders share
     LIVE_REDEEM_RETRY_SECONDS = 3600  # a position whose redeem failed (gas, a revert) is tried again after this long, not every look...
     LIVE_REDEEM_UNSENT_RETRY_SECONDS = 300  # ...one whose transaction never left (TxNotSent: not resolved on-chain yet, an RPC blip) after this long
     LIVE_REDEEM_TICK_SECONDS = 5     # the automatic redeem's own timer (live_redeem_loop): rounds whatever the paper trader does
@@ -1352,7 +1406,8 @@ class LiveBot(core.Bot):
     LIVE_NOTE_SECONDS = 600     # the same failure is announced at most this often
     LIVE_PLACING_GRACE_MS = 120_000  # a record left in "placing" is reconciled by its hash after this long
     LIVE_IDLE_LIST_MS = 60_000      # the open-order list is re-read this often even with nothing in flight (orders this bot did not place)
-    LIVE_SNAPSHOT_MAX_AGE_MS = 600_000  # the pre-open mode's account snapshot stands in for a cut read of the open list while younger than this (1.136.2)
+    LIVE_SNAPSHOT_MAX_AGE_MS = 600_000  # the pre-open mode's account snapshot stands in for a cut read of the open list while younger than this (1.136.2);
+    #                                     with no whole view of the account for this long, the whole read is tried again even after a cut one (1.150.0)
     LIVE_STEP_PAGES = 1             # a step's own read of the open list: the pages until every active record's order is seen, this many at most (1.137.1:
     #                                 3; 1.138.2: 1 — under the pre-open mode's thousands of orders the model's older ones are never on the first pages, the
     #                                 two more pages cost 0.6 s a step for nothing: they are read by their hash in rotation)
@@ -1392,15 +1447,18 @@ class LiveBot(core.Bot):
         self.live_redeem_lock = asyncio.Lock()               # one redeem round at a time (the command beside the automatic round)
         self.live_redeem_last: dict = {}                     # the last round (automatic or /live redeem): when, what it found, or why it could not look
         self.live_redeem_errors: dict[str, str] = {}         # position key -> why its last redeem failed (/live redeem check)
+        self.live_redeem_read_round: dict[str, int] = {}     # market id -> the number of the redeem round that last read it (this process's rounds): the longest unread are read first (1.150.0)
         self.live_redeem_noted = -1e9                        # the last failed redeem told on Telegram (LIVE_REDEEM_NOTE_SECONDS)
         self.live_redeem_loop_task: asyncio.Task | None = None
         self.live_gas_noted = -1e9
         self.live_step_ms: dict[str, int] = {}  # the last step's phases (预取 / 决策 / 下单 / 同步), for /diag
         self.live_fill_tasks: set = set()   # the fills reads of orders confirmed removed, beside the lane (live_fills_later)
         self.live_placing: set[str] = set()     # records whose order is being sent right now: the step and the express lane never both
+        self.live_cancels: set[str] = set()     # order ids one path is removing right now, the request to Predict's final word (live_cancel): never two at once
         self.live_last_signin = -1e9
         self.live_positions: tuple[list[dict], float] = ([], 0.0)
         self.live_positions_cut = False  # the last positions read for a reconciliation came cut at the page cap
+        self.live_positions_busy = ""    # ...or left a surplus that cannot be told from the pre-open mode's shares: why (1.150.0)
         self.live_late_checked = -1e9    # when the ended orders were last set against the account's positions (live_late_fills)
         self.live_trim_seen: dict[tuple[str, int], tuple[float, int]] = {}  # outcome -> (the holding's shortfall seen, when): trimmed once it stands a minute
         self.live_errors: list[str] = []  # the latest failures, newest last, for /live
@@ -1414,7 +1472,8 @@ class LiveBot(core.Bot):
         self.live_open_ids: set[str] = set()  # the last complete open list's order ids, and when it was read: a record whose order is on it is not pruned (prunable)
         self.live_open_ids_at = 0
         self.live_full_at_ms = -10 ** 15  # when this bot last read the whole open list itself (a step reads a few pages otherwise: 1.137.1)
-        self.live_full_cut = False  # that read came cut at the page cap: while the pre-open mode runs, its snapshot stands for the account instead (1.137.2)
+        self.live_full_cut = False  # that read came cut at the page cap: while the pre-open mode runs, its snapshot stands for the account instead (1.137.2;
+        #                             1.150.0: tried again once nothing has shown the whole account for LIVE_SNAPSHOT_MAX_AGE_MS — live_sync_orders)
         self.live_market_filter: bool | None = None  # whether Predict's open-order list honours marketId (1.139.0): None until a read shows it either way
         self.live_whole: tuple[set, set, int] = (set(), set(), 0)  # the last whole view of the account's open orders: ids, hashes, when read (live_counts_miss)
         self.live_requote_looked: set[str] = set()  # order ids of confirmed cancels whose slot live_requote_freed has looked at (live_cancel_fills, 1.138.0)
@@ -1428,6 +1487,9 @@ class LiveBot(core.Bot):
         self.live_place_ms = 0       # the last step's placement time (sim_after_decide), for the phases
         self.preopen = None  # the pre-open quoting mode's controller while it runs (preopen_apply: PREOPEN_15M, on the page or in the environment)
         self.preopen_task: asyncio.Task | None = None
+        self.preopen_day_read: tuple | None = None  # (ledger file, Beijing day, its accounted P&L, valid until): read while no controller holds it (preopen_file_day)
+        self.preopen_tidied = -1e9  # monotonic time of the last archive pass over the ledger file while the mode is off (preopen_tidy)
+        self.preopen_share: Any = None  # the archive's share of the review's figures, kept from call to call (preopen.ArchiveShare; preopen_review)
         self.preopen_factory: Any = None  # the tests' stand-in controller class
         self.preopen_lock = asyncio.Lock()
         self.handlers["/preopen"] = self.cmd_preopen  # the status, on / off, pause / resume, and the read-only probe of the listing
@@ -1470,6 +1532,30 @@ class LiveBot(core.Bot):
     def live_killed(self) -> str:
         record = self.live_kill_record()
         return "" if not record or record.get("resumed") else str(record.get("why") or "触发日亏损上限")
+
+    def live_loss_floor(self, cap: float) -> float:
+        """The day's settled P&L (the model trader's and the pre-open mode's) at or under which LIVE_MAX_DAILY_LOSS_USD stops
+        new orders: −cap. After /live resume lifted today's stop (1.150.0): a cap's worth under the loss the resume found —
+        the loss the operator went on with is not counted again, the next cap's worth is. The resume used to take the stop
+        away until midnight (Beijing) whatever was lost after it — −$294 in a day at a $50 cap — and a cap lowered after
+        it changed nothing: the line follows the cap as it is set now. A day in profit at the resume keeps the plain line
+        (never tighter than a day that had no stop). −inf for a record resumed by a version that kept no figure, until
+        live_check_kill dates it from its next look."""
+        record = self.live_kill_record()
+        if not record.get("resumed"):
+            return -cap
+        found = record.get("resumed_pnl")
+        return -cap + min(0.0, float(found)) if found is not None else -math.inf
+
+    def live_resumed_floor(self) -> float | None:
+        """For the status texts: the line the stop stands at once /live resume has lifted it today (live_loss_floor) — the
+        day's P&L may be past the cap there with the trader running. None on a day without a resume, with no limit set, or
+        while a record of an older version has no figure yet."""
+        cap = self.config.live_max_daily_loss_usd
+        if not cap or not self.live_kill_record().get("resumed"):
+            return None
+        floor = self.live_loss_floor(cap)
+        return floor if math.isfinite(floor) else None
 
     # --- the gate: why a decision is not sent (recorded like a group-cap refusal) ------------------------------------
     def sim_group_room(self, trades: dict[str, dict], mk: core.SimMarket, side: str, price: float, shares: float,
@@ -1631,18 +1717,48 @@ class LiveBot(core.Bot):
         return ""
 
     def live_daily_pnl(self, trades: dict[str, dict], now_ms: int) -> float:
+        """Today's settled P&L of the real records (the Beijing day; the loss stop's figure): every record settled today, at
+        its result as it stands. 1.150.0: plus what a result corrected TODAY took from a record settled on an earlier day —
+        a position pre-settled on the bot's own data before midnight (a win, counted that day) that Predict resolves the
+        other way after it keeps its first settlement's time (sim_settle: the journal's), so the correction's loss fell on a
+        day already over and no day's stop counted it. Only what today's corrections took away (their net, a record's
+        revisions of today together), never what they gave back: a correction in the bot's favour of yesterday's record
+        gives today's stop no room."""
         today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
         since = int(today.timestamp() * 1000)
-        return sum((float(t["payout"]) - float(t["price"])) * float(t["shares"]) for t in trades.values()
-                   if isinstance(t.get("live"), dict) and t.get("status") == "settled" and int(t.get("settled") or 0) >= since)
+        total = 0.0
+        for t in trades.values():
+            if not isinstance(t.get("live"), dict) or t.get("status") != "settled":
+                continue
+            shares = float(t["shares"])
+            if int(t.get("settled") or 0) >= since:
+                total += (float(t["payout"]) - float(t["price"])) * shares
+            else:  # settled before today: the payout's change today (its revisions carry their own time), when it is a loss
+                moved = sum(float(r.get("to") or 0) - float(r.get("from") or 0) for r in t.get("revisions") or ()
+                            if isinstance(r, dict) and int(r.get("at") or 0) >= since)
+                total += min(0.0, moved) * shares
+        return total
 
     def live_check_kill(self, trades: dict[str, dict], now_ms: int) -> None:
+        """The daily loss stop: tripped when the day's settled P&L is at −LIVE_MAX_DAILY_LOSS_USD or under — new orders
+        stop until midnight (Beijing), the resting ones are withdrawn. 1.150.0: lifted by hand (/live resume), it is armed
+        again a cap's worth further down (live_loss_floor): the losses the resume found do not trip it again (the operator
+        went on with them), the next cap's worth does — as the first did, and another resume lifts that one in turn. A day
+        with a record used to be skipped whole, tripped or resumed: one resume, and no loss of any size stopped the trader
+        until midnight."""
         cap = self.config.live_max_daily_loss_usd
-        if not cap or self.live_kill_record():
-            return  # once a day: tripped already, or resumed by hand (the losses are still there)
+        record = self.live_kill_record()
+        if not cap or (record and not record.get("resumed")):
+            return  # no limit set; or tripped today and standing
         pnl = self.live_daily_pnl(trades, now_ms) + self.preopen_pnl()  # the pre-open mode's day counted too (1.125.0)
-        if pnl <= -cap:
+        if record and record.get("resumed_pnl") is None:  # resumed by a version that kept no figure: counted from this look on
+            self.store.put("live:killed", {**record, "resumed_pnl": pnl})
+            return
+        if pnl <= self.live_loss_floor(cap):
             why = f"今日已结算亏损 {money(pnl)} 达到 LIVE_MAX_DAILY_LOSS_USD ${cap:g}"
+            if record:  # the second stop of a day says what the first one's resume found, and what went since
+                found = float(record["resumed_pnl"])
+                why += f"，手动恢复时 {money(found)}、之后又亏 ${found - pnl:,.2f}"
             self.store.put("live:killed", {"day": core.beijing_day(now_ms / 1000), "why": why, "at": now_ms})
             for tid, t in trades.items():
                 if isinstance(t.get("live"), dict) and t["status"] == "resting" and t["live"].get("state") in {"open", "placing", "unknown"}:
@@ -1669,7 +1785,9 @@ class LiveBot(core.Bot):
                 "index_set": outcome["index_set"], "assumed": assumed, "fee_bps": info.fee_bps,
                 "neg_risk": info.neg_risk, "yield_bearing": info.yield_bearing, "condition_id": info.condition_id,
                 "asks": [[p, q] for p, q in core.side_levels(mk.book, side)][:core.PREDICT_DEPTH],
-                "expires": (end // 1000 + 7200) if end and end // 1000 + 7200 > now_ms // 1000 + 120 else FAR_FUTURE}
+                # a maker's signed expiry — 1.150.0: a minute past the market's end, where it was two hours past it (order_expiry:
+                # the backstop when its cancel at the end cannot get through; the taker's is set as it is built, live_place_order)
+                "expires": order_expiry(end, now_ms)}
         trade.update(status="resting", shares=0.0, filled=None, fills=[], expected_price=float(trade["price"]),
                      cost_confirmed=maker is not None,  # a maker fills at its price; a taker's cost waits for Predict's average
                      live={"state": "pending", "want": want, "attempt": 1, "order_id": "", "hash": "", "placed_at": None,
@@ -1708,6 +1826,32 @@ class LiveBot(core.Bot):
         if isinstance(st, dict) and st.get("state") in {"pending", "placing", "open", "unknown"} and trade["status"] in {"expired", "settled"}:
             st["state"], st["cancel_why"] = "cancelling", "市场已出结果"
             st["events"].append({"at": now_ms, "what": "撤单：市场已出结果"})
+
+    def live_settle_late(self, trade: dict, now_ms: int) -> None:
+        """A real order's fill read only after its market's result (1.150.0). The step decides before it reads the orders
+        back (sim_decide, then live_sync), so a result the bot's own data gives in the very step — a first-touch line
+        crossed, a flip, a range or cap level reached — finds a just-filled order's record still at 0 shares: sim_settle
+        lapses it ("expired": 市场已出结果，挂单一直没成交) and the cancel that follows, or the positions check minutes
+        later (live_late_fills), then reads the fill. Every path left such a record alone (live_finish, live_cancel_fills_read
+        and live_adopted_status skip settled and expired records alike; sim_decide re-settles only on a changed result): it
+        held real shares as "未成交" with no payout — out of the journal's P&L and out of the day's settled loss, so the
+        loss stop (LIVE_MAX_DAILY_LOSS_USD) did not see the money until Predict's own result, hours later, and then on the
+        day of the lapse (after Beijing midnight: on no day's stop at all). The record is settled here instead, the moment
+        the shares are on it, on the result it already has — Predict's, else the bot's own — and stamped now (sim_settle):
+        the loss counts on the day it becomes known, a win as any pre-settled win does; Predict's word still confirms or
+        corrects it later (sim_confirm). No order goes out past a loss settled here (live_send_block recomputes the day's
+        figure before every send); the switch itself trips at the step's next check (live_check_kill)."""
+        shares, order = float(trade.get("shares") or 0), float(trade.get("order") or 0)
+        if trade.get("status") != "expired" or shares <= 1e-9:
+            return
+        final, local = trade.get("final"), trade.get("local")
+        result = final if isinstance(final, dict) and final.get("up") is not None else local
+        if not isinstance(result, dict) or result.get("up") is None:
+            return  # no result on the record to settle it on: left as it is
+        by = "Predict 最终结果" if result is final else "本地预结算"
+        what = f"Predict 结算：{final.get('name', '')}" if result is final else str(local.get("note") or "")
+        trade["live"]["events"].append({"at": now_ms, "what": f"市场出结果后才读到成交 {shares:g}/{order:g} 份：按已有的结果（{by}）结算，计入今日已结算盈亏"})
+        self.sim_settle(trade, float(result["up"]), f"{what}（市场出结果后才读到这笔真实成交 {shares:g}/{order:g} 份，按已有的结果结算）", now_ms, by)
 
     def sim_wait(self, trade: dict, mk: core.SimMarket | None, now_ms: int) -> str:
         st = trade.get("live")
@@ -1782,7 +1926,7 @@ class LiveBot(core.Bot):
             # list; the step's other cancels stay in its sync, after the open list's read, whose fills count before a confirmed removal
             # (1.83.0: a single-order read may lag the list, and a blind cancel would lose what filled)
             unsent = {tid: t for tid, t in self.live_cancels_unsent().items() if not t["live"].get("order_id")}
-            if unsent and self.live.ready:
+            if unsent and self.live.signed_in:  # 1.150.0: signed in, not ready — closed all the same (its re-quote waits for ready)
                 await self.live_cancel_blind(unsent, now_ms)
                 await self.live_requote_freed(list(unsent), now_ms)
             await self.live_place_pending(now_ms)
@@ -1909,9 +2053,10 @@ class LiveBot(core.Bot):
             return f"真实交易已暂停（{paused}）"
         if killed := self.live_killed():
             return f"今日停止开新仓：{killed}"
-        resumed = bool(self.live_kill_record().get("resumed"))  # /live resume after today's stop: the operator's call stands
-        if (cap := c.live_max_daily_loss_usd) and not resumed and (pnl := self.live_daily_pnl(trades, now_ms) + self.preopen_pnl()) <= -cap:
-            return f"今日已结算亏损 {money(pnl)} 已达 LIVE_MAX_DAILY_LOSS_USD ${cap:g}"  # recomputed now, not a flag saved a step ago
+        # recomputed now, not a flag saved a step ago — after /live resume too (1.150.0: against the line the resume left,
+        # live_loss_floor; the check used to be skipped for the rest of a day whose stop was lifted by hand)
+        if (cap := c.live_max_daily_loss_usd) and (pnl := self.live_daily_pnl(trades, now_ms) + self.preopen_pnl()) <= self.live_loss_floor(cap):
+            return f"今日已结算亏损 {money(pnl)} 已达 LIVE_MAX_DAILY_LOSS_USD ${cap:g}"
         if not self.live.ready:
             return f"真实交易未就绪：{self.live.not_ready_why}"
         decided = self.live_decided(trade, now_ms)
@@ -2018,9 +2163,11 @@ class LiveBot(core.Bot):
             LOG.info("停止前等在途的下单/撤单请求应答：%.1f 秒", time.monotonic() - started)
 
     def live_cancels_unsent(self, skip: Any = ()) -> dict[str, dict]:
-        """The records whose cancel is decided but not sent yet (state cancelling, an order id known), by tid."""
+        """The records whose cancel is decided but not sent yet (state cancelling, an order id known), by tid. Not one whose
+        removal another path has on its way right now (live_cancels, 1.150.0): its cancel_sent is only set once Predict answers."""
         return {tid: t for tid, t in self.sim_trades().items() if tid not in skip and isinstance(t.get("live"), dict)
                 and t["live"].get("state") == "cancelling" and not t["live"].get("cancel_sent") and tid not in self.live_placing
+                and str(t["live"].get("order_id") or "") not in self.live_cancels
                 and (t["live"].get("order_id") or not t["live"].get("hash"))}  # 1.138.1: one never sent (no id, no hash) is closed at once too
 
     async def sim_express_after(self, now_ms: int) -> None:
@@ -2038,7 +2185,7 @@ class LiveBot(core.Bot):
                     self.live_note_error(f"快车道下单失败：{core.clean_error(error) or type(error).__name__}")
 
         async def cancel(records: dict[str, dict]) -> None:
-            if records and self.live.ready:
+            if records and self.live.signed_in:  # 1.150.0: a cancel needs the sign-in alone (LiveTrader.signed_in), not the account check
                 try:
                     await self.live_cancel_blind(records, now_ms)
                 except Exception as error:
@@ -2064,8 +2211,10 @@ class LiveBot(core.Bot):
         operator's cancel, the emergency stop, LIVE=off and the loss stop are not followed by a fresh order here. The
         fresh order faces every gate a first one does; at the withdrawn price within the lane's cooldown it is not
         placed (sim_express_cooling). It names the record it follows (requote_of) and that one's withdrawal
-        (withdrawn_at): the 撤单→重挂 span of live_latency."""
-        if self.config.live_mode == "off" or self.config.sim_ways == "taker" or not tids:
+        (withdrawn_at): the 撤单→重挂 span of live_latency. Not while the account is not ready (1.150.0): the cancels of a
+        bot signed in but not ready go out (LiveTrader.signed_in), a fresh order would only be refused (live_room) — the
+        step quotes the slot again once ready."""
+        if self.config.live_mode == "off" or self.config.sim_ways == "taker" or not tids or not self.live.ready:
             return
         trades = self.sim_trades()
         freed: dict[tuple[str, str], tuple[str, dict]] = {}
@@ -2132,7 +2281,11 @@ class LiveBot(core.Bot):
                 # the limit (the dearest level seen, or the cap: LIVE_TAKER_PRICE): the book at or under it fills now, the
                 # rest waits LIVE_TAKER_WAIT_SECONDS, or less once the fair price moves away (live_taker_due)
                 amounts = limit_amounts(True, to_wei(want.get("limit") or want.get("cap") or want["price"]), shares_wei)
-                strategy, expiration = "LIMIT", int(now_ms // 1000) + TAKER_ORDER_SECONDS
+                # 1.150.0: its five minutes end with the market, as a maker's expiry does (order_expiry): built in a market's last
+                # minutes, its rest — withdrawn at the end like any order — stayed matchable up to five minutes past it when that
+                # cancel failed. Never longer than before; live_order_deadline keeps the five minutes (nothing is released sooner)
+                strategy, expiration = "LIMIT", min(int(now_ms // 1000) + TAKER_ORDER_SECONDS,
+                                                    order_expiry(core.sim_end_ms(trade.get("settle")), now_ms))
             order = build_order(wallet, want["token"], amounts["maker"], amounts["taker"], want["fee_bps"], expiration)
             digest, signature = wallet.sign_order(order, want["neg_risk"], want["yield_bearing"])
             body: dict = {"data": {"order": {**order, "signature": signature, "hash": digest},
@@ -2204,6 +2357,21 @@ class LiveBot(core.Bot):
             # or the positions evidence books it, or the grace period gives it up. Other 4xx answers stay definite refusals
             duplicate = http_status(error) == 409 or any(w in text.lower() for w in ("already exist", "already placed", "duplicate", "exists"))
             limited = isinstance(error, core.RemoteError) and (http_status(error) == 429 or (error.retry_after and http_status(error) == 0))
+            if st.get("order_id") or st.get("state") not in {"pending", "placing", "cancelling"}:
+                # 1.150.0: the step's sync ran while this request was in flight (the express lane sends outside sim_lock) and found
+                # the order by its hash: live_reconcile made the record "open", or "done" for a taker that filled at once; live_cancel
+                # gave one withdrawn meanwhile its id, and maybe its end. Predict has the order, so this answer (the 20 s timeout, a
+                # dropped connection, a 5xx, even a 4xx or a 429) says nothing about it: the record stays as the sync left it, where it
+                # lives, and Predict's own record decides its fills and its end. It used to be failed (live_fail): a filled taker booked
+                # "cancelled" with every share unfilled (outside the share caps, SIM_GROUP_USD and the local pre-settlement), a resting
+                # maker untracked and unreserved while its side was quoted again beside it after the backoff, and a "下单失败" alert; a
+                # 429 here would have cleared its hash (live_unsend) and sent it again. Checked before all of that: the request itself
+                # and a withdrawal only set pending/placing/cancelling and never an id — an id, or any other state, is a record another
+                # path has taken on (found on Predict, or already finished), and failing it again would undo what that path recorded
+                found = f"同步已按哈希找到订单 #{st['order_id']}" if st.get("order_id") else f"这条记录已另行处理（{st.get('state')}）"
+                st["events"].append({"at": now_ms, "what": f"下单应答出错（{text}），但{found}：以 Predict 的记录为准，不按下单失败处理"})
+                self.sim_save([(tid, trade)])
+                return
             if limited and not trade.get("withdrawn") and st.get("state") != "cancelling":
                 # refused by the client itself (a cooldown that began between the check above and the request), or by Predict's rate
                 # limiter (429: turned away before it was processed — 1.138.0, it counted as a refusal and shut the side out for five
@@ -2307,7 +2475,19 @@ class LiveBot(core.Bot):
         st.update(state="done", final="failed", error=why)
         st["events"].append({"at": now_ms, "what": why})
         trade.update(status="cancelled", unfilled=float(trade.get("order") or 0), note=why)
-        st["rekeyed"] = self.live_rekey(tid, trade)
+        # 1.150.0: a record failed by a path that still holds its slot key while it lives at tid#n already — failed before by
+        # another path (two paths ended one order: a cancel's final read beside another's, a read answered after the record was
+        # finished), or withdrawn (and moved) while this path waited on Predict — is not moved again. It was: the attempt stored
+        # twice (slot#1 and slot#2, one object under both keys), and when a fresh order had taken the slot meanwhile
+        # (LIVE_TAKER_RETRY_SECONDS may be as short as 1 s) sim_rekey's replace of sim:<slot> deleted THAT live order's record —
+        # resting on Predict with no record, its fills booked nowhere, outside LIVE_MAX_OPEN_USD. Saved where it lives instead
+        # (the callers write nothing more under the key they hold). Only this very object at its numbered key counts as moved:
+        # a copy saved back at the slot with an old "rekeyed" is moved as before
+        moved = st.get("rekeyed")
+        if moved and moved != tid and self.sim_trades().get(moved) is trade:
+            self.sim_save([(moved, trade)])
+        else:
+            st["rekeyed"] = self.live_rekey(tid, trade)
         wait = self.config.live_retry if retry is None else retry
         self.live_backoff[(trade["market"], trade["side"], "挂" if trade.get("maker") else "吃")] = (time.monotonic() + wait, why)
         self.live_note_error(f"{trade['item']} {trade['label']}：{why}")
@@ -2318,6 +2498,25 @@ class LiveBot(core.Bot):
         """Move a record to tid#n, freeing the paper trader's one slot per market, side and way."""
         return self.sim_rekey(tid, trade)
 
+    def live_save(self, tid: str, trade: dict) -> None:
+        """A record a pass over the orders changed (live_sync_orders, live_cancel_blind), saved where it lives: under the key
+        the pass holds — or, moved to tid#n since the pass took that key, there; never again under the old key (the slot may
+        hold a fresh order by now)."""
+        moved = trade["live"].get("rekeyed")
+        if not moved or moved == tid:
+            return self.sim_save([(tid, trade)])
+        # 1.150.0: moved by live_fail (a taker that filled nothing: saved there as it moved) — or withdrawn with nothing filled
+        # (sim_rekey: the express lane's look) while the pass, begun before, still held the slot key. Such a pass saved nothing,
+        # and with one path at a time on a cancel (live_cancels) it may be the only one that acts: the step's sync has its open
+        # list on its way, the lane withdraws the order, the sync gets to the cancel first and ends the record on Predict's
+        # confirmation — the lane leaves the order to it, and the fills read saves only a record Predict still returns
+        # (live_cancel_fills_read). The store kept the row "cancelling", its cancel unsent, beside a record done in memory: after
+        # a restart the removal went out again ("noop"), and a single-order read that no longer knew the order made the
+        # confirmed cancel "unknown" — its $ reserved, the side blocked for minutes, a false ❓ alert. Only this very object at
+        # its numbered key is written: a record no longer there (pruned, the view rebuilt from the store) is not put back
+        if self.sim_trades().get(moved) is trade:
+            self.sim_save([(moved, trade)])
+
     # --- reading back: fills, cancels, the final state of each order ---------------------------------------------------
     async def live_sync(self, now_ms: int) -> None:
         trades = self.sim_trades()
@@ -2326,13 +2525,13 @@ class LiveBot(core.Bot):
                   and t["live"].get("state") != "pending"}
         if active and not self.live.ready:
             await self.live_ensure_ready()  # real orders are followed to their end whatever the mode (LIVE=off included)
-        if not self.live.ready:
-            return
+        if not self.live.signed_in:
+            return  # 1.150.0: the sign-in is enough (LiveTrader.signed_in): the on-chain account check holds new orders, never these reads and cancels
         await self.live_renew_auth()
         if active or now_ms - self.live_list_at_ms >= self.LIVE_IDLE_LIST_MS:
             cancelling = [tid for tid, t in active.items() if t["live"].get("state") == "cancelling"]
             await self.live_sync_orders(active, now_ms)  # with nothing in flight the list is still read now and then: orders this bot did not place
-            await self.live_requote_freed(cancelling, now_ms)  # the slots the confirmed cancels freed: quoted again now, not next step
+            await self.live_requote_freed(cancelling, now_ms)  # the slots the confirmed cancels freed: quoted again now (once ready), not next step
         try:
             await self.live_late_fills(now_ms)  # 1.119.0: an order that ended with shares unfilled, against the account's positions
         except Exception as error:
@@ -2432,8 +2631,26 @@ class LiveBot(core.Bot):
         # snapshot stands for the whole account, or within a minute of this bot's own whole read; the rest of the records are read by
         # their hash (live_track). The 11-07 /diag: 同步 10.5 s of an 11.3 s step, twenty pages against the pre-open mode's thousands
         wanted = {str(t["live"].get("order_id")) for t in active.values() if t["live"].get("order_id")}
+        latched = self.live_full_cut and getattr(self, "preopen", None) is not None  # 1.137.2: a cut full read tells nothing the snapshot will not
+        # 1.150.0: ...which holds while a snapshot comes. live_full_cut is re-read by a whole read alone, and that clause allowed none
+        # for as long as a controller was attached — but one stays attached with no snapshot to give: crashed (alive False, kept
+        # until the next preopen_apply: a control-page save, /preopen on|off, a restart), paused (/preopen pause), held by an
+        # operator's stop or the day's loss cap (its account loop reads nothing while blocked), or its reads failing. The sync then
+        # stayed bounded for good and the account was never seen whole again, the model trader trading on: an order of its own that
+        # vanished never counted as missing, nor one of unknown state released by the evidence (live_counts_miss), an unrecorded
+        # order never seen or swept (live_note_unknown, live_orphan_sweep) — with that mode's orders withdrawn long since, the list
+        # would have read whole. So with no whole view — this bot's own or the snapshot's — and no whole read of its own for
+        # LIVE_SNAPSHOT_MAX_AGE_MS (the age at which a snapshot stops standing for the account), the clause lapses for one whole
+        # read: whole, the flag clears and the read is every minute's again, as without that mode; cut once more, the next is that
+        # long away — one in ten minutes, and only while nothing else shows the account
+        blind = (now_ms - int(self.live_whole[2] or 0) > self.LIVE_SNAPSHOT_MAX_AGE_MS
+                 and now_ms - self.live_full_at_ms >= self.LIVE_SNAPSHOT_MAX_AGE_MS)
         bounded = (self.live_snapshot_fresh(now_ms) or now_ms - self.live_full_at_ms < self.LIVE_IDLE_LIST_MS
-                   or (self.live_full_cut and getattr(self, "preopen", None) is not None))  # 1.137.2: a cut full read tells nothing the snapshot will not
+                   or (latched and not blind))
+        if latched and not bounded:
+            # ...whether that read succeeds or not: against that mode's thousands it is twenty pages, any of which may fail — asked
+            # for again at every step, a failing one would fail every step's sync with it (the records unread meanwhile)
+            self.live_full_at_ms = now_ms
         listing = time.monotonic()
         # 1.139.0: only the markets the model trader has orders on (the index and contract cards), when Predict filters the list by market —
         # every one of those orders seen every step; the pre-open mode's thousands on other markets never read here
@@ -2489,10 +2706,8 @@ class LiveBot(core.Bot):
             except Exception as error:
                 st["last_error"] = core.clean_error(error) or type(error).__name__
                 self.live_note_error(f"{trade['item']} {trade['label']} 订单同步失败：{st['last_error']}")
-            if st.get("rekeyed") and st["rekeyed"] != tid:
-                return  # moved to an attempt record (live_fail): saved there, never again under the old key
             if json.dumps(trade, sort_keys=True, default=str) != before:
-                self.sim_save([(tid, trade)])
+                self.live_save(tid, trade)  # where it lives: moved to an attempt record (tid#n) meanwhile, there — never again under the old key
         # 1.137.2: a resting maker order the list did not show is read by its hash LIVE_TRACK_READS a step at most, each at most every
         # LIVE_TRACK_READ_MS, the longest unread first — seventeen of them read every step, two at a time, were most of the sync's seconds
         unseen = sorted((tid for tid, t in active.items() if t["live"].get("state") == "open" and t.get("maker")
@@ -2712,10 +2927,8 @@ class LiveBot(core.Bot):
                 await self.live_cancel(tid, trade, {}, markets.get(trade["market"]), now_ms)
             except Exception as error:
                 st["last_error"] = core.clean_error(error) or type(error).__name__
-            if st.get("rekeyed") and st["rekeyed"] != tid:
-                return  # moved to an attempt record (a taker's live_fail): saved there, never again under the old key (1.138.1, as live_sync_orders)
             if json.dumps(trade, sort_keys=True, default=str) != before:
-                self.sim_save([(tid, trade)])
+                self.live_save(tid, trade)  # moved to an attempt record meanwhile: there, never again under the old key (1.138.1, as live_sync_orders)
         await asyncio.gather(*(one(tid, trade) for tid, trade in active.items()))
 
     def live_fills_later(self, tid: str, trade: dict, mk: Any) -> None:
@@ -2850,12 +3063,16 @@ class LiveBot(core.Bot):
         beyond what its records explain are read from the order's own record first, and what that still does not show
         is taken as filled on the newest such order, at most its unfilled count, costed as a fill of that order (a
         maker's price; a taker's limit, 待对账), noted on the record and announced; not within LIVE_LATE_FILLS_GRACE_MS
-        of the end (the positions list follows the matching a little late);
+        of the end (the positions list follows the matching a little late), nor while an order still working on the
+        outcome may hold that fill unread (live_late_unread, 1.150.0);
         (b) 1.119.1: an outcome the account holds a little less of than its open records say (Predict takes the taker
         fee in shares: 97.74 bought, 96.30 held) — the records are trimmed to the holding, in proportion, when no order
         with fills is still working there, the shortfall is within LIVE_TRIM_MAX and the same shortfall stands a minute
         later (the positions list follows the matching a little late); a position's payout is then exactly the shares
-        held (the cost, price with the fee times the shares bought, stays right within a cent). A list that cannot be
+        held, and its cost the money spent, over the fewer shares: a maker's price × shares, kept (1.122.0); a taker's
+        average price × the shares it bought — the fee its price carries was paid in the shares cut, not in USDT
+        (1.150.0: left in the cost as well, it was counted twice); a taker whose shares were booked from the holding
+        (live_from_holding), net of the fee already: its price × shares, kept like a maker's. A list that cannot be
         read, or came cut at the page cap, changes nothing."""
         if now_ms - self.live_late_checked < self.LIVE_LATE_FILLS_MS:
             return
@@ -2864,6 +3081,7 @@ class LiveBot(core.Bot):
         key_of = lambda t: (str((t["live"].get("want") or {}).get("market_id") or t.get("market_id") or ""), int((t["live"].get("want") or {}).get("index_set") or 0))
         live = [(tid, t) for tid, t in trades.items() if isinstance(t.get("live"), dict)]
         ended = [(tid, t) for tid, t in live  # 1.122.0: a settled record too — a fill read after the result still cost money (the day's loss stop counts it)
+                 # (1.150.0: one that lapsed at the result with nothing filled is settled as the fill lands on it — live_apply: live_settle_late)
                  if t["live"].get("state") == "done" and t["live"].get("order_id") and t.get("status") in {"cancelled", "filled", "settled", "expired"}
                  and float(t.get("order") or 0) - float(t.get("shares") or 0) > 1e-9
                  and self.LIVE_LATE_FILLS_GRACE_MS <= now_ms - core.trade_updated(t) <= self.LIVE_LATE_FILLS_WINDOW_MS]
@@ -2929,6 +3147,23 @@ class LiveBot(core.Bot):
                     left -= got
                     recorded[k] = recorded.get(k, 0.0) + got
                     self.live_adopted_status(tid, t, now_ms, f"结束后再读订单记录，读到成交 {got:g} 份（累计 {float(t['shares']):g}/{float(t.get('order') or 0):g}）")
+            if left <= self.LIVE_DUST_SHARES:
+                continue
+            # 1.150.0: the excess may be a WORKING order's own fill that its record here does not show yet — a resting maker the
+            # step's bounded read left for later (read by its hash every LIVE_TRACK_READ_MS), a cancel confirmed whose fills are
+            # read beside the step (fills_pending), a placement in flight. Before, it went at once onto the ended order whose price
+            # or time matched (a maker re-quoted at the same price is the normal re-quote; an ended taker matches any average at or
+            # under its limit) — not a guess, so never checked again — and when the working order's own read landed, the same
+            # shares sat on two records for good (50 held, 100 recorded): exposure, the journal, the P&L and the daily loss stop
+            # counting them twice. The orders resting there are read now (live_late_unread); while a record there may still hold
+            # fills not read, the outcome waits for the next minute's look (not trimmed either: it is in ``seen``). An order read
+            # now does not hold it — a re-quote resting on the side would otherwise keep a genuine late fill unbooked for hours.
+            if await self.live_late_unread(k, key_of, now_ms):
+                continue
+            # ...and the records as they stand now: a working order's read may have landed during the awaited reads above (the
+            # express lane and the cancels' fills reads run beside the step), after ``recorded`` was summed
+            left = min(left, held.get(k, 0.0) - po.get(k, 0.0) - sum(float(o.get("shares") or 0) for o in self.sim_trades().values()
+                                                                 if isinstance(o.get("live"), dict) and key_of(o) == k))
             if left <= self.LIVE_DUST_SHARES:
                 continue
             price, when = pos_price.get(k), pos_time.get(k, 0)
@@ -3034,17 +3269,65 @@ class LiveBot(core.Bot):
                 continue
             self.live_trim_seen.pop(k, None)
             scale = got / total
+            fee_off = 0.0  # what the takers' costs go down by: the fee they carried in USDT beside the shares cut (the notice says it)
             for tid, t in recs:
                 before = float(t["shares"])
                 after = round(before * scale, 6)
+                cut = float(t.get("fee_shares") or 0)  # the shares earlier trims took off this record
                 t["shares"] = after
-                t["fee_shares"] = round(float(t.get("fee_shares") or 0) + before - after, 6)
+                t["fee_shares"] = round(cut + before - after, 6)
+                what = f"按 Predict 持仓校正份数：{before:g} → {after:g}（账户在这一边共持有 {got:g} 份，比记录的 {total:g} 份少 {short:g} 份：手续费以份额扣除）"
                 if after > 0:
-                    t["price"] = round(float(t["price"]) * before / after, 6)  # 1.122.0: the money spent is the same, over fewer shares
-                t["live"]["events"].append({"at": now_ms, "what": f"按 Predict 持仓校正份数：{before:g} → {after:g}（账户在这一边共持有 {got:g} 份，比记录的 {total:g} 份少 {short:g} 份：手续费以份额扣除）"})
+                    price = float(t["price"])
+                    keep = price * before / after  # 1.122.0: the money spent is the same, over fewer shares
+                    if not t.get("maker") and not self.live_from_holding(t):
+                        # 1.150.0: ...but a taker's price × shares is not the money it spent. live_apply costs it at the average
+                        # plus the fee per share, and Predict takes that fee out of the shares bought — the very shares cut here —
+                        # not in USDT: a fill costs average × shares, never more than the order signed for (100 shares at 58¢:
+                        # $58.00 left the account, which holds 98.55 of them). Kept whole over the fewer shares, the fee was counted
+                        # twice — the shares gone AND their worth still in the cost ($58.84): every trimmed taker's P&L, a win's
+                        # and a loss's alike, came out low by the fee (−$0.84 per 100 shares at 58¢, up to 2% of the money in: the
+                        # journal, the EV comparison, the exposure and the day's loss figure). The money a taker spent is its
+                        # average price × the shares it bought (those held now and every share cut off it): the cost goes there —
+                        # never above the cost the record had, and never by lowering its per-share price (the 1.119.1 rule): a
+                        # record cut by less than its own fee (the shortfall is spread in proportion over the outcome's records)
+                        # keeps the rest of the fee in its cost, dear rather than cheap. (The premise — no USDT fee beside the
+                        # shares — is what the signed order allows and what the shortfall 1.119.1 saw amounts to: 97.74 bought,
+                        # 96.30 held is the whole 2% fee at about 58¢. It has not been confirmed with Predict.)
+                        # Only a taker whose shares were read from its order's own record, though: the shares bought, the fee
+                        # still among them. One whose shares were booked from the account's holding (live_from_holding: a late
+                        # fill adopted from the positions, an order of unknown state settled by them) holds them net of the fee
+                        # already, at a cost that is the money spent as it stands (within a cent), its "average" its limit and
+                        # the shares it bought unknown: it carries no fee twice, and what is cut off it is not its fee (another
+                        # record's, spread onto it; shares that left the account since) — its cost is kept whole, like a
+                        # maker's, as before 1.150.0. (Under the taker's rule only the per-share floor held it, and its cost
+                        # fell by price × the shares cut: 98.55 shares adopted at 58¢ beside a later taker of 100 at 30¢ —
+                        # $88.00 spent — were booked $87.70 together after the trim: under the money spent, the one way this
+                        # must not err.)
+                        keep = min(keep, max(price, float(t.get("avg") or price) * (before + cut) / after))
+                        if price * before - keep * after >= 0.005:
+                            fee_off += price * before - keep * after
+                            what += f"；成本 ${price * before:,.2f} → ${keep * after:,.2f}（吃单的手续费就是少掉的这些份额，不再另算进成本）"
+                    t["price"] = round(keep, 6)
+                t["live"]["events"].append({"at": now_ms, "what": what})
                 self.sim_save([(tid, t)])
+            costs = "（成本不变）" if fee_off < 0.005 else (f"（吃单的手续费就是少掉的这些份额，不再另算进成本：成本共减 ${fee_off:,.2f}"
+                                                           + ("；挂单的成本不变" if any(t.get("maker") for _, t in recs) else "")
+                                                           + ("；按账户持仓记入的吃单本来就是扣过手续费的份数，成本不变"
+                                                              if any(not t.get("maker") and self.live_from_holding(t) for _, t in recs) else "") + "）")
             self.live_notify(f"📐 份数校正：{recs[0][1]['item']} {recs[0][1]['label']}：账户持有 {got:g} 份，记录 {total:g} 份，少的 {short:g} 份是手续费以份额扣除；"
-                             f"{len(recs)} 笔记录按比例改为持有的份数（成本不变）", key=f"trim:{k[0]}:{k[1]}")
+                             f"{len(recs)} 笔记录按比例改为持有的份数{costs}", key=f"trim:{k[0]}:{k[1]}")
+
+    @staticmethod
+    def live_from_holding(t: dict) -> bool:
+        """Whether shares of this record were booked from the account's holding rather than read from its order's own
+        record (1.150.0): a late fill adopted from the positions (live_late_fills (a): ``adopted``), or an order of
+        unknown state settled by them (live_recheck, which leaves no mark but its event). Both events say the holding
+        exceeded the records — 持仓比记录多, the words matched here: they stay in those two events. Shares booked so are
+        what the account holds, net of the fee Predict takes in shares; read from the order's record they are the
+        shares bought, the fee still among them (live_late_fills (b))."""
+        st = t["live"]
+        return bool(st.get("adopted")) or any("持仓比记录多" in str(e.get("what") or "") for e in st.get("events") or ())
 
     async def live_undo_preopen_adoptions(self, live: list[tuple[str, dict]], key_of: Any, busy: set, po: dict, now_ms: int) -> None:
         """A backfill that was the pre-open mode's fill, undone (1.131.5): the order's own record, read again once the
@@ -3101,6 +3384,42 @@ class LiveBot(core.Bot):
         self.live_apply(tid, t, row, None, now_ms)
         st.pop("fills_pending", None)
         return max(0.0, float(t.get("shares") or 0) - before)
+
+    async def live_late_unread(self, k: tuple[str, int], key_of: Any, now_ms: int) -> str:
+        """Why the account's excess on outcome ``k`` may still be a working order's own fill that its record here does not
+        show — "" when none (live_late_fills (a), 1.150.0). The orders resting there are read first, by their hash, as
+        live_track reads them: a record Predict still shows open gets its fills. What still holds the outcome is a record
+        whose fills cannot be known now: a cancel confirmed whose fills are read beside the step (fills_pending), a
+        placement or a cancel in flight, an order of unknown state, a resting order whose read failed, found it ended
+        (its end is the sync's to book) or that was withdrawn meanwhile. A record never sent, or ended and read, holds
+        nothing; nor does a resting order read here."""
+        read: set[str] = set()
+        for tid, t in list(self.sim_trades().items()):
+            st = t.get("live")
+            if not isinstance(st, dict) or key_of(t) != k or st.get("state") != "open" or not st.get("hash"):
+                continue  # (by its hash alone: a read by id searches the account's whole open list)
+            row = None
+            with contextlib.suppress(Exception):
+                row = await self.live.api.order(str(st.get("order_id") or ""), str(st["hash"]))
+            if st.get("state") != "open" or not isinstance(row, dict) or order_final(row, float(t.get("order") or 0)):
+                continue  # withdrawn meanwhile (its cancel reads it), unreadable, or ended: not read here — it holds the outcome
+            before = float(t.get("shares") or 0)
+            self.live_apply(tid, t, row, None, now_ms)
+            read.add(str(st.get("order_id") or st["hash"]))
+            if float(t.get("shares") or 0) > before + 1e-9:
+                self.sim_save([(st.get("rekeyed") or tid, t)])
+        for t in list(self.sim_trades().values()):
+            st = t.get("live")
+            if not isinstance(st, dict) or key_of(t) != k:
+                continue
+            state, name = st.get("state"), str(st.get("order_id") or st.get("hash") or "")
+            if core.fills_pending(st):
+                return f"订单 #{name} 撤单已确认，撤单前的成交还没读回"
+            if state in {"placing", "cancelling", "unknown"} and name:  # (never sent: no id, no hash — nothing to fill)
+                return f"订单 #{name} {'发送中' if state == 'placing' else '撤单中' if state == 'cancelling' else '状态未知'}，成交未定"
+            if state == "open" and name not in read:
+                return f"挂着的订单 #{name} 这次没读到"
+        return ""
 
     def live_adopted_status(self, tid: str, t: dict, now_ms: int, how: str) -> None:
         """A record that gained fills after its order ended: a position now (unless settled), the event, the notice, saved."""
@@ -3186,11 +3505,17 @@ class LiveBot(core.Bot):
             return  # a fresh order may take Predict a moment to show on its reads: the looks only count after a minute
         # Predict has answered "no such order" this many looks in a row, a minute or more after the placement: a removal is
         # still asked for (if it exists after all, it must not fill — and the answer says whether it did), then the record ends
+        oid = str(st["order_id"])
+        if oid in self.live_cancels:
+            return  # 1.150.0: another path is removing this very order right now (live_cancel: withdrawn meanwhile): its answer ends the record
+        self.live_cancels.add(oid)
         try:
             result = await self.live.api.remove_orders([st["order_id"]])
         except Exception as error:
             st["last_error"] = core.clean_error(error) or type(error).__name__
             return  # the removal could not be asked for: again next look, the order stays reserved meanwhile
+        finally:
+            self.live_cancels.discard(oid)
         if st["order_id"] in (result.get("removed") or []):
             st["events"].append({"at": now_ms, "what": f"连续 {self.LIVE_MISSES} 次查不到这张单，补发的撤单请求撤掉了它（它其实还在）"})
             self.live_finish(tid, trade, {"status": "CANCELLED"}, mk, now_ms)
@@ -3253,9 +3578,34 @@ class LiveBot(core.Bot):
             # used to skip it for the single-order read, which may lag the list (or not know a removed order), and the
             # fills the list showed were lost with their reservation (1.83.0)
             self.live_apply(tid, trade, listed, mk, now_ms)
+        # 1.150.0: one path at a time removes an order and reads Predict's final word on it. The step's sync, every express pass that
+        # changed anything (live_cancels_unsent is global: any key's lane sends every unsent cancel), /live cancel and the emergency
+        # stop beside the step all reach the same withdrawn record, outside sim_lock, and cancel_sent is only set once Predict
+        # answers — so two paths sent two removals. The second answer ("noop": the first had taken the order off) overwrote the
+        # first's confirmation, and that path's single-order read, which may not know a just-removed order, put the finished record
+        # back to "unknown": its $ reserved again, the side blocked for minutes, a false ❓ alert. A taker's attempt was failed twice
+        # and stored at slot#1 and slot#2; a second final read answering after a fresh taker had taken the slot deleted that live
+        # order's record (live_fail). The other path leaves the order to this one: what the list showed is applied above, the
+        # answers here end the record — or leave it "cancelling", its cancel unsent, for the next pass when the request fails
+        oid = str(st["order_id"])
+        if oid in self.live_cancels:
+            return
+        self.live_cancels.add(oid)
+        try:
+            await self.live_cancel_order(tid, trade, listed, mk, now_ms)
+        finally:
+            self.live_cancels.discard(oid)
+
+    async def live_cancel_order(self, tid: str, trade: dict, listed: dict | None, mk: Any, now_ms: int) -> None:
+        """live_cancel's removal request and Predict's final word on the order, the order claimed by this path (live_cancels).
+        A record another path ended while an answer was on its way (the fills of a list completing it, an order's own record
+        read beside this) stays as that path left it: the answer changes nothing."""
+        st = trade["live"]
         if not st.get("cancel_sent"):
             st.setdefault("cancel_sent_at", self.market.now_ms())  # the first request's time, off the clock (live_latency: 决定→撤单发出)
             result = await self.live.api.remove_orders([st["order_id"]])
+            if st.get("state") != "cancelling":
+                return  # 1.150.0: ended meanwhile
             gone_now = st["order_id"] in result["removed"]
             st["cancel_sent"], st["cancel_confirmed"] = now_ms, bool(gone_now)
             if gone_now:
@@ -3275,6 +3625,8 @@ class LiveBot(core.Bot):
             self.live_cancel_again(st, now_ms, "撤单请求发出后仍在盘口，再发一次")  # still listed: its fills count while it rests
             return
         final = await self.live.api.order(st["order_id"], st.get("hash", ""))
+        if st.get("state") != "cancelling":
+            return  # 1.150.0: ended meanwhile
         order = float(trade.get("order") or 0)
         if final is not None and not order_final(final, order) and not st.get("cancel_confirmed"):
             self.live_apply(tid, trade, final, mk, now_ms)  # Predict still shows it open and did not confirm the removal: wait —
@@ -3317,8 +3669,12 @@ class LiveBot(core.Bot):
 
     def live_order_deadline(self, trade: dict) -> int:
         """When this order can no longer fill, on the bot's clock: a taker's LIMIT expires TAKER_ORDER_SECONDS after
-        it was built; a maker's at the expiry it was signed with, or two hours after the market's end — 0 when
-        nothing bounds it (then only Predict's word or an operator ends an unknown record)."""
+        it was built; a maker's two hours after the market's end, or at the expiry it was signed with should that be
+        later — 0 when nothing bounds it (then only Predict's word or an operator ends an unknown record). 1.150.0: an
+        order is signed to expire sooner than this now (order_expiry: a minute or two past its market's end), but what
+        waits on this — an unknown record's reservation and its side (live_recheck) — is released no sooner than it was:
+        a maker signed before that is valid the two hours, and the evidence (the open lists, the positions) ends an
+        unknown record within minutes anyway; this is only what is left when it cannot."""
         st, want = trade["live"], trade["live"].get("want") or {}
         if not trade.get("maker"):
             start = int(st.get("placed_at") or st.get("placing_at") or trade.get("opened") or 0)
@@ -3326,7 +3682,7 @@ class LiveBot(core.Bot):
         expires = int(want.get("expires") or 0)
         end = core.sim_end_ms(trade.get("settle"))
         bounds = [b for b in ((expires * 1000 if 0 < expires < FAR_FUTURE else 0), (end + 2 * 3600_000 if end else 0)) if b]
-        return min(bounds) if bounds else 0
+        return max(bounds) if bounds else 0  # the later of the two (they were one and the same until 1.150.0)
 
     def live_unknown_suspects(self, trade: dict) -> list[dict]:
         """The unrecorded open orders (live_unknown_open) that could be this unknown record's own order under a hash it
@@ -3360,9 +3716,12 @@ class LiveBot(core.Bot):
         word). Missing from LIVE_UNKNOWN_LOOKS complete open lists, unknown to the hash read and unknown for
         LIVE_UNKNOWN_SETTLE_MS, the account's positions decide (1.104.9): nothing beyond what the other records explain
         and it ends unfilled, its slot and reservation freed; a surplus is what it filled. Before, only its expiry plus a
-        margin ended it — a daily market's maker order expires two hours after the close, so the 11-04 长鑫 跌 side sat
-        blocked from 16:46 for a day ("状态未知、对账中"). The expiry path stays for a record the positions cannot
-        settle (unreadable, or the list cut)."""
+        margin ended it — a daily market's maker order expired two hours after the close then (live_order_deadline still
+        waits that long), so the 11-04 长鑫 跌 side sat blocked from 16:46 for a day ("状态未知、对账中"). The expiry path
+        stays for a record the evidence did not settle by then: past its expiry the positions alone decide. While they
+        cannot (unreadable, the list cut, a surplus that cannot be told from the pre-open mode's shares —
+        live_unexplained) the record stays unknown and reserved on either path, the positions read for it once a minute
+        at most, until they can, Predict's word, or an operator's /live release."""
         st = trade["live"]
         order = float(trade.get("order") or 0)
         row = by_id.get(str(st.get("order_id") or "-")) or by_hash.get(str(st.get("hash") or "-").lower())
@@ -3404,8 +3763,13 @@ class LiveBot(core.Bot):
             st["last_error"] = (f"连续 {st['unknown_misses']} 次完整列表没有它，但账户上还有 {len(suspects)} 张本机器人没有记录的挂单"
                                 f"（#{'、#'.join(u['id'] for u in suspects[:3])}）：可能就是这张，先核对；核对后 /live release 或 /live cancel account")
             return
-        if not expired and now_ms - int(st.get("unexplained_at") or 0) < self.LIVE_UNEXPLAINED_EVERY_MS:
-            return  # the positions are read for it once a minute at most
+        if now_ms - int(st.get("unexplained_at") or 0) < self.LIVE_UNEXPLAINED_EVERY_MS:
+            # the positions are read for it once a minute at most — past its expiry too (1.150.0). An expired record used to look
+            # every step until a look settled it; but a look can settle nothing for days — the list cut at the page cap, and now
+            # a surplus that cannot be told from the pre-open mode's shares (live_positions_busy: until an operator's /live
+            # release) — and each look reads every page of /positions, inside the step's sync and on the rate limit the orders
+            # and the pre-open mode share. The record stays reserved between the looks, as before its expiry.
+            return
         st["unexplained_at"] = now_ms
         # nothing can fill it any more (expired), or nothing says it exists (settled) — but it may have filled while it could
         # not be found (Predict's hash of it differing from the one computed here, its answer lost): the account's position on
@@ -3414,7 +3778,8 @@ class LiveBot(core.Bot):
         head = (f"订单的有效期已过（{core.stamp(deadline, seconds=False)}）" if expired
                 else f"连续 {st['unknown_misses']} 次完整的开放订单列表里没有它、按哈希也查不到，状态未知已 {unknown_ms // 60_000} 分钟")
         if extra is None:
-            st["last_error"] = head + ("，但持仓列表没读全（超过分页上限）：下次再核对（额度照旧占用）" if self.live_positions_cut
+            st["last_error"] = head + (f"，但{self.live_positions_busy}（额度照旧占用）" if self.live_positions_busy
+                                       else "，但持仓列表没读全（超过分页上限）：下次再核对（额度照旧占用）" if self.live_positions_cut
                                        else "，但持仓读取失败：下次再核对（额度照旧占用）")
             return
         if extra > 1e-9:
@@ -3434,9 +3799,10 @@ class LiveBot(core.Bot):
 
     async def live_unexplained(self, trade: dict) -> float | None:
         """The shares the account holds on this record's outcome beyond what the other records explain (their filled
-        shares on the same market and outcome): what an order that cannot be found may have filled. None when the
-        positions cannot be read now, or not whole (live_positions_cut)."""
-        self.live_positions_cut = False
+        shares on the same market and outcome) and the pre-open mode's fills there: what an order that cannot be found may
+        have filled. None when the positions cannot be read now, or not whole (live_positions_cut), or when a surplus cannot
+        be told from the pre-open mode's shares (live_positions_busy says why)."""
+        self.live_positions_cut, self.live_positions_busy = False, ""
         want = trade["live"].get("want") or {}
         mid, index_set = str(want.get("market_id") or trade.get("market_id") or ""), int(want.get("index_set") or 0)
         if not mid or not index_set:
@@ -3444,6 +3810,11 @@ class LiveBot(core.Bot):
         try:
             rows = await self.live.api.positions()
         except Exception:
+            rows = None
+        # again after the read: the step rechecks its unknown records side by side, and another one's look may have set these
+        # meanwhile — live_recheck reads them for this record right after this returns (no await in between)
+        self.live_positions_cut, self.live_positions_busy = False, ""
+        if rows is None:
             return None
         self.live_positions = (rows, time.time())
         if not getattr(self.live.api, "positions_complete", True):
@@ -3457,14 +3828,46 @@ class LiveBot(core.Bot):
             if str(market.get("id") or row.get("marketId") or "") == mid and int(outcome.get("indexSet") or 0) == index_set:
                 with contextlib.suppress(ValueError, TypeError):
                     held += from_wei(int(str(row.get("amount") or "0")))
-        explained = 0.0
+        explained, across = 0.0, 0.0  # the other records' shares on this outcome, and on the market's other outcomes
         for other in self.sim_trades().values():
             if other is trade or not isinstance(other.get("live"), dict):
                 continue
             o_want = other["live"].get("want") or {}
-            if str(o_want.get("market_id") or other.get("market_id") or "") == mid and int(o_want.get("index_set") or 0) == index_set:
-                explained += float(other.get("shares") or 0)
-        return max(0.0, held - explained)
+            if str(o_want.get("market_id") or other.get("market_id") or "") == mid:
+                if int(o_want.get("index_set") or 0) == index_set:
+                    explained += float(other.get("shares") or 0)
+                else:
+                    across += float(other.get("shares") or 0)
+        extra = max(0.0, held - explained)
+        if extra <= 1e-9:
+            # nothing beyond the records: this order filled nothing the account still holds, whatever the pre-open mode holds or
+            # has yet to read there (as before; a fill since merged into USDT with shares on the market's other side would not show)
+            return extra
+        # 1.150.0: the pre-open mode's shares are not this order's fill (PREOPEN.md: its fills are never booked onto the model
+        # trader's orders; live_recorded_by_outcome, live_late_fills and /live fills count them as recorded). Before, they stayed
+        # in this surplus: an order lost on an outcome where that mode held 10 shares was booked "filled 10" at its limit, the
+        # same shares then in the model's records and in the mode's ledger — exposure, the P&L and the loss stop counting them
+        # twice. A surplus is now attributed only once the pre-open mode's part of it is known for certain:
+        # - an order of that mode on this outcome whose fills are not read yet (preopen_unverified): the surplus may be its fill;
+        # - its read fills here are taken off only when nothing on the market's other side could have merged with them: Predict
+        #   merges the two sides of a market into USDT (1.104.11), so a pair of it filled both ways — or against a record's shares
+        #   on the other side — is no longer on the account, and taking its fills off would hide this order's own fill.
+        # Either way the record waits, reserved: for the ledger to read the order, else for Predict's word or an operator
+        # (/live release) — never a guess in either direction. Without the mode's fills or orders here nothing changes.
+        busy, po = self.preopen_unverified(), self.preopen_filled()
+        if (mid, index_set) in busy:
+            self.live_positions_busy = "这一边有开盘前预挂订单的成交还没读完，多出的份数可能是它的：读完再核对"
+            return None
+        theirs = float(po.get((mid, index_set), 0.0))
+        if theirs <= 1e-9:
+            return extra
+        other_side = (across > 1e-9 or any(m_id == mid and j != index_set and shares > 1e-9 for (m_id, j), shares in po.items())
+                      or any(m_id == mid and j != index_set for m_id, j in busy))  # anything its fills here may have merged with
+        if other_side:
+            self.live_positions_busy = (f"开盘前预挂在这一边成交了 {theirs:g} 份，这个市场另一边也有份数，Predict 会把两边的份额合并成 USDT，"
+                                        "分不清多出的份数是谁的：请在 Predict 核对，确认这张单不存在后 /live release")
+            return None
+        return max(0.0, extra - theirs)
 
     def prunable(self, trade: dict) -> bool:
         """A live record that filled nothing is pruned only once a complete open list read after it ended did not show
@@ -3540,7 +3943,12 @@ class LiveBot(core.Bot):
             if not isinstance(st, dict) or st.get("state") != "done" or t.get("status") in {"settled", "expired"}:
                 continue
             row = by_id.get(str(st.get("order_id") or "-")) or by_hash.get(str(st.get("hash") or "-").lower())
-            if row is None or (at_ms is not None and at_ms < core.trade_updated(t)):
+            # 1.150.0: ...nor does a list of a look that began before Predict confirmed the record's removal (cancel_done_at, off the
+            # clock as the answer came). An express pass stamps its events with the time the pass began, before its cancel's round
+            # trip: a step that began a moment after it, its list read by Predict before that removal, found the record "ended
+            # earlier" and still listed — the cancelled order was taken back (a false ⚠️ alert, its $ reserved and the side held
+            # again) and removed a second time
+            if row is None or (at_ms is not None and at_ms < max(core.trade_updated(t), int(st.get("cancel_done_at") or 0))):
                 continue
             st.pop("final", None)
             st.pop("error", None)
@@ -3592,7 +4000,8 @@ class LiveBot(core.Bot):
 
     def live_apply(self, tid: str, trade: dict, row: dict, mk: Any, now_ms: int) -> None:
         """The fills a record states, onto the trade: new shares become a fill (at the model's fair price now), the
-        average price it states replaces the expected cost."""
+        average price it states replaces the expected cost. Shares landing on a record that lapsed at its market's result
+        settle it on that result (live_settle_late, 1.150.0)."""
         st = trade["live"]
         order = float(trade.get("order") or 0)
         filled, status = order_fill(row, order)
@@ -3618,6 +4027,9 @@ class LiveBot(core.Bot):
                 trade["filled"], trade["fill_fair"] = now_ms, fair
             self.live_notify(f"✅ 成交：{trade['item']} {trade['label']} {core.cents(float(trade['price']))}×{filled - prev:g} 份"
                              f"（累计 {filled:g}/{order:g}，订单 #{st.get('order_id')}）")
+            # 1.150.0: read after the market's result (the record lapsed at 0 shares): settled on that result now. Only as shares
+            # land — every caller saves a record whose shares grew; a read that shows nothing new changes nothing here
+            self.live_settle_late(trade, now_ms)
         if filled >= order - 1e-9 and trade["status"] == "resting":
             trade["status"] = "filled"
             st["state"], st["final"] = "done", "filled"
@@ -3663,18 +4075,22 @@ class LiveBot(core.Bot):
         position resolved against the bot is marked settled (``lost``) and never asked about again (1.131.3: each one
         cost a market read every round, and the pre-open mode leaves one or more a filled window — hundreds a day
         against the rate limit its orders and cancels share); a market is read once a round whatever outcomes are held,
-        at most LIVE_REDEEM_READS markets a round, the newest positions first (the rest the next round), and a rate limit
-        ends the round. One round at a time: the command and the automatic round never redeem one position twice."""
+        at most LIVE_REDEEM_READS markets a round, the longest unread first (the rest the next rounds; 1.150.0: by the
+        newest positions alone the same markets took every read for as long as they stayed unresolved, and a resolved
+        winner behind them was never reached), and a rate limit ends the round. One round at a time: the command and
+        the automatic round never redeem one position twice."""
         async with self.redeem_lock():
             done, _ = await self.live_redeem_pass(now_ms)
             return done
 
     async def live_redeem_pass(self, now_ms: int, dry_run: bool = False) -> tuple[list[str], list[dict]]:
-        """One look at the account's positions, the newest first: (the redeemed lines, each position judged). Kinds:
+        """One look at the account's positions, the markets read the longest ago first (never yet: first of all; the
+        newest positions first among equals): (the redeemed lines, each position judged). Kinds:
         redeemed (now), claimable (resolved in its favour, not redeemed now: ``dry_run``, or no gas), failed (this
         round), waiting (a failed redeem's back-off), lost, open (not resolved), unread (its market not read: the round's
         cap, a failed read, a rate limit), fields (no index set on the position, no condition on the market), kept
-        (redeemed before, still listed). ``dry_run`` (/live redeem check): nothing sent, written or announced."""
+        (redeemed before, still listed). ``dry_run`` (/live redeem check): nothing sent, written or announced — the
+        markets the next round would read, whose turn it leaves as it was."""
         rows = await self.live.api.positions()
         self.live_positions = (rows, time.time())
         done: list[str] = []
@@ -3689,10 +4105,22 @@ class LiveBot(core.Bot):
         read_errors: dict[str, str] = {}
         limited = False
         errors = self.__dict__.setdefault("live_redeem_errors", {})
-        for row in sorted(rows, key=lambda r: -self.position_time(r)):  # the newest first: a capped round reaches the fresh wins
+        # 1.150.0: the markets go by how long ago this process read them here — never yet first, then by the round of their last read,
+        # the newest positions first among equals. By the newest positions alone (1.131.3) a capped round spent its LIVE_REDEEM_READS
+        # on the same newest markets every round for as long as they stayed unresolved (or their read kept failing), so a resolved
+        # winner behind forty of them was never read — by the automatic round or by /live redeem — and its USDT stayed locked: the
+        # pre-open mode's fills on the windows ahead are newer than the window that just resolved. A round that a rate limit cut
+        # short began at the same markets again, too. Now a round reads first what the last one did not reach and fills up with the
+        # newest: every market's turn comes within about (markets / LIVE_REDEEM_READS) rounds, and while one round reads them all
+        # each is read every round, as before.
+        read_round = self.__dict__.setdefault("live_redeem_read_round", {})
+        this_round = max(read_round.values(), default=0) + 1
+        unsettled: set[str] = set()  # the markets of the positions with no redeemed / lost mark: only their turn is remembered
+        market_of = lambda r: str((r.get("market") if isinstance(r.get("market"), dict) else {}).get("id") or r.get("marketId") or "")
+        for row in sorted(rows, key=lambda r: (read_round.get(market_of(r), 0), -self.position_time(r))):
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
             outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
-            mid = str(market.get("id") or row.get("marketId") or "")
+            mid = market_of(row)
             try:
                 amount = int(str(row.get("amount") or "0"))
             except ValueError:
@@ -3707,6 +4135,7 @@ class LiveBot(core.Bot):
             if mark:
                 seen.append({**entry, "kind": "lost" if mark.get("lost") else "kept", "tx": str(mark.get("tx") or "")})
                 continue
+            unsettled.add(mid)
             failed_at = self.live_redeem_failed.get(key)
             if failed_at is not None and time.monotonic() - failed_at < self.LIVE_REDEEM_RETRY_SECONDS:
                 seen.append({**entry, "kind": "waiting", "left": self.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - failed_at), "error": errors.get(key, "")})
@@ -3724,6 +4153,10 @@ class LiveBot(core.Bot):
                     markets[mid] = None
                     read_errors[mid] = core.clean_error(error) or type(error).__name__
                     limited = bool(getattr(error, "retry_after", 0) or http_status(error) == 429)  # rate-limited: nothing more asked of Predict this round
+                if not dry_run and not limited:
+                    # read — or not readable (a delisted market's 404): the other markets' turn before it is read again. One the rate
+                    # limit stopped keeps its place: it is the next round's first
+                    read_round[mid] = this_round
             raw = markets[mid]
             if raw is None:
                 seen.append({**entry, "kind": "unread", "error": read_errors.get(mid, "")})
@@ -3765,6 +4198,8 @@ class LiveBot(core.Bot):
             self.live_notify(line)
         if dry_run:
             return done, seen
+        for gone in set(read_round) - unsettled:
+            del read_round[gone]  # every position on it settled here (redeemed, lost) before this round, or no longer held: forgotten
         claimable = [s for s in seen if s["kind"] == "claimable"]
         if low_gas and claimable and time.monotonic() - self.live_gas_noted >= self.LIVE_REDEEM_RETRY_SECONDS:
             self.live_gas_noted = time.monotonic()
@@ -3956,9 +4391,24 @@ class LiveBot(core.Bot):
             self.store.delete_keys(["live:paused"])
             if getattr(self, "preopen", None) is not None:
                 self.preopen.manual_pause = self.preopen.ledger.pause(False)
-            if record := self.live_kill_record():
-                self.store.put("live:killed", {**record, "resumed": True, "resumed_at": now_ms})
-            return "▶️ 真实交易已恢复：满足条件的建议会重新下单。"
+            lifted = ""
+            record = self.live_kill_record()
+            if record and not record.get("resumed"):
+                # 1.150.0: today's loss stop lifted. The day's settled P&L as the resume finds it is kept with the record: the stop
+                # is armed again a cap's worth under it (live_loss_floor), where it used to be gone until midnight whatever was lost
+                # next. Only a standing stop is lifted — a resume that merely ends a pause later in the day moves nothing, or every
+                # pause and resume would hand out another cap. And the answer says what was lifted: the same command (the page's
+                # 恢复 button) ends a pause, and an operator ending one had no word that the day's loss stop went with it.
+                pnl = self.live_daily_pnl(self.sim_trades(), now_ms) + self.preopen_pnl()
+                self.store.put("live:killed", {**record, "resumed": True, "resumed_at": now_ms, "resumed_pnl": pnl})
+                self.live_noted.pop("kill", None)  # the next stop is announced however soon it comes (a keyed notice waits LIVE_NOTE_SECONDS)
+                cap = self.config.live_max_daily_loss_usd
+                lifted = f"；同时解除了今日亏损停机：今日已结算 {money(pnl)}，" + (
+                    f"再亏到 {money(self.live_loss_floor(cap))} 会再次停机" if cap else "现在不设亏损上限（LIVE_MAX_DAILY_LOSS_USD=0）")
+                held = getattr(self.preopen, "withdrawing", None) if self.preopen_active() else None
+                if held is not None and (why := held()):  # its own loss check is not lifted by this command (PREOPEN.md): said, not changed
+                    lifted += f"。开盘前预挂模式仍不挂单：{why}"
+            return "▶️ 真实交易已恢复：满足条件的建议会重新下单" + lifted + "。"
         if action == "cancel":
             return await self.live_cancel_command(words, now_ms)
         if action == "release":
@@ -4097,6 +4547,7 @@ class LiveBot(core.Bot):
                 # LIVE_MAX_DAILY_LOSS_USD (1.125.0): the page shows that same sum (day_pnl), daily_pnl stays the model trader's own
                 "preopen_pnl": (pre_pnl := self.preopen_pnl()), "day_pnl": own_pnl + pre_pnl,
                 "caps": {"order": c.live_max_order_usd, "open": c.live_max_open_usd, "daily_loss": c.live_max_daily_loss_usd},
+                "loss_floor": self.live_resumed_floor(),  # 1.150.0: where the loss stop stands after today's /live resume (None: at the cap)
                 "resting": sum(t["status"] == "resting" for _, t in live),
                 "unconfirmed": sum(t["live"].get("state") in {"pending", "placing", "cancelling", "unknown"} for _, t in live),
                 "synced_at": core.stamp(self.live_synced_at) if self.live_synced_at else "",
@@ -4116,12 +4567,16 @@ class LiveBot(core.Bot):
     # --- the order test: a tiny resting order, listed, cancelled ------------------------------------------------------------
     LIVE_TEST_SHARES = 5.0  # the floor; the exchange's minimum order value usually asks for more (50 shares at 2¢)
     LIVE_TEST_PRICE = 0.02  # never above this, and always under the best bid: it rests, it does not trade
+    LIVE_TEST_HARD_USD = 2.0  # LIVE_TRADING_ALLOWED=off: the most a test is worth, whatever is saved (a minimum order at any price is under it)
 
     async def live_test(self, args: list[str], now_ms: int) -> str:
         """The real order path checked end to end with a dollar or so locked for minutes at most: a LIMIT buy far
         under the market (it rests; it is withdrawn at once; it expires in ten minutes by itself), then the open-order
         list, the cancel and the final state, each step reported with what Predict answered. Arguments: a market name
-        to pick it, a share count, a price in cents (a price at or above the best bid may trade)."""
+        to pick it, a share count, a price in cents (a price at or above the best bid may trade). The arguments are
+        held to the limits like any real order (1.150.0, live_test_hold): never at or above the best ask, worth
+        LIVE_MAX_ORDER_USD at the most (LIVE_TEST_HARD_USD under the hard switch), and at a price that may trade only
+        while a model order could open."""
         if not self.live.ready:
             return f"未就绪：{self.live.not_ready_why}"
         words = [a.strip() for a in args if a and a.strip()]
@@ -4155,6 +4610,28 @@ class LiveBot(core.Bot):
         shares = max(shares_given if shares_given is not None else self.LIVE_TEST_SHARES, least)
         sized = (f"（{shares_given:g} 份不足 Predict 最低订单金额 ${MIN_ORDER_USD:g}，改为 {shares:g} 份）"
                  if shares_given is not None and shares > shares_given else "")
+        # 1.150.0: the share count and the price are the operator's (the control endpoint passes its request's "args" on as
+        # well), and readiness was all that stood before the signature: `/live test 恒生 1000 99` sent a $990 buy across the
+        # book with LIVE_MAX_ORDER_USD at $5 — under LIVE=pause, /live pause, today's loss stop and LIVE_TRADING_ALLOWED=off
+        # alike. The test is a resting order, and stays one whatever the arguments: (1) never at or above the best ask — that
+        # trades at once: a purchase no record holds, not a test (`恒生 100 1` typed as `恒生 1 100` was one); (2) worth
+        # LIVE_MAX_ORDER_USD at the most, like every real order — and LIVE_TEST_HARD_USD while LIVE_TRADING_ALLOWED=off: the
+        # cap is a saved setting (the page raises it), and under the hard switch no saved setting decides what leaves; (3) at
+        # a price that may trade (at or above the best bid) only while a model order could open a position (live_test_hold).
+        # The test without arguments — 2¢ at the most, under the best bid, $1 — passes all three in every mode: LIVE=pause is
+        # where it is meant to be run
+        c = self.config
+        best_ask, notional = float(mk.book.ask[0]), price * shares
+        if price >= best_ask - 1e-9:
+            return (f"❌ {mk.item}：测试价 {core.cents(price)} 不低于盘口最低卖价 {core.cents(best_ask)}，会立刻成交。挂单测试只挂单、不吃单："
+                    "给一个低于最低卖价的价格，或不给价格（自动挂在最高买价之下）")
+        most = c.live_max_order_usd if c.live_allowed else min(c.live_max_order_usd, self.LIVE_TEST_HARD_USD)
+        if notional > most + 1e-9:
+            limit = f"LIVE_MAX_ORDER_USD ${most:g}" if most == c.live_max_order_usd else f"${most:g}（部署变量 LIVE_TRADING_ALLOWED=off 时挂单测试的上限）"
+            return f"❌ 测试单 {core.cents(price)}×{shares:g} 份 = ${notional:,.2f}，超过 {limit}：减少份数或降低价格（不给份数和价格时约 $1）"
+        if caution and (why := self.live_test_hold(notional)):
+            return (f"❌ {why}：测试价 {core.cents(price)} 不低于盘口最高买价 {core.cents(best_bid)}，可能成交。"
+                    "这时挂单测试只能挂在最高买价之下（不给价格即可）")
         try:
             amounts = limit_amounts(True, to_wei(price), to_wei(shares))
             order = build_order(self.live.wallet, outcome["token"], amounts["maker"], amounts["taker"], info.fee_bps, int(now_ms // 1000) + 600)
@@ -4196,6 +4673,25 @@ class LiveBot(core.Bot):
         except Exception as error:
             lines.append(f"4/4 查询最终状态失败：{core.clean_error(error) or type(error).__name__}")
         return self.live_test_done(record, lines)
+
+    def live_test_hold(self, notional: float) -> str:
+        """Why an order test at a price that may trade is not sent now: the operator's stops and caps a model order of
+        its value would answer to before it opened a position — the hard switch, the mode, /live pause, today's loss stop
+        (the same flags live_room reads), LIVE_MAX_OPEN_USD. "" when none holds. A test under the best bid is not asked:
+        it rests, and is what LIVE=pause is there for."""
+        c = self.config
+        if not c.live_allowed:
+            return "部署变量 LIVE_TRADING_ALLOWED=off（硬开关），不开新仓"
+        if c.live_mode != "on":
+            return f"LIVE={c.live_mode}，" + ("只记账" if c.live_mode == "off" else "不开新仓")
+        if paused := self.live_paused():
+            return f"真实交易已暂停（{paused}；/live resume 恢复）"
+        if killed := self.live_killed():
+            return f"今日停止开新仓（{killed}）"
+        exposure = self.live_exposure(self.sim_trades())
+        if exposure + notional > c.live_max_open_usd + 1e-9:
+            return f"持仓+挂单 ${exposure:,.2f} 加本单 ${notional:,.2f} 超过 LIVE_MAX_OPEN_USD ${c.live_max_open_usd:g}"
+        return ""
 
     def live_test_done(self, record: dict, lines: list[str]) -> str:
         text = "\n".join(lines)
@@ -4303,8 +4799,11 @@ class LiveBot(core.Bot):
         after = self.sim_trades()
         states = [after.get(tid, t)["live"] for tid, t in targets.items()]
         confirmed = sum(s.get("state") == "done" for s in states)
-        sent = sum(s.get("state") == "cancelling" and bool(s.get("cancel_sent")) for s in states)
-        unsent = sum(s.get("state") == "cancelling" and not s.get("cancel_sent") for s in states)
+        # 1.150.0: a removal another path has on its way (the step's sync, an express pass: live_cancels) is sent, its answer awaited —
+        # this command's own pass left that order to it (live_cancel), and its cancel_sent is only set once Predict answers
+        flying = lambda s: str(s.get("order_id") or "") in self.live_cancels
+        sent = sum(s.get("state") == "cancelling" and (bool(s.get("cancel_sent")) or flying(s)) for s in states)
+        unsent = sum(s.get("state") == "cancelling" and not s.get("cancel_sent") and not flying(s) for s in states)
         if list_error:
             # the open list could not be read: the cancels with an order id went out by id all the same (live_cancel_blind)
             note = f"账户挂单列表读取失败（{list_error}）：撤单改按订单号直接发送" + ("，未发出的下一轮重试" if unsent else "")
@@ -4456,10 +4955,13 @@ class LiveBot(core.Bot):
     def live_text(self, now_ms: int) -> str:
         trades = self.sim_trades()
         live = [t for t in trades.values() if isinstance(t.get("live"), dict)]
+        # 1.150.0: a pause and today's loss stop are shown side by side — the pause alone was shown, and /live resume, sent to end
+        # it, lifts the stop as well
+        stops = "｜".join(x for x in ("⏸ 已暂停（" + self.live_paused() + "）" if self.live_paused() else "",
+                                    "🛑 今日停开新仓（" + self.live_killed() + "）" if self.live_killed() else "") if x)
         state = ("⚪ LIVE=off：只记账（/live mode pause 登录测试，/live mode on 真实下单）" if self.config.live_mode == "off"
                  else "🧪 LIVE=pause：只测试，不开新仓" + ("" if self.live.ready else "｜未就绪：" + self.live.not_ready_why) if self.config.live_mode == "pause"
-                 else "⏸ 已暂停（" + self.live_paused() + "）" if self.live_paused() else "🛑 今日停开新仓（" + self.live_killed() + "）"
-                 if self.live_killed() else ("🟢 运行中" if self.live.ready else "🔴 未就绪：" + self.live.not_ready_why))
+                 else stops or ("🟢 运行中" if self.live.ready else "🔴 未就绪：" + self.live.not_ready_why))
         ways, kinds = core.sim_scope(self.config)
         lines = [f"💰 {core.bold('真实交易')} v{core.VERSION}｜{state}", *self.live.summary_lines(),
                  f"策略：同模拟交易：净优势 ≥{self.config.sim_edge * 100:g}¢ 买 {self.config.sim_shares:g} 份；{ways}；{kinds}"]
@@ -4481,9 +4983,11 @@ class LiveBot(core.Bot):
         # LIVE_MAX_DAILY_LOSS_USD (1.125.0), so the line shows the same number (and the split when the pre-open part is non-zero):
         # showing only the model trader's part read e.g. −$15 of a −$50 cap while the stop had tripped at a combined −$55
         own, pre = self.live_daily_pnl(trades, now_ms), self.preopen_pnl()
+        floor = self.live_resumed_floor()  # 1.150.0: after /live resume the stop stands a cap's worth further down: said, beside the cap
         lines.append(f"持仓+挂单 ${exposure:,.2f} / ${self.config.live_max_open_usd:g}｜今日已结算盈亏 {money(own + pre)}"
                      + (f"（原策略 {money(own)} + 预挂 {money(pre)}）" if pre else "")
-                     + f"（上限 −${self.config.live_max_daily_loss_usd:g}）｜挂单中 {resting}｜今日下单 {placed_today}｜失败 {failed_today}")
+                     + f"（上限 −${self.config.live_max_daily_loss_usd:g}" + (f"；今天手动恢复过，停机线 {money(floor)}" if floor is not None else "")
+                     + f"）｜挂单中 {resting}｜今日下单 {placed_today}｜失败 {failed_today}")
         lines.append(self.live_redeem_status_line())
         stats = core.sim_stats(live)
         if stats["settled"]:
@@ -4523,8 +5027,8 @@ class LiveBot(core.Bot):
 
     def status(self, sub_id: str) -> str:
         state = ("LIVE=off，只记账（/live mode 切换）" if self.config.live_mode == "off" else "LIVE=pause，不开新仓" if self.config.live_mode == "pause"
-                 else "已暂停" if self.live_paused() else "今日停开新仓" if self.live_killed()
-                 else ("运行中" if self.live.ready else f"未就绪：{self.live.not_ready_why}"))
+                 else "、".join(x for x in ("已暂停" if self.live_paused() else "", "今日停开新仓" if self.live_killed() else "") if x)  # both, when both (1.150.0)
+                 or ("运行中" if self.live.ready else f"未就绪：{self.live.not_ready_why}"))
         return super().status(sub_id).replace("仅价格提醒；不会自动撤单/交易。", f"💰 真实交易 {state}｜/live 查看订单、持仓与风控")
 
     def journal_payload(self, full: bool = False, history: int | None = None) -> dict:
@@ -4538,14 +5042,48 @@ class LiveBot(core.Bot):
 
     def preopen_review(self) -> dict | None:
         """The review page's 开盘前预挂 section (preopen.review): the running controller's ledger, or the file read while the
-        mode is off; None when nothing is recorded."""
-        from preopen import read_rows, review
+        mode is off; None when nothing is recorded. Audit PRE-LEDGER-GROWTH: with the ledger's archive — the old finished
+        quotes that filled nothing left the working records (Ledger.archive_old), and the totals and tables count them as
+        they always did. By their counts, kept from call to call (preopen.ArchiveShare: the archive is read once, after
+        that only the rows moved in since): reading and parsing the whole archive at every call — two a build of
+        journal.json — took twice as long as the review had with every record in memory, and longer with every day of
+        history. Record by record off the file, as before that, only when the counts cannot stand for the records (one in
+        the archive that is no plain withdrawn quote) or could not be had; never kept in memory either way."""
+        from preopen import archive_share, read_archive, read_rows, review
         try:
-            rows = list(self.preopen.ledger.rows.values()) if self.preopen is not None else read_rows(self.config.preopen.db)
+            if self.preopen is not None:
+                rows, old = list(self.preopen.ledger.rows.values()), self.preopen.ledger.archived()
+            else:
+                rows, old = read_rows(self.config.preopen.db), read_archive(self.config.preopen.db)
         except Exception as error:
             LOG.warning("预挂复盘读取失败：%s", core.clean_error(error) or type(error).__name__)
             return None
-        return review(rows, self.market.now_ms()) if rows else None
+        now_ms = self.market.now_ms()
+        try:
+            share = self.preopen_share = archive_share(self.preopen.ledger if self.preopen is not None else self.config.preopen.db, rows, getattr(self, "preopen_share", None))
+            if share.fits(now_ms):
+                return review(rows, now_ms, share) if rows or share.count else None
+        except Exception as error:  # the counts could not be had: dropped (they may be half brought up to date), and the archive read record by record below
+            self.preopen_share = None
+            LOG.warning("预挂复盘的归档统计没用上（这次逐条读归档）：%s", core.clean_error(error) or type(error).__name__)
+        keys = {p.get("slug") for p in rows}  # a record in both (its move undone by hand) counts once: the working one
+        more: list[int] = [0]
+        failed: list[Exception] = []
+
+        def every() -> Any:
+            yield from rows
+            try:
+                for p in old:
+                    if p.get("slug") not in keys:
+                        more[0] += 1
+                        yield p
+            except Exception as error:  # the archive cannot be read (it is read as the review walks it): no figures, not short ones
+                failed.append(error)
+        out = review(every(), now_ms)
+        if failed:
+            LOG.warning("预挂复盘读取失败（归档）：%s", core.clean_error(failed[0]) or type(failed[0]).__name__)
+            return None
+        return out if rows or more[0] else None
 
     async def preopen_apply(self) -> None:
         """The pre-open mode as PREOPEN_15M and the PREOPEN_* settings say now (the environment, the control page's saved
@@ -4572,8 +5110,30 @@ class LiveBot(core.Bot):
             if self.preopen is None and not self.stopping.is_set():
                 if want.enabled:
                     self.preopen_start()
-                elif self.preopen_leftovers():  # off, yet its records hold orders that may rest: withdrawn all the same
-                    self.preopen_start(wind_down="预挂模式关着，但上次还有挂单没撤完")
+                else:
+                    self.preopen_tidy()  # off: no controller will ever move the old records out of the file the check below and the positions check read whole
+                    if self.preopen_leftovers():  # off, yet its records hold orders that may rest: withdrawn all the same
+                        self.preopen_start(wind_down="预挂模式关着，但上次还有挂单没撤完")
+
+    def preopen_tidy(self) -> None:
+        """The mode off and no controller on its ledger file: the old finished quotes that filled nothing still leave the
+        file's working records (preopen.archive_file — a running controller does it itself, Controller.archive). Audit
+        PRE-LEDGER-GROWTH: while the mode is off that file is read whole twice a minute by the positions check
+        (preopen_filled, preopen_unverified) and several times by every build of the review page — at 50,000 records two
+        seconds of the event loop each time. At a start and at a settings apply, an hour apart at least; a failure is
+        logged and nothing moves."""
+        from preopen import ARCHIVE_EVERY_MS, archive_file
+        path = self.config.preopen.db
+        if path == ":memory:" or time.monotonic() - getattr(self, "preopen_tidied", -1e9) < ARCHIVE_EVERY_MS / 1000:
+            return
+        self.preopen_tidied = time.monotonic()
+        try:
+            moved = archive_file(path, self.market.now_ms())
+        except Exception as error:
+            LOG.warning("预挂旧记录归档失败（记录原样保留）：%s", core.clean_error(error) or type(error).__name__)
+            return
+        if moved:
+            LOG.info("开盘前预挂（未开启）：%d 条早已结束、已撤且没成交的记录移入归档", moved)
 
     def preopen_leftovers(self) -> int:
         """Orders the pre-open mode's records say may still rest while the mode is off (1.141.0) — a stop in the middle of a
@@ -4591,6 +5151,7 @@ class LiveBot(core.Bot):
 
     def preopen_start(self, wind_down: str = "") -> None:
         from preopen import Controller
+        self.preopen_day_read = None  # a controller holds the ledger from here: its own records count (preopen_pnl), not a figure read off the file
         preopen = self.preopen = (self.preopen_factory or Controller)(self)
         if wind_down:  # nothing new goes out: the orders still resting are withdrawn, then it stops itself
             preopen.wind_down(wind_down)
@@ -4600,10 +5161,22 @@ class LiveBot(core.Bot):
             if not t.cancelled() and t.exception() is not None:
                 text = core.clean_error(t.exception()) or type(t.exception()).__name__
                 LOG.error("开盘前策略异常结束：%s", text)
-                # the bot goes on (its run() withdrew this mode's orders on the way out); the model trader is free again
+                # the bot goes on (its run() withdrew what it could of this mode's orders on the way out: counted below); the
+                # model trader is free again — within the day's loss stop, which still counts this mode's realised loss
+                # (preopen_pnl, Audit PRE-PNL-DROP)
                 preopen.error, preopen.alive = f"预挂模式已停止：{text}", False
                 self.live_note_error(f"开盘前预挂模式异常停止：{text}")
-                self.live_notify(f"⚠️ 开盘前预挂模式异常停止：{text}（本模式的挂单已撤，重启后恢复）", key="preopen:crash")
+                # Audit PRE-CRASH-WITHDRAW: what is left is counted, not assumed. "本模式的挂单已撤" went out whatever the
+                # withdrawal did — nothing at all on a ledger it could not write (fixed in on_stop), cut short by
+                # STOP_CANCEL_S, or stopped by a refusal of every request (401/403). The records in memory carry each removal.
+                try:
+                    from preopen import resting_orders
+                    left = sum(resting_orders(p, preopen.now()) for p in preopen.ledger.rows.values())
+                    gone = ("本模式的挂单已撤" if not left else
+                            f"还有 {left} 张预挂单可能还挂着，开场前 {preopen.settings.expiry_seconds} 秒签名到期之前仍可能成交，请到 Predict 核对")
+                except Exception:
+                    gone = "撤单情况不明，请到 Predict 核对"
+                self.live_notify(f"⚠️ 开盘前预挂模式异常停止：{text}（{gone}，重启后恢复）", key="preopen:crash")
             elif not t.cancelled() and getattr(preopen, "winding", "") and self.preopen is preopen and not self.stopping.is_set():
                 asyncio.get_running_loop().create_task(self.preopen_apply(), name="preopen-apply")  # wound up: cleared (or started afresh)
         task.add_done_callback(finished)
@@ -4625,6 +5198,7 @@ class LiveBot(core.Bot):
         with contextlib.suppress(Exception):
             preopen.ledger.close()
         self.preopen, self.preopen_task = None, None
+        self.preopen_day_read = None  # its last records are on file now: read afresh at the next loss check (preopen_file_day)
         LOG.info("开盘前预挂模式停止：%s", why)
 
     def preopen_active(self) -> bool:
@@ -4645,8 +5219,45 @@ class LiveBot(core.Bot):
         return float(self.preopen.risk()) if self.preopen_active() else 0.0
 
     def preopen_pnl(self) -> float:
-        """The running pre-open mode's accounted P&L of the day, counted with the model trader's against LIVE_MAX_DAILY_LOSS_USD."""
-        return float(self.preopen.daily_pnl()) if self.preopen_active() else 0.0
+        """The pre-open mode's accounted P&L of the day, counted with the model trader's against LIVE_MAX_DAILY_LOSS_USD: while
+        it runs for real, its day as it stands (a gain offsets the model trader's losses); while it does not — crashed (alive
+        False, kept until the next apply), LIVE≠on, switched off and cleared, off since a restart — its day's realised loss
+        alone, a gain counting 0."""
+        if self.preopen_active():
+            return float(self.preopen.daily_pnl())
+        # Audit PRE-PNL-DROP: this was 0.0 whenever the mode was not running (1.125.0 gated the day on preopen_active together
+        # with the reservation), so a crash, /preopen off (wound down, then cleared) or a restart with the mode off took the
+        # day's realised pre-open loss out of the stop: the model trader got its whole LIVE_MAX_DAILY_LOSS_USD back, and the
+        # account's real loss of the Beijing day could reach the cap plus that loss. A booked loss stays booked; what ends
+        # with the mode is its reservation (preopen_risk) and its exclusive hold (preopen_exclusive). Floored at 0: a stopped
+        # mode's gain never loosens the stop (it counted 0 before), so no state counts less loss than it used to. Records
+        # that cannot be read count 0, as before (logged).
+        preopen = getattr(self, "preopen", None)
+        try:
+            day = float(preopen.daily_pnl()) if preopen is not None else self.preopen_file_day()
+        except Exception as error:
+            LOG.warning("预挂当日盈亏读取失败（日亏损停机线这次只算原策略）：%s", core.clean_error(error) or type(error).__name__)
+            return 0.0
+        return min(0.0, day)
+
+    def preopen_file_day(self) -> float:
+        """Today's (Beijing) accounted P&L in the pre-open mode's ledger file while no controller holds it (Audit PRE-PNL-DROP):
+        read once and kept for the day — the loss checks run every step, every sync and every send, the file is never pruned
+        (about a second's read at 20,000 records), and nothing writes it while no controller runs; preopen_start and
+        preopen_stop drop the figure. A file that cannot be read counts 0 (the stop as it was) and is tried again a minute
+        on, not at every check."""
+        from preopen import read_rows
+        path, day, now = self.config.preopen.db, core.beijing_day(self.market.now_ms() / 1000), time.monotonic()
+        kept = getattr(self, "preopen_day_read", None)
+        if kept is not None and kept[:2] == (path, day) and now < kept[3]:
+            return kept[2]
+        try:
+            value, until = sum(float(p.get("pnl") or 0) for p in read_rows(path) if p.get("accounted_day") == day), math.inf
+        except Exception as error:
+            LOG.warning("预挂记录读取失败（日亏损停机线暂只算原策略，一分钟后再读）：%s", core.clean_error(error) or type(error).__name__)
+            value, until = 0.0, now + 60
+        self.preopen_day_read = (path, day, value, until)
+        return value
 
     def preopen_rows(self) -> list[dict]:
         """The pre-open mode's ledger records: the controller's (running or stopped), else the file; [] when neither reads."""

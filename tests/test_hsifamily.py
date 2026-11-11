@@ -100,10 +100,16 @@ async def run():
 
     # --- a short outage with no CFD anchor: etnet's last quote (still current) keeps its exact anchor -------------------------
     store.delete_prefix("anchor:HSI:cfd")
-    now = bj(9, 30, 21, 5); bot.market.now = now
+    now = bj(9, 30, 21, 3); bot.market.now = now
     bot.hsi.families["HSI"] = m.dataclasses.replace(bot.hsi.families["HSI"], quoted_ms=bj(9, 30, 21, 0))
     o = bot.hsi_odds(now)
     assert isinstance(o, m.CloseOdds) and bot.hsi_used.source == "etnet" and not o.warn, (o, bot.hsi_used)
+    # 1.150.0 (audit FEED-HSI-FUTURES-STALE; the line above ran at 21:05 until then): past three minutes without a change the
+    # card still shows that estimate, exact anchor and all, but nothing is suggested from it
+    now = bj(9, 30, 21, 5); bot.market.now = now
+    o = bot.hsi_odds(now)
+    assert isinstance(o, m.CloseOdds) and bot.hsi_used.source == "etnet" and "/ 16:10 现货收市时 24,600 →" in o.proxy_note, (o, bot.hsi_used)
+    assert o.warn == "恒指期货报价停在 09-30 21:00，已超 3 分钟未更新", o.warn
     # ... but not once it is older than the 10 minutes a live quote may be quiet
     now = bj(9, 30, 21, 11); bot.market.now = now
     feed["cfd"] = cfd("24885", "21:10:59")

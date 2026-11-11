@@ -32,6 +32,11 @@ a pause or an external cancel is quoted again too, at most MAX_ATTEMPTS times
 the book: the signed expiry is the backstop, the next process takes them over.
 1.127.1: the request wrapper takes a cancel's answer (no "data" key) as the
 success it is; only an explicit success=false is a refusal.
+
+Audit PRE-LATE-FILL: an order off the book is ended by a read of its record made
+LATE_FILL_MS after it left, not by the one right after its removal, which may
+not show the last seconds' matches yet — a pair withdrawn with nothing filled
+gives its reservation back a minute on, not at once (Controller.ended).
 """
 from __future__ import annotations
 
@@ -43,13 +48,14 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
 from decimal import Decimal as D
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 import main as core
 
@@ -58,6 +64,7 @@ TERMINAL = {"removed", "not_sent", "rejected", "not_found", "final"}  # states a
 NEVER_PLACED = {"not_sent", "rejected", "not_found"}                  # ...of which these never tied money up
 RETRY_MS, RETRY_MAX_MS = 15_000, 120_000  # a closing pair's cancels and reads are tried again this long after a try, doubling to the cap
 GIVE_UP_MS = 15 * 60_000  # after a window's start + this, an order Predict cannot show by its hash is taken as never placed (it expired before the start)
+LATE_FILL_MS = 60_000     # an order off the book is ended only by a read of its record made this long after it left: an earlier one may not show its last matches yet (Controller.ended)
 SPRINT_MS = 2_000         # the last stretch (past the cancel time, before the expiry): an order still open is asked to be cancelled this often, no backoff
 REFRESH_MS = 30_000       # an active window's market is read again this often (matching on; a status change withdraws the pair)
 REFRESH_FAR_MS = 900_000  # ...a window starting more than an hour away: this often (a day's windows must not cost a read a second; 1.134.1: 15 min, was 5)
@@ -91,6 +98,9 @@ MAY_REST = {"open", "placing", "unknown", "prepared"}  # order states that may b
 FREE_REASONS = ("设置不同", "预挂模式停止", "到时撤单或真实交易暂停", "距涨停", "距跌停", "临停")  # withdrawals that were not the window's doing (counts_against)
 MISS_STOP = 4          # discover: a card's coming windows are asked in start order; this many unlisted in a row end the card's full scan
 FULL_SCAN_MS = 60_000  # a full scan (up to MISS_STOP unlisted per card) this often; between them each card's first unlisted window alone is asked every poll
+ARCHIVE_AFTER_MS = 2 * core.DAY_MS  # a finished quote that filled nothing leaves the working records this long after its window's end (archivable, Ledger.archive_old)
+ARCHIVE_EVERY_MS = 3_600_000        # ...looked for at a start and then this often (Controller.archive; LiveBot.preopen_tidy while the mode is off)
+ARCHIVE_CHUNK = 2_000               # ...this many a transaction: the first pass over an old ledger moves tens of thousands, and the file must not double for it
 
 
 def final_order(row: dict) -> bool:
@@ -108,11 +118,34 @@ def order_verified(order: dict) -> bool:
 Settings = core.PreopenSettings  # the settings live in Config (PREOPEN_*, the control page's values included): Settings.from_config(config)
 
 
+def archivable(pair: dict, before_ms: int) -> bool:
+    """Whether a record is history and nothing else (Ledger.archive_old): accounted and closed, its window over before
+    ``before_ms``, every order ended in the ordinary way — its final record read, never sent, or refused outright, with no
+    note of a doubt (an order given up on — never found by its hash, final only as known — stays among the known ones:
+    Controller.known) — and nothing in it that anything but the review page's counts reads: no fill (no position, no
+    P&L: fills_by_outcome, daily_pnl, the EV bets, the tally's fills), no official result (the tally's cross-check)."""
+    return (bool(pair.get("accounted")) and pair.get("phase") == "closed" and int(pair.get("start_ms") or 0) > 0
+            and settle_from(pair) < before_ms and not float(pair.get("pnl") or 0) and not pair.get("result")
+            and all(o.get("state") in {"final", "not_sent", "rejected"} and float(o.get("filled") or 0) <= 0 and not o.get("note")
+                    for o in (pair.get("orders") or {}).values()))
+
+
 class Ledger:
-    """No background writer or structural re-key: an acknowledged record is on disk."""
+    """No background writer or structural re-key: an acknowledged record is on disk.
+
+    Audit PRE-LEDGER-GROWTH: ``rows`` (the table ``pairs``) are the working records — every one is loaded at a start and
+    walked by the loops many times a second — and nothing ever left them: one record a window, a level and an attempt, for
+    good (twenty cards at four levels: thousands a day). At 50,000 the start froze the bot for two seconds, the loops took
+    a quarter of its event loop, a listing's burst of pairs took seconds to send, and the memory and the file only grew.
+    The finished quotes that filled nothing now move to the table ``archive`` two days after their window (archive_old),
+    whole, in the same file; only the review page reads them — once: after that it keeps their counts and reads the rows
+    moved in since (ArchiveShare)."""
+    rewrites = 0  # passes of this process (any ledger's) that replaced a record the archive already held: its rows did not only grow, and the counts kept of them are read afresh (ArchiveShare)
+
     def __init__(self, path: str):
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=FULL")
@@ -120,12 +153,48 @@ class Ledger:
         self.conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, body TEXT NOT NULL)")
         self.conn.commit()
         self.rows = {slug: json.loads(body) for slug, body in self.conn.execute("SELECT slug,body FROM pairs")}
+        self.by_hash: dict[str, str] = {}  # order hash -> its record's key (holder); "" for a hash two records hold
+        for slug, row in self.rows.items():
+            self.index(slug, row)
+        self.archived_count = self.archive_count()  # (the status says how many)
+
+    def index(self, slug: str, row: dict) -> None:
+        """A record's order hashes noted in by_hash (holder). A hash two records hold at once — a cloned record; never this
+        code's own doing, the salt differs by window, level and attempt — is marked "": holder then walks the records,
+        the first holder its answer as it always was. An entry naming a record that no longer holds the hash is replaced."""
+        for order in (row.get("orders") or {}).values():
+            digest = order.get("hash")
+            if not digest:
+                continue
+            kept = self.by_hash.get(digest)
+            other = self.rows.get(kept) if kept and kept != slug else None
+            if other is not None and any(o.get("hash") == digest for o in (other.get("orders") or {}).values()):
+                self.by_hash[digest] = ""
+            elif kept != "":
+                self.by_hash[digest] = slug
+
+    def unindex(self, slug: str, row: dict) -> None:
+        """A record leaving ``rows`` (deleted, renamed, archived): its entries in by_hash go with it."""
+        for order in (row.get("orders") or {}).values():
+            if order.get("hash") and self.by_hash.get(order["hash"]) == slug:
+                del self.by_hash[order["hash"]]
+
+    def holder(self, digest: str) -> dict | None:
+        """The record one of whose orders has this hash (Controller.before_send). By the index: the walk it replaces went
+        through every record from the oldest to the one being sent, the newest, four times a pair (Audit
+        PRE-LEDGER-GROWTH). Whenever the index does not answer for certain — no entry, an entry whose record does not hold
+        the hash, a hash two records hold — the walk itself, so the answer is the one it always gave."""
+        row = self.rows.get(self.by_hash.get(digest) or "")
+        if row is not None and any(o.get("hash") == digest for o in row["orders"].values()):
+            return row
+        return next((p for p in self.rows.values() if any(o.get("hash") == digest for o in p["orders"].values())), None)
 
     def save(self, row: dict) -> None:
         body = json.dumps(row, ensure_ascii=False)
         with self.conn:
             self.conn.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body", (row["slug"], body))
         self.rows[row["slug"]] = row
+        self.index(row["slug"], row)
 
     def save_many(self, rows: list[dict]) -> None:
         """Several records in one transaction (1.141.0: a batch withdrawal touches thousands — one commit, not one each)."""
@@ -136,13 +205,16 @@ class Ledger:
                                   [(row["slug"], json.dumps(row, ensure_ascii=False)) for row in rows])
         for row in rows:
             self.rows[row["slug"]] = row
+            self.index(row["slug"], row)
 
     def delete(self, slug: str) -> None:
         """A pair none of whose orders was ever sent (the rate limiter refused the first request): no record, so a later
         poll places the window afresh — the same signed orders, their salt being deterministic."""
         with self.conn:
             self.conn.execute("DELETE FROM pairs WHERE slug=?", (slug,))
-        self.rows.pop(slug, None)
+        row = self.rows.pop(slug, None)
+        if row is not None:
+            self.unindex(slug, row)
 
     def rename(self, slug: str, new_slug: str) -> None:
         """A record stepping aside (its window quoted again under a new attempt): kept, under a key that is not the window's."""
@@ -151,7 +223,66 @@ class Ledger:
         with self.conn:
             self.conn.execute("DELETE FROM pairs WHERE slug=?", (slug,))
             self.conn.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body", (new_slug, json.dumps(row, ensure_ascii=False)))
+        self.unindex(slug, row)
         self.rows[new_slug] = row
+        self.index(new_slug, row)
+
+    def archive_old(self, now_ms: int) -> int:
+        """The records that are history only (archivable: accounted, closed, every order ended in the ordinary way, nothing
+        filled, no result, the window over ARCHIVE_AFTER_MS ago) moved from ``pairs`` to ``archive`` and out of ``rows``;
+        how many. Whole and in the same file — nothing is deleted (putting one back is one INSERT … SELECT) — a chunk a
+        transaction: in the archive and out of ``pairs`` together, or neither.
+
+        Why nothing else misses them: such a window started days ago, so it is never quoted again (candidate_problem) and
+        its attempts and failures (the salt, MAX_ATTEMPTS) are asked for by nothing; its orders are final or were never
+        placed, so the account can show none of them open (known, account); with no fill it has no position, no P&L and
+        no bet (fills_by_outcome, daily_pnl, cards_today — today's windows — the EV, the tally). A card's latest window
+        stays whatever its age: the listing horizon a controller reads off the records at a start is as it was.
+
+        What does change: the status counts and measures the working records (实测: the last two days' and the windows not
+        over); and two readers of ``rows`` in live.py find an archived record no more. /live cancel <order id> with the id
+        of an archived record's order (LiveBot.live_cancel_command) used to withdraw that window's pair and pause this
+        mode: the id is nobody's now ("没有订单号为 … 的真实挂单") and nothing is paused. And a market whose only records
+        are archived is none of this bot's markets any more (LiveBot.live_known_markets: live_orphan_sweep withdraws an
+        open order nobody recorded when it is on one of them, and only reports it otherwise). Neither is missed: an
+        archived record's window ended two days ago and more — its market is over — and its own orders' signatures
+        expired before the window began, so nothing of it can rest."""
+        latest: dict[str, int] = {}
+        for p in self.rows.values():
+            key = str(p.get("key") or "")
+            latest[key] = max(latest.get(key, 0), int(p.get("start_ms") or 0))
+        before = now_ms - ARCHIVE_AFTER_MS
+        gone = [slug for slug, p in self.rows.items() if archivable(p, before) and int(p.get("start_ms") or 0) < latest[str(p.get("key") or "")]]
+        if gone:  # the table is made by the first move, not at a start: opening a ledger writes nothing it did not write before
+            with self.conn:
+                self.conn.execute("CREATE TABLE IF NOT EXISTS archive (slug TEXT PRIMARY KEY, body TEXT NOT NULL)")
+        for at in range(0, len(gone), ARCHIVE_CHUNK):
+            part = gone[at:at + ARCHIVE_CHUNK]
+            held = self.archive_count()
+            with self.conn:
+                self.conn.executemany("INSERT INTO archive VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body",
+                                      ((slug, json.dumps(self.rows[slug], ensure_ascii=False)) for slug in part))
+                self.conn.executemany("DELETE FROM pairs WHERE slug=?", ((slug,) for slug in part))
+            for slug in part:  # (on disk first: a chunk that could not be written leaves its records where they were)
+                self.unindex(slug, self.rows.pop(slug))
+            self.archived_count = self.archive_count()
+            if self.archived_count - held != len(part):  # a record the archive held already — saved again after its move by a task that still had it — was replaced there, in place
+                Ledger.rewrites += 1
+        return len(gone)
+
+    def has_archive(self) -> bool:
+        return self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive'").fetchone() is not None
+
+    def archive_count(self) -> int:
+        """How many records the archive holds (none in a file nothing was moved in yet)."""
+        return int(self.conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0]) if self.has_archive() else 0
+
+    def archived(self) -> Iterator[dict]:
+        """The archived records, one at a time and never kept: the review page counts them so (LiveBot.preopen_review) when
+        it cannot go by their kept counts (ArchiveShare)."""
+        if self.has_archive():
+            for (body,) in self.conn.execute("SELECT body FROM archive"):
+                yield json.loads(body)
 
     def close(self) -> None:
         self.conn.close()
@@ -440,7 +571,8 @@ def resting_orders(pair: dict, now_ms: int) -> int:
 def counts_against(pair: dict) -> bool:
     """Whether a withdrawn record counts against its window's MAX_ATTEMPTS: one that ended by its own failure (a side not
     confirmed, a side ended unfilled — an external cancel, a deferred refusal — the market's status) does; one withdrawn
-    for what was not the window's doing (a settings change, the mode stopped, LIVE paused, the stock guard) does not
+    for what was not the window's doing (a settings change, the mode stopped, an operator's stop — the mode or LIVE
+    paused, /live cancel all, the emergency stop, at any book size: Audit PRE-PAUSE-STRIKES — and the stock guard) does not
     (1.131.6: a day of settings changes used up the three quotes of every window listed the day before). Marked on the
     record (free); an older record by its reason."""
     if pair.get("free"):
@@ -508,7 +640,8 @@ def pair_quote(pair: dict) -> tuple[float, float]:
 
 
 def read_rows(path: str) -> list[dict]:
-    """The ledger's pairs read while the mode is off (no controller holds the file): every record, as saved."""
+    """The ledger's pairs read while the mode is off (no controller holds the file): every working record, as saved (the
+    old finished quotes that filled nothing are in the archive: read_archive)."""
     if path == ":memory:" or not Path(path).exists():
         return []
     conn = sqlite3.connect(path)
@@ -516,6 +649,39 @@ def read_rows(path: str) -> list[dict]:
         return [json.loads(body) for (body,) in conn.execute("SELECT body FROM pairs")]
     finally:
         conn.close()
+
+
+def read_archive(path: str) -> Iterator[dict]:
+    """The ledger file's archived records (Ledger.archive_old) while the mode is off, one at a time and never kept: the
+    review page counts them so (LiveBot.preopen_review) when it cannot go by their kept counts (ArchiveShare). None in a
+    file from before the archive."""
+    if path == ":memory:" or not Path(path).exists():
+        return
+    conn = sqlite3.connect(path)
+    try:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive'").fetchone():
+            for (body,) in conn.execute("SELECT body FROM archive"):
+                yield json.loads(body)
+    finally:
+        conn.close()
+
+
+def archive_file(path: str, now_ms: int) -> int:
+    """Ledger.archive_old on the ledger file while no controller holds it (the mode off: LiveBot.preopen_tidy) — the
+    positions check and the review page read that file's working records whole, twice a minute and six times a build;
+    how many records moved. Nothing without a file (none is made)."""
+    if path == ":memory:" or not Path(path).exists():
+        return 0
+    ledger = Ledger(path)
+    try:
+        return ledger.archive_old(now_ms)
+    finally:
+        ledger.close()
+
+
+def level_name(price: float, shares: float) -> str:
+    """A price level as the review's tables name it: 49¢×10."""
+    return f"{price * 100:g}¢×{shares:g}"
 
 
 def quote_of(pair: dict) -> dict:
@@ -540,7 +706,7 @@ def quote_of(pair: dict) -> dict:
     at = dt.datetime.fromtimestamp(start / 1000, core.BEIJING)
     return {"window": window_of(pair), "key": str(pair.get("key") or ""), "card": str(pair.get("name") or pair.get("key") or "").rsplit(" ", 1)[0],
             "name": str(pair.get("name") or window_of(pair)), "day": at.strftime("%m-%d"), "date": at.date().isoformat(), "hour": at.hour, "start_ms": start,
-            "level_name": f"{price * 100:g}¢×{shares:g}",
+            "level_name": level_name(price, shares),
             "active": pair.get("phase") == "active", "accounted": accounted, "filled": total, "filled_up": filled["up"], "filled_down": filled["down"],
             "sent": {side: side in orders and orders[side].get("state") not in NEVER_PLACED for side in ("up", "down")},
             "price": price, "shares": shares, "volume": total * price, "settled": accounted and total > 0, "pending": total > 0 and not accounted,
@@ -601,40 +767,250 @@ def ev_bets(rows: list[dict]) -> list[dict]:
     return out
 
 
-def review(rows: list[dict], now_ms: int) -> dict:
+def review(rows: Iterable[dict], now_ms: int, old: ArchiveShare | None = None) -> dict:
     """The review page's 开盘前预挂 section (journal.json analysis.preopen): what this mode's quotes made — the totals, by the
     window's day, card, start hour (Beijing) and side, and the windows that filled, newest first. A record is a pair
-    (one window, one attempt) at least one order of which was sent; a window's two sides are two bets at the pair's price."""
+    (one window, one attempt) at least one order of which was sent; a window's two sides are two bets at the pair's price.
+    ``rows`` are walked once (the archived records come one at a time: LiveBot.preopen_review). ``old``: the archived
+    records counted in by their kept counts instead (ArchiveShare — one read for these ``rows`` that fits ``now_ms``):
+    every figure, and the order of the lines, as if the archived records themselves followed ``rows``."""
     qs = [quote_of(p) for p in rows if any(o.get("state") not in NEVER_PLACED for o in (p.get("orders") or {}).values())]
     days: dict[str, list[dict]] = {}
     dates: dict[str, list[dict]] = {}
     cards: dict[str, list[dict]] = {}
     levels: dict[tuple[float, float], list[dict]] = {}
     hours: dict[tuple[str, int], list[dict]] = {}
-    many = len({q["card"] for q in qs}) > 1
+    names = {q["card"] for q in qs} | set(old.lines["card"] if old is not None else ())
+    many = len(names) > 1
     for q in qs:
         days.setdefault(q["day"], []).append(q)
         dates.setdefault(q["date"], []).append(q)
         cards.setdefault(q["card"], []).append(q)
         levels.setdefault((q["price"], q["shares"]), []).append(q)
         hours.setdefault((q["card"] if many else "", q["hour"]), []).append(q)
+    if old is not None:  # the lines only archived records are on: no record of ``rows``, the archive's counts alone
+        for kind, lines in (("day", days), ("date", dates), ("card", cards), ("level", levels)):
+            for key in old.lines[kind]:
+                lines.setdefault(key, [])
+        for card, hour in old.lines["hour"]:
+            hours.setdefault((card if many else "", hour), [])
+    only = "" if many else next(iter(names), "")  # the one card there is, whose hours stand without its name
+
+    def summary(name: str, group: list[dict], kind: str, key: Any) -> dict:
+        r = review_summary(name, group)
+        return old.counted(r, kind, key, group) if old is not None else r
+
+    def side_line(name: str, side: str) -> dict:
+        r = review_side(name, side, qs)
+        return old.sided(r, side) if old is not None else r
+
+    def latest(day: str) -> int:  # the day's latest window (an archived one too)
+        starts = [q["start_ms"] for q in days[day]]
+        if old is not None and day in old.lines["day"]:
+            starts.append(old.lines["day"][day].latest)
+        return max(starts)
+
+    def size(card: str) -> int:  # the card's records (the archived ones too)
+        return len(cards[card]) + (old.lines["card"][card].records if old is not None and card in old.lines["card"] else 0)
     recent = sorted([q for q in qs if q["filled"] > 0], key=lambda q: q["start_ms"], reverse=True)[:60]
     shown = ("start_ms", "name", "key", "filled_up", "filled_down", "price", "volume", "result", "pnl", "status", "lead_min", "cancel_s", "attempt")
-    total = review_summary("全部", qs)
+    total = summary("全部", qs, "all", "")
     today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat()  # the daily summary takes today's and earlier windows: tomorrow's resting pairs are no day yet
     return {"total": total,
-            "daily": {"days": {date: summary_shape(review_summary(date, dates[date])) for date in dates if date <= today},
-                      "total": summary_shape(review_summary("全部", [q for q in qs if q["date"] <= today]))},  # the daily summary's share (core.merge_preopen_summary)
+            "daily": {"days": {date: summary_shape(summary(date, dates[date], "date", date)) for date in dates if date <= today},
+                      "total": summary_shape(summary("全部", [q for q in qs if q["date"] <= today], "all", ""))},  # the daily summary's share (core.merge_preopen_summary)
             "resting_usd": round(sum(q["price"] * q["shares"] * sum(q["sent"].values()) for q in qs if q["active"]), 4),
-            "days": [review_summary(day, days[day]) for day in sorted(days, key=lambda d: max(q["start_ms"] for q in days[d]), reverse=True)],
-            "cards": [review_summary(card, cards[card]) for card in sorted(cards, key=lambda c: (-len(cards[c]), c))],
-            "levels": [review_summary(levels[k][0]["level_name"], levels[k]) for k in sorted(levels, reverse=True)],  # the highest bid first
-            "hours": [review_summary(f"{card} {hour:02d} 时开始".strip(), hours[(card, hour)]) for card, hour in sorted(hours)],
-            "sides": [review_side(name, side, qs) for side, name in (("up", "涨"), ("down", "跌"))],
+            "days": [summary(day, days[day], "day", day) for day in sorted(days, key=latest, reverse=True)],
+            "cards": [summary(card, cards[card], "card", card) for card in sorted(cards, key=lambda c: (-size(c), c))],
+            "levels": [summary(levels[k][0]["level_name"] if levels[k] else level_name(*k), levels[k], "level", k) for k in sorted(levels, reverse=True)],  # the highest bid first
+            "hours": [summary(f"{card} {hour:02d} 时开始".strip(), hours[(card, hour)], "hour", (card if many else only, hour)) for card, hour in sorted(hours)],
+            "sides": [side_line(name, side) for side, name in (("up", "涨"), ("down", "跌"))],
             # 1.139.2: the weekend's windows against the weekdays' — the weekend as PREOPEN_WEEKEND draws it (on_weekend)
-            "weekly": [review_summary(f"周末（周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00）", [q for q in qs if on_weekend(q["start_ms"])]),
-                       review_summary("工作日", [q for q in qs if not on_weekend(q["start_ms"])])],
+            "weekly": [summary(f"周末（周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00）", [q for q in qs if on_weekend(q["start_ms"])], "week", True),
+                       summary("工作日", [q for q in qs if not on_weekend(q["start_ms"])], "week", False)],
             "recent": [{k: q[k] for k in shown} for q in recent]}
+
+
+REVIEW_KINDS = ("all", "date", "day", "card", "level", "hour", "week")  # the review's tables, as ArchiveShare keeps the archive's lines of each
+
+
+def review_lines(q: dict) -> tuple:
+    """The lines of the review's tables a quote is counted on, as (kind, key) — one of each of REVIEW_KINDS: the total, its
+    window's date (the daily summary) and day, its card, its level, its card's start hour, the weekend or the week."""
+    return (("all", ""), ("date", q["date"]), ("day", q["day"]), ("card", q["card"]), ("level", (q["price"], q["shares"])),
+            ("hour", (q["card"], q["hour"])), ("week", on_weekend(q["start_ms"])))
+
+
+class ArchiveLine:
+    """What the archive adds to one line of a review table: so many records, of so many windows, the latest starting then."""
+    __slots__ = ("records", "windows", "latest")
+
+    def __init__(self) -> None:
+        self.records = self.windows = 0
+        self.latest: float = -math.inf
+
+
+class ArchiveShare:
+    """The archive's share of the review's figures (review's ``old``), kept from one call to the next by
+    LiveBot.preopen_review. Audit PRE-LEDGER-GROWTH, the follow-up: the page counts the archived records as it always
+    did, and for that every call read the whole archive off the file and parsed it, record by record, on the bot's one
+    event loop — twice a build of journal.json, a build a minute while the page is open: at 42,000 archived two seconds a
+    call where the same history, all in memory, had taken one, and the one cost left that grew with the history.
+
+    An archived record is a finished quote that filled nothing (archivable). All it adds to any table is a record, a
+    withdrawn one, its window, and an order sent on a side — so the archive is read once, those counts are kept by table
+    and line (``lines``, ``sent``), and from then on only the rows moved in since are read (``top``: a pass appends, the
+    rowids grow). Windows are the one thing counts do not add up: a window with an archived record and a working one
+    (its other level filled) is one window. ``known`` says, for the windows of the working records alone, on which lines
+    their archived records are counted; a window it does not hold is looked up in the archive by its keys (learn). So
+    what is kept grows with the working records and the days of history, not with the archive.
+
+    The archive is read whole again (read) when its rows did not only grow: a record of it replaced in place by a pass
+    (Ledger.rewrites); rows gone or put in by another hand (the last row counted is no longer where it was, or the rows
+    do not add up to the count); or other records than before in both tables — those are counted as the working records
+    they are and passed by here (``skip``). What another hand changes leaving every key where it was — a body rewritten
+    in place — is not seen before the next start. And the counts are not used at all (fits) when the archive holds a
+    record that is no plain withdrawn quote, or one of a window after today's: the page reads the archive record by
+    record then, as it did. After a start the first call reads the archive whole, once."""
+    def __init__(self, path: str = "") -> None:
+        self.path = path
+        self.top = self.count = 0  # the archive's rows counted here: those up to this rowid, this many
+        self.last: tuple | None = None  # ...the last of them, as (its key,)
+        self.skip: frozenset[str] = frozenset()  # the keys that were working records' too when it was read: counted there, not here
+        self.rewrites = Ledger.rewrites
+        self.plain = True  # every record counted is a plain withdrawn quote (quote)
+        self.lines: dict[str, dict[Any, ArchiveLine]] = {kind: {} for kind in REVIEW_KINDS}
+        self.sent = {"up": 0, "down": 0}  # the records counted with an order sent on the side
+        self.known: dict[str, tuple] = {}  # window -> the lines its archived records are counted on: the working records' windows (every window of the archive while it is read whole)
+
+    def quote(self, slug: str, pair: dict) -> dict | None:
+        """An archived record as the review counts it (quote_of); None for one not counted here: no order of it ever placed
+        (review passes those by), a working record too (``skip``), or no plain withdrawn quote under its own key — which
+        leaves these counts no use (``plain``)."""
+        if not any(o.get("state") not in NEVER_PLACED for o in (pair.get("orders") or {}).values()):
+            return None
+        if pair.get("slug") != slug:  # (the working records are told from the archived ones by their keys)
+            self.plain = False
+            return None
+        if slug in self.skip:
+            return None
+        q = quote_of(pair)
+        if (q["active"] or not q["accounted"] or q["filled_up"] != 0 or q["filled_down"] != 0
+                or not (0 <= q["price"] < math.inf and math.isfinite(q["shares"]))):  # (a price that is a number: nothing filled at it is no volume)
+            self.plain = False
+            return None
+        return q
+
+    def add(self, slug: str, pair: dict) -> None:
+        """One more archived record counted: a record on each of its lines, and a window on those where no archived record of
+        its window was counted before (``known`` holds the window, or the archive has no earlier record of it)."""
+        q = self.quote(slug, pair)
+        if q is None:
+            return
+        seen = self.known.get(q["window"], ())
+        for kind, key in review_lines(q):
+            line = self.lines[kind].get(key)
+            if line is None:
+                line = self.lines[kind][key] = ArchiveLine()
+            line.records += 1
+            line.latest = max(line.latest, q["start_ms"])
+            if line not in seen:
+                line.windows += 1
+                seen += (line,)
+        self.known[q["window"]] = seen
+        for side in ("up", "down"):
+            self.sent[side] += q["sent"][side]
+
+    def learn(self, conn: sqlite3.Connection, window: str) -> None:
+        """``known`` for a window it does not hold: the lines the archive's records of that window are counted on, read off
+        the archive by the keys a window's records have — <window>, <window>#<level>, either with @<attempt>
+        (record_key, window_of) — among the rows counted (those up to ``top``)."""
+        seen: tuple = ()
+        for slug, body in conn.execute("SELECT slug, body FROM archive WHERE rowid <= ? AND (slug = ? OR (slug >= ? AND slug < ?) OR (slug >= ? AND slug < ?))",
+                                       (self.top, window, window + "#", window + "$", window + "@", window + "A")):
+            q = self.quote(slug, json.loads(body))
+            if q is not None and q["window"] == window:
+                seen += tuple(line for kind, key in review_lines(q) if (line := self.lines[kind][key]) not in seen)
+        self.known[window] = seen
+
+    @classmethod
+    def read(cls, conn: sqlite3.Connection, path: str, rows: list[dict], kept: ArchiveShare | None = None) -> ArchiveShare:
+        """The archive's share as the archive is now, for the working records ``rows``: ``kept`` — the last call's — with the
+        rows moved in since counted in (none read when there are none), or the archive read whole (the first call, a
+        ledger in memory, another file, and whenever its rows did not only grow: the class's own words). ``known`` then
+        holds the windows of ``rows`` and no other. ``kept`` is changed in place: after an error it is no use."""
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive'").fetchone() is None:
+            return cls(path)  # (a file nothing was moved in yet)
+        count = conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0]
+        mine = [slug for slug in {p.get("slug") for p in rows} if isinstance(slug, str)]
+        skip = frozenset(slug for at in range(0, len(mine), 500) for (slug,) in conn.execute(
+            f"SELECT slug FROM archive WHERE slug IN ({','.join('?' * len(mine[at:at + 500]))})", mine[at:at + 500]))
+        share = kept
+        # still the rows it counted, and nothing but rows after them: the last of them is where it was, and they and the later ones are all there is
+        fresh = (share is None or not share.count or path == ":memory:" or share.path != path or share.rewrites != Ledger.rewrites or share.skip != skip
+                 or conn.execute("SELECT slug FROM archive WHERE rowid = ?", (share.top,)).fetchone() != share.last
+                 or share.count + conn.execute("SELECT COUNT(*) FROM archive WHERE rowid > ?", (share.top,)).fetchone()[0] != count)
+        if fresh:
+            share = cls(path)
+            share.skip = skip
+        reached, added = share.top, 0
+        for rowid, slug, body in conn.execute("SELECT rowid, slug, body FROM archive WHERE rowid > ? ORDER BY rowid", (share.top,)):
+            pair = json.loads(body)
+            if not fresh and window_of(pair) not in share.known:  # (a window quoted and archived since the last call: an earlier record of it would be among the rows counted)
+                share.learn(conn, window_of(pair))
+            share.add(slug, pair)
+            reached, added, share.last = rowid, added + 1, (slug,)
+        share.top, share.count = reached, share.count + added
+        windows = {window_of(p) for p in rows}
+        for window in windows - share.known.keys():
+            if fresh:
+                share.known[window] = ()  # (every window of the archive is held just now: this one has no record there)
+            else:
+                share.learn(conn, window)
+        share.known = {window: share.known[window] for window in windows}
+        return share
+
+    def fits(self, now_ms: int) -> bool:
+        """Whether these counts can stand for the archive's records in review(…, now_ms): each a plain withdrawn quote
+        (``plain``), none of a window after today's — the daily summary's total takes today's and earlier (a clock set
+        back)."""
+        today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat()
+        return self.plain and all(date <= today for date in self.lines["date"])
+
+    def counted(self, r: dict, kind: str, key: Any, qs: list[dict]) -> dict:
+        """A review_summary line of the records ``qs`` with the archive's records of the same line counted in: that many more
+        records, withdrawn every one, and their windows but those ``qs`` has a record of too. (The sums of a line are
+        floats once a record was summed: 0.0, not 0, on a line of archived records alone.)"""
+        line = self.lines[kind].get(key)
+        if line is not None:
+            r["records"] += line.records
+            r["withdrawn"] += line.records
+            r["windows"] += line.windows - sum(1 for window in {q["window"] for q in qs} if line in self.known[window])
+            r["filled"] += 0.0
+            r["volume"] += 0.0
+        return r
+
+    def sided(self, r: dict, side: str) -> dict:
+        """A review_side line with the archive's orders sent on that side counted in (none of them filled)."""
+        if self.sent[side]:
+            r["records"] += self.sent[side]
+            r["filled"] += 0.0
+            r["volume"] += 0.0
+        return r
+
+
+def archive_share(source: Ledger | str, rows: list[dict], kept: ArchiveShare | None = None) -> ArchiveShare:
+    """ArchiveShare.read on a ledger — a controller's, or while the mode is off the file's path (none there: an empty
+    share) — whose working records are ``rows``; ``kept`` is what the last call returned (LiveBot.preopen_review)."""
+    if not isinstance(source, str):
+        return ArchiveShare.read(source.conn, source.path, rows, kept)
+    if source == ":memory:" or not Path(source).exists():
+        return ArchiveShare(source)
+    conn = sqlite3.connect(source)
+    try:
+        return ArchiveShare.read(conn, source, rows, kept)
+    finally:
+        conn.close()
 
 
 LISTING_CYCLE_MS = 15 * 60_000  # Predict lists one more window of a card every quarter hour (a day ahead): the next listing is expected a cycle after the last seen
@@ -714,6 +1090,8 @@ class Controller:
         self.stuck_checked_ms = 0
         self.stop = asyncio.Event()  # this mode's own stop (the page switching it off, a settings change): its run() withdraws the orders on the way out
         self.manual_pause = self.ledger.pause()
+        self.archived_ms = 0  # when the old finished records were last moved to the archive (archive: now, then every ARCHIVE_EVERY_MS)
+        self.archive(self.now())
         self.account_at = 0
         self.balance = 0.0
         self.open_reserved = 0.0
@@ -796,6 +1174,22 @@ class Controller:
         if send is not None:
             with contextlib.suppress(Exception):
                 send(text, key=key)
+
+    def archive(self, now_ms: int) -> None:
+        """The old finished quotes that filled nothing leave the working records (Ledger.archive_old, Audit
+        PRE-LEDGER-GROWTH) — at a start, before anything is read off them, and every ARCHIVE_EVERY_MS from the cancellation
+        loop. Never raises: a ledger that cannot take the move (a full disk) keeps every record where it was, the problem
+        is said and the next pass tries again — the quotes and the withdrawals do not wait on this."""
+        self.archived_ms = now_ms
+        try:
+            moved = self.ledger.archive_old(now_ms)
+        except Exception as error:
+            why = core.clean_error(error) or type(error).__name__
+            LOG.warning("开盘前预挂旧记录归档失败：%s", why)
+            self.error = f"旧记录归档失败：{why}（记录原样保留，不影响挂单和撤单，{ARCHIVE_EVERY_MS // 60_000} 分钟后再试）"
+            return
+        if moved:
+            LOG.info("开盘前预挂：%d 条早已结束、已撤且没成交的记录移入归档（复盘页照常统计），工作记录 %d 条", moved, len(self.ledger.rows))
 
     def note_cooldown(self) -> None:
         """A cooldown beginning (a 429 on any client sharing it) is counted and announced."""
@@ -986,7 +1380,12 @@ class Controller:
             return
         self.card_checked_ms = now_ms
         for rolling in core.preopen_cards():
-            if rolling.key not in self.settings.markets or not getattr(rolling, "limit_pct", 0):
+            # Audit PRE-ZHIPU-HALT: a card is passed over only when it has no exchange (the round-the-clock cards: nothing to
+            # judge). 1.130.0 passed over the cards without a daily price limit, which then meant the same thing; 1.134.0 added
+            # 智谱 (HKEX 2513: no daily limit, the halt rule alone — card_hold judges it so, PREOPEN.md promises it) but left
+            # this filter as it was, so 智谱 was never held: its resting 49¢ bids stayed up, and new ones went out, through a
+            # halt — the informed-flow case the guard exists for. card_hold itself skips the limit part when limit_pct is 0.
+            if rolling.key not in self.settings.markets or not getattr(rolling, "exchange", ""):
                 continue
             why = self.card_hold(rolling)
             if why:
@@ -1002,7 +1401,7 @@ class Controller:
         if why := self.blocked() or self.cooldown():
             return why
         digest = str(body.get("data", {}).get("order", {}).get("hash") or "").lower()
-        pair = next((p for p in self.ledger.rows.values() if any(o.get("hash") == digest for o in p["orders"].values())), None)
+        pair = self.ledger.holder(digest)  # (by the hash index: this walked every record, four times a pair — Audit PRE-LEDGER-GROWTH)
         if pair is None or pair["phase"] != "active" or self.now() >= pair["cancel_ms"]:
             return "市场已进入撤单阶段，不再发送"
         if (why := self.card_holds.get(str(pair.get("key") or ""))) and pair["start_ms"] - self.now() <= CARD_HOLD_NEAR_MS:
@@ -1172,8 +1571,50 @@ class Controller:
             return
         if not resting and not any(removable_ids(p) for p in self.ledger.rows.values() if p["phase"] != "closed"):
             return  # nothing left to withdraw (a wind-down that finished)
-        with contextlib.suppress(Exception):  # 1.141.0: in batches, a rate limit waited out (was cut after 12 s: a book of thousands mostly stayed)
+        until = time.monotonic() + STOP_CANCEL_S  # the whole way out, the fallback below included: STOP_CANCEL_S at most
+        try:  # 1.141.0: in batches, a rate limit waited out (was cut after 12 s: a book of thousands mostly stayed)
             await self.cancel_all("预挂模式停止，撤销预挂单", free=True, deadline_s=STOP_CANCEL_S)
+        except Exception as error:
+            # Audit PRE-CRASH-WITHDRAW: this was contextlib.suppress — and the withdrawal fails exactly when the mode crashed on
+            # a ledger it cannot write (a full disk, an I/O error, a read-only volume): cancel_many saves every pair before
+            # it sends a removal, and each answer is saved inside the batch withdrawal, so the first write raised again, the
+            # suppress swallowed it, and not one removal went out — every resting order stayed up, unmonitored and its
+            # fills unbooked, until its signed expiry, while the crash notice said they were withdrawn. A removal needs no
+            # record (save-first is for sending an order: place_pair), so what may still rest is withdrawn here with
+            # nothing written; the next start reconciles the records against Predict, as after any stop.
+            why = core.clean_error(error) or type(error).__name__
+            LOG.error("开盘前预挂停止时撤单出错：%s；改为不写记录直接撤", why)
+            self.error = f"停止时撤单出错：{why}；改为不写记录直接撤（下次启动时按 Predict 核对）"
+            await self.remove_unrecorded(until)
+
+    async def remove_unrecorded(self, until: float) -> None:
+        """on_stop's fallback (Audit PRE-CRASH-WITHDRAW): every order of this mode that may still rest (an id, not ended,
+        the signed expiry ahead) withdrawn in batches, the soonest window first, until ``until`` (time.monotonic), with
+        nothing written to the ledger — a removal is marked in memory only, so the crash notice and the status count what
+        is left (resting_orders). Never raises: a failure is logged, and what is left is counted the same way."""
+        import live
+        try:
+            now = self.now()
+            pairs = sorted((p for p in self.ledger.rows.values() if resting_orders(p, now)),
+                           key=lambda p: (int(p.get("cancel_ms") or p.get("start_ms") or 0), str(p.get("slug") or "")))
+            by_id = {str(o["id"]): o for p in pairs for o in p["orders"].values() if o.get("id") and o.get("state") not in TERMINAL}  # (removable_ids)
+            if not by_id:
+                return
+
+            def answered(removed: list[str], noop: list[str]) -> None:
+                for oid in removed:
+                    if oid in by_id:
+                        self.off_book(by_id[oid])
+            # patient whatever the count: the last try — no loop, no reconciliation follows — so a rate limit is waited out
+            # and a failed batch tried again, within ``until`` (impatient, a few ids would not be sent into a cooldown at all)
+            result = await live.remove_in_batches(
+                self.bulk_client(), list(by_id), self.remove_limit(), workers=BULK_WORKERS, patient=True,
+                deadline=until, stop=self.owner.stopping.is_set, on_answer=answered, now_ms=self.now)
+            LOG.warning("开盘前预挂不写记录直接撤：%d 张里撤掉 %d 张，%d 张已不在簿上，%d 张没撤成%s", len(by_id), len(result["removed"]),
+                        len(result["noop"]) + len(result["unanswered"]), len(result["failed"]) + len(result["left"]),
+                        f"（{result['errors'][-1]}）" if result["errors"] else "")
+        except Exception as error:
+            LOG.error("开盘前预挂不写记录直接撤单失败：%s", core.clean_error(error) or type(error).__name__)
 
     async def discover(self, probe_only: bool = False) -> None:
         """One discovery pass: first each card's next listing (the windows beyond the latest known listed, concurrently across
@@ -1489,6 +1930,11 @@ class Controller:
             LOG.warning("开盘前预挂 %s 没有发出：%s", pair["slug"], self.error)
             return ""
         if pair["phase"] != "active" or self.now() >= pair["cancel_ms"] or self.withdrawing():
+            if pair["phase"] == "active":
+                # Audit PRE-PAUSE-STRIKES: still active = both sides confirmed (an unconfirmed side made it "closing" in send,
+                # and that still counts): withdrawn here only for its cancel time or an operator's stop that came during the
+                # two POSTs, which the cancellation loop withdraws free ("到时撤单或真实交易暂停") — not the window's failure
+                pair["free"] = True
             await self.cancel_pair(pair, "单边未确认或已到撤单时间")
         LOG.info("开盘前预挂 %s：%s", pair["slug"], {s: o["state"] for s, o in pair["orders"].items()})
         return ""
@@ -1507,6 +1953,56 @@ class Controller:
         """Past the window's start by GIVE_UP_MS: an order Predict cannot show cannot fill any more (it expired before
         the start), and what it shows is final."""
         return self.now() >= pair["start_ms"] + GIVE_UP_MS
+
+    def off_book(self, order: dict) -> None:
+        """Predict's word that the order left the book (a removal it confirmed): "removed" — withdrawn, its final fills
+        unread — and when (gone_ms), for the read that may end it (final_read_ms)."""
+        order.update(state="removed", gone_ms=self.now())
+
+    def final_read_ms(self, order: dict, pair: dict) -> int:
+        """When a read of the record of an order off the book is its last word (ended): LATE_FILL_MS after the order was
+        known off the book (gone_ms: the removal's confirmation, or the first read that showed it ended). 0 — any time —
+        while that is not known (the first read says), and past the give-up (its signature expired a quarter hour ago)."""
+        gone = int(order.get("gone_ms") or 0)
+        return gone + LATE_FILL_MS if gone and not self.gave_up(pair) else 0
+
+    def ended(self, order: dict, pair: dict) -> None:
+        """An order whose record, just read and its fills applied, says it ended: "final" when that record is its last word
+        — the whole order filled (nothing more can show), or read LATE_FILL_MS after the order was known off the book
+        (final_read_ms) — else "removed": off the book, its final fills still to read (cancel_pair, at the try bookkeep
+        books; monitor_pair for a pair that rests on).
+
+        Audit PRE-LATE-FILL: any such read used to end the order, and a pair whose two records, read right after the
+        removal, said CANCELLED with nothing filled was accounted there and then (pnl 0) — and nothing reads an accounted
+        pair's orders again (due and settle_pair pass it by; the account snapshot shows open orders alone). That read can
+        lag the matching: README 1.119.0, the model trader's 300-share order "撤掉、0 成交" by the cancel's read of the same
+        GET /orders/{hash}, with 299.99 shares on the account. Shares matched in the seconds before a withdrawal so stayed
+        out of this ledger for good: no P&L, nothing in the day's loss stop, the outcome neither in fills_by_outcome nor in
+        unverified_outcomes — the model trader's positions check then took them for a fill of an order of its own on that
+        side (the 1.131.5 mix-up, with no undo: the pre-open fills read there never cover them) — and a window withdrawn
+        early through no fault of its own (supersedable) was quoted again on top of the fill. Held as "removed" instead,
+        the order is all a doubt needs: not verified (the outcome stays in unverified_outcomes, the pair reserved and not
+        accounted, its window not quoted again), nothing left to cancel, read again. The price is a minute: a pair
+        withdrawn with nothing filled is released, and its window quoted again, LATE_FILL_MS after its orders left the
+        book, not at once. A withdrawal costs no request more: the read right after a confirmed removal, which could not
+        end the order, is not made (cancel_pair), and a read that comes that late anyway (a big withdrawal's, a start's,
+        the result's) ends it as before; only an order that ended outside this mode's cancel is read once more. Not
+        covered: a record that shows a fill later still, or never (the model trader's backstop for those is the account's
+        positions; this mode has none)."""
+        if order["state"] == "final":
+            return  # (settle_pair reads a final order's record once more for its fills: final it stays)
+        order.setdefault("gone_ms", self.now())
+        whole = float(order.get("filled") or 0) >= float(pair_quote(pair)[1] or self.settings.shares) - 1e-9
+        order["state"] = "final" if whole or self.now() >= self.final_read_ms(order, pair) else "removed"
+
+    def finals_wait(self, pair: dict) -> int:
+        """When a pair with nothing left to cancel has its withdrawn orders' final fills read: once each record is its last
+        word (final_read_ms) — the one thing left to do for it. 0, nothing to wait for, while an order is still to cancel
+        or to find, or when no order waits for such a read."""
+        orders = pair["orders"].values()
+        if any(o["state"] not in TERMINAL for o in orders):
+            return 0
+        return max((self.final_read_ms(o, pair) for o in orders if o["state"] == "removed"), default=0)
 
     def note_open(self, market: dict) -> None:
         """The first time the listing shows one of this mode's windows OPEN (matching on): kept on the pair — how long
@@ -1529,8 +2025,9 @@ class Controller:
 
     def bookkeep(self, pair: dict, save: bool = True) -> None:
         """A closing or unverified pair's next try: SPRINT_MS on in the last stretch (in_sprint), else RETRY_MS after this one,
-        doubling to RETRY_MAX_MS; closed once nothing is left to cancel; accounted (its money released) once every order is
-        verified and nothing filled."""
+        doubling to RETRY_MAX_MS — and, with nothing left but its withdrawn orders' final fills, not before a read of their
+        records can end them (finals_wait); closed once nothing is left to cancel; accounted (its money released) once
+        every order is verified and nothing filled."""
         if self.in_sprint(pair):
             pair["retry_ms"] = self.now() + SPRINT_MS
         else:
@@ -1538,6 +2035,7 @@ class Controller:
             pair["tries"], pair["retry_ms"] = tries, self.now() + min(RETRY_MS * 2 ** (tries - 1), RETRY_MAX_MS)
         if pair["phase"] != "closed" and all(o["state"] in TERMINAL for o in pair["orders"].values()):
             pair["phase"] = "closed"
+        pair["retry_ms"] = max(pair["retry_ms"], self.finals_wait(pair))  # (Audit PRE-LATE-FILL: the read that ends a withdrawn order is made LATE_FILL_MS after it left the book)
         if (not pair.get("accounted") and all(order_verified(o) for o in pair["orders"].values())
                 and all(float(o.get("filled") or 0) <= 0 for o in pair["orders"].values())):
             pair.update(accounted=True, accounted_day=dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat(), pnl=0.0)
@@ -1545,15 +2043,16 @@ class Controller:
             self.ledger.save(pair)
 
     async def read_final(self, order: dict, pair: dict) -> None:
-        """An order's own record, for its final fills: final → "final"; none, past the give-up — never placed (no id) or
-        final as known (an id Predict no longer answers to)."""
+        """An order's own record, for its final fills: final → "final" once that record is its last word (ended: "removed",
+        to be read again, till then); none, past the give-up — never placed (no id) or final as known (an id Predict no
+        longer answers to)."""
         row = await self.cancel_api.order(order.get("id", ""), order.get("api_hash") or order["hash"])
         if row:
             if not order.get("id") and row.get("id") is not None:
                 order["id"] = str(row["id"])
             self.apply_fill(order, row, pair)
             if final_order(row):
-                order["state"] = "final"
+                self.ended(order, pair)
             elif self.gave_up(pair):  # a record Predict still shows open past the give-up: its signature expired long ago, nothing more can fill
                 order.update(state="final", note="开始后 15 分钟记录仍不是终态，签名早已过期：按已知成交记账")
         elif self.gave_up(pair):
@@ -1577,8 +2076,9 @@ class Controller:
                 if order["state"] in NEVER_PLACED or order["state"] == "final":
                     continue
                 if order["state"] == "removed":  # removed: its final fills, read once more (nothing is left to cancel)
-                    await self.read_final(order, pair)
-                    self.ledger.save(pair)
+                    if self.now() >= self.final_read_ms(order, pair):  # ...once that read can end it (ended), not before
+                        await self.read_final(order, pair)
+                        self.ledger.save(pair)
                     continue
                 # Unknown submissions are reconciled by their original hash.
                 if not order.get("id"):
@@ -1595,10 +2095,12 @@ class Controller:
                 pair.setdefault("cancel_sent_ms", self.now())
                 result = await self.cancel_api.remove_orders([order["id"]])
                 if order["id"] in result["removed"]:
-                    order["state"] = "removed"
+                    self.off_book(order)
                     pair.setdefault("cancel_done_ms", self.now())
                     self.ledger.save(pair)
-                await self.read_final(order, pair)  # the fills before the removal (bulk removals went first: no cancel waits behind this)
+                    if self.now() < self.final_read_ms(order, pair):
+                        continue  # the fills before the removal are read LATE_FILL_MS on, at the try bookkeep books: a read now could not end the order (ended)
+                await self.read_final(order, pair)  # not removed on Predict's word (it ended some other way, or rests on), or long past its window: what its record says now
                 self.ledger.save(pair)
             self.bookkeep(pair)
         finally:
@@ -1647,23 +2149,31 @@ class Controller:
                 or self.now() - int(pair.get("checked_ms") or 0) < 5_000):
             return  # (no snapshot yet: the first one covers every resting order at once — no burst of reads at a start)
         pair["checked_ms"] = self.now()
-        rejected = False
+        rejected = read = False
         for order in pair["orders"].values():
-            if order["state"] != "open":
+            # an open order — or one this look found ended a while ago (with a fill: the pair rests on), now that a read of its record can end it (ended)
+            if order["state"] != "open" and not (order["state"] == "removed" and self.now() >= self.final_read_ms(order, pair)):
                 continue
             if order.get("id") in self.listed_ids and self.now() - self.account_at <= self.account_stale_ms():
                 continue  # one paginated account snapshot covers every healthy resting order
             row = await self.api.order(order["id"], order.get("api_hash") or order["hash"])
             if row is None:
                 continue  # replication lag is not a zero-fill rejection
+            read = True
             self.apply_fill(order, row, pair)
             if final_order(row):
-                order["state"] = "final"
+                self.ended(order, pair)  # its last word only LATE_FILL_MS after it was seen ended: "removed" till then, and read again (Audit PRE-LATE-FILL)
                 if order["filled"] <= 0:
                     rejected = True
                     if str(row.get("status") or "").upper() in REFUSED_STATUSES:
                         order["refused"] = True  # Predict's deferred refusal (a post-only order that would cross): the window is not quoted again
-        self.ledger.save(pair)
+        if read:
+            # Audit PRE-MONITOR-SAVES: saved only when a record was read (a fill or a final state may have changed). checked_ms
+            # is pacing only (the same dict sits in ledger.rows, so the next look is paced from memory; after a restart a
+            # stale value just makes the first look due at once). A look that every fresh account snapshot covered read
+            # nothing and has nothing to make durable — before, it still cost one fsync'd commit (synchronous=FULL) on the
+            # event loop per resting pair every MONITOR_MS, i.e. hundreds a second with a full book of pairs.
+            self.ledger.save(pair)
         if rejected:
             await self.cancel_many([pair], "一边未成交即结束，撤掉另一边")
 
@@ -1675,6 +2185,20 @@ class Controller:
         by the caller (1.141.0): a few withdrawn here and now; a book of more than BULK_MIN_IDS left to the cancellation
         loop, which withdraws it in batches — the command answers at once instead of minutes later. The reply's line."""
         n = sum(len(removable_ids(p)) for p in self.ledger.rows.values() if p["phase"] != "closed")
+        if n <= BULK_MIN_IDS or not self.alive:
+            # Audit PRE-PAUSE-STRIKES: an operator's stop is not the window's doing, so the resting pairs withdrawn here and
+            # now are free (counts_against), as the cancellation loop's withdrawal of a bigger book always was
+            # ("到时撤单或真实交易暂停", free=True). They used to keep the operator's reason without the mark: a pause, /live
+            # cancel all or the emergency stop of BULK_MIN_IDS ids or fewer (PREOPEN_AHEAD_MINUTES=60 with BTC alone: about
+            # eight), or of any book once the controller had crashed, counted one failure against every withdrawn window's
+            # level — three pauses and the window was never quoted again ("失败满 3 次"), against PREOPEN.md (停止或暂停预挂
+            # 撤掉的不算次数); whether a pause counted depended on the book's size. Only the active pairs: one already closing
+            # on its own failure (a side not confirmed or ended unfilled, the market's status) keeps its count —
+            # cancel_all(free=True) would erase it, and the cap with it. cancel_all below saves the marks (cancel_many saves
+            # every pair it withdraws, with no await before).
+            for pair in self.ledger.rows.values():
+                if pair["phase"] == "active":
+                    pair["free"] = True
         if n <= BULK_MIN_IDS:
             await self.cancel_all(reason)
             return ""
@@ -1733,7 +2257,7 @@ class Controller:
             for oid in removed:
                 if oid in by_id:
                     pair, order = by_id[oid]
-                    order["state"] = "removed"
+                    self.off_book(order)
                     pair.setdefault("cancel_done_ms", self.now())
                     touched[pair["slug"]] = pair
             self.ledger.save_many(list(touched.values()))
@@ -1775,6 +2299,8 @@ class Controller:
                 continue
             if patient and any(str(o.get("id") or "") in unsent for o in pair["orders"].values()):
                 continue  # not sent: the loop takes it on in batches again once its retry is due
+            if self.now() < self.finals_wait(pair):
+                continue  # every order off the book this moment: their final fills are read LATE_FILL_MS on, at the try bookkeep booked (ended) — nothing to do now
             self.launch_reconcile(pair)  # the removed orders' final fills, the unknown ones' hashes: the reservation ends on what they show
         return result
 
@@ -1814,7 +2340,9 @@ class Controller:
             parts.append(f"上次分批撤 {last['orders']} 张（{when(last['at'], now)}）：撤掉 {last['removed']} 张" + (f"、{last['quiet']} 张已不在簿上" if last.get("quiet") else "")
                          + f"，{last['seconds']:.0f} 秒、{last['requests']} 个请求" + (f"、限流 {last['limited']} 次" if last.get("limited") else "")
                          + (f"；{last['missed']} 张没撤成，稍后接着撤" if last.get("missed") else ""))
-        if self.winding:
+        if self.winding or not self.alive:
+            # Audit PRE-CRASH-WITHDRAW: a crashed controller too — its status's "N 条挂着" counts the active records, which its
+            # withdrawal marked closing in memory whether or not a removal went out ("0 条挂着" with every order still up)
             parts.append(f"还可能挂着 {sum(resting_orders(p, now) for p in self.ledger.rows.values())} 张")
         return "批量撤单：" + self.remove_limit().text() + ("；" + "；".join(parts) if parts else "")
 
@@ -1948,6 +2476,8 @@ class Controller:
             if now - self.stuck_checked_ms >= 60_000:
                 self.stuck_checked_ms = now
                 self.check_stuck(now)
+            if now - self.archived_ms >= ARCHIVE_EVERY_MS:
+                self.archive(now)  # (never raises; only accounted, closed records go: none this loop or a task of it still works on)
             due = self.due(now)
             if due:
                 active = [p for p in due if p["phase"] == "active"]
@@ -1969,6 +2499,8 @@ class Controller:
                     held = {p["slug"] for p in heavy}  # the running batch's turn ends first: these wait for the next
                     stale = [p for p in stale if p["slug"] not in held]
                 for pair in stale:
+                    if self.now() < self.finals_wait(pair):
+                        continue  # withdrawn this very pass, every order off the book: nothing to do before their final reads, which its bookkeep booked (ended)
                     self.bookkeep(pair)  # the next try is booked now: a read that hangs does not make the loop ask again meanwhile
                     self.launch_reconcile(pair)
             if self.winding and self.wound_up(now):
@@ -2008,15 +2540,21 @@ class Controller:
             await asyncio.sleep(0.5)
 
     async def run(self) -> None:
+        jobs: list[asyncio.Task] = []
+        stops: list[asyncio.Task] = []
         try:
-            self.adopt()  # the last run's pairs: taken over as they are, or withdrawn and reconciled
-            jobs = [asyncio.create_task(self.account_loop(), name="preopen-account"),
-                    asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
-                    asyncio.create_task(self.refresh_loop(), name="preopen-refresh"),
-                    asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
-                    *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(PLACE_WORKERS))]
-            stops = [asyncio.create_task(self.owner.stopping.wait()), asyncio.create_task(self.stop.wait())]
             try:
+                # Audit PRE-CRASH-WITHDRAW: adopt() inside the guard whose finally runs on_stop. It ran before it, so a failure
+                # there (a record it must change — a window that started during a restart, a pair to withdraw — on a ledger
+                # it cannot write) ended the mode with the orders it had just taken over left resting, unmonitored, while
+                # the crash notice said they were withdrawn; now it withdraws them like any crash.
+                self.adopt()  # the last run's pairs: taken over as they are, or withdrawn and reconciled
+                jobs = [asyncio.create_task(self.account_loop(), name="preopen-account"),
+                        asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
+                        asyncio.create_task(self.refresh_loop(), name="preopen-refresh"),
+                        asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
+                        *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(PLACE_WORKERS))]
+                stops = [asyncio.create_task(self.owner.stopping.wait()), asyncio.create_task(self.stop.wait())]
                 await asyncio.wait([*stops, *jobs], return_when=asyncio.FIRST_COMPLETED)
                 for job in jobs:
                     if job.done() and not job.cancelled() and job.exception():
@@ -2143,10 +2681,11 @@ class Controller:
                 f"不足 {self.settings.entry_seconds} 秒不再新挂"
                 + (f"；股票卡开盘、午后头 {self.settings.open_quiet_minutes} 分钟内开始的场次不挂" if self.settings.open_quiet_minutes else "")
                 + (f"；周末不挂（北京时间周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00 开始的场次）" if not self.settings.weekend else "") + "\n"
-                f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清），"
+                f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清）"
+                + (f"，另有 {self.ledger.archived_count} 条已归档（结束超过 {ARCHIVE_AFTER_MS // core.DAY_MS} 天、已撤且没成交的；复盘页照常统计）" if self.ledger.archived_count else "") + "，"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
-                f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉且一份没成交的场次立即释放）"
+                f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉的场次在撤单 {LATE_FILL_MS // 1000} 秒后读到一份没成交才释放）"
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，按开场先后补挂中") if pairs_left else "")
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
                 + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）"
