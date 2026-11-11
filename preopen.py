@@ -48,6 +48,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -137,10 +138,14 @@ class Ledger:
     good (twenty cards at four levels: thousands a day). At 50,000 the start froze the bot for two seconds, the loops took
     a quarter of its event loop, a listing's burst of pairs took seconds to send, and the memory and the file only grew.
     The finished quotes that filled nothing now move to the table ``archive`` two days after their window (archive_old),
-    whole, in the same file; only the review page reads them (archived, read_archive)."""
+    whole, in the same file; only the review page reads them — once: after that it keeps their counts and reads the rows
+    moved in since (ArchiveShare)."""
+    rewrites = 0  # passes of this process (any ledger's) that replaced a record the archive already held: its rows did not only grow, and the counts kept of them are read afresh (ArchiveShare)
+
     def __init__(self, path: str):
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=FULL")
@@ -232,8 +237,16 @@ class Ledger:
         its attempts and failures (the salt, MAX_ATTEMPTS) are asked for by nothing; its orders are final or were never
         placed, so the account can show none of them open (known, account); with no fill it has no position, no P&L and
         no bet (fills_by_outcome, daily_pnl, cards_today — today's windows — the EV, the tally). A card's latest window
-        stays whatever its age: the listing horizon a controller reads off the records at a start is as it was. What does
-        change: the status counts and measures the working records (实测: the last two days' and the windows not over)."""
+        stays whatever its age: the listing horizon a controller reads off the records at a start is as it was.
+
+        What does change: the status counts and measures the working records (实测: the last two days' and the windows not
+        over); and two readers of ``rows`` in live.py find an archived record no more. /live cancel <order id> with the id
+        of an archived record's order (LiveBot.live_cancel_command) used to withdraw that window's pair and pause this
+        mode: the id is nobody's now ("没有订单号为 … 的真实挂单") and nothing is paused. And a market whose only records
+        are archived is none of this bot's markets any more (LiveBot.live_known_markets: live_orphan_sweep withdraws an
+        open order nobody recorded when it is on one of them, and only reports it otherwise). Neither is missed: an
+        archived record's window ended two days ago and more — its market is over — and its own orders' signatures
+        expired before the window began, so nothing of it can rest."""
         latest: dict[str, int] = {}
         for p in self.rows.values():
             key = str(p.get("key") or "")
@@ -245,6 +258,7 @@ class Ledger:
                 self.conn.execute("CREATE TABLE IF NOT EXISTS archive (slug TEXT PRIMARY KEY, body TEXT NOT NULL)")
         for at in range(0, len(gone), ARCHIVE_CHUNK):
             part = gone[at:at + ARCHIVE_CHUNK]
+            held = self.archive_count()
             with self.conn:
                 self.conn.executemany("INSERT INTO archive VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body",
                                       ((slug, json.dumps(self.rows[slug], ensure_ascii=False)) for slug in part))
@@ -252,6 +266,8 @@ class Ledger:
             for slug in part:  # (on disk first: a chunk that could not be written leaves its records where they were)
                 self.unindex(slug, self.rows.pop(slug))
             self.archived_count = self.archive_count()
+            if self.archived_count - held != len(part):  # a record the archive held already — saved again after its move by a task that still had it — was replaced there, in place
+                Ledger.rewrites += 1
         return len(gone)
 
     def has_archive(self) -> bool:
@@ -262,7 +278,8 @@ class Ledger:
         return int(self.conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0]) if self.has_archive() else 0
 
     def archived(self) -> Iterator[dict]:
-        """The archived records, one at a time and never kept (the review page counts them: LiveBot.preopen_review)."""
+        """The archived records, one at a time and never kept: the review page counts them so (LiveBot.preopen_review) when
+        it cannot go by their kept counts (ArchiveShare)."""
         if self.has_archive():
             for (body,) in self.conn.execute("SELECT body FROM archive"):
                 yield json.loads(body)
@@ -636,7 +653,8 @@ def read_rows(path: str) -> list[dict]:
 
 def read_archive(path: str) -> Iterator[dict]:
     """The ledger file's archived records (Ledger.archive_old) while the mode is off, one at a time and never kept: the
-    review page counts them (LiveBot.preopen_review). None in a file from before the archive."""
+    review page counts them so (LiveBot.preopen_review) when it cannot go by their kept counts (ArchiveShare). None in a
+    file from before the archive."""
     if path == ":memory:" or not Path(path).exists():
         return
     conn = sqlite3.connect(path)
@@ -661,6 +679,11 @@ def archive_file(path: str, now_ms: int) -> int:
         ledger.close()
 
 
+def level_name(price: float, shares: float) -> str:
+    """A price level as the review's tables name it: 49¢×10."""
+    return f"{price * 100:g}¢×{shares:g}"
+
+
 def quote_of(pair: dict) -> dict:
     """One record as the review counts it: a window, an attempt, two sides at one price; settled = accounted with a fill
     (the official result priced it), pending = a fill the result has not priced yet, withdrawn = accounted with none."""
@@ -683,7 +706,7 @@ def quote_of(pair: dict) -> dict:
     at = dt.datetime.fromtimestamp(start / 1000, core.BEIJING)
     return {"window": window_of(pair), "key": str(pair.get("key") or ""), "card": str(pair.get("name") or pair.get("key") or "").rsplit(" ", 1)[0],
             "name": str(pair.get("name") or window_of(pair)), "day": at.strftime("%m-%d"), "date": at.date().isoformat(), "hour": at.hour, "start_ms": start,
-            "level_name": f"{price * 100:g}¢×{shares:g}",
+            "level_name": level_name(price, shares),
             "active": pair.get("phase") == "active", "accounted": accounted, "filled": total, "filled_up": filled["up"], "filled_down": filled["down"],
             "sent": {side: side in orders and orders[side].get("state") not in NEVER_PLACED for side in ("up", "down")},
             "price": price, "shares": shares, "volume": total * price, "settled": accounted and total > 0, "pending": total > 0 and not accounted,
@@ -744,41 +767,250 @@ def ev_bets(rows: list[dict]) -> list[dict]:
     return out
 
 
-def review(rows: Iterable[dict], now_ms: int) -> dict:
+def review(rows: Iterable[dict], now_ms: int, old: ArchiveShare | None = None) -> dict:
     """The review page's 开盘前预挂 section (journal.json analysis.preopen): what this mode's quotes made — the totals, by the
     window's day, card, start hour (Beijing) and side, and the windows that filled, newest first. A record is a pair
     (one window, one attempt) at least one order of which was sent; a window's two sides are two bets at the pair's price.
-    ``rows`` are walked once (the archived records come one at a time: LiveBot.preopen_review)."""
+    ``rows`` are walked once (the archived records come one at a time: LiveBot.preopen_review). ``old``: the archived
+    records counted in by their kept counts instead (ArchiveShare — one read for these ``rows`` that fits ``now_ms``):
+    every figure, and the order of the lines, as if the archived records themselves followed ``rows``."""
     qs = [quote_of(p) for p in rows if any(o.get("state") not in NEVER_PLACED for o in (p.get("orders") or {}).values())]
     days: dict[str, list[dict]] = {}
     dates: dict[str, list[dict]] = {}
     cards: dict[str, list[dict]] = {}
     levels: dict[tuple[float, float], list[dict]] = {}
     hours: dict[tuple[str, int], list[dict]] = {}
-    many = len({q["card"] for q in qs}) > 1
+    names = {q["card"] for q in qs} | set(old.lines["card"] if old is not None else ())
+    many = len(names) > 1
     for q in qs:
         days.setdefault(q["day"], []).append(q)
         dates.setdefault(q["date"], []).append(q)
         cards.setdefault(q["card"], []).append(q)
         levels.setdefault((q["price"], q["shares"]), []).append(q)
         hours.setdefault((q["card"] if many else "", q["hour"]), []).append(q)
+    if old is not None:  # the lines only archived records are on: no record of ``rows``, the archive's counts alone
+        for kind, lines in (("day", days), ("date", dates), ("card", cards), ("level", levels)):
+            for key in old.lines[kind]:
+                lines.setdefault(key, [])
+        for card, hour in old.lines["hour"]:
+            hours.setdefault((card if many else "", hour), [])
+    only = "" if many else next(iter(names), "")  # the one card there is, whose hours stand without its name
+
+    def summary(name: str, group: list[dict], kind: str, key: Any) -> dict:
+        r = review_summary(name, group)
+        return old.counted(r, kind, key, group) if old is not None else r
+
+    def side_line(name: str, side: str) -> dict:
+        r = review_side(name, side, qs)
+        return old.sided(r, side) if old is not None else r
+
+    def latest(day: str) -> int:  # the day's latest window (an archived one too)
+        starts = [q["start_ms"] for q in days[day]]
+        if old is not None and day in old.lines["day"]:
+            starts.append(old.lines["day"][day].latest)
+        return max(starts)
+
+    def size(card: str) -> int:  # the card's records (the archived ones too)
+        return len(cards[card]) + (old.lines["card"][card].records if old is not None and card in old.lines["card"] else 0)
     recent = sorted([q for q in qs if q["filled"] > 0], key=lambda q: q["start_ms"], reverse=True)[:60]
     shown = ("start_ms", "name", "key", "filled_up", "filled_down", "price", "volume", "result", "pnl", "status", "lead_min", "cancel_s", "attempt")
-    total = review_summary("全部", qs)
+    total = summary("全部", qs, "all", "")
     today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat()  # the daily summary takes today's and earlier windows: tomorrow's resting pairs are no day yet
     return {"total": total,
-            "daily": {"days": {date: summary_shape(review_summary(date, dates[date])) for date in dates if date <= today},
-                      "total": summary_shape(review_summary("全部", [q for q in qs if q["date"] <= today]))},  # the daily summary's share (core.merge_preopen_summary)
+            "daily": {"days": {date: summary_shape(summary(date, dates[date], "date", date)) for date in dates if date <= today},
+                      "total": summary_shape(summary("全部", [q for q in qs if q["date"] <= today], "all", ""))},  # the daily summary's share (core.merge_preopen_summary)
             "resting_usd": round(sum(q["price"] * q["shares"] * sum(q["sent"].values()) for q in qs if q["active"]), 4),
-            "days": [review_summary(day, days[day]) for day in sorted(days, key=lambda d: max(q["start_ms"] for q in days[d]), reverse=True)],
-            "cards": [review_summary(card, cards[card]) for card in sorted(cards, key=lambda c: (-len(cards[c]), c))],
-            "levels": [review_summary(levels[k][0]["level_name"], levels[k]) for k in sorted(levels, reverse=True)],  # the highest bid first
-            "hours": [review_summary(f"{card} {hour:02d} 时开始".strip(), hours[(card, hour)]) for card, hour in sorted(hours)],
-            "sides": [review_side(name, side, qs) for side, name in (("up", "涨"), ("down", "跌"))],
+            "days": [summary(day, days[day], "day", day) for day in sorted(days, key=latest, reverse=True)],
+            "cards": [summary(card, cards[card], "card", card) for card in sorted(cards, key=lambda c: (-size(c), c))],
+            "levels": [summary(levels[k][0]["level_name"] if levels[k] else level_name(*k), levels[k], "level", k) for k in sorted(levels, reverse=True)],  # the highest bid first
+            "hours": [summary(f"{card} {hour:02d} 时开始".strip(), hours[(card, hour)], "hour", (card if many else only, hour)) for card, hour in sorted(hours)],
+            "sides": [side_line(name, side) for side, name in (("up", "涨"), ("down", "跌"))],
             # 1.139.2: the weekend's windows against the weekdays' — the weekend as PREOPEN_WEEKEND draws it (on_weekend)
-            "weekly": [review_summary(f"周末（周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00）", [q for q in qs if on_weekend(q["start_ms"])]),
-                       review_summary("工作日", [q for q in qs if not on_weekend(q["start_ms"])])],
+            "weekly": [summary(f"周末（周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00）", [q for q in qs if on_weekend(q["start_ms"])], "week", True),
+                       summary("工作日", [q for q in qs if not on_weekend(q["start_ms"])], "week", False)],
             "recent": [{k: q[k] for k in shown} for q in recent]}
+
+
+REVIEW_KINDS = ("all", "date", "day", "card", "level", "hour", "week")  # the review's tables, as ArchiveShare keeps the archive's lines of each
+
+
+def review_lines(q: dict) -> tuple:
+    """The lines of the review's tables a quote is counted on, as (kind, key) — one of each of REVIEW_KINDS: the total, its
+    window's date (the daily summary) and day, its card, its level, its card's start hour, the weekend or the week."""
+    return (("all", ""), ("date", q["date"]), ("day", q["day"]), ("card", q["card"]), ("level", (q["price"], q["shares"])),
+            ("hour", (q["card"], q["hour"])), ("week", on_weekend(q["start_ms"])))
+
+
+class ArchiveLine:
+    """What the archive adds to one line of a review table: so many records, of so many windows, the latest starting then."""
+    __slots__ = ("records", "windows", "latest")
+
+    def __init__(self) -> None:
+        self.records = self.windows = 0
+        self.latest: float = -math.inf
+
+
+class ArchiveShare:
+    """The archive's share of the review's figures (review's ``old``), kept from one call to the next by
+    LiveBot.preopen_review. Audit PRE-LEDGER-GROWTH, the follow-up: the page counts the archived records as it always
+    did, and for that every call read the whole archive off the file and parsed it, record by record, on the bot's one
+    event loop — twice a build of journal.json, a build a minute while the page is open: at 42,000 archived two seconds a
+    call where the same history, all in memory, had taken one, and the one cost left that grew with the history.
+
+    An archived record is a finished quote that filled nothing (archivable). All it adds to any table is a record, a
+    withdrawn one, its window, and an order sent on a side — so the archive is read once, those counts are kept by table
+    and line (``lines``, ``sent``), and from then on only the rows moved in since are read (``top``: a pass appends, the
+    rowids grow). Windows are the one thing counts do not add up: a window with an archived record and a working one
+    (its other level filled) is one window. ``known`` says, for the windows of the working records alone, on which lines
+    their archived records are counted; a window it does not hold is looked up in the archive by its keys (learn). So
+    what is kept grows with the working records and the days of history, not with the archive.
+
+    The archive is read whole again (read) when its rows did not only grow: a record of it replaced in place by a pass
+    (Ledger.rewrites); rows gone or put in by another hand (the last row counted is no longer where it was, or the rows
+    do not add up to the count); or other records than before in both tables — those are counted as the working records
+    they are and passed by here (``skip``). What another hand changes leaving every key where it was — a body rewritten
+    in place — is not seen before the next start. And the counts are not used at all (fits) when the archive holds a
+    record that is no plain withdrawn quote, or one of a window after today's: the page reads the archive record by
+    record then, as it did. After a start the first call reads the archive whole, once."""
+    def __init__(self, path: str = "") -> None:
+        self.path = path
+        self.top = self.count = 0  # the archive's rows counted here: those up to this rowid, this many
+        self.last: tuple | None = None  # ...the last of them, as (its key,)
+        self.skip: frozenset[str] = frozenset()  # the keys that were working records' too when it was read: counted there, not here
+        self.rewrites = Ledger.rewrites
+        self.plain = True  # every record counted is a plain withdrawn quote (quote)
+        self.lines: dict[str, dict[Any, ArchiveLine]] = {kind: {} for kind in REVIEW_KINDS}
+        self.sent = {"up": 0, "down": 0}  # the records counted with an order sent on the side
+        self.known: dict[str, tuple] = {}  # window -> the lines its archived records are counted on: the working records' windows (every window of the archive while it is read whole)
+
+    def quote(self, slug: str, pair: dict) -> dict | None:
+        """An archived record as the review counts it (quote_of); None for one not counted here: no order of it ever placed
+        (review passes those by), a working record too (``skip``), or no plain withdrawn quote under its own key — which
+        leaves these counts no use (``plain``)."""
+        if not any(o.get("state") not in NEVER_PLACED for o in (pair.get("orders") or {}).values()):
+            return None
+        if pair.get("slug") != slug:  # (the working records are told from the archived ones by their keys)
+            self.plain = False
+            return None
+        if slug in self.skip:
+            return None
+        q = quote_of(pair)
+        if (q["active"] or not q["accounted"] or q["filled_up"] != 0 or q["filled_down"] != 0
+                or not (0 <= q["price"] < math.inf and math.isfinite(q["shares"]))):  # (a price that is a number: nothing filled at it is no volume)
+            self.plain = False
+            return None
+        return q
+
+    def add(self, slug: str, pair: dict) -> None:
+        """One more archived record counted: a record on each of its lines, and a window on those where no archived record of
+        its window was counted before (``known`` holds the window, or the archive has no earlier record of it)."""
+        q = self.quote(slug, pair)
+        if q is None:
+            return
+        seen = self.known.get(q["window"], ())
+        for kind, key in review_lines(q):
+            line = self.lines[kind].get(key)
+            if line is None:
+                line = self.lines[kind][key] = ArchiveLine()
+            line.records += 1
+            line.latest = max(line.latest, q["start_ms"])
+            if line not in seen:
+                line.windows += 1
+                seen += (line,)
+        self.known[q["window"]] = seen
+        for side in ("up", "down"):
+            self.sent[side] += q["sent"][side]
+
+    def learn(self, conn: sqlite3.Connection, window: str) -> None:
+        """``known`` for a window it does not hold: the lines the archive's records of that window are counted on, read off
+        the archive by the keys a window's records have — <window>, <window>#<level>, either with @<attempt>
+        (record_key, window_of) — among the rows counted (those up to ``top``)."""
+        seen: tuple = ()
+        for slug, body in conn.execute("SELECT slug, body FROM archive WHERE rowid <= ? AND (slug = ? OR (slug >= ? AND slug < ?) OR (slug >= ? AND slug < ?))",
+                                       (self.top, window, window + "#", window + "$", window + "@", window + "A")):
+            q = self.quote(slug, json.loads(body))
+            if q is not None and q["window"] == window:
+                seen += tuple(line for kind, key in review_lines(q) if (line := self.lines[kind][key]) not in seen)
+        self.known[window] = seen
+
+    @classmethod
+    def read(cls, conn: sqlite3.Connection, path: str, rows: list[dict], kept: ArchiveShare | None = None) -> ArchiveShare:
+        """The archive's share as the archive is now, for the working records ``rows``: ``kept`` — the last call's — with the
+        rows moved in since counted in (none read when there are none), or the archive read whole (the first call, a
+        ledger in memory, another file, and whenever its rows did not only grow: the class's own words). ``known`` then
+        holds the windows of ``rows`` and no other. ``kept`` is changed in place: after an error it is no use."""
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive'").fetchone() is None:
+            return cls(path)  # (a file nothing was moved in yet)
+        count = conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0]
+        mine = [slug for slug in {p.get("slug") for p in rows} if isinstance(slug, str)]
+        skip = frozenset(slug for at in range(0, len(mine), 500) for (slug,) in conn.execute(
+            f"SELECT slug FROM archive WHERE slug IN ({','.join('?' * len(mine[at:at + 500]))})", mine[at:at + 500]))
+        share = kept
+        # still the rows it counted, and nothing but rows after them: the last of them is where it was, and they and the later ones are all there is
+        fresh = (share is None or not share.count or path == ":memory:" or share.path != path or share.rewrites != Ledger.rewrites or share.skip != skip
+                 or conn.execute("SELECT slug FROM archive WHERE rowid = ?", (share.top,)).fetchone() != share.last
+                 or share.count + conn.execute("SELECT COUNT(*) FROM archive WHERE rowid > ?", (share.top,)).fetchone()[0] != count)
+        if fresh:
+            share = cls(path)
+            share.skip = skip
+        reached, added = share.top, 0
+        for rowid, slug, body in conn.execute("SELECT rowid, slug, body FROM archive WHERE rowid > ? ORDER BY rowid", (share.top,)):
+            pair = json.loads(body)
+            if not fresh and window_of(pair) not in share.known:  # (a window quoted and archived since the last call: an earlier record of it would be among the rows counted)
+                share.learn(conn, window_of(pair))
+            share.add(slug, pair)
+            reached, added, share.last = rowid, added + 1, (slug,)
+        share.top, share.count = reached, share.count + added
+        windows = {window_of(p) for p in rows}
+        for window in windows - share.known.keys():
+            if fresh:
+                share.known[window] = ()  # (every window of the archive is held just now: this one has no record there)
+            else:
+                share.learn(conn, window)
+        share.known = {window: share.known[window] for window in windows}
+        return share
+
+    def fits(self, now_ms: int) -> bool:
+        """Whether these counts can stand for the archive's records in review(…, now_ms): each a plain withdrawn quote
+        (``plain``), none of a window after today's — the daily summary's total takes today's and earlier (a clock set
+        back)."""
+        today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat()
+        return self.plain and all(date <= today for date in self.lines["date"])
+
+    def counted(self, r: dict, kind: str, key: Any, qs: list[dict]) -> dict:
+        """A review_summary line of the records ``qs`` with the archive's records of the same line counted in: that many more
+        records, withdrawn every one, and their windows but those ``qs`` has a record of too. (The sums of a line are
+        floats once a record was summed: 0.0, not 0, on a line of archived records alone.)"""
+        line = self.lines[kind].get(key)
+        if line is not None:
+            r["records"] += line.records
+            r["withdrawn"] += line.records
+            r["windows"] += line.windows - sum(1 for window in {q["window"] for q in qs} if line in self.known[window])
+            r["filled"] += 0.0
+            r["volume"] += 0.0
+        return r
+
+    def sided(self, r: dict, side: str) -> dict:
+        """A review_side line with the archive's orders sent on that side counted in (none of them filled)."""
+        if self.sent[side]:
+            r["records"] += self.sent[side]
+            r["filled"] += 0.0
+            r["volume"] += 0.0
+        return r
+
+
+def archive_share(source: Ledger | str, rows: list[dict], kept: ArchiveShare | None = None) -> ArchiveShare:
+    """ArchiveShare.read on a ledger — a controller's, or while the mode is off the file's path (none there: an empty
+    share) — whose working records are ``rows``; ``kept`` is what the last call returned (LiveBot.preopen_review)."""
+    if not isinstance(source, str):
+        return ArchiveShare.read(source.conn, source.path, rows, kept)
+    if source == ":memory:" or not Path(source).exists():
+        return ArchiveShare(source)
+    conn = sqlite3.connect(source)
+    try:
+        return ArchiveShare.read(conn, source, rows, kept)
+    finally:
+        conn.close()
 
 
 LISTING_CYCLE_MS = 15 * 60_000  # Predict lists one more window of a card every quarter hour (a day ahead): the next listing is expected a cycle after the last seen

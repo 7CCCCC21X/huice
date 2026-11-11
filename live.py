@@ -1363,6 +1363,7 @@ class LiveBot(core.Bot):
         self.preopen_task: asyncio.Task | None = None
         self.preopen_day_read: tuple | None = None  # (ledger file, Beijing day, its accounted P&L, valid until): read while no controller holds it (preopen_file_day)
         self.preopen_tidied = -1e9  # monotonic time of the last archive pass over the ledger file while the mode is off (preopen_tidy)
+        self.preopen_share: Any = None  # the archive's share of the review's figures, kept from call to call (preopen.ArchiveShare; preopen_review)
         self.preopen_factory: Any = None  # the tests' stand-in controller class
         self.preopen_lock = asyncio.Lock()
         self.handlers["/preopen"] = self.cmd_preopen  # the status, on / off, pause / resume, and the read-only probe of the listing
@@ -4354,8 +4355,12 @@ class LiveBot(core.Bot):
         """The review page's 开盘前预挂 section (preopen.review): the running controller's ledger, or the file read while the
         mode is off; None when nothing is recorded. Audit PRE-LEDGER-GROWTH: with the ledger's archive — the old finished
         quotes that filled nothing left the working records (Ledger.archive_old), and the totals and tables count them as
-        they always did; read off the file one at a time, here and nowhere else, never kept in memory."""
-        from preopen import read_archive, read_rows, review
+        they always did. By their counts, kept from call to call (preopen.ArchiveShare: the archive is read once, after
+        that only the rows moved in since): reading and parsing the whole archive at every call — two a build of
+        journal.json — took twice as long as the review had with every record in memory, and longer with every day of
+        history. Record by record off the file, as before that, only when the counts cannot stand for the records (one in
+        the archive that is no plain withdrawn quote) or could not be had; never kept in memory either way."""
+        from preopen import archive_share, read_archive, read_rows, review
         try:
             if self.preopen is not None:
                 rows, old = list(self.preopen.ledger.rows.values()), self.preopen.ledger.archived()
@@ -4364,6 +4369,14 @@ class LiveBot(core.Bot):
         except Exception as error:
             LOG.warning("预挂复盘读取失败：%s", core.clean_error(error) or type(error).__name__)
             return None
+        now_ms = self.market.now_ms()
+        try:
+            share = self.preopen_share = archive_share(self.preopen.ledger if self.preopen is not None else self.config.preopen.db, rows, getattr(self, "preopen_share", None))
+            if share.fits(now_ms):
+                return review(rows, now_ms, share) if rows or share.count else None
+        except Exception as error:  # the counts could not be had: dropped (they may be half brought up to date), and the archive read record by record below
+            self.preopen_share = None
+            LOG.warning("预挂复盘的归档统计没用上（这次逐条读归档）：%s", core.clean_error(error) or type(error).__name__)
         keys = {p.get("slug") for p in rows}  # a record in both (its move undone by hand) counts once: the working one
         more: list[int] = [0]
         failed: list[Exception] = []
@@ -4377,7 +4390,7 @@ class LiveBot(core.Bot):
                         yield p
             except Exception as error:  # the archive cannot be read (it is read as the review walks it): no figures, not short ones
                 failed.append(error)
-        out = review(every(), self.market.now_ms())
+        out = review(every(), now_ms)
         if failed:
             LOG.warning("预挂复盘读取失败（归档）：%s", core.clean_error(failed[0]) or type(failed[0]).__name__)
             return None

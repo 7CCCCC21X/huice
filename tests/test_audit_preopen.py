@@ -1012,4 +1012,260 @@ async def _late_fill(folder):
 with tempfile.TemporaryDirectory() as _folder:
     asyncio.run(_late_fill(_folder))
 
+# PRE-LEDGER-GROWTH, the follow-up (the review of 1e0d641). With the old finished quotes moved to the archive the review
+# page still counts them all, and LiveBot.preopen_review did so by reading and parsing every archived record off the file
+# at every call — two calls a build of journal.json, a build a minute while the page is open, all of it on the bot's
+# event loop: with the mode on a call took twice as long as it had with the same records in memory (2.0 s against 1.0 s
+# at 42,000 archived), and longer with every day of history — the one cost of the ledger left that grew without bound.
+# Now the archive is read once and its share of every table kept as counts (preopen.ArchiveShare: an archived record is a
+# finished quote that filled nothing — a record, a withdrawn one, its window, an order sent on a side); a call reads the
+# rows moved in since the last one, none when there are none, and the page's figures are the same to the byte. The
+# archive is read whole again only when its rows did not only grow, and record by record, as before, when it holds
+# something that is no plain withdrawn quote.
+
+
+class _Parses:
+    """preopen's json with its loads counted: how many records a call read and parsed off the ledger file."""
+    def __init__(self):
+        self.n = 0
+
+    def __getattr__(self, name):
+        return getattr(json, name)
+
+    def loads(self, text, *args, **kwargs):
+        self.n += 1
+        return json.loads(text, *args, **kwargs)
+
+
+def _old_quote(stem, card, start, level=0, attempt=None, **over):
+    """A finished quote that filled nothing, as the ledger keeps one (what the review and the archive read of it)."""
+    slug = f"{stem}-{start // 1000}" + (f"#{level}" if level else "") + (f"@{attempt}" if attempt is not None else "")
+    order = lambda side: {"hash": f"0x{slug}/{side}", "id": f"{slug}/{side}", "state": "final", "filled": 0.0}
+    row = {"slug": slug, "key": stem.split("-")[0].upper() + "-15M", "market_id": str(start // 1000), "name": f"{card} 15分涨跌 {_p.hms(start)[:5]}",
+           "start_ms": start, "end_ms": start + 900_000, "level": level, "attempt": attempt or 0, "price": ("0.49", "0.48")[level], "shares": ("10", "20")[level],
+           "created_ms": start - 3_600_000, "cancel_sent_ms": start - 20_000, "cancel_done_ms": start - 19_600, "phase": "closed", "accounted": True, "pnl": 0.0,
+           "orders": {"up": order("up"), "down": order("down")}}
+    row.update(over)
+    return row
+
+
+async def _review_by_counts(folder):
+    db = str(Path(folder) / "r.preopen.sqlite3")
+    day = 24 * 60
+    at = lambda minutes: _T.NOW + minutes * 60_000  # (_T.NOW: Friday 11-06 09:00 in Beijing)
+    btc = lambda minutes, *args, **over: _old_quote("btc-updown-15m", "BTC", at(minutes), *args, **over)
+    uni = lambda minutes, *args, **over: _old_quote("unitree-updown-15m", "宇树", at(minutes), *args, **over)
+    filled = btc(60)  # Friday 10:00, the first level: Up filled whole, Down won
+    filled["orders"]["up"]["filled"] = 10.0
+    filled.update(result="down", pnl=-4.9)
+    one_side = uni(240)  # 宇树 Friday 13:00: one order sent, the other never
+    one_side["orders"]["down"]["state"] = "not_sent"
+    never = btc(120)  # Friday 11:00: no order of it ever placed — no quote to the review
+    never["orders"]["up"]["state"], never["orders"]["down"]["state"] = "not_sent", "rejected"
+    closing = btc(150, 1, phase="closing", accounted=False)  # Friday 11:30, the second level: still being withdrawn on Monday
+    resting = btc(5 * day, phase="active", accounted=False)  # Wednesday 09:00: resting (BTC's latest window)
+    for row, state in ((closing, "removed"), (resting, "open")):
+        for order in row["orders"].values():
+            order["state"] = state
+    led = _p.Ledger(db)
+    for row in (filled, btc(60, 1),                       # ...and that window's second level: nothing filled
+                btc(75, attempt=0), btc(75), btc(75, 1),  # 10:15: quoted twice at the first level, once at the second
+                one_side, never, btc(150), closing,       # (11:30: the first level withdrawn)
+                btc(day + 45),                            # Saturday 09:45: the weekend
+                btc(3 * day + 60), uni(3 * day + 240),    # Monday 10:00; 宇树's latest window, Monday 13:00
+                resting):
+        led.save(row)
+    later = at(3 * day + 180)  # Monday 12:00: Friday's and Saturday's windows are two days over
+    assert led.archive_old(later) == 8 and len(led.rows) == 5  # (the fill, the level being withdrawn, Monday's two, the resting one stay)
+    clock = types.SimpleNamespace(ms=later)
+    bot = _L.LiveBot.__new__(_L.LiveBot)
+    bot.preopen, bot.market, bot.sim_trades = types.SimpleNamespace(ledger=led, manual_pause=False), types.SimpleNamespace(now_ms=lambda: clock.ms), (lambda: {})
+    bot.config, bot.live = types.SimpleNamespace(preopen=types.SimpleNamespace(db=db)), types.SimpleNamespace(markets={})
+
+    def archived(path=db):
+        conn = sqlite3.connect(path)
+        try:
+            return [json.loads(body) for (body,) in conn.execute("SELECT body FROM archive ORDER BY rowid")]
+        finally:
+            conn.close()
+
+    def want(working):
+        """The page as it was before the follow-up: the review of every record — the working ones, then the archived ones that
+        are no working records too — as JSON."""
+        keys = {x["slug"] for x in working}
+        return json.dumps(_p.review([*working, *(x for x in archived() if x["slug"] not in keys)], clock.ms), ensure_ascii=False)
+
+    def look():
+        """(the page's section as JSON, how many records the call read and parsed off the file)"""
+        before = parses.n
+        out = bot.preopen_review()
+        return json.dumps(out, ensure_ascii=False), parses.n - before
+    parses = _p.json = _Parses()
+    try:
+        # --- the archive is read once: a call with nothing new in it reads none of it (it read all eight records, every call)
+        got, read = look()
+        assert got == want(list(led.rows.values())) and read == 8, read
+        again, read = look()
+        assert read == 0, f"a call with nothing new in the archive read and parsed the whole of it again ({read} records)"
+        assert again == got
+        before = parses.n
+        summary = bot.summary_rows([], {})  # a build of journal.json: the daily summary's call, and the analysis's own
+        bot.preopen_review()
+        assert parses.n == before, "a build of journal.json read the archive"
+        page = json.loads(got)
+        total = page["total"]
+        assert (total["records"], total["windows"], total["withdrawn"], total["resting"], total["pnl"]) == (12, 8, 9, 1, -4.9)  # (10:00 and 11:30: a level here, a level there — one window each)
+        assert [(x["label"], x["records"], x["markets"]) for x in summary] == [("11-09 周一", 2, 2), ("11-07 周六", 1, 1), ("11-06 周五", 8, 4), ("累计", 11, 7)]
+        assert [(x["name"], x["records"], x["windows"]) for x in page["cards"]] == [("BTC 15分涨跌", 10, 6), ("宇树 15分涨跌", 2, 2)]
+        assert [(x["name"], x["records"]) for x in page["sides"]] == [("涨", 12), ("跌", 11)]
+        assert [(x["records"], x["filled"]) for x in page["weekly"]] == [(1, 0.0), (11, 10.0)] and list(page["daily"]["days"]) == ["2026-11-06", "2026-11-09", "2026-11-07"]
+        share = bot.preopen_share
+        assert set(share.known) == {_p.window_of(x) for x in led.rows.values()} and len(share.known) == 5, "of the windows, the working records' alone are kept"
+
+        # --- two days on the 11:30 window's second level is withdrawn too and Monday's window is two days over: the pass
+        # moves the two, and the page's next call reads those two rows and no other
+        clock.ms = at(5 * day + 360)  # Wednesday 15:00
+        for order in closing["orders"].values():
+            order["state"] = "final"
+        closing.update(phase="closed", accounted=True)
+        led.save(closing)
+        assert led.archive_old(clock.ms) == 2
+        got, read = look()
+        assert got == want(list(led.rows.values())) and read == 2, read
+        assert (json.loads(got)["total"]["records"], json.loads(got)["total"]["windows"], len(bot.preopen_share.known)) == (12, 8, 3)
+        # a window quoted and archived between two looks at the page, and one more record of a window all of whose records
+        # are archived (nothing is kept of such a window: its three archived records are found by their keys)
+        led.save(btc(3 * day + 90))  # Monday 10:30
+        led.save(btc(75, attempt=1))
+        assert led.archive_old(clock.ms) == 2
+        got, read = look()
+        assert got == want(list(led.rows.values())) and read == 2 + 3, read
+        assert (json.loads(got)["total"]["records"], json.loads(got)["total"]["windows"]) == (14, 9)
+
+        # --- a record saved again after its move by a task that still held it. A settlement in flight saved it with the
+        # result: a working record for good, its old copy in the archive — one record to the page; the archive is read
+        # whole for it, once
+        count = len(archived())
+        saturday = next(x for x in archived() if x["start_ms"] == at(day + 45))
+        led.save({**saturday, "result": "up"})
+        got, read = look()
+        assert got == want(list(led.rows.values())) and (read, bot.preopen_share.skip, count) == (12, {saturday["slug"]}, 12), read
+        assert look() == (got, 0)
+        # ...a reconcile saved one with an order's state read anew: the next pass puts it back, in place of the old copy —
+        # the page looked at in between (the record a working one for the while), and not
+        back = copy.deepcopy(next(x for x in archived() if x["key"] == "UNITREE-15M"))
+        back["orders"]["down"]["state"] = "final"
+        led.save(back)
+        assert look()[0] == want(list(led.rows.values()))
+        rewrites = _p.Ledger.rewrites
+        assert led.archive_old(clock.ms) == 1 and _p.Ledger.rewrites == rewrites + 1 and len(archived()) == count
+        got, read = look()
+        assert got == want(list(led.rows.values())) and read == count, "a record replaced in the archive: the counts are the new copy's"
+        assert [(x["name"], x["records"]) for x in json.loads(got)["sides"]] == [("涨", 14), ("跌", 14)]
+        back = copy.deepcopy(next(x for x in archived() if x["slug"] == btc(60, 1)["slug"]))
+        back["orders"]["up"]["state"] = "not_sent"
+        led.save(back)
+        assert led.archive_old(clock.ms) == 1 and _p.Ledger.rewrites == rewrites + 2 and len(archived()) == count
+        got, read = look()
+        assert got == want(list(led.rows.values())) and read == count, "a record replaced in the archive between two looks: the counts are the new copy's"
+        assert [(x["name"], x["records"]) for x in json.loads(got)["sides"]] == [("涨", 13), ("跌", 14)]
+
+        # --- the mode off: the working records come off the file at every call, as they did; of the archive nothing is read
+        working = len(led.rows)
+        bot.preopen = None
+        led.close()
+        got, read = look()
+        assert got == want(_p.read_rows(db)) and (read, working) == (4, 4), read
+        assert look() == (got, working)
+        # something in the archive that is no plain withdrawn quote (put there by another hand): counts cannot stand for
+        # it — the archive is read record by record, as before the follow-up; gone again, the counts are read afresh
+        odd = btc(-day)
+        odd["orders"]["up"]["filled"] = 3.0
+        odd.update(result="up", pnl=1.53)
+        conn = sqlite3.connect(db)
+        with conn:
+            conn.execute("INSERT INTO archive VALUES (?,?)", (odd["slug"], json.dumps(odd, ensure_ascii=False)))
+        got, read = look()
+        assert got == want(_p.read_rows(db)) and not bot.preopen_share.plain and read >= working + count + 1, read
+        assert json.loads(got)["total"]["filled"] == 13.0
+        with conn:
+            conn.execute("DELETE FROM archive WHERE slug=?", (odd["slug"],))
+        got, read = look()
+        assert got == want(_p.read_rows(db)) and bot.preopen_share.plain and read == working + count, read
+        assert look() == (got, working)
+        # ...that hand takes a row out of the archive (the rows no longer add up to the count: read whole); then its last row
+        # out and two in — one row more than was counted and one row after the last one counted, as if a pass had moved
+        # one in, but the last row counted is not what it was: read whole
+        with conn:
+            conn.execute("DELETE FROM archive WHERE rowid=(SELECT MIN(rowid) FROM archive)")
+        count -= 1
+        got, read = look()
+        assert got == want(_p.read_rows(db)) and read == working + count, read
+        with conn:
+            conn.execute("DELETE FROM archive WHERE rowid=(SELECT MAX(rowid) FROM archive)")
+            for row in (btc(-day + 15), btc(-day + 30)):
+                conn.execute("INSERT INTO archive VALUES (?,?)", (row["slug"], json.dumps(row, ensure_ascii=False)))
+        conn.close()
+        count += 1
+        got, read = look()
+        assert got == want(_p.read_rows(db)) and read == working + count, read
+        assert look() == (got, working)
+        # the clock set back before an archived window's day (the daily summary takes today's and earlier): record by record
+        clock.ms = at(-day)
+        got, read = look()
+        assert got == want(_p.read_rows(db)) and not bot.preopen_share.fits(clock.ms) and read == working + count, read
+        clock.ms = at(5 * day + 360)
+
+        # --- the two readers of the working records in live.py that find an archived record no more (Ledger.archive_old's
+        # own words say so, and why neither is missed): /live cancel <an archived record's order id> is nobody's order and
+        # pauses nothing; a market whose records are all archived is none of this bot's markets
+        doc = _p.Ledger.archive_old.__doc__
+        assert "live_cancel_command" in doc and "live_known_markets" in doc, "archive_old does not say which readers of the working records no longer find an archived record"
+        led = _p.Ledger(db)
+        bot.preopen = types.SimpleNamespace(ledger=led, manual_pause=False)
+        gone = next(x for x in archived() if x["key"] == "UNITREE-15M")
+        text = await bot.live_cancel_command([gone["orders"]["up"]["id"]], clock.ms)
+        assert text.startswith("没有订单号为") and not led.pause() and bot.preopen.manual_pause is False, text
+        ids, _ = bot.live_known_markets()
+        assert gone["market_id"] not in ids and filled["market_id"] in ids
+        assert look() == (want(list(led.rows.values())), 0)  # (the mode on again, on the same file: the kept counts go on)
+        led.close()
+
+        # --- a window's archived records are found by their keys — <window>, <window>#<level>, either with @<attempt> —
+        # and no other window's: a key that only begins the same way is another window's (window_of)
+        led = _p.Ledger(str(Path(folder) / "k.preopen.sqlite3"))
+        w = "btc-updown-15m-1"
+        own = [btc(60, slug=w), btc(60, 1, slug=w + "#1"), btc(60, 1, slug=w + "#1@0"), btc(60, slug=w + "@2")]  # Friday's
+        others = [btc(day + 60, slug=w + "0"), btc(day + 60, 1, slug=w + "0#1"), btc(day + 60, slug=w + "A"), btc(day + 60, slug=w + "$"), btc(day + 60, slug=w[:-1])]  # Saturday's
+        for row in (*own, *others, btc(5 * day)):
+            led.save(row)
+        assert led.archive_old(clock.ms) == 9
+        share = _p.archive_share(led, list(led.rows.values()))
+        assert w not in share.known and (share.lines["all"][""].records, share.lines["all"][""].windows) == (9, 5)
+        share.learn(led.conn, w)
+        friday, saturday = (share.lines["date"][_p.quote_of(x)["date"]] for x in (own[0], others[0]))
+        assert friday in share.known[w] and saturday not in share.known[w] and len(share.known[w]) == 8, "the lines of its own four records: the total, a date, a day, a card, two levels, an hour, the week"
+
+        def both():
+            """(the review by the archive's counts, the review of every record) of this ledger, as JSON"""
+            working = list(led.rows.values())
+            by_counts = _p.review(working, clock.ms, _p.archive_share(led, working, share))
+            return json.dumps(by_counts, ensure_ascii=False), json.dumps(_p.review([*working, *archived(led.path)], clock.ms), ensure_ascii=False)
+        by_counts, every = both()  # one card in this ledger: its hours stand without its name, the archive's too
+        assert by_counts == every and [x["name"] for x in json.loads(by_counts)["hours"]] == ["09 时开始", "10 时开始"]
+        led.save(uni(5 * day))  # a second card with more working records than the first — which has more records, the archived counted
+        led.save(uni(5 * day + 15))
+        by_counts, every = both()
+        assert by_counts == every and [(x["name"], x["records"]) for x in json.loads(by_counts)["cards"]] == [("BTC 15分涨跌", 10), ("宇树 15分涨跌", 2)]
+        led.delete(btc(5 * day)["slug"])  # ...and the first card with no working record at all: two cards all the same
+        by_counts, every = both()
+        assert by_counts == every and [x["name"] for x in json.loads(by_counts)["hours"]] == ["BTC 15分涨跌 10 时开始", "宇树 15分涨跌 09 时开始"]
+        led.close()
+    finally:
+        _p.json = json
+
+
+with tempfile.TemporaryDirectory() as _folder:
+    asyncio.run(_review_by_counts(_folder))
+
 print("AUDIT_PREOPEN_OK")
