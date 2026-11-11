@@ -4884,20 +4884,27 @@ class LiveBot(core.Bot):
             left = min(self.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - self.live_redeem_failed[k]) for k in pull)
             self.live_redeem_pull(max(0.0, left) + 1)
         claimable = [s for s in seen if s["kind"] == "claimable"]
-        if low_gas and claimable and time.monotonic() - self.live_gas_noted >= self.LIVE_REDEEM_RETRY_SECONDS:
-            self.live_gas_noted = time.monotonic()
+        if low_gas and claimable:
             short = f"签名钱包的 BNB 不够付领取交易的 gas（节点拒收：{gas_refused}）" if gas_refused else "签名钱包的 BNB 不足 0.0005"  # (RDM-UNSENT-AS-SENT)
             text = (f"⛽ {short}，{len(claimable)} 个已结算的持仓（约 ${sum(s['value'] for s in claimable):,.2f}）等着领取：暂不自动领取。"
                     f"往 {self.live.wallet.signer} 转一点 BNB（BNB 链）后自动恢复")
-            self.live_note_error(text)
+            # 1.150.0 (audit RDM-NOTIFY-GATES): the hour was started before the notice was asked for — with LIVE_NOTIFY off, no chat
+            # subscribed, the chat /pause'd or its one sendMessage refused, nothing reached the owner and the next ⛽ came an hour
+            # on. The line in /live (live_errors) keeps this hourly clock; the notice is asked for every such round and keeps its
+            # own hour (LIVE_NOTE_EVERY), started only once a chat was given it, given back when no chat took it.
+            if time.monotonic() - self.live_gas_noted >= self.LIVE_REDEEM_RETRY_SECONDS:
+                self.live_gas_noted = time.monotonic()
+                self.live_note_error(text)
             self.live_notify(text, key="redeem:gas")  # 1.131.4: told on Telegram, not only in the log
         failed = [s for s in seen if s["kind"] == "failed"]
         if failed and time.monotonic() - getattr(self, "live_redeem_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
-            self.live_redeem_noted = time.monotonic()
             when = "5 分钟后" if failed[0].get("pulled") else "下一轮（最迟约 10 分钟）" if failed[0].get("unsent") else "一小时后"
             again = f"{when}自动再试" if self.config.live_auto_redeem else "自动领取关着，不会自己再试：发 /live redeem 再领"  # (RDM-CHECK-VERDICT)
-            self.live_notify(f"⚠️ 自动领取：{len(failed)} 个已结算的持仓没领成（{failed[0]['title']}：{failed[0]['error']}），"
-                             f"{again}。/live redeem check 查看原因", key="redeem:fail")
+            if self.live_notify(f"⚠️ 自动领取：{len(failed)} 个已结算的持仓没领成（{failed[0]['title']}：{failed[0]['error']}），"
+                                f"{again}。/live redeem check 查看原因", key="redeem:fail"):
+                # (RDM-NOTIFY-GATES) its hour only once a chat was given it — and given back when none took it
+                before, self.live_redeem_noted = getattr(self, "live_redeem_noted", -1e9), time.monotonic()
+                self.live_note_given_back("redeem:fail", lambda before=before: setattr(self, "live_redeem_noted", before))
         if cut and time.monotonic() - getattr(self, "live_cut_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
             # 1.150.0 (RDM-POSITIONS-CUT): a list longer than even the redeem's own read — told once an hour on its own timer (a bare
             # key would come back every LIVE_NOTE_SECONDS, a round or two), not only in the summary nobody asks for
@@ -5134,10 +5141,16 @@ class LiveBot(core.Bot):
 
     # --- telling the administrator ------------------------------------------------------------------------------------------
     LIVE_NOTE_BUFFER = 50   # unkeyed notices held per chat for its next batch message; beyond it the oldest are dropped (and counted)
+    # 1.150.0 (audit RDM-NOTIFY-GATES): the notices only the owner can act on — send BNB to the signer, a redeem keeps failing —
+    # are said whatever LIVE_NOTIFY says (it silences the orders' and fills' notices), and to the administrator's private chat
+    # when no chat is subscribed (never /subscribe'd, /pause'd, suspended); each sendMessage tried up to LIVE_NOTE_TRIES times
+    LIVE_NOTE_MUST = frozenset({"redeem:gas", "redeem:fail"})
+    LIVE_NOTE_EVERY = {"redeem:gas": LIVE_REDEEM_NOTE_SECONDS}  # a key's own pace (the others: LIVE_NOTE_SECONDS)
+    LIVE_NOTE_TRIES = 3
 
-    def live_notify(self, text: str, key: str = "") -> None:
+    def live_notify(self, text: str, key: str = "") -> bool:
         """A line to every active subscription (the administrator's chats); a keyed notice repeats at most every
-        LIVE_NOTE_SECONDS.
+        LIVE_NOTE_SECONDS (LIVE_NOTE_EVERY: its own pace). True when it was given to at least one chat.
 
         1.150.0 (audit LIVE-NOTIFY-PRIORITY): the unkeyed notices (📤 each placement, ✅ each fill, 💵, ℹ️ …) are coalesced
         per chat: each one joins that chat's buffer, and one batch delivery per chat sends everything buffered as ONE message, then whatever
@@ -5145,16 +5158,30 @@ class LiveBot(core.Bot):
         is empty. They used to be one message each: a maker re-quoting every few seconds over a few slots, plus fills,
         outran that rate, the queue grew without bound, and a keyed critical alert (🛑 kill switch, ❓ unknown order,
         ⚠️ …) waited behind every notice already queued — minutes late. Now a critical alert waits behind at most one
-        live batch message. Keyed notices keep their own delivery each, as before."""
-        if not self.config.live_notify or self.telegram is None:
-            return
+        live batch message. Keyed notices keep their own delivery each, as before.
+
+        1.150.0 (audit RDM-NOTIFY-GATES): the ⛽ no-gas and ⚠️ failed-redeem notices vanished with LIVE_NOTIFY=off, after /pause,
+        without /subscribe, or on one refused sendMessage — and their hour was started anyway, before the notice was even asked
+        for: the owner, who alone can fund the signer, heard nothing, and an hour late once the gate opened. A LIVE_NOTE_MUST key
+        now passes LIVE_NOTIFY and falls back to the administrator's chat; a keyed notice's clock starts only when a chat was
+        given it (False: none — no clock), and a must-notice no chat took after LIVE_NOTE_TRIES sends each gives its clock back
+        (and its caller's: live_note_given_back), so the next round says it again. Every other notice as before."""
+        must = key in self.LIVE_NOTE_MUST
+        if self.telegram is None or not (self.config.live_notify or must):
+            return False
+        targets = {sub_id: sub for sub_id, sub in self.subscriptions().items() if sub.get("active")}
+        if not targets and must and self.config.admin_id:  # (as suspend_target's notice: the administrator's private chat)
+            targets = {core.subscription_key(self.config.admin_id, 0): {"chat": self.config.admin_id, "thread": 0}}
+        if not targets or (key and self.stopping.is_set()):
+            return False  # nobody given it: a keyed notice's clock is not started
+        stamp = 0.0
         if key:
-            if time.monotonic() - self.live_noted.get(key, -1e9) < self.LIVE_NOTE_SECONDS:
-                return
-            self.live_noted[key] = time.monotonic()
-        for sub_id, sub in self.subscriptions().items():
-            if not sub.get("active"):
-                continue
+            if time.monotonic() - self.live_noted.get(key, -1e9) < self.LIVE_NOTE_EVERY.get(key, self.LIVE_NOTE_SECONDS):
+                return False
+            self.live_noted[key] = stamp = time.monotonic()
+        told: list[bool] = []  # a must-notice: what each chat's sends came to
+        queued = False
+        for sub_id, sub in targets.items():
             if not key:
                 buffer = self.live_note_buffer.setdefault(sub_id, [])
                 buffer.append(text)
@@ -5166,12 +5193,37 @@ class LiveBot(core.Bot):
                 async def batch(sub_id: str = sub_id, sub: dict = sub) -> None:
                     await self.live_note_batch(sub_id, sub)
                 self.deliver(f"live:batch:{sub_id}", batch)
+                queued = True
                 continue
             self.live_seq += 1
 
             async def send(sub: dict = sub, text: str = text) -> None:
-                await self.tell(sub["chat"], sub["thread"], text)
-            self.deliver(f"live:{self.live_seq}:{sub_id}", send)
+                ok = await self.tell(sub["chat"], sub["thread"], text)
+                for _ in range(self.LIVE_NOTE_TRIES - 1 if must else 0):  # (the sender waits out a 429's cool-down for that chat itself)
+                    if ok or self.stopping.is_set():
+                        break
+                    ok = await self.tell(sub["chat"], sub["thread"], text)
+                if must:
+                    told.append(ok)
+                    if len(told) == len(targets):  # every chat's sends have ended
+                        undo = self.__dict__.setdefault("live_note_undo", {}).pop((key, stamp), None)
+                        if not any(told):  # no chat has it: its clock given back — the next round says it, not an hour on
+                            if self.live_noted.get(key) == stamp:
+                                self.live_noted.pop(key, None)
+                            if undo is not None:
+                                undo()
+            queued = self.deliver(f"live:{self.live_seq}:{sub_id}", send) or queued
+        if key and not queued and self.live_noted.get(key) == stamp:
+            self.live_noted.pop(key, None)
+        return queued
+
+    def live_note_given_back(self, key: str, undo: Any) -> None:
+        """For the must-notice (LIVE_NOTE_MUST) just given to the chats under ``key`` (live_notify said True): ``undo`` runs when no
+        chat took it — whatever its caller wrote down for it (its own clock) given back with the notice's (1.150.0, RDM-NOTIFY-GATES).
+        Run once at most; dropped once a chat took it."""
+        stamp = self.live_noted.get(key)
+        if stamp is not None:
+            self.__dict__.setdefault("live_note_undo", {})[(key, stamp)] = undo
 
     async def live_note_batch(self, sub_id: str, sub: dict) -> None:
         """live_notify's batch delivery for one chat: send the buffered notices as one message, and again for those

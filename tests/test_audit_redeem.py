@@ -1979,4 +1979,80 @@ async def check_verdict():
 asyncio.run(check_verdict())
 
 
+# --- RDM-NOTIFY-GATES -----------------------------------------------------------------------------------------------------------
+SUB7 = {"7:0": {"chat": 7, "thread": 0, "active": True}}
+
+
+async def told_bot(subs, chain=None, low=False, **env):
+    """A ready bot with Telegram (a Chat) and the subscriptions ``subs``, one winner on market 500 — and the signer's BNB under
+    the floor when ``low``."""
+    bot = await ready_bot(**{"ADMIN_USER_ID": str(ADMIN), **env})
+    if chain is not None:
+        bot.live.chain = chain
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["500"] = [held(500)], mk(500, won=1)
+    bot.live.chain.bnb = 10 ** 13 if low else 10 ** 17
+    await bot.live.refresh_balance()
+    bot.telegram = Chat()
+    bot.store.put("subscriptions", subs)
+    return bot
+
+
+async def told_round(bot, at, start="⛽"):
+    """One redeem round and its deliveries: the chats a notice starting with ``start`` reached, in order."""
+    await bot.live_redeem(at)
+    await bot.drain_deliveries()
+    return [chat for chat, _, text in bot.telegram.sent if text.startswith(start)]
+
+
+async def notify_gates():
+    """RDM-NOTIFY-GATES: the ⛽ no-gas and ⚠️ failed-redeem notices — the only pushes saying the redeem needs the owner — vanished
+    with LIVE_NOTIFY=off (the orders' notices), after /pause, without /subscribe, or on one refused sendMessage, and their hour
+    was used up anyway. They now pass LIVE_NOTIFY, fall back to the administrator's private chat, try each send up to three
+    times, and start their clock only once a chat was given them (giving it back when none took them). The orders' notices and
+    every other keyed notice as before; at most one ⛽ an hour while delivery works."""
+    # (1) LIVE_NOTIFY=off, a chat subscribed: the ⛽ still reaches it — hourly; the orders' notices stay off
+    bot = await told_bot(SUB7, LIVE_NOTIFY="off", low=True)
+    assert await told_round(bot, NOW) == [7]  # (before: nothing, and the hour used up)
+    assert await told_round(bot, NOW + 10 * MIN) == [7], "hourly"
+    bot.live_noted["redeem:gas"] -= 3601
+    assert await told_round(bot, NOW + 61 * MIN) == [7, 7]
+    assert sum("⛽" in text for text in bot.live_errors) == 1, "the line in /live: on its own hourly clock, as before"
+    assert bot.live_notify("📤 an order") is False and bot.live_notify("🔐 signed in", key="signin") is False
+    await bot.drain_deliveries()
+    assert len(bot.telegram.sent) == 2, bot.telegram.sent
+    # (2) no chat subscribed — never, or /pause'd: the administrator's private chat
+    for subs in ({}, {f"{ADMIN}:0": {"chat": ADMIN, "thread": 0, "active": False}}):
+        bot = await told_bot(subs, low=True)
+        assert await told_round(bot, NOW) == [ADMIN], subs
+    # (3) one sendMessage refused: sent again at once, the notice arrives in that round, once
+    bot = await told_bot(SUB7, low=True)
+    bot.telegram = Chat(refuse=["⛽"])
+    assert await told_round(bot, NOW) == [7] and len(bot.telegram.tried) == 2, bot.telegram.tried
+    # (4) no chat took it (three sends refused): the clock given back — the next round says it, not an hour on
+    bot = await told_bot(SUB7, low=True)
+    bot.telegram = Chat(down=True)
+    assert await told_round(bot, NOW) == [] and len(bot.telegram.tried) == 3 and "redeem:gas" not in bot.live_noted
+    bot.telegram.down = False
+    assert await told_round(bot, NOW + 10 * MIN) == [7]  # (before: an hour on)
+    # (5) no administrator and no chat: nothing sent and no clock — the first round after a /subscribe says it
+    bot = await told_bot({}, ADMIN_USER_ID="0", low=True)
+    assert await told_round(bot, NOW) == [] and "redeem:gas" not in bot.live_noted
+    bot.store.put("subscriptions", SUB7)
+    assert await told_round(bot, NOW + 10 * MIN) == [7]
+    # (6) the ⚠️ failed redeem: LIVE_NOTIFY=off, no chat — the administrator; a round no chat took is told by the next failing one
+    bot = await told_bot({}, chain=Picky({cond(500): ("unsent", "RPC 错误：execution reverted")}), LIVE_NOTIFY="off")
+    bot.telegram = Chat(down=True)
+    assert await told_round(bot, NOW, "⚠️") == [] and len(bot.telegram.tried) == 3
+    bot.telegram.down = False
+    bot.live_redeem_failed.clear()  # (its five minutes over)
+    assert await told_round(bot, NOW + 6 * MIN, "⚠️ 自动领取：1 个已结算的持仓没领成") == [ADMIN]  # (before: nothing — and an hour on)
+    bot.live_redeem_failed.clear()
+    assert await told_round(bot, NOW + 12 * MIN, "⚠️") == [ADMIN], "hourly: still the one notice"
+    print("RDM_NOTIFY_GATES_OK")
+
+
+asyncio.run(notify_gates())
+
+
 print("AUDIT_REDEEM_OK")
