@@ -2054,6 +2054,16 @@ def parse_quote_close(source: str, market: str, raw: bytes, info: StockMarketInf
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
     final_from = dt.datetime.combine(local.date(), CALENDAR.close_time_for(info, local.date()), tz) + dt.timedelta(minutes=15)
     if quoted.date() < local.date() or (quoted.date() == local.date() and local >= final_from):
+        # A "final" quote must itself be stamped at the closing auction. A record stuck on an earlier print
+        # (feed lag, a source serving a cached snapshot) is otherwise taken as the dated close and settles the daily
+        # cards (outcome:<sym>:<day>, /calib, the LIVE daily-loss tally). Same 5-minute tolerance as note_live_close.
+        # Raise rather than return day=None: fetch then asks the next source (Sina after Tencent) and, if none has a
+        # real close, the caller keeps the last good close; day=None would stop the search and swap in the previous
+        # close as a baseline. A stock halted for the rest of the day therefore waits for the dated daily bar.
+        # `quoted` is naive exchange-local time (both feeds stamp local time), so compare with a naive close time.
+        close_at = dt.datetime.combine(quoted.date(), CALENDAR.close_time_for(info, quoted.date()))
+        if quoted < close_at - dt.timedelta(minutes=5):
+            raise ValueError(f"{source}最后一笔 {quoted:%m-%d %H:%M} 早于收盘竞价，不能当作收盘价")
         return quoted.date(), number(current, "收盘价"), number(previous, "昨收价")
     return None, number(previous, "昨收价"), None
 
@@ -16360,7 +16370,10 @@ class Bot:
             if self.window_settle_row(row, float(final), float(getattr(mkt, "TIE", IndexUpDownMarket.TIE))):
                 self.store.put(key, row)
         self.sigma_calib_cache.pop(spec.key, None)  # the card's factor is measured again on the next refresh (sigma_calib)
-        self.sigma_calib_cache.pop(CRYPTO_DAY_CALIB, None)
+        if kind == "day":
+            # 1.150.0: the daily cards' pool counts kind == "day" samples alone, so only a daily market settling can move it; every
+            # 15-minute and 5-minute window used to drop it too (one more full pass over the samples at each quarter hour and 5-minute mark)
+            self.sigma_calib_cache.pop(CRYPTO_DAY_CALIB, None)
 
     SIGMA_CALIB_PRIOR = 10     # sigma_calib: windows' worth of "σ is right" the measured ones are averaged with (20 before 1.121.0)
     SIGMA_CALIB_RANGE = (0.5, 2.0)  # ...and the factor's bounds (0.7–1.4 before 1.121.0: SK 海力士's windows moved 0.69 of the σ√τ
@@ -16372,27 +16385,41 @@ class Bot:
         (SIGMA_MODEL), the move from the line over the raw σ√τ priced then — pooled with SIGMA_CALIB_PRIOR windows at 1
         and kept within SIGMA_CALIB_RANGE. A 15-minute card's by its key; the daily crypto cards' together under
         CRYPTO_DAY_CALIB (1.106.1: a window a day each, the three moving on the same days). 1 with no such window yet.
-        Cached until a window settles (window_resolve)."""
+        Cached until a window settles (window_resolve).
+
+        1.150.0: a miss measures every key at once, in one pass over the samples (window_rows: every card's rows parsed and
+        sorted, the ones whose market ended while the bot was down settled). It used to make that pass for the one key asked
+        for, and refresh_updown asks for each card's: at every quarter hour twenty-odd windows settle together, so the
+        refresh right after made twenty-odd full passes back to back on the event loop (seconds with a few days of samples,
+        over half a minute at two weeks, more at WSAMPLE_KEEP_DAYS) while the new windows opened. Each key's factor is the
+        same as one measured on its own: the same rows, the same order, the same arithmetic."""
         cached = self.sigma_calib_cache.get(key)
         if cached is not None:
             return cached
-        firsts: dict[str, dict] = {}
-        # the current estimator's samples alone: the daily cards' (UpDownMarket), or this card's own (1.121.0: the 15-minute
-        # cards moved to the shape of the day, version 3; the daily cards stayed at 2)
-        current = UpDownMarket.SIGMA_MODEL if key == CRYPTO_DAY_CALIB else getattr(self.updowns.get(key), "SIGMA_MODEL", IndexUpDownMarket.SIGMA_MODEL)
+        firsts: dict[str, dict[str, dict]] = {}  # calibration key -> slug -> the market's earliest sample counted
+        current: dict[str, int] = {}  # calibration key -> the estimator version its samples must have
         for r in self.window_rows():
-            mine = r.get("kind") == "day" if key == CRYPTO_DAY_CALIB else (r.get("key") == key and r.get("kind") == "window")
-            if (not mine or r.get("move") is None or int(r.get("model") or 1) < current
-                    or not r.get("sigma_raw") or not r.get("tau")):
+            kind, card = r.get("kind"), r.get("key")
+            # the daily cards' samples pooled; a 15-minute (or 5-minute) card's by its own key — a row without one, or under the pool's
+            # own name, counts for no key (as when each key picked its rows: the pool took kind == "day", a card its key's windows)
+            calib =CRYPTO_DAY_CALIB if kind == "day" else card if kind == "window" and isinstance(card, str) and card != CRYPTO_DAY_CALIB else None
+            if calib is None:
                 continue
-            slug = str(r.get("slug"))
-            if slug not in firsts or int(r.get("left") or 0) > int(firsts[slug].get("left") or 0):
-                firsts[slug] = r
-        zs = [z for z in (sample_z(r, raw=True) for r in firsts.values()) if z is not None]
-        n = len(zs)
-        factor = math.sqrt((sum(z * z for z in zs) + self.SIGMA_CALIB_PRIOR) / (n + self.SIGMA_CALIB_PRIOR)) if n else 1.0
+            if calib not in current:
+                # the current estimator's samples alone: the daily cards' (UpDownMarket), or the card's own (1.121.0: the 15-minute
+                # cards moved to the shape of the day, version 3; the daily cards stayed at 2)
+                current[calib] = UpDownMarket.SIGMA_MODEL if calib == CRYPTO_DAY_CALIB else getattr(self.updowns.get(calib), "SIGMA_MODEL", IndexUpDownMarket.SIGMA_MODEL)
+            if r.get("move") is None or int(r.get("model") or 1) < current[calib] or not r.get("sigma_raw") or not r.get("tau"):
+                continue
+            mine, slug = firsts.setdefault(calib, {}), str(r.get("slug"))
+            if slug not in mine or int(r.get("left") or 0) > int(mine[slug].get("left") or 0):
+                mine[slug] = r
         low, high = self.SIGMA_CALIB_RANGE
-        self.sigma_calib_cache[key] = (min(max(factor, low), high), n)
+        for calib in {key, CRYPTO_DAY_CALIB, *self.updowns, *firsts}:  # a key without a counted window: 1
+            zs = [z for z in (sample_z(r, raw=True) for r in firsts.get(calib, {}).values()) if z is not None]
+            n = len(zs)
+            factor = math.sqrt((sum(z * z for z in zs) + self.SIGMA_CALIB_PRIOR) / (n + self.SIGMA_CALIB_PRIOR)) if n else 1.0
+            self.sigma_calib_cache[calib] = (min(max(factor, low), high), n)
         return self.sigma_calib_cache[key]
 
     def window_rows(self) -> list[dict]:
@@ -16514,7 +16541,10 @@ class Bot:
                              r.get("left", ""), num(r.get("up")), num(r.get("mkt")), num(r.get("bid")), num(r.get("ask")), num(r.get("book_age")),
                              num(r.get("sigma")), num(r.get("tau")), num(st) if st else "", num(r.get("z")), num(r.get("price")), num(r.get("line")),
                              num(r.get("need")), r.get("hold", ""), r.get("note", ""), num(r.get("result")), num(r.get("final")), num(r.get("move")),
-                             num(r["move"] / st) if r.get("move") is not None and st > 0 else "",
+                             # realized_z is the residual /calib's 波动 lines and SIGMA_CALIB use (sample_z: the end
+                             # over the price at the sample, over the σ√τ of the sigma_sqrt_tau column) — the move from the
+                             # line over the σ√τ left overstated it by √(window / τ) and invited raising a σ that was right
+                             num(z) if r.get("move") is not None and (z := sample_z(r)) is not None else "",
                              num(r.get("up_index")), num(r.get("up_lead")), num(r.get("lead_gap")),
                              "" if r.get("lead_used") is None else int(bool(r.get("lead_used")))])
         return out.getvalue()
@@ -16871,6 +16901,11 @@ class Bot:
                 close, source = q.spot, f"{q.spot_source or q.source} 实时（日K未出）"
             if close is not None:
                 self.note_outcome("HSI", local.date().isoformat(), close, source)
+        # 1.150.0: the stock cards' closes too. sim_note_closes ran only inside sim_step, which is scheduled only with SIM
+        # and PREDICT both on, so with the paper trader off the stock snapshots saved above were never scored by /calib
+        # (no outcome:{SYMBOL}:{day} ever written). Harmless when the trader is on as well: note_outcome writes only a
+        # changed value, and a stock outcome never moves the index σ factors (index_sigma_calibs keeps the indices alone).
+        self.sim_note_closes()
 
     PRED_FIELDS = frozenset({"key", "t", "target", "mode", "ref", "up", "move", "R", "beta", "sigma"})
 
@@ -16892,9 +16927,13 @@ class Bot:
     def index_sigma_calibs(self) -> dict[tuple[str, str], tuple[float, int]]:
         """The σ factor of each index card and mode (盘中 / 盘后) from its scored snapshots (residual_factor), for
         VolBook.get (SIGMA_CALIB, 1.106.1): measured when an outcome comes in (note_outcome) and at the start."""
-        saved = [v for _, v in self.store.items("pred:") if isinstance(v, dict) and self.PRED_FIELDS <= v.keys()
-                 and v.get("key") in PREDICT_KEYS.values()]  # the index cards alone: a stock card's snapshots are scored, not applied (1.120.1)
-        outcomes = {k.removeprefix("outcome:"): float(v) for k, v in self.store.items("outcome:")}
+        # the index cards alone: a stock card's snapshots are scored, not applied (1.120.1). 1.150.0: read by each index's own
+        # prefix (pred:{key}:, outcome:{key}:, as proxy_beta does) rather than every card's snapshots, kept PRED_KEEP_DAYS, parsed
+        # on the event loop at each outcome only to be dropped here; the same records in the same order, so the same factors
+        indices = sorted(set(PREDICT_KEYS.values()))
+        saved = [v for key in indices for _, v in self.store.items(f"pred:{key}:") if isinstance(v, dict) and self.PRED_FIELDS <= v.keys()
+                 and v.get("key") in PREDICT_KEYS.values()]
+        outcomes = {k.removeprefix("outcome:"): float(v) for key in indices for k, v in self.store.items(f"outcome:{key}:")}
         groups: dict[tuple[str, str], list[dict]] = {}
         for p in saved:
             close = outcomes.get(f"{p['key']}:{p['target']}")
