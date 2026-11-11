@@ -951,6 +951,16 @@ class TxNotSent(core.RemoteError):
     revert in simulation — a market Predict shows resolved before the chain does). Nothing spent: tried again soon."""
 
 
+class TxPending(core.RemoteError):
+    """A transaction that was sent but whose receipt did not come within the wait (Chain.wait): it may still be mined —
+    never a reason to send it again soon (1.150.0, audit RDM-ROUND-LOCK-STALL: a redeem round stops sending after one).
+    Its text is the wait's own; ``tx_hash`` the transaction's."""
+
+    def __init__(self, message: str, tx_hash: str = ""):
+        super().__init__(message)
+        self.tx_hash = tx_hash
+
+
 class RedeemUnread(core.RemoteError):
     """A redeem round could not read the account's positions (the key's rate-limit cooldown, a 429, a 5xx, a timeout):
     no position was judged and nothing was sent — the one failure of a round after which looking again soon is safe
@@ -1049,7 +1059,7 @@ class Chain:
                     raise core.RemoteError(f"交易失败（已回滚）：{tx_hash}")
                 return receipt
             await asyncio.sleep(3)
-        raise core.RemoteError(f"交易 {tx_hash} 在 {int(timeout)} 秒内未上链")
+        raise TxPending(f"交易 {tx_hash} 在 {int(timeout)} 秒内未上链", tx_hash)  # (a RemoteError: every caller's except as before)
 
     def approval_steps(self, yield_bearing: bool) -> list[tuple[str, str, str]]:
         """(label, kind, spender) for one market track, as the SDK's setApprovals sets them."""
@@ -1427,6 +1437,7 @@ class LiveBot(core.Bot):
     LIVE_REDEEM_STUCK_SECONDS = 1800  # no round has looked at the positions for this long: told on Telegram (key redeem:read), not only in /live
     LIVE_REDEEM_NOTE_SECONDS = 3600  # a failed redeem reaches Telegram at most this often
     REDEEM_REPORT_LINES = 6          # /live redeem check: the positions listed per kind (the rest counted)
+    REDEEM_CHECK_WAIT_SECONDS = 60   # /live redeem check waits this long at most for a round that holds the redeem lock, then answers without its dry run (1.150.0)
     LIVE_REDEEM_MIN_BNB_WEI = 5 * 10 ** 14  # under 0.0005 BNB no redeem goes out (one costs about 0.0002): one note, not a failure per position
     LIVE_NOTE_SECONDS = 600     # the same failure is announced at most this often
     LIVE_PLACING_GRACE_MS = 120_000  # a record left in "placing" is reconciled by its hash after this long
@@ -1481,6 +1492,7 @@ class LiveBot(core.Bot):
         self.live_redeem_stuck_noted = -1e9                  # ...and when no such look for LIVE_REDEEM_STUCK_SECONDS was last told (hourly at most)
         self.live_redeem_loop_task: asyncio.Task | None = None
         self.live_gas_noted = -1e9
+        self.live_redeem_since = 0        # when the redeem pass holding the lock began (bot clock, ms; 0: none) — /live and the check (1.150.0)
         self.live_redeem_cut = 0          # the last redeem pass's own positions read: 0 = whole, else the rows it read of a longer list (1.150.0)
         self.live_cut_noted = -1e9        # ...and when such a cut list was last told on Telegram (an hour apart, as the gas)
         self.live_step_ms: dict[str, int] = {}  # the last step's phases (预取 / 决策 / 下单 / 同步), for /diag
@@ -4188,7 +4200,11 @@ class LiveBot(core.Bot):
         winner behind them was never reached), and a rate limit ends the round. One round at a time: the command and
         the automatic round never redeem one position twice."""
         async with self.redeem_lock():
-            done, _ = await self.live_redeem_pass(now_ms)
+            self.live_redeem_since = self.market.now_ms()  # 1.150.0 (RDM-ROUND-LOCK-STALL): /live and the check say since when a pass holds the lock
+            try:
+                done, _ = await self.live_redeem_pass(now_ms)
+            finally:
+                self.live_redeem_since = 0
             return done
 
     async def live_redeem_pass(self, now_ms: int, dry_run: bool = False) -> tuple[list[str], list[dict]]:
@@ -4255,6 +4271,12 @@ class LiveBot(core.Bot):
         # rotation; a real round that reads it drops the name (one read ahead per win, never a standing priority). Kept while its
         # redeem never left and that retry is pulled (LIVE_REDEEM_UNSENT_PULLS): the retry at the wait's end reads it first too.
         first = self.__dict__.setdefault("live_redeem_first", {})
+        # 1.150.0 (audit RDM-ROUND-LOCK-STALL): the winners are redeemed one after another, each waiting up to 120 s for its receipt
+        # under the redeem lock — with a node that takes the transactions and mines none (a stuck nonce, an underpriced gas price)
+        # a round of N winners held the lock N × two minutes and sent N transactions into the same stuck queue. After one receipt
+        # that did not come in time (TxPending) this round sends nothing more: the rest stay 可领取 — no back-off, no mark — for
+        # the next round; the pending one keeps its hour (it may yet be mined: a second redeem would pay nothing).
+        held = ""
         market_of = lambda r: str((r.get("market") if isinstance(r.get("market"), dict) else {}).get("id") or r.get("marketId") or "")
         for row in sorted(rows, key=lambda r: (market_of(r) not in first, read_round.get(market_of(r), 0), -self.position_time(r))):
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
@@ -4318,7 +4340,7 @@ class LiveBot(core.Bot):
             if not info.condition_id:
                 seen.append({**entry, "kind": "fields", "error": "市场没写 conditionId，领取交易填不出来"})
                 continue
-            if dry_run or low_gas:
+            if dry_run or low_gas or held:
                 seen.append({**entry, "kind": "claimable"})
                 continue
             try:
@@ -4329,6 +4351,8 @@ class LiveBot(core.Bot):
                 text = core.clean_error(error) or type(error).__name__
                 self.live_redeem_failed[key] = time.monotonic() - self.LIVE_REDEEM_RETRY_SECONDS + wait
                 errors[key] = text
+                if isinstance(error, TxPending):
+                    held = text  # (RDM-ROUND-LOCK-STALL) sent, no receipt in time: nothing more sent this round
                 pulled = False
                 if unsent:
                     pulled = (runs := unsent_runs.get(key, 0) + 1) <= self.LIVE_REDEEM_UNSENT_PULLS
@@ -4384,7 +4408,7 @@ class LiveBot(core.Bot):
         counts: dict[str, int] = {}
         for s in seen:
             counts[s["kind"]] = counts.get(s["kind"], 0) + 1
-        self.live_redeem_last = {"at": now_ms, "counts": counts, "low_gas": low_gas, "error": "", "cut": cut, "limited": limited}
+        self.live_redeem_last = {"at": now_ms, "counts": counts, "low_gas": low_gas, "error": "", "cut": cut, "limited": limited, "held": held}
         if not limited:
             self.live_redeem_whole_at = time.monotonic()  # (RDM-ROUND-VOID) a look no rate limit cut short: live_redeem_again's notice waits again
         return done, seen
@@ -4401,6 +4425,7 @@ class LiveBot(core.Bot):
         cut = int(last.get("cut") or 0)  # 1.150.0 (RDM-POSITIONS-CUT): the counts are of the part read — said, so 输掉的 N reads for what it is
         return (f"持仓 {sum(counts.values())} 个" + (f"：{text}" if text else "")
                 + ("；签名钱包 BNB 不足，领取交易发不出去" if last.get("low_gas") and counts.get("claimable") else "")
+                + ("；一笔领取交易没在时限内上链，这一轮其余的先不发" if last.get("held") and counts.get("claimable") else "")  # (RDM-ROUND-LOCK-STALL)
                 + (f"；⚠️ 持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查" if cut else ""))
 
     def live_redeem_status_line(self) -> str:
@@ -4410,7 +4435,10 @@ class LiveBot(core.Bot):
         last = getattr(self, "live_redeem_last", {}) or {}
         task = getattr(self, "live_redeem_task", None)
         when = f"上一轮 {max(0, int((self.market.now_ms() - int(last['at'])) / 60_000))} 分钟前：{self.live_redeem_summary(last)}" if last.get("at") else "本次启动后还没跑过"
-        return f"自动领取：开｜{when}" + ("｜正在领取" if task is not None and not task.done() else "") + "｜/live redeem check 查原因"
+        since = int(getattr(self, "live_redeem_since", 0) or 0)  # 1.150.0 (RDM-ROUND-LOCK-STALL): a long round is told from a fresh one
+        running = (f"｜正在领取（{core.stamp(since, seconds=False)} 起）" if since
+                   else "｜正在领取" if task is not None and not task.done() else "")
+        return f"自动领取：开｜{when}" + running + "｜/live redeem check 查原因"
 
     async def live_redeem_report(self, now_ms: int) -> str:
         """/live redeem check, read-only (nothing sent, written or announced): the switches, the signing wallet's gas,
@@ -4436,7 +4464,25 @@ class LiveBot(core.Bot):
         if not ready:
             lines.append("结论：真实交易未就绪，读不了持仓，也领不了：" + self.live.not_ready_why)
             return "\n".join(lines)
-        async with self.redeem_lock():
+        # 1.150.0 (audit RDM-ROUND-LOCK-STALL): the dry run waited for the redeem lock with no bound, so while a round redeemed —
+        # each winner up to 120 s for its receipt — the check answered only when that round ended: half an hour and more with a
+        # node that mines nothing, exactly when the owner needs it. It waits REDEEM_CHECK_WAIT_SECONDS at most (a healthy round
+        # of a dozen winners ends within a minute or so), then answers with what it has, without the dry run. Never beside the
+        # round: a second burst of reads on the key the orders share, and positions that round is redeeming called 可领取.
+        lock = self.redeem_lock()
+        deadline = time.monotonic() + self.REDEEM_CHECK_WAIT_SECONDS
+        while lock.locked() and time.monotonic() < deadline:
+            await asyncio.sleep(1)
+        if lock.locked():  # (no await between this test and the acquire below)
+            since = int(getattr(self, "live_redeem_since", 0) or 0)
+            started = f"（{core.stamp(since, seconds=False)} 起，已 {max(0, int((self.market.now_ms() - since) / 60_000))} 分钟）" if since else ""
+            lines.append(f"结论：有一轮领取正在进行{started}：它把领取交易逐个发出、每个等上链（最多 120 秒）后才结束；"
+                         "这次没有逐个查看持仓，等 /live 不再显示“正在领取”再发 /live redeem check")
+            recent = [e for e in self.live_errors if "领取" in e or "⛽" in e][-3:]
+            if recent:
+                lines.append("最近的领取问题：\n" + "\n".join("  " + e for e in recent))
+            return "\n".join(lines)
+        async with lock:
             _, seen = await self.live_redeem_pass(now_ms, dry_run=True)
             cut = int(getattr(self, "live_redeem_cut", 0) or 0)  # this dry run's own read (1.150.0): set by the pass, under the same lock
         n = lambda kind: sum(1 for s in seen if s["kind"] == kind)

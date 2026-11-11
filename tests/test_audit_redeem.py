@@ -414,4 +414,98 @@ async def soon_names_the_market():
 asyncio.run(soon_names_the_market())
 
 
+# --- RDM-ROUND-LOCK-STALL -------------------------------------------------------------------------------------------------------
+class Node(L.Chain):
+    """The REAL Chain (send, wait, redeem; the real signing with the SDK's test key) over a scripted JSON-RPC node that takes
+    every transaction; ``mines`` False: it mines none. A node that mines answers the first receipt poll; one that does not is
+    given no time at all (the real wait would poll 120 s)."""
+    def __init__(self, wallet, mines=False):
+        super().__init__("https://rpc.invalid", wallet)
+        self.mines, self.sent = mines, []
+
+    async def rpc(self, method, params):
+        if method == "eth_sendRawTransaction":
+            self.sent.append(params[0])
+            return "0x" + f"{len(self.sent):064x}"
+        if method == "eth_getTransactionReceipt":
+            return {"blockNumber": "0x10", "status": "0x1"} if self.mines else None
+        return {"eth_getTransactionCount": "0x1", "eth_gasPrice": "0x3b9aca00", "eth_estimateGas": "0x5208", "eth_getBalance": hex(10 ** 17),
+                "eth_call": "0x" + "0" * 63 + "1"}[method]
+
+    async def wait(self, tx_hash, timeout=120.0):
+        return await super().wait(tx_hash, timeout=5 if self.mines else 0)
+
+
+async def round_lock_stall():
+    """RDM-ROUND-LOCK-STALL: a round holds the redeem lock for its whole pass, each winner waiting up to 120 s for its receipt —
+    with a node that takes the transactions and mines none, N × two minutes. /live redeem check waited for that lock with no bound
+    and said nothing until the round ended, and /live showed 正在领取 with no start. The check now waits a minute at most and then
+    answers without its dry run (never beside the round), /live says since when; and after one receipt that did not come in time
+    the round sends nothing more — the rest stay 可领取 for the next round, the pending one keeps its hour."""
+    # F1: the check while a round holds the lock (its one redeem waiting for a receipt)
+    bot = await ready_bot()
+    fake, chain = bot.live.api, bot.live.chain
+    fake.positions_rows, fake.markets["500"] = [held(500)], mk(500, won=1)
+    receipt, plain = asyncio.Event(), chain.redeem
+
+    async def slow(*args):
+        await receipt.wait()
+        return await plain(*args)
+    chain.redeem = slow
+    bot.live_last_redeem = -1e9
+    bot.live_redeem_tick()
+    while not bot.redeem_lock().locked():
+        await asyncio.sleep(0)
+    bot.REDEEM_CHECK_WAIT_SECONDS = 0
+    report = await asyncio.wait_for(bot.live_redeem_report(NOW + MIN), 2)  # (before: no answer until the round ended)
+    assert "结论：有一轮领取正在进行（10-05 10:00 起，已 0 分钟）" in report and "持仓 1 个" not in report, report
+    assert "｜正在领取（10-05 10:00 起）｜" in bot.live_redeem_status_line(), bot.live_redeem_status_line()
+    assert "｜正在领取（10-05 10:00 起）" in report and "签名钱包" in report, report  # what it has: the switches, the status, the gas
+    # ...a round that ends within the wait: the full report, as before
+    bot.REDEEM_CHECK_WAIT_SECONDS = 5
+    later = asyncio.create_task(bot.live_redeem_report(NOW + MIN))
+    await asyncio.sleep(0.2)
+    receipt.set()
+    report = await asyncio.wait_for(later, 4)
+    await bot.live_redeem_task
+    assert "持仓 1 个：已领仍列着 1" in report and "正在进行" not in report, report
+    assert [cid for cid, *_ in chain.redeemed] == [cond(500)] and bot.live_redeem_since == 0, "redeemed once"
+    assert "正在领取" not in bot.live_redeem_status_line(), bot.live_redeem_status_line()
+    # F2: a node that takes every transaction and mines none — one transaction, the rest left 可领取 for the next round
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows = [held(mid) for mid in (501, 502, 503)]
+    fake.markets.update({str(mid): mk(mid, won=1) for mid in (501, 502, 503)})
+    node = bot.live.chain = Node(bot.live.wallet)
+    try:
+        await node.wait("0xabc")
+        assert False, "no receipt"
+    except L.TxPending as error:
+        assert str(error) == "交易 0xabc 在 0 秒内未上链" and error.tx_hash == "0xabc" and isinstance(error, m.RemoteError)
+    sent = notices(bot)
+    assert await bot.live_redeem(NOW) == []
+    assert len(node.sent) == 1, ("one transaction into a node that confirms none", len(node.sent))
+    assert bot.live_redeem_last["counts"] == {"failed": 1, "claimable": 2}, bot.live_redeem_last
+    assert list(bot.live_redeem_failed) == ["live:redeemed:501:1"], bot.live_redeem_failed
+    assert bot.LIVE_REDEEM_RETRY_SECONDS - 5 < bot.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - bot.live_redeem_failed["live:redeemed:501:1"]), "its hour"
+    assert not any(bot.store.get(f"live:redeemed:{mid}:1") for mid in (501, 502, 503)), "no mark"
+    assert "这一轮其余的先不发" in bot.live_redeem_summary(bot.live_redeem_last) and [k for k, _ in sent] == ["redeem:fail"], (bot.live_redeem_last, sent)
+    assert "一小时后自动再试" in sent[0][1] and "在 0 秒内未上链" in sent[0][1], sent
+    # ...the node mining again: the next round sends the other two (the pending one waits its hour)
+    node.mines = True
+    done = await bot.live_redeem(NOW + 10 * MIN)
+    assert len(done) == 2 and len(node.sent) == 3 and bot.live_redeem_last["counts"] == {"redeemed": 2, "waiting": 1}, (done, bot.live_redeem_last)
+    # control: a node that mines — every winner, one transaction each, as before
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows = [held(mid) for mid in (501, 502, 503)]
+    fake.markets.update({str(mid): mk(mid, won=1) for mid in (501, 502, 503)})
+    node = bot.live.chain = Node(bot.live.wallet, mines=True)
+    assert len(await bot.live_redeem(NOW)) == 3 and len(node.sent) == 3 and all(bot.store.get(f"live:redeemed:{mid}:1") for mid in (501, 502, 503))
+    print("RDM_ROUND_LOCK_STALL_OK")
+
+
+asyncio.run(round_lock_stall())
+
+
 print("AUDIT_REDEEM_OK")
