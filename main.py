@@ -1980,17 +1980,28 @@ def parse_yahoo_daily(raw: bytes) -> list[tuple[dt.date, D | None, D]]:
         stamps, closes, opens = result["timestamp"], quote["close"], quote.get("open") or []
     except (ValueError, KeyError, IndexError, TypeError):
         raise ValueError("Yahoo 日 K 返回格式异常") from None
-    bars = []
-    for i, ts in enumerate(stamps):
+    # 1.150.0: one bar per exchange-local date, keyed by date and filled in timestamp order. Yahoo sometimes returns
+    # today's live price as a second row with the same date (often with no open). Sorting the whole (date, open, close)
+    # tuples then compared the opens of the two copies: a None against a Decimal raised TypeError (the source failed
+    # for that cycle), and two numeric opens ordered the copies by open, so merge_closes could keep the older close.
+    # The later stamp now wins; when it has no open, the earlier copy's open (the session open) is kept.
+    by_day: dict[dt.date, tuple[dt.date, D | None, D]] = {}
+    try:
+        order = sorted(range(len(stamps)), key=lambda i: int(stamps[i]))
+    except (ValueError, TypeError):
+        raise ValueError("Yahoo 日 K 返回格式异常") from None
+    for i in order:
         close = closes[i] if i < len(closes) else None
         if close is None:
             continue
-        day = dt.datetime.fromtimestamp(int(ts) + offset, dt.timezone.utc).date()
-        bars.append((day, _open_price(str(opens[i])) if i < len(opens) and opens[i] is not None else None,
-                     D(str(close)).quantize(D("0.01"))))
-    if not bars:
+        day = dt.datetime.fromtimestamp(int(stamps[i]) + offset, dt.timezone.utc).date()
+        opened = _open_price(str(opens[i])) if i < len(opens) and opens[i] is not None else None
+        if opened is None and day in by_day:
+            opened = by_day[day][1]
+        by_day[day] = (day, opened, D(str(close)).quantize(D("0.01")))
+    if not by_day:
         raise ValueError("Yahoo 日 K 没有返回任何交易日")
-    return sorted(bars)
+    return sorted(by_day.values(), key=lambda bar: bar[0])
 
 
 def _open_price(text: str) -> D | None:
@@ -4056,7 +4067,7 @@ class DailyCloses:
         for rank, (kind, url) in enumerate(self.sources):
             try:
                 raw = await fetch_source(url, self.REFERERS.get(kind))
-                bars = finished_bars(sorted(self.parse(kind, self.market, raw)), self.market, now_ms)
+                bars = finished_bars(sorted(self.parse(kind, self.market, raw), key=lambda bar: bar[0]), self.market, now_ms)
                 if not bars:
                     raise ValueError("日 K 为空")
             except Exception as error:
@@ -4665,7 +4676,13 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
             a, b, k = fit
             for r in (r for r in done if r["target"] == day):
                 tested.append(r)
-                fitted.append(norm_cdf((a + b * r["move"]) / max(k * math.sqrt(max(r["R"], 1e-6)), 1e-9)))
+                # 1.149.1: the fit stands on the model's own reference (y = ln(close/ref_raw)), but the hit is judged on the
+                # reference the page showed (the Predict target price when settle_on_strike used it) — so, as in the σ
+                # walk-forward above (1.122.0), the formula must stand on that reference too:
+                # P(close > ref) = Φ((a + b·move − ln(ref/ref_raw)) / (k√R)). Without a strike ref == ref_raw and the shift is 0.
+                ref, ref_raw = float(r.get("ref") or 0), float(r.get("ref_raw") or r.get("ref") or 0)
+                shift = math.log(ref / ref_raw) if ref > 0 and ref_raw > 0 else 0.0
+                fitted.append(norm_cdf((a + b * r["move"] - shift) / max(k * math.sqrt(max(r["R"], 1e-6)), 1e-9)))
         if tested:
             old = scores([r["up"] for r in tested], [r["hit"] for r in tested])
             new = scores(fitted, [r["hit"] for r in tested])
@@ -8613,8 +8630,8 @@ class IndexUpDownMarket(UpDownMarket):
     SIGMA_MINUTES = 240          # σ: the last four hours of 1-minute index candles, the last hour weighing about half (minute_vol)
     SIGMA_MODEL = 3              # the estimator's version, kept on each sample: the calibration counts samples of the current one alone
     #                              (3: the shape of the day, 1.121.0; 2: the weighted four hours, 1.106.0)
-    SHAPE_SECONDS = 3600         # the shape of the day (vol_shape) is read this often, and at once while there is none
-    SHAPE_RETRY_SECONDS = 300    # ...and this soon after a read failed
+    SHAPE_SECONDS = 3600         # the shape of the day (vol_shape) is read this often, and at once at first (shape_ms = 0)
+    SHAPE_RETRY_SECONDS = 300    # ...and this soon after a read failed or found no shape
     SHAPE_ROWS = 1500            # 15-minute candles read for it (the futures API's most: 15 days round the clock; a stock's sessions within SHAPE_DAYS)
     TIE = D("0.0005")            # an end this close to the start (relative) is left to Predict: Chainlink's report may differ
 
@@ -8839,7 +8856,11 @@ class IndexUpDownMarket(UpDownMarket):
         """σ from the 1-minute index candles: the session's minutes alone when the windows follow one (the index stands still
         outside it: a σ over the night or the lunch break would call the open near certain); enough candles to reach the
         previous session. 1.121.0: the level they show is put on the shape of the day (read_shape, minute_vol_shaped)."""
-        if self.shape is None or now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:
+        # 1.149.x (audit MOD-SHAPE-RETRY): the stamp alone decides. "self.shape is None or" used to re-read the 1,500 15-minute
+        # candles on every σ read (each minute near a window) while there was no shape — a new listing, or a session card
+        # after a long closure — bypassing SHAPE_RETRY_SECONDS. The first read is still at once (shape_ms starts at 0),
+        # read_shape stamps shape_ms for a retry in SHAPE_RETRY_SECONDS when it finds none, and carry() passes the stamp on.
+        if now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:
             await self.read_shape(now_ms)  # the usual volatility of the window's quarter hour, which the level below is put on
         rows, keep = await self.sigma_rows()
         self.sigma, self.shape_factor = minute_vol_shaped(rows, now_ms, self.SIGMA_MINUTES, keep, shape=self.shape,
@@ -8999,7 +9020,7 @@ class SpotWindowMarket(IndexUpDownMarket):
 
     async def read_vol(self, now_ms: int) -> None:
         """σ from the pair's 1-minute candles (minute_vol), put on the shape of the day (1.121.0: read_shape, minute_vol_shaped)."""
-        if self.shape is None or now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:
+        if now_ms - self.shape_ms >= self.SHAPE_SECONDS * 1000:  # the stamp alone decides (IndexUpDownMarket.read_vol)
             await self.read_shape(now_ms)
         rows = await self.candles("1m", self.SIGMA_MINUTES + 2)
         self.sigma, self.shape_factor = minute_vol_shaped(rows, now_ms, self.SIGMA_MINUTES, shape=self.shape, at_ms=self.spec.start_ms + 60_000)
@@ -9081,9 +9102,11 @@ class FlipMarket:
     def __init__(self, store: "Store", spec: FlipSpec):
         self.store, self.spec = store, spec
         self.prices: dict[str, D] = {}
+        self.pushed: dict[str, tuple[int, float]] = {}  # coin -> (now_ms, monotonic) of its last push or allMids read
         self.priced_ms = 0
         self.sigma: float | None = None
         self.sigma_ms = 0
+        self.vol_error = ""  # the last σ read's failure, kept (and shown) until a read succeeds: reads are paced (refresh)
         self.error = ""
         self.times = {"price": -1e9, "vol": -1e9, "scan": -1e9}
 
@@ -9092,10 +9115,25 @@ class FlipMarket:
 
     def push_mid(self, coin: str, mid: D, now_ms: int) -> None:
         """One coin's mid pushed in (HyperliquidStream): the pair is priced once both coins have one, the 30-second read
-        deferred by as long."""
+        deferred by as long.
+
+        1.150.0: the pair is only as fresh as its OLDER leg. Each coin keeps its own push time, and priced_ms and the
+        read timer take the older of the two: one coin's pushes must not keep a silent leg's mid looking live (its
+        subscription refused or stalled while the shared socket stays busy with the other coin), nor defer the allMids
+        read for ever. A silent leg now ages the read timer, so allMids is re-read every PRICE_SECONDS and refreshes
+        both legs; if that read fails too, priced_ms ages past PRICE_STALE_MS and odds() holds.
+
+        The read timer only ever moves forward here: refresh() stamps it when it starts an allMids read, and a FAILED
+        read leaves the silent leg's push time old, so taking the plain minimum would wind the timer back on the very
+        next push and retry allMids on every 1-second refresh tick (a Hyperliquid 429 kept going, starving the HL
+        quotes and the KOSPI/KR200 proxy on the same info endpoint). With max() a failing read is retried once per
+        PRICE_SECONDS, as with no pushes at all; priced_ms still takes the older leg, so the stale hold is unchanged."""
         self.prices = {**self.prices, coin: mid}
-        if all(c in self.prices for c in (self.spec.coin, self.spec.other)):
-            self.priced_ms, self.times["price"] = now_ms, time.monotonic()
+        self.pushed = {**self.pushed, coin: (now_ms, time.monotonic())}
+        pair = (self.spec.coin, self.spec.other)
+        if all(c in self.prices and c in self.pushed for c in pair):
+            self.priced_ms = min(self.pushed[c][0] for c in pair)
+            self.times["price"] = max(self.times["price"], min(self.pushed[c][1] for c in pair))
 
     async def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict]:
         rows = await self.info({"type": "candleSnapshot", "req": {"coin": coin, "interval": interval,
@@ -9128,17 +9166,29 @@ class FlipMarket:
                         raise ValueError(f"Hyperliquid 没有 {coin} 的报价")
                     prices[coin] = number(mids[coin], f"{coin} 价格")
                 self.prices, self.priced_ms = prices, now_ms
+                self.pushed = {c: (now_ms, mono) for c in prices}  # both legs read just now (push_mid's per-leg times)
             except Exception as error:
                 errors.append(clean_error(error) or type(error).__name__)
-        if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
+        # 1.150.0: no "or self.sigma is None" any more: times["vol"] starts at -1e9, so the first read still happens at once,
+        # and a failed read is paced by the back-off below instead of being repeated on every refresh (once a second)
+        if mono - self.times["vol"] >= self.VOL_SECONDS:
             self.times["vol"] = mono
             try:
                 first = now_ms - 32 * 24 * HOUR_MS
                 a = await self.candles(self.spec.coin, "1h", first, now_ms)
                 b = await self.candles(self.spec.other, "1h", first, now_ms)
                 self.sigma, self.sigma_ms = ratio_vol(a, b, now_ms), now_ms
+                self.vol_error = ""
             except Exception as error:
-                errors.append(f"波动率：{clean_error(error) or type(error).__name__}")
+                # back off as RangeMarket does: a failing read (a Hyperliquid 429 or outage, or too little common history)
+                # is tried again in 1 minute while σ is unknown, in 5 while an older σ is kept, not on every 1-second tick
+                # of the reference loop. Each candleSnapshot of ~768 hourly rows costs weight on the same info endpoint the
+                # Hyperliquid quotes and the KOSPI/KR200 proxy read, so retrying every second could keep a 429 going and
+                # starve those reads. A σ missing or stale meanwhile only holds the advice (odds() checks both).
+                self.times["vol"] = mono - self.VOL_SECONDS + (60 if self.sigma is None else 300)
+                self.vol_error = f"波动率：{clean_error(error) or type(error).__name__}"
+        if self.vol_error:
+            errors.append(self.vol_error)  # still shown between the paced retries (odds() gives it as the reason it waits)
         if mono - self.times["scan"] >= self.SCAN_SECONDS:
             self.times["scan"] = mono
             try:
@@ -9723,15 +9773,22 @@ class CapMarket:
         hist["pool"] = pool
         hist.setdefault("through", start_hour)
         if start_s % 3600 and "first" not in hist:
-            # the window opens mid-hour: that hour counts only from the opening minute
+            # the window opens mid-hour: that hour counts only from the opening minute. While that hour is still running
+            # its later minutes do not exist yet: keep the high of the minutes there are and read them again on the next
+            # scan; only once the hour is over is it marked done/skipped for good. (Marking it on the first scan lost a
+            # spike later in that hour for good: that hour's hourly bar is left out on purpose, it starts before the
+            # window.) A high read from a minute that is still running was still reached, so it may be kept.
+            over = now_s >= start_hour
             try:
-                bars = [b for b in await self.ohlcv("minute", start_s - start_s % 3600 + 3600, 60) if b[0] >= start_s]
-                hist["first"] = "done" if bars else "skipped"
+                bars = [b for b in await self.ohlcv("minute", start_hour, 60) if b[0] >= start_s]
                 for bar in bars:
                     if bar[2] > hist["bar_high"]:
                         hist["bar_high"], hist["bar_at"] = bar[2], bar[0]
+                if over:
+                    hist["first"] = "done" if bars else "skipped"
             except Exception:
-                hist["first"] = "skipped"
+                if over:
+                    hist["first"] = "skipped"
         rows: list[tuple[int, float, float, float, float]] = []
         before, floor, known = end_s, int(hist["through"]), int(hist.get("bars_from") or 1 << 62)
         for _ in range(10):  # 1000 hours per page, newest first
@@ -9829,6 +9886,10 @@ class CapMarket:
         if now_ms >= self.spec.end_ms + 60_000:
             return 0.0  # the window is over: only what happened inside it counts, never today's market cap
         if cap is None or self.sigma is None or self.input_problem(now_ms):
+            return None
+        if now_ms < self.spec.start_ms:
+            # audit MOD-PREWINDOW: before the window opens nothing counts yet and the touch model from today's cap (kinked
+            # at the target, the days before the start ignored) overprices every target near it: unpriced until it opens.
             return None
         years = max(0.0, (self.spec.end_ms - max(now_ms, self.spec.start_ms)) / YEAR_MS)
         return hit_probability(float(cap), float(target), self.sigma, years)
@@ -10016,7 +10077,11 @@ def price_level(title: str) -> D | None:
     """The price a ladder market's title names: '↑ 130,000' / '$4.5K' / '↓ $100k' / 'Will Solana reach $250?' -> the
     number; a year next to a month name is not a price. None when there is none."""
     text = re.sub(r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?:\d{1,2},?\s+)?20\d\d\b", " ", str(title))
-    text = re.sub(r"\b20\d\d\b(?![,.]?\d)", " ", text) if re.search(r"[$↑↓▲▼]|\d\s*[kK]\b", text) else text
+    # audit MOD-PRICE-LEVEL-20XX: '↑ 2050' / '↓ 2000' / '$2050' is a level, not a year: a 20xx right after an
+    # arrow or $ (with at most one space between) is the price and is kept; a bare year elsewhere ('in 2026', 'before
+    # 2027') is still removed. Removing it too made such a level vanish from the ladder without a word (no row, no trade).
+    # Python lookbehinds are fixed-width, hence one for "marker+digits" and one for "marker, space, digits".
+    text = re.sub(r"(?<![$↑↓▲▼])(?<![$↑↓▲▼]\s)\b20\d\d\b(?![,.]?\d)", " ", text) if re.search(r"[$↑↓▲▼]|\d\s*[kK]\b", text) else text
     found = [(m.group(1), m.group(2), m.start()) for m in re.finditer(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*([kKmM]?)(?![\w.])", text)]
     if not found:
         return None
@@ -10130,7 +10195,12 @@ def book_disputes(book: "PredictBook | None") -> bool:
     with no quotes at all (often a market already settled) disputes nothing."""
     if book is None or not (book.bids or book.asks):
         return False
-    return max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0) < 0.9
+    # 1.150.0: judged on the best bid. A thin book bid 20¢ / offered 95¢ used to "agree" through its far ask, so a
+    # level our data alone calls reached (e.g. a ZEC level listed after the category's window low was printed) showed
+    # ✓ 已触及 and settled a paper Yes as a win. The bid is what someone will actually pay for Yes, so it alone says
+    # whether the market believes the touch; only a book with no bid at all is judged by its ask. Disputing more only
+    # holds a level as "请核实" and waits for Predict's own result: it never trades more.
+    return float((book.bids or book.asks)[0][0]) < 0.9
 
 
 def book_decided(book: "PredictBook | None") -> str:
@@ -10178,6 +10248,9 @@ class RangeMarket:
         self.sigma_ms = 0
         self.running: dict = {}           # the running hour's candle (in the window): {"open", "high", "low"}
         self.scanned_ms = 0               # when the extremes were last read up to now
+        # audit MOD-RANGE-WICK: hour open ms -> [highest, lowest] trade pushed in that hour (in the window). In memory only:
+        # after a restart the next scan's running candle covers the hour.
+        self.pushed: dict[int, list[float]] = {}
         self.error = ""
         self.failures = {"price": "", "vol": "", "scan": ""}  # each part's last failure, kept until that part succeeds
         self.times = {"price": -1e9, "vol": -1e9, "scan": -1e9}
@@ -10189,6 +10262,16 @@ class RangeMarket:
         """A trade pushed in (BinanceStream): the price as the 30-second read would set it, that read deferred by as long."""
         self.price, self.priced_ms, self.times["price"] = price, now_ms, time.monotonic()
         self.failures["price"] = ""
+        # audit MOD-RANGE-WICK: a trade pushed through a level is a touch (Predict's book shows it decided at once), but
+        # marks() only took the latest price, so the next push back under the level un-reached it until the next scan's
+        # running-hour candle (up to SCAN_SECONDS) — a decided level priced as open, its No side looking cheap. Keep the
+        # extremes of the pushed trades per hour until the persisted hours (history "through") cover that hour.
+        if self.start_ms and self.start_ms <= now_ms < self.window_end:  # a window not known yet records nothing
+            hour, p = now_ms - now_ms % 3_600_000, float(price)
+            seen = self.pushed.get(hour)
+            self.pushed[hour] = [max(seen[0], p), min(seen[1], p)] if seen else [p, p]
+            through = int(self.history.get("through") or 0)
+            self.pushed = {h: x for h, x in self.pushed.items() if h + 3_600_000 > through}
 
     @property
     def window_end(self) -> int:
@@ -10353,7 +10436,14 @@ class RangeMarket:
                 break
         if now_ms >= end and not running:
             hist["through"] = max(int(hist["through"]), end)  # hours without a candle had no trades
-        self.running, self.scanned_ms = running, now_ms
+        self.running = running
+        # audit MOD-RANGE-SCAN-EMPTY: count the scan as "read up to now" (advice_problem) only when the record really
+        # reaches the last hour (or the window's end). An empty or short hourly answer that does not raise (a proxy in
+        # BINANCE_BASE_URL, maintenance) leaves "through" hours behind with the running hour unknown; stamping it fresh
+        # let advice through while a level touched in those unread hours was still priced as open. Every normal scan
+        # passes: the running candle's hour, the current minute (opening hour), this hour's start, or the window's end.
+        if int(hist["through"]) >= min(now_ms, end) - 3_600_000:
+            self.scanned_ms = now_ms
         self.store.put(f"range:{self.spec.slug}", hist)
 
     def marks(self) -> dict:
@@ -10367,6 +10457,10 @@ class RangeMarket:
             hour = self.priced_ms - self.priced_ms % 3_600_000
             highs.append((float(self.price), hour))
             lows.append((float(self.price), hour))
+        for hour, (top, bottom) in self.pushed.items():  # audit MOD-RANGE-WICK: trades pushed since the last scan
+            if self.start_ms < hour + 3_600_000 and hour < self.window_end:
+                highs.append((top, hour))
+                lows.append((bottom, hour))
         high = max((x for x in highs if x[0] is not None), key=lambda x: x[0], default=(None, 0))
         low = min((x for x in lows if x[0] is not None), key=lambda x: x[0], default=(None, 0))
         return {"high": high[0], "high_at": high[1], "low": low[0], "low_at": low[1]}
@@ -10384,13 +10478,22 @@ class RangeMarket:
 
     def probability(self, level: D, direction: str, now_ms: int) -> float | None:
         """P(Yes) for one level: 1 once reached; 0 once the window is over and read to its end without it; else the touch
-        model from the live price (zero drift, the 30-day σ). None while the price or σ is missing or stale, or while the
-        window's last hours are not read yet."""
+        model from the live price (zero drift, the 30-day σ). None while the price or σ is missing or stale, while the
+        window's last hours are not read yet, or before the window opens."""
         if self.reached(level, direction):
             return 1.0
         if now_ms >= self.window_end:
             return 0.0 if self.complete() else None
         if self.price is None or self.sigma is None or self.price_stale(now_ms):
+            return None
+        if now_ms < self.start_ms:
+            # audit MOD-PREWINDOW: before the window opens (a next-month ladder added early) no level is reached: only a
+            # candle inside the window counts. The touch model from today's price is the wrong model there: a level
+            # already beyond today's price comes out certain (1.0), one just short of it 0.95-0.995 (the model is kinked
+            # at the level and ignores the days before the start), while the true P, averaged over the price at the
+            # window's start, is about 0.85-0.89 with six days to go. The trader would buy Yes up to its fair cap on
+            # those. Leave every level unpriced until the window opens (no fair: no sim row, "—" on the card); a
+            # start of 0 (not known yet) never gets here, and advice_problem already holds then.
             return None
         years = self.remaining_years(now_ms)
         touch = hit_probability if direction == "up" else low_probability
@@ -15430,6 +15533,7 @@ class Bot:
         # the price streams (1.87.0): the crypto cards by the pair that prices them, the Binance venues, Hyperliquid
         self.pair_markets: dict[tuple[str, str], list] = {}  # (venue, pair) -> the cards priced from it (BinanceStream)
         self.index_markets: dict[str, list] = {}  # futures pair -> the 15-minute cards its index prices (markPrice field i)
+        self.pair_trades: dict[tuple[str, str], tuple] = {}  # (venue, pair) -> the last trade (time, price) pushed to its cards (price_pushed)
         for card in (*self.touches.values(), *self.updowns.values()):
             if isinstance(card, StockTouchMarket):
                 continue  # a US stock's touch market (1.146.0): Yahoo's prices, nothing on Binance
@@ -16858,6 +16962,13 @@ class Bot:
         for key, title, odds_of in cards:
             raw = odds_of(now_ms)
             if not isinstance(raw, CloseOdds) or now_ms - self.pred_last.get(key, -PRED_EVERY_MS) < PRED_EVERY_MS:
+                continue
+            if now_ms >= self.target_close(title, raw.target)[0]:
+                # 1.149.x: past the target session's own close the outcome is decided, only not published yet — KRX
+                # 15:30-15:33 KST before the cards roll over at KRX_SETTLED (the auction's random end and Naver's delay),
+                # a stock card or 上证 until its close+15. Such a snapshot is no prediction: scored by /calib it would
+                # pull the (key, 盘中) σ factor (residual_factor) toward an R=1-minute "forecast" of a known close.
+                # Skipped before pred_last, so the half-hour slot is kept for the first snapshot on the next target.
                 continue
             self.pred_last[key] = now_ms
             prev = self.pred_prev.get(key)  # where the price had been going: the effective price against the snapshot before (1.120.2)
@@ -19582,6 +19693,15 @@ class Bot:
             rm = self.ranges.get(trade["key"])
             if rm is None:
                 return None
+            end = int(s.get("end") or 0)
+            if end and end != rm.end_ms:
+                # MOD-STOCKRANGE-CHOOSE: there is one range object per spec key, and the card can move to another
+                # deadline's market (StockRangeMarket.choose / learn moves its start and end; a changed LADDER_DEADLINES
+                # pin does the same). rm's window and extremes then belong to the new market, not to this trade's: a
+                # touch after this trade's own deadline would read as a Yes. The trade's end was kept in its settle dict,
+                # so when it no longer matches, the bot's own data cannot decide it and Predict's own result settles it.
+                # Records without "end" (older versions) keep the previous behaviour.
+                return None
             level, direction = D(str(s["target"])), s.get("dir", "up")
             marks = rm.marks()
             high, low = marks["high"], marks["low"]
@@ -19614,8 +19734,8 @@ class Bot:
                 "RESOLVED" in str(meta.get("status", "")).upper() and now_ms < int(s["end"]))
             if reached:
                 book = self.predict.yes_book(row)[0] if row else None
-                top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=1.0) if book else 1.0
-                if top >= 0.9:  # the book agrees, or is gone: reached (an open disagreement waits)
+                # 1.150.0: the same rule as the range ladder (best bid, see book_disputes), not max(bid, ask)
+                if not book_disputes(book):  # the book agrees, or is gone: reached (an open disagreement waits)
                     return 1.0, f"{usd_short(target)} 已触及（按机器人数据，以 {cap.spec.settle} 为准）", proof
                 return None
             if now_ms > int(s["end"]) + self.SIM_SETTLE_MS and not cap.coverage():
@@ -23126,11 +23246,21 @@ class Bot:
             except ValueError:
                 price = None
             if price is not None:
+                # audit MOD-HYPE-MARKPRICE: the row is merged per pair, so a markPriceUpdate frame (a SYMBOLS pair, a 15-minute
+                # card's index) re-sends it with the LAST aggTrade's price and time. push_price stamps that price "now" and
+                # defers the card's own 30-second REST read, so with aggTrade stalled and markPrice@1s still arriving the
+                # futures ladder (HYPE) was priced from a frozen trade that looked fresh forever. Only a trade not pushed yet
+                # (its time and price) prices the cards that take "now"; a spot window takes the trade's own time already.
+                trade = (row.get("time"), row.get("price"))
+                fresh = row.get("time") is None or self.pair_trades.get((venue, symbol)) != trade
+                self.pair_trades[(venue, symbol)] = trade
                 for card in cards:
                     if isinstance(card, SpotWindowMarket) and row.get("time") is not None:
                         card.push_index(price, int(row["time"]), now_ms)  # a 15-minute spot window: the trade's own time, as an index push
-                    else:
+                    elif fresh:
                         card.push_price(price, now_ms)
+                    else:
+                        continue  # the same trade again (a mark frame): nothing moved, the card's price ages and its REST read comes due
                     keys.append(card.spec.key)
         if keys:
             self.priced(keys)

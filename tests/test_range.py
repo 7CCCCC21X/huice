@@ -481,8 +481,8 @@ async def run():
     assert [(e["what"], e["source"], e["price"]) for e in ev["sources"]] == [("现价", "币安现货", 112050.4), ("本月最高", "币安小时 K", 119200.0),
                                                                            ("本月最低", "币安小时 K", 108000.0)], ev["sources"]
     # results from the bot's own candles: reached → Yes at once; not reached → No once the whole window is read
-    trade = lambda target, direction, mid="21": {"kind": "range", "key": "BTC-HIT-10", "market": f"{BTC.slug}#{mid}",
-                                                 "settle": {"target": target, "dir": direction, "end": BTC.end_ms}}
+    trade = lambda target, direction, mid="21", end=BTC.end_ms: {"kind": "range", "key": "BTC-HIT-10", "market": f"{BTC.slug}#{mid}",
+                                                                 "settle": {"target": target, "dir": direction, "end": end}}
     up, note, proof = bot.sim_result(trade("118000", "up", "23"), NOW)
     assert up == 1.0 and note == "↑ $118k 已触及（BTCUSDT 本月最高 119,200）" and proof["high"] == 119200.0 and proof["high_at"] == RUN, (note, proof)
     assert bot.sim_result(trade("108500", "down", "24"), NOW) is None  # reached by our candles, but the book trades it at 30-35¢: Predict decides
@@ -492,10 +492,12 @@ async def run():
     assert up == 1.0 and note == "↓ $108.5k 已触及（BTCUSDT 本月最低 108,000）", note
     assert bot.sim_result(trade("120000", "up"), NOW) is None  # open
     assert bot.sim_result(trade("120000", "up"), rm.window_end + bot.SIM_SETTLE_MS + 1) is None  # the window not read to its end
-    bot.ranges["BTC-HIT-10"] = done  # a window read to its end without 120k
-    up, note, proof = bot.sim_result(trade("120000", "up"), done.window_end + bot.SIM_SETTLE_MS + 1)
+    bot.ranges["BTC-HIT-10"] = done  # a window read to its end without 120k (the trade carries that window's own end)
+    up, note, proof = bot.sim_result(trade("120000", "up", end=done.end_ms), done.window_end + bot.SIM_SETTLE_MS + 1)
     assert up == 0.0 and note == "整个窗口都没到 $120k" and proof["through"] == done.window_end, (note, proof)
-    assert bot.sim_result(trade("120000", "up"), done.window_end + 1) is None  # settled an hour after the close
+    assert bot.sim_result(trade("120000", "up", end=done.end_ms), done.window_end + 1) is None  # settled an hour after the close
+    # MOD-STOCKRANGE-CHOOSE: a trade whose own window ended elsewhere is not judged on this object's window
+    assert bot.sim_result(trade("120000", "up"), done.window_end + bot.SIM_SETTLE_MS + 1) is None
     bot.ranges["BTC-HIT-10"] = rm
     assert bot.sim_result({**trade("1", "up"), "key": "GONE"}, NOW) is None
     assert m.SIM_KINDS["range"] == "价格阶梯"
