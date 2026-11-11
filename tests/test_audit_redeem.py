@@ -1424,4 +1424,58 @@ async def marks_permanent():
 asyncio.run(marks_permanent())
 
 
+# --- RDM-GAS-STALE --------------------------------------------------------------------------------------------------------------
+async def gas_stale():
+    """RDM-GAS-STALE: the gas gate was judged on a BNB reading of any age — USDT and BNB are re-read together, one failing half
+    stores neither, and an old LOW reading kept every round at BNB 不足 (and the ⛽ note asking for BNB already sent) while /live
+    redeem check, reading on its own, said 够付 gas. When the joint re-read fails the BNB is read alone; with no fresh figure at
+    all a reading older than LIVE_BALANCE_STALE_S is not taken for the present — no 不足, no ⛽, nothing sent blind, said as
+    unread. The stored pair (the order gate's) is never touched; a fresh low reading, a recent one, a never-read one: as before."""
+    async def refused(owner=None):
+        raise m.RemoteError("RPC 错误：limit exceeded")
+
+    async def account(bnb):
+        bot = await ready_bot()
+        fake, chain = bot.live.api, bot.live.chain
+        fake.positions_rows, fake.markets["301"] = [held(301)], mk(301, won=1)
+        chain.bnb = bnb
+        await bot.live.refresh_balance()
+        return bot, chain
+
+    # (a) read low, topped up since, the USDT read failing: the BNB read alone — redeemed (before: 可领取 1；签名钱包 BNB 不足)
+    bot, chain = await account(10 ** 13)
+    chain.bnb, chain.usdt_balance = 10 ** 17, refused
+    bot.live.balance = (*bot.live.balance[:2], time.time() - 700)
+    sent = notices(bot)
+    assert len(await bot.live_redeem(NOW)) == 1 and len(chain.redeemed) == 1 and not bot.live_redeem_last["low_gas"], bot.live_redeem_last
+    assert "redeem:gas" not in [k for k, _ in sent], sent
+    assert bot.live.balance[1] == 10 ** 13 and "余额刷新失败" in bot.live_balance_gate(), "the order gate's pair untouched"
+    # (b) nothing readable and the last reading 700 s old: not taken for the present — nothing sent, no 不足, no ⛽, said as unread
+    bot, chain = await account(10 ** 13)
+    chain.usdt_balance = chain.bnb_balance = refused
+    bot.live.balance = (*bot.live.balance[:2], time.time() - 700)
+    sent = notices(bot)
+    assert await bot.live_redeem(NOW) == [] and chain.redeemed == [] and not bot.live_redeem_last["low_gas"], bot.live_redeem_last
+    assert sent == [] and bot.live_redeem_last["counts"] == {"claimable": 1}, sent
+    summary = bot.live_redeem_summary(bot.live_redeem_last)
+    assert "签名钱包的 BNB 读不到（RPC 错误：limit exceeded），上次读到是 11 分钟前，这一轮先不发" in summary and "BNB 不足" not in summary, summary
+    # (c) as before: a fresh low reading holds back with the ⛽ note; a recent one (300 s) with nothing readable still judges
+    bot, chain = await account(10 ** 13)
+    sent = notices(bot)
+    assert await bot.live_redeem(NOW) == [] and chain.redeemed == [] and bot.live_redeem_last["low_gas"] and [k for k, _ in sent] == ["redeem:gas"], sent
+    bot, chain = await account(10 ** 13)
+    chain.usdt_balance = chain.bnb_balance = refused
+    bot.live.balance = (*bot.live.balance[:2], time.time() - 300)
+    assert await bot.live_redeem(NOW) == [] and chain.redeemed == [] and bot.live_redeem_last["low_gas"] and not bot.live_redeem_last["gas_unread"]
+    # ...and never read at all, nothing readable: not low, tried as before
+    bot, chain = await account(10 ** 17)
+    chain.usdt_balance = chain.bnb_balance = refused
+    bot.live.balance = None
+    assert len(await bot.live_redeem(NOW)) == 1 and len(chain.redeemed) == 1
+    print("RDM_GAS_STALE_OK")
+
+
+asyncio.run(gas_stale())
+
+
 print("AUDIT_REDEEM_OK")

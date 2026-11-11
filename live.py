@@ -4602,11 +4602,28 @@ class LiveBot(core.Bot):
         done: list[str] = []
         seen: list[dict] = []
         balance = self.live.balance
+        bnb = int(balance[1]) if balance is not None and len(balance) >= 2 else None
+        gas_unread = ""
         if not dry_run and (balance is None or len(balance) < 3 or time.time() - float(balance[2]) > self.LIVE_BALANCE_SECONDS):
-            with contextlib.suppress(Exception):  # the paper trader's step keeps it fresh; with that step off, here (1.131.4)
+            # 1.150.0 (audit RDM-GAS-STALE): the gas was judged on whatever reading was left when the re-read failed — USDT and BNB
+            # are read together (refresh_balance), so one failing half stored neither, and an old LOW reading kept every round
+            # at BNB 不足 and the ⛽ note asking for BNB already sent, while /live redeem check (its own read) said 够付 gas. The
+            # BNB alone is read now when the joint read fails (never written into the stored pair: its stamp vouches for the
+            # USDT the order gate relies on). With no fresh figure at all, a reading up to LIVE_BALANCE_STALE_S old still
+            # judges (as for orders); an older one is not taken for the present — neither 不足 nor a ⛽ note, and nothing sent
+            # blind: the round says the BNB could not be read and leaves the winners 可领取. Never read: as before (not low).
+            try:  # the paper trader's step keeps it fresh; with that step off, here (1.131.4)
                 await self.live.refresh_balance()
-            balance = self.live.balance
-        low_gas = balance is not None and int(balance[1]) < self.LIVE_REDEEM_MIN_BNB_WEI
+                bnb = int(self.live.balance[1])
+            except Exception as error:
+                try:
+                    bnb = int(await self.live.chain.bnb_balance())
+                except Exception as alone:
+                    if balance is not None and len(balance) >= 3 and time.time() - float(balance[2]) > self.LIVE_BALANCE_STALE_S:
+                        gas_unread = (f"签名钱包的 BNB 读不到（{core.clean_error(alone) or core.clean_error(error) or type(alone).__name__}），"
+                                      f"上次读到是 {int((time.time() - float(balance[2])) // 60)} 分钟前")
+                        bnb = None
+        low_gas = bnb is not None and bnb < self.LIVE_REDEEM_MIN_BNB_WEI
         markets: dict[str, dict | None] = {}  # this round's reads, one per market (None: the read failed)
         read_errors: dict[str, str] = {}
         limited = False
@@ -4760,7 +4777,7 @@ class LiveBot(core.Bot):
             if not info.condition_id:
                 seen.append({**entry, "kind": "fields", "error": "市场没写 conditionId，领取交易填不出来"})
                 continue
-            if dry_run or low_gas or held:
+            if dry_run or low_gas or held or gas_unread:  # (RDM-GAS-STALE) no BNB figure to send on: none sent blind
                 seen.append({**entry, "kind": "claimable"})
                 continue
             if info.neg_risk:  # (RDM-NEGRISK-AMOUNT) the chain's balance, not Predict's figure: what the adapter will pull
@@ -4868,7 +4885,7 @@ class LiveBot(core.Bot):
         for s in seen:
             counts[s["kind"]] = counts.get(s["kind"], 0) + 1
         self.live_redeem_last = {"at": now_ms, "counts": counts, "low_gas": low_gas, "error": "", "cut": cut, "limited": limited, "held": held,
-                                 "gas_refused": gas_refused}
+                                 "gas_refused": gas_refused, "gas_unread": gas_unread}
         if not limited:
             self.live_redeem_whole_at = time.monotonic()  # (RDM-ROUND-VOID) a look no rate limit cut short: live_redeem_again's notice waits again
         return done, seen
@@ -4887,6 +4904,7 @@ class LiveBot(core.Bot):
                 + (("；签名钱包的 BNB 不够付领取交易的 gas（节点拒收），领取交易发不出去" if last.get("gas_refused")  # (RDM-UNSENT-AS-SENT)
                     else "；签名钱包 BNB 不足，领取交易发不出去") if last.get("low_gas") and counts.get("claimable") else "")
                 + ("；一笔领取交易没在时限内上链，这一轮其余的先不发" if last.get("held") and counts.get("claimable") else "")  # (RDM-ROUND-LOCK-STALL)
+                + (f"；{last['gas_unread']}，这一轮先不发" if last.get("gas_unread") and counts.get("claimable") else "")  # (RDM-GAS-STALE)
                 + (f"；⚠️ 持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查" if cut else ""))
 
     def live_redeem_status_line(self) -> str:
