@@ -1287,7 +1287,8 @@ class LiveBot(core.Bot):
     LIVE_NOTE_SECONDS = 600     # the same failure is announced at most this often
     LIVE_PLACING_GRACE_MS = 120_000  # a record left in "placing" is reconciled by its hash after this long
     LIVE_IDLE_LIST_MS = 60_000      # the open-order list is re-read this often even with nothing in flight (orders this bot did not place)
-    LIVE_SNAPSHOT_MAX_AGE_MS = 600_000  # the pre-open mode's account snapshot stands in for a cut read of the open list while younger than this (1.136.2)
+    LIVE_SNAPSHOT_MAX_AGE_MS = 600_000  # the pre-open mode's account snapshot stands in for a cut read of the open list while younger than this (1.136.2);
+    #                                     with no whole view of the account for this long, the whole read is tried again even after a cut one (1.150.0)
     LIVE_STEP_PAGES = 1             # a step's own read of the open list: the pages until every active record's order is seen, this many at most (1.137.1:
     #                                 3; 1.138.2: 1 — under the pre-open mode's thousands of orders the model's older ones are never on the first pages, the
     #                                 two more pages cost 0.6 s a step for nothing: they are read by their hash in rotation)
@@ -1349,7 +1350,8 @@ class LiveBot(core.Bot):
         self.live_open_ids: set[str] = set()  # the last complete open list's order ids, and when it was read: a record whose order is on it is not pruned (prunable)
         self.live_open_ids_at = 0
         self.live_full_at_ms = -10 ** 15  # when this bot last read the whole open list itself (a step reads a few pages otherwise: 1.137.1)
-        self.live_full_cut = False  # that read came cut at the page cap: while the pre-open mode runs, its snapshot stands for the account instead (1.137.2)
+        self.live_full_cut = False  # that read came cut at the page cap: while the pre-open mode runs, its snapshot stands for the account instead (1.137.2;
+        #                             1.150.0: tried again once nothing has shown the whole account for LIVE_SNAPSHOT_MAX_AGE_MS — live_sync_orders)
         self.live_market_filter: bool | None = None  # whether Predict's open-order list honours marketId (1.139.0): None until a read shows it either way
         self.live_whole: tuple[set, set, int] = (set(), set(), 0)  # the last whole view of the account's open orders: ids, hashes, when read (live_counts_miss)
         self.live_requote_looked: set[str] = set()  # order ids of confirmed cancels whose slot live_requote_freed has looked at (live_cancel_fills, 1.138.0)
@@ -2379,8 +2381,26 @@ class LiveBot(core.Bot):
         # snapshot stands for the whole account, or within a minute of this bot's own whole read; the rest of the records are read by
         # their hash (live_track). The 11-07 /diag: 同步 10.5 s of an 11.3 s step, twenty pages against the pre-open mode's thousands
         wanted = {str(t["live"].get("order_id")) for t in active.values() if t["live"].get("order_id")}
+        latched = self.live_full_cut and getattr(self, "preopen", None) is not None  # 1.137.2: a cut full read tells nothing the snapshot will not
+        # 1.150.0: ...which holds while a snapshot comes. live_full_cut is re-read by a whole read alone, and that clause allowed none
+        # for as long as a controller was attached — but one stays attached with no snapshot to give: crashed (alive False, kept
+        # until the next preopen_apply: a control-page save, /preopen on|off, a restart), paused (/preopen pause), held by an
+        # operator's stop or the day's loss cap (its account loop reads nothing while blocked), or its reads failing. The sync then
+        # stayed bounded for good and the account was never seen whole again, the model trader trading on: an order of its own that
+        # vanished never counted as missing, nor one of unknown state released by the evidence (live_counts_miss), an unrecorded
+        # order never seen or swept (live_note_unknown, live_orphan_sweep) — with that mode's orders withdrawn long since, the list
+        # would have read whole. So with no whole view — this bot's own or the snapshot's — and no whole read of its own for
+        # LIVE_SNAPSHOT_MAX_AGE_MS (the age at which a snapshot stops standing for the account), the clause lapses for one whole
+        # read: whole, the flag clears and the read is every minute's again, as without that mode; cut once more, the next is that
+        # long away — one in ten minutes, and only while nothing else shows the account
+        blind = (now_ms - int(self.live_whole[2] or 0) > self.LIVE_SNAPSHOT_MAX_AGE_MS
+                 and now_ms - self.live_full_at_ms >= self.LIVE_SNAPSHOT_MAX_AGE_MS)
         bounded = (self.live_snapshot_fresh(now_ms) or now_ms - self.live_full_at_ms < self.LIVE_IDLE_LIST_MS
-                   or (self.live_full_cut and getattr(self, "preopen", None) is not None))  # 1.137.2: a cut full read tells nothing the snapshot will not
+                   or (latched and not blind))
+        if latched and not bounded:
+            # ...whether that read succeeds or not: against that mode's thousands it is twenty pages, any of which may fail — asked
+            # for again at every step, a failing one would fail every step's sync with it (the records unread meanwhile)
+            self.live_full_at_ms = now_ms
         listing = time.monotonic()
         # 1.139.0: only the markets the model trader has orders on (the index and contract cards), when Predict filters the list by market —
         # every one of those orders seen every step; the pre-open mode's thousands on other markets never read here

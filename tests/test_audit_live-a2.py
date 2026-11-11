@@ -1163,4 +1163,226 @@ async def live_redeem_starve():
 
 asyncio.run(live_redeem_starve())
 
+
+async def live_bounded_stuck():
+    """LIVE-BOUNDED-STUCK: once a whole read of the open list had come back cut (the pre-open mode's thousands of orders: at
+    every start, before that mode's first snapshot), the step made none again for as long as a controller was attached (1.137.2:
+    its snapshot shows the account instead) — and only a whole read re-reads that flag. A controller that crashed (kept, alive
+    False, until the next preopen_apply), is paused, or is held by an operator's stop gives no snapshot: the sync stayed bounded
+    for good and the account was never seen whole again while the model trader traded on — an order of its own that vanished was
+    never counted as missing (its side and its money held), an unrecorded order on its own market never announced nor swept —
+    although that mode's orders were withdrawn and the list would have read whole. With no whole view and no whole read of its
+    own for LIVE_SNAPSHOT_MAX_AGE_MS the whole read is made again, one in ten minutes at most (whether it comes whole, cut, or
+    fails); beside a mode whose snapshot comes, or within ten minutes of a whole view, nothing changes (1.137.2 as it was)."""
+    from urllib.parse import parse_qsl, urlsplit
+    L = T["L"]
+    MIN, AGE, slot = 60_000, L.LiveBot.LIVE_SNAPSHOT_MAX_AGE_MS, f"{HSI_SLUG}|up|挂"
+    mkt = lambda at: hsi(0.70, [("0.55", "300")], [("0.58", "400")], at)
+    assert AGE == 10 * MIN and (L.PredictApi.ORDERS_PAGE, L.PredictApi.ORDERS_PAGES_MAX) == (50, 20)
+
+    class PagedApi(T["FakeApi"]):
+        """Predict's open list through the client's own paging (PredictApi.paged / orders: 50 a page by cursor, twenty pages a
+        read at most, no cursor after the last page), the marketId filter honoured — so the step reads the model trader's
+        markets only (1.139.0), which is never the whole account. Every page asked for is logged (asked)."""
+        ORDERS_PAGE, ORDERS_PAGES_MAX = L.PredictApi.ORDERS_PAGE, L.PredictApi.ORDERS_PAGES_MAX
+        paged, orders, rows = L.PredictApi.paged, L.PredictApi.orders, staticmethod(L.PredictApi.rows)
+
+        def __init__(self):
+            super().__init__()
+            self.orders_complete = self.positions_complete = True
+            self.asked: list[tuple[str, int]] = []  # (the market the page was asked of — "" for the whole list —, the cursor)
+            self.fail_page = 0  # this page of a read of the whole list answers HTTP 502 (0: none does)
+
+        async def authed(self, method, path, *args, **kwargs):
+            url = urlsplit(path)
+            q = dict(parse_qsl(url.query))
+            assert method == "GET" and url.path == "/orders" and q.get("status") == "OPEN", path
+            market, first, start = q.get("marketId", ""), int(q["first"]), int(q.get("after") or 0)
+            self.asked.append((market, start))
+            if self.fail_page and not market and start == (self.fail_page - 1) * first:
+                raise m.RemoteError("HTTP 502: bad gateway")
+            rows = [r for r in self.open.values() if not market or L.LiveBot.row_market_id(r) == market]
+            return {"success": True, "data": [dict(r) for r in rows[start:start + first]], "cursor": str(start + first) if start + first < len(rows) else None}
+
+        async def create_order(self, body):
+            out = await super().create_order(body)
+            self.open[out["order_id"]]["marketId"] = "101"  # Predict's rows name their market (the model trader's one market here)
+            return out
+
+    class Mode:
+        """The pre-open controller as LiveBot reads it, started by the real LiveBot.preopen_start (a crash goes through its own
+        done-callback). look() is its account loop: a complete snapshot of the account — nothing while it is dead or blocked
+        (Controller.account_loop reads only `if not self.blocked()`), account_at = 0 when the read fails (Controller.account)."""
+        def __init__(self, owner):
+            self.owner, self.settings = owner, types.SimpleNamespace(markets={"btc"})
+            self.alive, self.winding, self.error, self.manual_pause, self.failing, self.keep_on_stop = True, "", "", False, False, False
+            self.stop, self.crash = asyncio.Event(), asyncio.Event()
+            self.account_rows, self.account_at, self.mine, self.limited_at = [], 0, set(), ()
+            self.ledger = types.SimpleNamespace(rows={}, pause=lambda on=None: bool(on), close=lambda: None)
+
+        def blocked(self): return "进程或预挂模式停止中" if self.stop.is_set() else "本模式已手动暂停（/preopen resume 恢复）" if self.manual_pause else ""
+
+        def look(self, now):
+            if not self.alive or self.blocked():
+                return
+            if self.failing:
+                self.account_at = 0
+                return
+            self.account_rows, self.account_at = [dict(r) for r in self.owner.live.api.open.values()], now
+
+        def unmanaged_rows(self, rows): return [r for r in rows if str(r.get("id")) not in self.mine]
+        def known(self): return set(self.mine), set()
+        def filled_by_outcome(self, days=30): return {}
+        def daily_pnl(self): return 0.0
+        def risk(self): return 0.0
+        def status(self): return "开盘前预挂（测试替身）"
+        def request_rate(self): return None
+        def now(self): return self.owner.market.now_ms()
+
+        def withdraw_mine(self):
+            for oid in self.mine:
+                self.owner.live.api.open.pop(oid, None)
+
+        async def withdraw_all(self, reason):  # the pause withdraws the resting pairs
+            self.withdraw_mine()
+            return ""
+
+        async def run(self):
+            waits = [asyncio.ensure_future(event.wait()) for event in (self.crash, self.stop)]
+            try:
+                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+                if self.crash.is_set():
+                    self.withdraw_mine()  # Controller.run: on_stop withdraws this mode's orders on the way out of a crash too
+                    raise RuntimeError("预挂循环出错（测试）")
+            finally:
+                for wait in waits:
+                    wait.cancel()
+                self.alive = False
+
+    async def account():
+        """A ready bot on an account resting 1,200 orders of the pre-open mode (left on the book by the last process: preopen_stop
+        keep=True), the mode's controller attached before the first read, as LiveBot.run does. That first read — no snapshot
+        yet — is the whole one: twenty pages, cut."""
+        bot = make_bot(SIM_WAYS="maker")
+        api = bot.live.api = PagedApi()
+        api.markets["101"] = T["market_json"]("101")
+        for i in range(1200):
+            api.open[f"p{i}"] = {"id": f"p{i}", "status": "OPEN", "amount": str(10 * WEI), "amountFilled": "0", "marketId": str(5000 + i // 4),
+                                 "order": {"hash": f"0xpre{i:05d}", "side": 0, "makerAmount": str(49 * WEI // 10), "takerAmount": str(10 * WEI), "tokenId": f"77{i}"}}
+        bot.preopen_factory = Mode
+        bot.preopen_start()
+        mode = bot.preopen
+        mode.mine = set(api.open)
+        bot.notices = []
+        bot.live_notify = lambda text, key="": bot.notices.append(key)
+        bot.market.now = NOW
+        await bot.live_prepare()
+        assert bot.live.ready, bot.live.not_ready_why
+        assert bot.live_full_cut is True and bot.live_whole[2] == 0 and api.asked == [("", 50 * n) for n in range(20)], (bot.live_full_cut, api.asked)
+        return bot, api, mode
+
+    async def go(bot, at):
+        """The mode's account loop, then one trading step, at ``at``: how many pages of the WHOLE open list the step asked Predict
+        for (a read by market names its market)."""
+        api = bot.live.api
+        bot.preopen.look(at)
+        asked = len(api.asked)
+        await step(bot, at, mkt(at))
+        return sum(1 for market, _ in api.asked[asked:] if not market)
+
+    async def stuck(trigger):
+        bot, api, mode = await account()
+        rec = lambda: next(t for t in bot.sim_trades().values() if isinstance(t.get("live"), dict) and t["live"].get("order_id") == oid)
+        see = lambda: (trigger, (bot.live_whole[2] - NOW) / MIN, bot.live_full_cut, bot.live_sync_detail, [u["id"] for u in bot.live_unknown_open], bot.live_errors[-2:])
+        for k in range(1, 5):  # the mode runs: its snapshot of each minute stands for the account; the model trader's maker rests on market 101
+            seen = NOW + k * MIN
+            assert await go(bot, seen) == 0 and bot.live_sync_detail["bounded"] and bot.live_whole[2] == seen, (k, see())
+        oid = bot.sim_trades()[slot]["live"]["order_id"]
+        assert bot.live_market_filter is True and bot.live_sync_detail["markets"] == 1 and bot.live_full_cut is True, see()
+        if trigger == "crash":  # a job of the controller raises: its orders withdrawn on the way out, the controller kept (alive False)
+            mode.crash.set()
+            for _ in range(100):
+                if "preopen:crash" in bot.notices:
+                    break
+                await asyncio.sleep(0)
+            assert bot.preopen is mode and not mode.alive and not bot.preopen_active() and "preopen:crash" in bot.notices, (mode.alive, bot.notices)
+        else:
+            if trigger == "failed, then paused":  # its last read failed (account_at 0, as before a first snapshot) — and no other will come
+                mode.failing = True
+                mode.look(seen + 30_000)
+            await bot.cmd_preopen(m.Request("/preopen", ["pause"], 1, 0, 1))  # its orders withdrawn; its account loop reads nothing while paused
+            assert bot.preopen is mode and mode.alive and mode.manual_pause and bool(mode.account_at) == (trigger == "paused"), (trigger, mode.account_at)
+        assert set(api.open) == {oid}, "that mode's orders are withdrawn: the list would read whole"
+        # what only a whole view of the account catches: the model's own order gone from Predict without a final record (the
+        # hash read finds nothing), and an order nobody recorded on the bot's own market
+        api.open.pop(oid)
+        api.open["u1"] = {"id": "u1", "status": "OPEN", "amount": str(10 * WEI), "amountFilled": "0", "marketId": "101",
+                          "order": {"hash": "0xstray", "side": 0, "makerAmount": str(4 * WEI), "takerAmount": str(10 * WEI), "tokenId": "1011"}}
+        for k in range(1, 11):  # ten minutes: the last whole view is not older than a snapshot may be — bounded, as before
+            at = seen + k * MIN
+            assert await go(bot, at) == 0 and bot.live_sync_detail["bounded"] and bot.live_whole[2] == seen, (k, see())
+        assert bot.live_send_hold(at) == "" and not bot.preopen_exclusive(), "the model trader trades on meanwhile"
+        assert rec()["live"]["state"] == "open" and abs(bot.live_reserved(rec()) - 55.0) < 1e-9 and not bot.live_unknown_open and "u1" in api.open, see()
+        # the eleventh: nothing has shown the account for ten minutes — the whole read is made again (before: bounded for good, the
+        # record "open" with its $55 held and the stray resting unseen for as long as the controller stayed attached), and it
+        # comes whole: the flag clears, the read is every minute's again as without that mode
+        at = seen + 11 * MIN
+        assert await go(bot, at) == 1 and not bot.live_sync_detail["bounded"] and bot.live_full_cut is False and bot.live_whole[2] == at, see()
+        assert [u["id"] for u in bot.live_unknown_open] == ["u1"] and "unknown:u1" in bot.notices and bot.live_misses.get(slot) == 1, (see(), bot.notices, bot.live_misses)
+        at = seen + 12 * MIN
+        assert await go(bot, at) == 1 and not bot.live_sync_detail["bounded"] and bot.live_whole[2] == at and bot.live_misses.get(slot) == 2, see()
+        at = seen + 13 * MIN  # the stray seen so for two minutes is withdrawn (LIVE_ORPHAN_CANCEL); the third whole list without the model's order
+        assert await go(bot, at) == 1 and ("remove", ["u1"]) in api.calls and "u1" not in api.open and bot.live_orphans[-1]["id"] == "u1", (see(), api.calls[-3:])
+        assert not bot.live_unknown_open and "orphans:u1" in bot.notices and rec()["live"]["state"] == "unknown", (see(), bot.notices, rec()["live"])
+        for k in range(14, 17):  # three whole lists without it and three minutes unknown: the positions decide — nothing held, released
+            assert await go(bot, seen + k * MIN) == 1, (k, see())
+        t = rec()
+        assert t["live"]["state"] == "done" and t["status"] == "cancelled" and t["shares"] == 0 and bot.live_reserved(t) == 0, (t["live"], see())
+        assert any("按未成交结束" in e["what"] for e in t["live"]["events"]) and bot.live_full_cut is False, t["live"]["events"]
+        await bot.preopen_stop("测试结束")
+
+    async def running():
+        # beside a mode that runs, its 1,200 orders resting, the 1.137.2 rule stands: no whole read of this bot's own while a snapshot
+        # comes (twelve minutes: the first read's age alone never lapses the clause)
+        bot, api, mode = await account()
+        for k in range(1, 13):
+            seen = NOW + k * MIN
+            assert await go(bot, seen) == 0 and bot.live_sync_detail["bounded"] and bot.live_whole[2] == seen, (k, bot.live_sync_detail)
+        oid = bot.sim_trades()[slot]["live"]["order_id"]
+        # its reads fail from here on (account_at 0, as a controller just attached — a settings change — has none yet): bounded while
+        # the last whole view is younger than ten minutes, then one whole read (twenty pages, cut again) every ten minutes
+        mode.failing = True
+        looks = []
+        for k in range(13, 43):
+            pages = await go(bot, NOW + k * MIN)
+            looks += [(k, pages, bot.live_sync_detail["bounded"])] if pages else []
+            assert bot.live_full_cut is True and bot.live_whole[2] == seen and bot.live_synced_at == NOW + k * MIN, (k, bot.live_sync_detail, bot.live_errors[-1:])
+        assert looks == [(23, 20, False), (33, 20, False)], looks
+        # a whole read that fails is not asked for again at every step (each would fail that step's sync, the records unread): the
+        # steps after it read by market as before, the next whole read ten minutes on — and the one after that ten minutes on again
+        api.fail_page = 3
+        at = NOW + 43 * MIN
+        assert await go(bot, at) == 3 and bot.live_sync_failed_ms == at and bot.live_synced_at == at - MIN, (bot.live_sync_failed_ms - NOW, bot.live_synced_at - NOW)
+        assert "同步真实订单失败" in bot.live_errors[-1] and "502" in bot.live_errors[-1], bot.live_errors[-1]
+        for later in (5_000, 10_000, 15_000, *(k * MIN for k in range(1, 10))):
+            assert await go(bot, at + later) == 0 and bot.live_sync_detail["bounded"] and bot.live_synced_at == at + later, (later, bot.live_errors[-1:])
+        assert bot.live_send_hold(at + 9 * MIN) == "", bot.live_send_hold(at + 9 * MIN)
+        assert await go(bot, at + 10 * MIN) == 3 and bot.live_sync_failed_ms == at + 10 * MIN, "ten minutes on: tried once more"
+        api.fail_page = 0
+        for k in range(11, 20):
+            assert await go(bot, at + k * MIN) == 0 and bot.live_sync_detail["bounded"], k
+        assert await go(bot, at + 20 * MIN) == 20 and not bot.live_sync_detail["bounded"] and bot.live_full_cut is True and bot.live_whole[2] == seen, bot.live_sync_detail
+        t = bot.sim_trades()[slot]  # the model's own order rested on throughout: read by market each step, by its hash in a whole read's
+        assert t["live"]["order_id"] == oid and t["live"]["state"] == "open" and bot.live_sync_detail["markets"] == 0, (t["live"], bot.live_sync_detail)
+        assert await go(bot, at + 21 * MIN) == 0 and bot.live_sync_detail["markets"] == 1, bot.live_sync_detail
+        await bot.preopen_stop("测试结束")
+
+    for trigger in ("crash", "paused", "failed, then paused"):
+        await stuck(trigger)
+    await running()
+    print("LIVE_BOUNDED_STUCK_OK")
+
+
+asyncio.run(live_bounded_stuck())
+
 print("AUDIT_LIVE_A2_OK")
