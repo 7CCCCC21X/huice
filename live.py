@@ -4724,9 +4724,10 @@ class LiveBot(core.Bot):
         whose turn it leaves as it was."""
         # 1.150.0 (audit RDM-POSITIONS-CUT): the redeem's own read, LIVE_REDEEM_PAGES deep, and its own answer whether the list
         # came whole. It read api.positions() — ORDERS_PAGES_MAX pages, 1000 rows at 50 a page — and never looked at whether
-        # that was the whole list: the bot never burns a losing token, so on the pre-open mode's account the list grows by
-        # hundreds of rows a day, and a winner listed past the cut was never seen by any round (the ten-minute one, the one a
-        # win brings, /live redeem) while the round said 持仓 1000 个：输掉的 1000 and the check 赢的都领完了. The answer is
+        # that was the whole list: the bot never burns a losing token, so for as long as Predict lists resolved losers the list
+        # grows with every filled window (how fast is not measured: the owner's check of 11-11 listed 48 rows, no lost one among
+        # them), and a winner listed past the cut was never seen by any round (the ten-minute one, the one a win brings, /live
+        # redeem) while the round said 持仓 1000 个：输掉的 1000 and the check 赢的都领完了. The answer is
         # taken from this read itself, never from api.positions_complete: that flag is shared with the once-a-minute readers
         # (live_late_fills, /live fills, live_unexplained), which keep their twenty pages and their flag. A list longer even
         # than this read is said — live_redeem_cut, the round's summary, the check, one notice an hour — never taken whole.

@@ -69,11 +69,11 @@ def notices(bot) -> list:
 # --- RDM-POSITIONS-CUT ----------------------------------------------------------------------------------------------------------
 async def positions_cut():
     """RDM-POSITIONS-CUT: the redeem read the positions through api.positions() — ORDERS_PAGES_MAX pages (1000 rows at 50 a page)
-    — and never looked whether that was the whole list. The bot never burns a losing token, so the pre-open mode's account grows
-    by hundreds of rows a day: a winner listed past the cut was never redeemed by any round, the round said 持仓 1000 个：输掉的
-    1000 and /live redeem check 赢的都领完了. The redeem now reads LIVE_REDEEM_PAGES deep with its own answer (positions_read),
-    the minute readers keep their twenty pages and their flag, and a list longer still is said — the summary, the check, /live
-    redeem, one notice an hour — never taken for the whole."""
+    — and never looked whether that was the whole list. The bot never burns a losing token, so while Predict lists resolved
+    losers the list grows with every filled window (how fast is not measured): a winner listed past the cut was never redeemed
+    by any round, the round said 持仓 1000 个：输掉的 1000 and /live redeem check 赢的都领完了. The redeem now reads LIVE_REDEEM_PAGES
+    deep with its own answer (positions_read), the minute readers keep their twenty pages and their flag, and a list longer
+    still is said — the summary, the check, /live redeem, one notice an hour — never taken for the whole."""
     bot = await ready_bot()
     server, plain = Canned(), m._http_get
     m._http_get = server
