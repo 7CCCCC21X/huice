@@ -468,4 +468,313 @@ async def _crash_withdraws():
 
 asyncio.run(_crash_withdraws())
 
+# PRE-LEDGER-GROWTH: nothing ever left the ledger's working records — one a window, a level and an attempt, for good
+# (twenty cards at four levels: thousands a day). Every start loaded them all, the loops walked them all many times a
+# second, before_send walked them from the oldest for the pair being sent (the newest) four times a pair, and with the
+# mode off the positions check read the whole file twice a minute: at 50,000 records seconds-long freezes of the bot's
+# one event loop, a quarter of it gone to the walks, half a gigabyte of memory, all growing. Now a finished quote that
+# filled nothing moves to the ledger's archive two days after its window (same file, the record whole); only the review
+# page reads it, and counts it as before. Everything that carries money or a doubt stays a working record.
+import json
+import shutil
+
+_DAY = 86_400_000
+_ENV = dict(PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="1440", PREOPEN_SHARES="10", PREOPEN_LEVELS="48x20", LIVE_MAX_DAILY_LOSS_USD="0")
+
+
+def _controller_at(now_ms, **env):
+    """test_preopen's controller built with the clock already at ``now_ms`` (a restart then: its constructor reads the time)."""
+    real = _T.NOW
+    _T.NOW = now_ms
+    try:
+        return _T.controller(**env)
+    finally:
+        _T.NOW = real
+
+
+def _tables(db):
+    """(the working records' keys, the archive's records by key) as the file holds them."""
+    conn = sqlite3.connect(db)
+    try:
+        pairs = {slug for (slug,) in conn.execute("SELECT slug FROM pairs")}
+        archive = {slug: json.loads(body) for slug, body in conn.execute("SELECT slug, body FROM archive")}
+    finally:
+        conn.close()
+    return pairs, archive
+
+
+async def _at_cancel_time(ctl, clock, pair):
+    """A window reaching its cancel time, as the cancellation loop takes it: the active pairs due, withdrawn free."""
+    clock.ms = pair["cancel_ms"]
+    active = [x for x in ctl.due(clock.ms) if x["phase"] == "active"]
+    assert pair in active, pair["slug"]
+    await ctl.cancel_many(active, "到时撤单或真实交易暂停", free=True)
+    await _settled(ctl)
+
+
+async def _ledger_growth(folder):
+    db = str(Path(folder) / "g.preopen.sqlite3")
+    at = lambda minutes: _T.NOW + minutes * 60_000
+    mA, mB, mC, mD, mE = (_T.market(at=at(30 + 15 * k), mid=700 + k) for k in range(5))  # 09:30 … 10:30, Friday 11-06
+    mU, mR = _T.market(at=at(24 * 60 + 45), mid=710), _T.market(at=at(25 * 60), mid=711)  # Saturday 09:45 and 10:00
+    A, B, C, D, E, U, R = (x["categorySlug"] for x in (mA, mB, mC, mD, mE, mU, mR))
+    ctl, api, clock = _T.controller([mA, mB, mC], PREOPEN_DB=db, **_ENV)
+    for x in (mD, mE, mU, mR):
+        api.markets[str(x["id"])] = x
+        api.unlisted.add(x["categorySlug"])  # (placed one by one below, not by the discovery)
+    alone = lambda market: ctl.place_pair(_p.candidate(market, clock.ms, ctl.owner.config, ctl.settings))  # its first level
+    # A, B, C quoted at both levels by the discovery; C withdrawn as a settings change withdraws and quoted again: its
+    # first records step aside under '@0'
+    assert await _quote_all(ctl) == sorted([A, A + "#1", B, B + "#1", C, C + "#1"])
+    await ctl.cancel_many([ctl.ledger.rows[C], ctl.ledger.rows[C + "#1"]], "设置不同，撤掉后重新报价", free=True)
+    await _settled(ctl)
+    clock.ms += 30_000
+    assert await _quote_all(ctl) == [C, C + "#1"] and {C + "@0", C + "#1@0"} <= set(ctl.ledger.rows)
+    # B's first level fills on Up before its cancel; D's second order times out and is never found (given up); E's Down
+    # order is one Predict never removes and still lists as open days later
+    up = api.rows[ctl.ledger.rows[B]["orders"]["up"]["hash"]]
+    up["amountFilled"] = up["amount"]
+    api.fail_side = len(api.sent) + 2
+    await alone(mD)
+    await _settled(ctl)
+    await alone(mE)
+    api.stuck = {ctl.ledger.rows[E]["orders"]["down"]["id"]}
+    for slug in (A, B, C, E):
+        await _at_cancel_time(ctl, clock, ctl.ledger.rows[slug])
+    clock.ms = at(120)  # 11:00: every window over, past the give-up; Down won B
+    for slug in (D, E):
+        await ctl.cancel_pair(ctl.ledger.rows[slug], ctl.ledger.rows[slug].get("reason") or "撤单状态核对")
+    api.markets[str(mB["id"])]["outcomes"][0]["status"] = "WON"
+    await ctl.settle_pair(ctl.ledger.rows[B])
+    # Saturday: U's second order times out too, and the process stops before it is given up — in doubt, its money
+    # reserved; R is withdrawn at its cancel time like any other
+    clock.ms = ctl.account_at = at(24 * 60 + 30)
+    api.fail_side = len(api.sent) + 2
+    await alone(mU)
+    await _settled(ctl)
+    await alone(mR)
+    await _at_cancel_time(ctl, clock, ctl.ledger.rows[R])
+    # ...and an earlier attempt at A that ended with nothing filled but with Predict's result on it (the tally reads it)
+    res = copy.deepcopy(ctl.ledger.rows[A])
+    res.update(slug=A + "@7", attempt=7, result="up")
+    for n, order in enumerate(res["orders"].values()):
+        order.update(hash=f"0xres{n}", api_hash=f"0xres{n}", id=f"res{n}")
+    ctl.ledger.save(res)
+    done = lambda x: bool(x.get("accounted")) and x["phase"] == "closed"
+    assert [k for k, x in ctl.ledger.rows.items() if not done(x)] == [U], {k: (x["phase"], x.get("accounted")) for k, x in ctl.ledger.rows.items()}
+    assert abs(ctl.ledger.rows[B]["pnl"] + 4.9) < 1e-9 and ctl.ledger.rows[B]["result"] == "down"
+    assert ctl.ledger.rows[D]["orders"]["down"]["state"] == "not_found" and ctl.ledger.rows[U]["orders"]["down"]["state"] == "unknown"
+    assert "仍不是终态" in ctl.ledger.rows[E]["orders"]["down"]["note"] and api.rows[ctl.ledger.rows[E]["orders"]["down"]["hash"]]["status"] == "OPEN"
+    ctl.ledger.close()
+    old = {A, A + "#1", B + "#1", C + "@0", C + "#1@0", C, C + "#1"}  # finished, nothing filled, no doubt, no result
+    kept = {B, D, E, U, R, A + "@7"}  # a fill and its P&L; two orders given up on; one in doubt; a young one; a result
+    later = at(25 * 60 + 15) + 2 * _DAY - 30 * 60_000  # Monday 09:45: R's window ended two days less half an hour ago
+    for copy_of in ("off", "fail", "half", "last"):
+        shutil.copy(db, str(Path(folder) / f"{copy_of}.preopen.sqlite3"))
+    # what the code before the fix worked on and showed: every record, off the file
+    full = _p.read_rows(db)
+    assert {x["slug"] for x in full} == old | kept
+    by_slug = {x["slug"]: x for x in full}
+    ref = {"review": _p.review(full, later), "fills": _p.fills_by_outcome(full, later, 30), "unverified": _p.unverified_outcomes(full, later),
+           "ev": _p.ev_bets(full), "cards": _p.cards_today(full, later)}
+    total = ref["review"]["total"]
+    assert (total["records"], total["windows"], total["withdrawn"], total["pnl"]) == (13, 7, 11, -4.9)
+    assert ref["fills"] == {(str(mB["id"]), 2): 10.0} and ref["unverified"] == {(str(mU["id"]), 1)} and len(ref["ev"]) == 1
+
+    # --- a restart two days after the windows: the old finished quotes are no working records any more
+    again, _, clock2 = _controller_at(later, PREOPEN_DB=db, **_ENV)
+    again.api = again.cancel_api = api
+    api.ctl = again
+    assert set(again.ledger.rows) == kept, f"the old finished quotes are still working records: {sorted(set(again.ledger.rows) - kept)}"
+    pairs, archive = _tables(db)
+    assert pairs == kept and set(archive) == old, (sorted(pairs), sorted(archive))
+    assert all(archive[slug] == by_slug[slug] for slug in old), "an archived record is the record as it was, whole"
+    assert again.ledger.archived_count == 7 and "6 条（0 条挂着，5 条已结清），另有 7 条已归档" in again.status(), again.status()
+    assert set(again.ledger.by_hash) == {o["hash"] for x in again.ledger.rows.values() for o in x["orders"].values()}, "the hash index holds the working records' hashes alone"
+    # the review page and the daily summary: as before, the archive counted in (B's first level is a working record, its
+    # second an archived one: one window all the same)
+    bot = _L.LiveBot.__new__(_L.LiveBot)
+    bot.preopen, bot.config, bot.market, bot.sim_trades = again, again.owner.config, again.owner.market, (lambda: {})
+    assert bot.preopen_review() == ref["review"], "the review changed with the archive"
+    assert [(x["label"], x["records"], x["markets"], round(x["pnl"], 4)) for x in bot.summary_rows([], {})] == [("11-07 周六", 2, 2, 0), ("11-06 周五", 11, 5, -4.9), ("累计", 13, 7, -4.9)]
+    # what carries money, a doubt or a result is where it was: the fills the positions check counts and the outcomes it
+    # leaves alone, the reservation, the EV bets, today's cards, the tally's rows, the day's P&L in the loss stop, the
+    # orders known as this mode's, the listing horizon
+    rows = list(again.ledger.rows.values())
+    assert (again.filled_by_outcome(30), bot.preopen_filled(), bot.preopen_unverified()) == (ref["fills"], ref["fills"], ref["unverified"])
+    assert abs(again.risk() - 9.8) < 1e-9 and (_p.ev_bets(rows), _p.cards_today(rows, later)) == (ref["ev"], ref["cards"])
+    card = next(r for r in _m.preopen_cards() if r.key == "BTC-15M")
+    starts = {int(x["start_ms"]) for x in full}
+    assert bot.tally_fill_rows(card, starts) == [{"s": at(45), "up": 10.0, "down": 0.0, "price": 0.49, "result": "d"}]
+    assert bot.tally_official(card, starts) == {at(45): "d", at(30): "u"}
+    clock2.ms = at(180)  # (Friday noon again: the day B was settled on)
+    assert abs(again.daily_pnl() + 4.9) < 1e-9
+    clock2.ms = later
+    ids, hashes = again.known()
+    assert by_slug[E]["orders"]["down"]["id"] in ids and {by_slug[D]["orders"]["down"]["hash"], by_slug[U]["orders"]["down"]["hash"]} <= hashes
+    listed = await api.orders("OPEN")
+    assert [r["id"] for r in listed] == [by_slug[E]["orders"]["down"]["id"]] and again.unmanaged_rows(listed) == [], "the order Predict still lists is still this mode's"
+    assert (again.listed_until_ms, again.listed_by_card) == (at(25 * 60), {"BTC-15M": at(25 * 60)})
+
+    # --- before_send finds the pair being sent — the newest record — by its hash, without a walk through the records
+    mF = _T.market(at=later + 150 * 60_000, mid=720)  # Monday 12:15
+    api.markets[str(mF["id"])] = mF
+    await again.place_pair(_p.candidate(mF, clock2.ms, again.owner.config, again.settings))
+    F = mF["categorySlug"]
+    pairF = again.ledger.rows[F]
+    assert pairF["phase"] == "active" and [o["state"] for o in pairF["orders"].values()] == ["open", "open"]
+
+    class Walked(dict):
+        walks = 0
+
+        def values(self):
+            Walked.walks += 1
+            return super().values()
+    again.ledger.rows = Walked(again.ledger.rows)
+    assert again.before_send(pairF["orders"]["up"]["body"]) == "" and again.before_send(pairF["orders"]["down"]["body"]) == ""
+    assert Walked.walks == 0, f"before_send walked every record {Walked.walks} times for one pair's two orders"
+    assert again.before_send(by_slug[B]["orders"]["up"]["body"]) == "市场已进入撤单阶段，不再发送"  # a closed pair's order: found, refused
+    assert again.before_send({"data": {"order": {"hash": "0xnobody"}}}) == "市场已进入撤单阶段，不再发送"  # nobody's: refused as before
+    again.ledger.rows = dict(again.ledger.rows)
+
+    # --- an hour on, the loop's own pass takes R, two days over by now; F rests on; U, given up meanwhile, stays (a doubt)
+    clock2.ms = later + 3_600_000
+    loop = asyncio.create_task(again.cancellation_loop())
+    for _ in range(300):
+        if R not in again.ledger.rows and again.ledger.rows[U].get("accounted"):
+            break
+        await asyncio.sleep(0.01)
+    again.stop.set()
+    await asyncio.gather(loop, return_exceptions=True)
+    for task in again.settling.values():
+        task.cancel()
+    await _settled(again)
+    assert not loop.cancelled() and loop.exception() is None, loop
+    assert set(again.ledger.rows) == (kept - {R}) | {F} and pairF["phase"] == "active", sorted(again.ledger.rows)
+    assert again.ledger.rows[U]["orders"]["down"]["state"] == "not_found" and again.ledger.rows[U]["accounted"]
+    assert set(_tables(db)[1]) == old | {R} and again.ledger.archived_count == 8
+    everything = lambda: [*again.ledger.rows.values(), *(by_slug[slug] for slug in old | {R})]  # the working records, and the archived ones as they were
+    assert bot.preopen_review() == _p.review(everything(), clock2.ms)
+
+    # a pass that cannot be written stops nothing: said, every record where it was
+    def full_disk(now_ms):
+        raise sqlite3.OperationalError("database or disk is full")
+    real_pass, again.ledger.archive_old = again.ledger.archive_old, full_disk
+    again.archive(clock2.ms + _DAY)
+    assert "旧记录归档失败：database or disk is full" in again.error and len(again.ledger.rows) == 6
+    again.ledger.archive_old = real_pass
+    after = _p.review(everything(), clock2.ms)
+    again.ledger.close()
+    assert bot.preopen_review() is None, "an archive that cannot be read (the ledger closed here): no figures rather than short ones"
+    # ...the mode off: the review and the fills read off the file, the archive with it
+    bot.preopen = None
+    assert bot.preopen_review() == after and bot.preopen_filled() == ref["fills"]
+
+    # --- a controller on a ledger that cannot take the move starts all the same, with every record (as before the fix);
+    # opening the ledger wrote nothing new — the archive's table is made by the first move — and no archive reads as none
+    fail_db = str(Path(folder) / "fail.preopen.sqlite3")
+    real_pass = _p.Ledger.archive_old
+    _p.Ledger.archive_old = lambda self, now_ms: full_disk(now_ms)
+    try:
+        hurt, _, _ = _controller_at(later, PREOPEN_DB=fail_db, **_ENV)
+    finally:
+        _p.Ledger.archive_old = real_pass
+    assert set(hurt.ledger.rows) == old | kept and "旧记录归档失败" in hurt.error
+    assert not hurt.ledger.has_archive() and hurt.ledger.archived_count == 0 and list(hurt.ledger.archived()) == [] and list(_p.read_archive(fail_db)) == []
+    assert "已归档" not in hurt.status()
+    hurt.archive(later)
+    assert set(hurt.ledger.rows) == kept and hurt.ledger.has_archive() and hurt.ledger.archived_count == 7
+    hurt.ledger.close()
+    # the move goes a chunk a transaction — in the archive and out of the working records together, or neither: the second
+    # chunk's delete fails (a full disk), so the first chunk has moved, the second not at all, and the next pass finishes
+    half_db = str(Path(folder) / "half.preopen.sqlite3")
+    half = _p.Ledger(half_db)
+
+    class SecondDeleteFails:
+        deletes = 0
+
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self.conn.__enter__()
+
+        def __exit__(self, *exc):
+            return self.conn.__exit__(*exc)
+
+        def execute(self, *args):
+            return self.conn.execute(*args)
+
+        def executemany(self, sql, rows):
+            if sql.startswith("DELETE"):
+                SecondDeleteFails.deletes += 1
+                if SecondDeleteFails.deletes == 2:
+                    raise sqlite3.OperationalError("database or disk is full")
+            return self.conn.executemany(sql, rows)
+    real_conn, half.conn = half.conn, SecondDeleteFails(half.conn)
+    real_chunk, _p.ARCHIVE_CHUNK = _p.ARCHIVE_CHUNK, 3
+    try:
+        half.archive_old(later)
+        raise AssertionError("the failed chunk must raise")
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        half.conn = real_conn
+    pairs, archive = _tables(half_db)
+    assert len(archive) == 3 and set(archive) < old and half.archived_count == 3, sorted(archive)
+    assert pairs == set(half.rows) == (old | kept) - set(archive), "what is in the archive is in the working records no more, on disk and in memory alike"
+    try:
+        assert half.archive_old(later) == 4 and half.archived_count == 7  # the rest, two chunks
+    finally:
+        _p.ARCHIVE_CHUNK = real_chunk
+    assert _tables(half_db) == (kept, {slug: by_slug[slug] for slug in old}) and set(half.rows) == kept
+    half.close()
+    # a card's latest window stays whatever its age (R, a month old here): the listing horizon a start reads off the records
+    # is as it was
+    last, _, _ = _controller_at(later + 30 * _DAY, PREOPEN_DB=str(Path(folder) / "last.preopen.sqlite3"), **_ENV)
+    assert set(last.ledger.rows) == kept and (last.listed_until_ms, last.listed_by_card) == (at(25 * 60), {"BTC-15M": at(25 * 60)})
+    last.ledger.close()
+
+    # --- the mode off: nobody else would ever move them — the positions check reads that file whole twice a minute
+    off_db = str(Path(folder) / "off.preopen.sqlite3")
+    clock3 = types.SimpleNamespace(ms=later)
+    off = _pnl_bot(clock3, off_db, False, asyncio.Event())
+    passes, real_file = [], _p.archive_file
+    _p.archive_file = lambda path, now_ms: (passes.append(path), real_file(path, now_ms))[1]
+    try:
+        await off.preopen_apply()
+        await off.preopen_apply()  # (a settings apply a moment later: not again within the hour)
+    finally:
+        _p.archive_file = real_file
+    assert off.preopen is None and passes == [off_db], passes
+    assert {x["slug"] for x in _p.read_rows(off_db)} == kept and set(_tables(off_db)[1]) == old
+    assert off.preopen_review() == ref["review"] and off.preopen_filled() == ref["fills"] and off.preopen_unverified() == ref["unverified"]
+    nowhere = str(Path(folder) / "none.preopen.sqlite3")
+    await _pnl_bot(clock3, nowhere, False, asyncio.Event()).preopen_apply()
+    assert not Path(nowhere).exists(), "no ledger file is made for a mode that never ran"
+
+    # --- the index answers as the walk did, whatever the records: a hash two records hold, a record renamed, replaced, gone
+    led = _p.Ledger(":memory:")
+    walk = lambda h: next((x for x in led.rows.values() if any(o.get("hash") == h for o in x["orders"].values())), None)
+    row = lambda slug, *hs: {"slug": slug, "phase": "closed", "orders": {f"s{n}": {"hash": h, "state": "final"} for n, h in enumerate(hs)}}
+    same = lambda: all(led.holder(h) is walk(h) for h in ("h1", "h2", "h3", "h9", "nobody"))
+    led.save(row("a", "h1", "h2"))
+    led.save(row("b", "h3"))
+    assert same() and led.holder("h1") is led.rows["a"] and led.holder("nobody") is None
+    led.save(row("c", "h1"))  # a cloned record: two hold h1 — the first holder, as the walk says
+    assert same() and led.holder("h1") is led.rows["a"]
+    led.rename("a", "a@0")  # ...which steps aside to the end
+    assert same() and led.holder("h1") is led.rows["c"]
+    led.delete("c")
+    assert same() and led.holder("h1") is led.rows["a@0"]
+    led.save(row("b", "h9"))  # a record replaced under its key: its old hash is nobody's
+    assert same() and led.holder("h3") is None and led.holder("h9") is led.rows["b"]
+    led.save_many([row("d", "h3")])  # ...until another record has it
+    assert same() and led.holder("h3") is led.rows["d"]
+    led.close()
+
+
+with tempfile.TemporaryDirectory() as _folder:
+    asyncio.run(_ledger_growth(_folder))
+
 print("AUDIT_PREOPEN_OK")
