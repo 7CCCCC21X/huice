@@ -1065,4 +1065,98 @@ async def ctrl_edge_seq():
 
 
 asyncio.run(ctrl_edge_seq())
+
+
+async def ctrl_refresh_wake():
+    """CTRL-REFRESH-WAKE: the orderbook job (refresh_books) is ticked every second and a round runs every
+    PREDICT_POLL_SECONDS. (1) A round that is due while the feed's 429 cooldown holds is refused at once ("failed", no
+    request sent) on every tick until the cooldown ends, and each refusal woke the trader as a round of books does: a look
+    a second instead of one every SIM_SECONDS, on books that had not changed — the real trader reading its open orders
+    again each time, while Predict was limiting the key. (2) The hot set and the targets (every card priced) were worked
+    out on every tick, also the nine in ten on which the feed then answered "not due". Now only a round that brought books
+    wakes the trader (a refusal does not, nor a round whose every read failed), and a tick between two rounds works
+    nothing out. Forty seconds of both jobs, tick by tick, on a clock moved by hand: the real feed (its 429 drawn through
+    fetch, its cooldown, its rounds) and the real trader's step; only a key's read (refresh_timed) and Predict's answer
+    are stand-ins."""
+    real_time, real_blocking = m.time, m.predict_blocking
+
+    class Clock:  # main's view of the time module: the monotonic clock stands still between the ticks, the rest is real
+        t = float(int(real_time.monotonic()) + 60)
+
+        def monotonic(self):
+            return self.t
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+    sent = []  # the ticks on which a request went out to Predict
+
+    async def limited(fn, *args):  # Predict's answer to it: 429, no Retry-After (PREDICT_BACKOFF_SECONDS of cooldown)
+        sent.append(tick)
+        raise m.RemoteError("HTTP 429: Too Many Requests")
+    clock = Clock()
+    m.time, m.predict_blocking = clock, limited
+    try:
+        bot = m.Bot(m.Config.from_env({**base, "PREDICT_POLL_SECONDS": "10", "SIM_SECONDS": "5"}), m.Store(":memory:"), FM(NOW), None)
+        c, feed = bot.config, bot.predict
+        assert c.sim and c.predict and (c.predict_poll, c.sim_seconds, m.PREDICT_BACKOFF_SECONDS, m.REFERENCE_TICK) == (10, 5, 20, 1)
+        tick = 0
+        at = {"hot": [], "targets": [], "want": [], "read": []}  # the ticks on which each was done
+        real_hot, real_targets, real_want = bot.predict_hot, bot.predict_targets, feed.stream.want
+        last = list(real_targets(NOW))[-1]
+        bot.predict_hot = lambda now: at["hot"].append(tick) or real_hot(now)
+        bot.predict_targets = lambda now: at["targets"].append(tick) or real_targets(now)
+        feed.stream.want = lambda ids: at["want"].append(tick) or real_want(ids)
+
+        async def read(key, slug, hot_rows=None):  # one key's books read, as refresh_one answers for it
+            at["read"].append(tick)
+            if tick == 0 and key == last:  # the first round's last request draws the 429: the other keys' books came
+                try:
+                    await feed.fetch(m.PREDICT_REST + "/v1/markets/1/orderbook")
+                except m.RemoteError as error:
+                    feed.errors[key] = m.clean_error(error)
+                return 0
+            feed.errors.pop(key, None)
+            return 1
+        feed.refresh_timed = read
+        status, errors, woke, looks = [], {}, [], []
+        for tick in range(40):
+            now = bot.market.now = NOW + tick * 1000
+            result = await bot.refresh_books(now)  # the "Predict 盘口" job's tick
+            status.append(result.status if isinstance(result, m.Refreshed) else result)
+            errors[tick] = result.error if isinstance(result, m.Refreshed) else ""
+            if bot.sim_wake:
+                woke.append(tick)
+            if await bot.sim_step(now) is not False:  # the "模拟交易" job's tick: the trader looks when its timer or a wake says so
+                looks.append(tick)
+            clock.t += m.REFERENCE_TICK
+        # the rounds that ran: the one that drew the 429, the first after the cooldown, the one after that. In between the
+        # round is due again from the tenth second and refused until the twentieth, without a request
+        ran, refused = {0: "partial", 20: "ok", 30: "ok"}, list(range(10, 20))
+        assert status == [ran.get(t, "failed" if t in refused else False) for t in range(40)], status
+        assert "HTTP 429" in errors[0] and all("Predict 接口限流，冷却" in errors[t] for t in refused), errors
+        assert sorted(set(at["read"])) == list(ran) and sent == [0] and feed.calls == 1 and len(feed.limited) == 1, (at["read"], sent)
+        assert woke == list(ran), woke  # was [0, 10, 11, …, 19, 20, 30]: woken by every refusal
+        assert looks == [0, 5, 10, 15, 20, 25, 30, 35], looks  # was [0, 5, 10, 11, …, 19, 20, 25, 30, 35]: a look a second through the cooldown
+        assert at["hot"] == at["targets"] == [0, *refused, 20, 30], (at["hot"], at["targets"])  # was every one of the forty ticks
+        assert at["want"] == [0, *refused, 20, 30], at["want"]  # as before: the stream follows the hot set through the cooldown too
+        # the feed's own word for "due", asked by refresh_books and by refresh alike: PREDICT_POLL_SECONDS since a round began.
+        # The fortieth second: the round of the thirtieth is ten seconds old
+        assert feed.round_due() and await bot.refresh_books(now) == m.Refreshed("ok") and bot.sim_wake
+        clock.t += c.predict_poll - 0.5
+        assert not feed.round_due() and await bot.refresh_books(now) is False and await feed.refresh(real_targets(now)) is False
+        clock.t += 0.5
+        assert feed.round_due()
+
+        async def down(key, slug, hot_rows=None):  # every key's read fails (Predict down): the round runs and brings nothing...
+            feed.errors[key] = "HTTP 502: Bad Gateway"
+            return 0
+        feed.refresh_timed, bot.sim_wake = down, False
+        result = await bot.refresh_books(now)  # ...and does not wake the trader either
+        assert result.status == "failed" and "HTTP 502" in result.error and not feed.round_due() and not bot.sim_wake, result
+    finally:
+        m.time, m.predict_blocking = real_time, real_blocking
+
+
+asyncio.run(ctrl_refresh_wake())
 print("AUDIT_CONTROL_OK")

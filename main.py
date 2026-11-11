@@ -6121,13 +6121,20 @@ class PredictFeed:
         finally:
             self.key_ms[key] = int((time.monotonic() - started) * 1000)
 
+    def round_due(self) -> bool:
+        """Whether a round is due: PREDICT_POLL_SECONDS since the last one began — refresh's own first test, which
+        Bot.refresh_books asks before it works out a round's hot set and targets (1.150.0). The 429 cooldown is no part
+        of it: a round that is due while the cooldown holds is refused by refresh ("failed", at once, without moving
+        ``refreshed``), so it stays due — and is refused again on every tick — until the cooldown ends."""
+        return time.monotonic() - self.refreshed >= self.config.predict_poll
+
     async def refresh(self, targets: dict[str, str], force: bool = False, hot: set[str] | None = None,
                       hot_rows: set[str] | None = None) -> Refreshed | bool:
         """targets: item key -> slug. False = not due yet. ``hot``: the keys refreshed every round (the daily cards, the
         markets with orders, those near a trade); the others only every PREDICT_COLD_POLL_SECONDS — a few dozen ladder
         levels nobody is near cost a round most of its time. None = every key, every round. ``hot_rows``: of a hot
         ladder, the market ids read every round (refresh_ladder); None = all of its levels."""
-        if not force and time.monotonic() - self.refreshed < self.config.predict_poll:
+        if not force and not self.round_due():
             return False
         if (left := self.blocked_until - time.monotonic()) > 0:
             return Refreshed("failed", f"Predict 接口限流，冷却 {int(left) + 1} 秒后再试（盘口暂按上次结果显示）")
@@ -23194,7 +23201,14 @@ class Bot:
 
     async def refresh_books(self, now_ms: int) -> Refreshed | bool:
         """The orderbook round: the hot keys every round, the cold ones now and then (PredictFeed.refresh); a round
-        that brought books wakes the trader at once (sim_wake) instead of leaving it to its own timer."""
+        that brought books wakes the trader at once (sim_wake) instead of leaving it to its own timer. False = not due
+        yet, asked of the feed before anything is worked out for the round."""
+        if not self.predict.round_due():
+            # 1.150.0 (audit CTRL-REFRESH-WAKE): this job is ticked every second (REFERENCE_TICK) and a round runs every
+            # PREDICT_POLL_SECONDS. The hot set (every market priced, each ladder level's taker gap and maker verdict)
+            # and the targets (every daily card's odds) were worked out on each tick, on the event loop, and handed to
+            # a feed that answered "not due" — nine times in ten at the default ten seconds
+            return False
         hot = rows = None
         if self.config.sim:
             try:
@@ -23202,7 +23216,15 @@ class Bot:
             except Exception as error:  # the round goes on with every key
                 self.log_limited("predict-hot", f"分级轮询计算失败：{clean_error(error) or type(error).__name__}")
         result = await self.predict.refresh(self.predict_targets(now_ms), hot=hot, hot_rows=rows)
-        if result is not False and self.config.sim:
+        # 1.150.0 (audit CTRL-REFRESH-WAKE): only a round that brought books (ok, partial) wakes the trader; "failed" —
+        # none came — does not. That is also the feed's answer, at once and without a request, to a round due while its
+        # 429 cooldown holds, on every one-second tick until the cooldown ends, and `result is not False` woke the trader
+        # on each of them: a look every SIM_STEP_MIN_SECONDS instead of every SIM_SECONDS on books that had not changed —
+        # the real trader reading its open orders again each time, on the same API key, just while Predict was limiting
+        # it. Nothing is lost: its own timer, a fair price that moved (note_job) and a book stored or pushed (the
+        # express lane) bring the trader as before, and the stream goes on following the hot set below — its pushes are
+        # the only books coming in meanwhile.
+        if isinstance(result, Refreshed) and result.status != "failed" and self.config.sim:
             self.sim_wake = True
         if result is not False:
             self.predict.stream.want(self.predict.stream_targets(hot, rows))  # the stream follows the round's hot set (1.86.0)
