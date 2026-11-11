@@ -6039,8 +6039,9 @@ class LiveBot(core.Bot):
 
     async def _live_cancel_command(self, words: list[str], now_ms: int) -> str:
         trades = self.sim_trades()
-        targets = {tid: t for tid, t in trades.items() if isinstance(t.get("live"), dict) and t["status"] == "resting"
-                   and t["live"].get("state") in {"open", "placing", "pending", "unknown"}}
+        withdrawable = lambda t: (isinstance(t.get("live"), dict) and t["status"] == "resting"
+                                  and t["live"].get("state") in {"open", "placing", "pending", "unknown"})
+        targets = {tid: t for tid, t in trades.items() if withdrawable(t)}
         if not words:
             return "用法：/live cancel all（撤掉本策略的全部真实挂单）、/live cancel account（撤掉账户上的全部挂单，含手动单）或 /live cancel <订单号>；/live release <订单号> 把状态未知的订单按不存在处理"
         extra: list[str] = []  # the account's orders this bot has no record of
@@ -6052,6 +6053,22 @@ class LiveBot(core.Bot):
             pre_ids, pre_hashes = preopen.known() if preopen is not None else (set(), set())
             extra = [str(r.get("id")) for r in await self.live.api.orders("OPEN")
                      if str(r.get("id")) not in known and str(r.get("id")) not in pre_ids and (order_hash_of(r) or "-") not in pre_hashes]
+            # 1.150.0 (audit FR-CANCEL-ACCOUNT-STALE-KEY): that read is the whole account's — every page, many of them beside the
+            # pre-open mode's thousands — and nothing holds the express lane meanwhile: this command takes no sim_lock, and the lane
+            # sends its cancels and quotes a freed slot again outside it (sim_express_after, live_requote_freed). A record taken
+            # above could be withdrawn by the lane and moved to tid#1 (partly filled: moved there by the re-quote), its slot quoted
+            # again — a fresh real order sent under the slot key — before the read answered. The loop below then withdrew the old
+            # object once more and saved it back under the slot key, over the fresh order's record in memory and in the store: that
+            # order rested with no record (outside LIVE_MAX_OPEN_USD and the share caps; the slot free again in the bot's eyes, so
+            # the next look sent a second order beside it), and the old record lived under two keys (partly filled: its shares
+            # counted twice in the caps, the P&L and the day's loss figure, two rows of them after a restart), the reply saying
+            # 确认撤掉 all the same. The stale key live_save cures for the sync, the blind cancel and the late-fill check
+            # (LIVE-DOUBLE-CANCEL, XR-LATEFILL-STALE-KEY). So only a record still at the key taken — this very object: the view is
+            # rebuilt only when there is none (startup), every write of a sim: record keeps it current — and still resting there
+            # is withdrawn and saved below; one the lane withdrew or moved meanwhile is the lane's to cancel. The set only narrows:
+            # nothing more is withdrawn or sent ("all" and a single order id take their records with no wait before the loop)
+            view = self.sim_trades()
+            targets = {tid: t for tid, t in targets.items() if view.get(tid) is t and withdrawable(t)}
         elif words[0] != "all":
             targets = {tid: t for tid, t in targets.items() if str(t["live"].get("order_id")) == words[0]}
             if not targets:

@@ -1948,4 +1948,76 @@ for how in ("resend", "heartbeat", ""):
     assert (takers, orders) == ([], []), (how, takers, orders)
     # before ("resend", "heartbeat"): ([('吃跌', 0.408, 100.0)], [('create', '1012', 0.4)]) — a real LIMIT BUY of 跌 (token 1012) at
     # 40¢ × 100, sized and priced on our own cancelled 60¢ bid; with nothing re-stamped ("") nothing was bought before either
+
+
+async def cancel_account_stale_key():
+    """FR-CANCEL-ACCOUNT-STALE-KEY: /live cancel account took its records (the strategy's resting orders), then awaited the whole
+    account's open orders (every page) — no sim_lock held, the express lane running beside it. The lane withdrew the resting maker
+    (its edge under SIM_MAKER_EXIT_CENTS), moved the record to 挂#1, had the cancel confirmed and quoted the slot again
+    (live_requote_freed): a fresh real order at 挂. The command then withdrew the old object once more and saved it back under 挂,
+    over the fresh order's record: that order rested with no record (outside LIVE_MAX_OPEN_USD and the share caps) and the next
+    look sent a second one beside it; the old record lived under two keys — partly filled, its shares counted twice in the
+    exposure and stored twice (60 shares of a 30-share fill after a restart) — and the reply said 确认撤掉. Only a record still
+    resting at the key the command took is withdrawn and saved now."""
+    rows = lambda pairs: sorted((k.rsplit("|", 1)[-1], str((v.get("live") or {}).get("order_id")), (v.get("live") or {}).get("state"),
+                                 v.get("status"), round(float(v.get("shares") or 0), 6)) for k, v in pairs)
+    for filled in (0, 30):  # a maker that filled nothing (moved to 挂#1 as withdrawn), and one 30 shares filled (moved by the re-quote)
+        bot = make_bot(SIM_WAYS="maker", SIM_MAKER_EXIT_CENTS="6", SIM_MAKER_MIN_BID="100")
+        await bot.live_prepare()
+        api = bot.live.api
+        slot = f"{HSI_SLUG}|up|挂"
+        world["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
+        await bot.live_prefetch(NOW)
+        await bot.sim_express("HSI")
+        old = bot.sim_trades()[slot]
+        oid = old["live"]["order_id"]
+        assert old["live"]["state"] == "open" and sorted(api.open) == [oid], (filled, old["live"]["state"], sorted(api.open))
+        if filled:
+            api.fill(oid, filled)
+            await step(bot, NOW + 500, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 500))
+            assert (old["status"], old["shares"], old["live"]["state"]) == ("resting", filled, "open"), (old["status"], old["shares"], old["live"]["state"])
+        came, go, real = asyncio.Event(), asyncio.Event(), api.orders
+
+        async def orders(status="OPEN", **params):  # the whole account's read (no filter: every page), held on its way
+            got = await real(status, **params)
+            if not params and not came.is_set():
+                came.set()
+                await go.wait()
+            return got
+        api.orders = orders
+        bot.market.now = NOW + 1_000
+        cmd = asyncio.ensure_future(bot.live_cancel_command(["account"], NOW + 1_000))
+        await asyncio.wait_for(came.wait(), 20)
+        # meanwhile the lane: 60¢ fair against the 55¢ bid, under the 6¢ exit line -> withdrawn, the cancel confirmed, quoted again
+        bot.market.now = NOW + 1_300
+        world["markets"] = [hsi(0.60, [("0.50", "300")], [("0.53", "400")], NOW + 1_300)]
+        await bot.sim_express("HSI")
+        await bot.live_fills_wait()
+        fresh = bot.sim_trades()[slot]
+        fid = fresh["live"]["order_id"]
+        assert fresh is not old and fid != oid and bot.sim_trades()[f"{slot}#1"] is old and sorted(api.open) == [fid], (filled, fid, sorted(api.open))
+        go.set()
+        reply = await cmd
+        trades = bot.sim_trades()
+        assert trades[slot] is fresh and [k for k, v in trades.items() if v is old] == [f"{slot}#1"], (filled, [k for k, v in trades.items() if v is old])
+        want = [("挂", fid, "open", "resting", 0.0), ("挂#1", oid, "done", "filled" if filled else "cancelled", float(filled))]
+        assert rows(trades.items()) == want, (filled, rows(trades.items()))
+        assert rows((k.removeprefix("sim:"), v) for k, v in bot.store.items("sim:")) == want, (filled, sorted(bot.store.items("sim:")))  # store = memory
+        resting = {str(v["live"].get("order_id")) for v in trades.values() if isinstance(v.get("live"), dict) and v["live"].get("state") == "open"}
+        assert set(api.open) <= resting, (filled, sorted(api.open), sorted(resting))  # every order resting on Predict has its record
+        assert abs(bot.live_exposure(trades) - bot.live_reserved(fresh) - bot.live_reserved(old)) < 1e-9, (filled, bot.live_exposure(trades))  # each once
+        assert "确认撤掉" not in reply, reply  # the lane withdrew the order, not this command
+        # the next look places nothing beside the fresh order (the slot is not free in the bot's eyes)
+        creates = sum(c[0] == "create" for c in api.calls)
+        bot.market.now = NOW + 2_800
+        world["markets"] = [hsi(0.60, [("0.50", "300")], [("0.53", "400")], NOW + 2_800)]
+        bot.live_backoff.clear()
+        await bot.sim_express("HSI")
+        assert sum(c[0] == "create" for c in api.calls) == creates and sorted(api.open) == [fid], (filled, sorted(api.open))
+        # a restart on that store: one record per order, the 30 filled shares recorded once
+        again = L.LiveBot(bot.config, bot.store, T["FM"](NOW + 3_000), None)
+        assert rows(again.sim_trades().items()) == want, (filled, rows(again.sim_trades().items()))
+
+
+asyncio.run(cancel_account_stale_key())
 print("AUDIT_XREVIEW_OK")
