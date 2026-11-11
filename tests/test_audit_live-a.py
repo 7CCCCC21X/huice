@@ -221,8 +221,9 @@ async def double_cancel():
     order — put the finished record back to "unknown" (its $ reserved, the side blocked, a false ❓ alert); a taker's attempt
     was failed twice (stored at slot#1 and slot#2), and a second final read answering after a fresh taker had taken the slot
     deleted that live order's record: resting on Predict with no record. One path at a time now removes an order and reads
-    Predict's final word on it (live_cancels). Every case here is ordered by the fake's own events — which request has
-    reached Predict, which answer is let go — never by the clock."""
+    Predict's final word on it (live_cancels), and what that path records is saved where the record lives, whatever key
+    the pass still holds (live_save). Every case here is ordered by the fake's own events — which request has reached
+    Predict, which answer is let go — never by the clock."""
     book_, market_json = T["book"], T["market_json"]
     A50 = "ftse-china-a50-up-or-down-on-october-5-2026"
     BIDS, ASKS = [("0.55", "300")], [("0.58", "400")]
@@ -504,6 +505,65 @@ async def double_cancel():
     await step(bot, T1 + 5_000, card(0.40, T1 + 5_000))
     await bot.live_fills_wait()
     ended_once(bot, t, oid, n, T1 + 5_000)
+
+    # (10) withdrawn by the HSI lane with nothing filled — the record moves to tid#1, saved there "cancelling" — while a step's sync,
+    # begun before (the record open, at its slot), has its open list on its way; and the SYNC is the path that gets to the cancel:
+    # it removes the order and ends the record, holding the slot key the record has left. Nothing saved that: the sync wrote
+    # nothing under a key the record had left, the lane left the order to the sync (one path at a time), and the fills read does
+    # not know the removed order — the store kept the row "cancelling", its cancel unsent, beside a record done in memory, and a
+    # restart sent the removal again ("noop") and made the confirmed cancel "unknown". The same with the list read failing: the
+    # sync's cancels then go by order id (live_cancel_blind), under the same old key. Held: the lane's own cancels wait until the
+    # sync has the order — or nothing held, the real entry points alone: the list's answer let go and the lane started in one
+    # loop turn (which of the two then removes the order is the loop's to say; either way the record's end is saved)
+    for fails in (False, True):
+        for held in (True, False):
+            bot, tid, t, oid, n = await resting("maker", SIM_MAKER_EXIT_CENTS="5")
+            unknown_once_removed(bot.live.api)
+            ls = Held(bot.live.api, "orders", n=1, before=fails)  # (failing: the request still on its way, refused once let go)
+            rm = Held(bot.live.api, "remove_orders", lambda ids: list(ids) == [oid])
+            T1, moved = NOW + 5_000, f"{tid}#1"
+            stepping = asyncio.create_task(step(bot, T1, card(0.70, T1)))  # (nothing for the step itself to withdraw)
+            await asyncio.wait_for(ls.came[0].wait(), WAIT)  # the sync's list on its way: the record open, at its slot
+            assert t["live"]["state"] == "open" and bot.sim_trades().get(tid) is t, (t["live"]["state"], keys(bot, tid))
+            bot.live.api.fail_open = "HTTP 502: bad gateway" if fails else None
+            if held:
+                blind, lane_at, lane_go = bot.live_cancel_blind, asyncio.Event(), asyncio.Event()
+
+                async def lane_cancels(records, now_ms, blind=blind, lane_at=lane_at, lane_go=lane_go, moved=moved):
+                    if moved in records:  # the lane's own cancels, the record it has just moved among them (the sync's hold the slot key)
+                        lane_at.set()
+                        await lane_go.wait()
+                    return await blind(records, now_ms)
+                bot.live_cancel_blind = lane_cancels
+                lane = asyncio.create_task(hsi_pass(bot, T1 + 300, 0.40))
+                await asyncio.wait_for(lane_at.wait(), WAIT)  # withdrawn and moved by the lane, its cancel not begun...
+                ls.go[0].set()
+                await asyncio.wait_for(rm.came[0].wait(), WAIT)  # ...when the sync, its list answered, has the removal on its way
+                lane_go.set()
+            else:
+                ls.go[0].set()
+                lane = asyncio.create_task(hsi_pass(bot, T1 + 300, 0.40))
+                await asyncio.wait_for(rm.came[0].wait(), WAIT)
+            rm.go[0].set(); rm.go[1].set(); await stepping; await lane
+            await bot.live_fills_wait()
+            assert keys(bot, tid) == [moved] and bot.sim_trades()[moved] is t and t["live"].get("rekeyed") == moved, (keys(bot, tid), t["live"].get("rekeyed"))
+            assert not held or t["live"]["cancel_sent"] == T1, (t["live"]["cancel_sent"], T1)  # the removal was the sync's (the lane's pass began at T1 + 300)
+            ended_once(bot, t, oid, n, T1 + 300)  # ...and saved so, where the record lives
+            assert stored(bot, tid) == [f"sim:{moved}"], stored(bot, tid)  # nothing written back under the slot's key
+            # a restart on that store finds nothing to redo: no second removal, the confirmed cancel never "unknown"
+            bot.live.api.fail_open = None
+            again = T["L"].LiveBot(bot.config, bot.store, T["FM"](T1 + 60_000), None)
+            again.live.api, again.live.chain, again.sim_markets = bot.live.api, bot.live.chain, lambda now: world["markets"]
+            await again.live_prepare()
+            await step(again, T1 + 60_000, card(0.40, T1 + 60_000))
+            await again.live_fills_wait()
+            t2 = again.sim_trades()[moved]
+            assert removals(again, oid, n) == [("remove", [oid])] and t2["live"]["state"] == "done" and not said(t2, "状态未知"), (removals(again, oid, n), events(t2)[-2:])
+    # ...and only the record itself is written at its numbered key: an object that merely names that key (one held from before the
+    # view was rebuilt from the store, a record pruned since) is never put back there
+    cur = bot.sim_trades()[moved]
+    bot.live_save(tid, {**cur, "live": {**cur["live"], "state": "cancelling", "cancel_sent": 0}})
+    assert bot.sim_trades()[moved] is cur and bot.store.get(f"sim:{moved}")["live"]["state"] == "done" and stored(bot, tid) == [f"sim:{moved}"], stored(bot, tid)
 
 
 async def order_test_limits():

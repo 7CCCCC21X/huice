@@ -2335,6 +2335,25 @@ class LiveBot(core.Bot):
         """Move a record to tid#n, freeing the paper trader's one slot per market, side and way."""
         return self.sim_rekey(tid, trade)
 
+    def live_save(self, tid: str, trade: dict) -> None:
+        """A record a pass over the orders changed (live_sync_orders, live_cancel_blind), saved where it lives: under the key
+        the pass holds — or, moved to tid#n since the pass took that key, there; never again under the old key (the slot may
+        hold a fresh order by now)."""
+        moved = trade["live"].get("rekeyed")
+        if not moved or moved == tid:
+            return self.sim_save([(tid, trade)])
+        # 1.150.0: moved by live_fail (a taker that filled nothing: saved there as it moved) — or withdrawn with nothing filled
+        # (sim_rekey: the express lane's look) while the pass, begun before, still held the slot key. Such a pass saved nothing,
+        # and with one path at a time on a cancel (live_cancels) it may be the only one that acts: the step's sync has its open
+        # list on its way, the lane withdraws the order, the sync gets to the cancel first and ends the record on Predict's
+        # confirmation — the lane leaves the order to it, and the fills read saves only a record Predict still returns
+        # (live_cancel_fills_read). The store kept the row "cancelling", its cancel unsent, beside a record done in memory: after
+        # a restart the removal went out again ("noop"), and a single-order read that no longer knew the order made the
+        # confirmed cancel "unknown" — its $ reserved, the side blocked for minutes, a false ❓ alert. Only this very object at
+        # its numbered key is written: a record no longer there (pruned, the view rebuilt from the store) is not put back
+        if self.sim_trades().get(moved) is trade:
+            self.sim_save([(moved, trade)])
+
     # --- reading back: fills, cancels, the final state of each order ---------------------------------------------------
     async def live_sync(self, now_ms: int) -> None:
         trades = self.sim_trades()
@@ -2506,10 +2525,8 @@ class LiveBot(core.Bot):
             except Exception as error:
                 st["last_error"] = core.clean_error(error) or type(error).__name__
                 self.live_note_error(f"{trade['item']} {trade['label']} 订单同步失败：{st['last_error']}")
-            if st.get("rekeyed") and st["rekeyed"] != tid:
-                return  # moved to an attempt record (live_fail): saved there, never again under the old key
             if json.dumps(trade, sort_keys=True, default=str) != before:
-                self.sim_save([(tid, trade)])
+                self.live_save(tid, trade)  # where it lives: moved to an attempt record (tid#n) meanwhile, there — never again under the old key
         # 1.137.2: a resting maker order the list did not show is read by its hash LIVE_TRACK_READS a step at most, each at most every
         # LIVE_TRACK_READ_MS, the longest unread first — seventeen of them read every step, two at a time, were most of the sync's seconds
         unseen = sorted((tid for tid, t in active.items() if t["live"].get("state") == "open" and t.get("maker")
@@ -2727,10 +2744,8 @@ class LiveBot(core.Bot):
                 await self.live_cancel(tid, trade, {}, markets.get(trade["market"]), now_ms)
             except Exception as error:
                 st["last_error"] = core.clean_error(error) or type(error).__name__
-            if st.get("rekeyed") and st["rekeyed"] != tid:
-                return  # moved to an attempt record (a taker's live_fail): saved there, never again under the old key (1.138.1, as live_sync_orders)
             if json.dumps(trade, sort_keys=True, default=str) != before:
-                self.sim_save([(tid, trade)])
+                self.live_save(tid, trade)  # moved to an attempt record meanwhile: there, never again under the old key (1.138.1, as live_sync_orders)
         await asyncio.gather(*(one(tid, trade) for tid, trade in active.items()))
 
     def live_fills_later(self, tid: str, trade: dict, mk: Any) -> None:
@@ -3215,13 +3230,8 @@ class LiveBot(core.Bot):
         if st["order_id"] in (result.get("removed") or []):
             st["events"].append({"at": now_ms, "what": f"连续 {self.LIVE_MISSES} 次查不到这张单，补发的撤单请求撤掉了它（它其实还在）"})
             self.live_finish(tid, trade, {"status": "CANCELLED"}, mk, now_ms)
-        else:
-            self.live_unknown(tid, trade, f"连续 {self.LIVE_MISSES} 次查不到这张单，补发的撤单请求也未确认", now_ms)
-        moved = st.get("rekeyed")
-        if moved and moved != tid and self.sim_trades().get(moved) is trade:
-            # 1.150.0: withdrawn by the lane — and moved to tid#n — while this removal was on its way (the lane left the order to it,
-            # live_cancels): what it answered is saved where the record lives now; the sync writes only under the key it holds
-            self.sim_save([(moved, trade)])
+            return
+        self.live_unknown(tid, trade, f"连续 {self.LIVE_MISSES} 次查不到这张单，补发的撤单请求也未确认", now_ms)
 
     async def live_taker_due(self, tid: str, trade: dict, by_id: dict, mk: Any, now_ms: int) -> None:
         """A taker's LIMIT order still open: the rest is cancelled after LIVE_TAKER_WAIT_SECONDS, and sooner when the
