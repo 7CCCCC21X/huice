@@ -3134,6 +3134,25 @@ class IndexFutures:
         key = ("futures", q.source)
         if key in self.unmoved and self.seen[key][1] == q.quoted_ms:
             return f"恒指期货 {q.source} 页面启动后尚未见变动，报价时间无法确认"
+        return self.futures_stale(q, now_ms)
+
+    def futures_stale(self, q: FuturesQuote, now_ms: int) -> str:
+        """Why q is too old to trade on ("" while it is not): a futures session trades and q has not changed for
+        INDEX_STALE_MS (futures_hold's second rule, in its words) — an untimed block counted from when its values were
+        first seen, the bot's first read of it included.
+
+        1.150.0 (cross review XR-STALE-HOLD-FREEZE): futures_hold only holds the suggestions, and a held card's resting
+        order stands unjudged (Bot.sim_requote_reason): its 买1 not followed, the valid 买1 gone not seen. So a 跟买1 resting
+        when the page froze stayed at its price from before the stall, for whoever had seen the futures move, until
+        futures_problem's ten minutes paused the odds and SIM_NO_ODDS_WITHDRAW_MINUTES after that — where until this hold
+        the card priced on the still page and the order followed the book down (a bid at 58¢ left under a book that had
+        fallen to 50¢, filled when a seller came at 58¢). This is the order's reason to go (CloseOdds.stale →
+        SimMarket.price_problem), as the up/down card's stale price is. Not the first rule's: a page not yet seen to move
+        after a start is of no known age, but a live one moves within seconds — withdrawn for that, every order resting
+        at a restart during a session would be cancelled and placed again moments later. Counted from that first read, a
+        page that does not move is this rule's after three minutes like any other."""
+        if hk_futures_session(now_ms, self.holidays) not in ("日市", "夜市"):
+            return ""
         why = quote_problem(q.quoted_ms, now_ms, True, 0, self.LUNCH, INDEX_STALE_MS)
         return f"恒指期货{why}" if why else ""
 
@@ -4552,6 +4571,8 @@ class CloseOdds:
     tick: D = D("0.01")    # the price step a flat close is measured with
     widen: float = 1.0     # the σ ahead is this many times the plain estimate: the day's own move widened it (big_move_widen); 1 = not
     sigma_day: float = 0.0  # the whole day's σ (sigma_daily is the part ahead: in session the open-to-close share); 0 = sigma_daily (1.120.0)
+    stale: str = ""        # 1.150.0 (XR-STALE-HOLD-FREEZE): why the proxy price is too old to trade on (HSI: futures_stale) —
+    #                        ``warn`` holds the suggestions for it, and a resting order is withdrawn (SimMarket.price_problem)
 
     @property
     def direct(self) -> bool:
@@ -11305,9 +11326,42 @@ class StockTouchMarket(TouchMarket):
         if state != "交易中":
             return ("美股休市中：盘前盘后的价格不算数，但会影响开盘价，按收盘价报价会被知道盘后行情的人吃掉；"
                     + (f"北京时间 {stamp(opens, seconds=False)} 开盘后恢复" if opens else "开盘后恢复") + "；暂不给建议")
+        if stale := self.stale_price(now_ms):
+            return f"{stale}；暂不给建议"
+        if now_ms - self.minutes_ms > self.MINUTES_STALE_MS:
+            return "今天的 1 分钟 K 超过 5 分钟没读到；暂不给建议"
+        if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
+            return "波动率超过三天未更新；暂不给建议"
+        return ""
+
+    def price_problem(self, now_ms: int) -> str:
+        """Why an order resting on the card is withdrawn for its price (SimMarket.price_problem, Bot.sim_requote_reason; ""
+        while it is not): stale_price — the hold for it stays advice_problem's — while Yahoo's reads answer.
+
+        1.150.0 (cross review XR-STALE-HOLD-FREEZE): the hold alone keeps new orders off, and a held card's resting order
+        stands unjudged: its 买1 not followed, the valid 买1 gone not seen. So a bid resting when Yahoo's trade stuck — the
+        index refused for being 2% from it — stayed at its price for whoever saw the stock move, until the odds paused
+        (price_stale: half an hour after the stuck trade) and SIM_NO_ODDS_WITHDRAW_MINUTES after that, where until this
+        hold the card priced on that trade and the order followed the book down (a bid left at 28¢ while the book fell
+        with the stock, filled with "$210 first" worth 25.5¢ and falling to 17¢). It is withdrawn now, as on the up/down
+        cards (UpDownMarket.price_problem), and placed afresh by the first look on a fresh price. Not while the reads
+        fail: an outage pauses the odds within seconds of this rule (five minutes after the last read, the trade a few
+        seconds older), and the order is left to SIM_NO_ODDS_WITHDRAW_MINUTES as before (MOD-NVDA-CLOSE-RESTING keeps
+        in-session outages on that clock) — not withdrawn or not by which second the step happened to look. A market the
+        minutes decided has no price to be stale."""
+        if self.failures["price"] or self.history.get("kind") in {"low", "high"}:
+            return ""
+        return self.stale_price(now_ms)
+
+    def stale_price(self, now_ms: int) -> str:
+        """While the regular session runs, why the price in hand is too old to advise on ("" while it is not, and out of the
+        session, where advice_problem holds for the session itself): from before the session's open, or over PRICE_STALE_MS
+        old by its own time."""
+        if self.price is None or us_session_state(now_ms)[0] != "交易中":
+            return ""
         session = us_session(et_date(now_ms))
-        if session and self.price is not None and self.priced_ms < session[0]:
-            # 1.150.0: the session runs, and the price in hand is still from before its open — the close's: the hold above,
+        if session and self.priced_ms < session[0]:
+            # 1.150.0: the session runs, and the price in hand is still from before its open — the close's: the closed market's hold,
             # for the same reason, until a price of this session is in. Yahoo's last trade is yesterday's until its first
             # read of the new session (half a minute on any day; for as long as its reads fail, or answer with
             # yesterday's chart), and Binance's index, the one price that knows the open, is refused (note_index) for
@@ -11319,18 +11373,14 @@ class StockTouchMarket(TouchMarket):
             # book that had the open in it; with Yahoo stuck, for thirty minutes, the alert sent as well. An index
             # delivery stamped before the bell (taken in the session's first second) is a pre-market price too: the
             # next one, a second later, is the session's.
-            return f"美股已开盘，现价还是开盘前的（停在 {stamp(self.priced_ms, seconds=False)}），今天的价格还没读到；暂不给建议"
-        if self.price is not None and now_ms - self.priced_ms > self.PRICE_STALE_MS:
+            return f"美股已开盘，现价还是开盘前的（停在 {stamp(self.priced_ms, seconds=False)}），今天的价格还没读到"
+        if now_ms - self.priced_ms > self.PRICE_STALE_MS:
             # 1.150.0: the same later in the session — a price over five minutes old by its own time (PRICE_STALE_MS: what
             # prices nothing on the crypto card) is not advised on. It is Yahoo's trade standing still while its reads go
             # on answering (a stuck host; a halt): the index, once the stock is 2% from that trade, is refused for it
             # exactly as at the open, and until now the trade was advised on for the half hour price_stale gives it
             # (stuck at 10:05 with the stock up 2.5% by 10:20: 9¢ of fair price, to 10:35). The odds stay, as above.
-            return f"美股交易中，现价还停在 {stamp(self.priced_ms, seconds=False)}（超过 {self.PRICE_STALE_MS // 60_000} 分钟没更新）；暂不给建议"
-        if now_ms - self.minutes_ms > self.MINUTES_STALE_MS:
-            return "今天的 1 分钟 K 超过 5 分钟没读到；暂不给建议"
-        if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
-            return "波动率超过三天未更新；暂不给建议"
+            return f"美股交易中，现价还停在 {stamp(self.priced_ms, seconds=False)}（超过 {self.PRICE_STALE_MS // 60_000} 分钟没更新）"
         return ""
 
     def status(self) -> str:
@@ -11376,7 +11426,9 @@ class SimMarket:
     move: float | None = None  # a daily card: ln(effective / reference), the day's move so far — the proxy's after hours (1.120.0)
     sigma_day: float = 0.0   # ...and the whole day's σ it is measured against (sim_against_move)
     price_problem: str = ""  # an up/down card: why its price is too old to trade on now (UpDownMarket.price_problem; "" = fresh enough) —
-    #                          the card's ``hold`` says so too, and a resting order is withdrawn for it (sim_requote_reason, 1.150.0)
+    #                          the card's ``hold`` says so too, and a resting order is withdrawn for it (sim_requote_reason, 1.150.0).
+    #                          XR-STALE-HOLD-FREEZE: also NVDA first-touch's in the session (StockTouchMarket.price_problem) and the
+    #                          HSI after-hours card's futures (CloseOdds.stale: IndexFutures.futures_stale)
     decided: str = ""        # a first-touch market whose ``hold`` is the book's alone (Bot.touch_hold): the way Predict's book already
     # trades the question as settled against the model's fair price — "up" (the high line first) / "down". No hold lets an order be
     # opened; under the others one already resting stands, under this one it is judged as on a card that holds nothing (sim_requote_reason).
@@ -18187,7 +18239,11 @@ class Bot:
         # without a change while a session trades) may still be too still to trade on — or, first read after a start, of
         # no known age: the estimate is shown with the reason and nothing is suggested from it (futures_hold)
         hold = "期货锚点是近似值，暂不给建议" if approximate else self.hsi.futures_hold(used, now_ms)
-        return dataclasses.replace(odds, warn=hold) if hold else odds
+        # 1.150.0 (cross review XR-STALE-HOLD-FREEZE): and a quote three minutes still is too old to leave an order resting on:
+        # withdrawn (stale → SimMarket.price_problem; futures_stale says why), whatever the anchor — the approximate one holds
+        # all night as well. Nothing is placed while the card holds (sim_maker_gate): one cancel, quoted afresh once it moves
+        stale = self.hsi.futures_stale(used, now_ms)
+        return dataclasses.replace(odds, warn=hold, stale=stale) if hold else odds
 
     A50_SOFT_STALE_MS = 60 * 60_000  # A50 silent longer than this: no odds at all (shorter: odds with a warning)
     HL_STALE_MS = 10 * 60_000  # an HL mark older than this (refresh failing) is not used for new probabilities
@@ -19022,7 +19078,7 @@ class Bot:
                                      self.evidence(lambda title=title, odds=odds: self.close_evidence(title, odds, now_ms)),
                                      in_session=odds.direct and not lunch, lunch=lunch,
                                      move=math.log(float(odds.effective / odds.ref)) if odds.ref > 0 and odds.effective > 0 else None,
-                                     sigma_day=odds.sigma_day or odds.sigma_daily))
+                                     sigma_day=odds.sigma_day or odds.sigma_daily, price_problem=odds.stale))
         if not self.config.touch:
             return out
         for touch in self.touches.values():
@@ -19036,11 +19092,14 @@ class Bot:
                 # the question as settled — advice_problem alone let the trader buy what the card was holding back; that it is
                 # the book's alone goes with it (decided: the orders already resting are still judged, sim_requote_reason)
                 hold, decided = self.touch_hold(touch, odds, book, now_ms)
+                # 1.150.0 (XR-STALE-HOLD-FREEZE): a US stock's price too old to trade on (StockTouchMarket.price_problem) withdraws
+                # the order resting there, as on the up/down cards; the crypto cards' prices pause the odds instead (PRICE_STALE_MS)
+                stale = touch.price_problem(now_ms) if isinstance(touch, StockTouchMarket) else ""
                 out.append(SimMarket(spec.slug, f"{spec.symbol.removesuffix('USDT')} 先触 {low}/{high}", "touch", spec.key,
                                      odds.fair_upper, book, self.edge_need(touch.model_swing(now_ms)),
                                      hold, (high, low), {"deadline": spec.deadline_ms},
                                      self.evidence(lambda touch=touch: self.market_evidence("touch", now_ms, touch=touch)),
-                                     decided=decided))
+                                     decided=decided, price_problem=stale))
         for mkt in self.updowns.values():
             if only is not None and mkt.spec.key != only:
                 continue
@@ -20400,7 +20459,8 @@ class Bot:
             # 1.150.0: the card's own price is too old to trade on (its feed stalled while the book is fresh), and the card holds
             # its suggestion for it. An order under a hold stands unjudged (the next line) — its edge not held against the exit
             # line, a 买1 that fell away not followed — a bid left for whoever saw the move the card has not. It is withdrawn,
-            # as on a book gone stale, and placed afresh by the next look that has a fresh price
+            # as on a book gone stale, and placed afresh by the next look that has a fresh price. (Up/down cards; XR-STALE-HOLD-FREEZE:
+            # NVDA first-touch's stale trade in the session and the HSI after-hours card's still futures too)
             return f"{mk.price_problem}，撤单"
         if mk.hold and not mk.decided:
             return ""  # the fair price itself is in doubt: the order stands (sim_unpriced_reason withdraws it in time)
