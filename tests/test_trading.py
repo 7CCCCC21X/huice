@@ -411,7 +411,7 @@ async def run():
     assert lim["strategy"] == "LIMIT" and lim["pricePerShare"] == str(55 * 10 ** 16) and "slippageBps" not in lim
     o = lim["order"]
     assert o["tokenId"] == "1011" and o["makerAmount"] == str(55 * WEI) and o["takerAmount"] == str(100 * WEI) and o["side"] == 0
-    assert o["maker"] == ADDR and o["feeRateBps"] == "200" and o["expiration"] == str(CLOSE // 1000 + 7200) and o["signatureType"] == 0
+    assert o["maker"] == ADDR and o["feeRateBps"] == "200" and o["expiration"] == str(CLOSE // 1000 + 60) and o["signatureType"] == 0  # 1.150.0: a minute past the close (it was two hours past it: + 7200)
     assert o["hash"] == bot.live.wallet.order_hash(o, False, False) and o["signature"].startswith("0x") and len(o["signature"]) == 132
     assert Account.recover_message(encode_typed_data(full_message=bot.live.wallet.typed_data(o, False, False)), signature=o["signature"]) == ADDR
     assert mkt["strategy"] == "LIMIT" and "slippageBps" not in mkt and "isMinAmountOut" not in mkt and "amount" not in mkt

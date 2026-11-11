@@ -58,7 +58,9 @@ ZERO_HASH = "0x" + "0" * 64
 PROTOCOL_NAME, PROTOCOL_VERSION = "predict.fun CTF Exchange", "1"
 KERNEL_NAME, KERNEL_VERSION = "Kernel", "0.3.1"
 FAR_FUTURE = 4102444800  # 2100-01-01: a LIMIT order without an expiry, as the SDKs build it
-TAKER_ORDER_SECONDS = 300  # a taker's LIMIT order expires five minutes after it is built (its rest is cancelled sooner)
+TAKER_ORDER_SECONDS = 300  # a taker's LIMIT order expires five minutes after it is built (its rest is cancelled sooner)...
+ORDER_END_GRACE_SECONDS = 60  # ...and no later than this long after its market's end, as a maker's does (order_expiry, 1.150.0)...
+ORDER_MIN_SECONDS = 120       # ...or this long after the order is decided / built, should that be later: none is signed for less
 API_TIMEOUT = 12
 RPC_TIMEOUT = 15
 MAX_UINT256 = 2 ** 256 - 1
@@ -246,6 +248,31 @@ def build_order(wallet: Wallet, token_id: str, maker_amount: int, taker_amount: 
             "maker": wallet.maker, "signer": wallet.maker, "taker": ZERO_ADDRESS, "tokenId": str(token_id),
             "makerAmount": str(maker_amount), "takerAmount": str(taker_amount), "expiration": str(int(expiration)),
             "nonce": "0", "feeRateBps": str(int(fee_bps)), "side": 0, "signatureType": 0}
+
+
+def order_expiry(end_ms: int | None, now_ms: int) -> int:
+    """The latest expiry (epoch seconds) a model order on a market that ends at ``end_ms`` is signed with:
+    ORDER_END_GRACE_SECONDS after that end, never under ORDER_MIN_SECONDS from ``now_ms``; FAR_FUTURE (no expiry) only
+    when the market's end is not known.
+
+    1.150.0: the signed expiry is the one bound on an order that needs nothing from this bot or from Predict's API —
+    past it the exchange contract no longer matches the order — so it is what is left when a cancel cannot get through:
+    the cancel endpoint erroring, the sign-in broken, a long 429 cooldown, the process or its host down across the end
+    (stopping cancels nothing: drain_orders). The strategy wants no order on a market past its end: sim_quiet withdraws
+    every one there whatever the settings ("a bid left on a finished market is a free option for whoever holds the
+    losing side") and live_send_block sends none from then on. Yet a maker was signed for two hours past the end, and a
+    taker for its five minutes wherever the end fell: with the removal failing, the bid stayed matchable all that time
+    after the result was public, for the losing side's holders to sell into — a loss of up to LIVE_MAX_ORDER_USD an
+    order. The pre-open mode signs its orders to expire before their start for the same reason (PREOPEN.md: 撤单失败时的
+    兜底). The grace keeps an order good for its market's whole life whatever the clocks (this bot's, the chain's): the
+    withdrawal at the end comes first, the expiry is what is left when that fails. The floor replaces the old fallback
+    to FAR_FUTURE (an expiry under two minutes away meant no expiry at all — with the grace above, every order decided
+    in a market's last minute): an order decided that late is valid two minutes. Nothing is sent at or after the end
+    (live_send_block), so an order has over a minute left when it goes out — what the pre-open mode asks of its own
+    (SEND_MIN_LEFT_MS)."""
+    if not end_ms:
+        return FAR_FUTURE
+    return max(int(end_ms) // 1000 + ORDER_END_GRACE_SECONDS, int(now_ms) // 1000 + ORDER_MIN_SECONDS)
 
 
 # --- the REST API (api.predict.fun/v1): sign-in, orders, positions -----------------------------------------------------
@@ -1615,7 +1642,9 @@ class LiveBot(core.Bot):
                 "index_set": outcome["index_set"], "assumed": assumed, "fee_bps": info.fee_bps,
                 "neg_risk": info.neg_risk, "yield_bearing": info.yield_bearing, "condition_id": info.condition_id,
                 "asks": [[p, q] for p, q in core.side_levels(mk.book, side)][:core.PREDICT_DEPTH],
-                "expires": (end // 1000 + 7200) if end and end // 1000 + 7200 > now_ms // 1000 + 120 else FAR_FUTURE}
+                # a maker's signed expiry — 1.150.0: a minute past the market's end, where it was two hours past it (order_expiry:
+                # the backstop when its cancel at the end cannot get through; the taker's is set as it is built, live_place_order)
+                "expires": order_expiry(end, now_ms)}
         trade.update(status="resting", shares=0.0, filled=None, fills=[], expected_price=float(trade["price"]),
                      cost_confirmed=maker is not None,  # a maker fills at its price; a taker's cost waits for Predict's average
                      live={"state": "pending", "want": want, "attempt": 1, "order_id": "", "hash": "", "placed_at": None,
@@ -2082,7 +2111,11 @@ class LiveBot(core.Bot):
                 # the limit (the dearest level seen, or the cap: LIVE_TAKER_PRICE): the book at or under it fills now, the
                 # rest waits LIVE_TAKER_WAIT_SECONDS, or less once the fair price moves away (live_taker_due)
                 amounts = limit_amounts(True, to_wei(want.get("limit") or want.get("cap") or want["price"]), shares_wei)
-                strategy, expiration = "LIMIT", int(now_ms // 1000) + TAKER_ORDER_SECONDS
+                # 1.150.0: its five minutes end with the market, as a maker's expiry does (order_expiry): built in a market's last
+                # minutes, its rest — withdrawn at the end like any order — stayed matchable up to five minutes past it when that
+                # cancel failed. Never longer than before; live_order_deadline keeps the five minutes (nothing is released sooner)
+                strategy, expiration = "LIMIT", min(int(now_ms // 1000) + TAKER_ORDER_SECONDS,
+                                                    order_expiry(core.sim_end_ms(trade.get("settle")), now_ms))
             order = build_order(wallet, want["token"], amounts["maker"], amounts["taker"], want["fee_bps"], expiration)
             digest, signature = wallet.sign_order(order, want["neg_risk"], want["yield_bearing"])
             body: dict = {"data": {"order": {**order, "signature": signature, "hash": digest},
@@ -3299,8 +3332,12 @@ class LiveBot(core.Bot):
 
     def live_order_deadline(self, trade: dict) -> int:
         """When this order can no longer fill, on the bot's clock: a taker's LIMIT expires TAKER_ORDER_SECONDS after
-        it was built; a maker's at the expiry it was signed with, or two hours after the market's end — 0 when
-        nothing bounds it (then only Predict's word or an operator ends an unknown record)."""
+        it was built; a maker's two hours after the market's end, or at the expiry it was signed with should that be
+        later — 0 when nothing bounds it (then only Predict's word or an operator ends an unknown record). 1.150.0: an
+        order is signed to expire sooner than this now (order_expiry: a minute or two past its market's end), but what
+        waits on this — an unknown record's reservation and its side (live_recheck) — is released no sooner than it was:
+        a maker signed before that is valid the two hours, and the evidence (the open lists, the positions) ends an
+        unknown record within minutes anyway; this is only what is left when it cannot."""
         st, want = trade["live"], trade["live"].get("want") or {}
         if not trade.get("maker"):
             start = int(st.get("placed_at") or st.get("placing_at") or trade.get("opened") or 0)
@@ -3308,16 +3345,16 @@ class LiveBot(core.Bot):
         expires = int(want.get("expires") or 0)
         end = core.sim_end_ms(trade.get("settle"))
         bounds = [b for b in ((expires * 1000 if 0 < expires < FAR_FUTURE else 0), (end + 2 * 3600_000 if end else 0)) if b]
-        return min(bounds) if bounds else 0
+        return max(bounds) if bounds else 0  # the later of the two (they were one and the same until 1.150.0)
 
     async def live_recheck(self, tid: str, trade: dict, by_id: dict, by_hash: dict, mk: Any, now_ms: int) -> None:
         """An unknown record, every step: found on the list or by its hash, it is tracked again (or finished on a final
         word). Missing from LIVE_UNKNOWN_LOOKS complete open lists, unknown to the hash read and unknown for
         LIVE_UNKNOWN_SETTLE_MS, the account's positions decide (1.104.9): nothing beyond what the other records explain
         and it ends unfilled, its slot and reservation freed; a surplus is what it filled. Before, only its expiry plus a
-        margin ended it — a daily market's maker order expires two hours after the close, so the 11-04 长鑫 跌 side sat
-        blocked from 16:46 for a day ("状态未知、对账中"). The expiry path stays for a record the positions cannot
-        settle (unreadable, or the list cut)."""
+        margin ended it — a daily market's maker order expired two hours after the close then (live_order_deadline still
+        waits that long), so the 11-04 长鑫 跌 side sat blocked from 16:46 for a day ("状态未知、对账中"). The expiry path
+        stays for a record the positions cannot settle (unreadable, or the list cut)."""
         st = trade["live"]
         order = float(trade.get("order") or 0)
         row = by_id.get(str(st.get("order_id") or "-")) or by_hash.get(str(st.get("hash") or "-").lower())

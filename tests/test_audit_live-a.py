@@ -636,8 +636,139 @@ async def order_test_limits():
         assert orders(b) and all(usd <= cap + 1e-9 and cents < ASK for usd, _, cents in orders(b)), orders(b)
 
 
+async def maker_expiry():
+    """LIVE-MAKER-EXPIRY: the strategy leaves no order on a market past its end (sim_quiet withdraws every one there, whatever
+    the settings: "a bid left on a finished market is a free option for whoever holds the losing side"), but a maker was signed
+    to expire two hours after that end, and a taker five minutes after it was built wherever the end fell. The signed expiry is
+    the one bound left when the cancel cannot get through (Predict's cancel endpoint erroring, the sign-in broken, a long 429
+    cooldown) or the process is down across the end: the bid stayed matchable long after the result was public. An order is now
+    signed to expire a minute after its market's end, two minutes after it is decided should that be later, and without an
+    expiry only when no end is known (live.order_expiry). What waits on an order's expiry is released no sooner than it was:
+    an unknown maker's reservation and its side still wait two hours past the end (live_order_deadline)."""
+    L, CLOSE = T["L"], T["CLOSE"]
+    END = CLOSE // 1000  # the HSI card's close (16:10), in the seconds an order's expiration counts
+    card = lambda at: hsi(0.70, [("0.55", "300")], [("0.58", "400")], at)  # fair 70¢: a 55¢ bid worth joining (挂涨), a 58¢ ask worth taking (吃涨)
+    created = lambda bot: [body["data"] for kind, body in bot.live.api.calls if kind == "create"]
+    by_order = lambda bot, oid: next(t for t in bot.sim_trades().values() if isinstance(t.get("live"), dict) and t["live"].get("order_id") == oid)
+
+    async def looked(at):
+        """One look at the HSI card at ``at`` (SIM_WAYS=both): the bot, and the expiry each order it sent was signed with, by way (挂 / 吃)."""
+        bot = make_bot()
+        await bot.live_prepare(); await bot.live_prefetch(at)
+        await step(bot, at, card(at))
+        signed = {d["order"]["hash"].lower(): int(d["order"]["expiration"]) for d in created(bot)}  # what went to Predict, by the order's hash
+        trades = bot.sim_trades()
+        assert len(signed) == len(trades) and all(t["live"]["state"] == "open" for t in trades.values()), (at - CLOSE, sorted(trades), len(signed))
+        assert all(t["live"]["want"]["expires"] == signed[t["live"]["hash"]] for t in trades.values() if t["maker"])  # a maker: as its record says
+        return bot, {tid.rsplit("|", 1)[-1]: signed[t["live"]["hash"]] for tid, t in trades.items()}
+
+    # hours before the close: the maker a minute past it (it was two hours past it: END + 7200), the taker its five minutes as ever
+    bot, got = await looked(NOW)
+    assert got == {"挂": END + 60, "吃": NOW // 1000 + 300}, {k: v - END for k, v in got.items()}
+    # the close nearer than that: an order ends a minute past it — a taker's five minutes ran up to five minutes past the close —
+    # or two minutes after it is decided, in the market's last minute: never without an expiry while the end is known (a minute's
+    # grace with the old guard as it was — "under two minutes away: none" — left every order of the last minute without one)
+    for before, maker, taker in ((301, 60, -1),    # (a taker whose five minutes end before the close: as it was)
+                                 (240, 60, 60), (200, 60, 60), (61, 60, 60), (60, 60, 60),
+                                 (59, 61, 61), (30, 90, 90), (1, 119, 119)):
+        at = CLOSE - before * 1000
+        _, got = await looked(at)
+        assert got == {"挂": END + maker, "吃": END + taker}, (before, {k: v - END for k, v in got.items()})
+        assert all(at // 1000 + 120 <= exp < L.FAR_FUTURE for exp in got.values()) and got["吃"] <= at // 1000 + 300, (before, got)
+    # ...and an order only goes out before the end (live_send_block, unchanged): so with over a minute left, as the pre-open mode
+    # asks of its own orders (SEND_MIN_LEFT_MS); at the end and after it nothing is decided at all
+    late = bot.sim_open(card(CLOSE - 50_000), "up", CLOSE - 50_000, maker=m.BookEdge("涨", True, 0.55, 0.15, 300.0, 0.15), shares=100)
+    assert late["live"]["want"]["expires"] == END + 70 and bot.live_send_block(late, {}, CLOSE - 1) == "" and "已到结束时间" in bot.live_send_block(late, {}, CLOSE)
+    for at in (CLOSE, CLOSE + 5_000):
+        quiet = make_bot()
+        await quiet.live_prepare(); await quiet.live_prefetch(at)
+        await step(quiet, at, card(at))
+        assert not created(quiet) and not quiet.sim_trades(), (at - CLOSE, sorted(quiet.sim_trades()))
+
+    # the rule itself, and the end as each kind of market records it (a daily card's close, a touch market's deadline, a window's or
+    # a ladder's end); a market whose end is not known keeps an order without an expiry, as before
+    assert L.order_expiry(CLOSE, NOW) == L.order_expiry(CLOSE, CLOSE - 60_000) == END + 60 and L.order_expiry(CLOSE, CLOSE - 59_000) == END + 61
+    assert L.order_expiry(CLOSE, CLOSE + 3 * 3600_000) == END + 3 * 3600 + 120  # (decided after the end — sim_quiet sees to it that none is: still two minutes, not "none")
+    assert L.order_expiry(None, NOW) == L.order_expiry(0, NOW) == L.FAR_FUTURE
+    edge = m.BookEdge("涨", True, 0.55, 0.15, 300.0, 0.15)
+    opened = lambda kind, settle: bot.sim_open(dataclasses.replace(card(NOW), kind=kind, settle=settle), "up", NOW, maker=edge, shares=100)["live"]["want"]["expires"]
+    for kind, settle in (("close", {"key": "HSI", "target": "2026-10-05", "line": 24600.0, "close_ms": CLOSE}), ("touch", {"deadline": CLOSE}), ("flip", {"end": CLOSE}),
+                         ("updown", {"end": CLOSE, "start": CLOSE - 14 * 60_000, "window": 15}), ("ladder", {"target": "100", "end": CLOSE})):
+        assert opened(kind, settle) == END + 60, (kind, opened(kind, settle) - END)
+    assert opened("close", {"key": "HSI", "target": "2026-10-05", "line": 24600.0}) == opened("flip", {}) == L.FAR_FUTURE
+
+    # the harm itself, on an exchange that honours the signed expiry (its contract matches no order past it — the pre-open mode's
+    # backstop, PREOPEN.md): a 55¢ bid for 100 涨 rests from the morning on...
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare(); await bot.live_prefetch(NOW)
+    await step(bot, NOW, card(NOW))
+    fake = bot.live.api
+    oid = bot.sim_trades()[f"{HSI_SLUG}|up|挂"]["live"]["order_id"]
+    matchable = lambda at: oid in fake.open and int(fake.open[oid]["order"]["expiration"]) >= at // 1000  # resting, its signature not expired
+    # ...the process down from here on (stopping cancels nothing, drain_orders), the signature is all that bounds it: good for the
+    # market's whole life — the expiry takes nothing from the order — and dead a minute after the close (it was matchable until 18:10)
+    assert matchable(NOW) and matchable(CLOSE - 1_000) and matchable(CLOSE + 59_000), int(fake.open[oid]["order"]["expiration"]) - END
+    assert not matchable(CLOSE + 61_000) and not matchable(CLOSE + 45 * 60_000), int(fake.open[oid]["order"]["expiration"]) - END
+    # ...or the bot up, and every removal failing from the close on: withdrawn at the end as ever, asked for again each look, and
+    # still on Predict's book half an hour later, when the losing side's holders sell into whatever bid is left
+    real_remove = fake.remove_orders
+    async def failing(ids):
+        fake.calls.append(("remove", list(ids)))
+        raise m.RemoteError("HTTP 502: bad gateway")
+    fake.remove_orders = failing
+    for at in (CLOSE + 1_000, CLOSE + 61_000, CLOSE + 10 * 60_000, CLOSE + 30 * 60_000):
+        await step(bot, at, card(at))
+    t = by_order(bot, oid)
+    assert (t["status"], t["live"]["state"]) == ("cancelled", "cancelling") and "已到结束时间" in t["live"]["cancel_why"] and oid in fake.open, (t["status"], t["live"])
+    assert len([c for c in fake.calls if c == ("remove", [oid])]) >= 3 and len(created(bot)) == 1, fake.calls[-6:]
+    if matchable(CLOSE + 30 * 60_000):
+        fake.fill(oid, 100)  # (what happened: 100 shares of the side that lost, at 55¢ each)
+    fake.remove_orders = real_remove  # Predict's cancel endpoint back: the order is taken off, and nothing of it filled
+    await step(bot, CLOSE + 31 * 60_000, card(CLOSE + 31 * 60_000))
+    await bot.live_fills_wait()
+    t = by_order(bot, oid)
+    assert (t["status"], t["shares"], t["live"]["state"]) == ("cancelled", 0, "done") and oid not in fake.open, (t["status"], t["shares"], t["live"]["state"])
+    assert abs(bot.live_reserved(t)) < 1e-9 and abs(bot.live_exposure(bot.sim_trades())) < 1e-9, bot.live_exposure(bot.sim_trades())
+
+    # what waits on an order's expiry waits as long as it did. A maker Predict's reads lost (unknown: its $ reserved, its side
+    # held) with no whole list of the account's orders to settle it by: still held eleven minutes past the close — where its
+    # signature, and the ten-minute margin on it, would have let it go — and until two hours past it, as before
+    async def no_rows(status="OPEN", **params): return []
+    async def no_row(o, hash_=""): return None
+    async def not_removed(ids): return {"removed": [], "noop": list(ids)}
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare(); await bot.live_prefetch(NOW)
+    await step(bot, NOW, card(NOW))
+    fake = bot.live.api
+    tid = f"{HSI_SLUG}|up|挂"
+    oid = bot.sim_trades()[tid]["live"]["order_id"]
+    fake.orders, fake.order, fake.remove_orders = no_rows, no_row, not_removed
+    for at in (NOW + 10_000, NOW + 20_000, NOW + 30_000, NOW + 65_000):
+        await step(bot, at, card(at))
+    t = bot.sim_trades()[tid]
+    HELD = CLOSE + 2 * 3600_000
+    assert t["live"]["state"] == "unknown" and t["live"]["want"]["expires"] == END + 60 and bot.live_order_deadline(t) == HELD, (t["live"]["state"], bot.live_order_deadline(t) - CLOSE)
+    assert bot.live_status(NOW + 65_000)["unknown"][0]["deadline"] == m.stamp(HELD + bot.LIVE_UNKNOWN_MARGIN_MS, seconds=False)
+    fake.orders_complete = False  # a cut list is no look (the pre-open mode's thousands of orders): the evidence cannot end the record
+    for at in (CLOSE + 11 * 60_000 + 5_000, CLOSE + 11 * 60_000 + 10_000, HELD + bot.LIVE_UNKNOWN_MARGIN_MS - 5_000):
+        await step(bot, at, card(at))
+        t = by_order(bot, oid)
+        assert t["live"]["state"] == "unknown" and abs(bot.live_reserved(t) - 55.0) < 1e-9, (at - CLOSE, t["live"]["state"], bot.live_reserved(t))
+    await step(bot, HELD + bot.LIVE_UNKNOWN_MARGIN_MS + 5_000, card(HELD + bot.LIVE_UNKNOWN_MARGIN_MS + 5_000))
+    t = by_order(bot, oid)
+    assert t["live"]["state"] == "done" and abs(bot.live_reserved(t)) < 1e-9 and any("有效期已过" in e["what"] for e in t["live"]["events"]), t["live"]
+    # ...as do the records of before: a maker signed for its two hours, one of before the expiry was recorded at all; a taker's five
+    # minutes from its placement, whatever it is signed for now; a maker with no end to go by, nothing (Predict's word, an operator)
+    settle = {"key": "HSI", "target": "2026-10-05", "line": 24600.0, "close_ms": CLOSE}
+    deadline = lambda maker, settle, **st: bot.live_order_deadline({"maker": maker, "settle": settle, "live": st})
+    assert deadline(True, settle, want={"expires": END + 7200}) == deadline(True, settle, want={}) == deadline(True, settle, want={"expires": L.FAR_FUTURE}) == HELD
+    assert deadline(False, settle, want={"expires": END + 60}, placed_at=CLOSE - 30_000) == CLOSE + 270_000
+    assert deadline(True, {}, want={"expires": L.FAR_FUTURE}) == 0
+
+
 asyncio.run(place_timeout_race())
 asyncio.run(account_check_rpc_down())
 asyncio.run(double_cancel())
 asyncio.run(order_test_limits())
+asyncio.run(maker_expiry())
 print("AUDIT_LIVE_A_OK")
