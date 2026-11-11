@@ -323,4 +323,151 @@ async def touch_decided_hold():
 
 asyncio.run(touch_decided_hold())
 
+# --- SIM-STALE-BOOK-REQUOTE: a resting bid the fair price has fallen under is withdrawn on a stale or crossed book too -------------
+# A bid rests at 55¢ on a fair price of 70¢. Predict's book stops refreshing — its reads failing, or the feed in its own 429
+# cooldown while the trading client still works — and is stale after 90 s; the card's fair price (the index feeds', not the
+# book's: nothing holds the card) falls to 45¢. The exit line (SIM_MAKER_EXIT_CENTS, 5¢) is the rule that withdraws an order
+# whose edge is gone, and it stood behind the "no fresh view of the market" return: the bid stayed, 10¢ over the bot's own price,
+# until the stale-feed rule five minutes after the book's last read — with LIVE on a real order, for whoever saw the move.
+import live  # noqa: E402
+
+STALE = "hsi-stale-book"
+STALE_SETTLE = {"key": "HSI", "target": "2026-11-10", "line": 24600.0, "close_ms": NOW + 4 * 3600_000}
+STALE_ENV = {"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MAKER_POINTS": "off"}  # the defaults otherwise: the 5¢ exit line, the 10¢ bar
+
+
+def stale_mk(fair, read, bids=(("0.55", "300"),), asks=(("0.62", "100"),), **more):
+    """The 恒指 daily card at a fair price of ``fair``, its book (买1 55¢ × 300, 卖1 62¢) last read at ``read``."""
+    b = m.PredictBook("HSI", STALE, "401", "t", tuple((D(p), D(q)) for p, q in bids), tuple((D(p), D(q)) for p, q in asks), read, 200)
+    return m.SimMarket(STALE, "恒生指数", "close", "HSI", fair, b, 0.03, more.pop("hold", ""), ("涨", "跌"), STALE_SETTLE, {}, **more)
+
+
+def stale_bot(**env):
+    return m.Bot(m.Config.from_env({**STALE_ENV, **env}), m.Store(":memory:"), SelfFM(NOW), None)
+
+
+requote = lambda bot, rec, mk: bot.sim_requote_reason(rec, mk, NOW)
+qbot = stale_bot()
+bid55 = {"maker": True, "side": "up", "price": 0.55, "order": 100.0, "shares": 0.0, "status": "resting", "market": STALE, "kind": "close",
+         "key": "HSI", "settle": STALE_SETTLE}
+GONE = "净优势降到 -10.0¢，低于撤单线 5.0¢"
+CROSSED = (("0.54", "100"),)  # 卖1 under the 55¢ 买1: a snapshot caught mid-update, which heartbeats keep "fresh" for as long as it lasts
+assert requote(qbot, bid55, stale_mk(0.45, NOW)) == GONE  # a fresh book: as ever
+for age in (95_000, 200_000, 299_000):  # stale (PREDICT_STALE_MS, 90 s) but not yet for five minutes — before the fix: ""
+    assert requote(qbot, bid55, stale_mk(0.45, NOW - age)) == GONE, (age, requote(qbot, bid55, stale_mk(0.45, NOW - age)))
+assert requote(qbot, bid55, stale_mk(0.45, NOW, asks=CROSSED)) == GONE  # a crossed book — before the fix: ""
+assert requote(qbot, {**bid55, "side": "down"}, stale_mk(0.55, NOW - 95_000)) == GONE  # a 跌 bid at 55¢, 跌 worth 45¢
+# the stale-feed rules come first, as before: five minutes on a daily market, 90 s on a 15-minute window
+assert requote(qbot, bid55, stale_mk(0.45, NOW - 301_000)) == "盘口断流超过 5 分钟，撤单"
+win15 = {"end": NOW + 600_000, "start": NOW - 300_000, "window": "15m"}
+assert requote(qbot, {**bid55, "kind": "updown", "settle": win15},
+               m.dataclasses.replace(stale_mk(0.45, NOW - 95_000), kind="updown", settle=win15)) == "盘口断流超过 90 秒，撤单"
+# what still stands on a stale or crossed book: an order that has its edge (the line is the 5¢ exit line, not the 10¢ entry bar);
+# a held card's order (the fair price itself is in doubt: SIM_NO_ODDS_WITHDRAW_MINUTES' business); any order with the exit line off
+for fair in (0.70, 0.61):
+    assert requote(qbot, bid55, stale_mk(fair, NOW - 95_000)) == "" and requote(qbot, bid55, stale_mk(fair, NOW, asks=CROSSED)) == "", fair
+for mk in (stale_mk(0.45, NOW - 95_000, hold="σ 是先验值"), stale_mk(0.45, NOW, asks=CROSSED, hold="σ 是先验值"), stale_mk(0.45, NOW, hold="σ 是先验值")):
+    assert requote(qbot, bid55, mk) == "", requote(qbot, bid55, mk)
+assert requote(stale_bot(SIM_MAKER_EXIT_CENTS="0"), bid55, stale_mk(0.45, NOW - 95_000)) == ""
+# ... and the rules that read the book wait for a fresh one: the 买1 gone down to 50¢ is followed there, not on its stale copy
+fbot, moved = stale_bot(SIM_MAKER_FOLLOW_SETTLE_SECONDS="0"), (("0.50", "300"),)
+assert requote(fbot, bid55, stale_mk(0.70, NOW, bids=moved)) == "买1 移到 50.0¢，改跟" and requote(fbot, bid55, stale_mk(0.70, NOW - 95_000, bids=moved)) == ""
+# After hours the card is priced from a proxy and only bids with SIM_MAKER_AFTER_HOURS_CENTS (here 15¢) of edge rest, withdrawn a
+# cent under it: that line reads no book either. A 40¢ bid whose edge fell to 8¢ goes on a stale or crossed book as on a fresh
+# one (before the fix: kept, it still cleared the 5¢ exit line); in session the exit line alone applies
+abot, bid40 = stale_bot(SIM_MAKER_AFTER_HOURS_CENTS="15"), {**bid55, "price": 0.40}
+AFTER_HOURS = "盘后只挂净优势 ≥ 15.0¢ 的，现 8.0¢ 低于盘后撤单线 14.0¢"
+
+
+def night_mk(fair, read, asks=(("0.47", "100"),), in_session=False):
+    """The same card with its underlying not trading (``in_session`` False), the book at 买1 40¢ × 300, 卖1 47¢."""
+    return stale_mk(fair, read, bids=(("0.40", "300"),), asks=asks, in_session=in_session)
+
+
+assert requote(abot, bid40, night_mk(0.48, NOW)) == AFTER_HOURS  # a fresh book: as ever
+assert requote(abot, bid40, night_mk(0.48, NOW - 95_000)) == AFTER_HOURS, requote(abot, bid40, night_mk(0.48, NOW - 95_000))  # stale — before: ""
+assert requote(abot, bid40, night_mk(0.48, NOW, asks=(("0.39", "100"),))) == AFTER_HOURS  # crossed — before: ""
+assert requote(abot, bid40, night_mk(0.545, NOW - 95_000)) == ""  # 14.5¢: inside the cent of slack under the bar
+assert requote(abot, bid40, night_mk(0.48, NOW - 95_000, in_session=True)) == "" and requote(abot, bid40, night_mk(0.48, NOW - 95_000, in_session=None)) == ""
+
+
+class StaleApi:
+    """Predict as the real trader's client sees it: the market's details and our own orders, every order call noted."""
+    def __init__(self):
+        self.jwt, self.jwt_exp, self.auth_error, self.lookup = "t", 0, "", ""
+        self.open, self.closed, self.calls = {}, {}, []
+        self.markets = {"401": {"id": 401, "status": "REGISTERED", "isNegRisk": False, "isYieldBearing": False, "feeRateBps": 200,
+                                "conditionId": "0x" + "ab" * 32, "outcomes": [{"name": "Up", "indexSet": 1, "onChainId": "4011"},
+                                                                              {"name": "Down", "indexSet": 2, "onChainId": "4012"}]}}
+
+    async def ensure_auth(self): pass
+    async def market(self, mid): return self.markets[str(mid)]
+    async def positions(self): return []
+
+    async def create_order(self, body):
+        oid, order = str(101 + len(self.open) + len(self.closed)), body["data"]["order"]
+        self.calls.append(("create", oid))
+        self.open[oid] = {"id": oid, "status": "OPEN", "amount": order["takerAmount"], "amountFilled": "0", "strategy": body["data"]["strategy"],
+                          "order": {**order}}
+        return {"order_id": oid, "hash": order["hash"], "code": None}
+
+    async def remove_orders(self, ids):
+        self.calls.append(("remove", list(ids)))
+        removed = [i for i in ids if i in self.open]
+        for i in removed:
+            self.closed[i] = {**self.open.pop(i), "status": "CANCELLED"}
+        return {"removed": removed, "noop": [i for i in ids if i not in removed]}
+
+    async def orders(self, status="OPEN", **params):
+        return [dict(r) for r in (self.open.values() if status == "OPEN" else self.closed.values()) if r["status"] == status]
+
+    async def order(self, oid, hash_=""):
+        row = self.open.get(oid) or self.closed.get(oid)
+        return dict(row) if row is not None else None
+
+
+class StaleChain:
+    async def account_owner(self, account): return "0x8fd379246834eac74B8419FfdA202CF8051F7A03"
+    async def usdt_balance(self, owner=None): return 1000 * 10 ** 18
+    async def bnb_balance(self, owner=None): return 10 ** 17
+    async def allowance(self, key, owner=None): return 10 ** 30
+
+
+async def stale_book_orders():
+    """The paper trader and the real one over the same looks (the step, then the express lane): the bid placed on a fresh book
+    at a fair price of 70¢, the book then frozen at that read while the fair price moves."""
+    tid = f"{STALE}|up|挂"
+    resting, pulled = {tid: ("resting", "")}, {f"{tid}#1": ("cancelled", GONE)}
+    for real in (False, True):
+        world = {"markets": []}
+        if real:  # LIVE=on with the SDK test suite's key (never a real one); Predict's API and the chain are the stand-ins above
+            bot = live.LiveBot(m.Config.from_env({**STALE_ENV, "LIVE": "on", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, "PREDICT_API_KEY": "k"}),
+                               m.Store(":memory:"), SelfFM(NOW), None)
+            bot.live.api, bot.live.chain = StaleApi(), StaleChain()
+            await bot.live_prepare()
+            assert bot.live.ready, bot.live.ready_error
+        else:
+            bot = stale_bot()
+        bot.sim_markets = lambda now, only=None: world["markets"]
+        placed, cancel = [("create", "101")], [("create", "101"), ("remove", ["101"])]
+        for secs, fair, read, want, calls, on_predict in (
+                (0, 0.70, 0, resting, placed, ["101"]),
+                (95, 0.70, 0, resting, placed, ["101"]),  # the book stale, the edge still there: the order stands, as before
+                (100, 0.45, 0, pulled, cancel, []),       # the fair price under the bid: withdrawn now — before the fix it rested until +300 s
+                (120, 0.70, 0, pulled, cancel, []),       # the edge back, the book still stale: nothing is placed on a book nobody has read
+                (150, 0.70, 150, {**pulled, **resting}, [*cancel, ("create", "102")], ["102"])):  # read again: quoted afresh
+            at = NOW + secs * 1000
+            bot.market.now, bot.sim_ran, world["markets"] = at, -1e9, [stale_mk(fair, NOW + read * 1000)]
+            await bot.sim_step(at)
+            await bot.sim_express("HSI")
+            if real:
+                await bot.live_fills_wait()
+            got = {k: (t["status"], (t.get("withdrawn") or {}).get("why", "")) for k, t in bot.sim_trades().items()}
+            assert got == want, (real, secs, got)
+            if real:  # the cancel reached Predict, and no order went out while the book was stale
+                assert bot.live.api.calls == calls and sorted(bot.live.api.open) == on_predict, (secs, bot.live.api.calls, sorted(bot.live.api.open))
+
+
+asyncio.run(stale_book_orders())
+
 print("AUDIT_DECISION_OK")

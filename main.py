@@ -19333,7 +19333,9 @@ class Bot:
         """Why a resting order is withdrawn to be placed afresh when the chance returns (its slot is freed when nothing
         filled): the underlying is about to open or has just opened (SIM_OPEN_QUIET_MINUTES), is not in session
         (SIM_MAKER_SESSION), its edge fell under the exit line (SIM_MAKER_EXIT_CENTS), the valid 买1 is gone or has moved
-        (SIM_MAKER_MIN_BID). "" while it may stand."""
+        (SIM_MAKER_MIN_BID). "" while it may stand. On a stale or crossed book the rules that read the book wait for a
+        fresh one; those that need the fair price alone — the exit line, after hours the after-hours bar — are judged
+        all the same (1.150.0), and a held card's order stands (sim_unpriced_reason)."""
         c = self.config
         if not trade.get("maker") or mk is None:
             return ""
@@ -19357,14 +19359,29 @@ class Bot:
         stale_ms = SIM_WINDOW_STALE_WITHDRAW_MS if (trade.get("settle") or {}).get("window") else SIM_STALE_WITHDRAW_MS
         if mk.book.stale(now_ms) and now_ms - mk.book.fetched_ms > stale_ms:  # no pricing basis: not left for someone with one to fill
             return f"盘口断流超过 {stale_ms // 1000} 秒，撤单" if stale_ms < 120_000 else f"盘口断流超过 {stale_ms // 60_000} 分钟，撤单"
-        if mk.hold or mk.book.stale(now_ms) or book_crossed(mk.book):
-            return ""  # no fresh view of the market: the order stands
+        if mk.hold:
+            return ""  # the fair price itself is in doubt: the order stands (sim_unpriced_reason withdraws it in time)
         side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)
         fair, _ = self.sim_fair(mk, side)  # the edge as the order was judged: at most SIM_MAX_FAIR_CENTS
         edge = fair - price
         exit_edge = self.sim_maker_exit(mk)
         if exit_edge > 0 and edge < exit_edge - 1e-9:
+            # 1.150.0 (audit SIM-STALE-BOOK-REQUOTE): judged before the book's freshness — the exit line reads no book. The card's
+            # fair price comes from the index / futures / Binance feeds and stays fresh (no hold) while Predict's book alone is
+            # stale (its reads failing, or the feed in its own 429 cooldown: the trading client still cancels) or crossed. This
+            # check stood behind the "no fresh view" return below, so a bid the fair price had fallen under was left on Predict —
+            # the free option the move's sellers take — until the stale-feed rule above, up to three and a half minutes on a
+            # daily market (55¢ bid, fair 70¢ → 45¢ on a book 95 s old: kept; the same look on a fresh book withdrew it)
             return f"净优势降到 {cents(edge)}，低于撤单线 {cents(exit_edge)}"
+        if mk.book.stale(now_ms) or book_crossed(mk.book):
+            # no fresh view of the book: the order stands for the rules below, which read it (the spread, the 买1). Of the mode's
+            # line the after-hours bar is judged here all the same: like the exit line it needs the fair price alone (False: without
+            # the deep-bid bar, which is the book's to say — so never stricter than the line a fresh book would give this order).
+            # Withdrawals only: nothing is placed on a stale or crossed book (sim_maker_gate, sim_requote_freed, sim_express_look)
+            bar, mode, line_name = self.sim_maker_mode(mk, False)
+            if mode and edge < (line := self.sim_maker_line(mk, False)) - 1e-9:
+                return f"{mode}只挂净优势 ≥ {cents(bar)} 的，现 {cents(edge)} 低于{line_name} {cents(line)}"
+            return ""
         only = (c.sim_maker_deep > 0 and c.sim_maker_deep_only and self.sim_mode_market(mk, c.sim_maker_deep_markets)
                 and self.sim_mode_market(mk, c.sim_maker_deep_only_markets) and not book_crossed(mk.book))
         if only and not trade.get("deep") and not trade.get("floor"):
