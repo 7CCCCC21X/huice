@@ -1343,6 +1343,9 @@ async def taker_gap():
     g = gbot.sim_taker_gap(world["markets"][0], gbot.sim_trades(), NOW + 5_000)
     assert g["state"] == "near" and g["label"] == "吃跌" and g["sides"][0]["block"] == "已有持仓（每边只吃一次）" and g["text"] == "距吃单 26.0¢：吃跌 卖1 45.0¢，封顶 19.0¢", g
     # a rule holds the buy for the moment: the market's end; the card's hold; no asks on one side, on both; a fair price too low for a cap
+    # (the views below are a trader's that holds nothing — the {} — so also one that has not bought the 58¢ ask on paper yet: since
+    # 1.150.0 the paper trader remembers the asks it took, and the bot above would say "已被模拟交易买过（100 份）" for them)
+    gbot.sim_paper_used.clear()
     g = gbot.sim_taker_gap(hsi(0.70, [(0.55, 100)], [(0.58, 100)], CLOSE), {}, CLOSE)
     assert g["state"] == "blocked" and g["text"] == "吃涨可买 100 份，但已到结束时间，等结果出来：不开新单，挂单撤掉" and g["short"] == "吃涨 可买，但已到结束时间，等结果出来：不开新单，挂单撤掉", g
     g = gbot.sim_taker_gap(hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW, hold="行情过期"), {}, NOW)

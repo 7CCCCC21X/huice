@@ -632,12 +632,12 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_CRYPTO_15M_QUIET_SECONDS", "15 分钟涨跌结束前多少秒不下单（内测）", "0～600：每个 15 分钟窗口结束前这么多秒起不下任何订单（吃单、挂单都不下，真实订单在这之前决定、发出时已进入这段时间的也不发），未成交的挂单撤掉；默认 90；最后一分钟（结算价那根 1 分钟 K）本来就不交易；只管 15 分钟涨跌，“结束前多少分钟不交易”不管这类市场"),
     ("SIM_CRYPTO_15M_MAKER_QUIET_SECONDS", "15 分钟涨跌结束前多少秒不挂新单（内测）", "0～600：每个 15 分钟窗口结束前这么多秒起不再挂新的挂单（撤了重挂的也算新单，这段时间里只撤不挂）；已挂着的不动、吃单照常，直到“结束前多少秒不下单”那段才全部停下；默认 180（复盘里剩不到 3 分钟才挂的单成交后多半亏）；0 = 不另设"),
     ("SIM_MAKER_MIN_BID", "买1 至少多少份才跟", "挂单只跟第一个不少于这么多份的买价档位（不算自己的单），买1 移动 1¢ 以上就撤了改跟；0 = 跟最高买价、不改跟"),
-    ("SIM_MAKER_FLOOR_SHARES", "托底单份数", "这一边没有可跟的买价（盘口空着、买单都不够“买1 至少多少份”）时，按“托底单价格”挂这么多份守在最底下，等有人砸盘；至少挂到 Predict 最低订单金额 $1（1¢ 就是 100 份）；有了可跟的买1 就改跟；挂着时不占每边份数上限；0 = 不挂"),
+    ("SIM_MAKER_FLOOR_SHARES", "托底单份数", "这一边没有可跟的买价（盘口空着、买单都不够“买1 至少多少份”）时，按“托底单价格”挂这么多份守在最底下，等有人砸盘；至少挂到 Predict 最低订单金额 $1（1¢ 就是 100 份）；有了可跟的买1 就改跟；挂着时不占每边份数上限；每边份数、组上限或真实交易限额（单笔、持仓 + 挂单、余额）容不下整单时不挂，不缩份数；0 = 不挂"),
     ("SIM_MAKER_FLOOR_CENTS", "托底单价格（¢）", "1～50：托底单挂的价格；两边各按各的公平价算净优势，不够触发门槛的那一边不挂"),
     ("SIM_MAKER_FLOOR_MARKETS", "托底单只做这些市场（详细选项）", "逗号分隔的市场代码；在“托底单份数”卡片展开详细选项点选，空 = 范围内的所有市场"),
     ("SIM_MAKER_DEEPER", "买1 不够门槛时跟更深的买价", "开 = 跟买1 的净优势不够门槛（或不超过模型误差）时，挂到下面第一个够门槛的买价档位（买2、买3…，同样要有“买1 至少多少份”那么多别人的单），等有人砸穿买1 时接；涨、跌两边各按各的；关 = 只跟买1，不够就不挂"),
     ("SIM_MAKER_EXIT_CENTS", "挂单撤单线（¢/份）", "0～50：挂着的单净优势降到这个数以下就撤掉（不会高于触发门槛）；0 = 不撤"),
-    ("SIM_MAKER_FOLLOW_SETTLE_SECONDS", "买1 变了多久才改跟（秒）", "0～60：有效买1 移开、低价挂单被顶、击穿单下面的买单变了，新位置要连续保持这么多秒才撤了改挂；做市机器人每半秒撤了重挂一遍的盘口，不等一下就会跟着它反复撤挂、每次都排到队尾；0 = 一变就改。优势没了的撤单不受它影响"),
+    ("SIM_MAKER_FOLLOW_SETTLE_SECONDS", "买1 变了多久才改跟（秒）", "0～60：有效买1 移开或没了、低价挂单被顶、击穿单下面的买单变了，新位置要连续保持这么多秒才撤了改挂；做市机器人每半秒撤了重挂一遍的盘口，不等一下就会跟着它反复撤挂、每次都排到队尾；0 = 一变就改。优势没了的撤单不受它影响"),
     ("SIM_MAKER_SESSION", "只在标的开盘时段挂单", "开 = 指数/个股日涨跌的挂单只在标的开盘时段挂着，开盘前、收盘后全部撤掉；加密市场不受影响"),
     ("SIM_MAKER_SPREAD_CENTS", "挂单价差上限（¢）", "0～99：平时只在买卖价差不超过这个数的双边盘口挂单；0 = 不限，价差再宽、只有单边的盘口也跟有效买1 挂（门槛不变）"),
     ("SIM_MAKER_DEEP_CENTS", "低价挂单模式（¢/份）", "0～90：按挂价算净优势不低于这个数（不低于触发门槛）的单挂在最高买价之上 1¢、排在最前，多付 1¢ 换先成交；有人（至少 1 份）挂到它之上或同价就撤了重挂到他之上 1¢，挂价留不足这个数就原地不动；价差超过上限的盘口也挂、只挂这种单，在那种盘口上净优势降到它 1¢ 以下撤掉；不分时段，盘后另要满足盘后门槛；0 = 关"),
@@ -808,7 +808,7 @@ class Config:
     # Predict's minimum order value: FLOOR_MIN_USD) rests at SIM_MAKER_FLOOR_CENTS, for a seller dumping into the empty side; 0 = none (1.105.0)
     sim_maker_floor: float = 0.01     # SIM_MAKER_FLOOR_CENTS / 100: the floor order's price
     sim_maker_exit: float = 0.05      # SIM_MAKER_EXIT_CENTS / 100: a resting order is withdrawn when its edge falls under this; 0 = never
-    sim_maker_follow_settle: float = 2.0  # SIM_MAKER_FOLLOW_SETTLE_SECONDS: a re-quote (the 买1 moved, a deep-bid order pushed off the front,
+    sim_maker_follow_settle: float = 2.0  # SIM_MAKER_FOLLOW_SETTLE_SECONDS: a re-quote (the 买1 moved or gone, a deep-bid order pushed off the front,
     # a sweep order's bids changed) waits until the new place has held this long; 0 = at once
     sim_maker_session: bool = True    # SIM_MAKER_SESSION: a daily card's resting orders only while its underlying trades (withdrawn before the open)
     sim_maker_deep_only: bool = False  # SIM_MAKER_DEEP_ONLY: with the deep-bid mode on, only its orders are placed (no joining the 买1 queue)
@@ -11377,6 +11377,9 @@ class SimMarket:
     sigma_day: float = 0.0   # ...and the whole day's σ it is measured against (sim_against_move)
     price_problem: str = ""  # an up/down card: why its price is too old to trade on now (UpDownMarket.price_problem; "" = fresh enough) —
     #                          the card's ``hold`` says so too, and a resting order is withdrawn for it (sim_requote_reason, 1.150.0)
+    decided: str = ""        # a first-touch market whose ``hold`` is the book's alone (Bot.touch_hold): the way Predict's book already
+    # trades the question as settled against the model's fair price — "up" (the high line first) / "down". No hold lets an order be
+    # opened; under the others one already resting stands, under this one it is judged as on a card that holds nothing (sim_requote_reason)
 
 
 class LazyEvidence(Mapping):
@@ -11564,7 +11567,10 @@ def own_on_book(trade: Mapping, book: Any) -> float:
     st = trade.get("live") if isinstance(trade.get("live"), Mapping) else None
     if st is None or st.get("state") in ("pending", "placing"):
         return 0.0
-    answered = int(st.get("answered_at") or 0)
+    # 1.150.0: Predict's answer on the books' clock (answered_ms, the wall clock a book is stamped with — SIM-OWN-ON-BOOK-CLOCK),
+    # not answered_at on the Binance-offset clock (a record saved before 1.150.0 has only answered_at and keeps it), against
+    # the time the book's levels were taken (book_content_ms — FEED-FETCHED-MS), not its fetched_ms
+    answered = int(st.get("answered_ms") or st.get("answered_at") or 0)
     if answered and book is not None and book_content_ms(book) < answered:
         return 0.0
     return max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0)
@@ -11644,6 +11650,8 @@ def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
 
 
 SIM_MAKER_FOLLOW = 0.01  # a resting order follows the valid 买1 once it has moved this far (1¢) from the order's price
+SIM_FOLLOW_GONE = -1.0  # where a valid 买1 that is gone "is", for the settle clock (Bot.sim_follow_settled): over a cent from every price, so the
+#                         clock starts anew when the 买1 goes and when one is there again a cent or more from the order (1.150.0)
 FLOOR_MIN_USD = 1.0  # a floor order is at least this much (Predict's minimum order value, live.MIN_ORDER_USD): 100 shares at 1¢
 SIM_MAKER_MODE_SLACK = 0.01  # under the after-hours / deep-bid modes a resting order is kept while its edge is within a cent under the mode's bar
 SIM_MAKER_DEEP_STEP = 0.01  # a deep-bid order goes this far above the best bid: at the front of the book, filled before the queue there
@@ -11735,7 +11743,15 @@ def market_driver(kind: str, key: str, settle: dict | None = None, item: str = "
     if kind == "ladder":
         spec = next((s for s in CAP_MARKETS if s.key == key), None)
         return key, spec.name if spec else (item.rsplit(" ", 1)[0] if item else key)
-    specs = {"touch": (*TOUCH_MARKETS, *TOUCH_SETTLED), "updown": (*UPDOWN_MARKETS, *DAILY_UPDOWN_MARKETS),
+    # 1.150.0: the 15- and 5-minute window cards (WINDOW_UPDOWN_MARKETS, kind "updown") are read from the same Binance pair
+    # as the pair's other cards (BTC-15M and BTC-5M from BTCUSDT, like BTC-DAY, the BTC touch and the BTC ladder), so a
+    # BTC move hits them all at once: their worst ends count in the pair's SIM_GROUP_USD group. They had been left out
+    # of this list when they were added, and each window card fell back to its own key ("BTC-15M"), a group (and cap) of
+    # its own beside the pair's. Every WindowUpDownSpec has .symbol, and no window key is also a daily or monthly key.
+    # Inside the group each window is still an event of its own (event_of tells them apart by start and end: a 15-minute
+    # and a 5-minute window that end on the same minute are two events), so the windows' worst ends add up.
+    specs = {"touch": (*TOUCH_MARKETS, *TOUCH_SETTLED),
+             "updown": (*UPDOWN_MARKETS, *DAILY_UPDOWN_MARKETS, *WINDOW_UPDOWN_MARKETS),
              "range": (*RANGE_MARKETS, *STOCK_HIT_MARKETS)}.get(kind, ())
     spec = next((s for s in specs if s.key == key), None)
     symbol = spec.symbol if spec else key
@@ -11958,37 +11974,76 @@ def path_text(name: str, kinds: set[str], legs: tuple) -> str:
     return f"{name}{leg(*legs[0])} 又{leg(*legs[1])}"
 
 
-PATH_KINDS = {"range", "ladder", "touch"}  # the kinds one price path decides together; a close, a window, a flip are each decided by their own end
+PATH_KINDS = {"range", "ladder", "touch"}  # the kinds a price path decides, each family of them together (path_family); a close, a window, a flip are each decided by their own end
 
 
 def event_of(p: Mapping) -> tuple:
     """The settlement event an end-decided position belongs to: positions of one event hedge each other (the two sides of
     one day's close), positions of different events do not (1.122.0: ETH 先触高线 and ETH 当天收跌 were hedged as if one
-    move decided both — a path that touches the low line and then closes above the open loses both)."""
+    move decided both — a path that touches the low line and then closes above the open loses both). An up/down market
+    is the move from its start to its end, so the start is part of the event (1.150.0): BTC 15分 16:30–16:45 and BTC 5分
+    16:40–16:45 end on the same candle and, now that the window cards sit in their pair's group (market_driver), were
+    hedged as one event — 涨 on the first and 跌 on the second counted as a loss of nothing, while BTC falling to 16:40
+    and then rising a little, still under its 16:30 price, loses both. The same for a window that ends with the month
+    (a monthly card's record carries no start). Two sides of one market carry the same start and end and still hedge; a
+    record without the start beside one with it is counted apart, the careful way round."""
     settle = p.get("settle") or {}
-    return (str(p.get("kind") or ""), str(settle.get("key") or ""),
-            str(settle.get("target") or settle.get("end") or settle.get("deadline") or settle.get("day") or ""))
+    when = str(settle.get("target") or settle.get("end") or settle.get("deadline") or settle.get("day") or "")
+    if settle.get("start"):
+        when = f"{settle['start']}-{when}"
+    return str(p.get("kind") or ""), str(settle.get("key") or ""), when
+
+
+def path_family(p: Mapping) -> tuple:
+    """The path-decided positions one price path decides together (1.150.0): one first-touch market, one token's market-cap
+    ladder, or the levels of one price ladder in one window. The positions of a family are priced under one path and
+    hedge each other; two families do not, each counts at its own worst (group_worst_case), as two settlement events do
+    (event_of). Until now every path-decided position of a driver shared one path, and that path could not tell them
+    apart: a first-touch market's own lines are not among its levels (any rise counted as the high line reached first),
+    and a level counted as touched whatever its ladder's window. BTCUSDT carries BTC 先触 70k/90k, BTC 11月价格 and BTC
+    2027前价格: 「90k」 with No on 11月 ↑ $85k read as hedged (worst $0) — a rise to 85k and then a fall through 70k
+    loses both; 「70k」 with No on ↓ $75k likewise (down to 75k, then up through 90k); Yes on 11月 ↑ $100k with No on
+    2027前 ↑ $100k read as a sure gain — no 100k in November and 100k in December loses both. SIM_GROUP_USD (on paper
+    and for real orders) let such legs in whole — four of them at 300 shares, $585 at cost and all of it lost on one
+    path, under the default $300 — until other limits bound, and the review page's 最坏单一事件 showed the same figure.
+    Each old joint path, read by one family alone, is one of that family's own paths, so the families' worsts added up
+    are never above the old figure: the cap only tightens. What it gives up: a hedge that is real across windows (No on
+    11月 ↑ $100k with Yes on 2027前 ↑ $100k: a touch in November is a touch before 2027) counts as two losses — the
+    careful way round.
+    The family: a first-touch market's or a market-cap ladder's key (one market, one window: TouchSpec, CapSpec); a
+    price ladder's key and its window's end — a stock's category lists a market per deadline under one key
+    (StockRangeMarket.choose), and "by June" and "by December" are two windows. A position without a key (none of the
+    trader's own) is told apart by its window alone."""
+    kind, key, settle = str(p.get("kind") or ""), str(p.get("key") or ""), p.get("settle") or {}
+    if key and kind != "range":
+        return kind, key, ""
+    return kind, key, str(settle.get("end") or settle.get("deadline") or "")
 
 
 def group_worst_case(positions: list[dict], name: str = "") -> tuple[float, str]:
     """(P&L, the move) of one driver's positions under what hurts them most. The path-decided positions (a price ladder,
-    a range level, a first touch: PATH_KINDS) under one path: up to each upward level (or past all), down to each
-    downward level (or past all), neither — and, with levels on both sides, up to one then down to another (and the
-    reverse): both touched, No positions on both lose together (the single moves alone priced that pair at the loss of
-    one). Three No positions at $300M / $500M / $1B lose together on the move past $1B: that is the number to limit, not
-    the count of markets. The end-decided positions (a close, a window, a flip) each settlement event (event_of) at its
-    own worst end — up, down or flat — added up: one day's two sides hedge each other, two days, or a close and a touch,
-    do not, whatever one move would do to both (1.122.0). ``positions``: dicts with kind, side, settle, price and
-    shares; one flagged ``resting`` (an order not filled) counts only where it loses: an unfilled order is no hedge."""
+    a range level, a first touch: PATH_KINDS) family by family (path_family: one ladder in one window, one first-touch
+    market), each under its own worst path: up to each upward level (or past all), down to each downward level (or past
+    all), neither — and, with levels on both sides, up to one then down to another (and the reverse): both touched, No
+    positions on both lose together (the single moves alone priced that pair at the loss of one). Three No positions at
+    $300M / $500M / $1B lose together on the move past $1B: that is the number to limit, not the count of markets. The
+    end-decided positions (a close, a window, a flip) each settlement event (event_of) at its own worst end — up, down
+    or flat. The families and the events are added up: one ladder's levels, or one day's two sides, hedge each other;
+    two ladders' windows, a ladder and a first touch, two days, or a close and a touch do not, whatever one move would
+    do to both (1.122.0; the path-decided families 1.150.0). ``positions``: dicts with kind, key, side, settle, price
+    and shares; one flagged ``resting`` (an order not filled) counts only where it loses: an unfilled order is no hedge."""
     def gain(p: dict, up: float) -> float:
         payout = up if p.get("side") == "up" else 1 - up
         g = (payout - float(p["price"])) * float(p["shares"])
         return min(0.0, g) if p.get("resting") else g
 
-    paths = [p for p in positions if str(p.get("kind") or "") in PATH_KINDS]
-    kinds = {str(p.get("kind") or "") for p in paths}
+    families: dict[tuple, list[dict]] = {}
+    for p in positions:
+        if str(p.get("kind") or "") in PATH_KINDS:
+            families.setdefault(path_family(p), []).append(p)
     total, parts = 0.0, []
-    if paths:
+    for paths in families.values():
+        kinds = {str(p.get("kind") or "") for p in paths}
         up_levels = sorted({float(p["settle"].get("target") or 0) for p in paths
                             if p.get("kind") == "ladder" or (p.get("kind") == "range" and (p.get("settle") or {}).get("dir", "up") == "up")})
         down_levels = sorted({float(p["settle"].get("target") or 0) for p in paths
@@ -12011,7 +12066,7 @@ def group_worst_case(positions: list[dict], name: str = "") -> tuple[float, str]
         direction = min(pnls, key=lambda d: round(pnls[d], 6))  # the first of flat, up, down when as bad
         total += pnls[direction]
         parts.append(scenario_text(name, {kind}, direction, None))
-    return total, "、".join(dict.fromkeys(parts)) if parts else scenario_text(name, kinds, "flat", None)
+    return total, "、".join(dict.fromkeys(parts)) if parts else scenario_text(name, set(), "flat", None)  # (no position at all)
 
 
 def sim_positions(trades: list[dict]) -> list[dict]:
@@ -12566,11 +12621,60 @@ def median(values: Iterable[float]) -> float | None:
     return ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
 
 
-def sim_maker_efficiency(trades: list[dict]) -> dict:
+def maker_rest_ms(trade: dict) -> int | None:
+    """How long a resting order that filled nothing rested: its withdrawal (or its settlement, when it expired) less its
+    opening; None when either is not on the record."""
+    end = int((trade.get("withdrawn") or {}).get("at") or trade.get("settled") or 0)
+    return end - int(trade["opened"]) if end and trade.get("opened") else None
+
+
+def withdrawal_reason_key(trade: dict) -> str:
+    """A record's withdrawal reason with its numbers replaced by N, so one rule's lines count as one; "" for none."""
+    why = str((trade.get("withdrawn") or {}).get("why") or "")
+    return re.sub(r"\d+(?:\.\d+)?", "N", why) if why else ""
+
+
+SIM_PRUNED_KEY = "simpruned"   # the store's record of what sim_prune removed; not under "sim:", so never read as a trade
+SIM_PRUNED_REASONS = 40        # distinct withdrawal reasons kept per card and kind there; any further one counts as 其他
+
+
+def sim_pruned_count(rows: Any, gone: Iterable[dict]) -> list[dict]:
+    """``rows`` (the stored totals, SIM_PRUNED_KEY) with the resting orders among ``gone`` — the records sim_prune is
+    about to delete — added: per card (card_of) and kind, how many, how many of them cancelled and expired, the shares
+    they asked for, how long they rested and why they were withdrawn. Everything sim_maker_efficiency reads off an
+    unfilled record, kept per card and kind so the review page's filter still applies (a per-slot count would grow by
+    two lines per 15-minute window for ever). Takers and refused orders are not counted: the efficiency is the makers'."""
+    by = {(str(r.get("card") or ""), str(r.get("kind") or "")): r for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict)}
+    for t in gone:
+        if not t.get("maker"):
+            continue
+        key = (card_of(t), str(t.get("kind") or ""))
+        r = by.setdefault(key, {"card": key[0], "kind": key[1]})
+        r["n"] = int(r.get("n") or 0) + 1
+        status = "expired" if t.get("status") == "expired" else "cancelled"
+        r[status] = int(r.get(status) or 0) + 1
+        r["order"] = float(r.get("order") or 0) + float(t.get("order") or t.get("shares") or 0)
+        rest = maker_rest_ms(t)
+        if rest is not None:
+            r["rest_ms"], r["rest_n"] = int(r.get("rest_ms") or 0) + rest, int(r.get("rest_n") or 0) + 1
+        if why := withdrawal_reason_key(t):
+            reasons = r.setdefault("reasons", {})
+            if why not in reasons and len(reasons) >= SIM_PRUNED_REASONS:
+                why = "其他"
+            reasons[why] = int(reasons.get(why) or 0) + 1
+    return list(by.values())
+
+
+def sim_maker_efficiency(trades: list[dict], pruned: Iterable[Mapping] | None = None) -> dict:
     """The resting orders' record: how many were placed, filled whole, filled in part, never filled (expired at the end
     or withdrawn empty) or still rest; the fill rate of the finished ones by count (any fill) and by shares; how long
     the filled ones waited for their first fill (mean, median); how long the unfilled ones rested; the most frequent
-    withdrawal reasons, their numbers replaced by N so one rule's lines count as one."""
+    withdrawal reasons, their numbers replaced by N so one rule's lines count as one.
+
+    ``pruned``: the totals of the unfilled attempts sim_prune has deleted (sim_pruned_count's rows). 1.150.0: without them
+    the figures were survivors': every fill is kept for ever and only the newest SIM_ATTEMPTS_KEEP empty attempts per
+    slot, so a slot quoted 100 times with 5 fills read 5 / 25 = 20% filled, not 5% — the more often a slot was re-quoted,
+    the better it looked. They count as placed, ended and unfilled, with their shares, rests and reasons."""
     makers = [t for t in trades if bool(t.get("maker"))]
     resting = [t for t in makers if t.get("status") == "resting"]
     ended = [t for t in makers if t.get("status") != "resting"]
@@ -12580,24 +12684,26 @@ def sim_maker_efficiency(trades: list[dict]) -> dict:
     partial = [t for t in ended if 0 < shares_of(t) < order_of(t) - 1e-9]
     unfilled = [t for t in ended if shares_of(t) <= 0]
     waits = sorted(int(t["filled"]) - int(t.get("opened") or 0) for t in makers if t.get("filled") and shares_of(t) > 0)
-    rests = []
-    for t in unfilled:
-        end = int((t.get("withdrawn") or {}).get("at") or t.get("settled") or 0)
-        if end and t.get("opened"):
-            rests.append(end - int(t["opened"]))
+    rests = [rest for t in unfilled if (rest := maker_rest_ms(t)) is not None]
     reasons: dict[str, int] = {}
     for t in makers:
-        why = str((t.get("withdrawn") or {}).get("why") or "")
-        if why:
-            key = re.sub(r"\d+(?:\.\d+)?", "N", why)
+        if key := withdrawal_reason_key(t):
             reasons[key] = reasons.get(key, 0) + 1
-    ordered = sum(order_of(t) for t in ended)
-    return {"placed": len(makers), "filled": len(whole), "partial": len(partial), "unfilled": len(unfilled), "resting": len(resting),
-            "expired": sum(t.get("status") == "expired" for t in unfilled), "cancelled": sum(t.get("status") == "cancelled" for t in unfilled),
-            "fill_rate": (len(whole) + len(partial)) / len(ended) if ended else None,
+    gone = [p for p in pruned or () if isinstance(p, Mapping)]
+    total = lambda field: sum(p.get(field) or 0 for p in gone)
+    for p in gone:
+        for key, n in (p.get("reasons") or {}).items():
+            reasons[key] = reasons.get(key, 0) + int(n or 0)
+    n_gone, n_ended = int(total("n")), len(ended) + int(total("n"))
+    ordered = sum(order_of(t) for t in ended) + float(total("order"))
+    rest_n, rest_ms = len(rests) + int(total("rest_n")), sum(rests) + total("rest_ms")
+    return {"placed": len(makers) + n_gone, "filled": len(whole), "partial": len(partial), "unfilled": len(unfilled) + n_gone, "resting": len(resting),
+            "expired": sum(t.get("status") == "expired" for t in unfilled) + int(total("expired")),
+            "cancelled": sum(t.get("status") == "cancelled" for t in unfilled) + int(total("cancelled")),
+            "fill_rate": (len(whole) + len(partial)) / n_ended if n_ended else None,
             "share_rate": sum(shares_of(t) for t in ended) / ordered if ordered else None,
             "wait_n": len(waits), "wait_avg": sum(waits) / len(waits) if waits else None, "wait_median": median(waits),
-            "rest_n": len(rests), "rest_avg": sum(rests) / len(rests) if rests else None,
+            "rest_n": rest_n, "rest_avg": rest_ms / rest_n if rest_n else None,
             "reasons": [{"why": why, "n": n} for why, n in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:8]]}
 
 
@@ -15999,6 +16105,7 @@ class Bot:
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.sim_ran = -1e9  # monotonic time of the paper trader's last look
+        self.sim_looked_ms = 0  # ...and the bot's clock (ms) it decided on: read under the lock, where the decisions are made (sim_step, 1.150.0)
         self.sim_wake = False  # a round of books just came in, or a fair price moved: the next look does not wait for SIM_SECONDS
         self.fair_sig: tuple | None = None  # the fair prices as of the last feed refresh (note_job): a change wakes the trader
         self.fair_sig_at = -1e9
@@ -16013,6 +16120,10 @@ class Bot:
         self.sim_follow_timers: dict[str, asyncio.TimerHandle] = {}  # book key -> the express look due when a follow's settle runs out (sim_follow_wake)
         self.sigma_calib_cache: dict[str, tuple[float, int]] = {}  # card key -> (σ factor, windows measured): sigma_calib
         self.sim_taker_seen: dict[str, int] = {}  # taker slot -> when (ms) its side was first buyable in the run of looks that still finds it so (SIM_TAKER_HOLD_SECONDS)
+        # market -> {"end": its end (ms), "up" / "down": {price level in that side's terms: [shares the paper takers bought there and
+        # the earlier resting orders were credited, shares the order resting on that side now was credited]}}: what the paper fills have
+        # already taken of the asks the book still shows (sim_paper_book)
+        self.sim_paper_used: dict[str, dict] = {}
         self.sim_unpriced_since: dict[str, int] = {}  # market -> when (ms) a step first found it unpriced with an order resting (sim_unpriced_reason)
         self.sim_step_ms: dict[str, int] = {}  # the last decision phase, by part (for /diag)
         self.sim_step_info: dict[str, int] = {}  # ...and its size: markets judged, records held
@@ -18294,6 +18405,38 @@ class Bot:
             return flip_book(book), ""
         return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
 
+    def touch_hold(self, touch: "TouchMarket", odds: "TouchOdds | str", book: PredictBook | None, now_ms: int) -> tuple[str, str]:
+        """(why no trade is suggested on a first-touch market — "" = it may be —, the way the book trades the question
+        as settled when that is the reason: "up" the high line first, "down" the low one, else ""). One answer for the
+        web card (touch_payload) and for SimMarket.hold / .decided (sim_markets: the paper and the real trader, the
+        express lane, the edge alerts) — the market's own reasons (advice_problem), or Predict's book (``book``, priced
+        as "high barrier first": touch_book) already trading the question as settled (book_decided) while the model's
+        fair price is not there: still open by its path check, or decided the other way. A stale book decides nothing
+        here (nothing is suggested or bought on one anyway).
+        1.150.0 (audit SIM-TOUCH-DECIDED-HOLD): the book_decided check stood in touch_payload alone, and sim_markets gave
+        the trader advice_problem by itself. A wick through a line that comes back inside within its own minute is not
+        seen by the path check until its next scan (peek skips the minute still forming: SCAN_SECONDS later, up to
+        SCAN_STALE_MS while the kline reads fail and pushed trades keep the price fresh). Through that window the card
+        said 定局 and held, while the trader — README: what the card holds back is never bought — took the side the book
+        offered at a cent or two because it had lost (300 shares on paper, a real order with LIVE on), rested bids on
+        it, and the Telegram alerts announced it as 新机会 whatever SIM_MARKETS said.
+        The book's hold is told apart from the market's own (the review of that fix) for the orders that exist when it
+        begins. It keeps new orders out, as every hold does; but a held card's resting order also stands unjudged
+        (sim_requote_reason), and handed this hold as one more of those, an order resting when the book turned was no
+        longer withdrawn at the exit line when the model's own price fell under it — the rule that had judged it until
+        then — and a decision an API cooldown had held back went out into the settled book when the cooldown ended
+        (LiveBot.live_taker_recheck)."""
+        if not isinstance(odds, TouchOdds):
+            return "", ""
+        hold = touch.advice_problem(now_ms)
+        if not hold and book is not None and not book.stale(now_ms):
+            decided = book_decided(book)
+            if (decided == "up" and odds.fair_upper < 0.9) or (decided == "down" and odds.fair_upper > 0.1):
+                low, high = touch.spec.label(touch.spec.low), touch.spec.label(touch.spec.high)
+                return (f"盘口已把 {high if decided == 'up' else low} 先触当作定局（{'买价 ≥90¢' if decided == 'up' else '卖价 ≤10¢'}），"
+                        "模型尚未核验到这次触线；待核验，暂不给建议"), decided
+        return hold, ""
+
     def touch_payload(self, touch: "TouchMarket", now_ms: int) -> dict:
         """Web card for a first-touch market: 涨 = the high barrier first, 跌 = the low one first."""
         spec = touch.spec
@@ -18303,12 +18446,7 @@ class Bot:
         out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
         book, why = self.touch_book(spec)
         odds = touch.odds(now_ms)
-        hold = touch.advice_problem(now_ms) if isinstance(odds, TouchOdds) else ""
-        if isinstance(odds, TouchOdds) and not hold and book is not None and not book.stale(now_ms):
-            decided = book_decided(book)
-            if (decided == "up" and odds.fair_upper < 0.9) or (decided == "down" and odds.fair_upper > 0.1):
-                hold = (f"盘口已把 {high if decided == 'up' else low} 先触当作定局（{'买价 ≥90¢' if decided == 'up' else '卖价 ≤10¢'}），"
-                        "模型尚未核验到这次触线；待核验，暂不给建议")
+        hold = self.touch_hold(touch, odds, book, now_ms)[0]  # the very answer sim_markets hands the trader (SimMarket.hold)
         if book is not None:
             ok = isinstance(odds, TouchOdds)
             swing = touch.model_swing(now_ms) if ok else 0.0
@@ -18848,10 +18986,15 @@ class Bot:
             book, _ = self.touch_book(spec)
             if isinstance(odds, TouchOdds) and book is not None:
                 low, high = spec.label(spec.low), spec.label(spec.high)
+                # the hold is the card's, whole (touch_hold, 1.150.0): the market's own reasons and the book already trading
+                # the question as settled — advice_problem alone let the trader buy what the card was holding back; that it is
+                # the book's alone goes with it (decided: the orders already resting are still judged, sim_requote_reason)
+                hold, decided = self.touch_hold(touch, odds, book, now_ms)
                 out.append(SimMarket(spec.slug, f"{spec.symbol.removesuffix('USDT')} 先触 {low}/{high}", "touch", spec.key,
                                      odds.fair_upper, book, self.edge_need(touch.model_swing(now_ms)),
-                                     touch.advice_problem(now_ms), (high, low), {"deadline": spec.deadline_ms},
-                                     self.evidence(lambda touch=touch: self.market_evidence("touch", now_ms, touch=touch))))
+                                     hold, (high, low), {"deadline": spec.deadline_ms},
+                                     self.evidence(lambda touch=touch: self.market_evidence("touch", now_ms, touch=touch)),
+                                     decided=decided))
         for mkt in self.updowns.values():
             if only is not None and mkt.spec.key != only:
                 continue
@@ -18928,6 +19071,97 @@ class Bot:
             day = dt.datetime.fromtimestamp(base.close_ms / 1000, offset).date().isoformat()
             self.note_outcome(symbol, day, base.value, base.source)
 
+    def sim_paper(self) -> bool:
+        """Whether the trader's buys are paper ones now: filled by the bot's own rules (a taker at once from the book it
+        saw, a resting order as sellers show: sim_open, sim_fill), nothing sent to Predict. Always here; the real trader
+        only with LIVE=off (LiveBot.sim_paper)."""
+        return True
+
+    def sim_paper_book(self, mk: SimMarket, side: str, resting: bool = False) -> PredictBook:
+        """The book a paper buy of ``side`` is filled from: mk.book less the shares paper fills already took at each of
+        that side's price levels (sim_paper_used), a level bought out left out — mk.book itself when nothing was taken,
+        and always in real trading.
+
+        1.150.0 (audit SIM-PAPER-TAKER-REBUY): a paper buy changes nothing on Predict, so the asks it "took" are in every
+        later book. The taker bought them again at each look — the step's every few seconds, the express lane's a tenth of
+        a second after every price push, on the very same snapshot — until SIM_TAKER_MAX_SHARES: one 100-share ask became
+        a 300-share position, a 10-share one thirty buys of 10. With SIM_WAYS=both the one ask a resting order was
+        presumed filled from was bought by the taker as well. And a floor order, placed at its price wherever the asks
+        stand (SIM_MAKER_FLOOR_CENTS), was credited the asks under it, became a position, and the next one in its slot
+        was credited the same asks again. On thin books the paper volume, P&L, EV and markouts were those of one bet
+        counted several times over, and the shares that never existed used up the caps (SIM_GROUP_USD, the per-side
+        counts) the real chances then met.
+
+        The rule is the resting order's own (maker_fill: the most ever seen, never a sum of looks — one seller is seen
+        again on every look), kept per price level and across the paper fills: what they took at a price stays out of
+        what that level shows, for as long as the book shows the level at all. More shares offered there than were taken
+        are new and can be bought (SIM_TAKER_MAX_SHARES' one buy after another, from depth that is really left); the same
+        ones are not bought twice. A look that finds the level gone forgets it (sim_paper_seen): what is offered at that
+        price later is another seller's.
+
+        ``resting`` is the view of the order resting on that side now (sim_fill): what it was credited itself stays in —
+        its own sightings are its "most ever seen" to handle (taken out as well, a level grown from 40 to 100 would
+        credit it 60, not 100) — and everything else is out: the takers' buys and what the resting orders before it were
+        credited (sim_paper_rested).
+
+        Kept in memory: after a restart the asks still showing can be bought once more. Real trading reads its fills
+        from Predict, and its book is the real one."""
+        used = (self.sim_paper_used.get(mk.market) or {}).get(side) if self.sim_paper() else None
+        if not used:
+            return mk.book
+        kept, cut = [], False
+        for p, q in (mk.book.asks if side == "up" else mk.book.bids):  # 涨 / Yes buys the asks, 跌 / No the bids (side_levels)
+            took = used.get(round(float(p), 6) if side == "up" else round(1 - float(p), 6))
+            gone = (took[0] + (0.0 if resting else took[1])) if took else 0.0
+            if gone <= 1e-9:
+                kept.append((p, q))
+                continue
+            cut = True
+            left = round(float(q) - gone, 6)
+            if left > 1e-9:
+                kept.append((p, D(str(left))))
+        if not cut:
+            return mk.book
+        return dataclasses.replace(mk.book, **{"asks" if side == "up" else "bids": tuple(kept)})
+
+    def sim_paper_took(self, mk: SimMarket, side: str, levels: Iterable, resting: bool = False) -> None:
+        """Remember what a paper fill took of ``side``'s asks (sim_paper_used): ``levels`` [(price in the side's terms,
+        shares)] — a taker's as its quote walked them, the resting order's (``resting``) as sim_fill credited them."""
+        held = self.sim_paper_used.setdefault(mk.market, {"end": sim_end_ms(mk.settle), "up": {}, "down": {}})
+        for price, shares in levels:
+            if float(shares) > 1e-9:
+                held[side].setdefault(round(float(price), 6), [0.0, 0.0])[1 if resting else 0] += float(shares)
+
+    def sim_paper_rested(self, mk: SimMarket, side: str) -> None:
+        """A fresh paper order rests on ``side``: what the orders before it were credited there is theirs (positions
+        now), not a sighting of its own — counted with the takers' buys from here on, out of its view (sim_paper_book)."""
+        for took in ((self.sim_paper_used.get(mk.market) or {}).get(side) or {}).values():
+            took[0], took[1] = took[0] + took[1], 0.0
+
+    def sim_paper_seen(self, mk: SimMarket) -> None:
+        """A look at a market's book, for what its paper fills took there (sim_paper_used): a price level the book no
+        longer shows is forgotten — the shares bought there on paper are gone from Predict too, and what is offered at
+        that price later is new. A level still showing keeps what was taken from it, however its size has moved since."""
+        held = self.sim_paper_used.get(mk.market)
+        if held is None:
+            return
+        held["end"] = sim_end_ms(mk.settle)
+        for side in ("up", "down"):
+            if held[side]:
+                shown = {round(p, 6) for p, q in side_levels(mk.book, side) if q > 1e-9}
+                held[side] = {price: took for price, took in held[side].items() if price in shown}
+        if not held["up"] and not held["down"]:
+            del self.sim_paper_used[mk.market]
+
+    def sim_paper_spent(self, mk: SimMarket, side: str, cap: float) -> float:
+        """Shares the book still shows at or under ``cap`` on ``side`` that paper fills already took (what sim_paper_book
+        leaves out there), for the pages' words; 0 in real trading."""
+        book = self.sim_paper_book(mk, side)
+        if book is mk.book:
+            return 0.0
+        under = lambda b: sum(q for p, q in side_levels(b, side) if p <= cap + 1e-9)
+        return max(under(mk.book) - under(book), 0.0)
+
     def sim_open(self, mk: SimMarket, side: str, now_ms: int, maker: BookEdge | None = None,
                  taker: dict | None = None, shares: float | None = None) -> dict:
         """A paper buy of SIM_SHARES of one side, with everything it was decided on (entry snapshot: the model's inputs,
@@ -18967,11 +19201,23 @@ class Bot:
 
     def sim_fill(self, trade: dict, mk: SimMarket, now_ms: int) -> None:
         """A resting order against the book as it stands now: more shares presumed filled when sellers show at or
-        through its price (with a snapshot of what was seen, the model's view and its sources at that moment)."""
-        credited, seen = maker_fill(trade, mk.book)
+        through its price (with a snapshot of what was seen, the model's view and its sources at that moment). The
+        sellers are the book's less what other paper fills already have of them (sim_paper_book, 1.150.0: with
+        SIM_WAYS=both one 100-share ask at the order's price was bought by the taker and credited to the order too);
+        what the order is credited is in turn not there for a taker, nor for the next order in its slot."""
+        side = trade["side"]
+        credited, seen = maker_fill(trade, self.sim_paper_book(mk, side, resting=True))
         trade["queue_min"] = min(float(trade.get("queue_min", trade.get("queue_ahead", 0.0))), seen["queue_now"])
         if credited <= float(trade["shares"]) + 1e-9:
             return
+        # the newly credited shares, taken from the cheapest asks at or under its price that paper fills have not used yet
+        left, took = credited - float(trade["shares"]), []
+        for p, q in side_levels(self.sim_paper_book(mk, side), side):
+            if left <= 1e-9 or p > float(trade["price"]) + 1e-9:
+                break
+            took.append((p, min(q, left)))
+            left -= min(q, left)
+        self.sim_paper_took(mk, side, took, resting=True)
         fair = mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up
         trade["fills"].append({"at": now_ms, "shares": credited - float(trade["shares"]), "fair": fair, "fair_up": mk.fair_up,
                                "how": "推定成交", "seen": seen, "book": book_snapshot(mk.book), **self.evidence_of(mk)})
@@ -19443,18 +19689,24 @@ class Bot:
                     name = mk.sides[0 if side == "up" else 1]
                     fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: judged at the limit when the card says more
                     capped = f"（公平价 {cents(fair + cut)} 按上限 {cents(fair)} 计）" if cut > 0 else ""
-                    cap = self.sim_taker_cap(mk, side, bps)
+                    base = self.sim_taker_cap(mk, side, bps)
+                    cap = self.sim_taker_self_cap(trades, mk, side, base)  # as the trader: under our own real buy of the other side
                     room, taken = self.sim_taker_room(trades, mk, side, self.sim_taker_want(mk, side, cap))
-                    q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
+                    # (on paper the asks less what paper fills already took, as the trader's own look: sim_paper_book, 1.150.0)
+                    q = taker_quote(self.sim_paper_book(mk, side), side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
                     held = trades.get(f"{mk.market}|{side}|吃")
-                    if cap <= 0:
+                    if base <= 0:
                         parts.append(f"{name}：无封顶价（公平价 {cents(fair)} 留不出 {cents(max(mk.need, self.sim_taker_bar(mk)))}）{capped}")
                     elif room < SIM_MIN_SHARES - 1e-9 and held is not None:
                         parts.append(f"{name}：" + (f"已有{sim_status(held)}，等它结束" if sim_in_flight(held) else
                                                     self.sim_taker_full_text(trades, mk, side, taken) if c.sim_taker_max_shares > 0 else
                                                     f"已有{sim_status(held)}（每边只吃一次）"))
+                    elif cap < base - 1e-9 and (q is None or q["got"] < SIM_MIN_SHARES - 1e-9) and any(p <= base + 1e-9 for p, _ in side_levels(mk.book, side)):
+                        parts.append(f"{name}：{self.sim_taker_self_text(cap)}")  # buyable but for our own order (audit SIM-SELF-MATCH)
                     elif q is None or q["got"] < SIM_MIN_SHARES - 1e-9:
-                        parts.append(f"{name}：封顶 {cents(cap)}{capped}，之下没有卖单")
+                        spent = self.sim_paper_spent(mk, side, cap)  # the asks there are the ones a paper fill already bought
+                        parts.append(f"{name}：封顶 {cents(cap)}{capped}，" + (f"之下的卖单已被模拟交易买过（{spent:g} 份），等新的卖单"
+                                                                          if spent >= SIM_MIN_SHARES - 1e-9 else "之下没有卖单"))
                     else:
                         q, hold = self.sim_taker_pick(mk, trades, side, q, now_ms)  # the count the caps take, or why none
                         parts.append(f"{name}：封顶 {cents(cap)}{capped}，可买 {q['got']:g} 份" + (f"（已吃 {taken:g} 份，上限 {c.sim_taker_max_shares:g}）" if taken > 0 else "")
@@ -19495,15 +19747,20 @@ class Bot:
             model = mk.fair_up if side == "up" else 1 - mk.fair_up
             fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: judged at the limit when the card says more
             capped = f"（公平价 {cents(model)} 按上限 {cents(fair)} 计）" if cut > 0 else ""
-            cap = self.sim_taker_cap(mk, side, bps)
+            # 1.150.0 (audit SIM-SELF-MATCH): the trader's own cap (sim_take), a cent under our own real buy of the other side
+            # while one is not off the book — the card read 可吃单 … 可买 N 份 for our own order, which the trader never takes
+            base = self.sim_taker_cap(mk, side, bps)
+            cap = self.sim_taker_self_cap(trades, mk, side, base)
             levels = side_levels(mk.book, side)
             ask = levels[0][0] if levels else None
             room, taken = self.sim_taker_room(trades, mk, side, self.sim_taker_want(mk, side, cap))
             held = trades.get(f"{mk.market}|{side}|吃")
-            q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
+            # 1.150.0: on paper the asks less what paper fills already took (sim_paper_book), as the trader's own look — the card
+            # would otherwise read 可买 N 份 for shares it bought a look ago and will not buy again
+            q = taker_quote(self.sim_paper_book(mk, side), side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
             got = float(q["got"]) if q and q["got"] >= SIM_MIN_SHARES - 1e-9 else 0.0
             block = ""
-            if cap <= 0:
+            if base <= 0:
                 block = f"公平价 {cents(model)}{'（按上限 ' + cents(fair) + ' 计）' if cut > 0 else ''} 留不出 {cents(need)}"
             elif room < SIM_MIN_SHARES - 1e-9 and held is not None:
                 block = (f"已有{sim_status(held)}，等它结束" if sim_in_flight(held)
@@ -19511,8 +19768,12 @@ class Bot:
                          else f"已有{sim_status(held)}（每边只吃一次）")
             elif ask is None:
                 block = "没有卖单"
+            elif not got and cap < base - 1e-9 and ask <= base + 1e-9:
+                block = self.sim_taker_self_text(cap)  # buyable but for our own order: said, not shown as a 1¢ gap
             elif not got and ask <= cap + 1e-9:
-                block = f"封顶 {cents(cap)} 之下只有零星卖单（不足 1 份）"
+                spent = self.sim_paper_spent(mk, side, cap)
+                block = (f"封顶 {cents(cap)} 之下的卖单已被模拟交易买过（{spent:g} 份），等新的卖单" if spent >= SIM_MIN_SHARES - 1e-9
+                         else f"封顶 {cents(cap)} 之下只有零星卖单（不足 1 份）")
             gap = round(ask - cap, 6) if ask is not None and cap > 0 else None
             if why and not block:
                 block = why  # 1.138.0: under the headline's reason the sides are not buyable — no "可买 N 份" beside "不吃单"
@@ -19813,12 +20074,13 @@ class Bot:
         SIM_TAKER_SWEEP_SHARES — every share the asks at or under the cap show, up to that many and never fewer than
         the per-buy count: at a fair price of 50¢ the asks at 20¢ and 30¢ both clear the bar, so both are taken in one
         order rather than the 20¢ ones now and the 30¢ ones a step later (if still there). A thin book is bought as
-        before (the order asks for the per-buy count, the rest of it waits at the cap in real trading)."""
+        before (the order asks for the per-buy count, the rest of it waits at the cap in real trading). On paper the
+        asks are the book's less what paper fills already took of them (sim_paper_book, 1.150.0)."""
         base = self.sim_taker_shares(mk)
         sweep = self.config.sim_taker_sweep
         if sweep <= 0 or cap <= 0:
             return base
-        visible = sum(q for p, q in side_levels(mk.book, side) if p <= cap + 1e-9)
+        visible = sum(q for p, q in side_levels(self.sim_paper_book(mk, side), side) if p <= cap + 1e-9)
         return min(max(base, min(visible, sweep)), self.sim_order_cap(mk))  # a daily crypto market sweeps no more than a buy
 
     def sim_taker_room(self, trades: dict[str, dict], mk: SimMarket, side: str, want: float | None = None) -> tuple[float, float]:
@@ -19884,6 +20146,42 @@ class Bot:
         cap = taker_cap(fair, max(mk.need, self.sim_taker_bar(mk) - slack), bps)
         limit = self.sim_after_hours_price(mk)
         return min(cap, limit) if limit is not None and cap > 0 else cap
+
+    @staticmethod
+    def sim_taker_self_cap(trades: dict[str, dict], mk: SimMarket, side: str, cap: float) -> float:
+        """1.150.0 (audit SIM-SELF-MATCH): the taker cap of ``side`` kept a cent under our own real resting buy of the other
+        side. A 跌 bought at 1 − b is our own 涨 bid at b (and a 涨 at 1 − d is our own 跌 bid at d, an ask at 1 − d on the
+        book): side_levels counts that order as someone's liquidity, and the real taker is a LIMIT order at the cap
+        (sim_taker_limit), so whenever 1 − b ≤ cap it would match ourselves — a complete set for $1 plus the taker fee
+        instead of the trade the edge was about. It happens when the fair price jumps past a stale maker of the other side
+        before that maker is withdrawn: in the step the taker is decided (and sent in sim_after_decide) before the step's
+        cancels, and in the express lane the cancel runs beside the placement while the book still shows the order.
+        Counted conservatively: any order not finished at Predict (pending, placing, open, cancelling, unknown — a pending
+        one may be sent first), and a finished one whose cancel Predict confirmed after the book was read (the book may
+        still show it). Paper records have no "live" state and are not counted: paper trading is unchanged. Only lowers
+        the cap: the taker buys less or nothing, never more.
+        Not only a maker (review of the first fix): a real taker is a LIMIT order too, and what it did not fill rests on
+        the book at its limit until LIVE_TAKER_WAIT_SECONDS or live_taker_stale cancels it — in the step's sync, after
+        this decision, and never in the express lane: the same race. Its level is the limit the order was signed at
+        (live.want.limit, else its cap — as LiveBot.live_unit_cap), not the record's price (a taker's is average + fee)."""
+        other = "down" if side == "up" else "up"
+        for t in trades_of_market(trades, mk.market):
+            st = t.get("live")
+            if t.get("side") != other or not isinstance(st, dict):
+                continue
+            if max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0) <= 1e-9:
+                continue  # nothing of it left to rest
+            done = int(st.get("cancel_done_ms") or 0)
+            if st.get("state") not in (None, "done") or (done and int(getattr(mk.book, "fetched_ms", 0) or 0) <= done):
+                want = st.get("want") if isinstance(st.get("want"), dict) else {}
+                level = float((t.get("price") if t.get("maker") else want.get("limit") or want.get("cap") or t.get("cap") or t.get("price")) or 0)
+                cap = min(cap, round(1 - level - 0.01, 6))  # Predict's cent tick: strictly under our level
+        return cap
+
+    @staticmethod
+    def sim_taker_self_text(cap: float) -> str:
+        """Why a side shows nothing to take while sim_taker_self_cap holds its cap down (the order check and 距吃单)."""
+        return f"另一边自己的真实买单还没撤完，{cents(cap + 0.01)} 及以上的卖单不吃（其中有自己的单），之下没有卖单"
 
     def sim_deep_book(self, mk: SimMarket) -> bool:
         """Whether this market's book is quoted on under the deep-bid mode (SIM_MAKER_DEEP_CENTS, on the chosen markets
@@ -20009,7 +20307,11 @@ class Bot:
         """Why a resting order is withdrawn to be placed afresh when the chance returns (its slot is freed when nothing
         filled): the underlying is about to open or has just opened (SIM_OPEN_QUIET_MINUTES), is not in session
         (SIM_MAKER_SESSION), its edge fell under the exit line (SIM_MAKER_EXIT_CENTS), the valid 买1 is gone or has moved
-        (SIM_MAKER_MIN_BID). "" while it may stand."""
+        (SIM_MAKER_MIN_BID; either for SIM_MAKER_FOLLOW_SETTLE_SECONDS: sim_follow_settled). "" while it may stand. On a
+        stale or crossed book the rules that read the book wait for a fresh one; those that need the fair price alone —
+        the exit line, after hours the after-hours bar — are judged all the same (1.150.0), and a held card's order
+        stands (sim_unpriced_reason) — but for a first-touch market held by its book alone (mk.decided): an order
+        resting there is judged as on a card that holds nothing, and a decision not yet sent is void."""
         c = self.config
         if not trade.get("maker") or mk is None:
             return ""
@@ -20039,14 +20341,47 @@ class Bot:
             # line, a 买1 that fell away not followed — a bid left for whoever saw the move the card has not. It is withdrawn,
             # as on a book gone stale, and placed afresh by the next look that has a fresh price
             return f"{mk.price_problem}，撤单"
-        if mk.hold or mk.book.stale(now_ms) or book_crossed(mk.book):
-            return ""  # no fresh view of the market: the order stands
+        if mk.hold and not mk.decided:
+            return ""  # the fair price itself is in doubt: the order stands (sim_unpriced_reason withdraws it in time)
+        # 1.150.0 (audit SIM-TOUCH-DECIDED-HOLD, the review of its fix): not so on a first-touch market held by its book alone
+        # (mk.decided: the book trades the question as settled, the model's price is not there). Until that fix the trader had no
+        # such hold and an order resting there was judged by everything below; handed the hold as one more reason to let it stand,
+        # a 挂90k at 80¢ stayed on Predict under a book bidding 92¢ while BTC fell and the model's own price went to 70¢ — for
+        # SIM_NO_ODDS_WITHDRAW_MINUTES (half an hour; for good at 0) where the exit line had cancelled it within a look — and was
+        # filled when the 92¢ bid was swept: the book wrong, the model right, the bid 10¢ over the model. That hold is there to
+        # keep new orders out; it is no ground to stop judging the ones already resting. Withdrawals only, so never more than
+        # before that fix: nothing is placed while the card holds (sim_maker_gate, sim_requote_freed, sim_express_look), and the
+        # half hour still ends what these rules leave
+        if mk.decided and (trade["live"] if isinstance(trade.get("live"), dict) else {}).get("state") == "pending":
+            # ...and a real order still waiting to be sent (pending: held back by a cooldown, a sign-in) is no resting order but
+            # a new one, and under this hold it does not go out, as none is decided (sim_maker_gate). The real trader's send-time
+            # re-check asks this function about a decision that waited (LiveBot.live_taker_recheck), and "a held card's order
+            # stands" sent it: a 挂70k at 10¢ decided on an open book and held back five seconds by an API cooldown, the book
+            # meanwhile trading "90k first" as settled, went out into asks at 2¢ — the side the card held back, while the taker
+            # beside it was voided. (One whose request is on its way — placing — lands as the order resting before the book
+            # turned did, and is judged as that one is. Under the other holds a waiting decision is sent as before: unchanged.)
+            return f"卡片暂不建议（{mk.hold}）"
         side, price = str(trade.get("side") or "up"), float(trade.get("price") or 0)
         fair, _ = self.sim_fair(mk, side)  # the edge as the order was judged: at most SIM_MAX_FAIR_CENTS
         edge = fair - price
         exit_edge = self.sim_maker_exit(mk)
         if exit_edge > 0 and edge < exit_edge - 1e-9:
+            # 1.150.0 (audit SIM-STALE-BOOK-REQUOTE): judged before the book's freshness — the exit line reads no book. The card's
+            # fair price comes from the index / futures / Binance feeds and stays fresh (no hold) while Predict's book alone is
+            # stale (its reads failing, or the feed in its own 429 cooldown: the trading client still cancels) or crossed. This
+            # check stood behind the "no fresh view" return below, so a bid the fair price had fallen under was left on Predict —
+            # the free option the move's sellers take — until the stale-feed rule above, up to three and a half minutes on a
+            # daily market (55¢ bid, fair 70¢ → 45¢ on a book 95 s old: kept; the same look on a fresh book withdrew it)
             return f"净优势降到 {cents(edge)}，低于撤单线 {cents(exit_edge)}"
+        if mk.book.stale(now_ms) or book_crossed(mk.book):
+            # no fresh view of the book: the order stands for the rules below, which read it (the spread, the 买1). Of the mode's
+            # line the after-hours bar is judged here all the same: like the exit line it needs the fair price alone (False: without
+            # the deep-bid bar, which is the book's to say — so never stricter than the line a fresh book would give this order).
+            # Withdrawals only: nothing is placed on a stale or crossed book (sim_maker_gate, sim_requote_freed, sim_express_look)
+            bar, mode, line_name = self.sim_maker_mode(mk, False)
+            if mode and edge < (line := self.sim_maker_line(mk, False)) - 1e-9:
+                return f"{mode}只挂净优势 ≥ {cents(bar)} 的，现 {cents(edge)} 低于{line_name} {cents(line)}"
+            return ""
         only = (c.sim_maker_deep > 0 and c.sim_maker_deep_only and self.sim_mode_market(mk, c.sim_maker_deep_markets)
                 and self.sim_mode_market(mk, c.sim_maker_deep_only_markets) and not book_crossed(mk.book))
         if only and not trade.get("deep") and not trade.get("floor"):
@@ -20079,10 +20414,32 @@ class Bot:
             # "gone" and was voided at the send, or withdrawn by the express lane before it ever reached Predict)
             own = own_on_book(trade, mk.book)
             level = maker_level(mk.book, side, max(c.sim_maker_min_bid, SIM_MAKER_FRONT_MIN) if deep_order else c.sim_maker_min_bid, own, price)
+            key = f"{trade.get('market')}|{side}"  # the slot's settle clock (sim_follow_settled)
             if level is None:
                 if floor_order:
                     return ""  # still nothing to follow: the floor order is what rests here
-                return f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟" if c.sim_maker_min_bid > 0 else ""  # nobody else bids: a deep-bid order stays
+                if c.sim_maker_min_bid <= 0:
+                    return ""  # nobody else bids: a deep-bid order stays
+                # 1.150.0 (audit SIM-FOLLOW-SETTLE-GONE): the valid 买1 gone waits for the settle as a move does — "nowhere" is a place
+                # too (SIM_FOLLOW_GONE): the clock starts at the first look that finds it gone, starts anew when a 买1 is back a cent
+                # or more from the order, and is cleared by one back at the order's price (move None, below). This branch returned at
+                # once, never reaching the clock, and with the settle on the express lane acts on every re-quote reason
+                # (sim_express_acts): ONE push without SIM_MAKER_MIN_BID shares besides ours on any level — the stack pulled for the
+                # moment before it is re-posted, the very case the settle was made for (the 11-04 recording happened to keep a
+                # 111-share stub at 1¢, so its gaps read as moves), or a thin 买1 half sold — cancelled the real order; a floor order
+                # took the slot and followed the stack back after the settle: two cancels and two placements a flicker, the queue
+                # place lost each time (such a book replayed at a quarter second of API latency: 12 cancels and 11 placements in
+                # 20 s, the order off the book for 18 of them — on the rate limit every order and cancel shares).
+                # Gone for the whole settle it is withdrawn as before, by the lane's own timer when no push comes (sim_follow_wake);
+                # the edge gone, the market's end and every other withdrawal are judged above, at once as ever; with the settle at 0
+                # this one is too.
+                # Not for a decision Predict does not hold yet (pending; placing: its request may still be held back before it goes
+                # out): it has no queue place to keep, and the send-time re-check (LiveBot.live_taker_recheck) must go on voiding
+                # it — waiting there would SEND an order whose 买1 is gone
+                st = trade.get("live") if isinstance(trade.get("live"), dict) else {}
+                if st.get("state") not in ("pending", "placing") and not self.sim_follow_settled(key, SIM_FOLLOW_GONE, now_ms, mk.key):
+                    return ""
+                return f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟"
             move: tuple[float, str] | None = None  # (the place the order would move to, why), to go once that place has held (sim_follow_settled)
             if not deep_order:
                 if abs(level[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
@@ -20131,7 +20488,6 @@ class Bot:
                     # on a book with no bid at its price (the order is not on it: nothing of its own to mistake) and
                     # every withdrawal above still go
                     move = None
-            key = f"{trade.get('market')}|{side}"
             if move is None:
                 if not self.sim_follow_readonly:
                     self.sim_follow_since.pop(key, None)
@@ -20144,7 +20500,8 @@ class Bot:
         (the clock starts when it is first seen, again when the place changes; 0 = at once). A market maker on the 11-04
         SK 海力士 15 分 book pulled and re-posted its three-level stack every half second, the 买1 a cent or two away each
         time and gone for a moment in between: an order following every look would have been withdrawn and placed again
-        all day, last in the queue each time (1.104.3)."""
+        all day, last in the queue each time (1.104.3). ``target`` SIM_FOLLOW_GONE: the valid 买1 gone, a place like any
+        other — the order is withdrawn once it has been gone that long (1.150.0; it was withdrawn at the first such look)."""
         settle = self.config.sim_maker_follow_settle
         if settle <= 0:
             return True
@@ -20212,9 +20569,14 @@ class Bot:
         """Of the attempts that filled nothing — a resting order withdrawn, a taker that lapsed, an order refused:
         cancelled or expired records with no shares, moved to tid#n — only the newest SIM_ATTEMPTS_KEEP per slot are
         kept. A maker re-quoted every few seconds for days left tens of thousands of them, and every look at the
-        records (the step, the journal, the page) paid for all of them. How many were removed."""
+        records (the step, the journal, the page) paid for all of them. How many were removed.
+
+        1.150.0: the resting orders among them are counted before they go (sim_pruned_count, under SIM_PRUNED_KEY), in
+        the transaction that deletes them: the review page's 挂单效率 and the daily report's 挂单成交率 are taken over
+        every attempt, not over every fill and the last 20 misses of each slot."""
         by_slot: dict[str, list[tuple[int, str]]] = {}
-        for tid, t in self.sim_trades().items():
+        trades = self.sim_trades()
+        for tid, t in trades.items():
             head, _, way = tid.rpartition("|")
             label, _, n = way.partition("#")
             if not n.isdigit() or t.get("status") not in {"cancelled", "expired"} or float(t.get("shares") or 0) > 1e-9:
@@ -20227,12 +20589,24 @@ class Bot:
             by_slot.setdefault(f"{head}|{label}", []).append((int(t.get("opened") or 0), tid))
         doomed = [tid for rows in by_slot.values() for _, tid in sorted(rows, reverse=True)[self.SIM_ATTEMPTS_KEEP:]]
         if doomed:
-            self.store.delete_keys([f"sim:{tid}" for tid in doomed])
+            counted = sim_pruned_count(self.store.get(SIM_PRUNED_KEY), [trades[tid] for tid in doomed])
+            # one transaction (Store.replace): an attempt is never deleted uncounted, nor counted and still there to be counted again
+            self.store.replace([f"sim:{tid}" for tid in doomed], [(SIM_PRUNED_KEY, counted)])
             if self.sim_cache is not None:
                 for tid in doomed:
                     self.sim_cache.pop(tid, None)
                 self.sim_gen = self.store.touched.get("sim", 0)
         return len(doomed)
+
+    def sim_pruned(self, flt: Mapping | None = None) -> list[dict]:
+        """The totals of the resting orders sim_prune has deleted (sim_pruned_count), those in ``flt`` (the review page's
+        filter: a card, a kind, a way — none of them under 吃单): what sim_maker_efficiency adds to the records still kept."""
+        flt = flt or {}
+        if flt.get("way") and not JOURNAL_WAYS.get(flt["way"], True):
+            return []
+        rows = self.store.get(SIM_PRUNED_KEY)
+        return [r for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict)
+                and (not flt.get("card") or r.get("card") == flt["card"]) and (not flt.get("kind") or r.get("kind") == flt["kind"])]
 
     def prunable(self, trade: dict) -> bool:
         """Whether sim_prune may drop this record of an attempt that filled nothing; on paper always (LiveBot: not while its
@@ -20267,6 +20641,9 @@ class Bot:
             if best > price + 1e-9:
                 return (f"挂 {cents(price)}，最低卖价 {cents(best)}（高出 {cents(best - price)}）：要有人卖到挂价或更低才算成交；"
                         f"现在公平价 {cents(fair)}")
+            if not any(p <= price + 1e-9 for p, _ in side_levels(self.sim_paper_book(mk, trade["side"], resting=True), trade["side"])):
+                # 1.150.0: every such seller is one another paper fill already has (sim_fill credits none of them again)
+                return f"盘口卖到挂价的卖单已被模拟交易买过，不再重复算成交；现在公平价 {cents(fair)}"
             return f"盘口有卖到挂价的卖单，已按看到的数量推定成交；现在公平价 {cents(fair)}"
         if status != "filled":
             return ""
@@ -20546,6 +20923,15 @@ class Bot:
             self.log_limited("sim_ev", f"EV 检查失败：{clean_error(error) or type(error).__name__}")
         self.sim_note_closes()
         async with self.sim_lock:  # never beside the express lane (sim_express): one set of decisions at a time
+            # 1.150.0 (audit SIM-STALE-CLOCK): the look's clock is read here, where its decisions are made, not where the job began.
+            # The real trader's prefetch (a market's details, a sign-in: seconds when Predict is slow) and the wait for this lock lie
+            # in between, and the markets below are priced on the data of now. Judged on the job's clock, a book past
+            # PREDICT_STALE_MS, a quote past its age hold and a market in its last minutes all looked that much younger, and a
+            # taker's run of buyable looks (SIM_TAKER_HOLD_SECONDS) began that much early — while the order, stamped off the real
+            # clock (LiveBot.sim_open), went out as "decided this very second", past the send-time re-check kept for the
+            # decisions that waited (live_taker_recheck): a real order on a 97 s book after a 12 s details read. Kept in
+            # sim_looked_ms: the real trader's sync of this step runs on the same clock (LiveBot.sim_step)
+            now_ms = self.sim_looked_ms = max(now_ms, self.market.now_ms())
             confirm = await self.sim_decide(now_ms)
         await self.sim_after_decide(now_ms)  # the real orders go out now, not behind the settlement lookups
         await confirm
@@ -20576,6 +20962,7 @@ class Bot:
             if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
                 self.sim_taker_unseen(mk)  # a look that cannot judge the market breaks its takers' runs (SIM_TAKER_HOLD_SECONDS)
                 continue  # positions filled in other kinds (SIM_MARKETS narrowed) still settle below; resting ones are withdrawn
+            self.sim_paper_seen(mk)  # the asks paper fills took that this book no longer shows are forgotten (1.150.0)
             self.sim_quote(mk, trades, now_ms, changed)
             self.sim_take(mk, trades, now_ms, changed)
         self.sim_taker_seen = {tid: at for tid, at in self.sim_taker_seen.items() if tid.rsplit("|", 2)[0] in markets}  # gone markets forgotten
@@ -20626,6 +21013,24 @@ class Bot:
                     trade["confirm"] = "local"
             if json.dumps(trade, sort_keys=True, default=str) != before:
                 changed.append((tid, trade))
+        if self.sim_paper_used:
+            # What paper fills took on a market that is over is forgotten (sim_paper_used) here, once the records above have had
+            # their look, and never while an order still rests there; until then it is kept through the looks that do not price
+            # the market (a quote missing for a moment, a card on hold): its asks are still the ones already bought when it is
+            # priced again. 1.150.0 (the review of the SIM-PAPER-TAKER-REBUY fix): it was forgotten before that loop, which
+            # judges an order still resting at its market's end one last time — its fills on this book (sim_fill), then its
+            # withdrawal (sim_withdraw_reason: sim_quiet) — so that order was filled from the book as read: the 100 at 55¢ a
+            # taker had bought a second before the end were credited to it as well, a floor order the asks the one before it in
+            # its slot had been credited. One ask counted twice again, in the step's first look past the end of a market still
+            # listed then with an order resting on it (an up/down card is priced for a minute past the end its records keep, the
+            # open of its last 1-minute candle); the express lane never forgets a market for its end, so the count hung on which
+            # lane looked first. And the end an order is withdrawn at is its own record's (sim_withdraw_reason), the one the
+            # memory goes by the card's (sim_paper_seen): should the card name an earlier one, the order rests on past it and is
+            # still not credited what another paper fill has. With the market over and no order resting there, no paper fill
+            # comes from its book again (sim_quiet opens none)
+            self.sim_paper_used = {market: held for market, held in self.sim_paper_used.items()
+                                   if (now_ms < held["end"] if held["end"] is not None else market in markets)
+                                   or any(t.get("status") == "resting" for t in trades_of_market(trades, market))}
         t3 = time.monotonic()
         self.sim_unpriced_since = {market: since for market, since in self.sim_unpriced_since.items() if market in unpriced}
         for tid in rekeys:
@@ -20696,6 +21101,14 @@ class Bot:
                 trades[new_tid] = trades.pop(tid)
                 changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]
             trades[tid] = self.sim_open(mk, side, now_ms, maker=maker, shares=count)
+            if not isinstance(trades[tid].get("live"), dict):
+                self.sim_paper_rested(mk, side)  # 1.150.0: a paper order is not credited the asks the orders before it in the slot were
+            # 1.150.0 (audit SIM-FOLLOW-SETTLE-GONE): a fresh order starts without a settle clock. The slot's clock (market|side) is
+            # cleared only by a look that finds its order in place (sim_requote_reason: move None); an order that ended while one
+            # ran — withdrawn at the settle or for its edge, filled — left it behind, and the next order in the slot would take it
+            # over: "gone" is one place for every order (SIM_FOLLOW_GONE), so its first look at a one-push gap would find the 买1
+            # "gone for long" and withdraw it at once
+            self.sim_follow_since.pop(f"{mk.market}|{side}", None)
             changed.append((tid, trades[tid]))
             refused.add(side)  # 1.138.0: the other side in the same look — the card showed both 可挂, the second waited for the next look
 
@@ -20786,10 +21199,13 @@ class Bot:
             # hours the after-hours bar, never over the after-hours price limit): every ask at or under it is bought, up
             # to SIM_SHARES; nothing above it, however much is wanted
             cap = self.sim_taker_cap(mk, side, bps)
+            cap = self.sim_taker_self_cap(trades, mk, side, cap)  # never at or through our own live resting buy of the other side
             # what this side may still take (SIM_TAKER_MAX_SHARES), 0 with an order in flight; the count asked for is every
             # ask under the cap (SIM_TAKER_SWEEP_SHARES) or the per-buy count
             room, _ = self.sim_taker_room(trades, mk, side, self.sim_taker_want(mk, side, cap))
-            q = taker_quote(mk.book, side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
+            # 1.150.0 (audit SIM-PAPER-TAKER-REBUY): on paper the asks are the book's less what paper fills already took of
+            # them (sim_paper_book); in real trading the book as read
+            q = taker_quote(self.sim_paper_book(mk, side), side, room, bps, cap) if cap > 0 and room >= SIM_MIN_SHARES - 1e-9 else None
             if q and q["got"] >= SIM_MIN_SHARES - 1e-9:  # under a share is dust, not a trade: the slot stays free
                 quotes.append((round(fair - q["cost"], 4), side, q))
         self.sim_taker_looked(mk, {side for _, side, _ in quotes}, now_ms)  # the runs of looks that find each side buyable
@@ -20809,6 +21225,10 @@ class Bot:
             trades[new_tid] = trades.pop(tid)
             changed[:] = [(new_tid if k == tid else k, t) for k, t in changed]
         trades[tid] = self.sim_open(mk, side, now_ms, taker=q)
+        if trades[tid].get("status") == "filled" and not isinstance(trades[tid].get("live"), dict):
+            # a paper buy, filled here and now: Predict's book stays as it was, so the asks it took are remembered — the
+            # next look (and a resting order's presumed fill) does not get them again. A real order is filled by Predict
+            self.sim_paper_took(mk, side, q["levels"])
         changed.append((tid, trades[tid]))
 
     def sim_taker_looked(self, mk: SimMarket, buyable: set[str], now_ms: int) -> None:
@@ -20859,6 +21279,7 @@ class Bot:
         if quiet:
             return q, quiet
         bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
+        book = self.sim_paper_book(mk, side)  # the asks the smaller counts are quoted on: as ``q`` was (on paper less what paper fills took, 1.150.0)
         room, full = self.sim_side_room(trades, mk, side)  # SIM_AFTER_HOURS_MAX_SHARES: what the side may still hold after hours
         if full:
             return q, full
@@ -20870,7 +21291,7 @@ class Bot:
             return q, full
         if q["want"] > min(room, mroom, uroom) + 1e-9:
             left = min(room, mroom, uroom)
-            smaller = taker_quote(mk.book, side, float(math.floor(left + 1e-9)), bps, q["cap"])
+            smaller = taker_quote(book, side, float(math.floor(left + 1e-9)), bps, q["cap"])
             if not smaller or smaller["got"] < SIM_MIN_SHARES - 1e-9:
                 return q, (f"这张卡未结算窗口的资金只剩 {left:g} 份的额度，封顶价之下买不到一份" if uroom < min(room, mroom)
                            else f"这一边只剩 {left:g} 份额度（加密日涨跌每边上限），封顶价之下买不到一份" if mroom < room
@@ -20883,7 +21304,7 @@ class Bot:
 
         def quote(n: int) -> dict | None:
             if n not in quotes:
-                quotes[n] = taker_quote(mk.book, side, float(n), bps, q["cap"])
+                quotes[n] = taker_quote(book, side, float(n), bps, q["cap"])
             return quotes[n]
 
         def fits(n: int) -> bool:  # the paper cap alone while searching; the real-trading limits are counted once, below
@@ -20919,7 +21340,8 @@ class Bot:
         sweep orders too) is outside SIM_AFTER_HOURS_MAX_SHARES — placed whatever the side holds, at its whole count:
         a bid far under the fair price, filled only when someone dumps into the book, is wanted however large the
         position (10-20); the cap counts the positions and the ordinary orders (side_held). The group cap and the
-        real-trading limits hold for every order. (shares, "" | why none may be placed)."""
+        real-trading limits hold for every order. A floor order (maker.floor) goes at its own count (sim_floor_shares) or
+        not at all: a cap or limit that cannot take it whole refuses it, none cuts it. (shares, "" | why none may be placed)."""
         want = float(min(self.config.sim_shares, self.sim_order_cap(mk)))  # SIM_CRYPTO_DAY_SHARES on a daily crypto market
         if maker.floor:
             want = self.sim_floor_shares(maker.price)  # a floor order: its own count, never cut (under Predict's minimum it could not go out)
@@ -20956,6 +21378,18 @@ class Bot:
         why = self.sim_group_room(trades, mk, side, maker.price, want)
         if not why:
             return want, ""
+        if maker.floor:
+            # 1.150.0 (audit SIM-FLOOR-CHURN): refused at its count, as by the share caps above — the size-down below is for the
+            # orders judged by SIM_SHARES. A floor order is judged by its own count (sim_requote_reason): one cut here went out,
+            # was withdrawn at the next look ("托底单份数已改为 N 份，按新份数重挂") and was placed again, cut again — the loop
+            # an ordinary order made on 10-14 — a cancel and a new order every few seconds for as long as the limit bound, on the
+            # rate limit every order and cancel shares. The group cap is one such limit (on paper the default 100 × 1¢ under a
+            # group with less than its $1 of room: a withdrawn attempt a look); the real trader's come through the same call
+            # (LiveBot.sim_group_room → live_room) — what LIVE_MAX_OPEN_USD leaves, the USDT balance, and LIVE_MAX_ORDER_USD
+            # itself: a floor order worth more than it (500 × 5¢ against $20, each a one-click preset) looped on every empty
+            # side, no position needed. (For real only a floor order worth more than Predict's $1 minimum got that far: the
+            # default one cut was under it, and refused as such.) The refusal is the limit's own, at the whole count
+            return want, why
         best = self.sim_size_down(self.sim_size_top(trades, want, maker.price),
                                   lambda n: not Bot.sim_group_room(self, trades, mk, side, maker.price, float(n)))
         if best is not None:
@@ -21013,18 +21447,28 @@ class Bot:
             return
         now_ms = self.market.now_ms()
         if await self.sim_express_look(key, now_ms):
-            await self.sim_express_after(now_ms)
+            await self.sim_express_after(max(now_ms, self.market.now_ms()))  # 1.150.0: never stamped before the look it follows (which may have waited for the lock)
 
     async def sim_express_look(self, key: str, now_ms: int) -> list[tuple[str, dict]]:
         """One express look at a key's markets (sim_express), under the step's lock: the records it changed, saved —
         [] when it changed nothing."""
         changed: list[tuple[str, dict]] = []
         async with self.sim_lock:
+            # 1.150.0 (audit SIM-STALE-CLOCK): judged on the clock after the wait for the lock, as the step is — a step's decisions
+            # hold it meanwhile, and live_requote_freed reads one clock for several keys' looks, each behind the last one's placements
+            now_ms = max(now_ms, self.market.now_ms())
             trades = self.sim_trades()
             for mk in self.sim_markets_for(key, now_ms):  # this key's markets alone: the other cards and ladders are not priced for it
                 if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
                     self.sim_taker_unseen(mk)
+                    if mk.decided and self.sim_in_scope(mk) and not (mk.book.stale(now_ms) or book_crossed(mk.book)):
+                        # 1.150.0 (audit SIM-TOUCH-DECIDED-HOLD, the review of its fix): a first-touch market held by its book alone
+                        # opens nothing, but its resting orders are still judged by this look (sim_requote_reason), as they were
+                        # before the trader was handed that hold: an edge gone is acted on at the push that shows it, not at the
+                        # step's next turn
+                        self.sim_express_rest(mk, trades, now_ms, changed)
                     continue
+                self.sim_paper_seen(mk)  # as the step: the asks paper fills took that this book no longer shows are forgotten
                 self.sim_express_rest(mk, trades, now_ms, changed)
                 if self.config.sim_ways != "taker":
                     self.sim_quote(mk, trades, now_ms, changed, express=True)
@@ -21065,7 +21509,9 @@ class Bot:
             if unfilled and order - filled > 0:  # the unfilled part: counted where it loses, never as a hedge
                 mine.append({**t, "shares": order - filled, "price": self.sim_resting_cost(t), "resting": True})
         price, shares = self.sim_group_order(mk, price, shares, taker)
-        candidate = {"kind": mk.kind, "side": side, "settle": mk.settle, "price": price, "shares": shares}
+        # (the key: what tells the candidate's ladder or first-touch market from the driver's others — path_family, 1.150.0;
+        # without it the order would count apart from the positions of its own ladder, never as their hedge)
+        candidate = {"kind": mk.kind, "key": mk.key, "side": side, "settle": mk.settle, "price": price, "shares": shares}
         worst, event = group_worst_case([*mine, candidate], name)
         if -worst > cap + 1e-9:
             return (f"{event}时这组仓位合计将亏 ${-worst:,.2f}，超过组上限 ${cap:g}"
@@ -21090,7 +21536,11 @@ class Bot:
         blocked = {k: v for k, v in (record.get("blocked") or {}).items()
                    if isinstance(v, dict) and now_ms - int(v.get("at") or 0) <= self.SIM_BLOCK_KEEP_MS}
         old = blocked.get(tid)
-        if old and now_ms - int(old.get("at") or 0) < self.SIM_BLOCK_NOTE_MS and old.get("why") == why:
+        # 1.150.0: a live back-off or API cooldown names its countdown ("N 秒后再试"), which changes every second; the same
+        # refusal is the same whatever its countdown (same_refusal), else every refused look rewrote simblock:<driver> (a DB
+        # write) and bumped the "simblock" generation that keys sim_report's cache. Inside the window the stored text keeps
+        # the countdown of its first write; its "at" says when that was.
+        if old and now_ms - int(old.get("at") or 0) < self.SIM_BLOCK_NOTE_MS and same_refusal(old.get("why"), why):
             return
         blocked[tid] = {"at": now_ms, "market": mk.market, "item": mk.item, "label": label, "price": price, "why": why,
                         "first": int((old or {}).get("first") or now_ms), "kind": mk.kind, "key": mk.key,  # (the filter's card and kind: 1.107.0)
@@ -21409,7 +21859,7 @@ class Bot:
                 "edges": sim_by_bucket(trades, lambda t: t.get("edge"), EDGE_BUCKETS, marks),
                 "fairs": sim_by_bucket(trades, lambda t: t.get("fair"), FAIR_BUCKETS, marks),
                 "sessions": sim_by_session(trades, exchange_of, holidays_of, marks),
-                "makers": sim_maker_efficiency(trades),
+                "makers": sim_maker_efficiency(trades, self.sim_pruned(flt)),  # 1.150.0: the attempts sim_prune removed counted in
                 "blocked": sim_blocked_outcomes(blocks, trades, self.config.sim_shares),
                 "versions": sim_by_version(trades, marks),  # 1.107.0: a setting changed, its values side by side
                 "windows": sim_by_window(trades, marks),    # 1.107.0: the 15-minute windows by start hour and by minutes left
@@ -21426,7 +21876,7 @@ class Bot:
 
     def sim_ev(self, trades: list[dict] | None = None, preopen: bool = True) -> dict:
         """模型 EV 对实际盈亏 (sim_ev_timeline, 1.140.0) over ``trades`` (every record when None) and, when ``preopen``, the
-        pre-open mode's settled fills (preopen.ev_bets: each filled side a coin-flip bet at its price)."""
+        pre-open mode's settled fills (preopen.ev_bets: each window one coin-flip bet at its price, 1.150.x)."""
         bets = sim_ev_bets(list(self.sim_trades().values()) if trades is None else trades)
         if preopen and (rows := self.preopen_rows()):
             from preopen import ev_bets
@@ -22464,7 +22914,7 @@ class Bot:
         money = lambda x: ("+$" if x >= 0 else "−$") + f"{abs(x):,.2f}"
         wl = lambda r: f"赢 {r['wins']} 输 {r['losses']}" + (f" 平 {r['ties']}" if r["ties"] else "")
         day, total, done = summary_of(today_rows, marks), summary_of(trades, marks), summary_of(settled_rows)
-        lifetime, makers = sim_stats(trades), sim_maker_efficiency(trades)
+        lifetime, makers = sim_stats(trades), sim_maker_efficiency(trades, self.sim_pruned())
         body = []
         if today_rows:
             ways = "、".join(f"{name} {n} 笔" for name, n in (("挂单", sum(bool(t.get("maker")) for t in today_rows)),
