@@ -4472,10 +4472,11 @@ class LiveBot(core.Bot):
             lock = self.live_redeem_lock = asyncio.Lock()
         return lock
 
-    async def live_redeem(self, now_ms: int) -> list[str]:
+    async def live_redeem(self, now_ms: int, manual: bool = False) -> list[str]:
         """Positions on markets Predict has resolved: the winning outcome's shares are redeemed for USDT on-chain
         (once per market and outcome); the lines say what was done. A position whose redeem failed waits
-        LIVE_REDEEM_RETRY_SECONDS; with no BNB for gas nothing is tried and the administrator hears once an hour. A
+        LIVE_REDEEM_RETRY_SECONDS — ``manual`` (the owner's /live redeem, the page's 领取已结算) tries it once now: 1.150.0,
+        audit RDM-MANUAL-BACKOFF; with no BNB for gas nothing is tried and the administrator hears once an hour. A
         position resolved against the bot is marked settled (``lost``) and never asked about again (1.131.3: each one
         cost a market read every round, and the pre-open mode leaves one or more a filled window — hundreds a day
         against the rate limit its orders and cancels share); a market is read once a round whatever outcomes are held,
@@ -4486,7 +4487,7 @@ class LiveBot(core.Bot):
         async with self.redeem_lock():
             self.live_redeem_since = self.market.now_ms()  # 1.150.0 (RDM-ROUND-LOCK-STALL): /live and the check say since when a pass holds the lock
             try:
-                done, _ = await self.live_redeem_pass(now_ms)
+                done, _ = await self.live_redeem_pass(now_ms, force=manual)
             finally:
                 self.live_redeem_since = 0
             return done
@@ -4601,7 +4602,7 @@ class LiveBot(core.Bot):
             return listed
         return held if isinstance(held, int) and held > 0 else listed
 
-    async def live_redeem_pass(self, now_ms: int, dry_run: bool = False) -> tuple[list[str], list[dict]]:
+    async def live_redeem_pass(self, now_ms: int, dry_run: bool = False, force: bool = False) -> tuple[list[str], list[dict]]:
         """One look at the account's positions, the markets read the longest ago first (never yet: first of all; the
         newest positions first among equals): (the redeemed lines, each position judged). Kinds:
         redeemed (now), claimable (resolved in its favour, not redeemed now: ``dry_run``, or no gas), failed (this
@@ -4748,7 +4749,13 @@ class LiveBot(core.Bot):
                 seen.append({**entry, "kind": "sent", "tx": str(s.get("tx") or ""), "age_ms": int(s.get("age_ms") or 0), "error": str(s.get("error") or "")})
                 continue
             failed_at = self.live_redeem_failed.get(key)
-            if failed_at is not None and time.monotonic() - failed_at < self.LIVE_REDEEM_RETRY_SECONDS:
+            # 1.150.0 (audit RDM-MANUAL-BACKOFF): the back-off held /live redeem (and the page's 领取已结算) as well — after the
+            # cause was gone (BNB topped up, the RPC back) the owner's command sent nothing for up to an hour and answered 没有可领取
+            # 的已结算持仓; only a restart cleared it. ``force`` (that command) tries such a position once in this pass: one attempt
+            # per position per command; the automatic rounds keep the wait. Nothing beside a transaction still out (the sent note
+            # above comes first), the gas floor and the marks as ever, and Chain.send's estimate refuses a redeem that would revert
+            # before anything is spent. A failure here starts its wait afresh.
+            if not force and failed_at is not None and time.monotonic() - failed_at < self.LIVE_REDEEM_RETRY_SECONDS:
                 seen.append({**entry, "kind": "waiting", "left": self.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - failed_at), "error": errors.get(key, "")})
                 if 1 <= unsent_runs.get(key, 0) <= self.LIVE_REDEEM_UNSENT_PULLS:
                     pull.append(key)  # a round inside its wait: the pull to the wait's end stands
@@ -5230,12 +5237,21 @@ class LiveBot(core.Bot):
                 await self.live_ensure_ready()
                 if not self.live.ready:
                     return f"未就绪：{self.live.not_ready_why}"
-            lines = await self.live_redeem(now_ms)
-            if lines:
-                return "\n".join(lines)
+            lines = await self.live_redeem(now_ms, manual=True)  # (RDM-MANUAL-BACKOFF) a position in a failed redeem's back-off: tried once now
             last = self.live_redeem_last
-            head = ("这次没有领取" if (last.get("counts") or {}).get("claimable")
-                    else "读到的持仓里没有可领取的" if last.get("cut") else "没有可领取的已结算持仓")  # 1.150.0: a cut list is no all-clear
+            counts = last.get("counts") or {}
+            # 1.150.0 (audit RDM-MANUAL-BACKOFF): the head said 没有可领取的已结算持仓 unless the gas held winners back — also for a
+            # failed redeem, a 缺字段 or 结算读不出 winner (none of them claimed) and a market not read; and a reply with a 💵 line
+            # was those lines alone, the failures beside them unsaid. Now: 这次没有领取 when something claimable was not claimed,
+            # 读到的持仓里没有可领取的 when part was not looked at, and the rest of the round after the 💵 lines
+            missed = {k: counts[k] for k in ("claimable", "failed", "waiting", "fields", "unclear") if counts.get(k)}
+            if lines:
+                if missed or counts.get("unread") or last.get("cut"):
+                    rest = sum(missed.values()) + int(counts.get("unread") or 0)
+                    lines.append((f"另有 {rest} 个这次没领：" if rest else "") + f"{self.live_redeem_summary(last)}。/live redeem check 看原因")
+                return "\n".join(lines)
+            head = ("这次没有领取" if missed
+                    else "读到的持仓里没有可领取的" if counts.get("unread") or last.get("cut") else "没有可领取的已结算持仓")  # 1.150.0: a cut list is no all-clear
             return f"{head}：{self.live_redeem_summary(last)}。/live redeem check 看原因"
         if action == "check":
             lines = await self.live_prepare()

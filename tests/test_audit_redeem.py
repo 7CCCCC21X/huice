@@ -1814,4 +1814,98 @@ async def check_forgets_failure():
 asyncio.run(check_forgets_failure())
 
 
+# --- RDM-MANUAL-BACKOFF ---------------------------------------------------------------------------------------------------------
+def req(*args):
+    """The administrator's /live command with ``args`` (answered inline: no background loops here)."""
+    return m.Request("/live", list(args), ADMIN, 0, ADMIN)
+
+
+class Picky(T["FakeChain"]):
+    """test_trading's FakeChain whose redeem of a condition in ``refuse`` fails: ("unsent", text) never left (TxNotSent: five
+    minutes), ("sent", text) was mined and reverted (the hour). Every attempt is counted (asked)."""
+    def __init__(self, refuse=None):
+        super().__init__()
+        self.refuse, self.asked = dict(refuse or {}), []
+
+    async def redeem(self, cid, index_set, amount, neg, yb):
+        self.asked.append(cid)
+        how, text = self.refuse.get(cid, ("", ""))
+        if how == "unsent":
+            raise L.TxNotSent(text)
+        if how == "sent":
+            raise m.RemoteError(text)
+        return await super().redeem(cid, index_set, amount, neg, yb)
+
+
+async def manual_backoff():
+    """RDM-MANUAL-BACKOFF: /live redeem (and the page's 领取已结算, the same action) obeyed the failure back-off — after the
+    cause was gone (BNB topped up, the RPC back) it sent nothing for up to an hour and answered 没有可领取的已结算持仓, the same
+    wrong head for 领取失败 / 缺字段; and a reply with a 💵 line hid the failures beside it. The command now tries a position in
+    back-off once (one attempt per position per command; the automatic rounds keep their wait), says 这次没有领取 when something
+    claimable was not claimed, 读到的持仓里没有可领取的 when a market was not read, and the rest of the round after 💵 lines.
+    Never beside a transaction still out, never under the gas floor."""
+    # (a) a redeem that failed (mined and reverted: the hour), the cause gone: the round still waits, the command redeems at once
+    bot = await ready_bot()
+    fake, key = bot.live.api, "live:redeemed:500:1"
+    chain = bot.live.chain = Picky({cond(500): ("sent", "交易失败（已回滚）：0xbad")})
+    fake.positions_rows, fake.markets["500"] = [held(500)], mk(500, won=1)
+    assert await bot.live_redeem(NOW) == [] and chain.asked == [cond(500)]
+    chain.refuse.clear()
+    assert await bot.live_redeem(NOW + MIN) == [] and bot.live_redeem_last["counts"] == {"waiting": 1} and len(chain.asked) == 1, "the round keeps its hour"
+    answer = await bot.cmd_live(req("redeem"))  # (before: 没有可领取的已结算持仓：持仓 1 个：失败等重试 1 — nothing sent)
+    assert answer == "💵 已领取 window 500 Up 10 份：0xredeem" and bot.store.get(key)["tx"] == "0xredeem" and key not in bot.live_redeem_errors, answer
+    assert (await bot.cmd_live(req("redeem"))).startswith("没有可领取的已结算持仓：持仓 1 个：已领仍列着 1") and len(chain.asked) == 2, "once: the mark stands"
+    # (b) still failing: one attempt per command, said as such, and its wait afresh for the automatic round
+    bot = await ready_bot()
+    fake = bot.live.api
+    chain = bot.live.chain = Picky({cond(500): ("sent", "交易失败（已回滚）：0xbad")})
+    fake.positions_rows, fake.markets["500"] = [held(500)], mk(500, won=1)
+    await bot.live_redeem(NOW)
+    bot.live_redeem_failed[key] -= 600  # ten minutes into its hour
+    answer = await bot.cmd_live(req("redeem"))
+    assert answer == "这次没有领取：持仓 1 个：领取失败 1。/live redeem check 看原因" and len(chain.asked) == 2, answer  # (before: 没有可领取的…)
+    assert bot.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - bot.live_redeem_failed[key]) > bot.LIVE_REDEEM_RETRY_SECONDS - 5, "its hour afresh"
+    assert await bot.live_redeem(NOW + 2 * MIN) == [] and bot.live_redeem_last["counts"] == {"waiting": 1} and len(chain.asked) == 2
+    report = await bot.live_redeem_report(NOW + 3 * MIN)
+    assert "领取失败、等重试：" in report and "交易失败（已回滚）：0xbad（59 分钟后再试）" in report, report  # the check is no command: not forced
+    # (c) some redeemed, some not: the 💵 lines and the rest of the round
+    bot = await ready_bot()
+    fake = bot.live.api
+    chain = bot.live.chain = Picky({cond(502): ("sent", "交易失败（已回滚）：0xb2"), cond(503): ("unsent", "RPC 错误：execution reverted")})
+    fake.positions_rows = [held(mid) for mid in (501, 502, 503)]
+    fake.markets.update({str(mid): mk(mid, won=1) for mid in (501, 502, 503)})
+    answer = await bot.cmd_live(req("redeem"))
+    assert answer.split("\n") == ["💵 已领取 window 501 Up 10 份：0xredeem",
+                                  "另有 2 个这次没领：持仓 3 个：领了 1，领取失败 2。/live redeem check 看原因"], answer  # (before: the 💵 line alone)
+    # (d) as before: nothing resolved in the bot's favour; the gas floor (nothing sent, no wait started); a market not read
+    bot = await ready_bot()
+    fake = bot.live.api
+    chain = bot.live.chain = Picky()
+    fake.positions_rows, fake.markets["600"] = [held(600)], mk(600)
+    assert await bot.cmd_live(req("redeem")) == "没有可领取的已结算持仓：持仓 1 个：未结算 1。/live redeem check 看原因"
+    fake.markets["600"] = mk(600, won=1)
+    chain.bnb = 10 ** 13
+    await bot.live.refresh_balance()
+    answer = await bot.cmd_live(req("redeem"))
+    assert answer.startswith("这次没有领取：持仓 1 个：可领取 1；签名钱包 BNB 不足") and chain.asked == [] and bot.live_redeem_failed == {}, answer
+    chain.bnb = 10 ** 17
+    await bot.live.refresh_balance()
+    fake.positions_rows = [held(601)]  # (its market cannot be read)
+    answer = await bot.cmd_live(req("redeem"))
+    assert answer == "读到的持仓里没有可领取的：持仓 1 个：没读到市场 1。/live redeem check 看原因", answer  # (before: 没有可领取的已结算持仓)
+    # (e) never beside a transaction still out: the sent note comes first, forced or not
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["910"] = [held(910)], mk(910, won=1)
+    bot.live.chain = QuickChain(bot.live.wallet)
+    with node_for(eth_getTransactionReceipt=None) as node:
+        assert await bot.live_redeem(NOW) == []  # sent, no receipt in time: failed, its note kept
+        answer = await bot.cmd_live(req("redeem"))
+    assert node.methods().count("eth_sendRawTransaction") == 1 and "已发出待确认 1" in answer, (answer, node.methods())
+    print("RDM_MANUAL_BACKOFF_OK")
+
+
+asyncio.run(manual_backoff())
+
+
 print("AUDIT_REDEEM_OK")
