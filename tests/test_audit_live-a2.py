@@ -843,8 +843,10 @@ async def live_fill_after_local_settle():
         t2 = t0 + 100_000
         await look(bot, t2, *views(t2))
         t = rec(bot, oid)
-        if view == "fresh":
-            assert t["status"] == "filled" and t["shares"] == 100 and t.get("withdrawn") and not any(w.startswith(late_event) for w in whats(t)), see(t)
+        if view in ("fresh", "stale", "crossed"):
+            # a stale or crossed book no longer shields the bid from the exit line (audit SIM-STALE-BOOK-REQUOTE): withdrawn
+            # first as on a fresh book — only a look with no card for the market at all ("gone") still settles the market first
+            assert t["status"] == "filled" and t["shares"] == 100 and t.get("withdrawn") and not any(w.startswith(late_event) for w in whats(t)), (view, see(t))
         else:
             assert t["status"] == "settled" and t["payout"] == 0.0 and t["shares"] == 100 and t["settled"] == t2 and t["live"]["state"] == "done", (view, see(t))
             assert day(bot, t2) == -55 and m.sim_status(t) == "输 −$55.00" and late_note in t["note"], (view, day(bot, t2), see(t))

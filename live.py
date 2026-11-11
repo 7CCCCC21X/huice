@@ -1767,6 +1767,11 @@ class LiveBot(core.Bot):
             self.live_notify(f"🛑 {why}；今天不再开新仓，已请求撤掉挂单（以 Predict 的确认为准）。/live resume 可手动恢复。", key="kill")
 
     # --- opening: the paper record becomes an order to place ----------------------------------------------------------
+    def sim_paper(self) -> bool:
+        """Paper buys only with LIVE=off (sim_open below). Otherwise the fills are Predict's and the book is the real one:
+        what earlier paper fills took of it (Bot.sim_paper_book, 1.150.0) is never taken out of a real decision."""
+        return self.config.live_mode == "off"
+
     def sim_open(self, mk: core.SimMarket, side: str, now_ms: int, maker: Any = None, taker: dict | None = None,
                  shares: float | None = None) -> dict:
         trade = super().sim_open(mk, side, now_ms, maker, taker, shares)
@@ -1904,7 +1909,14 @@ class LiveBot(core.Bot):
         marks["决策"] -= self.live_place_ms
         marks["下单"] = self.live_place_ms
         try:
-            await self.live_sync(now_ms)
+            # 1.150.0 (audit SIM-STALE-CLOCK): on the clock the step decided on (sim_looked_ms: Bot.sim_step reads it under the lock),
+            # as the decisions and their sync always shared one — not on the job's, read before the prefetch: a taker's unfilled rest
+            # was cancelled that much after LIVE_TAKER_WAIT_SECONDS (live_taker_due weighs it against placed_at, read off the clock).
+            # Nor on a clock read here: this sync's open-order list is stamped with it and weighed against the records' own stamps
+            # (live_readopt, prunable), and the express lane stamps a record when its pass begins, not when Predict answers — a
+            # list stamped after a pass that ran beside this step's placements, yet read before that pass's cancel was confirmed,
+            # would take the cancelled order back
+            await self.live_sync(max(now_ms, self.sim_looked_ms))
             mark("同步")
         except Exception as error:
             self.live_note_error(f"同步真实订单失败：{core.clean_error(error) or type(error).__name__}")
@@ -2330,6 +2342,13 @@ class LiveBot(core.Bot):
                 ORDER_SEND_CHECK.reset(token)
             took = time.monotonic() - sent
             st["answered_at"] = st["sent_at"] + int(took * 1000)
+            # 1.150.0: Predict's answer on the books' clock too (the wall clock a book's fetched_ms is stamped with), as
+            # cancel_done_ms is: answered_at is on the Binance-offset clock (market.now_ms = wall clock + offset_ms) for
+            # live_latency and is not to be compared with a book's read — own_on_book did, so within the clock offset of the
+            # answer our order was taken out of a level it had joined (a false "买1 gone") or counted as someone else's 买1 on
+            # a book that already showed it. The offset is taken back out rather than the wall clock read anew, so a market
+            # clock without an offset (the tests' fakes, whose books are stamped on that clock) keeps the two equal.
+            st["answered_ms"] = st["answered_at"] - int(getattr(self.market, "offset_ms", 0) or 0)
         except Exception as error:
             tid = st.get("rekeyed") or tid  # 1.138.0: withdrawn and moved (sim_rekey) while it waited: it lives there now — never saved back at the slot
             text = core.clean_error(error) or type(error).__name__
@@ -2418,7 +2437,7 @@ class LiveBot(core.Bot):
         an order of unknown state that never existed (1.138.1) — then waiting as a deferred order does."""
         st = trade["live"]
         st.update(state="pending", hash="")
-        for k in ("sent_at", "answered_at"):
+        for k in ("sent_at", "answered_at", "answered_ms"):
             st.pop(k, None)
         self.sim_save([(tid, trade)])
         self.live_defer(tid, trade, why, now_ms)
