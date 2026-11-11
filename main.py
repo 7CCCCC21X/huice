@@ -13471,8 +13471,10 @@ function takerLine(t){  // 距吃单: how far the trader itself (its own bar, ca
   d.title=(t.detail||t.text)+(t.bar!=null?"；机器人的吃单门槛：净优势 ≥"+cent(t.bar)+"，按它自己的份数、封顶价和手续费算，不是上面按试算金额算的四个方向":"");return d}
 // 为什么挂 / 不挂单: what the trader rests or takes on this book and why not, each side apart (why.json). Read when a row is
 // opened and every few seconds while one is; it holds an account's orders, so with real trading set up it asks for the
-// control key (WEB_CONTROL_KEY) once and keeps it in this tab, as the review page does
-let whyData=null,whyAt=0,whyBusy=false,whyErr="",whyKeyBad=false;
+// control key (WEB_CONTROL_KEY) once and keeps it in this tab, as the review page does. 1.150.0: a real account with no
+// WEB_CONTROL_KEY configured answers 403 with "nokey": there is no key to type, so the row shows the server's message once
+// (no prompt, no 5 s re-polls; a click on the title reads again) instead of asking after every value typed
+let whyData=null,whyAt=0,whyBusy=false,whyErr="",whyKeyBad=false,whyNoKey=false;
 function whyKey(){try{return sessionStorage.getItem("ctlkey")||""}catch(e){return ""}}
 function whyAsk(msg){const k=prompt(msg+"\\n下单情况里有实盘账户的挂单和持仓，需要控制口令（环境变量 WEB_CONTROL_KEY）：","");
   if(k===null||!k.trim()){whyKeyBad=true;return false}try{sessionStorage.setItem("ctlkey",k.trim())}catch(e){}whyKeyBad=false;return true}
@@ -13480,9 +13482,10 @@ async function loadWhy(force){
   if(whyBusy||(!force&&(whyKeyBad||Date.now()-whyAt<5000)))return;whyBusy=true;let again=false;
   try{const key=whyKey(),r=await fetch(location.pathname.replace(/\\/$/,"")+"/why.json",{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
     if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}
-      if(r.status===403&&whyAsk(j.message||"需要控制口令"))again=true;throw new Error(j.message||("HTTP "+r.status))}
+      whyNoKey=r.status===403&&!!j.nokey;if(whyNoKey)whyKeyBad=true;else if(r.status===403&&whyAsk(j.message||"需要控制口令"))again=true;
+      throw new Error(j.message||("HTTP "+r.status))}
     if(!r.ok)throw new Error("HTTP "+r.status);whyData=await r.json();whyAt=Date.now();whyErr=""}
-  catch(e){whyErr="读取失败："+(e.message||"网络错误")+(whyKeyBad?"（点标题重新输入口令）":"")}
+  catch(e){whyErr="读取失败："+(e.message||"网络错误")+(whyKeyBad&&!whyNoKey?"（点标题重新输入口令）":"")}
   finally{whyBusy=false}
   if(again)return loadWhy(true);
   if(last)render(last)}
@@ -14508,7 +14511,8 @@ async function load(){  // the list: light rows, the open trades and the last fe
   const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),20000);
   const wantAll=allLoaded||!!load.more;
   try{const key=ctlKey();const r=await fetch(base+"/journal.json"+(wantAll?"?all=1":""),{cache:"no-store",headers:key?{"X-Control-Key":key}:{},signal:ctl.signal});
-    if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}if(r.status===403&&askKey(j.message||"需要控制口令"))again=true;throw new Error(j.message||("HTTP "+r.status))}
+    if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}  // 1.150.0: "nokey" (a real account, WEB_CONTROL_KEY unset): nothing to type, the message once
+      if(r.status===403&&j.nokey)load.keyBad=true;else if(r.status===403&&askKey(j.message||"需要控制口令"))again=true;throw new Error(j.message||("HTTP "+r.status))}
     if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();
     if(openId&&!wantAll&&j.more>0&&!j.trades.some(t=>t.id===openId)){allLoaded=true;again=true}  // a link to an older trade: the whole list
     else{if(load.more){allLoaded=true;load.more=false}data=j;okAt=Date.now();if(filterKey())loadAna();  // the filter's tables refreshed with the list
@@ -15227,7 +15231,12 @@ class WebServer:
     def journal_keyed(self, path: str, query: str, head: str, client: str) -> tuple[int, str, bytes]:
         failed = self.key_check(head, client)
         if failed:
-            return failed[0], "application/json; charset=utf-8", json.dumps({"ok": False, "locked": True, "message": failed[1]}, ensure_ascii=False).encode("utf-8")
+            # 1.150.0: "nokey" marks the refusal of a real account's data with no WEB_CONTROL_KEY configured (key_check's
+            # uncounted 403): the odds page's 为什么挂 / 不挂单 row and the review page then show the message once instead of
+            # prompting for a key that cannot exist, re-prompting after every value typed. The 403 itself is unchanged.
+            nokey = not self.bot.config.web_control_key
+            return failed[0], "application/json; charset=utf-8", json.dumps(
+                {"ok": False, "locked": True, "nokey": nokey, "message": failed[1]}, ensure_ascii=False).encode("utf-8")
         return self.route("GET", path, query)
 
     def control_key_failed(self, client: str, now: float) -> None:

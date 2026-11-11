@@ -584,4 +584,96 @@ async def startup_notice_lost():
 
 
 asyncio.run(startup_notice_lost())
+
+async def why_no_key():
+    """XR-WHY-NO-KEY: a real account (a real-trading key, real orders in the records) with WEB_CONTROL_KEY unset. data.json keeps
+    a 距吃单 stub on every priced card so that its 为什么挂 / 不挂单 row stays (CTRL-DATAJSON-LEAK: "the keyed way to the same
+    facts"), but why.json and journal.json answer 403 "未设置 WEB_CONTROL_KEY" and count no failure (CTRL-NO-CONTROL-KEY): there is
+    no key to type. The row asked for one anyway, stored every value typed, read again, got the same 403 and asked again — only
+    Cancel ended it; the review page did the same. The 403 now says "nokey" and both pages show the message once, no prompt.
+    With a key configured a missing or wrong key still prompts (nokey false)."""
+    import json, os, re, shutil, subprocess, tempfile
+    token = "t" * 20
+
+    class FM:
+        def __init__(self): self.config = None
+        def now_ms(self): return NOW
+
+    def bot_of(control_key):
+        env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+               "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, **({"WEB_CONTROL_KEY": "control-key-123456"} if control_key else {})}
+        return m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(), None)
+
+    async def get(port, name, extra=""):
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(f"GET /p/{token}/{name} HTTP/1.1\r\nHost: x\r\n{extra}\r\n".encode()); await w.drain()
+        data = await r.read(); w.close()
+        head, _, body = data.partition(b"\r\n\r\n")
+        return int(head.split(b" ")[1]), body.decode("utf-8")
+
+    bodies, pages = {}, {}
+    for control_key in (False, True):
+        web = m.WebServer(bot_of(control_key), 0, token); web.CACHE_SECONDS = {}
+        port = await web.start()
+        try:
+            assert web.account_private() and bool(web.bot.config.web_control_key) == control_key
+            for name in ("why.json", "journal.json"):
+                for extra in ("", "X-Control-Key: guess-one-guess\r\n"):
+                    st, body = await get(port, name, extra)
+                    j = json.loads(body)
+                    assert st == 403 and j["locked"] is True, (control_key, name, st, body)
+                    assert j.get("nokey") is (not control_key), (control_key, name, extra, j)  # only "no key configured" is final
+                    if not control_key:
+                        assert "未设置 WEB_CONTROL_KEY" in j["message"], j
+                        bodies[name] = body
+            assert (web.control_failures == {}) is (not control_key), web.control_failures  # no key: nothing counted, as before
+            pages = {"odds": web.pages["page"].decode("utf-8"), "journal": web.pages["journal"].decode("utf-8")}
+        finally:
+            await web.stop()
+
+    odds, journal = pages["odds"], pages["journal"]
+    assert re.search(r"j\.nokey[^\n]*whyAsk\(", odds), "the odds page's row checks nokey before prompting"
+    assert re.search(r"j\.nokey[^\n]*askKey\(", journal), "the review page checks nokey before prompting"
+
+    # the pages' own code, run against the server's real 403 body with fetch / prompt stubbed (node; skipped without it)
+    node = shutil.which("node") or ("/opt/node22/bin/node" if os.path.exists("/opt/node22/bin/node") else "")
+    if not node:
+        print("why_no_key: node not found, page-code run skipped")
+        return
+    why_js = odds[odds.index("let whyData="):odds.index("function whyRow(")]
+    jr_js = journal[journal.index("function ctlKey()"):journal.index('["csv","scsv","json"]')]
+    harness = r"""
+const prompts=[],asks=[];let store={};
+globalThis.sessionStorage={getItem:k=>store[k]||null,setItem:(k,v)=>{store[k]=v}};
+globalThis.prompt=m=>{prompts.push(m);return prompts.length<=3?"guess-"+prompts.length:null};
+globalThis.location={pathname:"/p/T/"};
+const BODY=JSON.parse(process.env.BODY);
+globalThis.fetch=async(u,o)=>{asks.push(u);return {status:403,ok:false,json:async()=>BODY}};
+"""
+    odds_run = harness + "let last=null;function render(){}\n" + why_js + """
+(async()=>{await loadWhy(true);await loadWhy(false);
+console.log(JSON.stringify({prompts:prompts.length,fetches:asks.length,err:whyErr}))})();"""
+    jr_run = harness + """
+let dead=false,okAt=0,allLoaded=false,openId="",data=null,details={},base="/p/T";
+function filterKey(){return ""}function loadAna(){}function render(){}function loadDetail(){}function clock(){return ""}
+function $(tag,cls,text){return {tag,cls,text}}
+let meta=[];globalThis.document={getElementById:()=>({replaceChildren:(...a)=>{meta=a}}),querySelector:()=>null};
+""" + jr_js + """
+(async()=>{await load();await load();
+console.log(JSON.stringify({prompts:prompts.length,fetches:asks.length,meta:meta.map(x=>x.text).join("")}))})();"""
+    results = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        for label, code, body in (("odds", odds_run, bodies["why.json"]), ("journal", jr_run, bodies["journal.json"])):
+            path = pathlib.Path(tmp) / f"{label}.js"
+            path.write_text(code, encoding="utf-8")
+            out = subprocess.run([node, str(path)], capture_output=True, text=True, timeout=60, env={**os.environ, "BODY": body})
+            assert out.returncode == 0, (label, out.stderr[-2000:])
+            results[label] = json.loads(out.stdout.strip().splitlines()[-1])
+    o, jr = results["odds"], results["journal"]
+    assert o["prompts"] == 0 and o["fetches"] == 1, o  # one read, no prompt, no 5 s re-polls while the row is open
+    assert "未设置 WEB_CONTROL_KEY" in o["err"] and "重新输入口令" not in o["err"], o
+    assert jr["prompts"] == 0 and jr["fetches"] == 1 and "未设置 WEB_CONTROL_KEY" in jr["meta"], jr
+
+
+asyncio.run(why_no_key())
 print("AUDIT_XREVIEW_OK")
