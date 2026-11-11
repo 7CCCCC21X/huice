@@ -2536,9 +2536,9 @@ class LiveBot(core.Bot):
         return self.sim_rekey(tid, trade)
 
     def live_save(self, tid: str, trade: dict) -> None:
-        """A record a pass over the orders changed (live_sync_orders, live_cancel_blind), saved where it lives: under the key
-        the pass holds — or, moved to tid#n since the pass took that key, there; never again under the old key (the slot may
-        hold a fresh order by now)."""
+        """A record a pass over the orders changed (live_sync_orders, live_cancel_blind; 1.150.0: live_late_fills and its
+        helpers, XR-LATEFILL-STALE-KEY), saved where it lives: under the key the pass holds — or, moved to tid#n since the
+        pass took that key, there; never again under the old key (the slot may hold a fresh order by now)."""
         moved = trade["live"].get("rekeyed")
         if not moved or moved == tid:
             return self.sim_save([(tid, trade)])
@@ -3125,6 +3125,18 @@ class LiveBot(core.Bot):
         open_recs = [(tid, t) for tid, t in live if t.get("status") in {"filled", "resting"} and float(t.get("shares") or 0) > 1e-9]
         if not ended and not open_recs:
             return
+        # 1.150.0 (audit XR-LATEFILL-STALE-KEY): the keys above are taken before this pass awaits anything — the positions read
+        # (paged, one page after another), the orders' own records read again (live_reread_fills, live_late_unread,
+        # live_undo_preopen_adoptions) — and the pass runs in the step's sync, after the step has let go of sim_lock. The
+        # express lane runs beside it, on every book push: re-quoting or re-taking the same slot, it moves the record there to
+        # tid#n (sim_rekey) and opens a fresh order at the slot, sent at once (an order never waits behind the reads). Saved back
+        # under the key taken here — the trim about two minutes after nearly every taker fill, an adoption, a cost fix, a
+        # take-back, an undo — the old record replaced the fresh order's record, in the store and in memory alike: that real
+        # order rested or filled with no record (outside LIVE_MAX_OPEN_USD, the share caps and the loss stop; a resting one
+        # withdrawn only by the orphan sweep two minutes later, a filled one never booked at all), the old record was stored
+        # twice, and the slot, free again in the bot's eyes, took another order beside the unrecorded one. Every record this pass
+        # changes is saved where it lives now (live_save): under the key taken here, or the tid#n it was moved to meanwhile —
+        # never again under the slot key. Unmoved, that is the key taken here, as before
         try:
             rows = await self.live.api.positions()
         except Exception:
@@ -3265,7 +3277,7 @@ class LiveBot(core.Bot):
                     t.update(unfilled=max(order - float(t["shares"]), 0.0),
                              note=f"真实成交 {float(t['shares']):g}/{order:g} 份（订单结束后补记），其余 {max(order - float(t['shares']), 0.0):g} 份{st.get('cancel_why') or '已结束'}")
                 st["events"].append({"at": now_ms, "what": f"补记改正：按最近结束的订单补记的 {moved:g} 份其实是订单 #{oid2} 的（它的记录显示了成交），已改到那笔"})
-                self.sim_save([(tid, t)])
+                self.live_save(tid, t)  # 1.150.0: where it lives now — never the slot key taken before the reads (XR-LATEFILL-STALE-KEY, above)
                 self.live_adopted_status(tid2, t2, now_ms, f"结束后再读订单记录，读到成交 {got:g} 份（累计 {float(t2['shares']):g}/{float(t2.get('order') or 0):g}）；"
                                                             f"之前按最近结束的订单补记在 #{st.get('order_id')} 上的 {moved:g} 份已改到这里")
                 break
@@ -3286,7 +3298,7 @@ class LiveBot(core.Bot):
                 t["price"] = price if t.get("maker") else price + core.taker_fee(price, int((st.get("want") or {}).get("fee_bps") or 0))
                 st["events"].append({"at": now_ms, "what": f"补记的成本按 Predict 持仓均价改为 {core.cents(price)}（原按订单 #{st.get('order_id')} 的价 {core.cents(was)} 记）"})
                 self.live_notify(f"📌 成本校正：{t['item']} {t['label']}：补记那笔的成本按 Predict 持仓均价改为 {core.cents(price)}（原 {core.cents(was)}）", key=f"adoptprice:{tid}")
-            self.sim_save([(tid, t)])
+            self.live_save(tid, t)  # 1.150.0: where it lives now — never the slot key taken before the reads (XR-LATEFILL-STALE-KEY, above)
         # (b) a holding a little short of the open records: the fee taken in shares — the records trimmed to it, in proportion
         groups: dict[tuple[str, int], list[tuple[str, dict]]] = {}
         for tid, t in open_recs:
@@ -3347,7 +3359,10 @@ class LiveBot(core.Bot):
                             what += f"；成本 ${price * before:,.2f} → ${keep * after:,.2f}（吃单的手续费就是少掉的这些份额，不再另算进成本）"
                     t["price"] = round(keep, 6)
                 t["live"]["events"].append({"at": now_ms, "what": what})
-                self.sim_save([(tid, t)])
+                # 1.150.0: where it lives now (XR-LATEFILL-STALE-KEY, above). The positions read this trim weighs took a while: the lane
+                # may have re-taken the side meanwhile — this record moved to tid#1, a fresh taker at the slot, filled at once — and the
+                # trimmed record, saved at the slot, left that fill on Predict with no record here, the old one stored twice
+                self.live_save(tid, t)
             costs = "（成本不变）" if fee_off < 0.005 else (f"（吃单的手续费就是少掉的这些份额，不再另算进成本：成本共减 ${fee_off:,.2f}"
                                                            + ("；挂单的成本不变" if any(t.get("maker") for _, t in recs) else "")
                                                            + ("；按账户持仓记入的吃单本来就是扣过手续费的份数，成本不变"
@@ -3393,8 +3408,11 @@ class LiveBot(core.Bot):
                 continue  # unread: asked again next pass
             ad["po_checked"] = now_ms
             own, _ = order_fill(row, float(t.get("order") or 0))
+            # 1.150.0 (audit XR-LATEFILL-STALE-KEY): ``tid`` is the key live_late_fills took before its reads (this one included):
+            # the express lane may have moved the record to tid#n and opened a fresh order at the slot meanwhile — saved where it
+            # lives now (live_save), never back at the slot over that order's record
             if own > self.LIVE_DUST_SHARES:
-                self.sim_save([(tid, t)])
+                self.live_save(tid, t)
                 continue  # the order's own record shows fills: the backfill stands
             order = float(t.get("order") or 0)
             ad["undone"] = {"at": now_ms, "shares": shares}
@@ -3404,7 +3422,7 @@ class LiveBot(core.Bot):
                      note=(f"撤单：{st.get('cancel_why') or '已结束'}，一份都没成交（之前补记的 {shares:g} 份是开盘前预挂在同一边的成交，已撤销）" if ended == "cancelled"
                            else f"市场已出结果，挂单一直没成交（之前补记的 {shares:g} 份是开盘前预挂在同一边的成交，已撤销）"))
             st["events"].append({"at": now_ms, "what": f"补记撤销：订单 #{st['order_id']} 自己的记录一份都没成交，之前补记的 {shares:g} 份是开盘前预挂在同一边的成交（预挂已读到），已撤销"})
-            self.sim_save([(tid, t)])
+            self.live_save(tid, t)  # 1.150.0: where it lives now (above)
             self.live_notify(f"↩️ 补记撤销：{t['item']} {t['label']}：订单 #{st['order_id']} 在 Predict 的记录一份都没成交，之前补记的 {shares:g} 份"
                              f"其实是开盘前预挂在同一边的成交，已从这笔记录撤销（预挂的记录里照常有它）", key=f"unadopt:{tid}")
 
@@ -3468,7 +3486,11 @@ class LiveBot(core.Bot):
         st["events"].append({"at": now_ms, "what": "结束后核对持仓：" + how})
         self.live_notify(f"📌 补记成交：{t['item']} {t['label']} {core.cents(float(t['price']))}：{how}（订单 #{st.get('order_id')}，请在 Predict 核对）",
                          key=f"latefill:{st.get('order_id')}")
-        self.sim_save([(tid, t)])
+        # 1.150.0 (audit XR-LATEFILL-STALE-KEY): ``tid`` is the key live_late_fills took before its reads — the record moved to tid#n
+        # by the express lane meanwhile (a fresh order at the slot) is saved there (live_save), never back at the slot over that
+        # order's record: it rested or filled on Predict with no record here, and the slot, free again in the bot's eyes, took
+        # another order beside it
+        self.live_save(tid, t)
 
     async def live_fills_wait(self) -> None:
         """Every fills read in flight (live_fills_later), waited for: the step's sync and the tests."""

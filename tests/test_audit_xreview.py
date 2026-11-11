@@ -676,4 +676,152 @@ console.log(JSON.stringify({prompts:prompts.length,fetches:asks.length,meta:meta
 
 
 asyncio.run(why_no_key())
+
+
+async def latefill_stale_key():
+    """XR-LATEFILL-STALE-KEY: live_late_fills takes its (key, record) pairs, then awaits the account's positions (paged) and the
+    orders' own records — in the step's sync, after the step has let go of sim_lock. The express lane runs beside it: taking or
+    quoting the same slot again, it moves the record there to tid#1 and opens a fresh order at the slot, sent at once. The pass
+    then saved the old record back under the key it took — the trim of a taker's fee in shares (about two minutes after nearly
+    every taker fill), the adoption of a late fill, the adopted cost's check — over the fresh order's record, in the store and in memory:
+    that real order rested or filled with no record (outside LIVE_MAX_OPEN_USD, the share caps and the loss stop), the old record
+    was stored twice, and the slot, free again in the bot's eyes, took another order beside the unrecorded one. Each record is now
+    saved where it lives (live_save)."""
+    WEI = T["WEI"]
+    mkt = lambda fair, at: hsi(fair, [("0.55", "300")], [("0.58", "400")], at)
+    rows_of = lambda bot, slot: sorted((k.removeprefix("sim:").rsplit("|", 1)[-1], str((v.get("live") or {}).get("order_id")), round(float(v.get("shares") or 0), 6))
+                                       for k, v in bot.store.items("sim:") if k.removeprefix("sim:").split("#")[0] == slot)
+    up_row = lambda shares, **kw: [{"id": "p1", "market": {"id": 101, "title": "恒生指数"}, "outcome": {"name": "Up", "indexSet": 1, "onChainId": "1011"},
+                                    "amount": str(int(shares * WEI)), **kw}]
+
+    async def lane_in_the_read(bot, at):
+        """The step at ``at`` (fair 0.50: it decides nothing) whose late-fill pass is held on the positions read while the express
+        lane looks at the card (fair 0.70: the side taken or quoted again). Returns the step, still waiting, and the read's go."""
+        api = bot.live.api
+        came, go, real = asyncio.Event(), asyncio.Event(), api.positions
+
+        async def positions():  # the account's positions read, held on its way: the pass took its records before it
+            rows = await real()
+            if not came.is_set():
+                came.set()
+                await go.wait()
+            return rows
+        api.positions = positions
+        stepping = asyncio.ensure_future(step(bot, at, mkt(0.50, at)))
+        await asyncio.wait_for(came.wait(), 20)
+        bot.market.now, world["markets"] = at + 300, [mkt(0.70, at + 300)]
+        await bot.sim_express("HSI")
+        return stepping, go
+
+    def every_order_recorded(bot):
+        api, trades = bot.live.api, bot.sim_trades()
+        booked = {str(v["live"].get("order_id")) for v in trades.values() if isinstance(v.get("live"), dict)}
+        resting = {str(v["live"].get("order_id")) for v in trades.values() if isinstance(v.get("live"), dict) and v["live"].get("state") == "open"}
+        filled = {i for i, r in api.closed.items() if r["status"] == "FILLED"}
+        assert filled <= booked and set(api.open) <= resting, (sorted(filled), sorted(api.open), sorted(booked), sorted(resting))
+
+    # (a) the trim (the default way, taker; the fee taken in shares): a filled taker at 吃, trimmed while the lane takes the side again
+    bot = make_bot(SIM_WAYS="taker", SIM_TAKER_MAX_SHARES="300")
+    await bot.live_prepare()
+    api = bot.live.api
+    real_create = api.create_order
+
+    async def fills_at_once(body):
+        got = await real_create(body)
+        api.fill(got["order_id"], 100, done=True, price=0.58)
+        return got
+    api.create_order = fills_at_once
+    world["markets"] = [mkt(0.70, NOW)]
+    await bot.live_prefetch(NOW)
+    await step(bot, NOW, mkt(0.70, NOW))
+    slot = f"{HSI_SLUG}|up|吃"
+    old = bot.sim_trades()[slot]
+    assert old["live"]["order_id"] == "101" and old["status"] == "filled" and old["shares"] == 100, (old["live"].get("order_id"), old["status"], old["shares"])
+    api.positions_rows = up_row(98.551724)  # 100 bought, the fee taken in shares
+    await step(bot, NOW + 70_000, mkt(0.50, NOW + 70_000))  # the shortfall seen once; it must stand a minute later
+    stepping, go = await lane_in_the_read(bot, NOW + 135_000)  # ...and this pass trims
+    fresh = bot.sim_trades()[slot]
+    assert fresh is not old and fresh["live"]["order_id"] == "102" and bot.sim_trades()[f"{slot}#1"] is old, fresh["live"]  # the old record -> 吃#1
+    go.set()
+    await stepping
+    trades = bot.sim_trades()
+    assert old["shares"] == 98.551724, old["shares"]  # trimmed as before ...
+    assert trades[slot] is fresh and trades[f"{slot}#1"] is old, [k for k, v in trades.items() if v is old]  # ... where it lives
+    assert rows_of(bot, slot) == [("吃", "102", 0.0), ("吃#1", "101", 98.551724)], rows_of(bot, slot)  # one row per order (store = memory)
+    every_order_recorded(bot)  # the fresh taker's fill (#102) is booked: it was on Predict with no record
+
+    # (b) a late fill read from an ended maker's own record (an operator's cancel leaves it spent at its slot), while the lane quotes
+    # the slot again: live_adopted_status
+    bot = make_bot(SIM_WAYS="maker")
+    api = bot.live.api
+    await bot.live_prepare()
+    world["markets"] = [mkt(0.70, NOW)]
+    await bot.live_prefetch(NOW)
+    await step(bot, NOW, mkt(0.70, NOW))
+    slot = f"{HSI_SLUG}|up|挂"
+    old = bot.sim_trades()[slot]
+    oid = old["live"]["order_id"]
+    assert old["live"]["state"] == "open" and sorted(api.open) == [oid], (old["live"]["state"], sorted(api.open))
+    t1 = NOW + 5_000
+    bot.market.now = t1
+    await bot.live_cancel_command([oid], t1)
+    await bot.live_fills_wait()
+    assert bot.sim_trades()[slot] is old and old["live"]["state"] == "done" and old["status"] == "cancelled", (old["live"]["state"], old["status"])
+    api.closed[oid]["amountFilled"] = str(30 * WEI)  # matched as the cancel landed: on the order's own record and on the account
+    api.positions_rows = up_row(30)
+    t2 = t1 + 70_000
+    stepping, go = await lane_in_the_read(bot, t2)
+    fresh = bot.sim_trades()[slot]
+    assert fresh is not old and fresh["live"]["state"] == "open" and bot.sim_trades()[f"{slot}#1"] is old, fresh["live"]  # the spent record -> 挂#1
+    go.set()
+    await stepping
+    await bot.live_fills_wait()
+    trades = bot.sim_trades()
+    assert old["shares"] == 30, old["shares"]  # the late fill booked on its own order, as before
+    assert trades[slot] is fresh and trades[f"{slot}#1"] is old, [k for k, v in trades.items() if v is old]
+    assert rows_of(bot, slot) == [("挂", fresh["live"]["order_id"], 0.0), ("挂#1", oid, 30.0)], rows_of(bot, slot)
+    every_order_recorded(bot)
+    # ...and the next look at the side places nothing beside it: one order resting, the one the records hold
+    t3 = t2 + 1_500
+    bot.market.now, world["markets"] = t3, [mkt(0.70, t3)]
+    await bot.sim_express("HSI")
+    assert sorted(api.open) == [fresh["live"]["order_id"]], sorted(api.open)
+    every_order_recorded(bot)
+
+    # (c) the adopted cost's check, the pass after a late fill went onto an ended maker by the position's average price (the order's
+    # own record never showed it), while the lane quotes the slot again (the filled record -> 挂#1)
+    bot = make_bot(SIM_WAYS="maker")
+    api = bot.live.api
+    await bot.live_prepare()
+    world["markets"] = [mkt(0.70, NOW)]
+    await bot.live_prefetch(NOW)
+    await step(bot, NOW, mkt(0.70, NOW))
+    old = bot.sim_trades()[slot]
+    oid = old["live"]["order_id"]
+    t1 = NOW + 5_000
+    bot.market.now = t1
+    await bot.live_cancel_command([oid], t1)
+    await bot.live_fills_wait()
+    assert bot.sim_trades()[slot] is old and old["live"]["state"] == "done" and old["shares"] == 0, (old["live"]["state"], old["shares"])
+    api.positions_rows = up_row(30, avgPrice=str(old["price"]))
+    t2 = t1 + 70_000
+    await step(bot, t2, mkt(0.50, t2))  # adopted by the position's price, no race here
+    ad = old["live"].get("adopted") or {}
+    assert old["shares"] == 30 and old["status"] == "filled" and str(ad.get("by")).startswith("按 Predict 持仓均价") and not ad.get("guess"), (old["shares"], old["status"], ad)
+    assert not old["live"].get("adopted_price_fixed") and bot.sim_trades()[slot] is old
+    stepping, go = await lane_in_the_read(bot, t2 + 65_000)  # the next pass checks the adopted cost against the position's average
+    fresh = bot.sim_trades()[slot]
+    assert fresh is not old and fresh["live"]["state"] == "open" and bot.sim_trades()[f"{slot}#1"] is old, fresh["live"]
+    go.set()
+    await stepping
+    await bot.live_fills_wait()
+    trades = bot.sim_trades()
+    assert old["live"].get("adopted_price_fixed") is True  # the check ran and saved its mark ...
+    assert trades[slot] is fresh and trades[f"{slot}#1"] is old, [k for k, v in trades.items() if v is old]  # ... where the record lives
+    assert rows_of(bot, slot) == [("挂", fresh["live"]["order_id"], 0.0), ("挂#1", oid, 30.0)], rows_of(bot, slot)
+    assert bot.store.get(f"sim:{slot}#1")["live"].get("adopted_price_fixed") is True  # stored there, not only in memory
+    every_order_recorded(bot)
+
+
+asyncio.run(latefill_stale_key())
 print("AUDIT_XREVIEW_OK")
