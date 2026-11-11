@@ -1565,10 +1565,27 @@ class LiveBot(core.Bot):
         return ""
 
     def live_daily_pnl(self, trades: dict[str, dict], now_ms: int) -> float:
+        """Today's settled P&L of the real records (the Beijing day; the loss stop's figure): every record settled today, at
+        its result as it stands. 1.150.0: plus what a result corrected TODAY took from a record settled on an earlier day —
+        a position pre-settled on the bot's own data before midnight (a win, counted that day) that Predict resolves the
+        other way after it keeps its first settlement's time (sim_settle: the journal's), so the correction's loss fell on a
+        day already over and no day's stop counted it. Only what today's corrections took away (their net, a record's
+        revisions of today together), never what they gave back: a correction in the bot's favour of yesterday's record
+        gives today's stop no room."""
         today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
         since = int(today.timestamp() * 1000)
-        return sum((float(t["payout"]) - float(t["price"])) * float(t["shares"]) for t in trades.values()
-                   if isinstance(t.get("live"), dict) and t.get("status") == "settled" and int(t.get("settled") or 0) >= since)
+        total = 0.0
+        for t in trades.values():
+            if not isinstance(t.get("live"), dict) or t.get("status") != "settled":
+                continue
+            shares = float(t["shares"])
+            if int(t.get("settled") or 0) >= since:
+                total += (float(t["payout"]) - float(t["price"])) * shares
+            else:  # settled before today: the payout's change today (its revisions carry their own time), when it is a loss
+                moved = sum(float(r.get("to") or 0) - float(r.get("from") or 0) for r in t.get("revisions") or ()
+                            if isinstance(r, dict) and int(r.get("at") or 0) >= since)
+                total += min(0.0, moved) * shares
+        return total
 
     def live_check_kill(self, trades: dict[str, dict], now_ms: int) -> None:
         cap = self.config.live_max_daily_loss_usd
@@ -1642,6 +1659,32 @@ class LiveBot(core.Bot):
         if isinstance(st, dict) and st.get("state") in {"pending", "placing", "open", "unknown"} and trade["status"] in {"expired", "settled"}:
             st["state"], st["cancel_why"] = "cancelling", "市场已出结果"
             st["events"].append({"at": now_ms, "what": "撤单：市场已出结果"})
+
+    def live_settle_late(self, trade: dict, now_ms: int) -> None:
+        """A real order's fill read only after its market's result (1.150.0). The step decides before it reads the orders
+        back (sim_decide, then live_sync), so a result the bot's own data gives in the very step — a first-touch line
+        crossed, a flip, a range or cap level reached — finds a just-filled order's record still at 0 shares: sim_settle
+        lapses it ("expired": 市场已出结果，挂单一直没成交) and the cancel that follows, or the positions check minutes
+        later (live_late_fills), then reads the fill. Every path left such a record alone (live_finish, live_cancel_fills_read
+        and live_adopted_status skip settled and expired records alike; sim_decide re-settles only on a changed result): it
+        held real shares as "未成交" with no payout — out of the journal's P&L and out of the day's settled loss, so the
+        loss stop (LIVE_MAX_DAILY_LOSS_USD) did not see the money until Predict's own result, hours later, and then on the
+        day of the lapse (after Beijing midnight: on no day's stop at all). The record is settled here instead, the moment
+        the shares are on it, on the result it already has — Predict's, else the bot's own — and stamped now (sim_settle):
+        the loss counts on the day it becomes known, a win as any pre-settled win does; Predict's word still confirms or
+        corrects it later (sim_confirm). No order goes out past a loss settled here (live_send_block recomputes the day's
+        figure before every send); the switch itself trips at the step's next check (live_check_kill)."""
+        shares, order = float(trade.get("shares") or 0), float(trade.get("order") or 0)
+        if trade.get("status") != "expired" or shares <= 1e-9:
+            return
+        final, local = trade.get("final"), trade.get("local")
+        result = final if isinstance(final, dict) and final.get("up") is not None else local
+        if not isinstance(result, dict) or result.get("up") is None:
+            return  # no result on the record to settle it on: left as it is
+        by = "Predict 最终结果" if result is final else "本地预结算"
+        what = f"Predict 结算：{final.get('name', '')}" if result is final else str(local.get("note") or "")
+        trade["live"]["events"].append({"at": now_ms, "what": f"市场出结果后才读到成交 {shares:g}/{order:g} 份：按已有的结果（{by}）结算，计入今日已结算盈亏"})
+        self.sim_settle(trade, float(result["up"]), f"{what}（市场出结果后才读到这笔真实成交 {shares:g}/{order:g} 份，按已有的结果结算）", now_ms, by)
 
     def sim_wait(self, trade: dict, mk: core.SimMarket | None, now_ms: int) -> str:
         st = trade.get("live")
@@ -2768,6 +2811,7 @@ class LiveBot(core.Bot):
         key_of = lambda t: (str((t["live"].get("want") or {}).get("market_id") or t.get("market_id") or ""), int((t["live"].get("want") or {}).get("index_set") or 0))
         live = [(tid, t) for tid, t in trades.items() if isinstance(t.get("live"), dict)]
         ended = [(tid, t) for tid, t in live  # 1.122.0: a settled record too — a fill read after the result still cost money (the day's loss stop counts it)
+                 # (1.150.0: one that lapsed at the result with nothing filled is settled as the fill lands on it — live_apply: live_settle_late)
                  if t["live"].get("state") == "done" and t["live"].get("order_id") and t.get("status") in {"cancelled", "filled", "settled", "expired"}
                  and float(t.get("order") or 0) - float(t.get("shares") or 0) > 1e-9
                  and self.LIVE_LATE_FILLS_GRACE_MS <= now_ms - core.trade_updated(t) <= self.LIVE_LATE_FILLS_WINDOW_MS]
@@ -3585,7 +3629,8 @@ class LiveBot(core.Bot):
 
     def live_apply(self, tid: str, trade: dict, row: dict, mk: Any, now_ms: int) -> None:
         """The fills a record states, onto the trade: new shares become a fill (at the model's fair price now), the
-        average price it states replaces the expected cost."""
+        average price it states replaces the expected cost. Shares landing on a record that lapsed at its market's result
+        settle it on that result (live_settle_late, 1.150.0)."""
         st = trade["live"]
         order = float(trade.get("order") or 0)
         filled, status = order_fill(row, order)
@@ -3611,6 +3656,9 @@ class LiveBot(core.Bot):
                 trade["filled"], trade["fill_fair"] = now_ms, fair
             self.live_notify(f"✅ 成交：{trade['item']} {trade['label']} {core.cents(float(trade['price']))}×{filled - prev:g} 份"
                              f"（累计 {filled:g}/{order:g}，订单 #{st.get('order_id')}）")
+            # 1.150.0: read after the market's result (the record lapsed at 0 shares): settled on that result now. Only as shares
+            # land — every caller saves a record whose shares grew; a read that shows nothing new changes nothing here
+            self.live_settle_late(trade, now_ms)
         if filled >= order - 1e-9 and trade["status"] == "resting":
             trade["status"] = "filled"
             st["state"], st["final"] = "done", "filled"

@@ -634,4 +634,318 @@ async def live_taker_fee_double():
 
 asyncio.run(live_taker_fee_double())
 
+
+async def live_fill_after_local_settle():
+    """LIVE-FILL-AFTER-LOCAL-SETTLE: a real order's fill read only after its market's result. The step decides before it reads
+    the orders back, so a result the bot's own data gives in that very step (a first-touch line crossed; a flip, a range or cap
+    level alike) finds a just-filled order's record at 0 shares and lapses it ("expired": 市场已出结果，挂单一直没成交); the cancel
+    that follows — or the positions check minutes later — then reads the fill, and nothing settled the record: real shares shown
+    as "未成交" with no payout, out of the day's settled loss (LIVE_MAX_DAILY_LOSS_USD did not see the money) until Predict's own
+    result hours later, which then kept the lapse's time: after Beijing midnight the loss was on no day's stop. And a position
+    pre-settled on the bot's data before midnight that Predict resolved the other way after it was booked to the day already
+    over. Now the record is settled on the result it already has the moment the shares are read, stamped then; and what a
+    correction made today took from a record settled on an earlier day counts today. Real paths only (no direct sim_settle)."""
+    world, market_json, BJ, book, clock = T["world"], T["market_json"], T["BJ"], T["book"], T["time"]
+    spec = next((s for s in m.TOUCH_MARKETS if s.key == "BNB-2027"), None) or next(s for s in m.TOUCH_MARKETS if not s.stock)
+    slug, mid, start = spec.slug, "201", BJ(11, 1, 0)
+    low, high = f"${int(spec.low)}", f"${int(spec.high)}"  # the outcomes' names: 涨 / up is the high line's side
+    quiet = ([("0.55", "300")], [("0.58", "400")])  # before the touch: the high side's fair price 70¢, its 买1 55¢, its ask 58¢
+    lost = ([("0.01", "500")], [("0.02", "500")])   # the low line touched first: the high side is worth nothing
+    won = ([("0.97", "500")], [("0.99", "500")])    # the high line touched first
+    late_event, late_note = "市场出结果后才读到成交", "市场出结果后才读到这笔真实成交"
+
+    def touch(fair, bids, asks, at):
+        return m.SimMarket(slug, "先触", "touch", spec.key, fair, book(bids, asks, at, slug, spec.key, None, mid), 0.03, "", (high, low),
+                           {"deadline": spec.deadline_ms}, {})
+
+    def predict_says(bot, name):
+        """Predict's own word on the market from now on, asked at the next step: resolved on ``name``, or (None) still open."""
+        async def details(market_id):
+            resolved = {"index": 0 if name == high else 1, "name": name, "split": False, "how": "outcomes.status"} if name else None
+            return {"status": "RESOLVED" if name else "REGISTERED", "resolved": resolved, "outcomes": []}
+        bot.predict.market_details = details
+        bot.sim_checked.clear()
+
+    async def setup(at, ways, **env):
+        bot = make_bot(SIM_WAYS=ways, LIVE_MAX_DAILY_LOSS_USD="50", **env)
+        bot.market.now = at
+        bot.live.api.markets[mid] = market_json(mid, names=(high, low))
+        bot.touches[spec.key].start_ms = start
+        predict_says(bot, None)
+        await bot.live_prepare()
+        world["markets"] = [touch(0.70, *quiet, at)]
+        await bot.live_prefetch(at)
+        return bot, bot.live.api
+
+    async def look(bot, at, *markets):
+        """One step and the fills reads it started; with no market given, no card prices the market in this look."""
+        world["markets"] = list(markets)
+        await step(bot, at)
+        await bot.live_fills_wait()
+
+    def touched(bot, kind, at):
+        """The bot's own data decides the market: what TouchMarket.scan writes when a line is reached."""
+        hi, lo = (float(spec.high) + 1, float(spec.high) - 40) if kind == "high" else (float(spec.low) + 12, float(spec.low) - 1)
+        bot.store.put(f"touch:{slug}", {"kind": kind, "time": at, "hi": hi, "lo": lo, "start": start})
+
+    def holds(api, t, shares, **more):
+        want = t["live"]["want"]
+        api.positions_rows = [{"id": "p1", "market": {"id": int(mid), "title": "先触"}, "amount": str(int(shares * WEI)), **more,
+                               "outcome": {"name": want["outcome"], "indexSet": want["index_set"], "onChainId": want["token"]}}]
+
+    rec = lambda bot, oid: next(t for t in bot.sim_trades().values() if (t.get("live") or {}).get("order_id") == oid)
+    kept = lambda t: (t["status"], t["shares"], t.get("payout"), t.get("settled"))
+    stored = lambda bot, oid: kept(next(v for _, v in bot.store.items("sim:") if (v.get("live") or {}).get("order_id") == oid))  # as a restart reads it
+    day = lambda bot, at: round(bot.live_daily_pnl(bot.sim_trades(), at), 4)
+    whats = lambda t: [e["what"] for e in t["live"]["events"]]
+    see = lambda t: (t["status"], t["shares"], t.get("payout"), t.get("confirm"), t["live"]["state"], m.stamp(int(t.get("settled") or 0)), t.get("note"), whats(t)[-3:])
+
+    async def express_taker():
+        """(a) An express-lane taker fills at once on Predict; the touch is recorded; the NEXT step settles the market on the bot's
+        own data before its sync reads the fill (the record lapses at 0 shares), then the cancel's read finds the 100 shares."""
+        t0 = BJ(11, 10, 23, 59)
+        bot, api = await setup(t0, "taker")
+        await bot.sim_express(spec.key)
+        t = bot.sim_trades()[f"{slug}|up|吃"]
+        oid = t["live"]["order_id"]
+        assert t["status"] == "resting" and t["live"]["state"] == "open" and oid, see(t)
+        api.fill(oid, 100, done=True, price=0.58)  # matched at once; not read back yet
+        touched(bot, "low", t0 - 60_000)
+        t2 = t0 + 3_000
+        await look(bot, t2, touch(0.0, *lost, t2))
+        t = rec(bot, oid)
+        assert t["status"] == "settled" and t["payout"] == 0.0 and t["shares"] == 100 and t["confirm"] == "local" and t["live"]["state"] == "done", see(t)
+        assert t["settled"] == t2 and m.sim_status(t) == "输 −$58.84" and "先触及" in t["note"] and late_note in t["note"], see(t)
+        assert f"{late_event} 100/100 份：按已有的结果（本地预结算）结算，计入今日已结算盈亏" in whats(t) and whats(t).count("撤单：市场已出结果") == 1, whats(t)
+        assert day(bot, t2) == -58.84 and m.sim_stats([t])["losses"] == 1 and m.sim_stats([t])["expired"] == 0, (day(bot, t2), see(t))
+        assert stored(bot, oid) == kept(t) == ("settled", 100.0, 0.0, t2), ("saved so, not only in the step's view", stored(bot, oid))
+        # the loss stop sees it from this moment: nothing more is sent (the gate recomputes the day's loss); the switch trips at the next step
+        assert "已达 LIVE_MAX_DAILY_LOSS_USD $50" in bot.live_send_block(t, bot.sim_trades(), t2), bot.live_send_block(t, bot.sim_trades(), t2)
+        await look(bot, t2 + 5_000, touch(0.0, *lost, t2 + 5_000))
+        assert "今日已结算亏损 −$58.84" in bot.live_killed(), bot.live_kill_record()
+        # Predict's result after midnight confirms it: the loss stays on the day it became known (counted and stopped then), once
+        predict_says(bot, low)
+        t3 = BJ(11, 11, 0, 30)
+        await look(bot, t3, touch(0.0, *lost, t3))
+        t = rec(bot, oid)
+        assert t["status"] == "settled" and t["confirm"] == "confirmed" and t["payout"] == 0.0 and t["settled"] == t2 and not t["revisions"], see(t)
+        assert day(bot, t3) == 0 and day(bot, t2 + 30_000) == -58.84, (day(bot, t3), day(bot, t2 + 30_000))
+
+    async def blind_maker(view):
+        """(b) A resting bid swept by the dump at the touch. With a fresh book the exit line withdraws it first (the normal path,
+        the control); a look without a fresh view of the market — its book stale, crossed, or no card for it — settles the
+        market first: the record lapses, then the cancel's read finds the fill."""
+        t0 = BJ(11, 10, 14, 0)
+        bot, api = await setup(t0, "maker", SIM_MAKER_EXIT_CENTS="5")
+        await look(bot, t0, touch(0.70, *quiet, t0))
+        t = bot.sim_trades()[f"{slug}|up|挂"]
+        oid = t["live"]["order_id"]
+        assert t["status"] == "resting" and t["live"]["state"] == "open" and t["price"] == 0.55 and oid, see(t)
+        api.fill(oid, 100, done=True, price=0.55)
+        touched(bot, "low", t0 + 30_000)
+        views = lambda at: {"fresh": [touch(0.0, *lost, at)], "stale": [touch(0.0, *quiet, t0)], "gone": [],
+                            "crossed": [touch(0.0, [("0.03", "500")], [("0.02", "500")], at)]}[view]
+        t2 = t0 + 100_000
+        await look(bot, t2, *views(t2))
+        t = rec(bot, oid)
+        if view == "fresh":
+            assert t["status"] == "filled" and t["shares"] == 100 and t.get("withdrawn") and not any(w.startswith(late_event) for w in whats(t)), see(t)
+        else:
+            assert t["status"] == "settled" and t["payout"] == 0.0 and t["shares"] == 100 and t["settled"] == t2 and t["live"]["state"] == "done", (view, see(t))
+            assert day(bot, t2) == -55 and m.sim_status(t) == "输 −$55.00" and late_note in t["note"], (view, day(bot, t2), see(t))
+        await look(bot, t2 + 5_000, *views(t2 + 5_000))
+        t = rec(bot, oid)
+        assert t["status"] == "settled" and t["payout"] == 0.0 and day(bot, t2 + 5_000) == -55, (view, see(t))
+        assert "今日已结算亏损 −$55.00" in bot.live_killed(), (view, bot.live_kill_record())
+
+    async def winner():
+        """(c) The bid on the side that wins, filled just before the touch: it stands (a fresh book, the edge is there), the
+        market is settled first, the fill read after — a win counted as any pre-settled win is (before: "未成交" until Predict)."""
+        t0 = BJ(11, 10, 14, 0)
+        bot, api = await setup(t0, "maker", SIM_MAKER_EXIT_CENTS="5")
+        await look(bot, t0, touch(0.40, *quiet, t0))  # the low side's fair price 60¢: its 买1 is 1 − 58¢ = 42¢
+        t = bot.sim_trades()[f"{slug}|down|挂"]
+        oid = t["live"]["order_id"]
+        assert t["status"] == "resting" and abs(t["price"] - 0.42) < 1e-9 and oid, see(t)
+        api.fill(oid, 100, done=True, price=0.42)
+        touched(bot, "low", t0 + 30_000)
+        t2 = t0 + 100_000
+        await look(bot, t2, touch(0.0, *lost, t2))
+        t = rec(bot, oid)
+        assert t["status"] == "settled" and t["payout"] == 1.0 and t["shares"] == 100 and t["settled"] == t2 and m.sim_status(t) == "赢 +$58.00", see(t)
+        assert day(bot, t2) == 58 and not bot.live_kill_record(), day(bot, t2)
+
+    async def late_backfill(t0, by_record):
+        """(d) The cancel's read says 0 filled (the record lapsed for good, its order ended); Predict's record of the order and
+        the account's positions show the 100 shares a minute later — the 1.122.0 backfill (live_late_fills: the order's own
+        record read again, or the position's price naming the order) puts them on the record, which is settled then. A lapse
+        at 23:59 whose fill is read after midnight counts on the new day: its stop trips."""
+        bot, api = await setup(t0, "maker", SIM_MAKER_EXIT_CENTS="5")
+        await look(bot, t0, touch(0.70, *quiet, t0))
+        oid = bot.sim_trades()[f"{slug}|up|挂"]["live"]["order_id"]
+        touched(bot, "low", t0 + 30_000)
+        t2 = t0 + 60_000
+        await look(bot, t2)  # no card for it in this look: lapsed on the bot's own result, the cancel confirmed, nothing filled as far as it shows
+        t = rec(bot, oid)
+        assert t["status"] == "expired" and t["shares"] == 0 and t["live"]["state"] == "done" and t["settled"] == t2 and day(bot, t2) == 0, see(t)
+        if by_record:
+            api.closed[oid]["amountFilled"] = str(100 * WEI)
+            holds(api, t, 100)
+        else:
+            holds(api, t, 100, avgPrice="0.55")  # the order's record still shows nothing: the position's average price names the order
+        t4 = t2 + 70_000
+        await look(bot, t4)
+        t = rec(bot, oid)
+        assert t["status"] == "settled" and t["shares"] == 100 and t["payout"] == 0.0 and t["settled"] == t4 and t["confirm"] == "local", (by_record, see(t))
+        assert any(w.startswith("结束后核对持仓：") for w in whats(t)) and any(w.startswith(late_event) for w in whats(t)), whats(t)
+        assert by_record or t["live"]["adopted"]["by"].startswith("按 Predict 持仓均价"), t["live"].get("adopted")
+        assert stored(bot, oid) == kept(t) == ("settled", 100.0, 0.0, t4), stored(bot, oid)
+        assert day(bot, t4) == -55, day(bot, t4)  # (t0 23:58: t4 is 00:00:10 of the next day — that day's figure)
+        await look(bot, t4 + 5_000)
+        assert "今日已结算亏损 −$55.00" in bot.live_killed() and bot.live_kill_record()["day"] == m.beijing_day(t4 / 1000), bot.live_kill_record()
+        await look(bot, t4 + 70_000)  # explained now: nothing more is adopted, nothing settled twice
+        t = rec(bot, oid)
+        assert t["shares"] == 100 and t["settled"] == t4 and len(t["fills"]) == 1 and not t["revisions"], see(t)
+
+    async def partial_then_more():
+        """(e) Part of the bid matched just before the result (unread), more as the cancel landed: settled on the 30 shares the
+        open list shows at the cancel, and the 20 the order's own record shows after the confirmed removal count as well."""
+        t0 = BJ(11, 10, 14, 0)
+        bot, api = await setup(t0, "maker", SIM_MAKER_EXIT_CENTS="5")
+        await look(bot, t0, touch(0.70, *quiet, t0))
+        oid = bot.sim_trades()[f"{slug}|up|挂"]["live"]["order_id"]
+        api.fill(oid, 30)  # still open on Predict, 30 matched
+        api.fill_on_cancel[oid] = T["L"].to_wei(50)
+        touched(bot, "low", t0 + 30_000)
+        t2 = t0 + 60_000
+        await look(bot, t2)
+        t = rec(bot, oid)
+        assert t["status"] == "settled" and t["payout"] == 0.0 and t["shares"] == 50 and t["settled"] == t2 and t["live"]["state"] == "done", see(t)
+        assert [f["shares"] for f in t["fills"]] == [30, 20] and sum(w.startswith(late_event) for w in whats(t)) == 1, (t["fills"], whats(t))
+        assert day(bot, t2) == -27.5 and bot.live_reserved(t) == 0 and not t["live"].get("fills_pending"), (day(bot, t2), bot.live_reserved(t))
+        assert stored(bot, oid) == kept(t) == ("settled", 50.0, 0.0, t2), stored(bot, oid)
+
+    async def predict_first():
+        """(f) The result on the lapsed record is Predict's own (as a backfill undone leaves it: live_undo_preopen_adoptions): the
+        late fill is settled on that, not on the bot's earlier figure, and a win is redeemed soon."""
+        t0 = BJ(11, 10, 14, 0)
+        bot, api = await setup(t0, "maker", SIM_MAKER_EXIT_CENTS="5")
+        await look(bot, t0, touch(0.70, *quiet, t0))
+        oid = bot.sim_trades()[f"{slug}|up|挂"]["live"]["order_id"]
+        touched(bot, "low", t0 + 30_000)
+        t2 = t0 + 60_000
+        await look(bot, t2)
+        tid, t = next((k, x) for k, x in bot.sim_trades().items() if (x.get("live") or {}).get("order_id") == oid)
+        assert t["status"] == "expired" and t["shares"] == 0 and t["local"]["up"] == 0.0, see(t)
+        t.update(final={"up": 1.0, "name": high, "how": "outcomes.status", "at": t2 + 1_000, "status": "RESOLVED", "outcomes": []}, confirm="mismatch")
+        bot.sim_save([(tid, t)])
+        api.closed[oid]["amountFilled"] = str(100 * WEI)
+        holds(api, t, 100)
+        t4 = t2 + 70_000
+        bot.live_last_redeem = clock.monotonic()  # a redeem round just ran: the next would be LIVE_REDEEM_SECONDS away
+        await look(bot, t4)
+        t = rec(bot, oid)
+        assert t["status"] == "settled" and t["payout"] == 1.0 and t["shares"] == 100 and t["settled"] == t4 and t["note"].startswith(f"Predict 结算：{high}"), see(t)
+        assert f"{late_event} 100/100 份：按已有的结果（Predict 最终结果）结算，计入今日已结算盈亏" in whats(t) and t["confirm"] == "mismatch", whats(t)
+        assert day(bot, t4) == 45 and clock.monotonic() - bot.live_last_redeem >= bot.LIVE_REDEEM_SECONDS - bot.LIVE_REDEEM_SOON_SECONDS - 1, day(bot, t4)
+
+    async def stuck_before():
+        """(g) A record an earlier version left lapsed with its shares (the fill read after the result, never settled): Predict's
+        result, after midnight, settles it — at that time, on that day's stop; no longer at the lapse's time, a day already over."""
+        t0 = BJ(11, 10, 23, 58)
+        bot, api = await setup(t0, "maker", SIM_MAKER_EXIT_CENTS="5")
+        await look(bot, t0, touch(0.70, *quiet, t0))
+        oid = bot.sim_trades()[f"{slug}|up|挂"]["live"]["order_id"]
+        api.fill(oid, 100, done=True, price=0.55)
+        touched(bot, "low", t0 + 30_000)
+        t2 = t0 + 60_000
+        bot.live_settle_late = lambda trade, now_ms: None  # as before 1.150.0: nothing settled a fill read after the result
+        await look(bot, t2)
+        del bot.live_settle_late
+        tid, t = next((k, x) for k, x in bot.sim_trades().items() if (x.get("live") or {}).get("order_id") == oid)
+        assert t["status"] == "expired" and t["shares"] == 100 and t.get("payout") is None and t["settled"] == t2, see(t)
+        # a read of its order that shows nothing new settles nothing (no caller would save it: settled in the step's view only,
+        # it would be lapsed again after a restart) — Predict's result does
+        assert await bot.live_reread_fills(tid, t, t2 + 20_000) == 0 and kept(t) == stored(bot, oid) == ("expired", 100.0, None, t2), (see(t), stored(bot, oid))
+        predict_says(bot, low)
+        t3 = BJ(11, 11, 0, 30)
+        await look(bot, t3)
+        t = rec(bot, oid)
+        assert t["status"] == "settled" and t["payout"] == 0.0 and t["confirm"] == "confirmed" and t["settled"] == t3, see(t)
+        assert day(bot, t3) == -55, day(bot, t3)
+        await look(bot, t3 + 5_000)
+        assert "今日已结算亏损 −$55.00" in bot.live_killed() and bot.live_kill_record()["day"] == "2026-11-11", bot.live_kill_record()
+
+    async def correction(first, final, when, counted, tripped):
+        """(h) A position (its fill read in time) pre-settled on the bot's own data at 23:59; Predict's result at ``when`` differs
+        (or agrees). The record keeps its first settlement's time (the journal's); what a correction made on a later day took
+        away counts on that day, what it gave back does not."""
+        t0 = BJ(11, 10, 23, 59)
+        bot, api = await setup(t0, "taker")
+        await bot.sim_express(spec.key)
+        oid = bot.sim_trades()[f"{slug}|up|吃"]["live"]["order_id"]
+        api.fill(oid, 100, done=True, price=0.58)
+        await bot.live_sync(t0 + 1_000)  # read back in time: a position
+        assert rec(bot, oid)["status"] == "filled" and rec(bot, oid)["shares"] == 100, see(rec(bot, oid))
+        touched(bot, first, t0 - 60_000)
+        t2 = t0 + 3_000
+        up1, up2 = first == "high", final == "high"
+        await look(bot, t2, touch(float(up1), *(won if up1 else lost), t2))
+        t = rec(bot, oid)
+        assert t["status"] == "settled" and t["payout"] == float(up1) and t["settled"] == t2 and day(bot, t2) == (41.16 if up1 else -58.84), see(t)
+        predict_says(bot, high if up2 else low)
+        await look(bot, when, touch(float(up2), *(won if up2 else lost), when))
+        t = rec(bot, oid)
+        assert t["status"] == "settled" and t["payout"] == float(up2) and t["confirm"] == ("confirmed" if first == final else "mismatch"), see(t)
+        assert t["settled"] == t2 and [r["at"] for r in t["revisions"]] == [when] * (first != final), see(t)  # the journal's time stays; the revision has its own
+        assert day(bot, when) == counted, (first, final, m.stamp(when), day(bot, when))
+        await look(bot, when + 5_000, touch(float(up2), *(won if up2 else lost), when + 5_000))
+        assert bool(bot.live_killed()) == tripped and day(bot, when + 5_000) == counted, (first, final, bot.live_kill_record())
+
+    async def corrected_twice():
+        """(i) Two corrections on one later day: the bot's own data turns yesterday's win into a loss at 00:10 (the 100 it took
+        counts, the stop trips), Predict says it was a win after all at 00:30: the day's figure is their net, nothing — not the
+        100 of a loss that did not happen."""
+        t0 = BJ(11, 10, 23, 59)
+        bot, api = await setup(t0, "taker")
+        await bot.sim_express(spec.key)
+        oid = bot.sim_trades()[f"{slug}|up|吃"]["live"]["order_id"]
+        api.fill(oid, 100, done=True, price=0.58)
+        await bot.live_sync(t0 + 1_000)
+        touched(bot, "high", t0 - 60_000)
+        t2 = t0 + 3_000
+        await look(bot, t2, touch(1.0, *won, t2))
+        assert rec(bot, oid)["payout"] == 1.0 and day(bot, t2) == 41.16, see(rec(bot, oid))
+        touched(bot, "low", t0 - 120_000)  # the bot's own data corrected
+        t3 = BJ(11, 11, 0, 10)
+        await look(bot, t3, touch(0.0, *lost, t3))
+        t = rec(bot, oid)
+        assert t["payout"] == 0.0 and t["settled"] == t2 and [(r["by"], r["at"]) for r in t["revisions"]] == [("本地数据更正", t3)], see(t)
+        assert day(bot, t3) == -100 and "今日已结算亏损 −$100.00" in bot.live_killed(), (day(bot, t3), bot.live_kill_record())
+        predict_says(bot, high)
+        t4 = BJ(11, 11, 0, 30)
+        await look(bot, t4, touch(1.0, *won, t4))
+        t = rec(bot, oid)
+        assert t["payout"] == 1.0 and t["confirm"] == "mismatch" and t["settled"] == t2 and len(t["revisions"]) == 2, see(t)
+        assert day(bot, t4) == 0, day(bot, t4)
+
+    next_day, same_day = BJ(11, 11, 0, 30), BJ(11, 10, 23, 59) + 30_000
+    cases = [(express_taker,), (blind_maker, "fresh"), (blind_maker, "stale"), (blind_maker, "crossed"), (blind_maker, "gone"), (winner,),
+             (late_backfill, BJ(11, 10, 14, 0), True), (late_backfill, BJ(11, 10, 14, 0), False), (late_backfill, BJ(11, 10, 23, 58), True),
+             (partial_then_more,), (predict_first,), (stuck_before,),
+             # a local win at 23:59, Predict says the other line at 00:30: the +41.16 was 11-10's, the 100 the correction took is 11-11's
+             (correction, "high", "low", next_day, -100.0, True),
+             # ...a local loss Predict turns into a win the next day gives that day's stop no room (the −58.84 was 11-10's)
+             (correction, "low", "high", next_day, 0.0, False),
+             # ...Predict agreeing the next day changes nothing
+             (correction, "low", "low", next_day, 0.0, False),
+             # ...and a correction on the day of the settlement is the record's P&L as it stands, once (as before)
+             (correction, "high", "low", same_day, -58.84, True), (corrected_twice,)]
+    for case, *args in cases:
+        await case(*args)
+    print("LIVE_FILL_AFTER_LOCAL_SETTLE_OK")
+
+
+asyncio.run(live_fill_after_local_settle())
+
 print("AUDIT_LIVE_A2_OK")
