@@ -2430,6 +2430,26 @@ class LiveBot(core.Bot):
             self.sim_save([(st.get("rekeyed") or tid, trade)])  # 1.138.1: a record already at tid#n is not moved by live_fail, so not written by it either
             return
         tid = st.get("rekeyed") or tid  # 1.138.0: withdrawn and moved while the request was in flight: saved where it lives (it was saved back at the slot too — one order counted twice)
+        if st.get("state") == "done" and st.get("order_id"):
+            # 1.150.0 (audit XR-PLACE-SUCCESS-AFTER-END): a sync ran while this answer was on its way — the step's (the express lane
+            # sends outside sim_lock, and a slow answer outlasts the step's decisions and its sync), the emergency stop's or /live
+            # cancel's — found the order by its hash (the only way a record in flight gets an order id: live_reconcile, live_cancel,
+            # live_recheck) and ended the record on Predict's own word: the removal of an order withdrawn meanwhile confirmed, its final record
+            # read, or every share filled. This answer says only that Predict took the order, which that path already knew: the
+            # record stays as it was left, as the except branch above keeps it. It used to be undone — back to "cancelling" with
+            # cancel_sent=0: a second removal went out at once (sim_express_after's late cancels, or the next sync), its "noop"
+            # turned cancel_confirmed False, and a single-order read that no longer knows a removed order then made the confirmed
+            # cancel "unknown" (its side blocked for minutes until the evidence released it, a false ❓ alert); a taker's attempt
+            # was failed a second time; one ended by its market's result was tracked "open" again; and a "📤 已向 Predict 下单"
+            # notice followed the order's end. A record ended without its order found (an unknown one released by an operator or
+            # by the evidence while this answer was on its way) learns from it that Predict has the order: it goes on below as
+            # before, tracked or cancelled by the id just returned — never left resting untracked
+            if not st.get("placed_at"):
+                st["placed_at"] = self.market.now_ms()  # the record's 下单时间 (live_cancel's hash path sets none)
+            st["events"].append({"at": now_ms, "what": f"下单应答到达（订单 #{result['order_id']}，Predict 应答用时 {took:.1f} 秒），"
+                                                       f"但同步已按哈希找到这张单并已结束（{st.get('final') or '已结束'}）：以 Predict 的记录为准，不再改动"})
+            self.sim_save([(tid, trade)])
+            return
         if trade.get("withdrawn") or st.get("state") == "cancelling":
             # withdrawn while the request was in flight (the emergency stop, a rule): the order now rests on Predict under
             # a record that wants it gone — it is cancelled by the id just returned, at the next sync, and never tracked

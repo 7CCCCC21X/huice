@@ -824,4 +824,146 @@ async def latefill_stale_key():
 
 
 asyncio.run(latefill_stale_key())
+
+
+async def place_success_after_end():
+    """XR-PLACE-SUCCESS-AFTER-END: an order Predict takes at once but answers late — successfully — while a sync runs beside it
+    (the express lane sends outside sim_lock): the step's own, /live cancel all's or the emergency stop's sync finds the order by
+    its hash and ENDS the record on Predict's word — withdrawn meanwhile and its removal confirmed, a taker filled at once, a
+    market whose result came in flight. The late answer changes nothing then. It used to undo the end: back to "cancelling" with
+    cancel_sent=0 — a second removal, its "noop" turning cancel_confirmed False and, with a single-order read that no longer knows
+    a removed order, the confirmed cancel "unknown" (the side blocked for minutes, a false ❓ alert); a taker's attempt failed
+    twice; a record ended by its market's result tracked "open" again; a 📤 notice after the order's end. A record ended WITHOUT
+    its order found (an unknown one released before the answer came) is still tracked and reserved by the answer, as before."""
+    mkt = lambda fair, at: hsi(fair, [("0.55", "300")], [("0.58", "400")], at)
+    removals = lambda fake, oid: sum(1 for c in fake.calls if c == ("remove", [oid]))
+    UP = "1011"  # the Up outcome's token: the order held in flight is the Up side's
+
+    async def race(ways, how, read404=False):
+        bot = make_bot(SIM_WAYS=ways, SIM_MAKER_EXIT_CENTS="5")
+        bot.notes = []
+        bot.live_notify = lambda text, key="": bot.notes.append(text)
+        world["markets"] = [mkt(0.70, NOW)]
+        await bot.live_prepare(); await bot.live_prefetch(NOW)
+        fake = bot.live.api
+        if read404:  # Predict's single-order read no longer knows a removed order (GET /orders/{hash}: 404)
+            known = fake.order
+
+            async def order(oid, hash_=""):
+                row = fake.closed.get(str(oid))
+                return None if row is not None and row.get("status") == "CANCELLED" else await known(oid, hash_)
+            fake.order = order
+        real_create, taken, answer, held = fake.create_order, asyncio.Event(), asyncio.Event(), []
+
+        async def slow(body):  # the Up order: taken at once (a taker filled at once when asked), answered late — successfully
+            got = await real_create(body)
+            if held or body["data"]["order"]["tokenId"] != UP:
+                return got  # any other order (the step's Down quote at 0.40): answered at once
+            held.append(got)
+            if how == "filled":
+                fake.fill(got["order_id"], 100, done=True, price=0.58)
+            taken.set()
+            await answer.wait()
+            return got
+        fake.create_order = slow
+        bot.market.now = NOW
+        lane = asyncio.create_task(bot.sim_express("HSI"))  # the express lane's pass: its orders go out outside sim_lock
+        await asyncio.wait_for(taken.wait(), 5)
+        slot = f"{HSI_SLUG}|up|{'挂' if ways == 'maker' else '吃'}"
+        oid, t = held[0]["order_id"], bot.sim_trades()[slot]
+        assert t["live"]["state"] == "placing" and not t["live"].get("order_id"), t["live"]
+        if how in {"cancel", "stop"}:  # an operator's /live cancel all, or the emergency stop: its own sync finds, removes and ends it
+            bot.market.now = NOW + 1_000
+            if how == "cancel":
+                await bot.live_cancel_command(["all"], NOW + 1_000)
+            else:
+                assert (await bot.live_control("stop", {}))["ok"]
+        else:
+            if how == "result":  # the market's result while the request is in flight: cancelling, no withdrawal
+                bot.sim_settle(t, 0.0, "本地结果", NOW + 1_000, "本地数据")
+                bot.sim_save([(slot, t)])
+            # the step beside the lane ("withdrawn": its own decisions withdraw the order, the edge gone at 0.40): its sync finds the
+            # order by its hash
+            fair = 0.40 if how in {"withdrawn", "result"} else 0.70
+            await step(bot, NOW + 2_000, mkt(fair, NOW + 2_000))
+        await bot.live_fills_wait()
+        ended, seen = dict(t["live"]), len(bot.notes)
+        answer.set()
+        await lane  # the answer lands; the pass then sends the cancels it finds unsent (sim_express_after: late)
+        await bot.live_fills_wait()
+        fake.create_order = real_create
+        return bot, t, oid, ended, bot.notes[seen:]
+
+    for read404 in (False, True):
+        # a maker withdrawn in flight by the step's own decisions: its sync removed it (confirmed) and ended it — the answer adds an
+        # event, nothing else: no second removal, no "unknown", no 📤 after the end, the side free
+        bot, t, oid, ended, notes = await race("maker", "withdrawn", read404)
+        st, fake = t["live"], bot.live.api
+        assert ended["state"] == "done" and ended["final"] == "cancelled" and ended["cancel_confirmed"] and ended["order_id"] == oid, ended
+        assert st["state"] == "done" and st["final"] == "cancelled" and st["cancel_confirmed"] and removals(fake, oid) == 1, (read404, st["state"], st.get("cancel_confirmed"), fake.calls)
+        assert not any("状态未知" in e["what"] for e in st["events"]) and any("下单应答到达" in e["what"] for e in st["events"]), st["events"]
+        assert not any(n.startswith(("📤", "❓")) for n in notes), notes
+        assert bot.live_room(bot.sim_trades(), mkt(0.70, NOW + 2_500), "up", 0.55, 100.0) == "", "the side is free: its order is gone"
+        await step(bot, NOW + 12_000, mkt(0.40, NOW + 12_000)); await bot.live_fills_wait()
+        assert st["state"] == "done" and st["cancel_confirmed"] and removals(fake, oid) == 1, (st["state"], fake.calls)
+        key = next(k for k, v in bot.sim_trades().items() if v is t)
+        assert bot.store.get(f"sim:{key}")["live"]["state"] == "done", bot.store.get(f"sim:{key}")["live"]  # stored as it lives
+        # a taker withdrawn in flight by /live cancel all: removed and failed once (one 吃单未成交, one removal), never "unknown"
+        bot, t, oid, ended, notes = await race("taker", "cancel", read404)
+        st, fake = t["live"], bot.live.api
+        assert ended["state"] == "done" and ended["final"] == "failed" and ended["order_id"] == oid, ended
+        assert st["state"] == "done" and st["final"] == "failed" and removals(fake, oid) == 1, (read404, st["state"], fake.calls)
+        assert sum("吃单未成交" in e["what"] for e in st["events"]) == 1 and not any("状态未知" in e["what"] for e in st["events"]), st["events"]
+    # the emergency stop in flight: its "✅ Predict 确认撤掉" stands — no second removal, no 📤 after it, no ❓; resumed, the side is free
+    bot, t, oid, ended, notes = await race("maker", "stop", read404=True)
+    st, fake = t["live"], bot.live.api
+    assert ended["state"] == "done" and ended["cancel_confirmed"], ended
+    assert st["state"] == "done" and st["cancel_confirmed"] and removals(fake, oid) == 1, (st["state"], fake.calls)
+    assert not any(n.startswith(("📤", "❓")) for n in notes), notes
+    await bot.live_control("resume", {})
+    assert bot.live_room(bot.sim_trades(), mkt(0.70, NOW + 3_000), "up", 0.55, 100.0) == "", "the side is free once resumed"
+    # a market's result in flight: removed and ended by the sync — not tracked as "open" again
+    bot, t, oid, ended, notes = await race("maker", "result")
+    assert ended["state"] == "done" and t["status"] == "expired" and t["live"]["state"] == "done" and bot.live_reserved(t) == 0, t["live"]
+    # a taker filled at once, found by the sync's reconcile: done/filled stays done/filled
+    bot, t, oid, ended, notes = await race("taker", "filled")
+    assert ended["state"] == "done" and ended["final"] == "filled", ended
+    assert t["live"]["state"] == "done" and t["live"]["final"] == "filled" and t["shares"] == 100 and len(t["fills"]) == 1, t["live"]
+    # control: found by the sync but not ended (a maker still wanted, "open"): the answer is taken as before
+    bot, t, oid, ended, notes = await race("maker", "open")
+    assert ended["state"] == "open" and t["live"]["state"] == "open" and t["live"]["order_id"] == oid, t["live"]
+    assert any(e["what"].startswith(f"已下单 #{oid}") for e in t["live"]["events"]) and not any(c[0] == "remove" for c in bot.live.api.calls)
+
+    # control: a record ended WITHOUT its order found — "unknown" (the hash read came before Predict had the order), then released
+    # by an operator — learns from the answer that Predict has the order: tracked and reserved by the id, as before (never left
+    # resting untracked)
+    bot = make_bot(SIM_WAYS="maker", SIM_MAKER_EXIT_CENTS="5")
+    world["markets"] = [mkt(0.70, NOW)]
+    await bot.live_prepare(); await bot.live_prefetch(NOW)
+    fake = bot.live.api
+    real_create, sent, answer = fake.create_order, asyncio.Event(), asyncio.Event()
+
+    async def unprocessed(body):  # the Up order reaches Predict only as its answer comes back
+        if body["data"]["order"]["tokenId"] == UP and not sent.is_set():
+            sent.set()
+            await answer.wait()
+        return await real_create(body)
+    fake.create_order = unprocessed
+    bot.market.now = NOW
+    lane = asyncio.create_task(bot.sim_express("HSI"))
+    await asyncio.wait_for(sent.wait(), 5)
+    tid = f"{HSI_SLUG}|up|挂"
+    t = bot.sim_trades()[tid]
+    at = NOW + bot.LIVE_PLACING_GRACE_MS + 5_000
+    await step(bot, at, mkt(0.70, at))  # its sync: not on the open list, unknown to the hash read, past the grace
+    assert t["live"]["state"] == "unknown" and not t["live"].get("order_id"), t["live"]
+    assert bot.live_release_command([tid.lower()], at).startswith("已释放")
+    assert t["live"]["state"] == "done" and bot.live_reserved(t) == 0, t["live"]
+    answer.set()
+    await lane
+    oid = t["live"].get("order_id")
+    assert t["live"]["state"] == "open" and oid in fake.open and bot.live_reserved(t) > 0, t["live"]
+
+
+asyncio.run(place_success_after_end())
 print("AUDIT_XREVIEW_OK")
