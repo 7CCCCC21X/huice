@@ -838,7 +838,7 @@ class Config:
     # Real trading (live.py): LIVE=on sends every paper-trading decision to Predict as a real order.
     live: bool = False                 # LIVE=on or LIVE=pause: the real-trading module runs (live_mode says whether it opens positions)
     live_mode: str = "off"             # off | pause (wallet, sign-in, checks, the order test and cancels work; no new positions) | on
-    live_allowed: bool = True          # LIVE_TRADING_ALLOWED: the deployment's hard switch; off caps the mode at pause whatever the database saved
+    live_allowed: bool = True          # LIVE_TRADING_ALLOWED: the deployment's hard switch; anything but on/1/true/yes (unset = on) caps the mode at pause whatever the database saved
     live_key: str = field(default="", repr=False)  # PREDICT_PRIVATE_KEY: the signing wallet's private key (never logged)
     live_account: str = ""             # PREDICT_ACCOUNT: the Predict account (smart wallet / deposit address) the key controls; "" = the key's own address
     live_chain: int = 56               # PREDICT_CHAIN_ID: 56 = BNB mainnet, 97 = BNB testnet
@@ -894,7 +894,18 @@ class Config:
         live_mode = {"on": "on", "1": "on", "true": "on", "yes": "on", "pause": "pause", "paused": "pause", "test": "pause"}.get(
             e.get("LIVE", "off").strip().lower(), "off")
         live = live_mode != "off"
-        live_allowed = not off(e.get("LIVE_TRADING_ALLOWED", "on"))
+        # 1.150.0 (audit CTRL-LIVE-ALLOWED-FAILOPEN): the hard switch fails closed. It was read like the ordinary default-on
+        # switches (`not off(...)`): only off / 0 / false / no stopped real orders and every other value allowed them, so a
+        # stop typed as 关, 关闭, disabled, pause, stop, "of", a quoted "off", `off # why` or an emptied value left LIVE=on
+        # sending real orders — the mode shown as on, no 硬开关 line on /live or the page. It is the emergency stop (README:
+        # 紧急停止用它), typed by hand on the deployment in a hurry, and LIVE itself already reads an unknown word as off. Now
+        # only the variable left unset, or on / 1 / true / yes, allows real orders; anything else (set but empty too) caps
+        # the mode at pause exactly as off does. A word meant as "allowed" that is none of those costs a pause which /live,
+        # the page and the start-up notice put down to this switch (/live mode on answers how to lift it: 改成 on), never
+        # real orders the operator believed stopped. Not a ValueError: a crash loop at start-up would leave the resting
+        # orders and the pre-open quotes on the book with nobody watching, while pause keeps the sign-in, the cancels, the
+        # redeeming and the pre-open withdrawal at work.
+        live_allowed = str(e.get("LIVE_TRADING_ALLOWED", "on")).strip().lower() in {"on", "1", "true", "yes"}
         if live_mode == "on" and not live_allowed:
             live_mode = "pause"  # the hard switch: nothing the database saved can turn real orders on past it
         live_key, live_account = e.get("PREDICT_PRIVATE_KEY", "").strip(), e.get("PREDICT_ACCOUNT", "").strip()
@@ -1576,15 +1587,21 @@ class SourceHealth:
                         # behind for an hour; a recovered preferred feed is back as soon as any request to it succeeds
 
     NAMES = {"eastmoney": "东方财富", "sina": "新浪", "tencent": "腾讯", "yahoo": "Yahoo", "naver": "Naver", "etnet": "etnet"}  # SOURCES_OFF token -> the name in /diag
+    # 1.150.0 (audit CTRL-SOURCES-OFF): the host-name parts a token stands for besides its own word. Tencent's quotes come
+    # from qt.gtimg.cn and web.ifzq.gtimg.cn (gu.qq.com is only their Referer), so the word "tencent" is in no host the
+    # bot asks: SOURCES_OFF=tencent was accepted, /diag stopped probing 腾讯 (it filters by name) and /speed went on timing
+    # it, while every round still asked Tencent first — the Composite, the stocks' live batch, the daily bars, the σ bars
+    HOSTS = {"tencent": ("gtimg.cn", "qq.com")}
 
     def __init__(self) -> None:
         self.hosts: dict[str, list] = {}  # host -> [consecutive failures, cool until (monotonic), last error]
         self.off: frozenset = frozenset()  # SOURCES_OFF: tokens of the hosts never asked (Bot.apply_config keeps it current)
 
     def disabled(self, url: str) -> bool:
-        """Whether SOURCES_OFF names this URL's host (a token is part of the host name: eastmoney, sina, tencent…)."""
+        """Whether SOURCES_OFF names this URL's host: the token is part of the host name (eastmoney, sina, yahoo, naver,
+        etnet), or one of the parts HOSTS lists for it is (tencent: gtimg.cn, qq.com)."""
         host = self.host(url).lower()
-        return any(token in host for token in self.off)
+        return any(part in host for token in self.off for part in (token, *self.HOSTS.get(token, ())))
 
     def enabled(self, sources: Any) -> list:
         """``sources`` ((name, url, ...) tuples) without the ones switched off, in the order given."""
@@ -1622,9 +1639,11 @@ class SourceHealth:
         return sorted(self.enabled(sources), key=rank)
 
     def lines(self) -> list[str]:
+        """/diag's list of the hosts moved to the back. Not a host switched off since it last failed: it is no longer
+        "tried when nothing else answers", and its cooldown (up to an hour) would keep it listed as if it were."""
         now = time.monotonic()
         return [f"  ⏸️ {host}：连续失败 {n} 次，排到最后还剩 {int(until - now)} 秒｜{brief_error(error, 60)}"
-                for host, (n, until, error) in sorted(self.hosts.items()) if until > now]
+                for host, (n, until, error) in sorted(self.hosts.items()) if until > now and not self.disabled(host)]
 
 
 SOURCE_HEALTH = SourceHealth()
@@ -1632,7 +1651,22 @@ SOURCE_HEALTH = SourceHealth()
 
 async def fetch_source(url: str, extra: dict[str, str] | None = None, record: bool = True) -> bytes:
     """GET one quote-feed URL with a browser UA and the short feed timeout, recording the host's health
-    (``record=False`` for a diagnostic probe, which must not reorder the sources the live refresh uses)."""
+    (``record=False`` for a diagnostic probe, which must not reorder the sources the live refresh uses).
+    A host SOURCES_OFF names is never asked, by a refresh or by a probe: the call fails like a source that did not
+    answer, and the host's health is left as it was."""
+    if SOURCE_HEALTH.disabled(url):
+        # 1.150.0 (audit CTRL-SOURCES-OFF): the switch is kept here, where every request to a quote source passes. Until
+        # now only the callers that list their sources through SOURCE_HEALTH.order / enabled kept it. The ones that name
+        # a URL themselves went on asking a host the operator had switched off (README: 永不询问): the index daily closes
+        # (DailyCloses, KospiIndex.refresh_daily), the index σ bars, the KRX close check (krx_official), the anchors'
+        # 5-minute bars (cfd_bar_at, a50_sina_five_minute_at) and the US stocks' Yahoo chart. With the deployment's
+        # SOURCES_OFF=eastmoney that was the HSI daily close whenever Tencent failed, or answered without the day's bar
+        # after the close, and the HSI σ bars when Tencent and Yahoo both failed: a request refused, or left to time out
+        # (SOURCE_TIMEOUT) inside the HSI round, and the host listed in /diag as failing. Every one of those callers
+        # already takes a failed request as "this source has nothing" — the next source, the data in hand, or a pause —
+        # so a switched-off one is passed over the same way. Not recorded: it is no failure of the host (/diag would
+        # list it as cooling), and nothing was learnt that should clear one either.
+        raise RemoteError("SOURCES_OFF 已关闭此源")
     try:
         raw = await http_get(url, timeout=SOURCE_TIMEOUT, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **(extra or {})})
     except (RemoteError, TimeoutError, OSError) as error:
@@ -6142,13 +6176,20 @@ class PredictFeed:
         finally:
             self.key_ms[key] = int((time.monotonic() - started) * 1000)
 
+    def round_due(self) -> bool:
+        """Whether a round is due: PREDICT_POLL_SECONDS since the last one began — refresh's own first test, which
+        Bot.refresh_books asks before it works out a round's hot set and targets (1.150.0). The 429 cooldown is no part
+        of it: a round that is due while the cooldown holds is refused by refresh ("failed", at once, without moving
+        ``refreshed``), so it stays due — and is refused again on every tick — until the cooldown ends."""
+        return time.monotonic() - self.refreshed >= self.config.predict_poll
+
     async def refresh(self, targets: dict[str, str], force: bool = False, hot: set[str] | None = None,
                       hot_rows: set[str] | None = None) -> Refreshed | bool:
         """targets: item key -> slug. False = not due yet. ``hot``: the keys refreshed every round (the daily cards, the
         markets with orders, those near a trade); the others only every PREDICT_COLD_POLL_SECONDS — a few dozen ladder
         levels nobody is near cost a round most of its time. None = every key, every round. ``hot_rows``: of a hot
         ladder, the market ids read every round (refresh_ladder); None = all of its levels."""
-        if not force and time.monotonic() - self.refreshed < self.config.predict_poll:
+        if not force and not self.round_due():
             return False
         if (left := self.blocked_until - time.monotonic()) > 0:
             return Refreshed("failed", f"Predict 接口限流，冷却 {int(left) + 1} 秒后再试（盘口暂按上次结果显示）")
@@ -12959,7 +13000,7 @@ async function loadWhy(force){
   if(again)return loadWhy(true);
   if(last)render(last)}
 function whyRow(p){
-  if(!p||!p.market_id||!p.taker)return null;  // the books the trader prices: they carry its distance to a taker buy
+  if(!p||!p.market_id||!p.taker)return null;  // the books the trader prices: they carry its distance to a taker buy (with real trading set up only a stub of it, state off: the lines themselves are an account's orders and come with the key, in this row)
   const id="why#"+p.market_id,on=open.has(id),d=$("div","why"),h=$("button","whyh",(on?"▾ ":"▸ ")+"为什么挂 / 不挂单");
   h.type="button";h.setAttribute("aria-expanded",on?"true":"false");h.title="机器人在这个盘口现在挂什么、吃什么，两边各自为什么挂或不挂";
   h.addEventListener("click",e=>{e.stopPropagation();if(open.has(id))open.delete(id);else{open.add(id);loadWhy(true)}if(last)render(last)});
@@ -13104,7 +13145,9 @@ function priceLadderBook(c,it,L,live){
         if(maker&&!eligible){a.append($("span","pa","—"));a.title=r.bids==null&&r.asks==null?r.error||"Predict 暂无盘口":r.maker_note||r.points_note||"积分状态确认后才提示挂单优势";return a}
         if(!e){const nobook=r.bids==null&&r.asks==null;a.append($("span","pa",r.error?"⚠ 请核实":r.stale?"盘口过期":nobook?"—":r.fair==null?"模型暂缺":"暂无报价"));
           a.title=r.error||r.hold||(r.stale?"盘口过期，等待新盘口":nobook?"Predict 暂无盘口":r.fair==null?"模型价暂缺，等待行情或 σ":"等待有效盘口");return a}
-        if(ok){a.classList.add("pos");if(e.edge>=HOT)a.classList.add("hot")}
+        // 1.x (audit CTRL-LADDER-HOT): the red mark uses the same most-specific bar (level/card/section/global) as the card
+        // frame and the 机会条 above, so a red cell always means a framed card and a framed card always shows its red cell
+        if(ok){a.classList.add("pos");if(e.edge>=hotFor(it,r.label))a.classList.add("hot")}
         const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)),$("span","pv",sg(e.edge)));a.append(line);
         const tk=!maker&&r.taker&&(r.taker.state==="near"||r.taker.state==="ready")?r.taker:null;  // 距吃单, the trader's own distance
         if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(ok&&!maker&&e.short)a.append($("span","pwhy","深度不足"));
@@ -13576,7 +13619,7 @@ let sumOpen=true;try{sumOpen=localStorage.getItem("jrnsum")!=="0"}catch(e){}  //
 let anaOpen=false;try{anaOpen=localStorage.getItem("jrnana")==="1"}catch(e){}  // the analysis tables: folded unless opened by hand
 const base=location.pathname.replace(/\/journal\/?$/,"");
 document.getElementById("back").href=base;document.getElementById("ctl").href=base+"/control";
-document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";  // also right under /journal/
+document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";document.getElementById("mcsv").href=base+"/samples.csv";  // also right under /journal/ (CTRL-MCSV: the 导出模型样本 link too, else /journal/samples.csv 404s)
 function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
   if(MS_KEYS.has(k))return v?when(v):"—";if(k==="high_at")return v?when(v*1000):"—";if(CENT_KEYS.has(k))return cent(v);
   if(k==="sigma_daily"||k==="sigma"||k==="sigma_raw")return (v*100).toFixed(2)+"%";if(k==="history")return JSON.stringify(v);
@@ -14466,12 +14509,25 @@ def accepts_gzip(header_block: str) -> bool:
     return False
 
 
-def page_payload(payload: dict) -> dict:
+def page_payload(payload: dict, private: bool = False) -> dict:
     """odds_payload() as data.json carries it: the server's edge chips (four per book, eleven fields each) are left out of
     every book block. The page computes its own from the depth for the trade size the viewer picks and never reads them;
     /book, the alerts, the paper trader and the tests use the server's. Fetched every 10 seconds by every open tab, the
-    file is about 40% smaller without them (a quarter smaller after gzip). The payload given is left as it is."""
-    without = lambda block: {k: v for k, v in block.items() if k != "edges"}
+    file is about 40% smaller without them (a quarter smaller after gzip). The payload given is left as it is.
+    ``private`` (WebServer.account_private: a real account is behind the trader), 1.150.0: the trader's own lines are left
+    out as well. data.json needs the page link alone, and those lines are that account's orders and positions: 挂单 names a
+    resting order's side and price (挂涨 挂单中 55.0¢, 等待发送 before it is even sent); 距吃单 carries each side's filled
+    shares, an order in flight with its Predict id (真实订单 #… 已成交 x/y 份), 这一边持仓 N 份, the room left under the caps
+    (可买 N 份（已吃 M 份，上限 K）) and what the real-trading limits refuse (持仓+挂单 $… 已占满 LIVE_MAX_OPEN_USD, USDT
+    余额 $… 不够一份) — its state and every text of it follow the account, so none of it is kept; the paper-trading card's
+    nearest markets repeat the same texts. why.json, the same facts at length, has asked for the control key since 1.101.0,
+    while these were served to anyone holding the link. A book the trader prices keeps a 距吃单 stub (state off: the page
+    draws no line for it), so that its card still has the 为什么挂 / 不挂单 row: the keyed way to the same facts."""
+    def without(block: dict) -> dict:
+        out = {k: v for k, v in block.items() if k != "edges" and not (private and k == "maker")}
+        if private and "taker" in out:
+            out["taker"] = {"state": "off", "text": "", "private": True}
+        return out
     items = []
     for item in payload.get("items") or []:
         item = dict(item)
@@ -14480,6 +14536,8 @@ def page_payload(payload: dict) -> dict:
         ladder = item.get("ladder")
         if isinstance(ladder, dict) and isinstance(ladder.get("rows"), list):
             item["ladder"] = {**ladder, "rows": [without(row) if isinstance(row, dict) else row for row in ladder["rows"]]}
+        if private and item.get("kind") == "sim" and "near" in item:
+            item["near"] = []
         items.append(item)
     return {**payload, "items": items}
 
@@ -14559,8 +14617,13 @@ class WebServer:
             if len(parts) == 2:
                 return 200, "text/html; charset=utf-8", self.pages["page"]
             if parts[2] == "data.json":
-                return 200, "application/json; charset=utf-8", self.cached(
-                    "data.json", lambda: json.dumps(page_payload(self.bot.odds_payload()), ensure_ascii=False, default=str).encode("utf-8"))
+                # 1.150.0: this file needs the page link alone, so with a real account behind the trader it goes without
+                # the trader's own lines (page_payload: that account's resting orders and positions, card by card), as
+                # why.json, journal.json and control.json go behind the key. A body is cached per case: a copy built just
+                # before the first real order is never served after it.
+                private = self.account_private()
+                return 200, "application/json; charset=utf-8", self.cached("data.json?private" if private else "data.json", lambda: json.dumps(
+                    page_payload(self.bot.odds_payload(), private), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "journal":
                 return 200, "text/html; charset=utf-8", self.pages["journal"]
             if parts[2] == "journal.json":
@@ -14635,17 +14698,30 @@ class WebServer:
                 return last[:64]
         return peer_ip or "-"
 
+    def account_private(self) -> bool:
+        """A real account is behind the data: a real-trading key is configured, or the records hold real orders (a
+        database kept after the key was removed). Its account, orders, positions and trade records are then shown only
+        with the control key, and data.json, which the page link alone opens, goes without the trader's own lines
+        (page_payload)."""
+        return bool(getattr(self.bot.config, "live_key", "")) or self.bot.sim_has_real()
+
     def journal_locked(self) -> bool:
         """The review data (every trade with its fills, costs and real order records) needs the control key once a
         real-trading key is configured, or the records hold real orders (a database kept after the key was removed):
-        the page token alone shows the odds, never an account's activity."""
-        return bool(self.bot.config.web_control_key) and (bool(getattr(self.bot.config, "live_key", "")) or self.bot.sim_has_real())
+        the page token alone shows the odds, never an account's activity. 1.150.0: this holds with WEB_CONTROL_KEY unset
+        too (the data is then refused, see key_check), where before the lock was off and anyone with the page link read
+        the account's whole trade history."""
+        return self.account_private()
 
     def key_check(self, head: str, client: str) -> tuple[int, str] | None:
         """None when X-Control-Key carries the configured key; else (status, message), the failure counted."""
         configured = self.bot.config.web_control_key
         if not configured:
-            return None
+            # 1.150.0: no key to check. A paper bot's view-only console stays open; a real account's data fails closed
+            # (no failure counted: nobody guessed wrong, there is nothing to guess), since the page token alone must
+            # never show an account, its orders or its trades.
+            return None if not self.account_private() else (
+                403, "未设置 WEB_CONTROL_KEY：实盘账户的数据（账户、订单、持仓、交易记录）不对外显示，请在环境变量设置 WEB_CONTROL_KEY（12～64 个字符）后重启")
         now = time.monotonic()
         if now < self.control_global_lock_until:
             return 429, f"口令错误次数过多（全站），{int(self.control_global_lock_until - now) + 1} 秒后再试"
@@ -14688,8 +14764,8 @@ class WebServer:
                                           json.dumps({"ok": False, "locked": True, "message": message}, ensure_ascii=False).encode("utf-8"))
         full = lambda: (200, "application/json; charset=utf-8", self.cached(
             "control.json", lambda: json.dumps(self.bot.control_payload(), ensure_ascii=False, default=str).encode("utf-8")))
-        if not self.bot.config.web_control_key:
-            return full()  # no key configured: the page is view-only and says so
+        if not self.bot.config.web_control_key and not self.account_private():
+            return full()  # no key configured and no real account behind it: the page is view-only and says so
         if failed := self.key_check(head, client):
             return answer(*failed)
         return full()
@@ -15483,7 +15559,8 @@ def parse_close_entries(raw: str, now_ms: int, command: str = "/setclose") -> li
 
 class Bot:
     def __init__(self, config: Config, store: Store, market: Binance, telegram: Telegram):
-        config = self.control_config(config, store)  # the control page's saved changes, on top of the environment
+        # the control page's saved changes, on top of the environment; what no longer validates is dropped (run() says so)
+        config, self.control_dropped = self.control_config(config, store)
         self.config, self.store, self.market, self.telegram = config, store, market, telegram
         SOURCE_HEALTH.off = config.sources_off
         self.snapshots: dict[str, dict] = {}
@@ -15542,9 +15619,7 @@ class Bot:
                 continue  # a US stock's touch market (1.146.0): Yahoo's prices, nothing on Binance
             if isinstance(card, IndexUpDownMarket) and card.VENUE == "futures":  # a spot window (BTC 15分涨跌) is priced by its pair's trades
                 self.index_markets.setdefault(card.spec.symbol, []).append(card)
-                ticker = config.tickers.get(card.spec.symbol)  # LEAD_QUOTE: the stock's exchange quote (StockMarket.live_quote) leads the index
-                card.lead_code = ticker.code if ticker is not None else ""
-                card.lead_mode = config.lead_quote if ticker is not None else "off"
+                self.lead_route(card, config)  # LEAD_QUOTE: the stock's exchange quote (StockMarket.live_quote) leads the index
                 continue
             self.pair_markets.setdefault(("spot", card.spec.symbol), []).append(card)
         for rm in self.ranges.values():
@@ -15593,6 +15668,7 @@ class Bot:
         self.tally_gate = asyncio.Semaphore(3)  # ...three reads at a time
         self.sim_report_cache: dict[tuple, dict] = {}  # the last sim_report per arguments, while the records stand
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
+        self.edge_swept = False  # ...whose first look clears the delivery records an earlier version left above their stream's count (1.150.0)
         self.reference_pool: ThreadPoolExecutor | None = None
         self.diag_pool: ThreadPoolExecutor | None = None  # /diag's probes run here, not on the feeds' pool
         self.speed_pool: ThreadPoolExecutor | None = None  # /speed's requests (1.145.0), likewise
@@ -15632,6 +15708,9 @@ class Bot:
         self.last_log: dict[str, float] = {}
         self.command_notice: dict[int, float] = {}
         self.username = ""
+        self.telegram_ok = False  # the start-up check passed in this process (telegram_hello): commands are polled only then
+        self.hello_failures = 0   # its tries in a row that found Telegram out of reach, and (monotonic) the earliest moment
+        self.hello_next = 0.0     # of the next one: the commands loop's back-off
         self.handlers = {
             "/help": self.cmd_help, "/id": self.cmd_id, "/status": self.cmd_status, "/test": self.cmd_test,
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
@@ -17700,7 +17779,10 @@ class Bot:
             except Exception as error:  # the cards stand without it
                 self.log_limited("maker-line", f"挂单判断计算失败：{clean_error(error) or type(error).__name__}")
                 makers = {}
-            for item in items:  # each priced book block says how far the trader is from taking it (距吃单), and what it rests (1.138.1)
+            # each priced book block says how far the trader is from taking it (距吃单), and what it rests (1.138.1). Both, and
+            # the nearest markets below, are built from the trader's orders and positions: with a real account behind it
+            # data.json leaves them out (page_payload, 1.150.0) — whatever else is added here of the trader's own must go the same way
+            for item in items:
                 ladder = item.get("ladder") if isinstance(item.get("ladder"), dict) else {}
                 for block in [item.get("predict"), *(ladder.get("rows") or [])]:
                     if isinstance(block, dict) and str(block.get("market_id") or "") in gaps:
@@ -21388,6 +21470,18 @@ class Bot:
         self.edge_ran = time.monotonic()
         state = self.store.get("edgealerts", {})
         state = state if isinstance(state, dict) else {}
+        if not self.edge_swept:
+            # 1.150.0 (audit CTRL-EDGE-SEQ), once per start, before anything is observed or sent: until this version a ladder's
+            # idle maker stream was forgotten without its delivery records (edge_observe), and the stream that followed on
+            # that level counted from 1 under them — such levels are mute in the database this version starts on. A record
+            # above its stream's own count (no stream left: 0) can only come from such an earlier stream, so it is dropped;
+            # one at or under the count stays, so nothing is sent twice. The key ends with the subscription's chat:thread
+            # (subscription_key). Tried once: a start that cannot read them goes on without the repair.
+            self.edge_swept = True
+            count = lambda key: int((state.get(key.removeprefix("edgesent:").rsplit(":", 2)[0]) or {}).get("seq") or 0)
+            if stale := [key for key, got in self.store.items("edgesent:") if int(got or 0) > count(key)]:
+                self.store.delete_keys(stale)
+                LOG.info("优势提醒整理：清掉 %d 条旧版本留下的投递记录（编号高于所属提醒流现有的编号）", len(stale))
         before = json.dumps(state, sort_keys=True)
         costs = self.edge_costs()
         bars, _ = self.edge_bars()  # read once a round, not once a market
@@ -21451,7 +21545,17 @@ class Bot:
                 st["alert"]["offer"] = {**self.edge_note(mk, best, now_ms), "fair": mk.fair_up if best.side == "涨" else 1 - mk.fair_up}
             if maker_only:
                 st["alert"].update(maker_only=True, note=note)
-        if st.get("told") or st.get("pending") or st.get("alert") or any(now_ms - t < DAY_MS for t in st.get("last", {}).values()):
+        # 1.150.0 (audit CTRL-EDGE-SEQ): a stream that has announced (it has a count, seq) is kept for as long as its market
+        # is priced. edgesent:{market}:{sub} holds the last seq each subscription got, and edge_deliver and the digest skip
+        # every announcement numbered at or under it; those records go only together with the stream, a day after its
+        # market was last priced (edge_alerts). Every other stream keeps its last announcement and with it its record; a
+        # ladder's maker stream has its announcement taken back (points / eligibility coming and going: above, and in
+        # edge_alerts), and with nothing told, pending or announced and its last 新机会 a day old it was forgotten here.
+        # Its records were not, and the next stream on that level counted from 1 under them: its 新机会 and the 建议失效 /
+        # 方向反转 after it reached nobody until the count had passed the old one. The stream is kept rather than its
+        # records deleted at this point: a send still waiting on Telegram would write its seq back after the delete.
+        if (st.get("told") or st.get("pending") or st.get("alert") or st.get("seq")
+                or any(now_ms - t < DAY_MS for t in st.get("last", {}).values())):
             st["seen"] = now_ms - now_ms % 3_600_000
             state[market] = st
         else:
@@ -21727,33 +21831,50 @@ class Bot:
             return
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
         hour, minute = (int(x) for x in clock.split(":"))
-        due_at = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if local < due_at or local - due_at > dt.timedelta(milliseconds=self.REPORT_WINDOW_MS):
+        # 1.150.0: the catch-up window may run past Beijing midnight (a late SIM_DAILY_REPORT such as 23:30, with the bot
+        # down at the hour or Telegram refusing until after 00:00). Taking only today's due time cut the window at
+        # midnight: at 00:10 the due time became tonight's 23:30 and yesterday's report was lost for good. So the due time
+        # is the latest of today's and yesterday's that has passed (BEIJING has a fixed offset, so a day back is exact),
+        # and the report, its text and its record belong to that day, not to `local`.
+        today_due = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        due_at = today_due if today_due <= local else today_due - dt.timedelta(days=1)
+        if local - due_at > dt.timedelta(milliseconds=self.REPORT_WINDOW_MS):
             return
-        day_key = f"simreport:{local.date().isoformat()}"
+        report_day = due_at.date()
+        day_key = f"simreport:{report_day.isoformat()}"
         due = [(sub_id, sub) for sub_id, sub in self.subscriptions().items() if sub.get("active")
                and not self.store.get(f"{day_key}:{sub_id}") and not self.delivering(f"{day_key}:{sub_id}")]
         if not due:
             return
-        text = self.daily_report_text(now_ms)
+        # The review page's link carries the private page token, which (with WEB_CONTROL_KEY unset) opens control.json
+        # and the journal, real orders included. /web calls it private ("请勿转发"), so the unprompted daily push carries
+        # it only to the admin's private chat; group topics get the same report without it. /web and /sim still answer
+        # with the link wherever the admin types them. Each variant is built at most once per call.
+        texts: dict[bool, str] = {}
         for sub_id, sub in due:
             key = f"{day_key}:{sub_id}"
+            private = bool(self.config.admin_id) and (sub["chat"], sub["thread"]) == (self.config.admin_id, 0)
+            if private not in texts:
+                texts[private] = self.daily_report_text(now_ms, link=private, day=report_day)
+            text = texts[private]
             if not text:
                 self.store.put(key, {"skipped": now_ms})  # nothing to say today: the day is done for this subscription
                 continue
 
-            async def send(sub: dict = sub, key: str = key) -> None:
+            async def send(sub: dict = sub, key: str = key, text: str = text) -> None:
                 if await self.tell(sub["chat"], sub["thread"], text, html_mode=True):
                     self.store.put(key, self.market.now_ms())
             self.deliver(key, send)
 
-    def daily_report_text(self, now_ms: int) -> str:
+    def daily_report_text(self, now_ms: int, link: bool = True, day: dt.date | None = None) -> str:
         """The day's trading for Telegram (bold sentinels; send as HTML): what was ordered today and how it filled, the
         underlyings with the most records, what settled today and its P&L, the open positions with their unrealized P&L
-        at the books' middles, the lifetime, the resting orders' fill rate, and the review page's link. "" when there
-        is nothing to say: no record opened or settled today, no position held, no order resting."""
+        at the books' middles, the lifetime, the resting orders' fill rate, and (link) the review page's link. "" when there
+        is nothing to say: no record opened or settled today, no position held, no order resting. `day` (Beijing) is the
+        day reported, by default now_ms's; daily_report passes yesterday for a catch-up sent after midnight. Positions,
+        marks and the lifetime are always as of now_ms."""
         trades = list(self.sim_trades().values())
-        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+        today = day or dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         day_of = lambda ms: dt.datetime.fromtimestamp(int(ms or 0) / 1000, BEIJING).date()
         today_rows = [t for t in trades if day_of(t.get("opened")) == today]
         settled_rows = [t for t in trades if t["status"] == "settled" and day_of(t.get("settled")) == today]
@@ -21790,7 +21911,7 @@ class Bot:
                     + (f"｜收益率 {lifetime['roi'] * 100:+.1f}%" if lifetime["cost"] else ""))
         if makers["fill_rate"] is not None:
             body.append(f"挂单成交率 {makers['fill_rate'] * 100:.0f}%（{makers['placed']} 笔挂单；已结束的里有成交的占比）")
-        if self.config.web_port and self.web_token:
+        if link and self.config.web_port and self.web_token:  # link=False: a group copy (the token is private; daily_report)
             body.append(f"复盘页：{self.web_url()}/journal")
         title = "交易日报" if self.sim_has_real() else "模拟交易日报"
         return "\n".join([f"📒 {bold(title)} {today:%m-%d} {WEEKDAYS[today.weekday()]}", *tree(body)])
@@ -21912,9 +22033,10 @@ class Bot:
             out += [(key, getattr(mkt.spec, "name", key)) for key, mkt in table.items()]
         return out
 
-    def edge_target(self, words: list[str]) -> tuple[str, str]:
+    def edge_target(self, words: list[str], saved: dict[str, float] | None = None) -> tuple[str, str]:
         """The bar an /edge command addresses, from its words: nothing = the default; a section; a market (its key, an
-        alias, or part of its card's name), optionally followed by one of its levels. Returns (bar key, shown name)."""
+        alias, or part of its card's name), optionally followed by one of its levels. Returns (bar key, shown name).
+        With `saved` (the bars already set: /edge … off) a level names the bar saved under it, see below."""
         if not words:
             return "default", "默认"
         text = " ".join(words)
@@ -21936,9 +22058,30 @@ class Bot:
             if found:
                 key, name = found[0]
                 if rest:
-                    level = edge_level_norm(" ".join(rest))
-                    if not re.fullmatch(r"\d+(\.\d+)?[kmb]?", level):
+                    # CTRL-EDGE-LEVEL (follow-up): bars saved before the fix below keep their key exactly as typed
+                    # ("level:ETH-HIT-11|4500", "level:HSI|300m"); /edge and /status still list them, but the stricter
+                    # parsing below no longer produces those keys, so "/edge … off" could not take them away one by one
+                    # (only /edge 清空 could, with every valid bar). Taking a bar away needs no check: with the saved bars
+                    # given, the level as typed names the bar saved under exactly that spelling, on any market.
+                    typed = f"level:{key}|{edge_level_norm(' '.join(rest))}"
+                    if saved is not None and typed in saved:
+                        return typed, f"{name} {' '.join(rest)}"
+                    # CTRL-EDGE-LEVEL: edge_bar finds a level's bar by the card's own label (level_label on a price
+                    # ladder: 4500 -> "4.5k"; usd_short on a cap ladder: 1.234B -> "1.23b"), so a level typed any other
+                    # way ("4500", "130000", "1.234b") was saved, confirmed and listed, yet never matched a card; and a
+                    # market without levels (恒指 300m) got a bar that could never apply. Refuse the latter, and save
+                    # the typed number in the card's spelling; when the market's levels are known, it must be one.
+                    if key not in self.ranges and key not in self.caps:
+                        raise ValueError(f"「{name}」没有档位；去掉档位写 /edge {head} <¢>")
+                    match = re.fullmatch(r"(\d+(?:\.\d+)?)([kmb]?)", edge_level_norm(" ".join(rest)))
+                    if not match:
                         raise ValueError(f"档位「{' '.join(rest)}」看不懂；写成 300M、1B、120k 这样")
+                    spell = lambda v: edge_level_norm(level_label(v) if key in self.ranges else usd_short(v))
+                    level = spell(D(match.group(1)) * {"": 1, "k": 10 ** 3, "m": 10 ** 6, "b": 10 ** 9}[match.group(2)])
+                    known = [spell(row.target) for row in self.predict.ladders.get(key) or []]
+                    # (a saved bar of a level the market has dropped since can still be taken away)
+                    if known and level not in known and f"level:{key}|{level}" not in (saved or ()):
+                        raise ValueError(f"「{name}」没有「{' '.join(rest)}」这一档；现有档位：" + "、".join(dict.fromkeys(known)))
                     return f"level:{key}|{level}", f"{name} {' '.join(rest)}"
                 return f"key:{key}", name
         raise ValueError(f"找不到市场或栏目「{text}」。栏目：{'、'.join(self.EDGE_GROUPS.values())}；市场：" +
@@ -21988,13 +22131,17 @@ class Bot:
                                  "单位 ¢，0.5～50") from None
             if not 0.5 <= cents <= 50:
                 raise ValueError("门槛范围 0.5～50¢")
-        key, name = self.edge_target(args[:-1])
         if off:
+            key, name = self.edge_target(args[:-1], bars)  # also a bar saved under the level as typed (never matched a card)
             if key not in bars:
                 return f"ℹ️ {name} 没有单独的门槛，无需取消。\n" + self.edge_text()
             bars.pop(key, None); names.pop(key, None)
             self.update_settings(edge_bars=bars, edge_names=names)
             return f"✅ 已取消 {name} 的单独门槛。\n" + self.edge_text()
+        key, name = self.edge_target(args[:-1])
+        stale = self.edge_target(args[:-1], bars)[0]  # the same level saved as typed before CTRL-EDGE-LEVEL: this bar
+        if stale != key:                              # replaces it (else both are listed under the one name)
+            bars.pop(stale, None); names.pop(stale, None)
         bars[key] = round(cents, 2); names[key] = name
         self.update_settings(edge_bars=bars, edge_names=names)
         what = "默认门槛" if key == "default" else f"{name} 的提醒门槛"
@@ -22111,46 +22258,130 @@ class Bot:
         return f"{self.config.web_base}{path}" if self.config.web_base else path
 
     # --- the control page (/p/<token>/control): settings while running, the real-trading switches ------------------
+    CONTROL_RISK_KEYS = ("LIVE", "LIVE_MAX_ORDER_USD", "LIVE_MAX_OPEN_USD", "LIVE_MAX_DAILY_LOSS_USD")  # control_prune keeps these first
+
     @staticmethod
     def control_prune(env: Mapping[str, str], saved: Mapping[str, str]) -> tuple[Config, dict[str, str]]:
         """The configuration from the environment with the saved control settings on top. A saved value that no longer
-        validates (a bound tightened since it was saved) is dropped and the rest kept — never the whole page's settings
-        for one bad one, and never a save refused for a key the user did not touch. (config, dropped key -> why)."""
-        saved, dropped = dict(saved), {}
-        while True:
-            try:
-                return Config.from_env({**env, **saved}), dropped
-            except ValueError as error:
-                text = clean_error(error)
-                bad = next((k for k in sorted(saved, key=len, reverse=True) if k in text), None)  # the message names its key
-                if bad is None:
-                    raise
-                dropped[bad] = text
-                saved.pop(bad)
+        validates (a bound tightened since it was saved, an environment variable changed under it) is dropped and the rest
+        kept — never the whole page's settings for one bad one. (config, dropped key -> why); raises only when the
+        environment itself does not validate.
+
+        1.150.0 (audit CTRL-PRUNE): the bad value is found by trial, no longer guessed from the error's text. The guess took
+        the longest saved key named in the message cut to 280 characters, and gave up when none was: a failed int() names
+        no key, the pre-open checks name a dozen keys in one message (546 characters, the timing keys past the cut), and
+        when a saved PREOPEN_15M=on is what makes the pre-open values count, the bad one can be an environment variable no
+        saved key names. Giving up made the start-up fall back to the bare environment — the saved LIVE=off and the lowered
+        LIVE_MAX_* limits gone, env LIVE=on trading for real again; and where the message named several saved keys, valid
+        ones were dropped first (the pre-open $ cap, AHEAD, the deeper levels). Now the saved values are laid on the
+        environment (valid by itself: the process would not have started) one at a time, each kept when the result still
+        validates. LIVE and the LIVE_MAX_* limits go first, so they stand whenever they are valid on their own; PREOPEN_15M
+        goes last, so a pre-open conflict leaves the mode off (preopen_apply winds its leftover orders down) rather than
+        quoting on values nobody chose; passes repeat while one keeps something more, so a pair valid only together
+        (PREOPEN_CANCEL_SECONDS raised along with PREOPEN_ENTRY_SECONDS) is kept. A few milliseconds, and only when the
+        saved values as a whole fail."""
+        try:
+            return Config.from_env({**env, **saved}), {}
+        except ValueError:
+            pass  # one value or more no longer fits: rebuilt below
+        rank = lambda key: 0 if key in Bot.CONTROL_RISK_KEYS else 2 if key == "PREOPEN_15M" else 1
+        order = sorted(saved, key=rank)  # stable: the others in their saved order
+        config, kept, why = Config.from_env(dict(env)), {}, {}
+        grown = True
+        while grown:
+            grown = False
+            for key in order:
+                if key in kept:
+                    continue
+                try:
+                    config = Config.from_env({**env, **kept, key: saved[key]})
+                except ValueError as error:
+                    why[key] = clean_error(error)
+                    continue
+                kept[key], grown = saved[key], True
+        return config, {key: why[key] for key in order if key not in kept}
 
     @staticmethod
-    def control_config(config: Config, store: Store) -> Config:
+    def control_config(config: Config, store: Store) -> tuple[Config, list[str]]:
         """The configuration with the control page's saved changes (control:env) applied on top of the environment;
-        saved values that no longer validate are dropped (and forgotten) with a warning, never a crash at start-up."""
+        saved values that no longer validate are dropped (and forgotten) with a warning, never a crash at start-up. Also
+        the lines naming what was dropped: run() tells the administrator (1.150.0: Railway's log was the only trace)."""
         saved = store.get("control:env")
         if not isinstance(saved, dict) or not saved:
-            return config
+            return config, []
         kept = {k: str(v) for k, v in saved.items() if k in CONTROL_KEY_SET}
         try:
             applied, dropped = Bot.control_prune(config.env, kept)
         except ValueError as error:
-            LOG.warning("网页控制台保存的设置无效，已忽略：%s", clean_error(error))
-            return config
+            # Not reached: the environment validated a moment ago (config). Should it ever be, the saved values cannot be
+            # weighed, so none is applied — and nothing may come out looser than they were: no real order (at most pause)
+            why = clean_error(error)
+            LOG.warning("网页控制台保存的设置无法验证，已全部忽略，真实交易最多 pause：%s", why)
+            return (dataclasses.replace(config, live_mode="pause") if config.live_mode == "on" else config,
+                    [f"全部 {len(kept)} 项（无法验证，真实交易最多 pause）：{brief_error(why, 160)}"])
         if dropped:
             LOG.warning("网页控制台保存的设置里有无效项，已忽略：%s", "；".join(f"{k}：{why}" for k, why in dropped.items()))
             store.put("control:env", {k: v for k, v in kept.items() if k not in dropped})  # the page shows what is in force
-        return dataclasses.replace(applied, env=config.env)  # env stays the environment itself, never the merged values
+        return (dataclasses.replace(applied, env=config.env),  # env stays the environment itself, never the merged values
+                [f"{k}={brief_error(kept[k], 40)}：{brief_error(why, 160)}" for k, why in dropped.items()])
+
+    def control_dropped_text(self) -> str:
+        """The administrator's note on the saved control settings this start dropped (control_config), with what is in force."""
+        value = self.control_value
+        lines = ["⚠️ 网页控制台保存的设置这次启动时有无效项，已删除（改按环境变量或默认值），其余保存的设置照常生效：",
+                 *(f"• {line}" for line in self.control_dropped)]
+        if any(line.startswith("PREOPEN_15M=") for line in self.control_dropped):
+            lines.append("开盘前预挂模式因此没有开启，还挂着的预挂单会撤掉；改好上面说的设置后在控制台或用 /preopen on 重新开启。")
+        lines.append(f"现在：真实交易模式 {value('LIVE')}，单笔上限 ${value('LIVE_MAX_ORDER_USD')}，持仓+挂单上限 ${value('LIVE_MAX_OPEN_USD')}，"
+                     f"日亏损停机线 ${value('LIVE_MAX_DAILY_LOSS_USD')}。请在控制台核对。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def lead_route(card: "IndexUpDownMarket", config: Config) -> None:
+        """A 15-minute index card's exchange quote as ``config`` has it, at the start and again whenever the configuration
+        changes (apply_config): the stock's code and LEAD_QUOTE's mode while the card's pair has an exchange ticker — in
+        SYMBOLS, or added for a stock card the pre-open mode quotes (Config.from_env) — else none and off. refresh_updown
+        hands a card its quote (note_lead) only while lead_code is set, and the pre-open mode's limit / halt guard judges
+        on that very quote (Controller.card_hold reads card.lead). A card whose ticker neither came nor went is left as it
+        is: on a routed card LEAD_QUOTE's mode stays refresh_updown's to set each round (it sees the price the change moves
+        and wakes the trader for it)."""
+        ticker = config.tickers.get(card.spec.symbol)
+        code = ticker.code if ticker is not None else ""
+        if code == card.lead_code:
+            return
+        card.lead_code, card.lead_mode = code, config.lead_quote if ticker is not None else "off"
+        if ticker is None:
+            card.lead = None  # its ticker gone: nothing reads a quote for it any more, the last one in hand must not stand
 
     def apply_config(self, config: Config) -> None:
-        """A changed configuration takes effect: every loop reads self.config at use."""
+        """A changed configuration takes effect: every loop reads self.config at use, and what the start built from a
+        setting the control page can change (the stock feed's tickers, the 15-minute stock cards' exchange quote, the index
+        cards' σ factors) is brought to the new configuration here, as a restart would build it."""
+        before = self.config
         self.config = config
         self.predict.config = config  # the orderbook feed keeps its own reference (PREDICT_POLL_SECONDS)
         SOURCE_HEALTH.off = config.sources_off  # the quote feeds read the switch from here
+        # 1.150.0 (audit CTRL-CONFIG-RUNTIME): three more things were built from the start-up configuration and kept it until
+        # the next restart. PREOPEN_15M / PREOPEN_MARKETS add the exchange ticker of a stock card the pre-open mode quotes
+        # whose pair is not in SYMBOLS (Config.from_env, 1.134.0: 智谱 by default; SK 海力士 / 宇树 where SYMBOLS leaves them
+        # out), for that mode's limit / halt guard. Switched on the page (改动即时生效), by /preopen on or by a reset, the
+        # mode began quoting the card for real while the stock feed went on asking for the start-up tickers alone and the
+        # card had no quote routed (lead_code, set once in __init__): the guard found no exchange quote — nothing to judge
+        # — so neither the limit rule nor the halt rule applied, and nothing said so (a stock never asked for is never in
+        # error). And SIGMA_CALIB reached the index cards' σ only at the next index close (note_outcome), up to a weekend
+        # away: VolBook.get applies whatever factors it holds.
+        self.stocks.config = config  # the stock feed: the tickers it asks for (refresh_live, refresh) and serves (live_quote)
+        # each 15-minute stock card's exchange quote, as __init__ routes it. A card that gains a ticker here is from then on
+        # also priced with LEAD_QUOTE by the model trader, exactly as after a restart (the window under way by note_lead's
+        # rule for a bot that came late: on the index alone, unless the stock has not traded since the window's start)
+        for cards in self.index_markets.values():
+            for card in cards:
+                self.lead_route(card, config)
+        if config.sigma_calib != before.sigma_calib:  # on a change of the switch alone: measuring reads every snapshot on disk
+            self.vols.calib = {}
+            if config.sigma_calib:
+                with contextlib.suppress(Exception):  # as at the start: the estimates alone until the next outcome measures again
+                    self.vols.calib = self.index_sigma_calibs()
 
     def control_value(self, key: str) -> str:
         """A control setting's value in force, as the variable would be written."""
@@ -22270,9 +22501,18 @@ class Bot:
     def control_set(self, values: dict) -> dict:
         """Save the settings given, validated together like the environment. None clears a saved value (the environment's
         applies again); so does "" — except for a CONTROL_CLEARABLE setting the environment gives a value: there "" is
-        saved, the empty choice (every market, nothing left out, every source on) standing over the environment's."""
-        saved = {k: str(v) for k, v in (self.store.get("control:env") or {}).items() if k in CONTROL_KEY_SET}
-        if str(values.get("LIVE") or "").strip().lower() == "on" and not self.config.live_allowed:
+        saved, the empty choice (every market, nothing left out, every source on) standing over the environment's.
+        1.150.0 (CTRL-PRUNE): the request on top of the other saved values validates as a whole or nothing is saved — a
+        saved value the user did not send is never dropped to let it through (PREOPEN_PRICE_CENTS=45 under saved levels
+        48x20,47x40 answered 已保存并生效 while the levels and PREOPEN_AHEAD_MINUTES were deleted). Only a saved value that
+        had stopped validating before this request (the saved values pruned alone, as at start-up) is dropped on the way,
+        and the answer names it: a stale value never blocks a save, /live mode off included."""
+        before_saved = {k: str(v) for k, v in (self.store.get("control:env") or {}).items() if k in CONTROL_KEY_SET}
+        saved = dict(before_saved)
+        # 1.150.0 (audit CTRL-LIVE-ALLOWED-FAILOPEN): refused for every word Config.from_env reads as LIVE=on, no longer the
+        # bare "on" alone — a hand-made request's LIVE=true / 1 / yes was saved under the hard switch (capped at pause while
+        # it stood) and turned real orders on at the restart that lifted the switch, nobody having chosen on then
+        if str(values.get("LIVE") or "").strip().lower() in {"on", "1", "true", "yes"} and not self.config.live_allowed:
             return {"ok": False, "message": "部署变量 LIVE_TRADING_ALLOWED=off 禁止真实下单（硬开关）：不能保存 LIVE=on"}
         changed = []
         for key, _, _ in CONTROL_KEYS:
@@ -22297,18 +22537,22 @@ class Bot:
         if unknown:
             return {"ok": False, "message": "不能在网页上改的变量：" + "、".join(str(k)[:40] for k in unknown[:5])}
         try:
-            config, dropped = self.control_prune(self.config.env, saved)
+            _, stale = self.control_prune(self.config.env, before_saved)  # what had stopped validating before this request
         except ValueError as error:
             return {"ok": False, "message": clean_error(error)}
-        if any(k in values for k in dropped):
-            return {"ok": False, "message": "；".join(why for k, why in dropped.items() if k in values)}
-        for key in dropped:  # a saved value that stopped validating since: dropped, the save goes on
+        stale = {k: why for k, why in stale.items() if k not in values}  # a key the request sends is the request's to decide
+        for key in stale:  # a saved value that stopped validating since: dropped, the save goes on
             saved.pop(key, None)
+        try:
+            config = Config.from_env({**self.config.env, **saved})
+        except ValueError as error:
+            return {"ok": False, "message": clean_error(error)}
         config = dataclasses.replace(config, env=self.config.env)
         before = {key: self.control_value(key) for key, _, _ in CONTROL_KEYS}
         self.store.put("control:env", saved)
         self.apply_config(config)
         words = [f"{key}={self.control_value(key)}（原 {before[key]}）" for key in changed if self.control_value(key) != before[key]]
+        words += [f"{key} 保存的值已失效、已删除，现在 {self.control_value(key)}（{brief_error(why, 80)}）" for key, why in stale.items()]
         return {"ok": True, "message": ("已保存并生效：" + "；".join(words)) if words else "已保存，设置没有变化。"}
 
     async def live_control(self, action: str, data: dict) -> dict:
@@ -23168,7 +23412,14 @@ class Bot:
 
     async def refresh_books(self, now_ms: int) -> Refreshed | bool:
         """The orderbook round: the hot keys every round, the cold ones now and then (PredictFeed.refresh); a round
-        that brought books wakes the trader at once (sim_wake) instead of leaving it to its own timer."""
+        that brought books wakes the trader at once (sim_wake) instead of leaving it to its own timer. False = not due
+        yet, asked of the feed before anything is worked out for the round."""
+        if not self.predict.round_due():
+            # 1.150.0 (audit CTRL-REFRESH-WAKE): this job is ticked every second (REFERENCE_TICK) and a round runs every
+            # PREDICT_POLL_SECONDS. The hot set (every market priced, each ladder level's taker gap and maker verdict)
+            # and the targets (every daily card's odds) were worked out on each tick, on the event loop, and handed to
+            # a feed that answered "not due" — nine times in ten at the default ten seconds
+            return False
         hot = rows = None
         if self.config.sim:
             try:
@@ -23176,7 +23427,15 @@ class Bot:
             except Exception as error:  # the round goes on with every key
                 self.log_limited("predict-hot", f"分级轮询计算失败：{clean_error(error) or type(error).__name__}")
         result = await self.predict.refresh(self.predict_targets(now_ms), hot=hot, hot_rows=rows)
-        if result is not False and self.config.sim:
+        # 1.150.0 (audit CTRL-REFRESH-WAKE): only a round that brought books (ok, partial) wakes the trader; "failed" —
+        # none came — does not. That is also the feed's answer, at once and without a request, to a round due while its
+        # 429 cooldown holds, on every one-second tick until the cooldown ends, and `result is not False` woke the trader
+        # on each of them: a look every SIM_STEP_MIN_SECONDS instead of every SIM_SECONDS on books that had not changed —
+        # the real trader reading its open orders again each time, on the same API key, just while Predict was limiting
+        # it. Nothing is lost: its own timer, a fair price that moved (note_job) and a book stored or pushed (the
+        # express lane) bring the trader as before, and the stream goes on following the hot set below — its pushes are
+        # the only books coming in meanwhile.
+        if isinstance(result, Refreshed) and result.status != "failed" and self.config.sim:
             self.sim_wake = True
         if result is not False:
             self.predict.stream.want(self.predict.stream_targets(hot, rows))  # the stream follows the round's hot set (1.86.0)
@@ -23469,6 +23728,11 @@ class Bot:
             if final is not None and spec.start_ms == old.end_ms and mkt.close_of("start") is None:
                 # the new market's line is the very candle that just settled the old one: kept at once, not read again
                 self.store.put(f"updown:{spec.slug}:start", {"open": spec.start_ms, "close": str(final), "read_ms": now_ms, "from": old.slug})
+            # the market just over is never a target again (mkt.spec moved on, predict_targets reads only the current slug;
+            # its outcome info is pruned from predict.info already): its slug would otherwise stay in want_info for ever,
+            # one per roll — ~2,500 a day with every 15-minute card on. Dropped here, at the roll, not by pruning
+            # want_info to the targets: a 15-minute card's next slug is not a target until WINDOW_LEAD_MS before its window
+            self.predict.want_info.discard(old.slug)
             self.predict.want_info.add(spec.slug)
             if isinstance(daily, WindowUpDownSpec) and (pruned := self.updown_prune(daily, now_ms)):
                 LOG.info("%s：清掉 %d 条 %d 天前的窗口价格记录", key, pruned, self.UPDOWN_KEEP_MS // DAY_MS)
@@ -23624,7 +23888,56 @@ class Bot:
         if isinstance(query, dict):  # A button tap is a live intent, so it is not age-filtered.
             await self.process_callback(query)
 
+    @staticmethod
+    def telegram_refused(error: RemoteError) -> bool:
+        """Whether Telegram itself refused the request — an HTTP 4xx (401 / 404: a wrong or revoked token; README's 对方拒绝)
+        or an answer that is not ok — rather than could not be asked: a network error (连不上), a 5xx, a 429 flood wait (any
+        answer that names a wait) and a body that is not JSON say nothing about this token."""
+        hit = re.match(r"HTTP (\d{3})", str(error))
+        status = int(hit.group(1)) if hit else 0
+        if error.retry_after or status == 429:
+            return False
+        return 400 <= status < 500 or str(error).startswith("Telegram:")
+
+    async def telegram_hello(self) -> RemoteError | None:
+        """The start-up check, one try: the token must not be bound to a webhook — it may belong to another service, and
+        this program never removes one (README 已有 Webhook) — and getMe names the bot (parse_request tells a group's
+        /cmd@otherbot from ours by it). None once it passed (telegram_ok). A reported webhook (ValueError) and Telegram's
+        own refusal (telegram_refused: a wrong or revoked token) raise, as they always did.
+        1.150.0 (CTRL-TELEGRAM-STARTUP): Telegram out of reach or out of order — DNS or the network failing, a 5xx, a
+        429 — is not a refusal: that error is returned instead of raised, and hello_next is the earliest moment of the
+        next try (the poll's back-off: 2 seconds doubling up to a minute, and never before a wait Telegram named)."""
+        try:
+            webhook = await self.telegram.call("getWebhookInfo")
+            if webhook.get("url"):
+                raise ValueError("该 Bot Token 已绑定 Webhook。请为本项目使用独立机器人，或在原服务移除 Webhook 后重试")
+            me = await self.telegram.call("getMe")
+        except RemoteError as error:
+            if self.telegram_refused(error):
+                raise
+            self.hello_failures += 1
+            self.hello_next = time.monotonic() + max(error.retry_after, min(60, 2 ** min(self.hello_failures, 6)))
+            return error
+        self.username = me.get("username", "")
+        self.telegram_ok = True
+        return None
+
     async def commands_loop(self) -> None:
+        # 1.150.0 (CTRL-TELEGRAM-STARTUP): Telegram was out of reach when the process started (run): the start-up check
+        # is tried again here, backing off like the poll below, while the rest of the bot already runs. Not one update
+        # is asked for before it passed — the username is what tells a group's /cmd@otherbot from ours — and a token
+        # bound to a webhook stays refused: that ValueError, like Telegram rejecting the token, ends this core loop, so
+        # run() exits 1 and the next start refuses before any loop, as it always did.
+        while not self.telegram_ok and not self.stopping.is_set():
+            await self.wait(max(0.0, self.hello_next - time.monotonic()))
+            if self.stopping.is_set():
+                return
+            down = await self.telegram_hello()
+            if down is not None:
+                self.log_limited("hello", f"Telegram 仍不可用（{clean_error(down)}）：命令和菜单暂停，继续重试")
+                continue
+            LOG.info("Telegram 已恢复 @%s：注册菜单，开始接收命令", self.username)
+            await self.register_menu()
         offset = int(self.store.get("telegram_offset", 0))
         failures = 0
         while not self.stopping.is_set():
@@ -23669,20 +23982,32 @@ class Bot:
         """The bot's life: 0 when it stopped on request (signal), 1 when a core loop ended on its own (the process
         exits so Railway restarts it; a bot that keeps answering commands but no longer samples prices must not live)."""
         # Refuse to silently remove a webhook that may belong to another service.
-        webhook = await self.telegram.call("getWebhookInfo")
-        if webhook.get("url"):
-            raise ValueError("该 Bot Token 已绑定 Webhook。请为本项目使用独立机器人，或在原服务移除 Webhook 后重试")
-        me = await self.telegram.call("getMe")
-        self.username = me.get("username", "")
-        LOG.info("Starting @%s; symbols=%s; administrator_configured=%s", self.username,
+        # 1.150.0 (CTRL-TELEGRAM-STARTUP): Telegram being out of reach at this moment (its API down, DNS or the egress
+        # failing: nothing about this token) used to abort the start right here, before any loop — no sampling, no
+        # feeds, no trader: the real orders resting on Predict neither synced, re-judged nor withdrawn, no kill switch,
+        # no redeem, no control page — and Railway restarted the process into the same failure for as long as the
+        # outage lasted (LiveBot starting and abandoning its pre-open mode each time). Everything else starts now, the
+        # way it already carries on when Telegram goes away while running (messages go out as soon as Telegram takes
+        # them: a send touches no webhook); the commands loop tries the check again and polls only once it passed. The
+        # refusals are unchanged: a reported webhook and a token Telegram rejects still stop the start before any loop
+        # (found only later, they end the commands loop: exit 1, and the next start refuses).
+        down = await self.telegram_hello()
+        if down is not None:
+            LOG.warning("启动时 Telegram 不可用（%s）：行情、交易和网页照常启动；命令和菜单暂停，后台重试，恢复后自动接上", clean_error(down))
+        LOG.info("Starting @%s; symbols=%s; administrator_configured=%s", self.username or "?",
                  ",".join(self.config.symbols), bool(self.config.admin_id))
         # which secrets are set, never their values (Railway logs are not a place for a key)
         LOG.info("secrets configured: telegram_token=%s predict_api_key=%s predict_private_key=%s predict_account=%s web_control_key=%s live=%s",
                  bool(self.config.token), bool(self.config.predict_api_key), bool(self.config.live_key), bool(self.config.live_account),
                  bool(self.config.web_control_key), self.config.live)
-        await self.register_menu()
+        if self.config.live_key and not self.config.web_control_key:
+            LOG.warning("PREDICT_PRIVATE_KEY 已配置但 WEB_CONTROL_KEY 未设置：控制台和复盘数据（账户、订单、交易记录）锁定，设置 WEB_CONTROL_KEY 后才显示")
+        if self.telegram_ok:  # (Telegram out of reach: the commands loop publishes the menu once the check passed, never on a token whose webhook is unknown)
+            await self.register_menu()
         if not self.config.admin_id:
             LOG.warning("ADMIN_USER_ID 尚未配置：只能使用 /id；没有任何自动订阅")
+        elif self.control_dropped:  # 1.150.0 (CTRL-PRUNE): saved settings dropped at this start reach the administrator, not only the log
+            self.deliver("notice:control-dropped", functools.partial(self.tell, self.config.admin_id, 0, self.control_dropped_text()))
         if warning := calendar_warning(self.config.holidays, dt.datetime.now(BEIJING).date()):
             LOG.warning("%s", warning)
         loop = asyncio.get_running_loop()
