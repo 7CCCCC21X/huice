@@ -534,7 +534,8 @@ async def row_abort():
     assert last["counts"] == {"redeemed": 1, "fields": 4, "open": 1}, last
     assert not any(bot.store.get(f"live:redeemed:{mid}:{i}") for mid in ("900", "902", "903") for i in (0, 1, 2)), "no mark, never a guess"
     assert bot.live_redeem_summary(last) == "持仓 6 个：领了 1，缺字段 4，未结算 1", bot.live_redeem_summary(last)
-    assert [k for k, _ in sent] == [""] and "已领取 window 901 Up 25 份" in sent[0][1], sent  # the 💵 line, and nothing else
+    assert [k for k, _ in sent] == ["", "redeem:fields"] and "已领取 window 901 Up 25 份" in sent[0][1], sent  # the 💵 line...
+    assert sent[1][1].startswith("⚠️ 自动领取：4 个持仓缺字段，机器人领不了（"), sent  # ...and (RDM-FIELDS-SILENT) the four 缺字段, told once
     report = await bot.live_redeem_report(NOW + MIN)
     assert report.startswith("🔎 自动领取自检") and "缺字段：" in report, report
     for why in ("持仓的 indexSet 读不懂（'YES'），分不出是哪一边", "市场详情读不懂（", "持仓的份数（amount）读不懂（'7.5'）", "持仓没写市场编号"):
@@ -2106,6 +2107,58 @@ async def note_throttle():
 
 
 asyncio.run(note_throttle())
+
+
+# --- RDM-FIELDS-SILENT ----------------------------------------------------------------------------------------------------------
+async def fields_silent():
+    """RDM-FIELDS-SILENT: a position the bot can never redeem (缺字段: no indexSet on the row, no conditionId on a resolved
+    winner's market) was never pushed and never written to /live's 最近错误 — looked at every round for good, in silence, and the
+    check concluded 有已结算的持仓缺字段 even for a row whose market was never read. Each such position is now told once (to the
+    administrator when no chat is subscribed, whatever LIVE_NOTIFY says), a newcomer at the next hourly gate; /live gets the line;
+    the check stays silent; nothing is marked, sent or backed off."""
+    def setup(bot):
+        fake = bot.live.api
+        fake.markets.update({"701": {**mk(701, won=1), "conditionId": ""}, "702": mk(702)})
+        fake.positions_rows = [held(701), {**held(702), "outcome": {"name": "Up"}}]  # (702: no indexSet on the row)
+        return fake
+    # the dry run says it, and tells nobody
+    bot = await told_bot({}, LIVE_NOTIFY="off")
+    setup(bot)
+    errors = list(bot.live_errors)
+    head, _ = verdict_of(await bot.live_redeem_report(NOW))
+    await bot.drain_deliveries()
+    assert head == "结论：有持仓缺字段，机器人领不了（见上，有的还分不出是否结算、输赢）：到 Predict 网站看一下，结算赢了的手动领取，并把这条发我", head
+    assert bot.telegram.sent == [] and bot.live_errors == errors, "the check announces nothing"
+    # a round: told once — on Telegram (the administrator: no chat subscribed, LIVE_NOTIFY off) and in /live
+    fake = setup(bot)
+    said = lambda: [text for _, _, text in bot.telegram.sent if "缺字段" in text]
+    assert await bot.live_redeem(NOW) == [] and bot.live_redeem_last["counts"] == {"fields": 2}, bot.live_redeem_last
+    await bot.drain_deliveries()
+    assert said() == ["⚠️ 自动领取：2 个持仓缺字段，机器人领不了（window 701：市场没写 conditionId，领取交易填不出来）："
+                      "到 Predict 网站看一下，结算赢了的手动领取；/live redeem check 查看，并把它的回答发我"], bot.telegram.sent  # (before: nothing)
+    assert bot.telegram.sent[0][0] == ADMIN and "缺字段" in bot.live_errors[-1], bot.live_errors[-1:]
+    assert bot.live.chain.redeemed == [] and not bot.store.items("live:redeemed:") and bot.live_redeem_failed == {}, "no mark, no transaction, no back-off"
+    # the same positions again: nothing more
+    n = len(bot.live_errors)
+    await bot.live_redeem(NOW + 10 * MIN)
+    await bot.drain_deliveries()
+    assert len(said()) == 1 and len(bot.live_errors) == n
+    # a newcomer: told at the next hourly gate, not before
+    fake.markets["703"] = {**mk(703, won=1), "conditionId": ""}
+    fake.positions_rows.append(held(703))
+    await bot.live_redeem(NOW + 20 * MIN)
+    await bot.drain_deliveries()
+    assert len(said()) == 1, "within the hour"
+    bot.live_noted["redeem:fields"] -= 3601
+    bot.live_redeem_fields_noted -= 3601
+    await bot.live_redeem(NOW + 61 * MIN)
+    await bot.drain_deliveries()
+    assert len(said()) == 2 and said()[1].startswith("⚠️ 自动领取：3 个持仓缺字段，机器人领不了（window 703：") and "缺字段" in bot.live_errors[-1], said()
+    assert (await bot.cmd_live(req("redeem"))).startswith("这次没有领取：持仓 3 个：缺字段 3")
+    print("RDM_FIELDS_SILENT_OK")
+
+
+asyncio.run(fields_silent())
 
 
 print("AUDIT_REDEEM_OK")

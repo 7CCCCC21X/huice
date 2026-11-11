@@ -1731,6 +1731,8 @@ class LiveBot(core.Bot):
         self.live_redeem_noted = -1e9                        # the last never-sent failed redeem told on Telegram (LIVE_REDEEM_NOTE_SECONDS)
         self.live_redeem_untold: dict[str, dict] = {}        # position key -> a sent redeem that failed, not told yet (the next ⚠️; 1.150.0)
         self.live_redeem_notes: dict[str, str] = {}          # position key, or gas / cut / unclear / round / loop -> its problem line (the check, 1.150.0)
+        self.live_redeem_fields_told: set = set()            # (market, index set) of the 缺字段 positions told on Telegram (1.150.0)...
+        self.live_redeem_fields_noted = -1e9                 # ...and when such a line last went to /live's 最近错误 (hourly)
         self.live_redeem_again_n = 0                         # early rounds in a row asked for by live_redeem_again (0 again once a round looked, 1.150.0)
         self.live_redeem_whole_at = time.monotonic()         # when a round last looked at the positions with no rate limit cutting it (the start counts)
         self.live_redeem_stuck_noted = -1e9                  # ...and when no such look for LIVE_REDEEM_STUCK_SECONDS was last told (hourly at most)
@@ -4910,7 +4912,8 @@ class LiveBot(core.Bot):
         # cut list, the unreadable settlements, a failed round (this one looked); a failure not yet told, once no longer listed
         listed = {f"live:redeemed:{s['market_id']}:{s['index_set']}" for s in seen}
         found = {s["kind"] for s in seen}
-        over = {"round", "loop"} | ({"gas"} if not low_gas else set()) | ({"cut"} if not cut else set()) | ({"unclear"} if "unclear" not in found else set())
+        over = ({"round", "loop"} | ({"gas"} if not low_gas else set()) | ({"cut"} if not cut else set())
+                | ({"unclear"} if "unclear" not in found else set()) | ({"fields"} if "fields" not in found else set()))
         for gone in [k for k in notes if k in over or (k.startswith("live:redeemed:") and k not in listed)]:
             del notes[gone]
         for gone in [k for k in untold if k not in listed]:
@@ -4962,6 +4965,25 @@ class LiveBot(core.Bot):
                     if soft:
                         self.live_redeem_noted = before
                 self.live_note_given_back("redeem:fail", undo)
+        # 1.150.0 (audit RDM-FIELDS-SILENT): a position the bot can never redeem — no indexSet on the row, no conditionId on a
+        # resolved winner's market, a row or a market it cannot read (缺字段) — was never pushed and never written to /live's
+        # 最近错误: it was looked at every round for good in silence, the money left to the owner's luck. Each such position is
+        # told once (this process), a newcomer at the next hourly gate; the line in /live once an hour while one is new. Nothing
+        # else changes for it: no mark (a field may come later), no back-off, no transaction.
+        fields = [s for s in seen if s["kind"] == "fields"]
+        told = self.__dict__.setdefault("live_redeem_fields_told", set())
+        told &= {(s["market_id"], s["index_set"]) for s in fields}  # (one no longer 缺字段: forgotten)
+        fresh = [s for s in fields if (s["market_id"], s["index_set"]) not in told]
+        if fresh:
+            text = (f"⚠️ 自动领取：{len(fields)} 个持仓缺字段，机器人领不了（{fresh[0]['title']}：{fresh[0]['error']}）："
+                    "到 Predict 网站看一下，结算赢了的手动领取；/live redeem check 查看，并把它的回答发我")
+            if time.monotonic() - getattr(self, "live_redeem_fields_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
+                self.live_redeem_fields_noted = time.monotonic()
+                self.live_redeem_note("fields", text)
+            if self.live_notify(text, key="redeem:fields") is not False:  # (hourly: LIVE_NOTE_EVERY; False: no chat given it)
+                new = {(s["market_id"], s["index_set"]) for s in fresh}
+                told |= new
+                self.live_note_given_back("redeem:fields", lambda new=new: told.difference_update(new))
         if cut and time.monotonic() - getattr(self, "live_cut_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
             # 1.150.0 (RDM-POSITIONS-CUT): a list longer than even the redeem's own read — told once an hour on its own timer (a bare
             # key would come back every LIVE_NOTE_SECONDS, a round or two), not only in the summary nobody asks for
@@ -5158,8 +5180,8 @@ class LiveBot(core.Bot):
         if waiting or retrying:
             reasons.append(f"链上领取失败：{(waiting or retrying)[0].get('error') or '见上'}；"
                            + ("到时自动再试" if auto else "自动领取关着，不会自己再试：发 /live redeem 再试一次") + "，一直失败就把这条发我")
-        if n("fields"):
-            reasons.append("有已结算的持仓缺字段，没法领取：把这条发我")
+        if n("fields"):  # (RDM-FIELDS-SILENT) a row without indexSet is judged before its market is read: not 已结算 for sure
+            reasons.append("有持仓缺字段，机器人领不了（见上，有的还分不出是否结算、输赢）：到 Predict 网站看一下，结算赢了的手动领取，并把这条发我")
         if n("unclear"):  # 1.150.0 (RDM-OPEN-SHAPES): never 结算后自动领取 for half an answer
             reasons.append("有持仓的市场 Predict 的结算读不出（见上），机器人不会去领、也不记成输：可先到 Predict 网站手动领取，并把这条发我")
         if fresh and auto and not first:  # (the gas, the switch: said above, these included)
@@ -5201,8 +5223,8 @@ class LiveBot(core.Bot):
     # 1.150.0 (audit RDM-NOTIFY-GATES): the notices only the owner can act on — send BNB to the signer, a redeem keeps failing —
     # are said whatever LIVE_NOTIFY says (it silences the orders' and fills' notices), and to the administrator's private chat
     # when no chat is subscribed (never /subscribe'd, /pause'd, suspended); each sendMessage tried up to LIVE_NOTE_TRIES times
-    LIVE_NOTE_MUST = frozenset({"redeem:gas", "redeem:fail"})
-    LIVE_NOTE_EVERY = {"redeem:gas": LIVE_REDEEM_NOTE_SECONDS}  # a key's own pace (the others: LIVE_NOTE_SECONDS)
+    LIVE_NOTE_MUST = frozenset({"redeem:gas", "redeem:fail", "redeem:fields"})  # (redeem:fields, RDM-FIELDS-SILENT: a winner the bot can never claim)
+    LIVE_NOTE_EVERY = {"redeem:gas": LIVE_REDEEM_NOTE_SECONDS, "redeem:fields": LIVE_REDEEM_NOTE_SECONDS}  # a key's own pace (the others: LIVE_NOTE_SECONDS)
     LIVE_NOTE_TRIES = 3
 
     def live_notify(self, text: str, key: str = "") -> bool:
