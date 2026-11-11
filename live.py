@@ -992,9 +992,28 @@ def rpc_error_text(error: Any) -> str:
     return core.brief_error(text, 120) + f"（合约错误 {selector}" + (f" {REVERT_ERRORS[selector]}" if selector in REVERT_ERRORS else "") + "）"
 
 
+class RpcRefused(core.RemoteError):
+    """The node was reached and ANSWERED with a JSON-RPC error object — unlike a request that failed on the way (a timeout,
+    an HTTP status, a body that is no JSON), after which nobody knows what the node did. Its text is the bot's usual
+    「RPC 错误：…」 (so every ``except core.RemoteError`` and every message reads as before); ``said`` is the node's own
+    message, uncut (1.150.0, audit RDM-UNSENT-AS-SENT: Chain.send tells a raw transaction the node refused from one whose
+    answer was lost)."""
+
+    def __init__(self, message: str, said: str = ""):
+        super().__init__(message)
+        self.said = said
+
+
+# The node's answers to eth_sendRawTransaction that mean it did NOT take the transaction (go-ethereum / BNB Chain's pool
+# errors): nothing was broadcast, nothing spent (1.150.0, audit RDM-UNSENT-AS-SENT). "already known" and "nonce too low"
+# are not here: the first is this very transaction already in the node, the second may be (Chain.send looks it up).
+TX_REFUSED = ("insufficient funds", "underpriced", "intrinsic gas too low", "exceeds block gas limit", "txpool is full")
+
+
 class TxNotSent(core.RemoteError):
     """A transaction that never left the bot: its nonce or gas price could not be read, or its gas not estimated (a
-    revert in simulation — a market Predict shows resolved before the chain does). Nothing spent: tried again soon."""
+    revert in simulation — a market Predict shows resolved before the chain does), or the node answered the raw
+    transaction with a refusal (TX_REFUSED: no funds for the gas, underpriced…). Nothing spent: tried again soon."""
 
 
 class TxPending(core.RemoteError):
@@ -1037,7 +1056,8 @@ class Chain:
             raise core.RemoteError(self.error) from None
         if isinstance(data, dict) and data.get("error"):
             self.error = f"RPC 错误：{rpc_error_text(data['error'])}"  # (RDM-REVERT-REASON-DROPPED) a custom error's selector kept
-            raise core.RemoteError(self.error)
+            said = data["error"].get("message") if isinstance(data["error"], dict) else data["error"]
+            raise RpcRefused(self.error, str(said or ""))  # (RDM-UNSENT-AS-SENT) the node answered: still a RemoteError
         self.error = ""
         return data.get("result") if isinstance(data, dict) else None
 
@@ -1086,13 +1106,37 @@ class Chain:
                 nonce = int(str(await self.rpc("eth_getTransactionCount", [sender, "pending"])), 16)
                 gas_price = int(str(await self.rpc("eth_gasPrice", [])), 16)
                 estimate = await self.rpc("eth_estimateGas", [{"from": sender, "to": to, "data": "0x" + data.hex(), "value": hex(value)}])
+                gas = int(str(estimate), 16) * 125 // 100
             except core.RemoteError as error:
                 raise TxNotSent(str(error), error.retry_after) from error  # nothing sent, nothing spent
-            gas = int(str(estimate), 16) * 125 // 100
+            except (TypeError, ValueError) as error:  # (RDM-UNSENT-AS-SENT) an answer that is no number (result: null): nothing sent either
+                raise TxNotSent(f"RPC 回答的不是数字（{core.brief_error(str(error), 80)}）") from error
             tx = {"chainId": self.wallet.chain_id, "nonce": nonce, "gasPrice": gas_price, "gas": gas, "to": to,
                   "value": value, "data": "0x" + data.hex()}
             raw = self.wallet.sign_transaction(tx)
-            return str(await self.rpc("eth_sendRawTransaction", ["0x" + raw.hex()]))
+            tx_hash = "0x" + _eth()[5].keccak(raw).hex()  # a transaction's hash is the keccak of its signed bytes
+            # 1.150.0 (audit RDM-UNSENT-AS-SENT): the node's ANSWER to the raw transaction is told from a lost one. A refusal
+            # (TX_REFUSED: no BNB for the gas, underpriced, a full pool) means it was never broadcast and cost nothing, yet it
+            # counted as a sent failure — an hour's wait (README promised 5 分钟后再试 for 交易没发出去的) also when the wallet
+            # was topped up minutes later. "already known": this very transaction is in the node — sent; its receipt decides.
+            # "nonce too low": its nonce is used — by this transaction (a request delivered twice) or by another (a stale
+            # pending-nonce read): one look-up by its hash says which. Anything else the node says, and a request that failed
+            # on the way (timeout, HTTP 429 / 5xx, no JSON: it may have been taken), stays a sent failure as before. Never a
+            # second eth_sendRawTransaction here: one transaction per call, the next round decides.
+            try:
+                answer = await self.rpc("eth_sendRawTransaction", ["0x" + raw.hex()])
+            except RpcRefused as error:
+                said = error.said.lower()
+                if "already known" in said or "known transaction" in said:
+                    return tx_hash
+                if "nonce too low" in said:
+                    if await self.rpc("eth_getTransactionByHash", [tx_hash]):  # (a failing read raises: unknown, an hour as before)
+                        return tx_hash
+                    raise TxNotSent(str(error), error.retry_after) from error
+                if any(word in said for word in TX_REFUSED):
+                    raise TxNotSent(str(error), error.retry_after) from error  # refused: nothing broadcast, nothing spent
+                raise
+            return str(answer) if answer else tx_hash  # (a node answering null: the hash of what it was given)
 
     async def wait(self, tx_hash: str, timeout: float = 120.0) -> dict:
         """The receipt once mined; RemoteError when it reverted or did not come in time."""
@@ -4333,6 +4377,7 @@ class LiveBot(core.Bot):
         # that did not come in time (TxPending) this round sends nothing more: the rest stay 可领取 — no back-off, no mark — for
         # the next round; the pending one keeps its hour (it may yet be mined: a second redeem would pay nothing).
         held = ""
+        gas_refused = ""  # (RDM-UNSENT-AS-SENT) the node refused a redeem for the gas this round: the rest are 可领取 under the ⛽ note
         market_of = lambda r: str((r.get("market") if isinstance(r.get("market"), dict) else {}).get("id") or r.get("marketId") or "")
         for row in sorted(rows, key=lambda r: (market_of(r) not in first, read_round.get(market_of(r), 0), -self.position_time(r))):
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
@@ -4432,6 +4477,15 @@ class LiveBot(core.Bot):
             try:
                 tx = await self.live.chain.redeem(info.condition_id, index_set, amount, info.neg_risk, info.yield_bearing)
             except Exception as error:
+                if isinstance(error, TxNotSent) and "insufficient funds" in str(error).lower():
+                    # 1.150.0 (audit RDM-UNSENT-AS-SENT): the node refused the transaction for its gas — the wallet's shortage,
+                    # not this position's failure (the 0.0005 floor is judged once a round, on a fixed figure: a round that
+                    # runs the wallet down, or a higher gas price, ends here). It and the rest of the round are 可领取 under the
+                    # ⛽ note with the address to fund — no back-off, no 没领成, no refused send per winner; the next round
+                    # tries again (after a top-up: at once). Nothing was broadcast, nothing spent.
+                    low_gas, gas_refused = True, core.clean_error(error)
+                    seen.append({**entry, "kind": "claimable"})
+                    continue
                 unsent = isinstance(error, TxNotSent)  # never left (1.131.3): soon again — the chain may be a moment behind Predict's result
                 wait = self.LIVE_REDEEM_UNSENT_RETRY_SECONDS if unsent else self.LIVE_REDEEM_RETRY_SECONDS
                 text = core.clean_error(error) or type(error).__name__
@@ -4473,7 +4527,8 @@ class LiveBot(core.Bot):
         claimable = [s for s in seen if s["kind"] == "claimable"]
         if low_gas and claimable and time.monotonic() - self.live_gas_noted >= self.LIVE_REDEEM_RETRY_SECONDS:
             self.live_gas_noted = time.monotonic()
-            text = (f"⛽ 签名钱包的 BNB 不足 0.0005，{len(claimable)} 个已结算的持仓（约 ${sum(s['value'] for s in claimable):,.2f}）等着领取：暂不自动领取。"
+            short = f"签名钱包的 BNB 不够付领取交易的 gas（节点拒收：{gas_refused}）" if gas_refused else "签名钱包的 BNB 不足 0.0005"  # (RDM-UNSENT-AS-SENT)
+            text = (f"⛽ {short}，{len(claimable)} 个已结算的持仓（约 ${sum(s['value'] for s in claimable):,.2f}）等着领取：暂不自动领取。"
                     f"往 {self.live.wallet.signer} 转一点 BNB（BNB 链）后自动恢复")
             self.live_note_error(text)
             self.live_notify(text, key="redeem:gas")  # 1.131.4: told on Telegram, not only in the log
@@ -4511,7 +4566,8 @@ class LiveBot(core.Bot):
         counts: dict[str, int] = {}
         for s in seen:
             counts[s["kind"]] = counts.get(s["kind"], 0) + 1
-        self.live_redeem_last = {"at": now_ms, "counts": counts, "low_gas": low_gas, "error": "", "cut": cut, "limited": limited, "held": held}
+        self.live_redeem_last = {"at": now_ms, "counts": counts, "low_gas": low_gas, "error": "", "cut": cut, "limited": limited, "held": held,
+                                 "gas_refused": gas_refused}
         if not limited:
             self.live_redeem_whole_at = time.monotonic()  # (RDM-ROUND-VOID) a look no rate limit cut short: live_redeem_again's notice waits again
         return done, seen
@@ -4527,7 +4583,8 @@ class LiveBot(core.Bot):
         text = "，".join(f"{label} {counts[k]}" for k, label in cls.REDEEM_KINDS.items() if counts.get(k))
         cut = int(last.get("cut") or 0)  # 1.150.0 (RDM-POSITIONS-CUT): the counts are of the part read — said, so 输掉的 N reads for what it is
         return (f"持仓 {sum(counts.values())} 个" + (f"：{text}" if text else "")
-                + ("；签名钱包 BNB 不足，领取交易发不出去" if last.get("low_gas") and counts.get("claimable") else "")
+                + (("；签名钱包的 BNB 不够付领取交易的 gas（节点拒收），领取交易发不出去" if last.get("gas_refused")  # (RDM-UNSENT-AS-SENT)
+                    else "；签名钱包 BNB 不足，领取交易发不出去") if last.get("low_gas") and counts.get("claimable") else "")
                 + ("；一笔领取交易没在时限内上链，这一轮其余的先不发" if last.get("held") and counts.get("claimable") else "")  # (RDM-ROUND-LOCK-STALL)
                 + (f"；⚠️ 持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查" if cut else ""))
 
@@ -4611,8 +4668,12 @@ class LiveBot(core.Bot):
         low = bnb is not None and bnb < self.LIVE_REDEEM_MIN_BNB_WEI
         waiting = [s for s in seen if s["kind"] == "waiting"]
         reasons = []  # the gas first: without it neither the automatic round nor /live redeem can send anything
+        refused = str((getattr(self, "live_redeem_last", {}) or {}).get("gas_refused") or "")
         if (n("claimable") or waiting) and low:
             reasons.append(f"签名钱包的 BNB 不够付 gas，领取交易发不出去：往 {wallet.signer} 转一点 BNB（BNB 链，比如 0.005），到账后下一轮自动领取")
+        elif (n("claimable") or waiting) and refused:  # (RDM-UNSENT-AS-SENT) over the floor, yet the node refused the last round's redeem for its gas
+            reasons.append(f"上一轮节点以 gas 不够拒收了领取交易（{refused}）：签名钱包的 BNB 不够付领取交易的 gas，"
+                           f"往 {wallet.signer} 转一点 BNB（BNB 链，比如 0.005），到账后下一轮自动领取")
         if n("claimable") and not c.live_auto_redeem:
             reasons.append(f"自动领取关着，{n('claimable')} 个可领取（约 ${value:,.2f}）不会自己领：控制台“高级”里打开“自动领取已结算持仓”，或发 /live redeem 手动领")
         if reasons:

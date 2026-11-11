@@ -788,4 +788,123 @@ async def revert_reason():
 asyncio.run(revert_reason())
 
 
+# --- RDM-UNSENT-AS-SENT ---------------------------------------------------------------------------------------------------------
+def keccak_of(raw_hex: str) -> str:
+    """The hash a node gives a raw transaction: keccak of its signed bytes."""
+    return "0x" + L._eth()[5].keccak(bytes.fromhex(raw_hex.removeprefix("0x"))).hex()
+
+
+def node_for(**over):
+    """A healthy node for the REAL Chain: reads answered, every raw transaction taken (its hash) and mined at once."""
+    answers = dict(eth_getTransactionCount="0x1", eth_gasPrice="0x3b9aca00", eth_estimateGas="0x30d40", eth_getBalance=hex(10 ** 17),
+                   eth_call="0x" + "0" * 64, eth_sendRawTransaction=lambda params: keccak_of(params[0]),
+                   eth_getTransactionReceipt={"blockNumber": "0x10", "status": "0x1", "logs": []}, eth_getTransactionByHash=None)
+    answers.update(over)
+    return RpcNode(**answers)
+
+
+def refusal(message):
+    return {"error": {"code": -32000, "message": message}}
+
+
+async def unsent_as_sent():
+    """RDM-UNSENT-AS-SENT: Chain.send turned only its three reads into TxNotSent; the node's ANSWER refusing the raw
+    transaction (insufficient funds, underpriced, a full pool…) — nothing broadcast, nothing spent — was a plain RemoteError,
+    i.e. a sent failure: an hour's wait and 一小时后自动再试, also when the wallet was topped up minutes later. A refusal is now
+    TxNotSent (five minutes); "already known" is this very transaction (sent), "nonce too low" is looked up by its hash; a
+    request that failed on the way stays a sent failure (it may have been taken); never a second raw transaction in one call.
+    A refusal for the gas makes the round's winners 可领取 under the ⛽ note, not one refused send and 没领成 per winner."""
+    chain = L.Chain("https://rpc.invalid", L.Wallet(KEY, 56, PA))
+    tokens = L.ADDRESSES[56]["CONDITIONAL_TOKENS"]
+
+    async def send(node):
+        with node:
+            try:
+                return await chain.send(tokens, b"\xaa\xbb")
+            finally:
+                assert node.methods().count("eth_sendRawTransaction") == 1, ("one raw transaction per call", node.methods())
+
+    for said in ("insufficient funds for gas * price + value: balance 1, tx cost 2, overshot 1", "replacement transaction underpriced",
+                 "transaction underpriced: tip needed 1, tip permitted 0", "intrinsic gas too low", "txpool is full"):
+        try:
+            await send(node_for(eth_sendRawTransaction=refusal(said)))
+            assert False, said
+        except L.TxNotSent as error:  # (before: a plain RemoteError — the hour)
+            assert str(error) == f"RPC 错误：{said}", str(error)
+    # "already known": this very transaction is in the node — sent; its hash is the keccak of the signed bytes
+    node = node_for(eth_sendRawTransaction=refusal("already known"))
+    tx = await send(node)
+    raw = next(params[0] for method, params in node.log if method == "eth_sendRawTransaction")
+    assert tx == keccak_of(raw), tx
+    # "nonce too low": looked up by its hash — this transaction (taken: sent) or another one (never left: TxNotSent)
+    node = node_for(eth_sendRawTransaction=refusal("nonce too low: next nonce 6, tx nonce 5"), eth_getTransactionByHash={"hash": "0x…"})
+    assert await send(node) == keccak_of(next(p[0] for meth, p in node.log if meth == "eth_sendRawTransaction"))
+    assert node.methods()[-1] == "eth_getTransactionByHash" and node.log[-1][1] == [keccak_of(next(p[0] for meth, p in node.log if meth == "eth_sendRawTransaction"))]
+    try:
+        await send(node_for(eth_sendRawTransaction=refusal("nonce too low: next nonce 6, tx nonce 5")))
+        assert False
+    except L.TxNotSent as error:
+        assert "nonce too low" in str(error)
+    # unchanged: a request that failed on the way (it may have been taken) and an answer not known to be a refusal — sent failures
+    for answer in (m.RemoteError("网络错误 (TimeoutError: timed out)"), m.RemoteError("HTTP 503: Service Unavailable"), b"<html>bad gateway</html>",
+                   refusal("internal error")):
+        try:
+            await send(node_for(eth_sendRawTransaction=answer))
+            assert False, answer
+        except m.RemoteError as error:
+            assert not isinstance(error, L.TxNotSent), (answer, error)
+    assert (await send(node_for(eth_sendRawTransaction="0x" + "ab" * 32))) == "0x" + "ab" * 32  # the node's answer, as before
+    node = node_for(eth_sendRawTransaction=None)  # a node answering null: the hash of what it was given (before: "None")
+    assert await send(node) == keccak_of(next(p[0] for meth, p in node.log if meth == "eth_sendRawTransaction"))
+    for read in ("eth_getTransactionCount", "eth_estimateGas"):  # a read answering null: nothing sent (before: ValueError — the hour)
+        with node_for(**{read: None}) as node:
+            try:
+                await chain.send(tokens, b"\xaa\xbb")
+                assert False
+            except L.TxNotSent:
+                assert "eth_sendRawTransaction" not in node.methods()
+
+    # the round: the node refuses the first redeem for its gas (the wallet over the 0.0005 floor, but short at this gas price)
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows = [held(mid) for mid in (601, 602, 603)]
+    fake.markets.update({str(mid): mk(mid, won=1) for mid in (601, 602, 603)})
+    bot.live.chain = L.Chain("https://rpc.invalid", bot.live.wallet)
+    sent = notices(bot)
+    dry = refusal("insufficient funds for gas * price + value: balance 600000000000000, tx cost 750000000000000, overshot 150000000000000")
+    with node_for(eth_sendRawTransaction=dry) as node:
+        assert await bot.live_redeem(NOW) == []
+    assert node.methods().count("eth_sendRawTransaction") == 1, ("one refused send, not one per winner", node.methods())
+    last = bot.live_redeem_last
+    assert last["counts"] == {"claimable": 3} and last["low_gas"] and bot.live_redeem_failed == {}, (last, bot.live_redeem_failed)
+    assert not any(bot.store.get(f"live:redeemed:{mid}:1") for mid in (601, 602, 603)), "no mark"
+    assert [k for k, _ in sent] == ["redeem:gas"] and "节点拒收" in sent[0][1] and bot.live.wallet.signer in sent[0][1], sent  # not 没领成…一小时后
+    assert "不够付领取交易的 gas（节点拒收）" in bot.live_redeem_summary(last), bot.live_redeem_summary(last)
+    with node_for() as node:
+        report = await bot.live_redeem_report(NOW + MIN)
+    assert "结论：上一轮节点以 gas 不够拒收了领取交易" in report and bot.live.wallet.signer in report, report
+    with node_for() as node:  # topped up: the next round redeems all three, at once (no hour)
+        done = await bot.live_redeem(NOW + 10 * MIN)
+    assert len(done) == 3 and node.methods().count("eth_sendRawTransaction") == 3, (done, bot.live_redeem_last)
+    # a stale pending-nonce read (another transaction took the nonce): never left — five minutes, not an hour
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["604"] = [held(604)], mk(604, won=1)
+    bot.live.chain = L.Chain("https://rpc.invalid", bot.live.wallet)
+    sent = notices(bot)
+    with node_for(eth_sendRawTransaction=refusal("nonce too low: next nonce 6, tx nonce 5")):
+        assert await bot.live_redeem(NOW) == []
+    assert bot.live_redeem_last["counts"] == {"failed": 1} and bot.live_errors[-1].endswith("（交易没发出，5 分钟后再试）"), bot.live_errors[-1:]
+    left = bot.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - bot.live_redeem_failed["live:redeemed:604:1"])
+    assert left <= bot.LIVE_REDEEM_UNSENT_RETRY_SECONDS, left
+    assert [k for k, _ in sent] == ["redeem:fail"] and "5 分钟后自动再试" in sent[0][1] and bot.store.get("live:redeemed:604:1") is None, sent
+    bot.live_redeem_failed.clear()  # (the five minutes over)
+    with node_for():
+        assert len(await bot.live_redeem(NOW + 6 * MIN)) == 1
+    print("RDM_UNSENT_AS_SENT_OK")
+
+
+asyncio.run(unsent_as_sent())
+
+
 print("AUDIT_REDEEM_OK")
