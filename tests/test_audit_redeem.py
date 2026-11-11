@@ -554,4 +554,83 @@ async def row_abort():
 asyncio.run(row_abort())
 
 
+# --- RDM-OPEN-SHAPES ------------------------------------------------------------------------------------------------------------
+async def open_shapes():
+    """RDM-OPEN-SHAPES: a position is redeemed (or written off) only when the market says both — the settled status word and a
+    winner it can read — and that stays: a named result without the settled word may still be a proposal (a redeem then can be
+    mined for nothing; never a lost mark on less than settled). But half an answer read 未结算 for ever: the check said
+    结算后自动领取 beside 市场状态 RESOLVED, nothing was pushed. It is now its own kind, 结算读不出, with the missing half named,
+    and told on Telegram once it has stood half an hour (six hours for a named result without the settled word), an hour apart.
+    Nothing is sent and nothing written for it."""
+    def advance(bot, seconds):
+        """``seconds`` pass for the unclear positions' clocks (the round that first met each)."""
+        for k in bot.live_redeem_unclear:
+            bot.live_redeem_unclear[k] -= seconds
+
+    # (1) RESOLVED, no winner readable (outcomes without a status, no resolution object)
+    bot = await ready_bot()
+    fake, chain = bot.live.api, bot.live.chain
+    fake.markets["101"] = {**market_json("101", status="RESOLVED"), "conditionId": cond(101)}
+    fake.positions_rows = [held(101, 1), held(101, 2)]
+    sent = notices(bot)
+    await bot.live_redeem(NOW)
+    assert bot.live_redeem_last["counts"] == {"unclear": 2}, bot.live_redeem_last  # (before: {"open": 2})
+    assert chain.redeemed == [] and not any(bot.store.get(f"live:redeemed:101:{i}") for i in (1, 2)), "nothing sent, nothing written"
+    assert bot.live_redeem_summary(bot.live_redeem_last) == "持仓 2 个：结算读不出 2"
+    report = await bot.live_redeem_report(NOW + MIN)
+    assert "Predict 的结算读不出（机器人不会去领）：" in report and "Predict 写了已结算，但读不出哪一边赢（市场状态 RESOLVED）" in report, report
+    assert "结算后自动领取" not in report and "赢的都领完了" not in report and "结论：有持仓的市场 Predict 的结算读不出" in report, report
+    for _ in range(2):  # ten, twenty minutes on: not yet
+        advance(bot, 600)
+        await bot.live_redeem(NOW + MIN)
+    assert sent == [], sent
+    advance(bot, 1200)  # forty minutes
+    await bot.live_redeem(NOW + 40 * MIN)
+    assert [k for k, _ in sent] == ["redeem:unclear"] and "2 个持仓 Predict 的结算读不出（window 101：Predict 写了已结算，但读不出哪一边赢，市场状态 RESOLVED）" in sent[0][1], sent
+    assert "不会去领、也不记成输" in sent[0][1] and "结算读不出" in bot.live_errors[-1], sent
+    advance(bot, 600)
+    await bot.live_redeem(NOW + 50 * MIN)
+    assert len(sent) == 1, "an hour apart"
+    # ...the winner readable later: redeemed once, the loser written off, nothing left remembered
+    fake.markets["101"]["outcomes"] = [{**o, "status": "WON" if o["indexSet"] == 2 else "LOST"} for o in fake.markets["101"]["outcomes"]]
+    done = await bot.live_redeem(NOW + 60 * MIN)
+    assert len(done) == 1 and [(cid, i) for cid, i, *_ in chain.redeemed] == [(cond(101), 2)] and bot.store.get("live:redeemed:101:1")["lost"] is True
+    assert bot.live_redeem_unclear == {}, bot.live_redeem_unclear
+    # (2) a named result without the settled word (CLOSED; a proposal looks so): not redeemed, the other side NOT written off
+    bot = await ready_bot()
+    fake, chain = bot.live.api, bot.live.chain
+    fake.markets["201"] = mk(201, won=2, status="CLOSED")
+    fake.positions_rows = [held(201, 1), held(201, 2)]
+    sent = notices(bot)
+    await bot.live_redeem(NOW)
+    assert bot.live_redeem_last["counts"] == {"unclear": 2} and chain.redeemed == [], bot.live_redeem_last
+    assert bot.store.get("live:redeemed:201:1") is None and bot.store.get("live:redeemed:201:2") is None, "no lost mark on less than settled"
+    report = await bot.live_redeem_report(NOW + MIN)
+    assert "Predict 写了结果（Down），但市场状态不是已结算（市场状态 CLOSED）" in report, report
+    advance(bot, 40 * 60)
+    await bot.live_redeem(NOW + 40 * MIN)
+    assert sent == [], ("a proposal may stand for hours: not yet", sent)
+    advance(bot, 6 * 3600)
+    await bot.live_redeem(NOW + 7 * 60 * MIN)
+    assert [k for k, _ in sent] == ["redeem:unclear"] and "Predict 写了结果（Down），但市场状态不是已结算" in sent[0][1], sent
+    # (3) guards: the documented settled shape as before; a market still open stays 未结算 and is never told
+    bot = await ready_bot()
+    fake, chain = bot.live.api, bot.live.chain
+    fake.markets.update({"301": mk(301, won=2), "302": mk(302)})
+    fake.positions_rows = [held(301, 1), held(301, 2), held(302, 1), held(302, 2)]
+    sent = notices(bot)
+    done = await bot.live_redeem(NOW)
+    assert len(done) == 1 and bot.live_redeem_last["counts"] == {"redeemed": 1, "lost": 1, "open": 2}, bot.live_redeem_last
+    assert bot.store.get("live:redeemed:301:1")["lost"] is True and bot.store.get("live:redeemed:301:2")["tx"] == "0xredeem"
+    fake.positions_rows = [row for row in fake.positions_rows if row["id"] != "p301:2"]  # (redeemed: Predict lists it no more)
+    report = await bot.live_redeem_report(NOW + MIN)
+    assert "结论：现在没有可领取的：赢的都领完了，剩下的还没结算，结算后自动领取" in report and "结算读不出" not in report, report
+    await bot.live_redeem(NOW + 7 * 60 * MIN)
+    assert [k for k, _ in sent] == [""] and bot.live_redeem_unclear == {}, sent  # the 💵 line alone
+    print("RDM_OPEN_SHAPES_OK")
+
+
+asyncio.run(open_shapes())
+
+
 print("AUDIT_REDEEM_OK")

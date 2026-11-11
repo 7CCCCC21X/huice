@@ -1435,6 +1435,8 @@ class LiveBot(core.Bot):
     #                                  the next one this long after the key's cooldown ends, not LIVE_REDEEM_SECONDS on (live_redeem_again, 1.150.0)...
     LIVE_REDEEM_AGAIN_MAX = 3        # ...this many times in a row, the wait doubling (30, 60, 120 s); then the usual cadence again
     LIVE_REDEEM_STUCK_SECONDS = 1800  # no round has looked at the positions for this long: told on Telegram (key redeem:read), not only in /live
+    LIVE_REDEEM_UNCLEAR_SECONDS = 1800  # a position whose market Predict calls settled with no winner readable, this long so: told (redeem:unclear);
+    #                                     a named result without the settled word (it may be a proposal still) twelve times this long (1.150.0)
     LIVE_REDEEM_NOTE_SECONDS = 3600  # a failed redeem reaches Telegram at most this often
     REDEEM_REPORT_LINES = 6          # /live redeem check: the positions listed per kind (the rest counted)
     REDEEM_CHECK_WAIT_SECONDS = 60   # /live redeem check waits this long at most for a round that holds the redeem lock, then answers without its dry run (1.150.0)
@@ -1495,6 +1497,8 @@ class LiveBot(core.Bot):
         self.live_redeem_since = 0        # when the redeem pass holding the lock began (bot clock, ms; 0: none) — /live and the check (1.150.0)
         self.live_redeem_cut = 0          # the last redeem pass's own positions read: 0 = whole, else the rows it read of a longer list (1.150.0)
         self.live_cut_noted = -1e9        # ...and when such a cut list was last told on Telegram (an hour apart, as the gas)
+        self.live_redeem_unclear: dict[str, float] = {}  # "<market>:<index set>" -> when a round first met its settlement unreadable (1.150.0)
+        self.live_unclear_noted = -1e9    # ...and when such positions were last told on Telegram (an hour apart)
         self.live_step_ms: dict[str, int] = {}  # the last step's phases (预取 / 决策 / 下单 / 同步), for /diag
         self.live_fill_tasks: set = set()   # the fills reads of orders confirmed removed, beside the lane (live_fills_later)
         self.live_placing: set[str] = set()     # records whose order is being sent right now: the step and the express lane never both
@@ -4180,7 +4184,7 @@ class LiveBot(core.Bot):
 
     # --- redeeming resolved positions -------------------------------------------------------------------------------------
     REDEEM_KINDS = {"redeemed": "领了", "claimable": "可领取", "failed": "领取失败", "waiting": "失败等重试", "fields": "缺字段",
-                    "kept": "已领仍列着", "open": "未结算", "lost": "输掉的", "unread": "没读到市场"}
+                    "unclear": "结算读不出", "kept": "已领仍列着", "open": "未结算", "lost": "输掉的", "unread": "没读到市场"}
 
     def redeem_lock(self) -> asyncio.Lock:
         lock = getattr(self, "live_redeem_lock", None)
@@ -4346,8 +4350,19 @@ class LiveBot(core.Bot):
             except Exception as error:
                 seen.append({**entry, "kind": "fields", "error": f"市场详情读不懂（{core.clean_error(error) or type(error).__name__}），判断不了输赢"})
                 continue
-            if not core.PredictFeed.market_settled({"status": info.status}) or resolved is None:
-                seen.append({**entry, "kind": "open", "status": info.status or "?"})
+            settled = core.PredictFeed.market_settled({"status": info.status})
+            if not settled or resolved is None:
+                # 1.150.0 (audit RDM-OPEN-SHAPES): both signals must say "over" before anything is sent or written — the settled
+                # status word and a readable winner — and that stays: a named result without the settled word may still be a
+                # proposal (a redeem then could be mined for nothing if it flips; never a lost mark on less than settled). But half
+                # an answer read 未结算 for ever, with 结算后自动领取 in the check and nothing said: now its own kind with the
+                # missing half named, and told on Telegram once it has stood so (live_redeem_unclear, below). Neither half: 未结算.
+                if settled or resolved is not None:
+                    why = ("Predict 写了已结算，但读不出哪一边赢" if settled
+                           else f"Predict 写了结果（{resolved.get('name') or '?'}），但市场状态不是已结算")
+                    seen.append({**entry, "kind": "unclear", "status": info.status or "?", "error": why, "settled": settled})
+                else:
+                    seen.append({**entry, "kind": "open", "status": info.status or "?"})
                 continue
             won = resolved.get("split") or (resolved.get("index") is not None and index_set == int(resolved["index"]) + 1)
             if not won:
@@ -4424,6 +4439,23 @@ class LiveBot(core.Bot):
                     "先到 Predict 网站核对、手动领取。/live redeem check 查看")
             self.live_note_error(text)
             self.live_notify(text, key="redeem:cut")
+        # (RDM-OPEN-SHAPES) a settlement read half: remembered from the round that first met it while it stays so (or unread), told
+        # once it has stood LIVE_REDEEM_UNCLEAR_SECONDS — twelve times that for a named result without the settled word, which a
+        # proposal still in its dispute window looks like — an hour apart on its own timer. Nothing is sent or written for it.
+        unclear_since = self.__dict__.setdefault("live_redeem_unclear", {})
+        kinds = {f"{s['market_id']}:{s['index_set']}": s["kind"] for s in seen}
+        for gone in [k for k in unclear_since if kinds.get(k) not in ("unclear", "unread")]:
+            del unclear_since[gone]
+        stood = [s for s in seen if s["kind"] == "unclear"
+                 and time.monotonic() - unclear_since.setdefault(f"{s['market_id']}:{s['index_set']}", time.monotonic())
+                 >= self.LIVE_REDEEM_UNCLEAR_SECONDS * (1 if s.get("settled") else 12)]
+        if stood and time.monotonic() - getattr(self, "live_unclear_noted", -1e9) >= self.LIVE_REDEEM_NOTE_SECONDS:
+            self.live_unclear_noted = time.monotonic()
+            s = stood[0]
+            text = (f"⚠️ 自动领取：{len(stood)} 个持仓 Predict 的结算读不出（{s['title']}：{s['error']}，市场状态 {s['status']}），"
+                    "机器人不会去领、也不记成输：先到 Predict 网站手动领取，并把 /live redeem check 的回答发我")
+            self.live_note_error(text)
+            self.live_notify(text, key="redeem:unclear")
         counts: dict[str, int] = {}
         for s in seen:
             counts[s["kind"]] = counts.get(s["kind"], 0) + 1
@@ -4509,7 +4541,8 @@ class LiveBot(core.Bot):
         lines.append(f"持仓 {len(seen)} 个：" + ("，".join(f"{label} {n(k)}" for k, label in self.REDEEM_KINDS.items() if n(k)) or "没有")
                      + (f"（⚠️ 持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查）" if cut else ""))
         listed = {"claimable": ("可领取", self.REDEEM_REPORT_LINES), "waiting": ("领取失败、等重试", self.REDEEM_REPORT_LINES),
-                  "fields": ("缺字段", self.REDEEM_REPORT_LINES), "kept": ("已发过领取交易、Predict 还列着", 3), "open": ("未结算", 3), "unread": ("这次没读到市场", 2)}
+                  "fields": ("缺字段", self.REDEEM_REPORT_LINES), "unclear": ("Predict 的结算读不出（机器人不会去领）", self.REDEEM_REPORT_LINES),
+                  "kept": ("已发过领取交易、Predict 还列着", 3), "open": ("未结算", 3), "unread": ("这次没读到市场", 2)}
         for kind, (label, cap) in listed.items():
             items = [s for s in seen if s["kind"] == kind]
             if not items:
@@ -4518,8 +4551,8 @@ class LiveBot(core.Bot):
             for s in items[:cap]:
                 extra = {"claimable": f"，约 ${float(s.get('value') or 0):,.2f}",
                          "waiting": f"：{s.get('error') or '?'}（{max(1, int(float(s.get('left') or 0) / 60))} 分钟后再试）",
-                         "fields": f"：{s.get('error')}", "kept": f"（交易 {s.get('tx', '')[:14]}…）",
-                         "open": f"（市场状态 {s.get('status')}）", "unread": f"：{s.get('error')}"}[kind]
+                         "fields": f"：{s.get('error')}", "unclear": f"：{s.get('error')}（市场状态 {s.get('status')}）",
+                         "kept": f"（交易 {s.get('tx', '')[:14]}…）", "open": f"（市场状态 {s.get('status')}）", "unread": f"：{s.get('error')}"}[kind]
                 lines.append(f"  · {s['title']} / {s['outcome']} {s['shares']:g} 份{extra}")
             if len(items) > cap:
                 lines.append(f"  …另有 {len(items) - cap} 个")
@@ -4538,6 +4571,8 @@ class LiveBot(core.Bot):
             why = "有持仓已经发过领取交易并上链，Predict 还列着：可能只是列表没更新；过 10 分钟还在，就把这条发我"
         elif n("fields"):
             why = "有已结算的持仓缺字段，没法领取：把这条发我"
+        elif n("unclear"):  # 1.150.0 (RDM-OPEN-SHAPES): never 结算后自动领取 for half an answer
+            why = "有持仓的市场 Predict 的结算读不出（见上），机器人不会去领、也不记成输：可先到 Predict 网站手动领取，并把这条发我"
         elif n("claimable"):
             why = f"有 {n('claimable')} 个可领取（约 ${value:,.2f}），下一轮自动领取会领；急用就发 /live redeem"
         elif n("unread"):
