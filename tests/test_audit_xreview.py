@@ -966,4 +966,168 @@ async def place_success_after_end():
 
 
 asyncio.run(place_success_after_end())
+
+
+async def unknown_takes_latefill():
+    """XR-UNKNOWN-TAKES-LATEFILL: maker A (55¢) withdrawn by the express lane, Predict confirms the cancel; 30 shares matched as it
+    landed, but A's own record keeps showing 0 (it lags). The slot's next maker B's POST never reaches Predict and its answer is
+    lost: placing, then unknown after the grace — no order id, its hash unknown to Predict. The account holds 30 at 55¢.
+    LIVE-LATEFILL-ACTIVE's hold (live_late_unread) waited on B (状态未知) every minute, so B's release by the positions
+    (live_recheck → live_unexplained) booked the 30 onto the order that never existed, at its limit; once A's record showed its 30
+    and a further 10 landed there, A was read again and booked them too: 60 recorded, 40 held, for good. An unknown record without
+    an id whose hash Predict says it does not know no longer holds the pass: the position's price names A (as in 1.149.0), B ends
+    unfilled. Still held: an unknown record with an id (it reached Predict), and one without an id whose hash read has only ever
+    failed (XR-409-HASH-ERROR: Predict never answered — it may hold the order and its fill)."""
+    WEI = T["WEI"]
+    slot = f"{HSI_SLUG}|up|挂"
+    held = lambda n: [{"id": "p1", "market": {"id": 101}, "outcome": {"name": "Up", "indexSet": 1, "onChainId": "1011"},
+                       "amount": str(int(n * WEI)), "avgPrice": "0.55"}]
+    card = lambda fair, at: hsi(fair, [("0.55", "300")], [("0.58", "400")], at)
+    on_up = lambda bot: sorted((str(t["live"].get("order_id") or ""), float(t.get("shares") or 0)) for t in bot.sim_trades().values()
+                               if isinstance(t.get("live"), dict) and t["side"] == "up" and float(t.get("shares") or 0) > 0)
+
+    # (a) the record that never reached Predict does not take the ended order's late fill
+    bot = make_bot(SIM_WAYS="maker", SIM_MAKER_EXIT_CENTS="5")
+    await bot.live_prepare()
+    fake = bot.live.api
+    world["markets"] = [card(0.70, NOW)]
+    await bot.live_prefetch(NOW)
+    await step(bot, NOW, card(0.70, NOW))
+    a = bot.sim_trades()[slot]
+    a_oid = a["live"]["order_id"]
+    lag = {"on": True}
+    real_order, real_orders, real_create = fake.order, fake.orders, fake.create_order
+
+    async def lagging(oid, hash_=""):  # A's own record: 0 filled although 30 matched
+        row = await real_order(oid, hash_)
+        return {**row, "amountFilled": "0"} if lag["on"] and row is not None and str(row.get("id")) == a_oid else row
+
+    async def hiding(status="OPEN", **params):  # the list read just before the removal shows A with 0 filled too
+        return [{**r, "amountFilled": "0"} if str(r.get("id")) == a_oid else r for r in await real_orders(status, **params)]
+    lost = []
+
+    async def create(body):  # the next order on 涨 (B) never reaches Predict; its answer is lost (the HTTP layer's timeout)
+        if not lost and str(body["data"]["order"]["tokenId"]) == "1011":
+            lost.append(body["data"]["order"]["hash"])
+            raise m._net_error(TimeoutError("timed out"))
+        return await real_create(body)
+    fake.order, fake.orders, fake.create_order = lagging, hiding, create
+    t1 = NOW + 5_000
+    fake.open[a_oid]["amountFilled"] = str(30 * WEI)
+    fake.positions_rows = held(30)
+    bot.market.now, world["markets"] = t1, [card(0.40, t1)]  # the edge gone: A withdrawn by the express lane, the cancel confirmed
+    await bot.sim_express("HSI")
+    await bot.live_fills_wait()
+    fake.orders = real_orders
+    assert a["live"]["state"] == "done" and float(a["shares"]) == 0, (a["live"]["state"], a["shares"])
+    t2 = t1 + 2_000
+    await step(bot, t2, card(0.70, t2))  # the slot quoted again: B's POST lost
+    b = bot.sim_trades()[slot]
+    assert b is not a and b["live"]["state"] == "placing" and b["live"].get("hash") and not b["live"].get("order_id"), b["live"]
+    for k in range(1, 33):  # eight minutes of steps, A's record still lagging: B goes unknown (no order id), then is released
+        at = t2 + k * 15_000
+        await step(bot, at, card(0.70, at))
+        await bot.live_fills_wait()
+    assert any("状态未知" in e["what"] for e in b["live"]["events"]), [e["what"] for e in b["live"]["events"]]
+    assert b["live"]["state"] == "done" and float(b["shares"]) == 0, ("the order that never reached Predict took the fill", b["status"], b["shares"],
+                                                                      [e["what"] for e in b["live"]["events"]][-2:])
+    assert float(a["shares"]) == 30 and (a["live"].get("adopted") or {}).get("by", "").startswith("按 Predict 持仓均价"), (a["shares"], a["live"].get("adopted"))
+    assert on_up(bot) == [(a_oid, 30.0)], on_up(bot)
+    assert b["live"].get("hash_not_found") and not b["live"].get("order_id"), b["live"]  # "no such order" by its hash: it held nothing
+    # later: A's own record shows its 30, and a further 10 land on the outcome unrecorded: the next check reads A again — counted once
+    lag["on"] = False
+    fake.closed[a_oid]["amountFilled"] = str(30 * WEI)
+    fake.positions_rows = held(40)
+    t3 = t2 + 33 * 15_000
+    for k in range(6):
+        at = t3 + k * 15_000
+        await step(bot, at, card(0.70, at))
+        await bot.live_fills_wait()
+    assert sum(sh for _, sh in on_up(bot)) == 40, ("recorded vs held 40", on_up(bot))
+
+    async def requoted():  # maker A (55¢) withdrawn by a rule with nothing filled, the slot quoted again: B
+        bot = make_bot(SIM_WAYS="maker")
+        await bot.live_prepare()
+        world["markets"] = [card(0.70, NOW)]
+        await bot.live_prefetch(NOW)
+        await step(bot, NOW, card(0.70, NOW))
+        a = bot.sim_trades()[slot]
+        bot.market.now = NOW + 5_000
+        bot.sim_withdraw(a, "test: 买1 moved", NOW + 5_000)
+        a["withdrawn"]["rule"] = True
+        bot.sim_save([(slot, a)])
+        await bot.live_cancel_blind({slot: a}, NOW + 5_000)
+        await bot.live_fills_wait()
+        assert a["live"]["state"] == "done" and float(a["shares"]) == 0 and a["status"] == "cancelled", (a["live"]["state"], a["shares"])
+        return bot, bot.live.api, a
+
+    # (b) an unknown record WITH an order id (it reached Predict) still holds the check (LIVE-LATEFILL-ACTIVE): found again with its
+    # 50, the 50 are its own — not booked onto the ended order as well
+    bot, fake, a = await requoted()
+    await step(bot, NOW + 10_000, card(0.70, NOW + 10_000))
+    b = bot.sim_trades()[slot]
+    b_oid = b["live"]["order_id"]
+    assert b is not a and b_oid and b_oid != a["live"]["order_id"] and b["live"]["state"] == "open", b["live"]
+    gone = fake.open.pop(b_oid)
+    real_order, real_remove = fake.order, fake.remove_orders
+
+    async def none(oid, hash_=""): return None
+    async def noop(ids): return {"removed": [], "noop": list(ids)}
+    fake.order, fake.remove_orders = none, noop
+    for at in (NOW + 20_000, NOW + 30_000, NOW + 40_000, NOW + 75_000, NOW + 80_000):
+        await step(bot, at, card(0.70, at))
+    assert b["live"]["state"] == "unknown" and b["live"].get("order_id") == b_oid, b["live"]["state"]
+    fake.positions_rows = held(50)
+    bot.live_late_checked = -1e9
+    await step(bot, NOW + 85_000, card(0.70, NOW + 85_000))
+    assert float(a["shares"]) == 0 and not a["live"].get("adopted"), ("held while B (with an id) is unknown", a["shares"], a["live"].get("adopted"))
+    gone["amountFilled"] = str(50 * WEI)
+    fake.open[b_oid] = gone
+    fake.order, fake.remove_orders = real_order, real_remove
+    await step(bot, NOW + 90_000, card(0.70, NOW + 90_000))
+    assert on_up(bot) == [(b_oid, 50.0)], on_up(bot)
+
+    # (c) an unknown record WITHOUT an id whose hash read has only ever failed (XR-409-HASH-ERROR) still holds it: Predict never
+    # answered — it may hold the order and its fill. Here it does: B reached Predict and filled at once (never on the open list), its
+    # answer lost, the read by its hash failing for minutes. A, ended at the same price with room, does not take B's 100 by the
+    # position's price; once B's read works, the 100 are B's own — counted once
+    bot, fake, a = await requoted()
+    real_create, real_order, taken = fake.create_order, fake.order, []
+
+    async def taken_lost(body):
+        got = await real_create(body)
+        if not taken and str(body["data"]["order"]["tokenId"]) == "1011":
+            taken.append(body["data"]["order"]["hash"])
+            fake.fill(got["order_id"], 100, done=True)
+            raise m._net_error(TimeoutError("timed out"))
+        return got
+
+    async def failing(oid, hash_=""):
+        if taken and hash_ == taken[0]:
+            raise m.RemoteError("HTTP 500: internal error")
+        return await real_order(oid, hash_)
+    fake.create_order, fake.order = taken_lost, failing
+    await step(bot, NOW + 10_000, card(0.70, NOW + 10_000))
+    b = bot.sim_trades()[slot]
+    assert b is not a and b["live"]["state"] == "placing" and b["live"].get("hash") == taken[0] and not b["live"].get("order_id"), b["live"]
+    fake.positions_rows = held(100)
+    for k in range(1, 25):  # six minutes of steps, the read by B's hash failing: B goes unknown past the grace, no id, never released
+        at = NOW + 10_000 + k * 15_000
+        await step(bot, at, card(0.70, at))
+        await bot.live_fills_wait()
+    assert b["live"]["state"] == "unknown" and not b["live"].get("order_id") and not b["live"].get("hash_not_found"), b["live"]
+    assert float(a["shares"]) == 0 and not a["live"].get("adopted"), ("held while B's hash read fails", a["shares"], a["live"].get("adopted"))
+    fake.order = real_order  # the read by B's hash works again: found, FILLED 100
+    at = NOW + 10_000 + 25 * 15_000
+    await step(bot, at, card(0.70, at))
+    await bot.live_fills_wait()
+    b_oid = b["live"].get("order_id")
+    assert b["live"]["state"] == "done" and float(b["shares"]) == 100 and b_oid, (b["live"]["state"], b["shares"])
+    for k in range(1, 5):
+        await step(bot, at + k * 15_000, card(0.70, at + k * 15_000))
+        await bot.live_fills_wait()
+    assert on_up(bot) == [(b_oid, 100.0)], on_up(bot)
+
+
+asyncio.run(unknown_takes_latefill())
 print("AUDIT_XREVIEW_OK")

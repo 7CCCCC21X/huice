@@ -3465,9 +3465,10 @@ class LiveBot(core.Bot):
         show — "" when none (live_late_fills (a), 1.150.0). The orders resting there are read first, by their hash, as
         live_track reads them: a record Predict still shows open gets its fills. What still holds the outcome is a record
         whose fills cannot be known now: a cancel confirmed whose fills are read beside the step (fills_pending), a
-        placement or a cancel in flight, an order of unknown state, a resting order whose read failed, found it ended
-        (its end is the sync's to book) or that was withdrawn meanwhile. A record never sent, or ended and read, holds
-        nothing; nor does a resting order read here."""
+        placement or a cancel in flight, an order of unknown state (but not one Predict never gave an id and whose hash it
+        says it does not know: what that one filled is told from the positions alone, by its own release), a resting order
+        whose read failed, found it ended (its end is the sync's to book) or that was withdrawn meanwhile. A record never
+        sent, or ended and read, holds nothing; nor does a resting order read here."""
         read: set[str] = set()
         for tid, t in list(self.sim_trades().items()):
             st = t.get("live")
@@ -3490,6 +3491,21 @@ class LiveBot(core.Bot):
             state, name = st.get("state"), str(st.get("order_id") or st.get("hash") or "")
             if core.fills_pending(st):
                 return f"订单 #{name} 撤单已确认，撤单前的成交还没读回"
+            if state == "unknown" and not st.get("order_id") and st.get("hash_not_found"):
+                # 1.150.0 (audit XR-UNKNOWN-TAKES-LATEFILL): an order of unknown state Predict never gave an id (its answer lost: a
+                # timeout, a bare 409, a restart in flight), and whose hash Predict has since answered it does not know (live_recheck:
+                # hash_not_found), holds no fill a read could still bring: what it filled, if anything, is told from the account's
+                # positions alone, by its own release (live_recheck → live_unexplained), which books the outcome's whole surplus onto
+                # it at its limit. Waited on here as well, an ended order whose own record lagged the shares that matched as its
+                # cancel landed never got them: the release came first (the sync's orders are looked at before this pass, and the
+                # release does not wait for ended orders' unread fills), the order that never reached Predict took the shares, and
+                # once the ended order's record showed them and any new excess there had it read again, the same shares sat on two
+                # records for good (60 recorded, 40 held: exposure, the journal, the P&L and the daily loss stop — a win
+                # over-credited by shares × (1 − price) loosens it). Not waited on: the position's price or time names the ended
+                # order first, as before 1.150.0, and the release then finds no surplus. Still waited on: a placement in its grace,
+                # a cancel in flight, an unknown order with an id (it reached Predict), and one whose hash read has only ever failed
+                # (XR-409-HASH-ERROR: Predict has not answered — it may hold the order and its fill, still to be read)
+                continue
             if state in {"placing", "cancelling", "unknown"} and name:  # (never sent: no id, no hash — nothing to fill)
                 return f"订单 #{name} {'发送中' if state == 'placing' else '撤单中' if state == 'cancelling' else '状态未知'}，成交未定"
             if state == "open" and name not in read:
@@ -3851,6 +3867,14 @@ class LiveBot(core.Bot):
                 deadline = self.live_order_deadline(trade)
                 if not deadline or now_ms < deadline + self.LIVE_UNKNOWN_MARGIN_MS:
                     return
+            else:
+                if row is None and not st.get("order_id"):
+                    # 1.150.0 (audit XR-UNKNOWN-TAKES-LATEFILL): Predict answers that it knows no order by this hash, and never gave
+                    # the record an id: what it filled can be told from the positions alone (below). Marked so, it no longer holds
+                    # the late-fill pass on its outcome (live_late_unread): an ended order's lagging fill there is attributed by the
+                    # position's price or time before this record's release could book it as its own. A read that fails marks
+                    # nothing — that order may be on Predict, its fill still to be read
+                    st.setdefault("hash_not_found", now_ms)
         if row is not None:
             st["order_id"] = str(row.get("id") or st.get("order_id") or "")
             st["events"].append({"at": now_ms, "what": f"找回了订单 #{st['order_id']}（{str(row.get('status') or '?')}）"})
