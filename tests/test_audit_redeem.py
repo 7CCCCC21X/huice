@@ -1201,4 +1201,64 @@ async def sent_note():
 asyncio.run(sent_note())
 
 
+# --- RDM-NEGRISK-ADAPTER-UNCHECKED ----------------------------------------------------------------------------------------------
+async def adapter_unchecked():
+    """RDM-NEGRISK-ADAPTER-UNCHECKED: a neg-risk redeem goes through the adapter, which needs the account's ERC-1155 approval on
+    the track's multi-outcome tokens (both SDKs' REDEEM scope); nothing read or set it, and a missing one reverted the estimate
+    every round as the bare 「RPC 错误：execution reverted」. After such a failure the approval is read once and, missing, named
+    with the remedy (python main.py --approve) — never sent automatically; a redeem that goes through reads nothing."""
+    chain = L.Chain("https://rpc.invalid", L.Wallet(KEY, 56, PA))
+    blob = "0xe237d922" + "00" * 64
+    word = lambda bit: "0x" + str(bit).rjust(64, "0")
+
+    def reads(node):
+        return [p[0] for meth, p in node.log if meth == "eth_call"]
+
+    for yb, tokens, adapter in ((False, "CONDITIONAL_TOKENS", "NEG_RISK_ADAPTER"),
+                                (True, "YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS", "YIELD_BEARING_NEG_RISK_ADAPTER")):
+        with node_for(eth_estimateGas=revert(blob), eth_call=word(0)) as node:
+            try:
+                await chain.redeem("0x" + "ab" * 32, 2, 7 * WEI, True, yb)
+                assert False
+            except L.TxNotSent as error:
+                text = str(error)  # (before: 「RPC 错误：execution reverted（合约错误 0xe237d922 …）」 alone, no read)
+            assert text.startswith("多结果适配器没有这个账户结果代币的操作权") and "python main.py --approve" in text and "0xe237d922" in text, text
+            assert len(reads(node)) == 1 and reads(node)[0]["to"] == L.ADDRESSES[56][tokens], reads(node)
+            data = reads(node)[0]["data"]
+            assert data.startswith("0xe985e9c5") and PA[2:].lower() in data and data.endswith(L.ADDRESSES[56][adapter][2:].lower()), data
+            assert "eth_sendRawTransaction" not in node.methods()
+        # in place, or the read fails: the error as it was
+        for answer in (word(1), m.RemoteError("HTTP 503: 接口请求失败")):
+            with node_for(eth_estimateGas=revert(blob), eth_call=answer):
+                try:
+                    await chain.redeem("0x" + "ab" * 32, 2, 7 * WEI, True, yb)
+                    assert False
+                except L.TxNotSent as error:
+                    assert str(error).startswith("RPC 错误：execution reverted（合约错误 0xe237d922"), str(error)
+        # a redeem that goes through reads nothing; a binary redeem whose estimate reverts reads nothing either
+        with node_for() as node:
+            await chain.redeem("0x" + "ab" * 32, 2, 7 * WEI, True, yb)
+            assert reads(node) == [] and node.methods().count("eth_sendRawTransaction") == 1
+        with node_for(eth_estimateGas=revert(blob)) as node:
+            try:
+                await chain.redeem("0x" + "ab" * 32, 2, 7 * WEI, False, yb)
+                assert False
+            except L.TxNotSent:
+                assert reads(node) == []
+    # the round: the five-minute retry as before (nothing sent, no mark), the notice naming the remedy
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["951"] = [held(951)], {**mk(951, won=1), "isNegRisk": True}
+    bot.live.chain = QuickChain(bot.live.wallet)
+    sent = notices(bot)
+    with node_for(eth_estimateGas=revert(blob), eth_call=word(0)) as node:
+        assert await bot.live_redeem(NOW) == [] and "eth_sendRawTransaction" not in node.methods()
+    assert bot.live_errors[-1].endswith("（交易没发出，5 分钟后再试）") and "多结果适配器没有这个账户结果代币的操作权" in bot.live_errors[-1]
+    assert [k for k, _ in sent] == ["redeem:fail"] and "python main.py --approve" in sent[0][1] and bot.store.get("live:redeemed:951:1") is None, sent
+    print("RDM_NEGRISK_ADAPTER_UNCHECKED_OK")
+
+
+asyncio.run(adapter_unchecked())
+
+
 print("AUDIT_REDEEM_OK")

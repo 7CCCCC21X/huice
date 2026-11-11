@@ -1285,6 +1285,21 @@ class Chain:
             return None
         return None
 
+    ADAPTER_MISSING = ("多结果适配器没有这个账户结果代币的操作权（授权缺失），领取交易发不出去：运行 python main.py --approve"
+                       "（补上这项授权，签名钱包付一笔 gas），或在 Predict 网站上领取一次")
+
+    async def adapter_unapproved(self, yield_bearing: bool) -> bool:
+        """True only when the chain says so: the track's multi-outcome adapter is no operator of this account's multi-outcome
+        outcome tokens (isApprovedForAll(maker, adapter) on tokens_key(True, …) reads 0 — the one approval both SDKs' REDEEM
+        scope names for a neg-risk market). A failed or empty read says nothing (False)."""
+        try:
+            out = await self.call(self.addresses[tokens_key(True, yield_bearing)],
+                                  self.encode("isApprovedForAll(address,address)", ["address", "address"],
+                                              [self.wallet.maker, self.addresses[("YIELD_BEARING_" if yield_bearing else "") + "NEG_RISK_ADAPTER"]]))
+        except Exception:
+            return False
+        return len(out) >= 32 and int.from_bytes(out[:32], "big") == 0
+
     def redeem_target(self, neg_risk: bool, yield_bearing: bool) -> str:
         """The contract a redeem calls: the track's multi-outcome adapter for a neg-risk market, its conditional tokens else."""
         return self.addresses[("YIELD_BEARING_" if yield_bearing else "") + ("NEG_RISK_ADAPTER" if neg_risk else "CONDITIONAL_TOKENS")]
@@ -1297,7 +1312,19 @@ class Chain:
         target = self.redeem_target(neg_risk, yield_bearing)
         if neg_risk:
             amounts = [amount, 0] if index_set == 1 else [0, amount]
-            tx = await self.send(target, self.encode("redeemPositions(bytes32,uint256[])", ["bytes32", "uint256[]"], [condition, amounts]), sent=sent)
+            try:
+                tx = await self.send(target, self.encode("redeemPositions(bytes32,uint256[])", ["bytes32", "uint256[]"], [condition, amounts]), sent=sent)
+            except TxNotSent as error:
+                # 1.150.0 (audit RDM-NEGRISK-ADAPTER-UNCHECKED): a multi-outcome redeem goes through the adapter, which pulls the
+                # winning tokens from the account — it needs the account's ERC-1155 approval (both SDKs' REDEEM scope), which
+                # nothing in the running bot read or set: missing, the estimate reverted every round for ever as the bare
+                # 「RPC 错误：execution reverted」. Read once, only AFTER such a failure (a redeem that goes through reads nothing;
+                # a gate before the send would rest on an assumption about Predict's contract), and named when the chain says
+                # it is missing. Never sent from here — it is a permission grant and a transaction the owner chooses
+                # (python main.py --approve sets it). Still TxNotSent: the five-minute retry, no mark.
+                if not any(word in str(error).lower() for word in TX_REFUSED) and await self.adapter_unapproved(yield_bearing):
+                    raise TxNotSent(f"{self.ADAPTER_MISSING}（{error}）", error.retry_after) from error
+                raise
         else:
             tx = await self.send(target, self.encode("redeemPositions(address,bytes32,bytes32,uint256[])",
                                                      ["address", "bytes32", "bytes32", "uint256[]"],
