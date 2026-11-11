@@ -1739,6 +1739,7 @@ class LiveBot(core.Bot):
         self.live_redeem_loop_task: asyncio.Task | None = None
         self.live_gas_noted = -1e9
         self.live_redeem_since = 0        # when the redeem pass holding the lock began (bot clock, ms; 0: none) — /live and the check (1.150.0)
+        self.live_redeem_auto_at = 0      # when the last automatic round began (bot clock, ms; 0: none yet): /live beside a manual 上一轮 (1.150.0)
         self.live_redeem_cut = 0          # the last redeem pass's own positions read: 0 = whole, else the rows it read of a longer list (1.150.0)
         self.live_cut_noted = -1e9        # ...and when such a cut list was last told on Telegram (an hour apart, as the gas)
         self.live_redeem_unclear: dict[str, float] = {}  # "<market>:<index set>" -> when a round first met its settlement unreadable (1.150.0)
@@ -2937,6 +2938,7 @@ class LiveBot(core.Bot):
         # the round live_redeem_soon had brought included. Such a round now asks for the next one soon (live_redeem_again: after
         # the cooldown, at most LIVE_REDEEM_AGAIN_MAX times in a row). A failure in the middle of the pass keeps the usual cadence
         # under its own label — what it sent is marked, the rest is not hurried — and 读取持仓失败 names the positions read alone.
+        self.live_redeem_auto_at = now_ms  # (RDM-STATUS-LINE) when the last automatic round began, whatever a manual one wrote since
         try:
             if not self.live.ready:
                 await self.live_ensure_ready()  # signed in by the step otherwise: with the step off, here
@@ -4509,6 +4511,8 @@ class LiveBot(core.Bot):
                 done, _ = await self.live_redeem_pass(now_ms, force=manual)
             finally:
                 self.live_redeem_since = 0
+            if manual:  # (RDM-STATUS-LINE) the round /live shows as 上一轮 was the owner's, not the automatic one: said so there
+                self.live_redeem_last = {**self.live_redeem_last, "manual": True}
             return done
 
     def live_redeem_booked(self, key: str, tx: str, paid: int | None, amount: int, title: str, outcome: str, now_ms: int,
@@ -5041,7 +5045,15 @@ class LiveBot(core.Bot):
             return "自动领取：关（/live redeem 手动领取）"
         last = getattr(self, "live_redeem_last", {}) or {}
         task = getattr(self, "live_redeem_task", None)
-        ago = f"上一轮 {max(0, int((self.market.now_ms() - int(last['at'])) / 60_000))} 分钟前：{self.live_redeem_summary(last)}" if last.get("at") else ""
+        minutes = lambda at: max(0, int((self.market.now_ms() - int(at)) / 60_000))
+        ago = f"上一轮 {minutes(last['at'])} 分钟前：{self.live_redeem_summary(last)}" if last.get("at") else ""
+        if ago and last.get("manual"):
+            # 1.150.0 (audit RDM-STATUS-LINE): every non-dry pass writes live_redeem_last, the owner's /live redeem (and the page's
+            # 领取已结算) as well, and the line said 上一轮 0 分钟前 of it as of an automatic round — with the automatic rounds
+            # stopped, each manual one made them look alive. Now said as the owner's, beside the last automatic round's time
+            auto_at = int(getattr(self, "live_redeem_auto_at", 0) or 0)
+            ago = (f"上一轮（手动）{minutes(last['at'])} 分钟前：{self.live_redeem_summary(last)}"
+                   + (f"｜自动的上一轮 {minutes(auto_at)} 分钟前" if auto_at else "｜自动的本次启动后还没跑过"))
         if shut := self.live_redeem_shut():
             # 1.150.0 (audit RDM-OFF-NO-SIGNIN): a process started in LIVE=off does not sign in to Predict by itself (as designed:
             # off 只记账), so live_redeem_tick's gate stays shut and no automatic round runs for the positions still held — a

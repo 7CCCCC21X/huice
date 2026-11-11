@@ -2221,4 +2221,36 @@ async def page_redeem():
 asyncio.run(page_redeem())
 
 
+# --- RDM-STATUS-LINE ------------------------------------------------------------------------------------------------------------
+async def status_line():
+    """RDM-STATUS-LINE: every non-dry pass writes the round /live shows as 上一轮 — the owner's /live redeem (and the page's
+    领取已结算) too — and the line said 上一轮 0 分钟前 of it as of an automatic round: with the automatic rounds stopped, each
+    manual command made them look alive. A manual round is now said as such, beside the last automatic round's time. (The
+    running round's start and the LIVE=off wording came with RDM-ROUND-LOCK-STALL and RDM-OFF-NO-SIGNIN.)"""
+    line = lambda bot: next(l for l in bot.live_text(bot.market.now_ms()).split("\n") if l.startswith("自动领取"))
+    bot = await ready_bot()
+    fake = bot.live.api
+    fake.positions_rows, fake.markets["500"] = [held(500)], mk(500, won=1)
+    # a manual round before any automatic one
+    bot.market.now = NOW
+    await bot.live_action("redeem", [], NOW)
+    assert line(bot) == "自动领取：开｜上一轮（手动）0 分钟前：持仓 1 个：领了 1｜自动的本次启动后还没跑过｜/live redeem check 查原因", line(bot)
+    # an automatic round: the usual words
+    await auto_round(bot)
+    assert line(bot) == "自动领取：开｜上一轮 0 分钟前：持仓 1 个：已领仍列着 1｜/live redeem check 查原因", line(bot)
+    # three minutes on, the owner's /live redeem: said as his, the automatic round's time beside it (before: 上一轮 0 分钟前, no word)
+    bot.market.now = NOW + 3 * MIN
+    await bot.live_action("redeem", [], NOW + 3 * MIN)
+    assert line(bot) == "自动领取：开｜上一轮（手动）0 分钟前：持仓 1 个：已领仍列着 1｜自动的上一轮 3 分钟前｜/live redeem check 查原因", line(bot)
+    await bot.live_action("redeem", ["check"], NOW + 3 * MIN)  # the check (a dry run) writes nothing
+    assert "上一轮（手动）0 分钟前" in line(bot)
+    bot.market.now = NOW + 4 * MIN
+    await auto_round(bot)  # the next automatic round: as before
+    assert line(bot) == "自动领取：开｜上一轮 0 分钟前：持仓 1 个：已领仍列着 1｜/live redeem check 查原因", line(bot)
+    print("RDM_STATUS_LINE_OK")
+
+
+asyncio.run(status_line())
+
+
 print("AUDIT_REDEEM_OK")
