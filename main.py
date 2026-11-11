@@ -11454,7 +11454,7 @@ def path_text(name: str, kinds: set[str], legs: tuple) -> str:
     return f"{name}{leg(*legs[0])} 又{leg(*legs[1])}"
 
 
-PATH_KINDS = {"range", "ladder", "touch"}  # the kinds one price path decides together; a close, a window, a flip are each decided by their own end
+PATH_KINDS = {"range", "ladder", "touch"}  # the kinds a price path decides, each family of them together (path_family); a close, a window, a flip are each decided by their own end
 
 
 def event_of(p: Mapping) -> tuple:
@@ -11474,25 +11474,56 @@ def event_of(p: Mapping) -> tuple:
     return str(p.get("kind") or ""), str(settle.get("key") or ""), when
 
 
+def path_family(p: Mapping) -> tuple:
+    """The path-decided positions one price path decides together (1.150.0): one first-touch market, one token's market-cap
+    ladder, or the levels of one price ladder in one window. The positions of a family are priced under one path and
+    hedge each other; two families do not, each counts at its own worst (group_worst_case), as two settlement events do
+    (event_of). Until now every path-decided position of a driver shared one path, and that path could not tell them
+    apart: a first-touch market's own lines are not among its levels (any rise counted as the high line reached first),
+    and a level counted as touched whatever its ladder's window. BTCUSDT carries BTC 先触 70k/90k, BTC 11月价格 and BTC
+    2027前价格: 「90k」 with No on 11月 ↑ $85k read as hedged (worst $0) — a rise to 85k and then a fall through 70k
+    loses both; 「70k」 with No on ↓ $75k likewise (down to 75k, then up through 90k); Yes on 11月 ↑ $100k with No on
+    2027前 ↑ $100k read as a sure gain — no 100k in November and 100k in December loses both. SIM_GROUP_USD (on paper
+    and for real orders) let such legs in whole — four of them at 300 shares, $585 at cost and all of it lost on one
+    path, under the default $300 — until other limits bound, and the review page's 最坏单一事件 showed the same figure.
+    Each old joint path, read by one family alone, is one of that family's own paths, so the families' worsts added up
+    are never above the old figure: the cap only tightens. What it gives up: a hedge that is real across windows (No on
+    11月 ↑ $100k with Yes on 2027前 ↑ $100k: a touch in November is a touch before 2027) counts as two losses — the
+    careful way round.
+    The family: a first-touch market's or a market-cap ladder's key (one market, one window: TouchSpec, CapSpec); a
+    price ladder's key and its window's end — a stock's category lists a market per deadline under one key
+    (StockRangeMarket.choose), and "by June" and "by December" are two windows. A position without a key (none of the
+    trader's own) is told apart by its window alone."""
+    kind, key, settle = str(p.get("kind") or ""), str(p.get("key") or ""), p.get("settle") or {}
+    if key and kind != "range":
+        return kind, key, ""
+    return kind, key, str(settle.get("end") or settle.get("deadline") or "")
+
+
 def group_worst_case(positions: list[dict], name: str = "") -> tuple[float, str]:
     """(P&L, the move) of one driver's positions under what hurts them most. The path-decided positions (a price ladder,
-    a range level, a first touch: PATH_KINDS) under one path: up to each upward level (or past all), down to each
-    downward level (or past all), neither — and, with levels on both sides, up to one then down to another (and the
-    reverse): both touched, No positions on both lose together (the single moves alone priced that pair at the loss of
-    one). Three No positions at $300M / $500M / $1B lose together on the move past $1B: that is the number to limit, not
-    the count of markets. The end-decided positions (a close, a window, a flip) each settlement event (event_of) at its
-    own worst end — up, down or flat — added up: one day's two sides hedge each other, two days, or a close and a touch,
-    do not, whatever one move would do to both (1.122.0). ``positions``: dicts with kind, side, settle, price and
-    shares; one flagged ``resting`` (an order not filled) counts only where it loses: an unfilled order is no hedge."""
+    a range level, a first touch: PATH_KINDS) family by family (path_family: one ladder in one window, one first-touch
+    market), each under its own worst path: up to each upward level (or past all), down to each downward level (or past
+    all), neither — and, with levels on both sides, up to one then down to another (and the reverse): both touched, No
+    positions on both lose together (the single moves alone priced that pair at the loss of one). Three No positions at
+    $300M / $500M / $1B lose together on the move past $1B: that is the number to limit, not the count of markets. The
+    end-decided positions (a close, a window, a flip) each settlement event (event_of) at its own worst end — up, down
+    or flat. The families and the events are added up: one ladder's levels, or one day's two sides, hedge each other;
+    two ladders' windows, a ladder and a first touch, two days, or a close and a touch do not, whatever one move would
+    do to both (1.122.0; the path-decided families 1.150.0). ``positions``: dicts with kind, key, side, settle, price
+    and shares; one flagged ``resting`` (an order not filled) counts only where it loses: an unfilled order is no hedge."""
     def gain(p: dict, up: float) -> float:
         payout = up if p.get("side") == "up" else 1 - up
         g = (payout - float(p["price"])) * float(p["shares"])
         return min(0.0, g) if p.get("resting") else g
 
-    paths = [p for p in positions if str(p.get("kind") or "") in PATH_KINDS]
-    kinds = {str(p.get("kind") or "") for p in paths}
+    families: dict[tuple, list[dict]] = {}
+    for p in positions:
+        if str(p.get("kind") or "") in PATH_KINDS:
+            families.setdefault(path_family(p), []).append(p)
     total, parts = 0.0, []
-    if paths:
+    for paths in families.values():
+        kinds = {str(p.get("kind") or "") for p in paths}
         up_levels = sorted({float(p["settle"].get("target") or 0) for p in paths
                             if p.get("kind") == "ladder" or (p.get("kind") == "range" and (p.get("settle") or {}).get("dir", "up") == "up")})
         down_levels = sorted({float(p["settle"].get("target") or 0) for p in paths
@@ -11515,7 +11546,7 @@ def group_worst_case(positions: list[dict], name: str = "") -> tuple[float, str]
         direction = min(pnls, key=lambda d: round(pnls[d], 6))  # the first of flat, up, down when as bad
         total += pnls[direction]
         parts.append(scenario_text(name, {kind}, direction, None))
-    return total, "、".join(dict.fromkeys(parts)) if parts else scenario_text(name, kinds, "flat", None)
+    return total, "、".join(dict.fromkeys(parts)) if parts else scenario_text(name, set(), "flat", None)  # (no position at all)
 
 
 def sim_positions(trades: list[dict]) -> list[dict]:
@@ -20376,7 +20407,9 @@ class Bot:
             if unfilled and order - filled > 0:  # the unfilled part: counted where it loses, never as a hedge
                 mine.append({**t, "shares": order - filled, "price": self.sim_resting_cost(t), "resting": True})
         price, shares = self.sim_group_order(mk, price, shares, taker)
-        candidate = {"kind": mk.kind, "side": side, "settle": mk.settle, "price": price, "shares": shares}
+        # (the key: what tells the candidate's ladder or first-touch market from the driver's others — path_family, 1.150.0;
+        # without it the order would count apart from the positions of its own ladder, never as their hedge)
+        candidate = {"kind": mk.kind, "key": mk.key, "side": side, "settle": mk.settle, "price": price, "shares": shares}
         worst, event = group_worst_case([*mine, candidate], name)
         if -worst > cap + 1e-9:
             return (f"{event}时这组仓位合计将亏 ${-worst:,.2f}，超过组上限 ${cap:g}"

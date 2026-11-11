@@ -470,4 +470,175 @@ async def stale_book_orders():
 
 asyncio.run(stale_book_orders())
 
+# --- SIM-GROUP-WORST-CASE: one price path decides one first-touch market, or one ladder in one window — not a driver's every such market ---
+# BTCUSDT carries BTC 先触 70k/90k (to 2027-05-05), BTC 11月价格 (to 11-30) and BTC 2027前价格 (to 12-31): one risk group. One path
+# priced all their positions together and could not tell the markets apart: the first-touch market's own lines were not among its
+# levels (any rise counted as "90k first"), and a level counted as touched whatever its ladder's window. Three shapes read as
+# hedged — or as a sure gain — that one real path loses whole, so SIM_GROUP_USD (the paper trader's cap and the real one's) let
+# them grow until other limits bound, and the review page's 最坏单一事件 showed the same figure.
+G_TOUCH = m.touch_spec("BTC-2027")
+# the two ladders as main lists them on 11-10, kept here as this section's own lines and put (back) into main's table, where a
+# market's driver is looked up: a ladder leaves that table once its window is over
+G_NOV = m.RangeSpec("BTC-HIT-11", "what-price-will-bitcoin-hit-in-november-2026", "BTCUSDT", "spot", "BTC 11月价格",
+                    m.et_ms(2026, 11, 1, 0, 0, -4), m.et_ms(2026, 11, 30, 23, 59, -5), "down")
+G_Y27 = m.RangeSpec("BTC-HIT-2027", "what-price-will-bitcoin-hit-before-2027", "BTCUSDT", "spot", "BTC 2027前价格",
+                    m.et_ms(2025, 11, 24, 14, 0, -5), m.et_ms(2026, 12, 31, 23, 59, -5))
+m.RANGE_MARKETS = (*(s for s in m.RANGE_MARKETS if s.key not in {G_NOV.key, G_Y27.key}), G_NOV, G_Y27)
+G_LOW, G_HIGH, G_DAY = float(G_TOUCH.low), float(G_TOUCH.high), 86_400_000
+assert NOW < G_NOV.end_ms < G_Y27.end_ms < G_TOUCH.deadline_ms and (G_LOW, G_HIGH) == (70_000.0, 90_000.0)
+assert {m.market_driver("touch", G_TOUCH.key)[0], m.market_driver("range", G_NOV.key)[0], m.market_driver("range", G_Y27.key)[0]} == {"BTCUSDT"}
+
+
+def g_touch(side: str, price: float, shares: float = 100.0, spec=G_TOUCH) -> dict:
+    """A position on a first-touch market, as the trader records it: "up" = the high line (90k) first."""
+    return {"kind": "touch", "key": spec.key, "market": spec.slug, "item": "BTC 先触 70k/90k", "side": side, "price": price, "shares": shares,
+            "order": shares, "status": "filled", "maker": False, "settle": {"deadline": spec.deadline_ms}}
+
+
+def g_level(spec, arrow: str, target: int, side: str, price: float, shares: float = 100.0) -> dict:
+    """A position on one level of a price ladder: ``arrow`` "up" (↑: a High at or over the level in the window) or "down" (↓)."""
+    return {"kind": "range", "key": spec.key, "market": f"{spec.slug}#{arrow}{target}", "item": f"{spec.name} {'↑' if arrow == 'up' else '↓'} ${target // 1000}k",
+            "side": side, "price": price, "shares": shares, "order": shares, "status": "filled", "maker": False,
+            "settle": {"target": str(target), "dir": arrow, "end": spec.end_ms}}
+
+
+def g_real(positions: list, path: list) -> float:
+    """What ``positions`` really make on a price path — [(time, price)] from now on, a straight move between two points — each
+    market by its own rules: a level is touched by a point at or before its own ladder's end; the first-touch market goes to
+    the line reached first before its deadline, 50/50 when neither is."""
+    total = 0.0
+    for q in positions:
+        s = q["settle"]
+        if q["kind"] == "range":
+            seen = [px for at, px in path if at <= s["end"]]
+            up = float(max(seen) >= float(s["target"]) if s["dir"] == "up" else min(seen) <= float(s["target"]))
+        else:
+            first = next((px for at, px in path if at <= s["deadline"] and not G_LOW < px < G_HIGH), None)
+            up = 0.5 if first is None else float(first >= G_HIGH)
+        total += ((up if q["side"] == "up" else 1 - up) - q["price"]) * q["shares"]
+    return total
+
+
+G_CASES = (
+    # 「90k」 on the first touch + No on 11月 ↑ $85k: BTC rises to 85.5k, then falls through 70k — both lose (was: worst $0)
+    ([g_touch("up", 0.50), g_level(G_NOV, "up", 85_000, "down", 0.50)],
+     [(NOW, 80_000.0), (NOW + 5 * G_DAY, 85_500.0), (NOW + 10 * G_DAY, 69_500.0)], -100.0, "BTC 先触低线、BTC 涨到 $85k"),
+    # 「70k」 + No on 11月 ↓ $75k: down to 74.5k, then up through 90k — both lose (was: worst $0)
+    ([g_touch("down", 0.50), g_level(G_NOV, "down", 75_000, "down", 0.50)],
+     [(NOW, 80_000.0), (NOW + 5 * G_DAY, 74_500.0), (NOW + 10 * G_DAY, 90_500.0)], -100.0, "BTC 先触高线、BTC 跌到 $75k"),
+    # Yes on 11月 ↑ $100k + No on 2027前 ↑ $100k: no 100k in November, 100k on 12-10 — both lose (was: a sure gain of $15)
+    ([g_level(G_NOV, "up", 100_000, "up", 0.30), g_level(G_Y27, "up", 100_000, "down", 0.55)],
+     [(NOW, 80_000.0), (G_NOV.end_ms + 10 * G_DAY, 100_500.0)], -85.0, "BTC 都没触及、BTC 涨到 $100k"),
+)
+for g_held, g_path, g_loss, g_event in G_CASES:
+    assert abs(g_real(g_held, g_path) - g_loss) < 1e-9, (g_event, g_real(g_held, g_path))  # the path really loses every leg
+    g_worst, g_said = m.group_worst_case(g_held, "BTC")
+    assert g_worst <= g_loss + 1e-9, ("the group's worst case is milder than a real path's loss", g_event, g_worst, g_said)
+    assert abs(g_worst - g_loss) < 1e-9 and g_said == g_event, (g_worst, g_said)
+# two first-touch markets on one pair (the earlier BTC 70k/90k, off the page but still to be settled, and the one to 2027) are two
+# questions: 「90k」 on one and 「70k」 on the other both lose when each goes the wrong way (was: hedged, worst $0)
+g_old = m.touch_spec("BTC")
+assert g_old in m.TOUCH_SETTLED and m.market_driver("touch", g_old.key)[0] == "BTCUSDT" and g_old.key != G_TOUCH.key
+assert m.group_worst_case([g_touch("up", 0.50, spec=g_old), g_touch("down", 0.50)], "BTC") == (-100.0, "BTC 先触低线、BTC 先触高线")
+# a stock's "hits $100 by <date>" category lists a market per deadline under ONE key (StockRangeMarket.choose): Yes by June and No
+# by December at the same level both lose when the level is first reached in between (was: a sure gain of $15)
+g_june, g_dec = ({"kind": "range", "key": "STRC-100", "side": side, "price": price, "shares": 100.0,
+                  "settle": {"target": "100", "dir": "up", "end": end}} for side, price, end in (("up", 0.30, NOW + 30 * G_DAY), ("down", 0.55, NOW + 200 * G_DAY)))
+assert abs(m.group_worst_case([g_june, g_dec], "STRC")[0] + 85.0) < 1e-9, m.group_worst_case([g_june, g_dec], "STRC")
+assert m.path_family(g_june) != m.path_family(g_dec) and m.path_family(g_touch("up", 0.5)) != m.path_family(g_touch("up", 0.5, spec=g_old))
+# what stays one family, priced under one path as before: one ladder's levels in one window (the two sides of a level hedge; a
+# level on each side of the price is lost on the path that touches both), and the two sides of one first-touch market
+g_pair = [g_level(G_NOV, "up", 100_000, "down", 0.60), g_level(G_NOV, "up", 100_000, "up", 0.40)]
+assert m.path_family(g_pair[0]) == m.path_family(g_pair[1]) == m.path_family(g_level(G_NOV, "down", 75_000, "down", 0.5))
+assert abs(m.group_worst_case(g_pair, "BTC")[0]) < 1e-9, m.group_worst_case(g_pair, "BTC")
+g_worst, g_said = m.group_worst_case([g_level(G_NOV, "up", 85_000, "down", 0.60), g_level(G_NOV, "down", 75_000, "down", 0.60)], "BTC")
+assert abs(g_worst + 120.0) < 1e-9 and g_said in {"BTC 涨到 $85k 又跌到 $75k", "BTC 跌到 $75k 又涨到 $85k"}, (g_worst, g_said)
+assert abs(m.group_worst_case([g_touch("up", 0.60), g_touch("down", 0.60)], "BTC")[0] + 20.0) < 1e-9
+# what the careful way round costs: No on 11月 ↑ $100k with Yes on 2027前 ↑ $100k is a real hedge (a touch in November is a touch
+# before 2027: the pair loses $20 at most), counted as two losses — the cap refuses more, it never lets more through
+g_nested = [g_level(G_NOV, "up", 100_000, "down", 0.80), g_level(G_Y27, "up", 100_000, "up", 0.40)]
+assert abs(m.group_worst_case(g_nested, "BTC")[0] + 120.0) < 1e-9 and m.group_worst_case(g_nested, "BTC")[0] <= -20.0
+# the review page's 最坏单一事件 (sim_groups): the first shape at 300 shares a side — $345 at cost, all of it lost on the path above
+(g_row,) = m.sim_groups([g_touch("up", 0.55, 300.0), g_level(G_NOV, "up", 85_000, "down", 0.60, 300.0)])
+assert (g_row["driver"], g_row["markets"], g_row["event"]) == ("BTCUSDT", 2, "BTC 先触低线、BTC 涨到 $85k"), g_row
+assert abs(g_row["worst"] + 345.0) < 1e-9 and abs(g_row["cost"] - 345.0) < 1e-9, (g_row["worst"], g_row["cost"])  # was: −$45
+
+
+def g_market(rec: dict) -> m.SimMarket:
+    """The market of a position, as the trader is offered it (the cap reads its kind, key and settle)."""
+    book = m.PredictBook(rec["key"], rec["market"].partition("#")[0], "1", "t", ((D("0.49"), D("1000")),), ((D("0.51"), D("1000")),), NOW, 200)
+    return m.SimMarket(rec["market"], rec["item"], rec["kind"], rec["key"], 0.5, book, 0.02, "", ("Yes", "No"), rec["settle"])
+
+
+# the cap itself (sim_group_room: the paper trader's gate and the real trader's first one) at $300, sizes within a taker's 300
+# shares a side — the defaults, spelt out. The real trader's class with LIVE off (the SDK test suite's key, never a real one):
+# its own limits say nothing then, the cap's answer is all there is
+G_ENV = {"TELEGRAM_BOT_TOKEN": "1:x", "SIM_GROUP_USD": "300", "SIM_WAYS": "taker", "SIM_TAKER_MAX_SHARES": "300", "SIM_TAKER_SWEEP_SHARES": "300"}
+g_bots = [m.Bot(m.Config.from_env(G_ENV), m.Store(":memory:"), SelfFM(NOW), None),
+          live.LiveBot(m.Config.from_env({**G_ENV, "PREDICT_PRIVATE_KEY": "0x" + "a" * 64}), m.Store(":memory:"), SelfFM(NOW), None)]
+# four legs of 300 shares, $585 at cost, all of it lost when BTC reaches 89.9k in November (85k touched, 100k not) and goes on
+# through 90k to 100.5k by 12-10
+g_legs = [g_level(G_NOV, "up", 100_000, "up", 0.30, 300.0), g_level(G_Y27, "up", 100_000, "down", 0.55, 300.0),
+          g_touch("down", 0.50, 300.0), g_level(G_NOV, "up", 85_000, "down", 0.60, 300.0)]
+g_run = [(NOW, 80_000.0), (NOW + 10 * G_DAY, 89_900.0), (G_NOV.end_ms + 10 * G_DAY, 100_500.0)]
+assert abs(g_real(g_legs, g_run) + 585.0) < 1e-9
+for g_bot in g_bots:
+    assert g_bot.config.sim_group_usd == 300 and g_bot.config.live_mode == "off"
+    g_book = m.TradeMap({"t": g_touch("up", 0.55, 300.0)})
+    g_no85 = g_level(G_NOV, "up", 85_000, "down", 0.60, 300.0)
+    g_why = g_bot.sim_group_room(g_book, g_market(g_no85), "down", 0.60, 300.0)
+    assert g_why.startswith("BTC 先触低线、BTC 涨到 $85k时这组仓位合计将亏 $345.00，超过组上限 $300（BTC 已有 1 笔"), g_why  # was: "" (let through)
+    # ... and the order is cut to what fits, as on one ladder: $165 held, 225 more shares at 60¢ make the $300
+    assert g_bot.sim_size_down(299, lambda n: not g_bot.sim_group_room(g_book, g_market(g_no85), "down", 0.60, float(n))) == 225
+    # an order still resting counts as if filled, in its own family as well: 「90k」 × 300 bid at 55¢, nothing filled yet
+    g_book = m.TradeMap({"t": {**g_touch("up", 0.55, 0.0), "order": 300.0, "status": "resting", "maker": True}})
+    assert "合计将亏 $345.00，超过组上限 $300" in g_bot.sim_group_room(g_book, g_market(g_no85), "down", 0.60, 300.0)  # was: "" (read as −$180)
+    # the candidate counts with the positions of its own ladder (its key): the other side of a held level is still a hedge
+    g_book = m.TradeMap({"n": g_level(G_NOV, "up", 100_000, "down", 0.80, 300.0)})
+    assert g_bot.sim_group_room(g_book, g_market(g_level(G_NOV, "up", 100_000, "up", 0.40)), "up", 0.40, 300.0) == ""
+    # the four legs offered in turn, the cap deciding how much of each goes in: all $585 went in whole (the cap read −$285)
+    g_book, g_took = m.TradeMap(), []
+    for g_leg in g_legs:
+        g_fits = lambda n, leg=g_leg: not g_bot.sim_group_room(g_book, g_market(leg), leg["side"], leg["price"], float(n))
+        g_n = 300 if g_fits(300) else g_bot.sim_size_down(299, g_fits) or 0
+        g_took.append(g_n)
+        if g_n:
+            g_book = m.TradeMap({**g_book, g_leg["market"] + g_leg["side"]: {**g_leg, "shares": float(g_n), "order": float(g_n)}})
+    g_cost = sum(t["price"] * t["shares"] for t in g_book.values())
+    assert g_took == [300, 300, 90, 0] and abs(g_cost - 300.0) < 1e-9, (g_took, g_cost)  # was: [300, 300, 300, 300], $585
+    assert g_real(list(g_book.values()), g_run) >= -g_bot.config.sim_group_usd - 1e-9  # what that path now costs: the cap, no more
+    assert abs(m.group_worst_case(list(g_book.values()), "BTC")[0] + 300.0) < 1e-9
+
+
+def g_offer(rec: dict, mid: str, fair_up: float, bid: str, ask: str, sides=("Yes", "No")) -> m.SimMarket:
+    """The market of ``rec`` as a card prices it: Yes (the high line) worth ``fair_up``, its book 1000 shares at ``bid`` / ``ask``."""
+    book = m.PredictBook(rec["key"], rec["market"].partition("#")[0], mid, "t", ((D(bid), D("1000")),), ((D(ask), D("1000")),), NOW, 200)
+    return m.SimMarket(rec["market"], rec["item"], rec["kind"], rec["key"], fair_up, book, 0.02, "", sides, rec["settle"])
+
+
+async def group_cap_step():
+    """The paper trader's own looks at those four markets, each offering some 24¢ of net edge on its leg's side: the same cap and
+    sizes, the markets traded 先触价 and 价格阶梯 (SIM_MARKETS), the takers buying at the first look."""
+    bot = m.Bot(m.Config.from_env({**G_ENV, "SIM_MARKETS": "touch,range", "SIM_TAKER_HOLD_SECONDS": "0", "SIM_TAKER_HOLD_RANGE_SECONDS": "0"}),
+                m.Store(":memory:"), SelfFM(NOW), None)
+    offers = [g_offer(g_legs[0], "901", 0.55, "0.28", "0.30"), g_offer(g_legs[1], "902", 0.20, "0.45", "0.47"),
+              g_offer(g_legs[2], "903", 0.25, "0.50", "0.52", ("90k", "70k")), g_offer(g_legs[3], "904", 0.15, "0.40", "0.42")]
+    bot.sim_markets = lambda now: offers
+    for look in range(3):
+        bot.market.now, bot.sim_ran = NOW + look * 5000, -1e9
+        await bot.sim_step(NOW + look * 5000)
+    got = list(bot.sim_trades().values())
+    cost = sum(t["price"] * t["shares"] for t in got)
+    # before the fix all four went in whole: 300 shares each, $594.90 at cost, the cap reading −$294.90 — and −$594.90 on the path
+    assert {t["item"]: (t["label"], t["shares"]) for t in got} == {g_legs[0]["item"]: ("吃Yes", 300.0), g_legs[1]["item"]: ("吃No", 300.0),
+                                                                   g_legs[2]["item"]: ("吃70k", 79.0)}, [(t["item"], t["label"], t["shares"]) for t in got]
+    assert 299.0 < cost <= 300.0 and g_real(got, g_run) >= -300.0 - 1e-9, (cost, g_real(got, g_run))
+    (row,) = bot.sim_report()["groups"]  # the page's figure is the path's
+    assert abs(row["worst"] + cost) < 1e-9 and set(row["event"].split("、")) == {"BTC 都没触及", "BTC 涨到 $100k", "BTC 先触高线"}, row
+    blocked = {b["item"]: b["why"] for b in bot.sim_blocks()}  # what did not fit is on record, with the reason
+    assert set(blocked) == {g_legs[2]["item"], g_legs[3]["item"]} and all("超过组上限 $300" in why for why in blocked.values()), blocked
+
+
+asyncio.run(group_cap_step())
+
 print("AUDIT_DECISION_OK")

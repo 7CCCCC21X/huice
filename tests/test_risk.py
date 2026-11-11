@@ -42,11 +42,12 @@ assert abs(worst - (-84 - 90 + 5 - 5)) < 1e-9 and event == "$PONS FDV 涨到 $50
 # Yes holders lose when nothing is touched
 worst, event = m.group_worst_case([pos("ladder", "up", 0.3, target="300000000"), pos("ladder", "up", 0.1, target="1000000000")], "$PONS FDV")
 assert abs(worst + 40) < 1e-9 and event == "$PONS FDV 都没触及", (worst, event)
-# a price ladder's ↓ levels and a first-touch market fall together on a crash
+# a price ladder's ↓ levels and a first-touch market fall together on a crash (1.150.0: the ladder and the first-touch market
+# each at its own worst, added up — here the same $155, the move now names both; one path priced the two together before)
 mixed = [pos("range", "down", 0.8, target="60000", dir="down"), pos("range", "up", 0.2, target="90000", dir="up"),
          pos("touch", "up", 0.55, low=70000, high=90000)]
 worst, event = m.group_worst_case(mixed, "BTC")
-assert abs(worst + 155) < 1e-9 and event == "BTC 跌到 $60k", (worst, event)
+assert abs(worst + 155) < 1e-9 and event == "BTC 跌到 $60k、BTC 先触低线", (worst, event)
 assert m.group_worst_case([pos("close", "up", 0.6), pos("close", "up", 0.7, shares=50)], "恒生指数（10-07）") == (-95.0, "恒生指数（10-07）收跌")
 assert m.group_worst_case([pos("updown", "down", 0.4)], "BTC") == (-40.0, "BTC 收涨")
 assert m.group_worst_case([pos("touch", "down", 0.45)], "BNB") == (-45.0, "BNB 先触高线")
