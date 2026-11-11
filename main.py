@@ -11313,10 +11313,13 @@ def own_unsure(trade: Mapping, book: Any) -> bool:
     (placing), or Predict has answered it and the book's levels were taken before that answer — a push can beat the HTTP
     answer, and a REST read asked before it may be served after the order went in. On such a book the order cannot be
     told from somebody else's bid at its price: counted as ours it would be the 1.138.x withdrawal again, so it is not
-    (own_on_book), and a deep-bid order that then sees "a bid in front" may be looking at itself — it is held, not moved
-    up (Bot.sim_requote_reason; FEED-FETCHED-MS). Over with the next book whose levels were taken after the answer: a
-    changed push, or a REST read asked after it (on a pushed market that stays as it is, the cold round's). Never for an
-    order not sent yet (pending: no book shows it)."""
+    (own_on_book) — and a deep-bid or sweep order, whose place is worked out from the best bid of anyone else, may then
+    be working it out from itself. It is held where it is (Bot.sim_requote_reason; FEED-FETCHED-MS): never moved up
+    ("a bid in front" — withdrawn, placed a cent higher, and that one again), and not moved down or sideways either
+    while the book shows a bid at its own price (its own shares, fewer than SIM_MAKER_MIN_BID, read as somebody's bid
+    right under the best ask — "join the valid 买1 below": withdrawn, placed where it was, withdrawn again). Over with
+    the next book whose levels were taken after the answer: a changed push, or a REST read asked after it (on a pushed
+    market that stays as it is, the cold round's). Never for an order not sent yet (pending: no book shows it)."""
     st = trade.get("live") if isinstance(trade.get("live"), Mapping) else None
     if st is None or book is None or st.get("state") == "pending":
         return False
@@ -11324,6 +11327,28 @@ def own_unsure(trade: Mapping, book: Any) -> bool:
         return True
     left = max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0)
     return left > 1e-9 and own_on_book(trade, book) <= 1e-9  # sent, something left of it, and none of it counted: the book is from before the answer
+
+
+def ghost_unsure(trade: Mapping | None, book: Any) -> bool:
+    """The other side of own_unsure — whether ``book`` may NOT show our real order although Bot.sim_own_resting still
+    counts it there: Predict confirmed its cancel after the book's levels were taken (the ghost of 1.104.6, taken out of
+    the level at its price), and the bot has heard of that book since the cancel's request went out — its age restarted
+    by a push that arrived, a REST answer that landed, the same levels again. Such a book may be of before the cancel
+    reached Predict's book or of after it (the push of a cancel can beat its HTTP confirmation): what stands at the
+    order's price on it is the order still shown, or somebody else's bid, and a deep-bid order is not placed onto it
+    (Bot.sim_maker_reason; FEED-FETCHED-MS). A book last heard of before the request went out (a REST answer landed
+    earlier, the last push of before it) shows the order for certain: the ghost is taken out and the place it leaves is
+    used at once, as ever. Over with the next book whose levels were taken after the confirmation. The request's time on
+    the books' clock is the confirmation's (cancel_done_ms) less what the cancel took on the market clock
+    (cancel_sent_at → cancel_done_at); a record without those stamps is in doubt. Never for an order resting."""
+    st = trade.get("live") if isinstance(trade, Mapping) and isinstance(trade.get("live"), Mapping) else None
+    if st is None or book is None or trade.get("status") == "resting":
+        return False
+    done = int(st.get("cancel_done_ms") or 0)
+    if not done or book_content_ms(book) > done:
+        return False  # not cancelled, or a book taken after the confirmation: the order is off it
+    took = int(st["cancel_done_at"]) - int(st["cancel_sent_at"]) if st.get("cancel_sent_at") and st.get("cancel_done_at") else None
+    return took is None or int(getattr(book, "fetched_ms", 0) or 0) >= done - max(took, 0)
 
 
 def same_refusal(a: str, b: str) -> bool:
@@ -12435,6 +12460,12 @@ def own_levels(book: PredictBook, side: str) -> list[tuple[float, float]]:
     if side == "up":
         return [(float(p), float(q)) for p, q in book.bids]
     return [(round(1 - float(p), 6), float(q)) for p, q in book.asks]
+
+
+def bid_shares(book: PredictBook, side: str, price: float) -> float:
+    """The shares bid at ``price`` where a resting buy of ``side`` queues (own_levels: ours, when the book shows it, with
+    everybody else's); 0 when the book has no such level."""
+    return sum(q for p, q in own_levels(book, side) if abs(p - price) < 1e-9)
 
 
 def book_snapshot(book: PredictBook, depth: int = 5) -> dict:
@@ -18753,18 +18784,29 @@ class Bot:
         there is none. 1.150.0 (audit FEED-FETCHED-MS): "read" is when the book's levels were taken (book_content_ms), not
         its fetched_ms: a REST read asked before the confirmation and landing after it, or the old levels pushed again
         after it, still show the order under a later stamp — the ghost then counted as somebody's 买1, and the next real
-        order joined a level holding 20 shares of others."""
+        order joined a level holding 20 shares of others. Such a book may as well not show it any more (ghost_unsure):
+        what stands at its price may be somebody else's, and a deep-bid order is not placed onto it (sim_maker_reason)."""
+        t = Bot.sim_own_order(trades, market, side, book)
+        if t is None:
+            return 0.0, None
+        return max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0), float(t.get("price") or 0)
+
+    @staticmethod
+    def sim_own_order(trades: dict[str, dict], market: str, side: str, book: PredictBook | None = None) -> dict | None:
+        """The record sim_own_resting's shares and price are of: the real order resting on a market's side, else the
+        latest with shares unfilled whose cancel Predict confirmed after ``book``'s levels were taken; None when there
+        is none."""
         ghost = None
         for t in trades_of_market(trades, market):
             if t.get("side") != side or not t.get("maker") or not isinstance(t.get("live"), dict):
                 continue
-            own = max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0)
             if t.get("status") == "resting":
-                return own, float(t.get("price") or 0)
+                return t
             done = int(t["live"].get("cancel_done_ms") or 0)
-            if book is not None and done and book_content_ms(book) <= done and own > 1e-9 and (ghost is None or done > ghost[0]):
-                ghost = (done, own, float(t.get("price") or 0))
-        return (ghost[1], ghost[2]) if ghost else (0.0, None)
+            if (book is not None and done and book_content_ms(book) <= done and float(t.get("order") or 0) - float(t.get("shares") or 0) > 1e-9
+                    and (ghost is None or done > int(ghost["live"]["cancel_done_ms"]))):
+                ghost = t
+        return ghost
 
     def sim_in_scope(self, mk: SimMarket) -> bool:
         """Whether the paper trader trades this market: its kind is on (SIM_MARKETS) and it is not left out by name (SIM_SKIP)."""
@@ -18837,7 +18879,7 @@ class Bot:
         deep_bar = self.sim_maker_mode(mk, True)[0] if front_ok or wide else c.sim_maker_deep  # the deep-bid orders' bar here: SIM_MAKER_DEEP_CENTS, or the after-hours bar when higher
         limit = self.sim_after_hours_price(mk)  # after hours only at or under SIM_AFTER_HOURS_MAX_PRICE_CENTS
         maker_bar = self.sim_maker_mode(mk)[0]  # an ordinary order's bar here (SIM_MAKER_DEEPER looks under 买1 for it)
-        cands, joined, dear, capped = [], None, None, []  # joined / dear / capped: what was passed over or cut, for the reason when nothing is left
+        cands, joined, dear, capped, ghosted = [], None, None, [], ""  # joined / dear / capped / ghosted: what was passed over or cut, for the reason when nothing is left
         for side, name in (("up", "涨"), ("down", "跌")):
             fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: a near-certain side is judged at the limit, no higher
             if cut > 0:
@@ -18871,6 +18913,26 @@ class Bot:
                     sides_seen[side] = {"why": f"只挂低价挂单：买1 之上 1¢ 和下面都留不出 {cents(deep_bar)}（跟买1 也只有 {cents(fair - level[0])}）"}
                     continue
             price, queued = (sweep[0], sweep[1]) if sweep else front if use_front else level
+            if ((use_front or sweep is not None) and own_price is not None and abs(price - own_price) < 1e-9
+                    and bid_shares(mk.book, side, price) >= SIM_MAKER_FRONT_MIN - 1e-9
+                    and ghost_unsure(self.sim_own_order(trades, mk.market, side, mk.book), mk.book)):
+                # 1.150.0 (audit FEED-FETCHED-MS): a deep-bid order goes a cent over the best bid of anyone else — onto an
+                # empty price. Here it would go onto a bid: at the very price of the order just cancelled, whose shares
+                # were taken out of this level (sim_own_resting) because the book's levels were taken before Predict
+                # confirmed the cancel — on a book the bot has heard of since the cancel went out (ghost_unsure). That
+                # bid is the cancelled order still shown — then this is the place — or somebody else's, the order
+                # already off the book (the push of a cancel can beat its HTTP confirmation) — then the place is a cent
+                # over it; the book cannot tell which. Placed here beside somebody's 100 it was "pushed off the front"
+                # on the next book, withdrawn, and placed here again, the level read the same way after every cancel: 8
+                # orders and 8 cancels in 30 s, until the cold round's read (before content_ms the next re-send ended
+                # the doubt within the lane's cooldown). So the side waits for a book taken after the confirmation — a
+                # changed push, a REST read asked after it — as the resting order waits on a book that may show itself
+                # (own_unsure, sim_requote_reason). Any other place (a cent over a bid above, down to another level, a
+                # price nobody stands at) is used at once, as ever, and so is this one on a book last heard of before
+                # the cancel went out: that one shows the order for certain
+                ghosted = f"刚撤的单（{cents(price)}）可能还在这份盘口上，分不清 {cents(price)} 的买单是它还是别人的，等撤单确认之后的盘口再挂"
+                sides_seen[side] = {"why": ghosted}
+                continue
             rank = 1
             if (c.sim_maker_deeper and not use_front and sweep is None and not wide
                     and (fair - price < maker_bar - 1e-9 or fair - price <= mk.need)):
@@ -18897,6 +18959,8 @@ class Bot:
                 return None, f"盘后只挂 {cents(limit)} 以下的，可挂的价位 {cents(dear)} 高于它"
             if joined is not None:
                 return None, f"只挂低价挂单：买1 之上 1¢ 的净优势不到 {cents(deep_bar)}（跟买1 也只有 {cents(joined)}）"
+            if ghosted:
+                return None, ghosted
             return None, f"买1 不足 {c.sim_maker_min_bid:g} 份，不跟" if c.sim_maker_min_bid > 0 else "没有可跟的买价"
         if best.edge <= mk.need:
             return None, f"净优势 {cents(best.edge)} 不超过模型误差 {cents(mk.need)}" + cut_note
@@ -19645,13 +19709,22 @@ class Bot:
                         move = (target, f"买1 被顶到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
                 elif price - target >= SIM_MAKER_FOLLOW - 1e-9:
                     move = (target, f"买1 移到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
-                if move is not None and move[0] > price + 1e-9 and own_unsure(trade, mk.book):
+                if move is not None and own_unsure(trade, mk.book) and (
+                        move[0] > price + 1e-9 or bid_shares(mk.book, side, price) >= SIM_MAKER_FRONT_MIN - 1e-9):
                     # 1.150.0 (audit FEED-FETCHED-MS): a book that may show this very order with none of it counted — its
                     # levels taken before Predict's answer (a push beating the HTTP answer, a REST read in flight across
-                    # it), or the request still in flight. The "bid in front" may be the order itself: followed, it was
-                    # withdrawn and placed a cent higher, and that one again (a sweep order the same, over "the bid under
-                    # the threshold"). Held — never moved up — until a book taken after the answer tells the two apart; a
-                    # move down, and every withdrawal above, still goes
+                    # it), or the request still in flight. "The best bid of anyone else" may be the order itself. Up: "a
+                    # bid in front" — followed, it was withdrawn and placed a cent higher, and that one again (a sweep
+                    # order the same, over "the bid under the threshold"). Down: its own shares, fewer than
+                    # SIM_MAKER_MIN_BID (SIM_SHARES under it, an order a limit cut), read as somebody's bid with the best
+                    # ask a cent over it — no room in front, so "join the valid 买1 below": withdrawn, placed where it was,
+                    # and that one withdrawn at first sight (the settle's clock still held the place) — 24 orders and 24
+                    # cancels a minute while the order's own push stood as the book (before content_ms the next re-send
+                    # ended it inside the settle). So on such a book the order is never moved up, and not moved at all
+                    # while the book shows a bid at its price (SIM_MAKER_FRONT_MIN shares: less is dust the rule ignores
+                    # whoever it belongs to): held until a book taken after the answer tells the two apart. A move down
+                    # on a book with no bid at its price (the order is not on it: nothing of its own to mistake) and
+                    # every withdrawal above still go
                     move = None
             key = f"{trade.get('market')}|{side}"
             if move is None:
