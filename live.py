@@ -5229,11 +5229,16 @@ class LiveBot(core.Bot):
         mined, spent, reverted = self.live_redeem_gas_day(now_ms)
         if mined:
             # 1.150.0 (GAS-STATS): what a day of redeems costs and how far the signer's BNB goes — the receipts' own figures
-            # (REDEEM_GAS: no request here); no line before the first redeem with a fee on record
+            # (REDEEM_GAS: no request here); no line before the first redeem with a fee on record. How far it goes is counted
+            # down to LIVE_REDEEM_MIN_BNB_WEI, not down to nothing: under that floor live_redeem_pass sends no redeem at all, so
+            # the whole balance ÷ the average overstated it by floor ÷ average (tens of redeems: hours of wins at a dozen an
+            # hour), and under the floor — the line above saying ⛽ 不足 0.0005，领取交易发不出去 — it still promised some. There
+            # the count is left out: nothing goes out until the wallet is topped up, as the line above says.
             each = spent // mined
+            spare = bnb - self.LIVE_REDEEM_MIN_BNB_WEI if bnb is not None else -1
             lines.append(f"近 24 小时领取 {mined} 笔" + (f"（其中 {reverted} 笔回滚，gas 照付）" if reverted else "")
                          + f"，gas 共 {bnb_text(spent)} BNB（每笔平均 {bnb_text(each)} BNB）"
-                         + (f"；签名钱包 BNB 余额约够 {bnb // each} 笔" if bnb is not None and each > 0 else ""))
+                         + (f"；签名钱包 BNB 余额降到 0.0005（低于它机器人不发领取交易）前约够 {spare // each} 笔" if spare >= 0 and each > 0 else ""))
         if wallet.predict_account:
             lines.append(f"持仓账户 {wallet.maker}（Predict 账户：领取由签名钱包经它的 Kernel 合约执行，领到的 USDT 进这个账户）")
         if not ready:

@@ -2584,12 +2584,14 @@ async def gas_stats():
     assert bot.store.get("live:redeem-sent:826:1") is None and bot.store.get("live:redeemed:826:1") is None
     assert [f[1:] for f in bot.live_redeem_fees(NOW + 60 * MIN)] == [[200_000 * GWEI, 0]] * 2 + [
         [300_000 * GWEI, 0], [100_000 * GWEI, 0], [50_000 * GWEI, 1], [60_000 * GWEI, 1]], bot.live_redeem_fees(NOW + 60 * MIN)
-    # (f) the texts: the check's line under the signer's BNB (0.1 BNB: 659 more at the average); the ⛽ notice with the average
+    # (f) the texts: the check's line under the signer's BNB (0.1 BNB: 656 more at the average before it is down to the 0.0005 under
+    #     which no redeem goes out — GAS-STATS follow-up: it said 659, the whole balance's); the ⛽ notice with the average
     with node_for():
         report = await bot.live_redeem_report(NOW + 70 * MIN)
     lines = report.split("\n")
     at = next(i for i, line in enumerate(lines) if line.startswith("近 24 小时"))
-    assert lines[at] == "近 24 小时领取 6 笔（其中 2 笔回滚，gas 照付），gas 共 0.00091 BNB（每笔平均 0.0001517 BNB）；签名钱包 BNB 余额约够 659 笔", lines[at]
+    assert lines[at] == ("近 24 小时领取 6 笔（其中 2 笔回滚，gas 照付），gas 共 0.00091 BNB（每笔平均 0.0001517 BNB）；"
+                         "签名钱包 BNB 余额降到 0.0005（低于它机器人不发领取交易）前约够 656 笔"), lines[at]
     assert lines[at - 1].startswith("签名钱包 ") and "BNB 0.10000｜够付 gas" in lines[at - 1], lines[at - 1]
     sent = notices(bot)
     bot.live.balance = (1000 * WEI, 10 ** 13, time.time())
@@ -2758,6 +2760,30 @@ async def fields_told_unread():
 
 
 asyncio.run(fields_told_unread())
+
+
+# --- GAS-STATS (follow-up: how far the signer's BNB goes, counted down to the 0.0005 floor) ------------------------------------
+async def gas_stats_floor():
+    """GAS-STATS follow-up: 签名钱包 BNB 余额约够 Z 笔 was the whole balance ÷ the average fee, but under LIVE_REDEEM_MIN_BNB_WEI
+    (0.0005) live_redeem_pass sends no redeem at all. Under the floor the check said ⛽ 不足 0.0005，领取交易发不出去 and right below
+    it 约够 24 笔 (0.00049 BNB, 200k gas × 0.1 gwei a redeem: the owner's state); over it, it overstated by 0.0005 ÷ the average
+    (50 at 0.001 BNB, of which 25 go out). Now counted down to the floor, and left out under it."""
+    bot = await ready_bot()
+    for i in range(3):  # three redeems in the last day, 0.00002 BNB each
+        bot.store.put(*bot.live_redeem_fee_pair(200_000 * GWEI // 10, NOW - (3 - i) * MIN))
+    head = f"签名钱包 {bot.live.wallet.signer}（付 gas）：BNB "
+    day = "近 24 小时领取 3 笔，gas 共 0.00006 BNB（每笔平均 0.00002 BNB）"
+    for bnb, signer, count in ((10 ** 15, "0.00100｜够付 gas", "；签名钱包 BNB 余额降到 0.0005（低于它机器人不发领取交易）前约够 25 笔"),  # (before: 约够 50 笔)
+                               (49 * 10 ** 13, "0.00049｜⛽ 不足 0.0005，领取交易发不出去", ""),  # (before: 约够 24 笔, right under 发不出去)
+                               (5 * 10 ** 14, "0.00050｜够付 gas", "；签名钱包 BNB 余额降到 0.0005（低于它机器人不发领取交易）前约够 0 笔")):
+        bot.live.chain.bnb = bnb
+        lines = (await bot.live_redeem_report(NOW)).split("\n")
+        at = next(i for i, line in enumerate(lines) if line.startswith("近 24 小时"))
+        assert lines[at - 1:at + 1] == [head + signer, day + count], (bnb, lines[at - 1:at + 1])
+    print("GAS_STATS_FLOOR_OK")
+
+
+asyncio.run(gas_stats_floor())
 
 
 print("AUDIT_REDEEM_OK")
