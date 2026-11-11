@@ -11775,6 +11775,23 @@ def trade_driver(trade: dict) -> tuple[str, str]:
     return market_driver(str(trade.get("kind") or ""), str(trade.get("key") or ""), trade.get("settle"), str(trade.get("item") or ""))
 
 
+def driver_may_count(trade: Mapping) -> bool:
+    """Whether a record can ever count again in its driver's group (sim_group_room), for the driver index. 1.150.0 (audit
+    XR-DRIVER-WINDOWS-PERF): since every 15-minute window record settles on its pair's driver (BTCUSDT, not BTC-15M), every
+    BTC/ETH/BNB market's group check — the touch, the ladders, the daily cards, the windows — walked the pair's whole window
+    history, about 8 times per candidate under a binding cap, in the step and on every express push; finished records are
+    never pruned and every window is a new slot, so the walk grew by thousands of records a month and cost milliseconds a call.
+    Settled and expired records never count again: sim_open_order is False for them, and no path moves them back to filled
+    or resting (a fill read late settles them; live_readopt, live_adopted_status and live_finish skip them). A withdrawn
+    paper attempt (cancelled, no real order: no ``live``) never counts either — nothing can fill it. A cancelled record
+    with a real order stays indexed: live_readopt can revive it in place (resting / cancelling) while the index stands.
+    Leaving the others out changes no answer: sim_group_room skipped them anyway."""
+    status = trade.get("status")
+    if status in {"settled", "expired"}:
+        return False
+    return not (status == "cancelled" and not isinstance(trade.get("live"), dict))
+
+
 class TradeMap(dict):
     """The paper trades by id (sim_trades), with an index by market and one by driver, built on first use and dropped
     whenever the map itself changes (a record's status changes; its market, side and driver never do). The decision
@@ -11806,11 +11823,13 @@ class TradeMap(dict):
         return self._ids_by_market.get(market, [])
 
     def of_driver(self, driver: str) -> list[dict]:
-        """The records settling on one driver (trade_driver), in the map's order."""
+        """The records settling on one driver (trade_driver) that may still count in its group (driver_may_count), in the
+        map's order."""
         if self._by_driver is None:
             index: dict[str, list[dict]] = {}
             for t in self.values():
-                index.setdefault(trade_driver(t)[0], []).append(t)
+                if driver_may_count(t):  # 1.150.0: finished records left out (XR-DRIVER-WINDOWS-PERF)
+                    index.setdefault(trade_driver(t)[0], []).append(t)
             self._by_driver = index
         return self._by_driver.get(driver, [])
 
@@ -11865,9 +11884,10 @@ def trade_ids_of_market(trades: Mapping, market: str) -> list[str]:
 
 
 def trades_of_driver(trades: Mapping, driver: str) -> list[dict]:
-    """The records settling on one driver: from the map's index when it has one (TradeMap), else by scanning."""
+    """The records settling on one driver that may still count in its group (driver_may_count): from the map's index when
+    it has one (TradeMap), else by scanning."""
     of = getattr(trades, "of_driver", None)
-    return of(driver) if of is not None else [t for t in trades.values() if trade_driver(t)[0] == driver]
+    return of(driver) if of is not None else [t for t in trades.values() if driver_may_count(t) and trade_driver(t)[0] == driver]
 
 
 def side_held(trades: Mapping, market: str, side: str) -> dict:

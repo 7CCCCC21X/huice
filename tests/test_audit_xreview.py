@@ -357,4 +357,73 @@ def daily_pnl_perf():
 
 
 daily_pnl_perf()
+
+
+def driver_windows_perf():
+    """XR-DRIVER-WINDOWS-PERF: since every 15-minute window record settles on its pair's driver (BTCUSDT), the driver index
+    (TradeMap.of_driver) handed every BTC/ETH/BNB market's group check (sim_group_room) the pair's whole window history —
+    settled, expired, withdrawn paper attempts, never pruned — ~5 ms a call at 50k records, ~8 calls per candidate under a
+    binding cap. The index now holds only the records that may still count (driver_may_count); the group cap's answers stay
+    those of the full walk."""
+    import random, time, types
+    touch = next(s for s in m.TOUCH_MARKETS if s.symbol == "BTCUSDT")
+    card = next(s for s in m.WINDOW_UPDOWN_MARKETS if s.key == "BTC-15M")
+    at = 1_794_000_000_000
+
+    def window(i, status, shares=0.0, order=10.0, live=None, side="up"):
+        spec = card.window_spec(at - i * 900_000)
+        t = {"kind": "updown", "key": "BTC-15M", "market": spec.slug, "side": side, "price": 0.5, "shares": shares, "order": order,
+             "status": status, "settle": {"end": spec.end_ms, "start": spec.start_ms, **card.tag(spec)}, "item": spec.name}
+        if live is not None:
+            t["live"] = live
+        return t
+
+    plain = {}
+    for i in range(200):
+        plain[f"w{i}|up|挂"] = window(i, "settled", shares=10.0)
+    for i in range(50):
+        plain[f"x{i}|up|挂"] = window(i, "expired")
+        plain[f"c{i}|up|挂#1"] = window(i, "cancelled")  # a withdrawn paper attempt: nothing can fill it
+    plain["touch|up|吃"] = {"kind": "touch", "key": touch.key, "market": "btc-touch", "side": "up", "price": 0.3, "shares": 20.0,
+                           "order": 20.0, "status": "filled", "settle": {"deadline": touch.deadline_ms}}
+    assert {m.trade_driver(t)[0] for t in plain.values()} == {"BTCUSDT"}
+    tm = m.TradeMap(plain)
+    got = m.trades_of_driver(tm, "BTCUSDT")
+    assert got == [plain["touch|up|吃"]], f"the driver index walks {len(got)} records, 1 can count"
+    assert m.trades_of_driver(dict(plain), "BTCUSDT") == got  # the scan says the same
+    # a withdrawn record whose real order is done stays: live_readopt can revive it in place while the index stands
+    plain["r|up|挂"] = window(0, "cancelled", live={"state": "done"})
+    assert plain["r|up|挂"] in m.TradeMap(plain).of_driver("BTCUSDT")
+
+    # the group cap's answers: the index against the full walk of every record of the driver, over random records
+    class Full(dict):
+        def of_driver(self, driver):
+            return [t for t in self.values() if m.trade_driver(t)[0] == driver]
+
+    rnd = random.Random(7)
+    bot = types.SimpleNamespace(config=types.SimpleNamespace(sim_group_usd=40.0), sim_resting_cost=lambda t: float(t.get("price") or 0),
+                                sim_group_order=lambda mk, price, shares, taker=None: (price, shares))
+    mk = m.SimMarket("t", "BTC 先触", "touch", touch.key, 0.5, None, 0.0, "", ("x", "y"), {"deadline": touch.deadline_ms})
+    refusals = 0
+    for it in range(1500):
+        recs = {}
+        for j in range(rnd.randint(0, 12)):
+            order = rnd.choice([10.0, 50.0, 100.0])
+            live = None
+            if rnd.random() < 0.5:
+                live = {"state": rnd.choice(["done", "open", "cancelling", "pending", "unknown", "placing"]), "order_id": "1"}
+                if rnd.random() < 0.3:
+                    live["fills_pending"] = time.time() * 1000
+            recs[f"r{j}|挂"] = window(rnd.randint(-3, 3), rnd.choice(["filled", "resting", "cancelled", "settled", "expired"]),
+                                      shares=rnd.choice([0.0, order / 2, order]), order=order, live=live, side=rnd.choice(["up", "down"]))
+            recs[f"r{j}|挂"]["price"] = rnd.random()
+        side, price, shares = rnd.choice(["up", "down"]), rnd.random(), rnd.choice([10.0, 60.0, 100.0])
+        want = m.Bot.sim_group_room(bot, Full(recs), mk, side, price, shares)
+        assert m.Bot.sim_group_room(bot, m.TradeMap(recs), mk, side, price, shares) == want, (it, recs)
+        assert m.Bot.sim_group_room(bot, dict(recs), mk, side, price, shares) == want, (it, recs)
+        refusals += bool(want)
+    assert refusals > 100, refusals
+
+
+driver_windows_perf()
 print("AUDIT_XREVIEW_OK")
