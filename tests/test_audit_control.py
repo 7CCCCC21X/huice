@@ -708,4 +708,163 @@ async def ctrl_live_allowed_failopen():
 
 
 asyncio.run(ctrl_live_allowed_failopen())
+
+
+async def ctrl_config_runtime():
+    """CTRL-CONFIG-RUNTIME: Bot.apply_config swapped self.config while three things built from the start-up configuration
+    kept it until a restart — the stock feed (StockMarket.config: the tickers refresh_live asks for and live_quote serves),
+    each 15-minute stock card's exchange quote (lead_code / lead_mode, set once in __init__) and the index cards' σ factors
+    (VolBook.calib). So PREOPEN_15M / PREOPEN_MARKETS changed on the page (改动即时生效; /preopen on and 恢复环境变量 alike)
+    for a stock card whose pair has no ticker in SYMBOLS — 智谱 by default, SK 海力士 / 宇树 where SYMBOLS leaves them out —
+    started real pre-open quotes on a card whose exchange quote was neither fetched nor routed: the limit / halt guard
+    found nothing to judge and held nothing, with nothing saying so. And SIGMA_CALIB=off (or on) reached the index cards
+    only at the next index close. Now a change reaches all three at once, as a restart would build them."""
+    import datetime as dt, math
+    import preopen as p
+    D = m.D
+    now = int(dt.datetime(2026, 11, 6, 10, 0, tzinfo=m.BEIJING).timestamp() * 1000)  # a Friday, 11:00 in Seoul: KRX, SSE and HKEX all in continuous trading
+    quiet = {"TELEGRAM_BOT_TOKEN": "1:x", "STATE_DB": ":memory:", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SSE_INDEX": "off",
+             "HL_TICKERS": "off", "HL_INDEX": "off"}
+    spec = lambda key: next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == key)
+
+    async def nothing(*args, **kwargs): return None
+
+    def lead_lines_only(bot):  # refresh_updown's own lines (each card handed its exchange quote: note_lead), with no candle read and no window rolled
+        bot.updown_strike, bot.updown_roll = nothing, lambda now_ms: None
+        for mkt in bot.updowns.values():
+            mkt.refresh = nothing
+
+    # (a) end to end on the class the pre-open mode runs in. SYMBOLS leaves SK 海力士 out and the mode is off at the start;
+    # the page switches it on for 海力士 and 智谱. 海力士 trades 0.8% under its limit up, 智谱's last trade is 4 minutes old
+    env = {**quiet, "SYMBOLS": "CXMTUSDT", "LIVE": "on", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, "PREDICT_API_KEY": "k"}  # a made-up key, never a real one
+    store = m.Store(":memory:")
+    bot = L.LiveBot(m.Config.from_env(env), store, FM(now), None)
+    bot.live.api, bot.live.chain = FakeApi(), FakeChain()
+
+    class Mode(p.Controller):  # the real controller, started by the page's change; its loop is not run (nothing is sent anywhere)
+        async def run(self): await self.stop.wait()
+
+    bot.preopen_factory = Mode
+    sk, zh = bot.updowns["SKHYNIX-15M"], bot.updowns["ZHIPU-15M"]
+    assert sorted(bot.stocks.config.tickers) == ["CXMTUSDT"] and (sk.lead_code, sk.lead_mode, zh.lead_code, zh.lead_mode) == ("", "off", "", "off")
+    r = await bot.control_action({"action": "set", "values": {"PREOPEN_15M": "on", "PREOPEN_MARKETS": "skhynix,zhipu"}})  # the page's save
+    assert r["ok"] and "PREOPEN_15M=on" in r["message"], r
+    for _ in range(200):  # LiveBot.apply_config starts the mode on the change (preopen_apply)
+        await asyncio.sleep(0.01)
+        if bot.preopen is not None:
+            break
+    ctl = bot.preopen
+    try:
+        assert isinstance(ctl, Mode) and ctl.settings.markets == {"SKHYNIX-15M", "ZHIPU-15M"}, ctl
+        # the stock feed asks for the two stocks now, and the cards have their exchange codes (both stayed at the start-up state)
+        assert sorted(bot.stocks.config.tickers) == ["CXMTUSDT", "SKHYNIXUSDT", "ZHIPUUSDT"], sorted(bot.stocks.config.tickers)
+        assert (sk.lead_code, sk.lead_mode, zh.lead_code, zh.lead_mode) == ("000660", "on", "02513", "on"), (sk.lead_code, sk.lead_mode, zh.lead_code, zh.lead_mode)
+        asked = []
+
+        async def feeds(url, timeout=15, headers=None):  # Naver's KRX quote, Tencent's HK one; nothing else answers
+            asked.append(url)
+            if "domestic/stock/000660" in url:
+                return json.dumps({"datas": [{"stockName": "SK하이닉스", "closePrice": "129,000", "compareToPreviousClosePrice": "29,000",
+                                              "compareToPreviousPrice": {"code": "2"}, "fluctuationsRatio": "29.00",
+                                              "localTradedAt": "2026-11-06T10:59:55+09:00", "marketStatus": "OPEN"}]}).encode()
+            if "gtimg" in url and "r_hk02513" in url:
+                return ('v_r_hk02513="100~智谱~02513~119.00~100.00~101.00~' + "~".join(["0"] * 24) + '~2026/11/06 09:56:00~x";').encode("gbk")
+            raise m.RemoteError("offline")
+
+        m.SOURCE_HEALTH.hosts.clear()  # (no source cooling from an earlier case of this file)
+        real, m.http_get = m.http_get, feeds
+        try:
+            await bot.stocks.refresh_live(now, force=True)  # the feed's own round (every second while a stock trades)
+        finally:
+            m.http_get = real
+            m.SOURCE_HEALTH.hosts.clear()
+        assert any("domestic/stock/000660" in url for url in asked) and any("r_hk02513" in url for url in asked), asked
+        assert bot.stocks.live_quote("SKHYNIXUSDT", now)[0].last == D("129000") and bot.stocks.live_quote("ZHIPUUSDT", now)[0].last == D("119")
+
+        lead_lines_only(bot)
+        await bot.refresh_updown(now)
+        assert sk.lead is not None and (sk.lead.last, sk.lead.prev_close) == (D("129000"), D("100000")), sk.lead
+        assert zh.lead is not None and zh.lead.quoted_ms == now - 4 * 60_000, zh.lead
+        # ...and the mode's guard judges on it: both are held (was: no exchange quote, nothing judged, the quotes stayed up)
+        assert "现价 129,000.00 距涨停 130,000.00 不足 2%" in ctl.card_hold(spec("SKHYNIX-15M")), ctl.card_hold(spec("SKHYNIX-15M"))
+        assert "成交时间 4 分钟没动" in ctl.card_hold(spec("ZHIPU-15M")), ctl.card_hold(spec("ZHIPU-15M"))
+        await ctl.check_cards(now)  # the check the mode's loop runs: the held card's windows are passed by, its resting pairs withdrawn
+        assert "距涨停 130,000.00" in ctl.card_holds.get("SKHYNIX-15M", ""), ctl.card_holds
+        # a restart on the same database builds the very same routing
+        again = L.LiveBot(m.Config.from_env(env), store, FM(now), None)
+        assert sorted(again.stocks.config.tickers) == sorted(bot.stocks.config.tickers)
+        assert [(c.lead_code, c.lead_mode) for c in (again.updowns["SKHYNIX-15M"], again.updowns["ZHIPU-15M"])] == [("000660", "on"), ("02513", "on")]
+    finally:
+        await bot.preopen_stop("测试结束")
+
+    # (b) the default deployment: 智谱 is the one stock card whose pair is not in the default SYMBOLS. Added on the page while
+    # the mode runs on BTC, taken out, 一键全开, 恢复环境变量: the feed and the card follow each time (out: no quote left standing)
+    bot = m.Bot(m.Config.from_env({**quiet, "PREOPEN_15M": "on", "PREOPEN_MARKETS": "btc"}), m.Store(":memory:"), FM(now), None)
+    zh, sk = bot.updowns["ZHIPU-15M"], bot.updowns["SKHYNIX-15M"]
+    routed = lambda: ("ZHIPUUSDT" in bot.stocks.config.tickers, zh.lead_code, zh.lead_mode)
+    halted = m.IndexQuote("智谱", D("119"), D("100"), None, None, None, now - 4 * 60_000, "腾讯", "", now)
+    assert routed() == (False, "", "off") and (sk.lead_code, sk.lead_mode) == ("000660", "on")  # 海力士 is in the default SYMBOLS
+    assert bot.control_set({"PREOPEN_MARKETS": "btc,zhipu"})["ok"] and routed() == (True, "02513", "on"), routed()
+    bot.stocks.live["ZHIPUUSDT"] = zh.lead = halted
+    assert bot.stocks.live_quote("ZHIPUUSDT", now) == (halted, "")
+    assert bot.control_set({"PREOPEN_MARKETS": "btc"})["ok"] and routed() == (False, "", "off") and zh.lead is None, routed()
+    assert bot.stocks.live_quote("ZHIPUUSDT", now) == (None, "") and (sk.lead_code, sk.lead_mode) == ("000660", "on")
+    assert bot.control_set({"PREOPEN_MARKETS": "all"})["ok"] and routed() == (True, "02513", "on"), routed()
+    r = await bot.control_action({"action": "reset"})
+    assert r["ok"] and routed() == (False, "", "off") and bot.config.preopen.markets == {"BTC-15M"}, (r, routed())
+    # a card whose ticker neither came nor went is left as it is: LEAD_QUOTE's change still reaches it in refresh_updown, which
+    # sees the price move from the exchange-led one to the index and wakes the trader (set at the save, that wake was lost)
+    store = m.Store(":memory:")
+    bot = m.Bot(m.Config.from_env(quiet), store, FM(now), None)
+    sk = bot.updowns["SKHYNIX-15M"]
+    store.put(f"updown:{sk.spec.slug}:start", {"open": sk.spec.start_ms, "close": "100.0000", "read_ms": now})  # the window's line
+    store.put(f"updown:{sk.spec.slug}:lead", {"price": "100000", "at": sk.spec.start_ms + 60_000, "read_ms": now, "source": "Naver"})  # the exchange price then
+    sk.price, sk.index_ms = D("100.0000"), now  # the index flat, the stock +0.3% at its exchange
+    bot.stocks.live["SKHYNIXUSDT"] = m.IndexQuote("SK海力士", D("100300"), D("99000"), None, None, None, now - 1_000, "Naver", "交易中", now)
+    woken = []
+    bot.priced = lambda keys: woken.append(sorted(keys))
+    lead_lines_only(bot)
+    await bot.refresh_updown(now)
+    assert sk.effective(now) == (D("100.3000"), "交易所现价先行 +0.30%") and woken == [["SKHYNIX-15M"]], (sk.effective(now), woken)
+    woken.clear()
+    assert bot.control_set({"LEAD_QUOTE": "off"})["ok"]
+    await bot.refresh_updown(now)
+    assert sk.effective(now) == (D("100.0000"), "") and sk.lead_mode == "off" and woken == [["SKHYNIX-15M"]], (sk.effective(now), sk.lead_mode, woken)
+
+    # (c) SIGMA_CALIB: the index cards' σ factors (VolBook.get applies whatever calib holds) follow the switch at once
+    def seeded():
+        rows = m.Store(":memory:")
+        for i in range(25):  # 25 days moving 2% against a 1% σ (test_calib's rows): the residuals say ×1.87
+            day = (dt.date(2026, 7, 1) + dt.timedelta(days=i)).isoformat()
+            rows.put(f"outcome:KOSPI:{day}", 3300.0 * math.exp(0.02 * (1 if i % 2 else -1)))
+            rows.put(f"pred:KOSPI:{9_000_000 + i}", {"key": "KOSPI", "t": 9_000_000 + i, "target": day, "mode": "盘中", "ref": 3300.0,
+                                                     "up": 0.5, "move": 0.0, "beta": 1.0, "sigma": 0.01, "R": 1.0})
+        return rows
+
+    kbot = m.Bot(m.Config.from_env(quiet), seeded(), FM(now), None)
+    sigma = lambda: kbot.vols.get("KOSPI", "KOSPI", intraday=True)
+    on = sigma()
+    assert "快照残差校准 ×1.87" in on[1], on
+    scans, measure = [], kbot.index_sigma_calibs
+    kbot.index_sigma_calibs = lambda: scans.append(1) or measure()  # each measuring reads every snapshot on disk: counted
+    r = kbot.control_set({"SIGMA_CALIB": "off"})
+    off = sigma()
+    assert r["ok"] and not kbot.config.sigma_calib and kbot.vols.calib == {} and "校准" not in off[1], (r, kbot.vols.calib, off)  # was: ×1.87 until the next close
+    assert abs(on[0] / off[0] - 1.87) < 0.01 and not scans, (on, off, scans)
+    assert kbot.control_set({"SIGMA_CALIB": "on"})["ok"] and sigma() == on and len(scans) == 1, (sigma(), scans)  # was: no factor until the next close
+    assert kbot.control_set({"SIM_EDGE_CENTS": "12"})["ok"] and sigma() == on and len(scans) == 1, scans  # another setting's save measures nothing
+    r = await kbot.control_action({"action": "reset"})
+    assert r["ok"] and sigma() == on and len(scans) == 1, scans
+    kbot = m.Bot(m.Config.from_env({**quiet, "SIGMA_CALIB": "off"}), seeded(), FM(now), None)  # off in the environment, on on the page
+    assert kbot.vols.calib == {} and kbot.control_set({"SIGMA_CALIB": "on"})["ok"] and sigma() == on, sigma()
+    r = await kbot.control_action({"action": "reset"})  # 恢复环境变量: off again, the factors with it
+    assert r["ok"] and not kbot.config.sigma_calib and kbot.vols.calib == {} and sigma() == off, (r, sigma())
+
+    def broken(): raise ValueError("a snapshot that does not read")
+    kbot.index_sigma_calibs = broken  # a measuring that fails never keeps a save from taking effect: the estimates alone, as at a start
+    r = kbot.control_set({"SIGMA_CALIB": "on", "SIM_EDGE_CENTS": "12"})
+    assert r["ok"] and kbot.config.sigma_calib and kbot.config.sim_edge == 0.12 and kbot.vols.calib == {}, r
+
+
+asyncio.run(ctrl_config_runtime())
 print("AUDIT_CONTROL_OK")

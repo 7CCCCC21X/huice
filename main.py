@@ -15465,9 +15465,7 @@ class Bot:
                 continue  # a US stock's touch market (1.146.0): Yahoo's prices, nothing on Binance
             if isinstance(card, IndexUpDownMarket) and card.VENUE == "futures":  # a spot window (BTC 15分涨跌) is priced by its pair's trades
                 self.index_markets.setdefault(card.spec.symbol, []).append(card)
-                ticker = config.tickers.get(card.spec.symbol)  # LEAD_QUOTE: the stock's exchange quote (StockMarket.live_quote) leads the index
-                card.lead_code = ticker.code if ticker is not None else ""
-                card.lead_mode = config.lead_quote if ticker is not None else "off"
+                self.lead_route(card, config)  # LEAD_QUOTE: the stock's exchange quote (StockMarket.live_quote) leads the index
                 continue
             self.pair_markets.setdefault(("spot", card.spec.symbol), []).append(card)
         for rm in self.ranges.values():
@@ -22097,11 +22095,52 @@ class Bot:
                      f"日亏损停机线 ${value('LIVE_MAX_DAILY_LOSS_USD')}。请在控制台核对。")
         return "\n".join(lines)
 
+    @staticmethod
+    def lead_route(card: "IndexUpDownMarket", config: Config) -> None:
+        """A 15-minute index card's exchange quote as ``config`` has it, at the start and again whenever the configuration
+        changes (apply_config): the stock's code and LEAD_QUOTE's mode while the card's pair has an exchange ticker — in
+        SYMBOLS, or added for a stock card the pre-open mode quotes (Config.from_env) — else none and off. refresh_updown
+        hands a card its quote (note_lead) only while lead_code is set, and the pre-open mode's limit / halt guard judges
+        on that very quote (Controller.card_hold reads card.lead). A card whose ticker neither came nor went is left as it
+        is: on a routed card LEAD_QUOTE's mode stays refresh_updown's to set each round (it sees the price the change moves
+        and wakes the trader for it)."""
+        ticker = config.tickers.get(card.spec.symbol)
+        code = ticker.code if ticker is not None else ""
+        if code == card.lead_code:
+            return
+        card.lead_code, card.lead_mode = code, config.lead_quote if ticker is not None else "off"
+        if ticker is None:
+            card.lead = None  # its ticker gone: nothing reads a quote for it any more, the last one in hand must not stand
+
     def apply_config(self, config: Config) -> None:
-        """A changed configuration takes effect: every loop reads self.config at use."""
+        """A changed configuration takes effect: every loop reads self.config at use, and what the start built from a
+        setting the control page can change (the stock feed's tickers, the 15-minute stock cards' exchange quote, the index
+        cards' σ factors) is brought to the new configuration here, as a restart would build it."""
+        before = self.config
         self.config = config
         self.predict.config = config  # the orderbook feed keeps its own reference (PREDICT_POLL_SECONDS)
         SOURCE_HEALTH.off = config.sources_off  # the quote feeds read the switch from here
+        # 1.150.0 (audit CTRL-CONFIG-RUNTIME): three more things were built from the start-up configuration and kept it until
+        # the next restart. PREOPEN_15M / PREOPEN_MARKETS add the exchange ticker of a stock card the pre-open mode quotes
+        # whose pair is not in SYMBOLS (Config.from_env, 1.134.0: 智谱 by default; SK 海力士 / 宇树 where SYMBOLS leaves them
+        # out), for that mode's limit / halt guard. Switched on the page (改动即时生效), by /preopen on or by a reset, the
+        # mode began quoting the card for real while the stock feed went on asking for the start-up tickers alone and the
+        # card had no quote routed (lead_code, set once in __init__): the guard found no exchange quote — nothing to judge
+        # — so neither the limit rule nor the halt rule applied, and nothing said so (a stock never asked for is never in
+        # error). And SIGMA_CALIB reached the index cards' σ only at the next index close (note_outcome), up to a weekend
+        # away: VolBook.get applies whatever factors it holds.
+        self.stocks.config = config  # the stock feed: the tickers it asks for (refresh_live, refresh) and serves (live_quote)
+        # each 15-minute stock card's exchange quote, as __init__ routes it. A card that gains a ticker here is from then on
+        # also priced with LEAD_QUOTE by the model trader, exactly as after a restart (the window under way by note_lead's
+        # rule for a bot that came late: on the index alone, unless the stock has not traded since the window's start)
+        for cards in self.index_markets.values():
+            for card in cards:
+                self.lead_route(card, config)
+        if config.sigma_calib != before.sigma_calib:  # on a change of the switch alone: measuring reads every snapshot on disk
+            self.vols.calib = {}
+            if config.sigma_calib:
+                with contextlib.suppress(Exception):  # as at the start: the estimates alone until the next outcome measures again
+                    self.vols.calib = self.index_sigma_calibs()
 
     def control_value(self, key: str) -> str:
         """A control setting's value in force, as the variable would be written."""
