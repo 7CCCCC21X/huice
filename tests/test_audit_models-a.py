@@ -1279,4 +1279,185 @@ async def _nvc_live() -> None:
 asyncio.run(_nvc_live())
 m.fetch_source = _nv_fetch
 
+
+# --- MOD-DEADLINE-TEXT: a US stock's "hits $X by <date>" card (StockRangeMarket) takes the end of its window from the date
+# Predict's title, question or rules name (deadline_from_text). A month followed by its year and no day lost both — "by June
+# 2027", "by the end of December 2026": the day's one or two digits were the year's "20" and no year was left, so the end was
+# the 20th of the creation year or the next. Ten days early, or a year ("by December 2027" read in November 2026: 2026-12-20).
+# The card priced to that end: NVDA at 270 against $300 with thirteen months to run was 43% where it is 78%, and with
+# Predict's book where the true end has it (76¢ / 80¢) the trader bought the No side at 24¢ as worth 57¢. From the 21st the
+# card said 窗口已结束 with Predict's market still open and settled the paper trades on it as No; LADDER_DEADLINES pinning
+# the true date matched no market (nothing priced). Now a day is one or two digits with no digit after them: "by <month>
+# <year>" is that month's last day, and a month and a year with no "by" name no deadline (the next text decides, or the
+# card waits for the pin). main lists no US stock today (STOCK_HIT_MARKETS is empty): the market below is this section's,
+# listed the way the next one will be ----
+DL_JUN = int(dt.datetime(2026, 6, 18, 0, 16, 20, tzinfo=dt.timezone.utc).timestamp() * 1000)  # a market made in June (06-17 20:16 ET, as STRC's was)...
+DL_NOV = m.et_wall_ms(dt.date(2026, 11, 10), 10, 0)                                            # ...and one made late in the year
+DL_RULES = ('This market will resolve to "Yes" if any TradingView 1 minute candle for NVDA between market creation and the listed '
+            'date, 11:59 PM ET, has a final “High” value of at least $300. Otherwise, this market will resolve to "No."')  # (names no date)
+
+
+def _dl_end(year: int, month: int, day: int) -> int:
+    return m.et_wall_ms(dt.date(year, month, day), 23, 59)
+
+
+def _dl_read(*texts: str, created: int = DL_NOV) -> str:
+    """The deadline the texts name, as its date ("" when they name none): 23:59 ET of it."""
+    got = m.deadline_from_text(list(texts), created)
+    assert got == 0 or got == m.et_wall_ms(m.et_date(got), 23, 59), got
+    return f"{m.et_date(got):%Y-%m-%d}" if got else ""
+
+
+# "by <month> <year>": the month's last day, of the year named — whenever the market was made
+for text, created, want in (
+        ("Will NVDA hit $300 by June 2027?", DL_JUN, "2027-06-30"),      # was 2026-06-20: a year and ten days early
+        ("Will NVDA hit $300 by June 2027?", DL_NOV, "2027-06-30"),      # was 2027-06-20
+        ("Will NVDA hit $300 by December 2027?", DL_NOV, "2027-12-31"),  # was 2026-12-20: a year early
+        ("by December 2026", DL_JUN, "2026-12-31"), ("by the end of December 2026", DL_JUN, "2026-12-31"),  # (these: the 20th)
+        ("Will STRC hit $100 by Dec 2026?", DL_JUN, "2026-12-31"), ("by Dec. 2026", DL_JUN, "2026-12-31"), ("By DECEMBER 2026", DL_JUN, "2026-12-31"),
+        ("through November 2026", DL_JUN, "2026-11-30"), ("until the end of November 2026", DL_JUN, "2026-11-30"),
+        ("by end of February 2028", DL_NOV, "2028-02-29"), ("by February 2027", DL_NOV, "2027-02-28"),  # the named year's own February
+        ("by June 2026", DL_NOV, "2026-06-30"),  # a year named is that year, over or not: nothing rolls forward (was 2027-06-20)
+        ("by December 2026, 11:59 PM ET", DL_JUN, "2026-12-31"), ("by December 2026 11:59 PM ET", DL_JUN, "2026-12-31"),
+        ("by June, 2028", DL_NOV, "2028-06-30"), ("by June , 2028", DL_NOV, "2028-06-30")):  # (the comma kept the year whole before, too)
+    assert _dl_read(text, created=created) == want, (text, _dl_read(text, created=created))
+# "before <month>": read with a year as it is with none (the same month; the fix decides nothing about that word)
+assert _dl_read("before December 2026", created=DL_JUN) == _dl_read("before December", created=DL_JUN) != "", _dl_read("before December 2026", created=DL_JUN)
+# a month and a year with no "by" name no deadline, as a month alone never did (test_guard's "in January") — each was the 20th
+for text in ("June 2027", "December 2027", "Dec 2026", "Will NVDA hit $300 in June 2027?", "in December 2026", "by 30 June 2027", "by mid-June 2027"):
+    assert _dl_read(text) == _dl_read(text, created=DL_JUN) == "", (text, _dl_read(text), _dl_read(text, created=DL_JUN))
+# ...so the next text decides: Predict titles such a market by its deadline alone, the question says "by"; and a month with
+# its day further on in the same text is read, the month and year before it passed over
+assert _dl_read("December 2027", "Will NVDA hit $300 by December 2027?") == "2027-12-31"  # was 2026-12-20, off the title
+assert _dl_read("June 2027", "Will NVDA hit $300 in June 2027?", "", "between market creation and June 30, 2027, 11:59 PM ET") == "2027-06-30"
+assert _dl_read("listed in June 2026, it ends on December 31") == "2026-12-31"            # was 2027-06-20
+# a day that is one stays one: with a year or none, an ordinal, a real 20th, Predict's own "June 30" titles (unchanged)
+for text, created, want in (
+        ("by June 20, 2027", DL_NOV, "2027-06-20"), ("by June 20 2027", DL_NOV, "2027-06-20"), ("by June 20", DL_NOV, "2027-06-20"),
+        ("by June 20th", DL_JUN, "2026-06-20"), ("by June 2nd, 2027", DL_NOV, "2027-06-02"), ("by June 2", DL_JUN, "2027-06-02"),
+        ("by Dec. 31st, 2026", DL_JUN, "2026-12-31"), ("June 30", DL_JUN, "2026-06-30"), ("June 20, 2027", DL_NOV, "2027-06-20"),
+        ("December 31, 2027", DL_NOV, "2027-12-31"), ("by December", DL_JUN, "2026-12-31"), ("by the end of September", DL_JUN, "2026-09-30")):
+    assert _dl_read(text, created=created) == want, (text, _dl_read(text, created=created))
+assert _dl_read("June 30", "Will STRC hit $100 by June 30?") == "2027-06-30"
+# a month word with no day and no "by" is nothing, and no error: the bare-month pattern's day stays required (made optional
+# too — the finding's own fix, read to the letter — int(None) left choose and learn as a TypeError, into the Predict refresh)
+for text in ("in January", "the price may rise", "May", "December", "by which the committee may decide"):
+    assert _dl_read(text) == "", (text, _dl_read(text))
+
+# --- the card: its window as learnt from Predict's listing, the market chosen among the deadlines listed, the pin ------
+DL_SPEC = m.RangeSpec("NVDA-300", "nvda-hits-300-by-x", "NVDA", "nasdaq", "NVDA 触及 $300", 0, 0)
+DL_DEC26, DL_DEC27 = _dl_end(2026, 12, 31), _dl_end(2027, 12, 31)
+
+
+def _dl_row(mid: str, title: str, question: str) -> m.LadderRow:
+    return m.LadderRow(D("300"), mid, title, None, "", question)
+
+
+def _dl_meta(*mids: str) -> dict:
+    """Predict's details of the markets: made on 11-10, their rules naming no date."""
+    return {mid: ({"created_ms": DL_NOV, "question": "", "rules": DL_RULES, "outcomes": ["Yes", "No"], "status": "OPEN"}, 0) for mid in mids}
+
+
+dl26 = _dl_row("61", "December 2026", "Will NVDA hit $300 by December 2026?")
+dl27 = _dl_row("62", "December 2027", "Will NVDA hit $300 by December 2027?")
+dl_store = m.Store(":memory:")
+dl_card = m.StockRangeMarket(dl_store, DL_SPEC)
+dl_card.learn([dl27], _dl_meta("62"))
+assert dl_card.known() and (dl_card.start_ms, dl_card.end_ms) == (DL_NOV, DL_DEC27), m.et_date(dl_card.end_ms)  # was 2026-12-20
+assert dl_store.get(f"range:{DL_SPEC.slug}:window") == {"start": DL_NOV, "end": DL_DEC27, "title": "December 2027"}
+assert dl_card.close_label().startswith("12-31 23:59 ET"), dl_card.close_label()
+# one question listed once per deadline: the card keeps the latest still ahead (both were 2026-12-20: the first listed was kept)
+assert [r.market_id for r in dl_card.choose([dl26, dl27], _dl_meta("61", "62"))] == ["62"]
+# LADDER_DEADLINES pinning a true date finds its market (it matched none — "列出的截止日：2026-12-20" — and nothing was priced)
+for pin, mid in ((DL_DEC27, "62"), (DL_DEC26, "61")):
+    dl_pin = m.StockRangeMarket(m.Store(":memory:"), DL_SPEC, pin)
+    assert [r.market_id for r in dl_pin.choose([dl26, dl27], _dl_meta("61", "62"))] == [mid] and dl_pin.pin_missing == "", dl_pin.pin_missing
+# a listing that says the month and the year and nowhere "by": not read. The card waits for a deadline rather than price to a
+# 20th, and the pin is that market's deadline (1.83.1's rule for the one market whose title names no date)
+dl_bare = _dl_row("63", "June 2027", "Will NVDA reach $300 in June 2027?")
+dl_card = m.StockRangeMarket(m.Store(":memory:"), DL_SPEC)
+dl_card.learn(dl_card.choose([dl_bare], _dl_meta("63")), _dl_meta("63"))
+assert (dl_card.start_ms, dl_card.end_ms) == (DL_NOV, 0) and not dl_card.known(), m.et_date(dl_card.end_ms)     # was 2027-06-20
+assert dl_card.advice_problem(DL_NOV) == "等待 Predict 的创建时间和截止日期；暂不给建议" and dl_card.probability(D("300"), "up", DL_NOV) is None
+dl_pin = m.StockRangeMarket(m.Store(":memory:"), DL_SPEC, _dl_end(2027, 6, 30))
+assert dl_pin.choose([dl_bare], _dl_meta("63")) == [dl_bare] and dl_pin.pin_missing == "", dl_pin.pin_missing  # was: 列出的截止日：2027-06-20
+dl_pin.learn([dl_bare], _dl_meta("63"))
+assert dl_pin.known() and dl_pin.end_ms == _dl_end(2027, 6, 30)
+
+
+# --- the bot: the card's price, the paper trader's market and what it buys are those of the true end -------------------
+def _dl_bot(now: int, row: m.LadderRow, price: str, bid: str, ask: str) -> tuple:
+    """A bot with the stock market listed and Predict's one market of it (its book: bid / ask of the Yes side), the window
+    learnt as refresh_ranges learns it, the card's price and σ (45%) as its reads of Yahoo would leave them; the paper
+    trader on the price ladders, the rest of its settings the defaults."""
+    bot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                   "SIM_MARKETS": "range"}), m.Store(":memory:"), _Clock(now), None)
+    card = bot.ranges[DL_SPEC.key]
+    book = m.PredictBook(DL_SPEC.key, DL_SPEC.slug, row.market_id, row.title, ((D(bid), D("500")),), ((D(ask), D("500")),), now, 200)
+    bot.predict.market_meta[row.market_id] = ({"created_ms": DL_NOV, "question": row.question, "rules": DL_RULES, "outcomes": ["Yes", "No"],
+                                               "status": "OPEN"}, time.monotonic())
+    bot.predict.ladders[DL_SPEC.key] = card.choose([m.dataclasses.replace(row, book=book)], bot.predict.market_meta)
+    card.learn(bot.predict.ladders[DL_SPEC.key], bot.predict.market_meta)
+    card.price, card.priced_ms, card.fetched_ms, card.sigma, card.sigma_ms, card.scanned_ms = D(price), now, now, 0.45, now, now
+    return bot, card
+
+
+def _dl_bought(bot: m.Bot, now: int) -> list:
+    """What the paper trader buys on the market: looked at now and 31 s later (a taker's edge on a price ladder has to
+    hold SIM_TAKER_HOLD_RANGE_SECONDS, 30 s), by the step and by the express lane."""
+    return [(t["label"], t["status"]) for t in _looks(bot, DL_SPEC.key, now, now + 31_000).values()]
+
+
+dl_listed, m.STOCK_HIT_MARKETS = m.STOCK_HIT_MARKETS, (DL_SPEC,)
+try:
+    # 2026-11-12 14:00 ET, NVDA 270.00, "$300 by December 2027": thirteen months to run, 78%. Priced to 2026-12-20 it was 43%
+    dl_at = m.et_ms(2026, 11, 12, 14, 0, -5)
+    dl_fair = m.hit_probability(270.0, 300.0, 0.45, m.us_trading_years(dl_at, DL_DEC27 + 60_000))
+    dl_short = m.hit_probability(270.0, 300.0, 0.45, m.us_trading_years(dl_at, _dl_end(2026, 12, 20) + 60_000))  # the model, to the misread end
+    assert 0.42 < dl_short < 0.45 and 0.77 < dl_fair < 0.79, (dl_short, dl_fair)
+    # Predict at 55¢ / 57¢: the Yes side at 57¢ is 21¢ under its worth — the card says 吃Yes and the trader buys it (was: the
+    # No side at 45¢, taken for 12¢ under its worth, suggested and bought)
+    dl_bot, dl_card = _dl_bot(dl_at, dl27, "270", "0.55", "0.57")
+    dl_mk, = dl_bot.sim_markets(dl_at, only=DL_SPEC.key)
+    assert dl_card.end_ms == dl_mk.settle["end"] == DL_DEC27 and dl_mk.hold == "" and dl_mk.fair_up == dl_fair, (m.et_date(dl_card.end_ms), dl_mk.fair_up)
+    dl_item = dl_bot.range_payload(dl_card, dl_at)
+    assert dl_item["close_ms"] == DL_DEC27 and dl_item["close_label"].startswith("12-31 23:59 ET") and dl_item["ladder"]["hold"] == "", dl_item["close_label"]
+    assert dl_item["ladder"]["question"].startswith("NVDA 在 12-31 23:59 ET"), dl_item["ladder"]["question"]
+    dl_level, = dl_item["ladder"]["rows"]
+    assert dl_level["fair"] == dl_fair and [e["label"] for e in dl_level["edges"] if e["best"]] == ["吃Yes"], dl_level["edges"]  # was 吃No
+    assert _dl_bought(dl_bot, dl_at) == [("吃Yes", "filled")], dl_bot.sim_trades()  # was 吃No
+    # Predict at 76¢ / 80¢, where the true end has it: no side has an edge and nothing is bought (was: 300 No at 24¢, taken
+    # for worth 57¢ — an edge the misread end alone made; with LIVE on, a real order)
+    dl_bot, dl_card = _dl_bot(dl_at, dl27, "270", "0.76", "0.80")
+    dl_mk, = dl_bot.sim_markets(dl_at, only=DL_SPEC.key)
+    assert dl_mk.fair_up == dl_fair and dl_mk.hold == "" and dl_bot.sim_taker_gap(dl_mk, {}, dl_at)["state"] == "near", dl_bot.sim_taker_gap(dl_mk, {}, dl_at)
+    assert _dl_bought(dl_bot, dl_at) == [], dl_bot.sim_trades()
+    # 2027-06-16, a Wednesday, 14:00 ET, NVDA 290.00, "by June 2027": the rest of this session and nine more to run (the
+    # 18th is a holiday), 68%. Read as the 20th — this session and one more — it was 29%, and against Predict's 64¢ / 68¢ the
+    # trader bought 300 No at 37¢
+    dl_jun = _dl_row("64", "June 2027", "Will NVDA hit $300 by June 2027?")
+    dl_at = m.et_ms(2027, 6, 16, 14, 0, -4)
+    dl_bot, dl_card = _dl_bot(dl_at, dl_jun, "290", "0.64", "0.68")
+    dl_mk, = dl_bot.sim_markets(dl_at, only=DL_SPEC.key)
+    dl_fair = m.hit_probability(290.0, 300.0, 0.45, m.us_trading_years(dl_at, _dl_end(2027, 6, 30) + 60_000))
+    assert dl_card.end_ms == _dl_end(2027, 6, 30) and dl_mk.hold == "" and dl_mk.fair_up == dl_fair and 0.66 < dl_fair < 0.70, (m.et_date(dl_card.end_ms), dl_mk.fair_up)
+    assert _dl_bought(dl_bot, dl_at) == [], dl_bot.sim_trades()
+    # 2027-06-22, a Tuesday, 14:00 ET: the market has the rest of this session and six more. Read as the 20th the card said
+    # 窗口已结束, and with the daily bars read through that day (a high of 295) the paper trader settled the market as No —
+    # the level 3.4% away, Predict still trading it
+    dl_at = m.et_ms(2027, 6, 22, 14, 0, -4)
+    dl_bot, dl_card = _dl_bot(dl_at, dl_jun, "290", "0.20", "0.22")
+    dl_days = [d for d in (m.et_date(DL_NOV) + dt.timedelta(days=n) for n in range(260)) if m.us_session(d) and d < m.et_date(dl_at)]
+    dl_card.scan_days([(m.us_session(d)[0], 280.0, 295.0, 250.0, 290.0) for d in dl_days], dl_at)
+    assert dl_days[-1] == dt.date(2027, 6, 21) and dl_card.history["through"] == m.et_wall_ms(dt.date(2027, 6, 22), 0, 0) and dl_card.marks()["high"] == 295.0
+    assert dl_card.end_ms == _dl_end(2027, 6, 30) and not dl_card.complete() and dl_card.advice_problem(dl_at) == "", dl_card.advice_problem(dl_at)
+    dl_mk, = dl_bot.sim_markets(dl_at, only=DL_SPEC.key)
+    dl_fair = m.hit_probability(290.0, 300.0, 0.45, m.us_trading_years(dl_at, _dl_end(2027, 6, 30) + 60_000))
+    assert dl_mk.settle["end"] == _dl_end(2027, 6, 30) and dl_mk.hold == "" and dl_mk.fair_up == dl_fair and 0.5 < dl_fair < 0.75, (dl_mk.hold, dl_mk.fair_up)
+    assert dl_bot.range_payload(dl_card, dl_at)["ladder"]["hold"] == ""
+    # ...and a paper trade on it stays open: nothing is settled before the window's own end (was: 0.0, "整个窗口都没到 $300")
+    assert dl_bot.sim_result({"kind": "range", "key": DL_SPEC.key, "market": dl_mk.market, "settle": dl_mk.settle}, dl_at) is None
+finally:
+    m.STOCK_HIT_MARKETS = dl_listed
+
 print("AUDIT_MODELS_A_OK")

@@ -9986,19 +9986,29 @@ def us_trading_years(now_ms: int, end_ms: int, intraday: float = 1.0) -> float:
 
 def deadline_from_text(texts: list[str], after_ms: int) -> int:
     """The deadline a market's title names, as 23:59 ET of that date: "by December 31", "by Dec. 31, 2026", "by (the end
-    of) December", "截止于 12 月 31 日", "2026-12-31". A date without a year is the first such date on or after after_ms (the
-    market's creation). The first text that names one wins; 0 when none does."""
+    of) December", "by December 2026" (a month with no day: its last one), "截止于 12 月 31 日", "2026-12-31". A date without
+    a year is the first such date on or after after_ms (the market's creation). The first text that names one wins; 0 when
+    none does."""
     since = et_date(after_ms) if after_ms else dt.date.today()
     # whole month words only: "before MARket close" and "by DECision of the committee" name no month
     month = (r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|"
              r"october|oct|november|nov|december|dec)\b\.?")
+    # 1.150.0: a day is one or two digits with no digit after them — the (?!\d) of the two month patterns. Without it a month
+    # followed by its year and no day lost both: in "by June 2027" and "by the end of December 2026" the year's "20" was the
+    # day and no year was left, so the deadline was the 20th of the creation year or the next. Ten days early, or a year:
+    # "by December 2027" read in November 2026 was 2026-12-20. The card priced to that end (the time left cut short: P(Yes)
+    # too low, the No side bought on an edge that was not there), closed its window there and settled its paper trades as
+    # No with the market still open, and a LADDER_DEADLINES pin of the true date matched no market. Now "by <month> <year>"
+    # is that month's last day, as "by <month>" is. A month and a year with no "by" ("June 2027", "in December 2026") name
+    # no deadline, as a month alone never did ("in January"): the next text decides, or the card waits for the pin — the
+    # last pattern's day stays required (were it optional, every month word would match: "the price may rise")
     patterns = [
         (r"(20\d\d)-(\d\d)-(\d\d)", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
         (r"(20\d\d)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
         (r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (0, int(g[0]), int(g[1]))),
-        (r"(?i)\b(?:by|before|until|through)\s+(?:the\s+)?(?:end\s+of\s+)?" + month + r"\s*(\d{1,2})?(?:st|nd|rd|th)?,?\s*(20\d\d)?",
+        (r"(?i)\b(?:by|before|until|through)\s+(?:the\s+)?(?:end\s+of\s+)?" + month + r"\s*(\d{1,2}(?!\d))?(?:st|nd|rd|th)?,?\s*(20\d\d)?",
          lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()[:3]], int(g[1]) if g[1] else 0)),
-        (r"(?i)\b" + month + r"\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(20\d\d)?",
+        (r"(?i)\b" + month + r"\s+(\d{1,2}(?!\d))(?:st|nd|rd|th)?,?\s*(20\d\d)?",
          lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()[:3]], int(g[1]))),
     ]
     for text in texts:
