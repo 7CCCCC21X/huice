@@ -149,7 +149,8 @@ async def account_check_rpc_down():
     fair70 = lambda at: hsi(0.70, [("0.55", "300")], [("0.58", "400")], at)
 
     async def down_after_check(ways, empty=False, **env):
-        """An order resting on Predict, then the operator's /live check while the node is down."""
+        """An order resting on Predict, then the operator's /live check while the node is down (the timeout: on an account
+        whose check has not succeeded in this process yet — a restart's — since a failed RE-read keeps an earlier one)."""
         bot = make_bot(SIM_WAYS=ways, PREDICT_ACCOUNT=PA, **env)
         await bot.live_prepare()
         world["markets"] = [fair70(NOW)]
@@ -158,6 +159,8 @@ async def account_check_rpc_down():
         tid = f"{HSI_SLUG}|up|{'挂' if ways == 'maker' else '吃'}"
         oid = bot.sim_trades()[tid]["live"]["order_id"]
         assert bot.live.ready and oid in bot.live.api.open, (bot.live.not_ready_why, sorted(bot.live.api.open))
+        if not empty:  # 1.150.0 (audit RDM-CHECK-UNREADIES): "signed in, not verified" comes from a new process's first check
+            bot.live.account_checked = False  # (what a new process starts with); the zero owner answered un-readies a verified one as before
         tries = node_down(bot, empty)
         await bot.live_action("check", [], NOW + 2_000)
         why = "链上没有 Predict 账户" if empty else "无法在链上核对 PREDICT_ACCOUNT 的控制钥匙"

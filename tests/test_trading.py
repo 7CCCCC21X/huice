@@ -715,7 +715,7 @@ async def run():
     assert bot.LIVE_REDEEM_RETRY_SECONDS - 5 < bot.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - bot.live_redeem_failed["live:redeemed:101:2"]) <= bot.LIVE_REDEEM_RETRY_SECONDS
     bot.live_redeem_failed.clear()
     bot.live.chain.fail_unsent = "RPC 错误：execution reverted"  # 1.131.3: a transaction that never left (the chain behind Predict's result): five minutes, not an hour
-    assert await bot.live_redeem(CLOSE + 72 * 60_000 + 15_000) == [] and "交易没发出，5 分钟后再试" in bot.live_errors[-1], bot.live_errors[-1:]
+    assert await bot.live_redeem(CLOSE + 72 * 60_000 + 15_000) == [] and "交易没发出，5～15 分钟后的下一轮再试" in bot.live_errors[-1], bot.live_errors[-1:]  # (1.150.0: the next round after the wait)
     left = bot.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - bot.live_redeem_failed["live:redeemed:101:2"])
     assert bot.LIVE_REDEEM_UNSENT_RETRY_SECONDS - 5 < left <= bot.LIVE_REDEEM_UNSENT_RETRY_SECONDS, left
     bot.live.chain.fail_unsent = ""
@@ -1795,9 +1795,17 @@ async def audit_fixes():
     await abot.live_prepare()
     assert abot.live.ready and abot.live.account_checked
     async def boom(account): raise m.RemoteError("RPC 超时")
+    # 1.150.0 (audit RDM-CHECK-UNREADIES): a failed RE-read keeps this run's verification (it used to un-ready the bot); a FIRST
+    # verification that fails is no readiness, nor is a check not yet made with no error text
     abot.live.chain.account_owner = boom
     await abot.live_prepare()
-    assert not abot.live.ready and "无法在链上核对" in abot.live.not_ready_why
+    assert abot.live.ready and abot.live.account_checked and not abot.live.account_error
+    cbot = make_bot(PREDICT_ACCOUNT=PA)
+    cbot.live.chain.account_owner = boom
+    await cbot.live_prepare()
+    assert not cbot.live.ready and not cbot.live.ready_error and "无法在链上核对" in cbot.live.not_ready_why
+    cbot.live.account_error = ""
+    assert not cbot.live.ready and cbot.live.not_ready_why == "账户校验尚未完成"
     bbot = make_bot()
     await bbot.live_prepare()
     bmk = hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)
