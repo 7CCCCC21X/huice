@@ -5238,6 +5238,14 @@ class PredictBook:
     asks: tuple[tuple[D, D], ...]
     fetched_ms: int
     fee_bps: int | None = None  # the market's own taker fee rate (feeRateBps); None = not stated
+    # 1.150.0 (audit FEED-FETCHED-MS): when the levels were taken — a REST read's request time (Predict reads them somewhere
+    # between the request and its landing), a changed push's arrival; 0 = fetched_ms (a book built without it). fetched_ms
+    # is when the bot last knew the book current: a REST answer's landing, restarted by every unchanged re-send and
+    # heartbeat (PredictStream.refresh_age, touch). That is right for its age (stale, the 盘口断流 withdrawal, the page) and
+    # wrong for "was our order on it yet": levels taken before Predict answered an order (or confirmed its cancel) but
+    # stamped after it had our 100 taken out of a level that did not hold them — a brand-new real order withdrawn as
+    # "买1 不足" — or the cancelled order's ghost counted as somebody's 买1 (book_content_ms)
+    content_ms: int = 0
 
     @property
     def bid(self) -> tuple[D, D] | None:
@@ -5249,6 +5257,20 @@ class PredictBook:
 
     def stale(self, now_ms: int) -> bool:
         return now_ms - self.fetched_ms > PREDICT_STALE_MS
+
+
+def book_content_ms(book: Any) -> int:
+    """When ``book``'s levels were taken (PredictBook.content_ms; its fetched_ms when it carries none): what the events of
+    our own orders — Predict's answer, a cancel's confirmation — are compared with (own_on_book, own_unsure,
+    Bot.sim_own_resting), never the book's age."""
+    return int(getattr(book, "content_ms", 0) or getattr(book, "fetched_ms", 0) or 0)
+
+
+def book_restarted(book: "PredictBook", now_ms: int) -> "PredictBook":
+    """``book`` known current at ``now_ms`` (the same levels pushed again, the heartbeat: PredictStream.refresh_age,
+    touch): its age restarts, the time its levels were taken stays (FEED-FETCHED-MS) — pinned here, so that a book built
+    without a content_ms does not take the new stamp for it."""
+    return dataclasses.replace(book, fetched_ms=now_ms, content_ms=book_content_ms(book))
 
 
 def flip_book(book: "PredictBook") -> "PredictBook":
@@ -5921,7 +5943,7 @@ class PredictFeed:
                 self.meta_errors.pop(market["id"], None)
             except (RemoteError, TimeoutError, OSError) as error:
                 self.meta_errors[market["id"]] = clean_error(error) or type(error).__name__
-        asked = time.monotonic()
+        asked, asked_ms = time.monotonic(), int(time.time() * 1000)  # asked_ms: the book's content time (refresh_one, FEED-FETCHED-MS)
         if self.market_settled((self.market_meta.get(market["id"]) or ({}, 0))[0]):
             # Predict has settled this level: it has no live book any more (asking gets HTTP 400) and the card needs none
             return LadderRow(target, market["id"], market["title"], None, "", market.get("question", "")), asked
@@ -5934,7 +5956,7 @@ class PredictFeed:
             return LadderRow(target, market["id"], market["title"], kept, clean_error(error) or type(error).__name__,
                              market.get("question", "")), asked
         fee = (self.market_meta.get(market["id"]) or ({}, 0))[0].get("fee_bps")
-        book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
+        book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee, content_ms=asked_ms)
         return LadderRow(target, market["id"], market["title"], book, "", market.get("question", "")), asked
 
     async def refresh_ladder(self, key: str, slug: str, only: set[str] | None = None, aged: bool = False) -> int:
@@ -6123,13 +6145,19 @@ class PredictFeed:
             if slug in self.want_info and slug not in self.info:
                 await self.market_info(slug, market["id"])
             fee = await self.market_fee(market["id"])
-            asked = time.monotonic()
+            # 1.150.0 (audit FEED-FETCHED-MS): the wall clock beside ``asked`` is the book's content time (content_ms). Predict
+            # reads the levels somewhere between this and the answer's landing, so a read asked before it answered our order
+            # (or confirmed its cancel) may not show the order (or may still show it) however late it lands. Stamped with
+            # its landing alone, such a read landing after Predict's answer passed for "read after it": our own 100 came
+            # out of a 买1 that did not hold them, and the lane withdrew the order it had just placed (own_on_book); the
+            # cancelled order's ghost counted as somebody's 买1 (Bot.sim_own_resting). The landing stays fetched_ms, its age
+            asked, asked_ms = time.monotonic(), int(time.time() * 1000)
             bids, asks, _ = await self.orderbook(market)
             if asked < self.book_asked.get(key, -1e18):
                 # a later request's book is stored already (the cold round's slow read landing after the hot round's): this
                 # answer would put the book back in time under a newer read time (1.83.2) — dropped, the express lane not woken
                 return 0
-            book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
+            book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee, content_ms=asked_ms)
             self.stream.note_rest(key, self.books.get(key), book)  # a pushed book replaced by a later REST read: compared (/diag)
             self.books[key] = book
             self.book_asked[key] = asked
@@ -6469,7 +6497,8 @@ class PredictStream:
 
     def book(self, mid: str, data: Any) -> None:
         """A pushed book into the feed: the levels replace the stored book's (a side left out keeps its own), its age
-        restarts, the read time is now (a REST answer asked for earlier is dropped), the express lane is told."""
+        restarts, the read time is now (a REST answer asked for earlier is dropped), the express lane is told. New levels
+        are taken now (content_ms); the same levels again restart the age alone (refresh_age)."""
         target = self.subscribed.get(mid) or self.wanted.get(mid)
         if target is None or not isinstance(data, dict):
             self.dropped += 1
@@ -6504,7 +6533,8 @@ class PredictStream:
         if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and 0 < stamp <= now_ms + 60_000:
             self.lag.append(now_ms - int(stamp))
             del self.lag[:-300]
-        book = dataclasses.replace(old, bids=old.bids if bids is None else bids, asks=old.asks if asks is None else asks, fetched_ms=now_ms)
+        book = dataclasses.replace(old, bids=old.bids if bids is None else bids, asks=old.asks if asks is None else asks, fetched_ms=now_ms,
+                                   content_ms=now_ms)  # new levels: taken now (FEED-FETCHED-MS; a re-send or a heartbeat keeps this)
         if level:
             feed.ladder_rows[key][mid] = dataclasses.replace(row, book=book, error="")
             feed.row_asked.setdefault(key, {})[mid] = asked
@@ -6527,16 +6557,18 @@ class PredictStream:
         return f"，推送延迟中位 {ordered[len(ordered) // 2]} ms、最大 {ordered[-1]} ms（最近 {len(ordered)} 次更新）"
 
     def refresh_age(self, key: str, level: bool, mid: str) -> None:
-        """A market's stored book is as current as it was (its book pushed again unchanged): its age restarts."""
+        """A market's stored book is as current as it was (its book pushed again unchanged): its age restarts — not the
+        time its levels were taken (book_restarted, FEED-FETCHED-MS: the levels of before our order, pushed again after
+        Predict answered it, are still the levels of before it; own_on_book took our shares out of them)."""
         feed, now_ms = self.feed, int(time.time() * 1000)
         if level:
             row = (feed.ladder_rows.get(key) or {}).get(mid)
             if row is not None and row.book is not None and str(row.book.market_id) == str(mid):
-                feed.ladder_rows[key][mid] = dataclasses.replace(row, book=dataclasses.replace(row.book, fetched_ms=now_ms))
+                feed.ladder_rows[key][mid] = dataclasses.replace(row, book=book_restarted(row.book, now_ms))
         else:
             book = feed.books.get(key)
             if book is not None and str(book.market_id) == str(mid):
-                feed.books[key] = dataclasses.replace(book, fetched_ms=now_ms)
+                feed.books[key] = book_restarted(book, now_ms)
 
     def touch(self) -> None:
         """The heartbeat says the connection lives: every book pushed on it whose topic still brings frames is as current
@@ -6553,12 +6585,12 @@ class PredictStream:
         alive = {mid for mid, at in self.heard.items() if mid in self.live and mono - at <= PREDICT_WS_SILENT_SECONDS}
         for key, book in list(feed.books.items()):
             if book.market_id in alive:
-                feed.books[key] = dataclasses.replace(book, fetched_ms=now_ms)
+                feed.books[key] = book_restarted(book, now_ms)  # its age alone: the levels are as old as they were (FEED-FETCHED-MS)
         for key, rows in list(feed.ladder_rows.items()):
             touched = False
             for mid, row in list(rows.items()):
                 if mid in alive and row.book is not None:
-                    rows[mid] = dataclasses.replace(row, book=dataclasses.replace(row.book, fetched_ms=now_ms))
+                    rows[mid] = dataclasses.replace(row, book=book_restarted(row.book, now_ms))
                     touched = True
             if touched:
                 feed.ladder_publish(key)
@@ -11162,14 +11194,36 @@ def sim_position(trade: Mapping) -> bool:
 def own_on_book(trade: Mapping, book: Any) -> float:
     """Our own unfilled shares a real resting order adds to the book's level at its price — 0 until Predict can have it there:
     not while pending or in flight (placing), and not on a book read before Predict's answer (1.138.0 / 1.138.1: a decision not
-    yet sent was taken out of the level it would join, so a 跟买1 on a thin 买1 saw the 买1 "gone" and was voided or withdrawn)."""
+    yet sent was taken out of the level it would join, so a 跟买1 on a thin 买1 saw the 买1 "gone" and was voided or withdrawn).
+    1.150.0 (audit FEED-FETCHED-MS): "read" is when the book's levels were taken (book_content_ms: a REST read's request, a
+    changed push's arrival), not its fetched_ms — a REST answer landing after Predict's, or the levels of before the order
+    pushed again after it, carried a later stamp over the same old levels, and the order just placed was withdrawn as
+    "买1 不足". A book whose levels were taken before the answer may show the order all the same (own_unsure)."""
     st = trade.get("live") if isinstance(trade.get("live"), Mapping) else None
     if st is None or st.get("state") in ("pending", "placing"):
         return 0.0
     answered = int(st.get("answered_at") or 0)
-    if answered and book is not None and int(getattr(book, "fetched_ms", 0) or 0) < answered:
+    if answered and book is not None and book_content_ms(book) < answered:
         return 0.0
     return max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0)
+
+
+def own_unsure(trade: Mapping, book: Any) -> bool:
+    """Whether ``book`` may show our real order although own_on_book counts none of it: the request is in flight
+    (placing), or Predict has answered it and the book's levels were taken before that answer — a push can beat the HTTP
+    answer, and a REST read asked before it may be served after the order went in. On such a book the order cannot be
+    told from somebody else's bid at its price: counted as ours it would be the 1.138.x withdrawal again, so it is not
+    (own_on_book), and a deep-bid order that then sees "a bid in front" may be looking at itself — it is held, not moved
+    up (Bot.sim_requote_reason; FEED-FETCHED-MS). Over with the next book whose levels were taken after the answer: a
+    changed push, or a REST read asked after it (on a pushed market that stays as it is, the cold round's). Never for an
+    order not sent yet (pending: no book shows it)."""
+    st = trade.get("live") if isinstance(trade.get("live"), Mapping) else None
+    if st is None or book is None or st.get("state") == "pending":
+        return False
+    if st.get("state") == "placing":
+        return True
+    left = max(float(trade.get("order") or 0) - float(trade.get("shares") or 0), 0.0)
+    return left > 1e-9 and own_on_book(trade, book) <= 1e-9  # sent, something left of it, and none of it counted: the book is from before the answer
 
 
 def same_refusal(a: str, b: str) -> bool:
@@ -18497,7 +18551,10 @@ class Bot:
         the resting one, else the latest whose cancel Predict confirmed after ``book`` was read (live_cancel's
         cancel_done_ms: the book may show the order until the next push, and the order that takes a cancelled one's
         place is decided on that very book — it must not join its own ghost as the valid 买1; 1.104.6). (0, None) when
-        there is none."""
+        there is none. 1.150.0 (audit FEED-FETCHED-MS): "read" is when the book's levels were taken (book_content_ms), not
+        its fetched_ms: a REST read asked before the confirmation and landing after it, or the old levels pushed again
+        after it, still show the order under a later stamp — the ghost then counted as somebody's 买1, and the next real
+        order joined a level holding 20 shares of others."""
         ghost = None
         for t in trades_of_market(trades, market):
             if t.get("side") != side or not t.get("maker") or not isinstance(t.get("live"), dict):
@@ -18506,7 +18563,7 @@ class Bot:
             if t.get("status") == "resting":
                 return own, float(t.get("price") or 0)
             done = int(t["live"].get("cancel_done_ms") or 0)
-            if book is not None and done and book.fetched_ms <= done and own > 1e-9 and (ghost is None or done > ghost[0]):
+            if book is not None and done and book_content_ms(book) <= done and own > 1e-9 and (ghost is None or done > ghost[0]):
                 ghost = (done, own, float(t.get("price") or 0))
         return (ghost[1], ghost[2]) if ghost else (0.0, None)
 
@@ -19389,6 +19446,14 @@ class Bot:
                         move = (target, f"买1 被顶到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
                 elif price - target >= SIM_MAKER_FOLLOW - 1e-9:
                     move = (target, f"买1 移到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
+                if move is not None and move[0] > price + 1e-9 and own_unsure(trade, mk.book):
+                    # 1.150.0 (audit FEED-FETCHED-MS): a book that may show this very order with none of it counted — its
+                    # levels taken before Predict's answer (a push beating the HTTP answer, a REST read in flight across
+                    # it), or the request still in flight. The "bid in front" may be the order itself: followed, it was
+                    # withdrawn and placed a cent higher, and that one again (a sweep order the same, over "the bid under
+                    # the threshold"). Held — never moved up — until a book taken after the answer tells the two apart; a
+                    # move down, and every withdrawal above, still goes
+                    move = None
             key = f"{trade.get('market')}|{side}"
             if move is None:
                 if not self.sim_follow_readonly:

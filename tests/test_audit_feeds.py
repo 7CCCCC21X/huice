@@ -448,4 +448,466 @@ async def feed_heartbeat_fresh() -> None:
 
 asyncio.run(feed_heartbeat_fresh())
 
+
+# FEED-FETCHED-MS: a book's fetched_ms is its age — a REST answer's landing, restarted by every unchanged re-send and by
+# the heartbeat — but own_on_book (1.138.1: a book read before Predict's answer shows none of our order) and
+# Bot.sim_own_resting (1.104.6: a book read before a cancel's confirmation may still show the order) took it for the time
+# the levels were read. A REST read asked before Predict's answer and landing after it, or the old levels pushed again
+# after it, then had our own 100 taken out of a 买1 that did not hold them — the real order just placed withdrawn as
+# "买1 不足", a floor order placed and withdrawn, the order placed again at the back of the queue — or the cancelled
+# order's ghost counted as somebody's 买1, and the next real order rested on 20 shares of others. A book now carries the
+# time its levels were taken beside its age; and a deep-bid order is not moved up on a book that may show the order
+# itself uncounted (a push can beat the HTTP answer: it then chased itself a cent at a time).
+async def feed_fetched_ms() -> None:
+    import datetime as dt, json
+    import live as L
+    D, real_time, WEI = m.D, m.time, 10 ** 18
+    BJ = lambda mo, d, h, mi=0: int(dt.datetime(2026, mo, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+    SLUG = "hang-seng-index-up-or-down-on-october-5-2026"
+    SETTLE = {"key": "HSI", "target": "2026-10-05", "line": 24600.0, "close_ms": BJ(10, 5, 16, 10)}
+    ASKS = [["0.58", "400"]]
+    lv = lambda rows: tuple((D(p), D(q)) for p, q in rows)
+
+    class Clock:  # main's and live's wall clock, in the test's hands; the rest stays the real module's. One clock for
+        #           everything: answered_at being on the Binance-offset clock is another finding (SIM-OWN-ON-BOOK-CLOCK)
+        def __init__(self, ms):
+            self.ms, self.skew = ms, 0.0
+
+        def time(self):
+            return (self.ms + 0.5) / 1000  # int(time.time() * 1000) is self.ms exactly
+
+        def monotonic(self):  # the real one, moved on with the wall clock where a round trip is timed on it (pass_ms)
+            return real_time.monotonic() + self.skew
+
+        def pass_ms(self, ms):  # time passes on both clocks
+            self.ms, self.skew = self.ms + ms, self.skew + ms / 1000
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+    class FM:  # the bot's market clock: the same one
+        config = None
+
+        def now_ms(self):
+            return clock.ms
+
+    class Server:  # Predict's book of the market: the others' bids and our own open orders
+        def __init__(self, others):
+            self.others, self.ours = dict(others), {}
+
+        def levels(self):
+            rows = dict(self.others)
+            for price, shares in self.ours.values():
+                rows[price] = rows.get(price, 0.0) + shares
+            return {"bids": [[f"{p:.2f}", f"{q:g}"] for p, q in sorted(rows.items(), reverse=True) if q > 0], "asks": ASKS}
+
+    class Api:  # Predict as the real trader sees it (tests/test_trading.py's FakeApi, cut down): an order is on Predict's
+        #         book, or off it, as its request arrives; an order is answered at once, a cancel confirmed 100 ms later
+        def __init__(self, server):
+            self.jwt, self.jwt_exp, self.auth_error, self.lookup = "t", 0, "", ""
+            self.markets, self.open, self.closed, self.calls, self.positions_rows = {}, {}, {}, [], []
+            self.next_id, self.server, self.on_create, self.on_remove = 100, server, None, None
+
+        async def ensure_auth(self): pass
+
+        async def market(self, mid): return self.markets[str(mid)]
+
+        async def create_order(self, body):
+            self.next_id += 1
+            oid, order = str(self.next_id), body["data"]["order"]
+            price, shares = round(int(order["makerAmount"]) / int(order["takerAmount"]), 2), int(order["takerAmount"]) / WEI
+            self.calls.append(("create", price))
+            self.server.ours[oid] = (price, shares)
+            self.open[oid] = {"id": oid, "status": "OPEN", "amount": order["takerAmount"], "amountFilled": "0",
+                              "strategy": body["data"]["strategy"], "order": {**order}}
+            if self.on_create is not None:  # what else happens while the order's answer is on its way back
+                hook, self.on_create = self.on_create, None
+                await hook()
+            return {"order_id": oid, "hash": order["hash"], "code": None}
+
+        async def remove_orders(self, ids):
+            if self.on_remove is not None:  # what else happens as the cancel goes out, before it reaches Predict
+                hook, self.on_remove = self.on_remove, None
+                await hook()
+            self.calls.append(("remove", list(ids)))
+            removed = [i for i in ids if i in self.open]
+            for i in removed:
+                self.server.ours.pop(i, None)
+                self.closed[i] = {**self.open.pop(i), "status": "CANCELLED"}
+            clock.ms += 100
+            return {"removed": removed, "noop": [i for i in ids if i not in removed]}
+
+        async def orders(self, status="OPEN", **params):
+            rows = list(self.open.values()) if status == "OPEN" else [r for r in self.closed.values() if r["status"] == status]
+            return [dict(r) for r in rows]
+
+        async def order(self, oid, hash_=""):
+            row = self.open.get(oid) or self.closed.get(oid)
+            return dict(row) if row is not None else None
+
+        async def positions(self): return self.positions_rows
+
+    class Chain:
+        async def account_owner(self, account): return "0x8fd379246834eac74B8419FfdA202CF8051F7A03"  # the test key's address
+        async def usdt_balance(self, owner=None): return 1000 * WEI
+        async def bnb_balance(self, owner=None): return 10 ** 17
+        async def allowance(self, key, owner=None): return 10 ** 30
+        async def redeem(self, *a): return "0xredeem"
+
+    def single_feed(feed=None):  # HSI (market 101) with its market, fee and strike in hand: a read is the orderbook request alone
+        feed = feed or m.PredictFeed(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}))
+        mono = real_time.monotonic()
+        feed.markets[SLUG] = ({"id": "101", "conditionId": "c", "title": "HSI up?"}, mono)
+        feed.fees["101"], feed.strikes[SLUG] = (200, mono), (None, mono)
+        return feed
+
+    def card(book, fair=0.70):
+        return m.SimMarket(SLUG, "恒生指数", "close", "HSI", fair, book, 0.03, "", ("涨", "跌"), SETTLE,
+                           {"basis": {"fair_up": fair, "ref": 24600.0}, "sources": [{"what": "恒指期货", "source": "etnet"}], "proxy": None})
+
+    def slow(feed, levels):
+        """The feed's requests from here on: Predict takes the snapshot (``levels()``) as the request reaches it — at
+        once — and the answer is on its way until ``go`` is set. (taken, go)."""
+        taken, go = asyncio.Event(), asyncio.Event()
+
+        async def fetch(url, payload=None):
+            snapshot = json.loads(json.dumps(levels()))
+            taken.set()
+            await go.wait()
+            return {"data": snapshot}
+        feed.fetch = fetch
+        return taken, go
+
+    async def looked(feed):  # the express looks a stored book started, to their end
+        while feed.express_tasks:
+            await asyncio.gather(*list(feed.express_tasks))
+            await asyncio.sleep(0)
+
+    async def ask(feed, levels):
+        """A REST read of HSI goes out (the real refresh_one) and Predict takes its snapshot; landed by land()."""
+        taken, go = slow(feed, levels)
+        read = asyncio.create_task(feed.refresh_one("HSI", SLUG))
+        await taken.wait()
+        return read, go
+
+    async def land(feed, read, go, lane=True):
+        """The read's answer lands now: its book is stored, and the express lane looks at once (unless ``lane`` is off)."""
+        hook = feed.on_update
+        feed.on_update = hook if lane else None
+        try:
+            go.set()
+            assert await read == 1, feed.errors
+        finally:
+            feed.on_update = hook
+        await looked(feed)
+        return feed.books["HSI"]
+
+    async def rest_read(feed, levels, during=None, lands_ms=0, lane=True):
+        """One whole REST read: asked now, ``during`` runs while its answer is on its way, landing ``lands_ms`` after that."""
+        read, go = await ask(feed, levels)
+        if during is not None:
+            await during()
+        clock.ms += lands_ms
+        return await land(feed, read, go, lane)
+
+    def resting(price, order_id):  # a real resting 跟买1 of 100 shares, as the record holds it
+        return {"maker": True, "side": "up", "price": price, "order": 100.0, "shares": 0.0, "market": SLUG, "status": "resting",
+                "live": {"state": "open", "order_id": order_id}}
+
+    async def rest_across_the_answer():
+        """A REST read asked before Predict answered the order, landing after it: the levels of before the order."""
+        feed = single_feed()
+        before = {"bids": [["0.55", "150"], ["0.53", "80"]], "asks": ASKS}  # the 买1 our 100 are about to join: 150 of others
+        order, asked = resting(0.55, "7"), clock.ms
+
+        async def answered():  # Predict answers the order 400 ms after the read went out
+            clock.ms += 400
+            order["live"].update(sent_at=clock.ms - 300, answered_at=clock.ms)
+        bk = await rest_read(feed, lambda: before, answered, 600)
+        assert bk.fetched_ms == asked + 1000 > order["live"]["answered_at"] and not bk.stale(clock.ms)  # its age: its landing's, as before
+        assert m.own_on_book(order, bk) == 0.0, \
+            "a REST read asked before Predict's answer holds the levels of before the order, whenever it lands"
+        assert m.maker_level(bk, "up", 100, m.own_on_book(order, bk), 0.55) == (0.55, 150.0)
+        # the same levels pushed again after the answer, and the heartbeat: the age restarts, the levels are no newer
+        stream = feed.stream
+        stream.subscribed = {"101": ("HSI", False)}
+        clock.ms += 200
+        stream.book("101", {"version": 3, **before})
+        bk = feed.books["HSI"]
+        assert stream.repeated == 1 and bk.fetched_ms == clock.ms and m.own_on_book(order, bk) == 0.0, \
+            "the old levels pushed again are not a book read after the answer"
+        # the read asked after the answer shows the order: 100 of the 250 are ours again, 150 of others still make the 买1
+        clock.ms += 50
+        bk = await rest_read(feed, lambda: {"bids": [["0.55", "250"], ["0.53", "80"]], "asks": ASKS}, None, 300)
+        assert m.own_on_book(order, bk) == 100.0 and m.maker_level(bk, "up", 100, 100.0, 0.55) == (0.55, 150.0)
+
+    async def pushes_across_the_answer():
+        """A pushed market: the push of before the order, then re-sends and heartbeats after Predict's answer."""
+        feed = single_feed()
+        feed.books["HSI"] = m.PredictBook("HSI", SLUG, "101", "HSI up?", lv([["0.55", "150"], ["0.53", "80"]]), lv(ASKS), clock.ms, 200)
+        stream = feed.stream
+        stream.subscribed = {"101": ("HSI", False)}
+        clock.ms += 100
+        levels = {"bids": [["0.55", "150"], ["0.53", "90"]], "asks": ASKS}
+        stream.book("101", {"version": 3, **levels})  # a changed push: 150 of others at 55¢
+        assert stream.books == 1 and "101" in stream.live
+        clock.ms += 100
+        order = resting(0.55, "8")
+        order["live"].update(sent_at=clock.ms, answered_at=clock.ms + 300)
+        clock.ms += 500  # 200 ms after Predict's answer: the server's re-send of the same levels, then its heartbeat
+        stream.book("101", {"version": 3, **levels})
+        clock.ms += 100
+        stream.touch()
+        bk = feed.books["HSI"]
+        assert stream.repeated == 1 and bk.fetched_ms == clock.ms > order["live"]["answered_at"] and not bk.stale(clock.ms)  # its age: as before
+        assert m.own_on_book(order, bk) == 0.0, "a re-send and a heartbeat restart the book's age, not the time its levels were taken"
+        assert m.maker_level(bk, "up", 100, m.own_on_book(order, bk), 0.55) == (0.55, 150.0)
+        clock.ms += 100
+        stream.book("101", {"version": 4, "bids": [["0.55", "250"], ["0.53", "90"]], "asks": ASKS})  # the push that shows the order
+        assert m.own_on_book(order, feed.books["HSI"]) == 100.0
+        # a book that carries no content time of its own (built by hand) keeps its old stamp for it when pushed again
+        feed = single_feed()
+        feed.books["HSI"] = m.PredictBook("HSI", SLUG, "101", "HSI up?", lv(levels["bids"]), lv(ASKS), clock.ms, 200)
+        feed.stream.subscribed = {"101": ("HSI", False)}
+        order = resting(0.55, "9")
+        order["live"].update(sent_at=clock.ms + 100, answered_at=clock.ms + 400)
+        clock.ms += 600
+        feed.stream.book("101", {"version": 1, **levels})
+        assert feed.stream.repeated == 1 and feed.books["HSI"].fetched_ms == clock.ms and m.own_on_book(order, feed.books["HSI"]) == 0.0
+
+    async def ladder_level():
+        """A ladder level's book (ladder_row_read, and its topic's re-send): the same."""
+        key, slug = "BTC-CAP", "what-market-cap-will-x-hit"
+        market = {"id": "41", "conditionId": "c41", "title": "$200M", "question": ""}
+        feed = m.PredictFeed(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}))
+        feed.market_meta["41"] = ({"fee_bps": 200, "status": "REGISTERED"}, real_time.monotonic())
+        before = {"bids": [["0.55", "150"]], "asks": ASKS}
+        taken, go = slow(feed, lambda: before)
+        asked = clock.ms
+        read = asyncio.create_task(feed.ladder_row_read(key, slug, market))
+        await taken.wait()
+        clock.ms += 400
+        order = {**resting(0.55, "5"), "market": f"{slug}#41"}
+        order["live"].update(sent_at=clock.ms - 300, answered_at=clock.ms)
+        clock.ms += 600
+        go.set()
+        row, _ = await read
+        assert row.book.fetched_ms == asked + 1000 and m.own_on_book(order, row.book) == 0.0, \
+            "a ladder level's REST read asked before Predict's answer"
+        feed.ladder_rows[key] = {"41": row}
+        feed.stream.subscribed = {"41": (key, True)}
+        clock.ms += 200
+        feed.stream.book("41", {"version": 2, **before})
+        again = feed.ladder_rows[key]["41"].book
+        assert feed.stream.repeated == 1 and again.fetched_ms == clock.ms and m.own_on_book(order, again) == 0.0
+
+    async def rest_across_the_cancel():
+        """The 1.104.6 ghost: a REST read asked before Predict confirmed the cancel, landing after it, still shows the order."""
+        feed = single_feed()
+        gone = {"t": {**resting(0.55, "7"), "status": "cancelled", "live": {"state": "done", "order_id": "7"}}}
+        with_ghost = {"bids": [["0.55", "120"], ["0.53", "80"]], "asks": ASKS}  # 20 of others and our 100, cancelled a moment later
+
+        async def confirmed():  # Predict confirms the cancel 100 ms after the read went out
+            clock.ms += 100
+            gone["t"]["live"]["cancel_done_ms"] = clock.ms
+        bk = await rest_read(feed, lambda: with_ghost, confirmed, 300)
+        own, price = m.Bot.sim_own_resting(gone, SLUG, "up", bk)
+        assert bk.fetched_ms > gone["t"]["live"]["cancel_done_ms"] and (own, price) == (100.0, 0.55), \
+            f"a REST read asked before the cancel's confirmation may still show the order, whenever it lands: {(own, price)}"
+        assert m.maker_level(bk, "up", 100, own, price) is None  # 20 of others: no 买1 to join
+        feed.stream.subscribed = {"101": ("HSI", False)}
+        clock.ms += 200
+        feed.stream.book("101", {"version": 2, **with_ghost})  # the same levels pushed again: still the ghost's
+        assert feed.stream.repeated == 1 and m.Bot.sim_own_resting(gone, SLUG, "up", feed.books["HSI"]) == (100.0, 0.55)
+        clock.ms += 50  # a read asked after the confirmation: the order is off the book, nothing of it is taken out
+        bk = await rest_read(feed, lambda: {"bids": [["0.55", "150"], ["0.53", "80"]], "asks": ASKS}, None, 300)
+        assert m.Bot.sim_own_resting(gone, SLUG, "up", bk) == (0.0, None) and m.maker_level(bk, "up", 100, 0.0, None) == (0.55, 150.0)
+
+    PAPER = {"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "maker", "SIM_MAKER_POINTS": "off", "SIM_MAKER_SESSION": "off",
+             "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_DEEP_CENTS": "10"}
+
+    def deep_order(bot, price, at, **more):  # a real deep-bid order sent at ``at`` and answered 400 ms later
+        return {"market": SLUG, "side": "up", "maker": True, "price": price, "order": 100.0, "shares": 0.0, "status": "resting",
+                "deep": True, "settle": SETTLE, "kind": "close", "key": "HSI", "version": bot.sim_version(),
+                "live": {"state": "open", "order_id": "7", "sent_at": at, "answered_at": at + 400}, **more}
+
+    async def deep_bid_is_not_its_own_front():
+        """A deep-bid order on a book that may show the order itself (taken before Predict's answer): never moved up."""
+        bot = m.Bot(m.Config.from_env({**PAPER, "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0"}), m.Store(":memory:"), FM(), None)
+        T = clock.ms
+
+        def why(trade, bids, at, fair=0.70, bot=bot):  # the re-quote reason on a book whose levels were taken at ``at``
+            book = m.PredictBook("HSI", SLUG, "101", "t", lv(bids), lv([["0.60", "300"]]), at, None)
+            return bot.sim_requote_reason(trade, card(book, fair), T + 450)
+        deep = deep_order(bot, 0.31, T)             # sent at T, answered at T + 400
+        ours = [["0.31", "100"], ["0.30", "500"]]   # our 100 at 31¢, a cent over the others' 30¢
+        topped = [["0.33", "50"], *ours]            # ...and somebody's 50 at 33¢ in front of them
+        assert why(deep, ours, T + 300) == "", "pushed 100 ms before Predict's answer: the bid 'in front' is the order itself"
+        assert why({**deep, "live": {"state": "placing", "sent_at": T}}, ours, T + 100) == "", "the request still in flight"
+        assert why(deep, topped, T + 300) == ""     # held on such a book whatever it shows
+        assert why(deep, ours, T + 410) == ""       # a book taken after the answer: the 100 are ours, nothing is in front
+        assert why(deep, topped, T + 410) == "买1 被顶到 33.0¢，改挂 34.0¢"  # ...and a real bid in front is followed, as before
+        assert why(deep, [["0.25", "500"]], T + 300) == "买1 移到 25.0¢，改挂 26.0¢"  # a move down goes on any book
+        unsent = [["0.33", "50"], ["0.30", "500"]]  # an order not sent yet is on no book: judged as before (the send-time re-check)
+        assert why({**deep, "live": {"state": "pending"}}, unsent, T + 300) == "买1 被顶到 33.0¢，改挂 34.0¢"
+        assert why({k: v for k, v in deep.items() if k != "live"}, unsent, T + 300) == "买1 被顶到 33.0¢，改挂 34.0¢"  # paper: unchanged
+        # a sweep order (SIM_MAKER_DEEP_ONLY) the same: "the bid under the threshold" may be the order itself. The front at
+        # 50¢ (no edge there at a fair price of 55¢), our 100 at 20¢, the others' 19¢
+        sbot = m.Bot(m.Config.from_env({**PAPER, "SIM_MAKER_DEEP_ONLY": "on", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0"}),
+                     m.Store(":memory:"), FM(), None)
+        sweep = deep_order(sbot, 0.20, T, sweep=True)
+        under = [["0.50", "300"], ["0.20", "100"], ["0.19", "500"]]
+        assert why(sweep, under, T + 300, 0.55, sbot) == "", "a sweep order re-quoted over itself"
+        assert why(sweep, under, T + 410, 0.55, sbot) == ""
+        assert why(sweep, [under[0], ["0.22", "50"], *under[1:]], T + 410, 0.55, sbot) == "下面的买单变了，击穿单改挂 23.0¢"
+
+    async def deep_bid_through_the_settle():
+        """The real stream and the default follow settle (2 s): our deep-bid order's own push beats Predict's answer, the
+        server re-sends it every second — and the look at the settle's end still does not move the order over itself."""
+        bot = m.Bot(m.Config.from_env(PAPER), m.Store(":memory:"), FM(), None)
+        feed, stream = bot.predict, bot.predict.stream
+        feed.on_update = None  # the looks below are made by hand
+        feed.books["HSI"] = m.PredictBook("HSI", SLUG, "101", "t", lv([["0.30", "500"]]), lv([["0.60", "300"]]), clock.ms, None)
+        stream.subscribed = {"101": ("HSI", False)}
+        deep = deep_order(bot, 0.31, clock.ms)
+        ours = {"bids": [["0.31", "100"], ["0.30", "500"]], "asks": [["0.60", "300"]]}
+        clock.ms += 150
+        stream.book("101", {"version": 2, **ours})  # the order on the book, pushed 250 ms before the HTTP answer
+        clock.ms += 270
+        assert bot.sim_requote_reason(deep, card(feed.books["HSI"]), clock.ms) == ""
+        for _ in range(2):
+            clock.ms += 1000
+            stream.book("101", {"version": 2, **ours})
+        clock.ms += 250  # 2.25 s after the first look: past the settle it would have started
+        assert stream.repeated == 2 and feed.books["HSI"].fetched_ms > deep["live"]["answered_at"]
+        assert bot.sim_requote_reason(deep, card(feed.books["HSI"]), clock.ms) == "", "the settle's look moved the order over its own push"
+        # somebody's 50 at 33¢: a changed push, taken after the answer — followed once it has held the settle
+        stream.book("101", {"version": 3, "bids": [["0.33", "50"], *ours["bids"]], "asks": ours["asks"]})
+        assert m.own_on_book(deep, feed.books["HSI"]) == 100.0 and bot.sim_requote_reason(deep, card(feed.books["HSI"]), clock.ms) == ""
+        clock.ms += 2100
+        assert bot.sim_requote_reason(deep, card(feed.books["HSI"]), clock.ms) == "买1 被顶到 33.0¢，改挂 34.0¢"
+
+    # the real trader as tests/test_trading.py sets it up (the key is the SDK test suite's, never a real one), makers only;
+    # SIM_MAKER_MIN_BID (100), SIM_SHARES (100), SIM_MAKER_FOLLOW_SETTLE_SECONDS (2) and the floor orders at their defaults
+    LIVE = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "WEB_PORT": "8080",
+            "SIM_WAYS": "maker", "SIM_MARKETS": "all", "LIVE": "on", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, "PREDICT_API_KEY": "k",
+            "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off", "PREDICT_WS": "off",
+            "LIVE_MAX_ORDER_USD": "100", "LIVE_MAX_OPEN_USD": "250", "LIVE_MAX_DAILY_LOSS_USD": "50"}
+
+    async def live_bot(others, **env):  # ...on the real feed: a REST-polled market, the card's fair price 70¢
+        server = Server(others)
+        bot = L.LiveBot(m.Config.from_env({**LIVE, **env}), m.Store(":memory:"), FM(), None)
+        bot.live.api, bot.live.chain = Api(server), Chain()
+        bot.live.api.markets["101"] = {"id": 101, "status": "REGISTERED", "isNegRisk": False, "isYieldBearing": False, "feeRateBps": 200,
+                                       "conditionId": "0x" + "ab" * 32, "outcomes": [{"name": "Up", "indexSet": 1, "onChainId": "1011"},
+                                                                                    {"name": "Down", "indexSet": 2, "onChainId": "1012"}]}
+        feed = single_feed(bot.predict)
+        bot.sim_markets = lambda now_ms, only=None: [card(feed.books["HSI"])] if "HSI" in feed.books else []
+        await bot.live_prepare()
+        await bot.live_prefetch(clock.ms)
+        assert bot.live.ready, bot.live.ready_error
+        return bot, server
+
+    async def step(bot):
+        bot.sim_ran = -1e9
+        await bot.sim_step(clock.ms)
+
+    async def live_order_not_withdrawn():
+        """End to end, the defaults: a REST read in flight across the order's answer no longer withdraws the order."""
+        bot, server = await live_bot({0.55: 150.0, 0.53: 80.0})
+        api, feed, tid = bot.live.api, bot.predict, f"{SLUG}|up|挂"
+        await rest_read(feed, server.levels, lane=False)  # 买1 55¢ × 150 of others
+
+        async def placed():  # 50 ms after the read went out the step joins the 55¢ level with a real order, answered at once
+            clock.ms += 50
+            await step(bot)
+            assert api.calls == [("create", 0.55)] and bot.sim_trades()[tid]["live"]["state"] == "open", api.calls
+        clock.ms += 1000
+        bk = await rest_read(feed, server.levels, placed, 300)  # ...and lands 300 ms after Predict's answer: the lane looks at once
+        rec = bot.sim_trades()[tid]
+        assert api.calls == [("create", 0.55)] and rec["status"] == "resting" and rec["price"] == 0.55 and rec["live"]["state"] == "open", \
+            f"the order just placed was withdrawn on a book that cannot show it: {api.calls}"
+        assert float(bk.bids[0][1]) == 150 and bk.fetched_ms > rec["live"]["answered_at"]  # (the levels of before the order, landed after it)
+        clock.ms += 50  # the read asked after the answer: 250 at 55¢, 100 of them ours — counted again; 150 of others keep the 买1
+        bk = await rest_read(feed, server.levels, None, 300)
+        assert float(bk.bids[0][1]) == 250 and m.own_on_book(rec, bk) == 100.0 and api.calls == [("create", 0.55)]
+
+    async def live_ghost_not_joined():
+        """End to end: a REST read in flight across a cancel's confirmation shows the cancelled order — not a 买1 to join."""
+        bot, server = await live_bot({0.55: 300.0, 0.53: 80.0}, SIM_MAKER_FLOOR_SHARES="0", SIM_MAKER_FOLLOW_SETTLE_SECONDS="0")
+        api, feed, tid = bot.live.api, bot.predict, f"{SLUG}|up|挂"
+        await rest_read(feed, server.levels, lane=False)
+        clock.ms += 50
+        await step(bot)  # our 100 join the 300 at 55¢
+        assert api.calls == [("create", 0.55)]
+        clock.ms += 1000
+        server.others[0.55] = 20.0  # the others leave: 20 and our 100
+        await rest_read(feed, server.levels, None, 300)
+        flying = []
+
+        async def cancel_goes_out():  # the market's next REST read goes out as the cancel does: Predict still has the order
+            flying.append(await ask(feed, server.levels))
+        api.on_remove = cancel_goes_out
+        clock.ms += 1000
+        await step(bot)  # "买1 不足": withdrawn, the cancel confirmed, the slot looked at again — nothing to join
+        trades = bot.sim_trades()
+        assert api.calls == [("create", 0.55), ("remove", ["101"])] and tid not in trades, api.calls
+        done = trades[f"{tid}#1"]["live"]["cancel_done_ms"]
+        assert done == clock.ms
+        clock.ms += 300
+        bk = await land(feed, *flying[0])  # the read lands 300 ms after the confirmation: the lane looks at once
+        assert float(bk.bids[0][1]) == 120 and bk.fetched_ms > done  # 20 of others and the ghost, stamped after the confirmation
+        await step(bot)  # ...and so does the step
+        assert api.calls == [("create", 0.55), ("remove", ["101"])] and tid not in bot.sim_trades(), \
+            f"a real order joined its own ghost — 20 shares of others under SIM_MAKER_MIN_BID 100: {api.calls}"
+        server.others[0.55] = 150.0  # others back at 55¢, on a read asked after the cancel: joined again
+        clock.ms += 1000
+        await rest_read(feed, server.levels, None, 300)
+        await step(bot)
+        assert api.calls == [("create", 0.55), ("remove", ["101"]), ("create", 0.55)], api.calls
+        assert bot.sim_trades()[tid]["status"] == "resting"
+
+    async def live_deep_bid_holds():
+        """End to end, the deep-bid mode on a pushed market: the push that shows the new order beats Predict's HTTP answer."""
+        bot, server = await live_bot({0.30: 500.0}, SIM_MAKER_DEEP_CENTS="10", SIM_MAKER_FLOOR_SHARES="0",
+                                     SIM_MAKER_FOLLOW_SETTLE_SECONDS="0")
+        api, feed, tid = bot.live.api, bot.predict, f"{SLUG}|up|挂"
+        await rest_read(feed, server.levels, lane=False)  # 30¢ × 500 of others under a 58¢ ask: a cent in front has the edge
+        feed.stream.subscribed = {"101": ("HSI", False)}
+
+        async def pushed():  # the book with the order on it arrives 100 ms after the request, 200 ms before its HTTP answer
+            clock.pass_ms(100)
+            feed.stream.book("101", {"version": 2, **server.levels()})
+            await looked(feed)  # the lane looks at once, the request still in flight
+            clock.pass_ms(200)
+        api.on_create = pushed
+        clock.ms += 50
+        await step(bot)
+        rec = bot.sim_trades()[tid]
+        assert api.calls == [("create", 0.31)] and rec["deep"] and rec["status"] == "resting" and rec["live"]["state"] == "open", api.calls
+        assert feed.books["HSI"].bids[0] == (D("0.31"), D("100")) and feed.books["HSI"].fetched_ms < rec["live"]["answered_at"]
+        clock.ms += 50
+        await step(bot)  # the look after the answer, on that book: the 100 at 31¢ "in front" are the order itself
+        assert api.calls == [("create", 0.31)] and bot.sim_trades()[tid] is rec and rec["status"] == "resting", \
+            f"a deep-bid order withdrawn to be placed over its own push: {api.calls}"
+        server.others[0.33] = 50.0  # somebody's 50 at 33¢, pushed after the answer: a real bid in front, followed as before
+        clock.ms += 1000
+        feed.stream.book("101", {"version": 3, **server.levels()})
+        await looked(feed)
+        await step(bot)
+        assert api.calls == [("create", 0.31), ("remove", ["101"]), ("create", 0.34)], api.calls
+
+    clock = Clock(BJ(10, 5, 10, 0))
+    m.time = L.time = clock
+    try:
+        for part in (rest_across_the_answer, pushes_across_the_answer, ladder_level, rest_across_the_cancel,
+                     deep_bid_is_not_its_own_front, deep_bid_through_the_settle, live_order_not_withdrawn, live_ghost_not_joined,
+                     live_deep_bid_holds):
+            await part()
+    finally:
+        m.time = L.time = real_time
+
+
+asyncio.run(feed_fetched_ms())
+
 print("AUDIT_FEEDS_OK")
