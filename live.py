@@ -2112,6 +2112,11 @@ class LiveBot(core.Bot):
                             f"现在原策略 {money(own)}、预挂 {money(pre)}")
                     if not self.preopen_active():
                         why += "（预挂未运行：当日盈利不计入）"
+                    elif getattr(self.preopen, "winding", ""):
+                        # 1.150.0 (Audit FR-WINDDOWN-GAIN): switched off and winding down, the mode counts as stopped (preopen_pnl):
+                        # a resume taken while it ran at a gain re-trips at the switch-off, while its controller still lives —
+                        # said like the stopped mode's, or the notice showed the gain gone with no reason
+                        why += "（预挂已关闭、正在收尾：当日盈利不计入）"
                 else:
                     why += f"，手动恢复时 {money(found)}、之后又亏 ${found - pnl:,.2f}"
             self.store.put("live:killed", {"day": core.beijing_day(now_ms / 1000), "why": why, "at": now_ms})
@@ -6528,10 +6533,20 @@ class LiveBot(core.Bot):
 
     def preopen_pnl(self) -> float:
         """The pre-open mode's accounted P&L of the day, counted with the model trader's against LIVE_MAX_DAILY_LOSS_USD: while
-        it runs for real, its day as it stands (a gain offsets the model trader's losses); while it does not — crashed (alive
-        False, kept until the next apply), LIVE≠on, switched off and cleared, off since a restart — its day's realised loss
-        alone, a gain counting 0."""
-        if self.preopen_active():
+        it runs for real (not winding down), its day as it stands (a gain offsets the model trader's losses); while it does
+        not — crashed (alive False, kept until the next apply), LIVE≠on, switched off (winding down, or cleared), off since a
+        restart — its day's realised loss alone, a gain counting 0."""
+        # 1.150.0 (Audit FR-WINDDOWN-GAIN): a controller winding down is alive, so preopen_active() is True, and this counted
+        # its whole day, a gain included. Winding means the mode is switched off (1.141.0: /preopen off, a control-page save;
+        # and since XR-PRELATE-CRASHED also a mode that is off and only has withdrawn orders whose final fills are unread —
+        # an operator's withdrawal on a crashed controller, a restart within LATE_FILL_MS of a withdrawal — preopen_leftovers):
+        # while it wound down, the switched-off mode's gain offset the model trader's losses, the send-time recheck let real
+        # orders out past LIVE_MAX_DAILY_LOSS_USD and the kill switch did not trip — for about a minute, and in FINALS_WAIT_MS
+        # rounds for as long as Predict's order reads failed — where 1.149.0 had no controller in that state, counted 0 and
+        # stopped. A winding controller places nothing: it counts as the stopped mode it is (preopen_exclusive treats it so
+        # too) — its loss still counted, its gain not; so a /live resume taken meanwhile no longer anchors on a gain that
+        # drops out a minute later (the stop re-tripped with no new loss).
+        if self.preopen_active() and not getattr(self.preopen, "winding", ""):
             return float(self.preopen.daily_pnl())
         # Audit PRE-PNL-DROP: this was 0.0 whenever the mode was not running (1.125.0 gated the day on preopen_active together
         # with the reservation), so a crash, /preopen off (wound down, then cleared) or a restart with the mode off took the

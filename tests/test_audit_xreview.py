@@ -2020,4 +2020,119 @@ async def cancel_account_stale_key():
 
 
 asyncio.run(cancel_account_stale_key())
+
+
+async def winddown_gain():
+    """FR-WINDDOWN-GAIN: the daily loss stop counts the pre-open mode's whole day (a gain offsetting the model trader's losses)
+    only while the mode runs for real; stopped — crashed, LIVE≠on, switched off — its loss alone, a gain counting 0
+    (PRE-PNL-DROP). preopen_pnl went by preopen_active(), which a controller winding down passes (alive, LIVE=on), and since
+    XR-PRELATE-CRASHED a mode that is OFF starts one only to read the final fills of withdrawn orders ("removed": an operator's
+    withdrawal on a crashed controller, a restart within LATE_FILL_MS of a withdrawal). While it ran, the switched-off mode's
+    gain offset the model trader's losses: past LIVE_MAX_DAILY_LOSS_USD the send-time recheck let real orders out and the kill
+    switch did not trip, where 1.149.0 (no controller in that state) stopped. A winding controller now counts as stopped."""
+    import tempfile, types
+    import preopen as P
+    import test_preopen as TP
+    with tempfile.TemporaryDirectory() as folder:
+        db = str(pathlib.Path(folder) / "w.preopen.sqlite3")
+        now = TP.NOW + 2 * 3600_000  # 11:00 Beijing, 2026-11-06
+        mk = TP.market(at=now + 3600_000, mid=200)
+        ctl0, _, _ = TP.controller([mk], PREOPEN_DB=db, PREOPEN_MARKETS="btc", PREOPEN_AHEAD_MINUTES="1440")
+        await ctl0.place_pair(P.candidate(mk, TP.NOW, ctl0.owner.config, ctl0.settings))
+        for pair in list(ctl0.ledger.rows.values()):  # withdrawn on a crashed controller (/preopen pause): off the book, final reads pending
+            for order in pair["orders"].values():
+                order["state"] = "removed"
+            ctl0.ledger.save(pair)
+        ctl0.ledger.save({"slug": "booked-gain", "card": "btc", "phase": "closed", "accounted": True, "accounted_day": "2026-11-06",
+                          "pnl": 51.0, "start_ms": TP.NOW + 3600_000, "orders": {}})  # the mode's booked gain of the day: +$51
+        ctl0.ledger.close()
+        clock = types.SimpleNamespace(ms=now)
+        bot = L.LiveBot.__new__(L.LiveBot)
+        bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "STATE_DB": ":memory:", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64,
+                                        "LIVE_MAX_DAILY_LOSS_USD": "100", "PREOPEN_DB": db, "PREOPEN_15M": "off", "PREOPEN_MARKETS": "btc"})
+        bot.store, bot.stopping = m.Store(":memory:"), asyncio.Event()
+        bot.market = types.SimpleNamespace(now_ms=lambda: clock.ms)
+        bot.live_notify, bot.live_note_error = (lambda text, key="": None), (lambda text: None)
+        bot.live = types.SimpleNamespace(ready=False, not_ready_why="past the loss check", usd=lambda: None)
+        bot.preopen, bot.preopen_task, bot.preopen_lock = None, None, asyncio.Lock()
+        bot.preopen_tidied = 1e18  # (no archive pass in this check)
+        made = []
+
+        def factory(owner):  # the real controller on that ledger file; Predict's order reads fail (HTTP 503), so it winds on
+            ctl, api, _ = TP.controller([TP.market()], PREOPEN_DB=db, PREOPEN_MARKETS="btc")
+            ctl.owner.market.now_ms = lambda: clock.ms
+
+            async def failing(*args, **kwargs):
+                raise m.RemoteError("HTTP 503: Service Unavailable")
+            api.order = failing
+            made.append(ctl)
+            return ctl
+        bot.preopen_factory = factory
+        # the model trader's settled day: −$120 (240 shares at 50¢, paid nothing)
+        trades = {"m1": {"live": {"state": "done"}, "status": "settled", "settled": now - 1000, "payout": 0.0, "price": 0.5, "shares": 240.0}}
+        probe = {"live": {"want": {"shares": 10}, "events": [{"at": 0}]}, "maker": True, "price": 0.5, "order": 10}
+
+        def stop_hits():  # (the send-time recheck refuses, the kill switch trips)
+            bot.store.delete_keys(["live:killed"])
+            refused = "已达 LIVE_MAX_DAILY_LOSS_USD $100" in bot.live_send_block(probe, trades, clock.ms)
+            bot.live_check_kill(trades, clock.ms)
+            tripped = bool(bot.live_kill_record())
+            bot.store.delete_keys(["live:killed"])
+            return refused, tripped
+        assert bot.preopen_leftovers() == 2, bot.preopen_leftovers()  # the two withdrawn orders whose final fills are unread
+        assert bot.preopen_pnl() == 0.0 and stop_hits() == (True, True)  # no controller: the file's +$51 counts 0 (PRE-PNL-DROP)
+        await bot.preopen_apply()  # the mode off with those records: a wind-down controller, only to read them (XR-PRELATE-CRASHED)
+        await asyncio.sleep(0.3)  # its loops run; the reads fail: it winds on
+        ctl = bot.preopen
+        try:
+            assert ctl is not None and made == [ctl] and ctl.winding and ctl.alive and bot.preopen_active(), (made, getattr(ctl, "winding", None))
+            assert abs(ctl.daily_pnl() - 51.0) < 1e-9, ctl.daily_pnl()  # it holds the switched-off mode's +$51 of the day
+            # before: +$51 counted (−$69 against the $100 cap) — not refused, not tripped: real orders went on past the cap
+            assert bot.preopen_pnl() == 0.0, f"winding down: the switched-off mode's gain counted ({bot.preopen_pnl():+.2f})"
+            assert stop_hits() == (True, True), "winding down: the model trader went on past LIVE_MAX_DAILY_LOSS_USD"
+            row = ctl.ledger.rows["booked-gain"]  # its loss of the day still counts while it winds down
+            row["pnl"] = -49.0
+            assert abs(bot.preopen_pnl() + 49) < 1e-9, bot.preopen_pnl()
+            row["pnl"] = 51.0
+        finally:
+            await bot.preopen_stop("test end", keep=True)
+        assert bot.preopen is None and not ctl.alive
+
+    # the stop's notice and /live resume with a controller winding down (test_trading's bot, $50 cap, a stand-in controller)
+    def bot_with(pre_day):
+        bot = make_bot()
+        bot.notes = []
+        bot.live_notify = lambda text, key="": bot.notes.append(text)
+        bot.preopen = types.SimpleNamespace(alive=True, daily_pnl=lambda: pre_day, winding="", manual_pause=False, withdrawing=lambda: "",
+                                            ledger=types.SimpleNamespace(pause=lambda value=None: False))
+        trades = {"m1": {"live": {"state": "done"}, "status": "settled", "settled": NOW - 1000, "payout": 0.0, "price": 0.5, "shares": 220.0}}
+        bot.sim_trades = lambda: trades
+        return bot, trades
+
+    # resumed while the mode ran at +$60 (model trader −$110: −$50 counted, line −$100), then switched off: its gain drops out
+    # at once, the stop trips again at −$110 and says why (before: −$50 counted while it wound down, the same re-trip at its end)
+    bot, trades = bot_with(60.0)
+    bot.live_check_kill(trades, NOW)
+    assert bot.live_killed().startswith("今日已结算亏损 −$50.00"), bot.live_killed()
+    await bot.live_action("resume", [], NOW)
+    assert bot.live_killed() == "" and bot.live_loss_floor(50.0) == -100.0
+    bot.preopen.winding = "预挂模式已关闭"  # switched off: winding down, its controller alive
+    assert bot.preopen_active() and bot.preopen_pnl() == 0.0, bot.preopen_pnl()
+    bot.live_check_kill(trades, NOW + 1000)
+    assert bot.live_killed() == ("今日已结算亏损 −$110.00 达到 LIVE_MAX_DAILY_LOSS_USD $50，手动恢复时 −$50.00（原策略 −$110.00、预挂 +$60.00），"
+                                 "现在原策略 −$110.00、预挂 +$0.00（预挂已关闭、正在收尾：当日盈利不计入）"), bot.live_killed()
+    # a resume taken DURING the wind-down anchors on what counts (−$110, line −$160), not on the gain about to drop out: when
+    # the controller ends, no false re-trip (before: anchored at −$50, line −$100, tripped again a minute on with no trade)
+    bot, trades = bot_with(60.0)
+    bot.preopen.winding = "预挂模式关着，但上次还有挂单没撤完"
+    bot.live_check_kill(trades, NOW)
+    assert bot.live_killed().startswith("今日已结算亏损 −$110.00"), bot.live_killed()
+    reply = await bot.live_action("resume", [], NOW)
+    assert "今日已结算 −$110.00，再亏到 −$160.00 会再次停机" in reply, reply
+    bot.preopen.alive = False  # wound up: it stopped itself (cleared at the next apply)
+    bot.live_check_kill(trades, NOW + 61_000)
+    assert bot.live_killed() == "", bot.live_killed()
+
+
+asyncio.run(winddown_gain())
 print("AUDIT_XREVIEW_OK")
