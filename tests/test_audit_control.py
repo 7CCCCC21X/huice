@@ -1159,4 +1159,244 @@ async def ctrl_refresh_wake():
 
 
 asyncio.run(ctrl_refresh_wake())
+
+
+async def ctrl_telegram_startup():
+    """CTRL-TELEGRAM-STARTUP: Bot.run asked Telegram for getWebhookInfo and getMe before anything else and let every failure
+    out. Telegram out of reach at that moment (its API down, DNS, the egress: a deploy or a restart during an outage) ended
+    run() before one loop had started — no sampling, no feeds, no trader (the real orders resting on Predict neither synced,
+    re-judged nor withdrawn), no kill switch, no redeem, no control page — and Railway restarted the process into the same
+    failure for as long as the outage lasted, LiveBot starting and abandoning its pre-open mode on every round. Now an
+    outage at the start is not a refusal: everything else starts, the commands loop tries the check again (backing off,
+    never before a wait Telegram named) and asks for updates only once it passed. A reported webhook and a token Telegram
+    rejects still stop the start before any loop; found only later, they end the bot (exit 1)."""
+    import logging, socket, time, types
+
+    class Market(m.Binance):
+        def now_ms(self): return int(time.time() * 1000)
+        async def sync_clock(self): pass
+        async def prices(self): return {"UNITREEUSDT": {"symbol": "UNITREEUSDT", "price": "73.13", "time": self.now_ms()}}
+        async def get(self, path, **p): return []
+
+    # the failures as the HTTP layer hands them to Telegram.call: each a fresh error, built by the layer's own functions
+    dns = lambda: m._net_error(socket.gaierror(-3, "Temporary failure in name resolution"))
+    reset = lambda: m._net_error(ConnectionResetError(104, "Connection reset by peer"))
+    http = lambda code, body=b"": (lambda: m._remote_error("api.telegram.org", code, None, body, ""))
+    bad_gateway = http(502, b"<html><body>502 Bad Gateway</body></html>")
+    flood = lambda seconds: http(429, json.dumps({"ok": False, "error_code": 429, "description": f"Too Many Requests: retry after {seconds}",
+                                                  "parameters": {"retry_after": seconds}}).encode())
+    unauthorized = http(401, b'{"ok":false,"error_code":401,"description":"Unauthorized"}')
+    not_found = http(404, b'{"ok":false,"error_code":404,"description":"Not Found"}')
+    assert str(dns()).startswith("网络错误 (gaierror") and str(bad_gateway()).startswith("HTTP 502") and flood(90)().retry_after == 90
+    assert str(unauthorized()) == "HTTP 401: Unauthorized" and str(not_found()) == "HTTP 404: Not Found"
+
+    class Tg:
+        """Telegram as the bot meets it. ``down`` (an error factory): every request fails with it until it is cleared.
+        ``script``: what the next requests meet, one each (an error factory, or None for an answer); after it every
+        request is answered. ``webhook``: what getWebhookInfo reports when it answers."""
+        def __init__(self, down=None, script=(), webhook=""):
+            self.down, self.script, self.webhook = down, list(script), webhook
+            self.calls, self.sent, self.updates = [], [], []
+        async def call(self, method, payload=None, timeout=15):
+            self.calls.append(method)
+            fault = self.down or (self.script.pop(0) if self.script else None)
+            if fault is not None:
+                raise fault()
+            if method == "getWebhookInfo": return {"url": self.webhook}
+            if method == "getMe": return {"username": "AuditBot"}
+            if method == "getUpdates":
+                await asyncio.sleep(0.02)
+                batch, self.updates = self.updates, []
+                return batch
+            return True
+        async def send(self, chat, thread, text, reply_markup=None, parse_mode=None):
+            if self.down is not None:
+                raise self.down()
+            self.sent.append((chat, text))
+
+    quiet = {"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "SYMBOLS": "UNITREEUSDT", "BASELINE_MODE": "manual", "HSI_FUTURES": "off",
+             "KOSPI_INDEX": "off", "SSE_INDEX": "off", "PREDICT": "off", "BNB_TOUCH": "off", "SIM": "off", "PROBABILITY": "off",
+             "WEB": "off", "POLL_SECONDS": "3", "STATE_DB": ":memory:"}
+
+    def make(tg, cls=m.Bot, **env):
+        """A bot on ``tg``, and its commands loop's waits: the seconds it asked for, each cut to a moment (the other loops
+        wait as they do)."""
+        cfg = m.Config.from_env({**quiet, **env})
+        bot, waits = cls(cfg, m.Store(":memory:"), Market(cfg), tg), []
+        real_wait = bot.wait
+
+        async def wait(seconds):
+            if asyncio.current_task().get_name() == "commands":
+                waits.append(seconds)
+                seconds = min(seconds, 0.02)
+            await real_wait(seconds)
+        bot.wait = wait
+        return bot, waits
+
+    async def until(cond, seconds=5.0):
+        end = time.monotonic() + seconds
+        while not cond() and time.monotonic() < end:
+            await asyncio.sleep(0.01)
+        return cond()
+
+    async def started(bot, runner):
+        """run() got as far as its loops — the sampling began a cycle, the feeds' tasks run — and goes on."""
+        await until(lambda: bot.last_cycle > 0 or runner.done())
+        assert not runner.done(), f"run() ended at the start: {(runner.exception() if not runner.cancelled() else 'cancelled')!r}"
+        assert bot.last_cycle > 0 and bot.reference_tasks and not any(t.done() for t in bot.reference_tasks)
+
+    class Capture(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.lines = []
+        def emit(self, record): self.lines.append((record.levelname, record.getMessage()))
+    log = Capture()
+    m.LOG.addHandler(log)
+    propagate, m.LOG.propagate = m.LOG.propagate, False  # (the warnings expected here stay out of the suite's output)
+    try:
+        # (1) DNS fails when the process starts. It was: RemoteError out of run(), nothing started (exit 1, restart, again).
+        # Now the loops run, and all Telegram is asked is the check: a try after 2 s, 4 s, … a minute, nothing else
+        tg = Tg(down=dns)
+        bot, waits = make(tg)
+        runner = asyncio.create_task(bot.run())
+        await started(bot, runner)
+        assert await until(lambda: len(waits) >= 7), waits
+        assert set(tg.calls) == {"getWebhookInfo"} and not bot.telegram_ok and bot.username == "", tg.calls  # no getMe, no menu, no update asked for
+        assert 0 < waits[0] <= 2 and all(want - 1 < got <= want for got, want in zip(waits[1:7], (4, 8, 16, 32, 60, 60))), waits
+        assert any(level == "WARNING" and "启动时 Telegram 不可用" in text and "网络错误 (gaierror" in text for level, text in log.lines), log.lines
+        # Telegram answers again: the check passes (the webhook first, then getMe), the menu is published, and only then
+        # is the first update asked for — a group's command for another bot is told from ours by the name getMe gave
+        update = lambda uid, text: {"update_id": uid, "message": {"text": text, "chat": {"id": 42}, "from": {"id": 42}, "date": time.time()}}
+        tg.updates = [update(1, "/id@OtherBot"), update(2, "/id@AuditBot")]
+        seen = len(tg.calls)
+        tg.down = None
+        assert await until(lambda: bot.store.get("telegram_offset") == 3 and tg.sent), (tg.calls[seen:], tg.sent)
+        await asyncio.sleep(0.05)  # (every answer queued for the two has gone out by now)
+        assert tg.calls[seen:seen + 5] == ["getWebhookInfo", "getMe", "setMyCommands", "setChatMenuButton", "getUpdates"], tg.calls[seen:]
+        assert bot.telegram_ok and bot.username == "AuditBot"
+        assert [text for chat, text in tg.sent if "用户 ID" in text] == [m.id_text(42, 42, 0)], tg.sent  # one answer: ours
+        assert not runner.done()
+        bot.stopping.set()
+        assert await asyncio.wait_for(runner, 10) == 0
+
+        # (2) a 5xx is an outage too, and so is a 429: the wait Telegram names is kept (the next try not before it)
+        tg = Tg(script=[bad_gateway, flood(90)])
+        bot, waits = make(tg)
+        runner = asyncio.create_task(bot.run())
+        await started(bot, runner)
+        assert await until(lambda: "getUpdates" in tg.calls), tg.calls
+        assert tg.calls[:7] == ["getWebhookInfo"] * 3 + ["getMe", "setMyCommands", "setChatMenuButton", "getUpdates"], tg.calls
+        assert 0 < waits[0] <= 2 and 89 < waits[1] <= 90 and len(waits) == 2, waits
+        bot.stopping.set()
+        assert await asyncio.wait_for(runner, 10) == 0
+        # getMe failing after the webhook answered: the whole check again, the webhook too
+        tg = Tg(script=[None, reset])
+        bot, waits = make(tg)
+        runner = asyncio.create_task(bot.run())
+        await started(bot, runner)
+        assert await until(lambda: "getUpdates" in tg.calls), tg.calls
+        assert tg.calls[:7] == ["getWebhookInfo", "getMe"] * 2 + ["setMyCommands", "setChatMenuButton", "getUpdates"], tg.calls
+        bot.stopping.set()
+        assert await asyncio.wait_for(runner, 10) == 0
+        # a stop while it waits out an hour Telegram named (Railway's SIGTERM during the outage): at once, exit 0
+        cfg = m.Config.from_env(quiet)
+        bot = m.Bot(cfg, m.Store(":memory:"), Market(cfg), Tg(down=flood(3600)))  # (its waits are real)
+        runner = asyncio.create_task(bot.run())
+        await started(bot, runner)
+        assert bot.hello_next - time.monotonic() > 3500 and bot.telegram.calls == ["getWebhookInfo"], bot.telegram.calls
+        bot.stopping.set()
+        assert await asyncio.wait_for(runner, 10) == 0 and bot.telegram.calls == ["getWebhookInfo"]
+
+        # (3) the refusals stand, before any loop: a reported webhook (README 已有 Webhook), a token Telegram rejects
+        for tg, kind, word in ((Tg(webhook="https://other.example/hook"), ValueError, "已绑定 Webhook"),
+                               (Tg(script=[unauthorized]), m.RemoteError, "HTTP 401"), (Tg(script=[not_found]), m.RemoteError, "HTTP 404"),
+                               (Tg(script=[None, unauthorized]), m.RemoteError, "HTTP 401")):
+            bot, waits = make(tg)
+            try:
+                await asyncio.wait_for(bot.run(), 5)
+            except kind as error:
+                assert word in str(error), error
+            else:
+                raise AssertionError(f"the start was not refused: {tg.calls}")
+            assert not bot.reference_tasks and bot.last_cycle == 0 and not waits and not bot.telegram_ok, tg.calls
+            assert set(tg.calls) <= {"getWebhookInfo", "getMe"}, tg.calls
+
+        # (4) out of reach at the start, and the refusal shows once Telegram answers: the commands loop ends and run() with
+        # it, exit 1 (Railway restarts it, and that start refuses before any loop). No update was asked for, no menu written
+        for tg, word in ((Tg(script=[dns], webhook="https://other.example/hook"), "已绑定 Webhook"), (Tg(script=[bad_gateway, unauthorized]), "HTTP 401")):
+            bot, waits = make(tg)
+            log.lines.clear()
+            assert await asyncio.wait_for(bot.run(), 10) == 1
+            assert bot.last_cycle > 0 and len(waits) == 1 and not bot.telegram_ok and all(t.done() for t in bot.reference_tasks), waits
+            assert tg.calls == ["getWebhookInfo"] * 2, tg.calls
+            assert any(level == "ERROR" and "核心循环 commands 意外结束" in text and word in text for level, text in log.lines), log.lines
+
+        # what counts as Telegram's own refusal, on the errors as the HTTP layer and Telegram.call make them: a 4xx (but
+        # the 429) and an answer that is not ok (but one that names a wait)
+        async def not_ok(answer):  # Telegram.call's error for a 200 answer without ok
+            real, m.http_json = m.http_json, (lambda url, payload=None, timeout=15: asyncio.sleep(0, answer))
+            try:
+                await m.Telegram("1:x").call("getMe")
+            except m.RemoteError as error:
+                return error
+            finally:
+                m.http_json = real
+        refused = m.Bot.telegram_refused
+        outage = [dns(), reset(), m._net_error(TimeoutError("timed out")), http(500)(), bad_gateway(), http(503)(), http(504)(), flood(7)(),
+                  m.RemoteError("接口未返回有效 JSON"),
+                  await not_ok({"ok": False, "error_code": 429, "description": "Too Many Requests: retry after 5", "parameters": {"retry_after": 5}})]
+        verdict = [unauthorized(), not_found(), http(400)(), http(403)(), http(409)(),
+                   await not_ok({"ok": False, "error_code": 401, "description": "Unauthorized"})]
+        assert str(verdict[-1]) == "Telegram: Unauthorized" and outage[-1].retry_after == 5, (verdict[-1], outage[-1])
+        assert not any(refused(e) for e in outage) and all(refused(e) for e in verdict), ([str(e) for e in outage if refused(e)],
+                                                                                         [str(e) for e in verdict if not refused(e)])
+
+        # (5) LiveBot starts its pre-open mode before Bot.run: every one of those restarts started a controller and
+        # abandoned it (preopen_stop keep=True, exit 1, again). It now runs on through the outage, the one controller, and
+        # is kept at the stop as before
+        class FakeCtl:  # the controller's stand-in (LiveBot.preopen_factory): runs until it is stopped
+            made = []
+            def __init__(self, owner):
+                self.owner, self.settings, self.alive, self.stop, self.error = owner, owner.config.preopen, True, asyncio.Event(), ""
+                self.ledger = types.SimpleNamespace(close=lambda: None, rows={})
+                self.ended, self.winding, self.keep_on_stop = False, "", False
+                FakeCtl.made.append(self)
+            def wind_down(self, reason):
+                self.winding = reason
+                self.stop.set()
+            async def run(self):
+                try:
+                    await self.stop.wait()
+                finally:
+                    self.ended, self.alive = True, False
+            def filled_by_outcome(self, days=30): return {}
+            def status(self): return "fake"
+        tg = Tg(down=dns)
+        bot, waits = make(tg, L.LiveBot, LIVE="off", PREDICT_PRIVATE_KEY="a" * 64, PREOPEN_15M="on")  # a made-up key, never a real one
+        bot.preopen_factory = FakeCtl
+        runner = asyncio.create_task(bot.run())
+        await started(bot, runner)
+        ctl = bot.preopen
+        assert FakeCtl.made == [ctl] and ctl.alive and not ctl.ended
+        assert await until(lambda: len(waits) >= 4) and not runner.done()  # some failed tries later: still that controller, running
+        assert FakeCtl.made == [ctl] and bot.preopen is ctl and not ctl.ended and not ctl.stop.is_set()
+        bot.stopping.set()
+        assert await asyncio.wait_for(runner, 30) == 0 and ctl.ended and ctl.keep_on_stop and bot.preopen is None
+
+        # (6) the real client with the network disabled (tests/offline.py): the request fails inside the HTTP layer
+        cfg = m.Config.from_env(quiet)
+        bot = m.Bot(cfg, m.Store(":memory:"), Market(cfg), m.Telegram("1:" + "x" * 30))
+        log.lines.clear()
+        runner = asyncio.create_task(bot.run())
+        await started(bot, runner)
+        assert not bot.telegram_ok and bot.hello_failures >= 1
+        assert any(level == "WARNING" and "启动时 Telegram 不可用（网络错误" in text for level, text in log.lines), log.lines
+        bot.stopping.set()
+        assert await asyncio.wait_for(runner, 10) == 0
+    finally:
+        m.LOG.removeHandler(log)
+        m.LOG.propagate = propagate
+
+
+asyncio.run(ctrl_telegram_startup())
 print("AUDIT_CONTROL_OK")

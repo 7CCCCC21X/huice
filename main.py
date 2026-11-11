@@ -15561,6 +15561,9 @@ class Bot:
         self.last_log: dict[str, float] = {}
         self.command_notice: dict[int, float] = {}
         self.username = ""
+        self.telegram_ok = False  # the start-up check passed in this process (telegram_hello): commands are polled only then
+        self.hello_failures = 0   # its tries in a row that found Telegram out of reach, and (monotonic) the earliest moment
+        self.hello_next = 0.0     # of the next one: the commands loop's back-off
         self.handlers = {
             "/help": self.cmd_help, "/id": self.cmd_id, "/status": self.cmd_status, "/test": self.cmd_test,
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
@@ -23667,7 +23670,56 @@ class Bot:
         if isinstance(query, dict):  # A button tap is a live intent, so it is not age-filtered.
             await self.process_callback(query)
 
+    @staticmethod
+    def telegram_refused(error: RemoteError) -> bool:
+        """Whether Telegram itself refused the request — an HTTP 4xx (401 / 404: a wrong or revoked token; README's 对方拒绝)
+        or an answer that is not ok — rather than could not be asked: a network error (连不上), a 5xx, a 429 flood wait (any
+        answer that names a wait) and a body that is not JSON say nothing about this token."""
+        hit = re.match(r"HTTP (\d{3})", str(error))
+        status = int(hit.group(1)) if hit else 0
+        if error.retry_after or status == 429:
+            return False
+        return 400 <= status < 500 or str(error).startswith("Telegram:")
+
+    async def telegram_hello(self) -> RemoteError | None:
+        """The start-up check, one try: the token must not be bound to a webhook — it may belong to another service, and
+        this program never removes one (README 已有 Webhook) — and getMe names the bot (parse_request tells a group's
+        /cmd@otherbot from ours by it). None once it passed (telegram_ok). A reported webhook (ValueError) and Telegram's
+        own refusal (telegram_refused: a wrong or revoked token) raise, as they always did.
+        1.150.0 (CTRL-TELEGRAM-STARTUP): Telegram out of reach or out of order — DNS or the network failing, a 5xx, a
+        429 — is not a refusal: that error is returned instead of raised, and hello_next is the earliest moment of the
+        next try (the poll's back-off: 2 seconds doubling up to a minute, and never before a wait Telegram named)."""
+        try:
+            webhook = await self.telegram.call("getWebhookInfo")
+            if webhook.get("url"):
+                raise ValueError("该 Bot Token 已绑定 Webhook。请为本项目使用独立机器人，或在原服务移除 Webhook 后重试")
+            me = await self.telegram.call("getMe")
+        except RemoteError as error:
+            if self.telegram_refused(error):
+                raise
+            self.hello_failures += 1
+            self.hello_next = time.monotonic() + max(error.retry_after, min(60, 2 ** min(self.hello_failures, 6)))
+            return error
+        self.username = me.get("username", "")
+        self.telegram_ok = True
+        return None
+
     async def commands_loop(self) -> None:
+        # 1.150.0 (CTRL-TELEGRAM-STARTUP): Telegram was out of reach when the process started (run): the start-up check
+        # is tried again here, backing off like the poll below, while the rest of the bot already runs. Not one update
+        # is asked for before it passed — the username is what tells a group's /cmd@otherbot from ours — and a token
+        # bound to a webhook stays refused: that ValueError, like Telegram rejecting the token, ends this core loop, so
+        # run() exits 1 and the next start refuses before any loop, as it always did.
+        while not self.telegram_ok and not self.stopping.is_set():
+            await self.wait(max(0.0, self.hello_next - time.monotonic()))
+            if self.stopping.is_set():
+                return
+            down = await self.telegram_hello()
+            if down is not None:
+                self.log_limited("hello", f"Telegram 仍不可用（{clean_error(down)}）：命令和菜单暂停，继续重试")
+                continue
+            LOG.info("Telegram 已恢复 @%s：注册菜单，开始接收命令", self.username)
+            await self.register_menu()
         offset = int(self.store.get("telegram_offset", 0))
         failures = 0
         while not self.stopping.is_set():
@@ -23712,12 +23764,19 @@ class Bot:
         """The bot's life: 0 when it stopped on request (signal), 1 when a core loop ended on its own (the process
         exits so Railway restarts it; a bot that keeps answering commands but no longer samples prices must not live)."""
         # Refuse to silently remove a webhook that may belong to another service.
-        webhook = await self.telegram.call("getWebhookInfo")
-        if webhook.get("url"):
-            raise ValueError("该 Bot Token 已绑定 Webhook。请为本项目使用独立机器人，或在原服务移除 Webhook 后重试")
-        me = await self.telegram.call("getMe")
-        self.username = me.get("username", "")
-        LOG.info("Starting @%s; symbols=%s; administrator_configured=%s", self.username,
+        # 1.150.0 (CTRL-TELEGRAM-STARTUP): Telegram being out of reach at this moment (its API down, DNS or the egress
+        # failing: nothing about this token) used to abort the start right here, before any loop — no sampling, no
+        # feeds, no trader: the real orders resting on Predict neither synced, re-judged nor withdrawn, no kill switch,
+        # no redeem, no control page — and Railway restarted the process into the same failure for as long as the
+        # outage lasted (LiveBot starting and abandoning its pre-open mode each time). Everything else starts now, the
+        # way it already carries on when Telegram goes away while running (messages go out as soon as Telegram takes
+        # them: a send touches no webhook); the commands loop tries the check again and polls only once it passed. The
+        # refusals are unchanged: a reported webhook and a token Telegram rejects still stop the start before any loop
+        # (found only later, they end the commands loop: exit 1, and the next start refuses).
+        down = await self.telegram_hello()
+        if down is not None:
+            LOG.warning("启动时 Telegram 不可用（%s）：行情、交易和网页照常启动；命令和菜单暂停，后台重试，恢复后自动接上", clean_error(down))
+        LOG.info("Starting @%s; symbols=%s; administrator_configured=%s", self.username or "?",
                  ",".join(self.config.symbols), bool(self.config.admin_id))
         # which secrets are set, never their values (Railway logs are not a place for a key)
         LOG.info("secrets configured: telegram_token=%s predict_api_key=%s predict_private_key=%s predict_account=%s web_control_key=%s live=%s",
@@ -23725,7 +23784,8 @@ class Bot:
                  bool(self.config.web_control_key), self.config.live)
         if self.config.live_key and not self.config.web_control_key:
             LOG.warning("PREDICT_PRIVATE_KEY 已配置但 WEB_CONTROL_KEY 未设置：控制台和复盘数据（账户、订单、交易记录）锁定，设置 WEB_CONTROL_KEY 后才显示")
-        await self.register_menu()
+        if self.telegram_ok:  # (Telegram out of reach: the commands loop publishes the menu once the check passed, never on a token whose webhook is unknown)
+            await self.register_menu()
         if not self.config.admin_id:
             LOG.warning("ADMIN_USER_ID 尚未配置：只能使用 /id；没有任何自动订阅")
         elif self.control_dropped:  # 1.150.0 (CTRL-PRUNE): saved settings dropped at this start reach the administrator, not only the log
