@@ -268,81 +268,187 @@ asyncio.run(round_void())
 
 
 # --- RDM-UNSENT-RETRY-GRID ------------------------------------------------------------------------------------------------------
+class Clock:
+    """live.py's ``time`` made virtual (monotonic and wall clock): a test lets minutes pass at once (``L.time = Clock()``)."""
+    def __init__(self):
+        self.t = 1_000_000.0
+
+    def monotonic(self):
+        return self.t
+
+    def time(self):
+        return 1.79e9 + self.t
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+class Behind(T["FakeChain"]):
+    """The chain a moment behind Predict's result: a condition's redeem reverts in the gas estimate (TxNotSent: nothing sent,
+    nothing spent) until the chain has its result. ``ready``: condition -> clock time; ``at``: condition -> when redeemed."""
+    def __init__(self, clock):
+        super().__init__()
+        self.clock, self.ready, self.at, self.refused = clock, {}, {}, 0
+
+    async def redeem(self, cid, index_set, amount, neg, yb):
+        if self.clock.t < self.ready.get(cid, 0.0):
+            self.refused += 1
+            raise L.TxNotSent("RPC 错误：execution reverted")
+        tx = await super().redeem(cid, index_set, amount, neg, yb)
+        self.at[cid] = self.clock.t
+        return tx
+
+
 async def unsent_retry_grid():
-    """RDM-UNSENT-RETRY-GRID: a redeem that never left (TxNotSent: the chain a moment behind Predict's result, an RPC blip) waits
-    five minutes and the bot said 5 分钟后自动再试 — but nothing brought a round when the wait ended: the retry came with the next
-    ten-minute round (up to fifteen when another round came inside the wait). For its first three such failures in a row the
-    position now brings the next round to the end of its wait (the shared pull: never later than a round already due, never
-    inside the key's cooldown); then the usual rounds, and the text says so. A sent failure, low gas and the check pull nothing."""
-    bot = await ready_bot()
-    fake, chain, key = bot.live.api, bot.live.chain, "live:redeemed:500:1"
-    fake.positions_rows, fake.markets["500"] = [held(500)], mk(500, won=1)
-    chain.fail_unsent = "RPC 错误：execution reverted"
-    sent = notices(bot)
-    # (a) the first try never left: the next round at the wait's end, five minutes on — not the ten-minute round
-    bot.live_last_redeem = time.monotonic()  # (as the tick stamps it when the round starts)
-    assert await bot.live_redeem(NOW) == [] and chain.redeemed == []
-    assert 295 < due(bot) <= 302, due(bot)
-    assert bot.live_errors[-1].endswith("（交易没发出，5 分钟后再试）") and bot.live_redeem_unsent == {key: 1}, (bot.live_errors[-1:], bot.live_redeem_unsent)
-    assert [k for k, _ in sent] == ["redeem:fail"] and "5 分钟后自动再试" in sent[0][1], sent
-    # (b) another round inside the wait (a win elsewhere) finds it waiting: the pull to the wait's end stands
-    bot.live_last_redeem = time.monotonic()
-    assert await bot.live_redeem(NOW + MIN) == [] and bot.live_redeem_last["counts"] == {"waiting": 1}, bot.live_redeem_last
-    assert 290 < due(bot) <= 302, due(bot)
-    # (c) /live redeem check moves nothing
-    stamp = bot.live_last_redeem
-    await bot.live_redeem_report(NOW + MIN + 1000)
-    assert bot.live_last_redeem == stamp
-    # (d) the second and third such failures in a row pull too; the fourth waits for the usual round, and says so
-    for runs in (2, 3, 4):
-        bot.live_redeem_failed.clear()  # (the wait over)
-        bot.live_last_redeem = time.monotonic()
-        assert await bot.live_redeem(NOW + runs * 6 * MIN) == [] and bot.live_redeem_unsent == {key: runs}, bot.live_redeem_unsent
-        if runs <= bot.LIVE_REDEEM_UNSENT_PULLS:
-            assert 295 < due(bot) <= 302 and bot.live_errors[-1].endswith("（交易没发出，5 分钟后再试）"), (runs, due(bot), bot.live_errors[-1:])
-    assert due(bot) > 595 and bot.live_errors[-1].endswith("（交易没发出，下一轮再试，最迟约 10 分钟）"), (due(bot), bot.live_errors[-1:])
-    bot.live_last_redeem = time.monotonic()
-    assert await bot.live_redeem(NOW + 30 * MIN) == [] and bot.live_redeem_last["counts"] == {"waiting": 1} and due(bot) > 595, "past the bound: not even from the wait"
-    # (e) it goes out: the run of failures forgotten
-    chain.fail_unsent = ""
-    bot.live_redeem_failed.clear()
-    done = await bot.live_redeem(NOW + 40 * MIN)
-    assert len(done) == 1 and bot.live_redeem_unsent == {} and [cid for cid, *_ in chain.redeemed] == [cond(500)], (done, bot.live_redeem_unsent)
-    # (f) a sent failure (its gas paid, its transaction may yet be mined): the hour's wait, nothing pulled
-    fake.positions_rows.append(held(501)); fake.markets["501"] = mk(501, won=1)
-    chain.fail = "交易失败（已回滚）"
-    bot.live_last_redeem = time.monotonic()
-    assert await bot.live_redeem(NOW + 50 * MIN) == [] and due(bot) > 595 and bot.live_errors[-1].endswith("（一小时后再试）"), (due(bot), bot.live_errors[-1:])
-    assert bot.live_redeem_unsent == {}
-    # (g) low gas: nothing tried, nothing pulled
-    chain.fail = ""
-    fake.positions_rows.append(held(502)); fake.markets["502"] = mk(502, won=1)
-    chain.bnb = 10 ** 13
-    await bot.live.refresh_balance()
-    bot.live_last_redeem = time.monotonic()
-    assert await bot.live_redeem(NOW + 51 * MIN) == [] and bot.live_redeem_last["counts"].get("claimable") == 1 and due(bot) > 595, bot.live_redeem_last
-    # (h) the key cooling when the wait ends: the pulled round after the cooldown, not into it
-    chain.bnb = 10 ** 17
-    await bot.live.refresh_balance()
-    chain.fail_unsent = "HTTP 503: Service Unavailable"
-    bot.live_redeem_failed.clear()
-    fake.blocked_until = time.monotonic() + 400
-    bot.live_last_redeem = time.monotonic()
-    assert await bot.live_redeem(NOW + 52 * MIN) == []
-    assert 429 <= due(bot) <= 431, due(bot)
+    """RDM-UNSENT-RETRY-GRID: a redeem that never left (TxNotSent: the chain a moment behind Predict's result, an RPC blip) waits,
+    and nothing brings a round when the wait ends: the retry is the next round that comes, and one coming inside the wait
+    starts the ten minutes afresh. The package's first fix pulled the next round to the wait's end — with the chain behind,
+    every win's first try fails so and each brought a round of its own (a positions read and market reads more on the key the
+    orders share: 20-60 % more a day), the cap of three in a row never reached; and after the fourth failure it said 「下一轮再试，
+    最迟约 10 分钟」 while a round inside the wait made it 14.5. Now no round is brought: a position's first such try waits a
+    minute (the rounds that come anyway take it), the later ones five, and the texts say 1～11 / 5～15 分钟后的下一轮 — the
+    bound a round inside the wait gives. Driven through the real tick on a virtual clock; fakes only."""
+    import re
+    plain_time = L.time
+    clock = L.time = Clock()
+    try:
+        async def run_for(bot, seconds, events=()):
+            """The redeem's own timer for ``seconds``: a tick every LIVE_REDEEM_TICK_SECONDS, each round run to its end (a round
+            takes no virtual time); ``events`` ((offset, callable)) happen on their tick. The rounds' start times."""
+            start, starts, todo = clock.t, [], sorted(events, key=lambda e: e[0])
+            while clock.t - start < seconds:
+                while todo and todo[0][0] <= clock.t - start:
+                    todo.pop(0)[1]()
+                before = bot.live_redeem_task
+                bot.live_redeem_tick()
+                if bot.live_redeem_task is not before:
+                    starts.append(clock.t)
+                    await bot.live_redeem_task
+                clock.t += bot.LIVE_REDEEM_TICK_SECONDS
+            return starts
+
+        async def account(*mids):
+            bot = await ready_bot()
+            chain = bot.live.chain = Behind(clock)
+            fake = bot.live.api
+            fake.positions_rows = [held(mid) for mid in mids]
+            fake.markets.update({str(mid): mk(mid) for mid in mids})
+            bot.live_last_redeem = clock.t  # (a round just ran)
+            return bot, fake, chain, notices(bot)
+
+        def span(text):
+            """The seconds a text promises the retry in, (soonest, latest), from its 「a～b 分钟后的下一轮」."""
+            found = re.search(r"(\d+)～(\d+) 分钟后的下一轮", text)
+            assert found, ("the retry said with its bound", text)
+            return int(found[1]) * 60, int(found[2]) * 60
+
+        due = lambda bot: bot.LIVE_REDEEM_SECONDS - (clock.t - bot.live_last_redeem)
+        left = lambda bot, key: bot.LIVE_REDEEM_RETRY_SECONDS - (clock.t - bot.live_redeem_failed[key])
+        # (a) the round a win brings finds the chain behind: the first try never left — a minute's wait and no round brought for
+        #     it (the next is the usual one, ten minutes after this round's start); the line and the ⚠️ say 1～11 分钟后的下一轮
+        bot, fake, chain, sent = await account()
+        fake.positions_rows, fake.markets["510"] = [held(510)], mk(510, won=1)
+        chain.ready[cond(510)] = clock.t + 10 ** 6
+        bot.live_redeem_soon("510")
+        starts = await run_for(bot, 30)
+        tf, note = starts[0], bot.live_errors[-1]
+        assert len(starts) == 1 and bot.live_redeem_last["counts"] == {"failed": 1}, bot.live_redeem_last
+        assert note.endswith("领取 window 510 失败：RPC 错误：execution reverted（交易没发出，1～11 分钟后的下一轮再试）"), note
+        assert sent == [("redeem:fail", "⚠️ 自动领取：1 个已结算的持仓没领成（window 510：RPC 错误：execution reverted），"
+                                        "1～11 分钟后的下一轮自动再试。/live redeem check 查看原因")], sent
+        assert 0 < left(bot, "live:redeemed:510:1") <= bot.LIVE_REDEEM_UNSENT_FIRST_SECONDS, left(bot, "live:redeemed:510:1")
+        assert due(bot) > bot.LIVE_REDEEM_SECONDS - 15, ("no round brought for the retry", due(bot))  # (before: 291 — pulled)
+        # (b) the worst case it promises: another win's round inside that minute finds it waiting and starts the ten minutes
+        #     afresh; the chain has the result a minute on. Retried by the next round that comes — inside 1～11 minutes, and no
+        #     round but the one the win brought and the usual one
+        chain.ready[cond(510)] = tf + 60
+        starts = await run_for(bot, 15 * 60, [(25, lambda: bot.live_redeem_soon())])
+        assert len(starts) == 2 and starts[0] - tf < 60 and chain.at.get(cond(510)) == starts[1], (starts, tf, chain.at)
+        lo, hi = span(note)
+        assert lo <= chain.at[cond(510)] - tf <= hi, (chain.at[cond(510)] - tf, note)
+        assert len(chain.redeemed) == 1 and bot.live_redeem_unsent == {}, (chain.redeemed, bot.live_redeem_unsent)
+        # (c) the chain refusing on: the second, third and fourth tries in a row wait five minutes and say 5～15 分钟后的下一轮;
+        #     the market stays named for the first three (the retry reads it first), not after — winners the chain refuses for
+        #     good never take every round's reads
+        bot, fake, chain, sent = await account()
+        fake.positions_rows, fake.markets["520"] = [held(520)], mk(520, won=1)
+        chain.ready[cond(520)] = clock.t + 10 ** 6
+        for runs in (1, 2, 3, 4):
+            bot.live_redeem_failed.clear()  # (its wait over)
+            bot.live_last_redeem = -1e9  # (a round due)
+            starts = await run_for(bot, 5)
+            tf, note = starts[0], bot.live_errors[-1]
+            wait = bot.LIVE_REDEEM_UNSENT_FIRST_SECONDS if runs == 1 else bot.LIVE_REDEEM_UNSENT_RETRY_SECONDS
+            assert note.endswith(f"（交易没发出，{'1～11' if runs == 1 else '5～15'} 分钟后的下一轮再试）"), (runs, note)
+            assert wait - 10 < left(bot, "live:redeemed:520:1") <= wait and due(bot) > bot.LIVE_REDEEM_SECONDS - 10, (runs, due(bot))
+            assert bot.live_redeem_unsent == {"live:redeemed:520:1": runs}, bot.live_redeem_unsent
+            assert ("520" in bot.live_redeem_first) == (runs <= bot.LIVE_REDEEM_UNSENT_NAMED), (runs, bot.live_redeem_first)
+        # the reviewer's case: another win's round 250 s after the fourth (inside its five minutes), then the chain has it — the
+        # retry 14.5 minutes on (said: 最迟约 10 分钟 before), inside the 5～15 said now
+        chain.ready[cond(520)] = tf + 260
+        starts = await run_for(bot, 20 * 60, [(245, lambda: bot.live_redeem_soon())])
+        lo, hi = span(note)
+        assert chain.at.get(cond(520)) is not None and lo <= chain.at[cond(520)] - tf <= hi, (starts, tf, note)
+        assert chain.at[cond(520)] - tf > 14 * 60 and bot.live_redeem_unsent == {}, (chain.at[cond(520)] - tf, bot.live_redeem_unsent)
+        # (d) a flow: six wins seven minutes apart beside three markets still open, the chain in step with Predict's result or
+        #     90 s behind it. Behind, every first try never leaves — and brings no round: the same rounds as in step, one market
+        #     read more per retry and nothing else on the key the orders share; each win redeemed once, within 1～11 minutes of
+        #     its failed try (the round the win brought: 20 s after it)
+
+        async def flow(lag):
+            opened, wins = [str(900 + i) for i in range(3)], [str(530 + i) for i in range(6)]
+            bot, fake, chain, sent = await account(*opened, *wins)
+            reads, rounds, market, listing, won = [], [], fake.market, fake.positions, {}
+
+            async def counting(mid):
+                reads.append(str(mid))
+                return await market(mid)
+
+            async def listed():
+                rounds.append(clock.t)
+                return await listing()
+            fake.market, fake.positions = counting, listed
+
+            def settle(mid):
+                def now():
+                    fake.markets[mid] = mk(mid, won=1)
+                    chain.ready[cond(mid)] = clock.t + lag
+                    won[mid] = clock.t
+                    bot.live_redeem_soon(mid)  # (as the pre-open mode's settle_pair on Predict's final result)
+                return now
+            await run_for(bot, 3600, [(60 + 420 * i, settle(mid)) for i, mid in enumerate(wins)])
+            assert sorted(cid for cid, *_ in chain.redeemed) == sorted(cond(mid) for mid in wins), ("each win once", chain.redeemed, bot.live_redeem_last)
+            return {"rounds": len(rounds), "reads": len(reads), "refused": chain.refused, "late": [chain.at[cond(mid)] - won[mid] for mid in wins]}
+        step, late = await flow(0), await flow(90)
+        assert step["refused"] == 0 and late["refused"] == 6, (step, late)
+        assert late["rounds"] == step["rounds"], ("a redeem that never left brings no round of its own", late["rounds"], step["rounds"])
+        assert late["reads"] - step["reads"] == late["refused"], ("one market read more per retry, nothing else", late["reads"], step["reads"])
+        assert all(60 <= v <= bot.LIVE_REDEEM_SOON_SECONDS + 11 * 60 + bot.LIVE_REDEEM_TICK_SECONDS for v in late["late"]), late["late"]
+        # (e) /live redeem check moves no clock; a sent failure (its gas paid; its transaction may yet be mined) keeps its hour
+        bot, fake, chain, sent = await account()
+        fake.positions_rows, fake.markets["540"] = [held(540)], mk(540, won=1)
+        chain.fail, stamp = "交易失败（已回滚）", bot.live_last_redeem
+        await bot.live_redeem_report(NOW)
+        assert bot.live_last_redeem == stamp and chain.redeemed == []
+        starts = await run_for(bot, 30, [(0, lambda: bot.live_redeem_soon("540"))])
+        assert len(starts) == 1 and bot.live_errors[-1].endswith("（一小时后再试）") and bot.live_redeem_unsent == {}, bot.live_errors[-1:]
+        assert bot.LIVE_REDEEM_RETRY_SECONDS - 60 < left(bot, "live:redeemed:540:1") and due(bot) > bot.LIVE_REDEEM_SECONDS - 15, due(bot)
+        assert [k for k, _ in sent] == ["redeem:fail"] and "一小时后自动再试" in sent[0][1], sent
+    finally:
+        L.time = plain_time
     print("RDM_UNSENT_RETRY_GRID_OK")
 
 
 asyncio.run(unsent_retry_grid())
 
 
-# --- RDM-SOON-NO-TARGET (the name kept through a pulled retry) ------------------------------------------------------------------
+# --- RDM-SOON-NO-TARGET (the name kept through a retry of a redeem that never left) ---------------------------------------------
 async def soon_names_the_market():
     """RDM-SOON-NO-TARGET: live_redeem_soon only moved the clock. With more than forty markets unjudged, the round a win brought
     read the forty longest unread — and the market that had just settled, read a round before as still open, waited for a later
     round. The win's market is now named (sim_settle, the pre-open settle_pair) and read first by the next real round, inside the
-    cap; once read it goes back into the rotation. Kept named while its redeem never left and that retry is pulled, so the retry
-    at the wait's end reads it first too; the check reads it first and leaves the name."""
+    cap; once read it goes back into the rotation. Kept named through its first LIVE_REDEEM_UNSENT_NAMED redeems in a row that
+    never left, so the retry after the wait reads it first too; the check reads it first and leaves the name."""
     bot = await ready_bot()
     fake, chain, CAP = bot.live.api, bot.live.chain, bot.LIVE_REDEEM_READS
     newer = [str(600 + i) for i in range(45)]
@@ -386,7 +492,7 @@ async def soon_names_the_market():
     done, r4 = await look(NOW + 20 * MIN)
     assert r4[0] == newer[CAP] and bot.live_redeem_first == {}, (r4[:3], bot.live_redeem_first)
     # the chain behind Predict's result: the named market read first, its redeem never left — still named; inside the wait not
-    # read and still named; at the wait's end read first and redeemed, the name gone
+    # read and still named; after the wait read first and redeemed, the name gone
     chain.fail_unsent = "RPC 错误：execution reverted"
     won(newer[0], NOW + 21 * MIN)
     done, r5 = await look(NOW + 21 * MIN + 20_000)
@@ -886,7 +992,8 @@ async def unsent_as_sent():
     with node_for() as node:  # topped up: the next round redeems all three, at once (no hour)
         done = await bot.live_redeem(NOW + 10 * MIN)
     assert len(done) == 3 and node.methods().count("eth_sendRawTransaction") == 3, (done, bot.live_redeem_last)
-    # a stale pending-nonce read (another transaction took the nonce): never left — five minutes, not an hour
+    # a stale pending-nonce read (another transaction took the nonce): never left — its first such try: a minute, not an hour
+    # (RDM-UNSENT-RETRY-GRID, its follow-up: the texts say the next round after the wait, 1～11 分钟后)
     bot = await ready_bot()
     fake = bot.live.api
     fake.positions_rows, fake.markets["604"] = [held(604)], mk(604, won=1)
@@ -894,11 +1001,11 @@ async def unsent_as_sent():
     sent = notices(bot)
     with node_for(eth_sendRawTransaction=refusal("nonce too low: next nonce 6, tx nonce 5")):
         assert await bot.live_redeem(NOW) == []
-    assert bot.live_redeem_last["counts"] == {"failed": 1} and bot.live_errors[-1].endswith("（交易没发出，5 分钟后再试）"), bot.live_errors[-1:]
+    assert bot.live_redeem_last["counts"] == {"failed": 1} and bot.live_errors[-1].endswith("（交易没发出，1～11 分钟后的下一轮再试）"), bot.live_errors[-1:]
     left = bot.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - bot.live_redeem_failed["live:redeemed:604:1"])
-    assert left <= bot.LIVE_REDEEM_UNSENT_RETRY_SECONDS, left
-    assert [k for k, _ in sent] == ["redeem:fail"] and "5 分钟后自动再试" in sent[0][1] and bot.store.get("live:redeemed:604:1") is None, sent
-    bot.live_redeem_failed.clear()  # (the five minutes over)
+    assert left <= bot.LIVE_REDEEM_UNSENT_FIRST_SECONDS, left
+    assert [k for k, _ in sent] == ["redeem:fail"] and "1～11 分钟后的下一轮自动再试" in sent[0][1] and bot.store.get("live:redeemed:604:1") is None, sent
+    bot.live_redeem_failed.clear()  # (the wait over)
     with node_for():
         assert len(await bot.live_redeem(NOW + 6 * MIN)) == 1
     print("RDM_UNSENT_AS_SENT_OK")
@@ -1154,7 +1261,7 @@ async def sent_note():
     bot.live_redeem_failed.clear()
     with node_for(eth_sendRawTransaction=refusal("replacement transaction underpriced")):
         await bot.live_redeem(NOW + 90 * MIN)
-    assert bot.store.get("live:redeem-sent:904:1") is None and bot.live_errors[-1].endswith("（交易没发出，5 分钟后再试）")
+    assert bot.store.get("live:redeem-sent:904:1") is None and bot.live_errors[-1].endswith("（交易没发出，5～15 分钟后的下一轮再试）")  # (failed before: five minutes)
     # (e) a restart while the receipt was awaited: the next process finds the note and books the first transaction (standard), or
     #     sends nothing and books it (neg-risk: before, a 没领成 for a paid position) — one transaction in all
     for neg in (False, True):
@@ -1251,7 +1358,7 @@ async def adapter_unchecked():
     sent = notices(bot)
     with node_for(eth_estimateGas=revert(blob), eth_call=word(0)) as node:
         assert await bot.live_redeem(NOW) == [] and "eth_sendRawTransaction" not in node.methods()
-    assert bot.live_errors[-1].endswith("（交易没发出，5 分钟后再试）") and "多结果适配器没有这个账户结果代币的操作权" in bot.live_errors[-1]
+    assert bot.live_errors[-1].endswith("（交易没发出，1～11 分钟后的下一轮再试）") and "多结果适配器没有这个账户结果代币的操作权" in bot.live_errors[-1]
     assert [k for k, _ in sent] == ["redeem:fail"] and "python main.py --approve" in sent[0][1] and bot.store.get("live:redeemed:951:1") is None, sent
     print("RDM_NEGRISK_ADAPTER_UNCHECKED_OK")
 
@@ -2078,8 +2185,8 @@ async def note_throttle():
         bot.live_noted["redeem:fail"] = bot.live_noted.get("redeem:fail", -1e9) - 601  # (ten minutes pass for the notice's own clock)
         await told_round(bot, NOW + minutes * MIN)
         return warned()
-    # (1) a redeem that never left: told, its five minutes
-    assert await round_at(0) == ["⚠️ 自动领取：1 个已结算的持仓没领成（window 501：RPC 错误：execution reverted），5 分钟后自动再试。/live redeem check 查看原因"]
+    # (1) a redeem that never left: told, its retry (its first such try: the next round after a minute)
+    assert await round_at(0) == ["⚠️ 自动领取：1 个已结算的持仓没领成（window 501：RPC 错误：execution reverted），1～11 分钟后的下一轮自动再试。/live redeem check 查看原因"]
     # (2) ten minutes on: 501 goes out; 502 is SENT and fails — told, though a never-sent one took the hour
     chain.refuse = {cond(502): ("sent", "交易失败（已回滚）：0xbad")}
     bot.live_redeem_failed.clear()
@@ -2094,7 +2201,7 @@ async def note_throttle():
     fake.positions_rows += [held(504), held(505)]
     last = (await round_at(30))[2:]
     assert last == ["⚠️ 自动领取：2 个已结算的持仓没领成（window 505：交易失败（已回滚）：0xe5，一小时后自动再试；"
-                    "window 504：RPC 错误：execution reverted，5 分钟后自动再试）。/live redeem check 查看原因"], last
+                    "window 504：RPC 错误：execution reverted，1～11 分钟后的下一轮自动再试）。/live redeem check 查看原因"], last
     # (5) the check's problem lines: kept through ten order failures; gone once the positions are redeemed
     for k in range(10):
         bot.live_note_error(f"吃涨 {k} 吃单未成交（不在盘口）")

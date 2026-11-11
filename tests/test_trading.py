@@ -715,7 +715,7 @@ async def run():
     assert bot.LIVE_REDEEM_RETRY_SECONDS - 5 < bot.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - bot.live_redeem_failed["live:redeemed:101:2"]) <= bot.LIVE_REDEEM_RETRY_SECONDS
     bot.live_redeem_failed.clear()
     bot.live.chain.fail_unsent = "RPC 错误：execution reverted"  # 1.131.3: a transaction that never left (the chain behind Predict's result): five minutes, not an hour
-    assert await bot.live_redeem(CLOSE + 72 * 60_000 + 15_000) == [] and "交易没发出，5 分钟后再试" in bot.live_errors[-1], bot.live_errors[-1:]
+    assert await bot.live_redeem(CLOSE + 72 * 60_000 + 15_000) == [] and "交易没发出，5～15 分钟后的下一轮再试" in bot.live_errors[-1], bot.live_errors[-1:]  # (1.150.0: the next round after the wait)
     left = bot.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - bot.live_redeem_failed["live:redeemed:101:2"])
     assert bot.LIVE_REDEEM_UNSENT_RETRY_SECONDS - 5 < left <= bot.LIVE_REDEEM_UNSENT_RETRY_SECONDS, left
     bot.live.chain.fail_unsent = ""
