@@ -1285,6 +1285,16 @@ class Chain:
             return None
         return None
 
+    async def outcome_balance(self, token: Any, neg_risk: bool, yield_bearing: bool, owner: str | None = None) -> int | None:
+        """The account's on-chain balance of one outcome token: ERC-1155 balanceOf on the track's conditional tokens contract
+        for that kind of market (the SDKs' pairing, tokens_key). None when the answer is shorter than a word; a failed read
+        raises."""
+        text = str(token).strip()
+        token_id = int(text, 16) if text.lower().startswith("0x") else int(text)
+        out = await self.call(self.addresses[tokens_key(neg_risk, yield_bearing)],
+                              self.encode("balanceOf(address,uint256)", ["address", "uint256"], [owner or self.wallet.maker, token_id]))
+        return int.from_bytes(out[:32], "big") if len(out) >= 32 else None
+
     ADAPTER_MISSING = ("多结果适配器没有这个账户结果代币的操作权（授权缺失），领取交易发不出去：运行 python main.py --approve"
                        "（补上这项授权，签名钱包付一笔 gas），或在 Predict 网站上领取一次")
 
@@ -4512,6 +4522,25 @@ class LiveBot(core.Bot):
             self.live_note_error(f"领取 {title} 的交易 {tx} 一小时没上链、节点里也查不到：重新领取")
         return booked, out
 
+    async def live_negrisk_amount(self, outcome: dict, info: MarketInfo, index_set: int, listed: int) -> int:
+        """What a multi-outcome redeem names: the account's balance of the winning token on the chain, when one read says it.
+
+        1.150.0 (audit RDM-NEGRISK-AMOUNT): the adapter pulls exactly the amounts the redeem names, and the bot named Predict's
+        listed amount (as the SDK recipe does): one wei more than held reverted the estimate every round, less left the rest
+        on the chain behind the mark for good. One eth_call (balanceOf on the track's multi-outcome tokens: no transaction,
+        not Predict's limit), only for a neg-risk redeem about to be sent. Any doubt keeps the listed amount as before — no
+        token id, two different ids (the row's and the market's), a failed or empty read, a zero — never a skip or a mark."""
+        ids = {str(outcome.get("onChainId") or outcome.get("tokenId") or ""),
+               next((str(o.get("token") or "") for o in info.outcomes if o.get("index_set") == index_set), "")} - {""}
+        read = getattr(self.live.chain, "outcome_balance", None)
+        if len(ids) != 1 or not callable(read):
+            return listed
+        try:
+            held = await read(ids.pop(), True, info.yield_bearing)
+        except Exception:
+            return listed
+        return held if isinstance(held, int) and held > 0 else listed
+
     async def live_redeem_pass(self, now_ms: int, dry_run: bool = False) -> tuple[list[str], list[dict]]:
         """One look at the account's positions, the markets read the longest ago first (never yet: first of all; the
         newest positions first among equals): (the redeemed lines, each position judged). Kinds:
@@ -4697,6 +4726,8 @@ class LiveBot(core.Bot):
             if dry_run or low_gas or held:
                 seen.append({**entry, "kind": "claimable"})
                 continue
+            if info.neg_risk:  # (RDM-NEGRISK-AMOUNT) the chain's balance, not Predict's figure: what the adapter will pull
+                amount = await self.live_negrisk_amount(outcome, info, index_set, amount)
             sent_key = self.REDEEM_SENT + key.removeprefix("live:redeemed:")
 
             async def note_sent(tx_hash: str, sent_key: str = sent_key, title: str = entry["title"], name: str = str(outcome.get("name") or ""),

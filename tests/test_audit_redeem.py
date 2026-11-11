@@ -1261,4 +1261,100 @@ async def adapter_unchecked():
 asyncio.run(adapter_unchecked())
 
 
+# --- RDM-NEGRISK-AMOUNT ---------------------------------------------------------------------------------------------------------
+class HeldChain(T["FakeChain"]):
+    """test_trading's FakeChain with the account's on-chain balances of outcome tokens (``held``: token id -> wei; a value
+    that is an exception is raised); every read logged."""
+    def __init__(self, held=None):
+        super().__init__()
+        self.held, self.reads = dict(held or {}), []
+
+    async def outcome_balance(self, token, neg_risk, yield_bearing, owner=None):
+        self.reads.append((str(token), neg_risk, yield_bearing))
+        found = self.held.get(str(token), 0)
+        if isinstance(found, BaseException):
+            raise found
+        return found
+
+
+async def negrisk_amount():
+    """RDM-NEGRISK-AMOUNT: a multi-outcome redeem named Predict's listed amount; the adapter pulls exactly that — one wei more
+    than held reverted the estimate every round, less left the rest on the chain behind the mark for good. The redeem now
+    names the account's on-chain balance of the winning token (one free read, neg-risk only); any doubt (no id, two ids, a
+    failed or zero read) keeps the listed amount; a binary redeem, the check and a round without gas read nothing."""
+    async def round_with(chain, listed, neg=True, row_id=True, market_token=True, dry=False):
+        bot = await ready_bot()
+        fake = bot.live.api
+        raw = {**mk(961, won=1), "isNegRisk": neg}
+        if not market_token:
+            raw["outcomes"] = [{k: v for k, v in o.items() if k != "onChainId"} for o in raw["outcomes"]]
+        row = held(961)
+        row["amount"] = str(listed)
+        if row_id:
+            row["outcome"] = {**row["outcome"], "onChainId": "9611"}
+        fake.positions_rows, fake.markets["961"] = [row], raw
+        bot.live.chain = chain
+        if dry:
+            return bot, await bot.live_redeem_report(NOW)
+        return bot, await bot.live_redeem(NOW)
+
+    # (a) listed one wei over the chain's balance: the balance is redeemed (before: the listed amount — a revert every round)
+    chain = HeldChain({"9611": 100 * WEI})
+    bot, done = await round_with(chain, 100 * WEI + 1)
+    assert [amount for _, _, amount, *_ in chain.redeemed] == [100 * WEI] and chain.reads == [("9611", True, False)], (chain.redeemed, chain.reads)
+    # (b) listed under it: the whole balance, and the line and the mark say what was redeemed (before: 100, 30 stranded)
+    chain = HeldChain({"9611": 130 * WEI})
+    bot, done = await round_with(chain, 100 * WEI)
+    assert [amount for _, _, amount, *_ in chain.redeemed] == [130 * WEI] and done == ["💵 已领取 window 961 Up 130 份：0xredeem"], (chain.redeemed, done)
+    assert bot.store.get("live:redeemed:961:1")["amount"] == str(130 * WEI)
+    # (c) no id on the row: the market's token at that index set is read
+    chain = HeldChain({"9611": 130 * WEI})
+    await round_with(chain, 100 * WEI, row_id=False)
+    assert chain.reads == [("9611", True, False)] and chain.redeemed[0][2] == 130 * WEI
+    # (d) any doubt: the listed amount as before — a failed read, a zero, two different ids, no id at all
+    for found in (m.RemoteError("HTTP 503: 接口请求失败"), 0):
+        chain = HeldChain({"9611": found})
+        await round_with(chain, 100 * WEI)
+        assert chain.redeemed[0][2] == 100 * WEI, found
+    chain = HeldChain({"9611": 130 * WEI})
+    bot = await ready_bot()
+    raw = {**mk(962, won=1), "isNegRisk": True}
+    row = {**held(962), "outcome": {"name": "Up", "indexSet": 1, "onChainId": "9999"}}  # the row names another token than the market
+    bot.live.api.positions_rows, bot.live.api.markets["962"] = [row], raw
+    bot.live.chain = chain
+    await bot.live_redeem(NOW)
+    assert chain.reads == [] and chain.redeemed[0][2] == 10 * WEI, (chain.reads, chain.redeemed)
+    chain = HeldChain({"9611": 130 * WEI})
+    await round_with(chain, 100 * WEI, row_id=False, market_token=False)
+    assert chain.reads == [] and chain.redeemed[0][2] == 100 * WEI
+    # (e) a binary redeem reads nothing (the whole balance is burnt whatever the amount); the check and no gas read nothing
+    chain = HeldChain({"9611": 130 * WEI})
+    await round_with(chain, 100 * WEI, neg=False)
+    assert chain.reads == [] and chain.redeemed[0][2] == 100 * WEI
+    chain = HeldChain({"9611": 130 * WEI})
+    bot, report = await round_with(chain, 100 * WEI, dry=True)
+    assert chain.reads == [] and chain.redeemed == [] and "可领取" in report, report
+    chain = HeldChain({"9611": 130 * WEI})
+    chain.bnb = 10 ** 13
+    bot = await ready_bot()
+    bot.live.chain = chain
+    await bot.live.refresh_balance()
+    bot.live.api.positions_rows, bot.live.api.markets["961"] = [held(961)], {**mk(961, won=1), "isNegRisk": True}
+    assert await bot.live_redeem(NOW) == [] and chain.reads == [] and chain.redeemed == []
+    # (f) the read itself: balanceOf(maker, id) on the track's multi-outcome tokens (standard: the CONDITIONAL_TOKENS address)
+    for account in ("", PA):
+        real = L.Chain("https://rpc.invalid", L.Wallet(KEY, 56, account))
+        for yb, tokens in ((False, "CONDITIONAL_TOKENS"), (True, "YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS")):
+            with node_for(eth_call="0x" + hex(7 * WEI)[2:].rjust(64, "0")) as node:
+                assert await real.outcome_balance("987654321", True, yb) == 7 * WEI
+            call = node.log[-1][1][0]
+            assert call["to"] == L.ADDRESSES[56][tokens] and call["data"] == "0x00fdd58e" + pad(real.wallet.maker)[2:] + hex(987654321)[2:].rjust(64, "0"), call
+        with node_for(eth_call="0x"):
+            assert await real.outcome_balance("1", True, False) is None
+    print("RDM_NEGRISK_AMOUNT_OK")
+
+
+asyncio.run(negrisk_amount())
+
+
 print("AUDIT_REDEEM_OK")
