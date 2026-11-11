@@ -15539,6 +15539,7 @@ class Bot:
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.sim_ran = -1e9  # monotonic time of the paper trader's last look
+        self.sim_looked_ms = 0  # ...and the bot's clock (ms) it decided on: read under the lock, where the decisions are made (sim_step, 1.150.0)
         self.sim_wake = False  # a round of books just came in, or a fair price moved: the next look does not wait for SIM_SECONDS
         self.fair_sig: tuple | None = None  # the fair prices as of the last feed refresh (note_job): a change wakes the trader
         self.fair_sig_at = -1e9
@@ -19887,6 +19888,15 @@ class Bot:
             self.log_limited("sim_ev", f"EV 检查失败：{clean_error(error) or type(error).__name__}")
         self.sim_note_closes()
         async with self.sim_lock:  # never beside the express lane (sim_express): one set of decisions at a time
+            # 1.150.0 (audit SIM-STALE-CLOCK): the look's clock is read here, where its decisions are made, not where the job began.
+            # The real trader's prefetch (a market's details, a sign-in: seconds when Predict is slow) and the wait for this lock lie
+            # in between, and the markets below are priced on the data of now. Judged on the job's clock, a book past
+            # PREDICT_STALE_MS, a quote past its age hold and a market in its last minutes all looked that much younger, and a
+            # taker's run of buyable looks (SIM_TAKER_HOLD_SECONDS) began that much early — while the order, stamped off the real
+            # clock (LiveBot.sim_open), went out as "decided this very second", past the send-time re-check kept for the
+            # decisions that waited (live_taker_recheck): a real order on a 97 s book after a 12 s details read. Kept in
+            # sim_looked_ms: the real trader's sync of this step runs on the same clock (LiveBot.sim_step)
+            now_ms = self.sim_looked_ms = max(now_ms, self.market.now_ms())
             confirm = await self.sim_decide(now_ms)
         await self.sim_after_decide(now_ms)  # the real orders go out now, not behind the settlement lookups
         await confirm
@@ -20355,13 +20365,16 @@ class Bot:
             return
         now_ms = self.market.now_ms()
         if await self.sim_express_look(key, now_ms):
-            await self.sim_express_after(now_ms)
+            await self.sim_express_after(max(now_ms, self.market.now_ms()))  # 1.150.0: never stamped before the look it follows (which may have waited for the lock)
 
     async def sim_express_look(self, key: str, now_ms: int) -> list[tuple[str, dict]]:
         """One express look at a key's markets (sim_express), under the step's lock: the records it changed, saved —
         [] when it changed nothing."""
         changed: list[tuple[str, dict]] = []
         async with self.sim_lock:
+            # 1.150.0 (audit SIM-STALE-CLOCK): judged on the clock after the wait for the lock, as the step is — a step's decisions
+            # hold it meanwhile, and live_requote_freed reads one clock for several keys' looks, each behind the last one's placements
+            now_ms = max(now_ms, self.market.now_ms())
             trades = self.sim_trades()
             for mk in self.sim_markets_for(key, now_ms):  # this key's markets alone: the other cards and ladders are not priced for it
                 if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):

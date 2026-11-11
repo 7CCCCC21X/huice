@@ -1693,7 +1693,14 @@ class LiveBot(core.Bot):
         marks["决策"] -= self.live_place_ms
         marks["下单"] = self.live_place_ms
         try:
-            await self.live_sync(now_ms)
+            # 1.150.0 (audit SIM-STALE-CLOCK): on the clock the step decided on (sim_looked_ms: Bot.sim_step reads it under the lock),
+            # as the decisions and their sync always shared one — not on the job's, read before the prefetch: a taker's unfilled rest
+            # was cancelled that much after LIVE_TAKER_WAIT_SECONDS (live_taker_due weighs it against placed_at, read off the clock).
+            # Nor on a clock read here: this sync's open-order list is stamped with it and weighed against the records' own stamps
+            # (live_readopt, prunable), and the express lane stamps a record when its pass begins, not when Predict answers — a
+            # list stamped after a pass that ran beside this step's placements, yet read before that pass's cancel was confirmed,
+            # would take the cancelled order back
+            await self.live_sync(max(now_ms, self.sim_looked_ms))
             mark("同步")
         except Exception as error:
             self.live_note_error(f"同步真实订单失败：{core.clean_error(error) or type(error).__name__}")

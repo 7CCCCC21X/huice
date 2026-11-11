@@ -641,4 +641,257 @@ async def group_cap_step():
 
 asyncio.run(group_cap_step())
 
+# --- SIM-STALE-CLOCK: a look judges on the clock read where its decisions are made, not on the one its job began with -------------
+# The step's job reads the clock; then the real trader's prefetch waits for Predict (a new market's details — seconds when Predict
+# is slow, API_TIMEOUT at the worst — or a sign-in) and the step waits for the express lane's lock; only then are the markets
+# priced, on the data of that moment, and judged. On the job's clock everything looked that much younger than it was: a book past
+# PREDICT_STALE_MS (90 s) was traded, a taker's run of buyable looks (SIM_TAKER_HOLD_RANGE_SECONDS, the price ladders' 30 s wick
+# filter) began before the first look, a taker's unfilled rest outlived LIVE_TAKER_WAIT_SECONDS. The send-time re-check kept for
+# decisions that waited (live_taker_recheck) saw none of it: the order is stamped off the real clock (1.138.0) — "decided this
+# very second".
+CLOCK_ENV = {"TELEGRAM_BOT_TOKEN": "1:x", "SIM_WAYS": "taker", "SIM_MARKETS": "all", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0"}
+CLOCK_LIVE = {**CLOCK_ENV, "LIVE": "on", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, "PREDICT_API_KEY": "k",  # the SDK test suite's key, never a real one
+              "LIVE_MAX_ORDER_USD": "100", "LIVE_MAX_OPEN_USD": "250"}
+CLOCK_SETTLE = {"key": "CLK", "target": "2026-11-10", "line": 100.0, "close_ms": NOW + 4 * 3600_000}
+
+
+class ClockApi(StaleApi):
+    """Predict with three markets (501 and 502: two daily cards; 503: one level of a price ladder). The details read of market
+    ``slow`` takes ``lag`` ms of the bot's clock; ``on_create`` / ``on_remove`` / ``on_orders`` are awaited while that call's
+    request or answer is on its way."""
+    def __init__(self, clock):
+        super().__init__()
+        self.clock, self.slow, self.lag = clock, "", 0
+        self.on_create = self.on_remove = self.on_orders = None
+        self.markets = {mid: {**self.markets["401"], "id": int(mid), "outcomes": [{"name": "Up", "indexSet": 1, "onChainId": mid + "1"},
+                                                                              {"name": "Down", "indexSet": 2, "onChainId": mid + "2"}]}
+                        for mid in ("501", "502", "503")}
+
+    async def market(self, mid):
+        if str(mid) == self.slow:
+            self.clock.now += self.lag
+        return self.markets[str(mid)]
+
+    async def create_order(self, body):
+        out = await super().create_order(body)  # on Predict now...
+        if self.on_create:
+            await self.on_create(out["order_id"])  # ...its answer on its way back
+        return out
+
+    async def remove_orders(self, ids):
+        if self.on_remove:
+            await self.on_remove(list(ids))  # the request on its way: nothing removed yet
+        return await super().remove_orders(ids)
+
+    async def orders(self, status="OPEN", **params):
+        rows = await super().orders(status, **params)  # Predict's answer as of now...
+        if self.on_orders:
+            await self.on_orders(status)  # ...on its way back
+        return rows
+
+    def tokens(self) -> list:
+        """The outcome token of every order sent so far ("5011": market 501's first outcome, 涨 / Yes)."""
+        return [row["order"]["tokenId"] for row in (*self.open.values(), *self.closed.values())]
+
+
+def clock_card(mid: str, read: int, fair: float = 0.70, bid: str = "0.40", ask: str = "0.58") -> m.SimMarket:
+    """A daily card on market ``mid``, its book last read at ``read``: 涨 worth ``fair``, offered at 58¢ × 400 — some 11¢ of
+    net edge for a taker."""
+    b = m.PredictBook(f"CLK-{mid}", f"clock-card-{mid}", mid, "t", ((D(bid), D("300")),), ((D(ask), D("400")),), read, 200)
+    return m.SimMarket(b.slug, f"时钟卡 {mid}", "close", b.key, fair, b, 0.03, "", ("涨", "跌"), CLOCK_SETTLE, {})
+
+
+def clock_level(read: int) -> m.SimMarket:
+    """One level of a price ladder (market 503): Yes worth 50¢, offered at 30¢ × 400."""
+    b = m.PredictBook("CLK-RANGE", "clock-range", "503", "t", ((D("0.10"), D("500")),), ((D("0.30"), D("400")),), read, 200)
+    return m.SimMarket("clock-range#503", "时钟阶梯 ↑ $120k", "range", "CLK-RANGE", 0.50, b, 0.03, "", ("Yes", "No"),
+                       {"target": "120000", "dir": "up", "end": NOW + 6 * 3600_000}, {}, makers=False)
+
+
+async def clock_bot(**env):
+    """The real trader over the stand-ins (Predict's API with the slow details read, the chain), signed in; its markets are
+    world["markets"]. (the bot, the API, the world)."""
+    clock, world = SelfFM(NOW), {"markets": []}
+    bot = live.LiveBot(m.Config.from_env({**CLOCK_LIVE, **env}), m.Store(":memory:"), clock, None)
+    bot.live.api, bot.live.chain = ClockApi(clock), StaleChain()
+    bot.sim_markets = lambda now, only=None: world["markets"]
+    await bot.live_prepare()
+    assert bot.live.ready, bot.live.ready_error
+    return bot, bot.live.api, world
+
+
+async def clock_step(bot, world, at: int, *markets) -> None:
+    """The step's job starting at ``at`` (the clock its job reads) over ``markets``."""
+    bot.market.now, bot.sim_ran, world["markets"] = at, -1e9, list(markets)
+    await bot.sim_step(at)
+
+
+async def clock_stale_book():
+    """Market 501's details are known; its book was read at NOW and not again. The job starts 85 s later (the book fresh) and its
+    prefetch reads the details of ANOTHER market, new on the page: 12 s. The step decides 97 s after the book's read — nothing is
+    sent on it (before the fix: a real LIMIT order, the send-time re-check passed over). Without the slow read the 85 s book
+    trades as ever."""
+    for lag, traded in ((12_000, False), (0, True)):
+        bot, api, world = await clock_bot()
+        world["markets"] = [clock_card("501", NOW)]
+        await bot.live_prefetch(NOW)
+        assert "501" in bot.live.markets and "502" not in bot.live.markets
+        api.slow, api.lag = "502", lag
+        priced, synced, real_sync = [], [], bot.live_sync
+        bot.sim_markets = lambda now, only=None, priced=priced, world=world: (priced.append(now), world["markets"])[1]
+
+        async def sync_spy(now_ms, synced=synced, real_sync=real_sync):
+            synced.append(now_ms)
+            return await real_sync(now_ms)
+        bot.live_sync = sync_spy
+        start = NOW + 85_000
+        await clock_step(bot, world, start, clock_card("501", NOW), clock_card("502", start))
+        trades = bot.sim_trades()
+        assert ("5011" in api.tokens()) == traded and ("clock-card-501|up|吃" in trades) == traded, (lag, api.tokens(), sorted(trades))
+        assert "5021" in api.tokens(), (lag, api.tokens(), bot.sim_blocks()[:2])  # the new market's own book is fresh: it trades either way
+        # the prefetch prices the cards on the job's clock (it runs first); the decisions and all that follows them on the look's —
+        # the cards' own holds (a quote's age, a market's last minutes) and the time left to the close are judged as of then too
+        assert priced[0] == start and set(priced[1:]) == {start + lag}, (lag, [at - start for at in priced])
+        fresh = trades["clock-card-502|up|吃"]
+        # ...which is the record's time, the stamp the send-time re-check measures from (1.138.0, unchanged: a decision of this
+        # very second goes out as made) and the clock of the sync that follows the decisions
+        assert bot.sim_looked_ms == start + lag and fresh["opened"] == start + lag and fresh["live"]["events"][0]["at"] == start + lag, \
+            (lag, bot.sim_looked_ms - start, fresh["opened"] - start, fresh["live"]["events"][0]["at"] - start)
+        assert fresh["live"]["state"] == "open" and synced == [start + lag], (lag, fresh["live"]["state"], [s - start for s in synced])
+
+
+async def clock_hold_run():
+    """The price ladders' wick filter (SIM_TAKER_HOLD_RANGE_SECONDS, 30 s by default): a side's run of buyable looks begins when
+    the step really looked — 12 s after its job began — so the express lane, on the real clock, buys after 30 s of it (before
+    the fix: after 18 s, the run stamped at the job's start)."""
+    bot, api, world = await clock_bot()
+    assert bot.config.sim_taker_hold_range == 30.0 and bot.config.sim_taker_hold == 0.0, "the defaults"
+    api.slow, api.lag = "502", 12_000
+    await clock_step(bot, world, NOW, clock_level(NOW), clock_card("502", NOW))
+    looked = NOW + 12_000
+    assert bot.sim_taker_seen["clock-range#503|up|吃"] == looked and "5031" not in api.tokens(), \
+        (bot.sim_taker_seen["clock-range#503|up|吃"] - NOW, api.tokens())
+    api.lag = 0
+    for after, bought in ((18_000, False), (31_000, True)):
+        bot.market.now, world["markets"] = looked + after, [clock_level(looked + after)]
+        await bot.sim_express("CLK-RANGE")
+        assert ("5031" in api.tokens()) == bought, (after, api.tokens())
+
+
+async def clock_taker_rest():
+    """A taker's LIMIT order rests unfilled (LIVE_TAKER_WAIT_SECONDS, 60 by default). The next job starts 57 s after Predict's
+    answer and waits 5 s for a new market's details: the step looks 62 s after it and its sync cancels the rest (before the fix:
+    kept for another step as "57 s old" — the sync ran on the job's clock, placed_at is read off the real one)."""
+    bot, api, world = await clock_bot()
+    assert bot.config.live_taker_wait == 60
+    await clock_step(bot, world, NOW, clock_card("501", NOW))
+    rest = bot.sim_trades()["clock-card-501|up|吃"]["live"]
+    placed, oid = rest["placed_at"], rest["order_id"]
+    assert rest["state"] == "open" and placed == NOW and oid in api.open
+    api.slow, api.lag = "502", 5_000
+    await clock_step(bot, world, placed + 57_000, clock_card("501", placed + 57_000), clock_card("502", placed + 57_000))
+    rest = next(t["live"] for t in bot.sim_trades().values() if (t.get("live") or {}).get("order_id") == oid)
+    assert rest["state"] == "done" and rest["cancel_why"] == "吃单 60 秒未全部成交" and oid not in api.open, (rest["state"], rest.get("cancel_why"))
+
+
+async def clock_behind_lock():
+    """The lock. A look that waits for the other lane's decisions judges on the clock after the wait — the step, and the express
+    lane too (it reads its clock before it waits): a book 89 s old when the look began and 90.5 s old when it could judge is not
+    traded (before the fix: judged 89 s old, bought). The paper trader here: the clock is the decision layer's, whoever sends."""
+    paper = m.Bot(m.Config.from_env(CLOCK_ENV), m.Store(":memory:"), SelfFM(NOW), None)
+    seen, offered, after = [], {}, []
+    paper.sim_markets = lambda now, only=None: (seen.append(now), [offered["card"]])[1]
+    real_after = paper.sim_express_after
+
+    async def after_spy(now_ms):
+        after.append(now_ms)
+        return await real_after(now_ms)
+    paper.sim_express_after = after_spy
+
+    async def behind_the_lock(look, card):
+        offered["card"], paper.market.now, paper.sim_ran = card, NOW, -1e9
+        await paper.sim_lock.acquire()          # the other lane decides...
+        waiting = asyncio.ensure_future(look())
+        await asyncio.sleep(0)                  # ...this look has read its clock and waits for the lock...
+        paper.market.now = NOW + 1_500          # ...a second and a half
+        paper.sim_lock.release()
+        await asyncio.wait_for(waiting, 5)
+
+    for look in (lambda: paper.sim_step(NOW), lambda: paper.sim_express("CLK-501")):
+        await behind_the_lock(look, clock_card("501", NOW - 89_000))
+        assert seen[-1] == NOW + 1_500 and not paper.sim_trades(), (seen[-1] - NOW, sorted(paper.sim_trades()))
+    assert paper.sim_looked_ms == NOW + 1_500
+    # ...and what follows an express decision (the real trader's orders and cancels) is not stamped before the look it follows
+    await behind_the_lock(lambda: paper.sim_express("CLK-501"), clock_card("501", NOW))
+    opened = [t["opened"] - NOW for t in paper.sim_trades().values()]
+    assert opened == [1_500] and after == [NOW + 1_500], (opened, [a - NOW for a in after])
+    # a caller's clock ahead of the bot's own stands, as the decision's stamp does (max): nothing is judged on an earlier clock
+    paper.market.now, paper.sim_ran = NOW, -1e9
+    await paper.sim_step(NOW + 5_000)
+    assert seen[-1] == NOW + 5_000 and paper.sim_looked_ms == NOW + 5_000
+
+
+async def clock_sync_list():
+    """The step's sync runs on the clock the step decided on — not on one read when the sync begins. Its open-order list is
+    stamped with that clock and weighed against the records' own stamps (live_readopt: a list older than a record's last change
+    says nothing about it), and the express lane stamps a record when its pass begins, not when Predict answers its cancel. An
+    express pass beside the step's own placement: the index moved, the resting 55¢ bid is withdrawn, its cancel on its way; the
+    step's sync asks for the list, Predict answers with the bid still on it, then the cancel lands and is confirmed, then the
+    list arrives. Stamped at the sync's start that list would be "newer" than the record and take the cancelled order back
+    (恢复跟踪, a ⚠️ message, a second cancel); on the step's clock it is left alone, as before the fix."""
+    bot, api, world = await clock_bot(SIM_WAYS="maker", SIM_MAKER_EXIT_CENTS="6", SIM_MAKER_MIN_BID="100", SIM_MAKER_SESSION="off",
+                                      SIM_MAKER_POINTS="off", SIM_MAKER_SPREAD_CENTS="10", SIM_MAKER_FOLLOW_SETTLE_SECONDS="0")
+    bot.live_market_filter = False  # (the stand-in's list does not filter by market: one read a sync)
+    resting = lambda mid, at: clock_card(mid, at, 0.70, "0.55", "0.58")
+    world["markets"] = [resting("501", NOW)]
+    await bot.live_prefetch(NOW)
+    await bot.sim_express("CLK-501")
+    first = bot.sim_trades()["clock-card-501|up|挂"]["live"]
+    oid = first["order_id"]
+    assert first["state"] == "open" and oid in api.open
+    notes, phase = [], {"n": 0}
+    bot.live_notify = lambda text, key=None, **more: notes.append(text)
+    cancel_sent, cancel_lands = asyncio.Event(), asyncio.Event()
+    at = NOW + 5_000
+
+    async def on_create(order_id):
+        if phase["n"] == 0:  # the step's own order (market 502) is on Predict, its answer 200 ms away...
+            phase["n"] = 1
+            bot.market.now += 200
+            world["markets"] = [clock_card("501", bot.market.now, 0.60, "0.50", "0.53"), resting("502", at)]  # ...the index moved meanwhile:
+            phase["express"] = asyncio.ensure_future(bot.sim_express("CLK-501"))  # the lane withdraws the 55¢ bid (5¢ left, under the 6¢ line)...
+            await asyncio.wait_for(cancel_sent.wait(), 5)                         # ...and its cancel request is on its way
+
+    async def on_remove(ids):
+        if oid in ids and not cancel_lands.is_set():
+            cancel_sent.set()
+            await asyncio.wait_for(cancel_lands.wait(), 5)  # Predict has not processed the removal yet
+
+    record = lambda: next(t for t in bot.sim_trades().values() if (t.get("live") or {}).get("order_id") == oid)
+
+    async def on_orders(status):
+        if phase["n"] == 1 and status == "OPEN":  # the step's sync: Predict's answer, the 55¢ bid still on it, is on its way back...
+            phase["n"] = 2
+            assert oid in api.open
+            cancel_lands.set()                    # ...while the removal is processed and answered
+            for _ in range(60):
+                await asyncio.sleep(0)
+            phase["ended"] = record()["live"]["state"] == "done"
+    api.on_create, api.on_remove, api.on_orders = on_create, on_remove, on_orders
+    await clock_step(bot, world, at, resting("501", at), resting("502", at))
+    await asyncio.wait_for(phase["express"], 5)
+    await bot.live_fills_wait()
+    # the race ran: the list was made with the bid on it, and the record had ended (the cancel confirmed) before the list arrived
+    assert phase["n"] == 2 and phase["ended"] and bot.market.now == at + 200, phase
+    old = record()
+    events = [e["what"] for e in old["live"]["events"]]
+    assert old["live"]["state"] == "done" and old["live"]["final"] == "cancelled" and old["live"]["cancel_confirmed"], old["live"]
+    assert not any("重新出现在开放订单列表" in e for e in events) and not any("本已按结束处理" in n for n in notes), (events, notes)
+    assert [c for c in api.calls if c[0] == "remove"] == [("remove", [oid])], api.calls
+
+
+CLOCK_CASES = (clock_stale_book, clock_hold_run, clock_taker_rest, clock_behind_lock, clock_sync_list)
+for clock_case in CLOCK_CASES:
+    asyncio.run(clock_case())
+
 print("AUDIT_DECISION_OK")
