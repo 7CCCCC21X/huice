@@ -1261,7 +1261,7 @@ async def _nvc_live() -> None:
         assert (live["state"], live["order_id"]) == ("open", "101") and api.calls == [("create", "101")] and list(api.open) == ["101"], (live["state"], api.calls)
     order = api.open["101"]
     assert (order["strategy"], order["pricePerShare"], order["order"]["tokenId"], order["order"]["side"]) == ("LIMIT", str(44 * 10 ** 16), "772", 0), order
-    assert order["order"]["takerAmount"] == str(100 * 10 ** 18) and int(order["order"]["expiration"]) == NVDA.deadline_ms // 1000 + 7200  # Predict keeps it until then
+    assert order["order"]["takerAmount"] == str(100 * 10 ** 18) and int(order["order"]["expiration"]) == NVDA.deadline_ms // 1000 + L.ORDER_END_GRACE_SECONDS  # Predict keeps it until then (a minute past the market's deadline since LIVE-MAKER-EXPIRY; two hours before)
     # a resting order decided three seconds ago and held back goes out while the session runs (the send-time re-check)...
     assert lb.live_taker_recheck(_nvc_pending(lb, at - 3_000), at) == ("", False)
     # 16:00:00: withdrawn by the step, the cancel sent and confirmed by its own sync. The results at 16:20 find no order
