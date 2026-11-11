@@ -5381,9 +5381,14 @@ class LiveBot(core.Bot):
             head = f"持仓列表超过 {cut} 条，只读到前 {cut} 条，其余没检查：后面可能还有赢的没领，先到 Predict 网站核对、手动领取"
             reasons = [head + "；读到的这部分里没有可领取的"] if settled else [head + "；" + reasons[0], *reasons[1:]]
         if small:
-            # 1.150.0 (GAS-MIN-VALUE): left by the owner's own setting — said last, after whatever needs doing, and never under 赢的都领完了
+            # 1.150.0 (GAS-MIN-VALUE): left by the owner's own setting — said last, after whatever needs doing, and never under 赢的都领完了.
+            # Lowered or cleared, the setting lets the next round redeem them only with gas to send on: with the signer under the
+            # 0.0005 floor (the owner's state when he asked) or the node refusing the last round's redeems for their gas, that round
+            # sends nothing and leaves them 可领取 under the ⛽ note — so then the BNB is said to come first, in `then`'s words
+            short = "现在不足 0.0005" if low else "上一轮节点以 gas 不够拒收了领取交易" if refused else ""
             reasons.append(f"有 {len(small)} 个赢了的持仓价值低于 ${floor:g}（共约 ${small_value:,.2f}），按 LIVE_REDEEM_MIN_USD 暂不领取、不花 gas；"
-                           "没有记成已领或输掉：这项调低或清零后" + ("下一轮自动领取就领" if auto else "发 /live redeem 就领（自动领取关着）"))
+                           "没有记成已领或输掉：这项调低或清零后" + (f"，签名钱包还要先有够付 gas 的 BNB（{short}），{then}" if short
+                                                         else "下一轮自动领取就领" if auto else "发 /live redeem 就领（自动领取关着）"))
         lines.append("结论：" + reasons[0])
         lines.extend(f"另外：{r}" for r in reasons[1:])
         if recent:

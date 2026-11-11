@@ -2786,4 +2786,55 @@ async def gas_stats_floor():
 asyncio.run(gas_stats_floor())
 
 
+# --- GAS-MIN-VALUE (follow-up: what lowering the setting does with no gas to send on) ------------------------------------------
+async def gas_min_value_no_gas():
+    """GAS-MIN-VALUE follow-up: the check's 另外 line for the winners left under LIVE_REDEEM_MIN_USD promised 这项调低或清零后下一轮
+    自动领取就领 (发 /live redeem 就领 with the switch off) whatever the gas. With the signer under the 0.0005 floor — the owner's
+    state — clearing the setting sends nothing: the next round leaves the winner 可领取 under the ⛽ note. The BNB is said first
+    now, in the words the claimable ones get (到账后下一轮自动领取 / 到账后发 /live redeem 领取); with gas, word for word as before."""
+    said = "有 1 个赢了的持仓价值低于 $5（共约 $3.00），按 LIVE_REDEEM_MIN_USD 暂不领取、不花 gas；没有记成已领或输掉：这项调低或清零后"
+    bots = {}
+    for auto, then in ((True, "到账后下一轮自动领取"), (False, "到账后发 /live redeem 领取（自动领取关着）")):
+        bot = bots[auto] = await ready_bot(LIVE_AUTO_REDEEM="on" if auto else "off")
+        assert bot.control_set({"LIVE_REDEEM_MIN_USD": "5"})["ok"]
+        fake = bot.live.api
+        fake.positions_rows, fake.markets["741"] = [held(741, shares=3)], mk(741, won=1)
+        bot.live.chain.bnb = 10 ** 13  # 0.00001 BNB: under the floor
+        await bot.live.refresh_balance()
+        report = await bot.live_redeem_report(NOW)
+        assert verdict_of(report) == ("结论：现在没有可领取的：赢的除小额暂不领的（见下）以外都领完了",
+                                      [said + f"，签名钱包还要先有够付 gas 的 BNB（现在不足 0.0005），{then}"]), report  # (before: 下一轮自动领取就领)
+    # what the bot does: cleared under the floor, the round sends nothing (可领取, the ⛽ note); topped up, the next round redeems it, once
+    bot = bots[True]
+    sent = notices(bot)
+    assert bot.control_set({"LIVE_REDEEM_MIN_USD": None})["ok"] and bot.config.live_redeem_min_usd == 0
+    assert await bot.live_redeem(NOW + 10 * MIN) == [] and bot.live_redeem_last["counts"] == {"claimable": 1} and bot.live.chain.redeemed == []
+    assert [k for k, _ in sent if k == "redeem:gas"] == ["redeem:gas"], sent
+    bot.live.chain.bnb = 10 ** 17
+    await bot.live.refresh_balance()
+    assert len(await bot.live_redeem(NOW + 20 * MIN)) == 1 and [cid for cid, *_ in bot.live.chain.redeemed] == [cond(741)]
+    assert await bot.live_redeem(NOW + 30 * MIN) == [] and len(bot.live.chain.redeemed) == 1
+    # the node refusing the last round's redeem for its gas (the BNB over the floor): the same words, with that reason
+    bot = await ready_bot()
+    assert bot.control_set({"LIVE_REDEEM_MIN_USD": "5"})["ok"]
+    fake = bot.live.api
+    fake.positions_rows = [held(741, shares=3), held(742, shares=20)]
+    fake.markets.update({"741": mk(741, won=1), "742": mk(742, won=1)})
+    bot.live.chain.fail_unsent = "insufficient funds for gas * price + value: have 600000000000000 want 900000000000000"
+    notices(bot)
+    assert await bot.live_redeem(NOW) == [] and bot.live_redeem_last["gas_refused"] and bot.live_redeem_last["counts"] == {"claimable": 1, "small": 1}
+    head, more = verdict_of(await bot.live_redeem_report(NOW + MIN))
+    assert head.startswith("结论：上一轮节点以 gas 不够拒收了领取交易") and more == [
+        said + "，签名钱包还要先有够付 gas 的 BNB（上一轮节点以 gas 不够拒收了领取交易），到账后下一轮自动领取"], (head, more)
+    # with gas: as before
+    bot.live.chain.fail_unsent = ""
+    assert len(await bot.live_redeem(NOW + 10 * MIN)) == 1 and not bot.live_redeem_last["gas_refused"]
+    fake.positions_rows = [held(741, shares=3)]  # (742 redeemed: no longer listed)
+    assert verdict_of(await bot.live_redeem_report(NOW + 11 * MIN))[1] == [said + "下一轮自动领取就领"]
+    print("GAS_MIN_VALUE_NO_GAS_OK")
+
+
+asyncio.run(gas_min_value_no_gas())
+
+
 print("AUDIT_REDEEM_OK")
