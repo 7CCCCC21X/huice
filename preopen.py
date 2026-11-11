@@ -758,8 +758,16 @@ def ev_bets(rows: list[dict]) -> list[dict]:
     independent flips (filled² / 4 each, as before) it added variance it does not have — σ grew, z was pulled to 0 and the 激进
     verdict (and the hourly "模型把优势看高了" notice) could be hidden behind the hedged windows; it also counted the window twice
     toward EV_MIN_BETS. A one-sided window keeps core.ev_bet's filled² / 4. A pair without a sent order, an unsettled one or a
-    side whose result is not kept is no bet (a window none of whose filled sides is kept is skipped)."""
-    out = []
+    side whose result is not kept is no bet (a window none of whose filled sides is kept is skipped).
+    1.150.0: one bet per WINDOW, not per record. With PREOPEN_LEVELS a window is several records (record_key <window>#<level>)
+    and a re-quote leaves superseded ones ('@<attempt>'), all on the same market and settled by the same coin flip X, so the
+    window pays Σup · X + Σdown · (1 − X) − cost: one sample of variance (Σup − Σdown)² / 4. Netted per record only, a window
+    filled Up on one level and Down on another still got the phantom variance (and the double count toward EV_MIN_BETS) the
+    note above removed, and levels filled on the same side were taken for independent flips (2 × 100 instead of 400): σ too
+    small and the window counted twice. Grouped by window_of the effect on σ goes both ways — hedged levels lose the variance
+    they do not have (激进 sooner), same-side levels gain their true correlation and count once (激进 later) — both the true
+    statistics under the model's own p = 0.5. The bet's price is the share-weighted average (display only)."""
+    windows: dict[str, dict] = {}
     for pair in rows:
         if not any(o.get("state") not in NEVER_PLACED for o in (pair.get("orders") or {}).values()):
             continue
@@ -770,10 +778,17 @@ def ev_bets(rows: list[dict]) -> list[dict]:
                 if q[f"filled_{side}"] > 0 and q["side_pnl"][side] is not None}
         if not kept:
             continue
-        filled = sum(f for f, _ in kept.values())
-        bet = core.ev_bet(q["start_ms"], "预挂", q["card"], q["price"], filled, 0.5, (0.5 - q["price"]) * filled, sum(x for _, x in kept.values()))
-        if len(kept) == 2:
-            bet["var"] = (kept["up"][0] - kept["down"][0]) ** 2 * 0.25
+        w = windows.setdefault(q["window"], {"q": q, "up": 0.0, "down": 0.0, "ev": 0.0, "pnl": 0.0, "cost": 0.0})
+        for side, (f, x) in kept.items():
+            w[side] += f
+            w["ev"] += (0.5 - q["price"]) * f
+            w["pnl"] += x
+            w["cost"] += q["price"] * f
+    out = []
+    for w in windows.values():
+        filled = w["up"] + w["down"]
+        bet = core.ev_bet(w["q"]["start_ms"], "预挂", w["q"]["card"], w["cost"] / filled, filled, 0.5, w["ev"], w["pnl"])
+        bet["var"] = (w["up"] - w["down"]) ** 2 * 0.25  # the unhedged part; a one-sided window keeps core.ev_bet's filled² / 4
         out.append(bet)
     return out
 

@@ -209,4 +209,37 @@ async def resume_preopen_anchor():
 asyncio.run(hash_read_error_409())
 asyncio.run(sendrefused_reconcile())
 asyncio.run(resume_preopen_anchor())
+
+
+def ev_sigma_levels():
+    """XR-EV-SIGMA-LEVELS: SIM-EV-SIGMA netted Up against Down inside one record only. With PREOPEN_LEVELS (and re-quotes) one
+    window is several records — <window>#<level>, superseded '@<attempt>' — all settled by the same coin flip, so each still
+    became its own bet: a window hedged across levels kept the phantom variance and the double count toward EV_MIN_BETS, and
+    same-side levels were taken for independent flips. preopen.ev_bets now makes one bet per window: variance (Σup − Σdown)² / 4."""
+    import datetime as dt
+    import preopen as P
+    at = int(dt.datetime(2026, 11, 10, 12, 0, tzinfo=m.BEIJING).timestamp() * 1000)
+
+    def row(i, suffix, price, up, down, result, attempt=0):
+        return {"key": "BTC-15M", "slug": f"btc-updown-15m-{i}{suffix}", "name": "BTC 15分涨跌 10:00–10:15", "price": str(price),
+                "shares": "20", "start_ms": at - (i + 1) * 900_000, "phase": "closed", "accounted": True, "result": result,
+                "attempt": attempt, "orders": {"up": {"state": "final", "filled": up}, "down": {"state": "final", "filled": down}}}
+
+    # level 0 filled Up 20 at 49¢, level 1 filled Down 20 at 48¢, up won: one hedged bet, no variance
+    bets = P.ev_bets([row(1, "", 0.49, 20.0, 0.0, "up"), row(1, "#1", 0.48, 0.0, 20.0, "up")])
+    assert len(bets) == 1, bets
+    b = bets[0]
+    assert (b["shares"], b["var"], round(b["ev"], 9), round(b["pnl"], 9)) == (40.0, 0.0, 0.6, 0.6), b
+    # two levels both Up: the same flip, perfectly correlated -> 40² / 4, not 2 × 100
+    bets = P.ev_bets([row(2, "", 0.49, 20.0, 0.0, "down"), row(2, "#1", 0.48, 20.0, 0.0, "down")])
+    assert len(bets) == 1 and (bets[0]["shares"], bets[0]["var"]) == (40.0, 400.0), bets
+    # a superseded attempt '@1', level 0 and level '#1' of the same window: still one bet
+    assert len(P.ev_bets([row(3, "@1", 0.49, 10.0, 0.0, "up", 1), row(3, "", 0.49, 0.0, 10.0, "up"),
+                          row(3, "#1", 0.48, 0.0, 0.0, "up")])) == 1
+    # different windows stay separate bets; a one-sided window keeps filled² / 4
+    bets = P.ev_bets([row(4, "", 0.49, 20.0, 0.0, "up"), row(5, "", 0.49, 20.0, 0.0, "up")])
+    assert len(bets) == 2 and [x["var"] for x in bets] == [100.0, 100.0], bets
+
+
+ev_sigma_levels()
 print("AUDIT_XREVIEW_OK")
