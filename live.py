@@ -6118,19 +6118,31 @@ class LiveBot(core.Bot):
             else:
                 extra_note = note
         failed = [s.get("last_error") for s in states if s.get("last_error") and s.get("state") == "cancelling"]
+        # 1.150.0 (audit FR-STOP-OK-UNKNOWN): a target this command's own sync ended "unknown" (live_unknown) landed in none of the
+        # counts above — those read "done" and "cancelling" alone — so the reply was "✅ 策略挂单 1 笔：Predict 确认撤掉 0 笔" and the
+        # emergency stop came back ok=True, a green toast, while the bot itself holds that order as possibly resting and filling,
+        # its $ reserved and its side blocked. Three ways lead there: an order sent with no id back whose read by the hash keeps
+        # raising past LIVE_PLACING_GRACE_MS (XR-409-HASH-ERROR — it used to stay "cancelling" with the error, counted as failed: ❌),
+        # the same read finding no such order, and a removal Predict did not confirm of an order no read shows any more
+        # (live_cancel_order). The stop did not take such an order off, so it is counted and named, and the reply is ❌ — the
+        # stop's verdict (LIVE-STOP-OK) and the page's 撤掉全部 with it. The reply alone changes: nothing more or less is sent, the
+        # record stays unknown, reserved and blocking until Predict's word, the evidence, its expiry or /live release ends it
+        unknown = sum(s.get("state") == "unknown" for s in states)
         parts = []
         if targets:
             parts.append(f"策略挂单 {len(targets)} 笔：Predict 确认撤掉 {confirmed} 笔"
                          + (f"，{sent} 笔撤单请求已发送、待确认（每 10 秒核对，确认前额度仍占用）" if sent else "")
                          + (f"，{unsent} 笔撤单请求尚未发出（下一轮重试，额度仍占用）" if unsent else "")
-                         + (f"，{len(failed)} 笔出错（{failed[0]}）" if failed else ""))
+                         + (f"，{len(failed)} 笔出错（{failed[0]}）" if failed else "")
+                         + (f"，{unknown} 笔状态未知（下单或撤单是否生效未知，额度照旧占用；请在 Predict 核对，确认不存在后 /live release 释放）"
+                            if unknown else ""))
         if extra:
             parts.append(extra_text)
         if list_error and not unsent:
             parts.append(extra_note)
         parts.extend(p for p in problems if p != (extra_text if extra else None))
         pending = sent + unsent
-        head = "❌ " if problems or failed else ("⏳ " if pending else "✅ ")
+        head = "❌ " if problems or failed or unknown else ("⏳ " if pending else "✅ ")
         return head + "；".join(parts) + ("" if not targets else "\n" + "、".join(f"{t['item']} {t['label']}" for t in targets.values()))
 
     @staticmethod

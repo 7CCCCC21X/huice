@@ -2135,4 +2135,94 @@ async def winddown_gain():
 
 
 asyncio.run(winddown_gain())
+
+
+async def stop_ok_unknown():
+    """FR-STOP-OK-UNKNOWN: the emergency stop's verdict (LIVE-STOP-OK) is its cancel command's head, and that command counted its
+    targets as confirmed ("done"), sent, unsent or failed (those three "cancelling"). A target its own sync ended "unknown" was in
+    none of them: "✅ 策略挂单 1 笔：Predict 确认撤掉 0 笔", ok=True — a green toast, on the stop and on the page's 撤掉全部 — while
+    the bot itself held that order as possibly resting and filling, $55 reserved. Three ways in: a maker sent with no id back (a
+    bare 409) whose read by the hash keeps raising past the placing grace (XR-409-HASH-ERROR: it used to stay "cancelling" with the
+    error, ❌), the same read finding no such order, and a removal Predict did not confirm of an order no read shows any more. Such
+    a target is counted and named now, and the reply is ❌; nothing else changes — the same requests, the record unknown and
+    reserved, the cases inside the grace as before."""
+    card = lambda at: hsi(0.70, [("0.55", "300")], [("0.58", "400")], at)
+    creates = lambda bot: sum(c[0] == "create" for c in bot.live.api.calls)
+
+    async def unsure(read: str, minutes: int):
+        """A maker whose POST answered a bare 409 — "placing" with its hash and no order id — its read by the hash raising
+        ("error") or answering None ("none"), stepped each minute; the clock then `minutes` past its sending."""
+        bot = make_bot(SIM_WAYS="maker")
+        bot.live_market_filter = False
+        await bot.live_prepare()
+        api = bot.live.api
+        world["markets"] = [card(NOW)]
+        await bot.live_prefetch(NOW)
+
+        async def conflict(body):
+            api.calls.append(("create", body))
+            raise m.RemoteError("HTTP 409: Conflict")
+
+        async def by_hash(oid, hash_=""):
+            if read == "error":
+                raise m.RemoteError("HTTP 400: invalid order hash")
+            return None
+        api.create_order, api.order = conflict, by_hash
+        await step(bot, NOW, card(NOW))
+        t = bot.sim_trades()[next(k for k in bot.sim_trades() if k.startswith(f"{HSI_SLUG}|up|挂"))]
+        reserved = bot.live_reserved(t)
+        assert t["live"]["state"] == "placing" and t["live"].get("hash") and not t["live"].get("order_id") and reserved > 0, t["live"]
+        for k in range(1, minutes):
+            await step(bot, NOW + k * 60_000, card(NOW + k * 60_000))
+        bot.market.now = NOW + minutes * 60_000 + 1_000
+        return bot, t, reserved
+
+    unknown_line = "，1 笔状态未知（下单或撤单是否生效未知，额度照旧占用；请在 Predict 核对，确认不存在后 /live release 释放）"
+    for read in ("error", "none"):
+        # past the grace the stop's own sync ends the record "unknown": red, and the line says so; still unknown, reserved, sent once
+        bot, t, reserved = await unsure(read, 6)
+        out = await bot.live_control("stop", {})
+        assert not out["ok"] and out["message"].split("\n")[1] == "❌ 策略挂单 1 笔：Predict 确认撤掉 0 笔" + unknown_line, (read, out)
+        assert bot.live_paused() == "紧急停止" and t["live"]["state"] == "unknown", (read, t["live"]["state"])
+        assert abs(bot.live_reserved(t) - reserved) < 1e-9 and creates(bot) == 1, (read, bot.live_reserved(t), creates(bot))
+        # the page's 撤掉本策略全部挂单 (/live cancel all): the same reply, red
+        bot, t, reserved = await unsure(read, 6)
+        out = await bot.live_control("cancel", {"id": "all"})
+        assert not out["ok"] and out["message"].startswith("❌ 策略挂单 1 笔：Predict 确认撤掉 0 笔" + unknown_line), (read, out)
+        assert t["live"]["state"] == "unknown" and abs(bot.live_reserved(t) - reserved) < 1e-9, (read, t["live"]["state"])
+        # inside the grace the read's error (or the 409's) is no evidence either way: "cancelling", ❌ 出错, as before
+        bot, t, reserved = await unsure(read, 0)
+        out = await bot.live_control("stop", {})
+        head = out["message"].split("\n")[1]
+        assert not out["ok"] and head.startswith("❌ ") and "笔出错（HTTP " in head and "状态未知" not in head, (read, out)
+        assert t["live"]["state"] == "cancelling", (read, t["live"]["state"])
+    # an order with its id, resting: Predict answers "noop" to its removal and no read shows it any more (live_cancel_order): red
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare()
+    api = bot.live.api
+    world["markets"] = [card(NOW)]
+    await bot.live_prefetch(NOW)
+    await step(bot, NOW, card(NOW))
+    t = bot.sim_trades()[f"{HSI_SLUG}|up|挂"]
+    oid, reserved = t["live"]["order_id"], bot.live_reserved(t)
+    assert t["live"]["state"] == "open" and oid in api.open and reserved > 0, t["live"]
+
+    async def noop(ids):
+        api.calls.append(("remove", list(ids)))
+        return {"removed": [], "noop": list(ids)}
+
+    async def no_rows(status="OPEN", **params):
+        return []
+
+    async def no_row(o, hash_=""):
+        return None
+    api.remove_orders, api.orders, api.order = noop, no_rows, no_row
+    bot.market.now = NOW + 1_000
+    out = await bot.live_control("stop", {})
+    assert not out["ok"] and out["message"].split("\n")[1] == "❌ 策略挂单 1 笔：Predict 确认撤掉 0 笔" + unknown_line, out
+    assert t["live"]["state"] == "unknown" and abs(bot.live_reserved(t) - reserved) < 1e-9, (t["live"]["state"], bot.live_reserved(t))
+    assert [c for c in api.calls if c[0] == "remove"] == [("remove", [oid])], api.calls  # one removal, as before
+
+
+asyncio.run(stop_ok_unknown())
 print("AUDIT_XREVIEW_OK")
