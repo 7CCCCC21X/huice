@@ -53,6 +53,46 @@ groups = m.sim_groups([window_rec("BTC-DAY", {"end": 5, "day": "2026-11-10"}, "B
                        window_rec("BTC-15M", win, "BTC 15分涨跌 16:30–16:45")])
 assert [(g["driver"], g["worst"]) for g in groups] == [("BTCUSDT", -100.0)], [(g["driver"], g["name"], g["worst"]) for g in groups]
 
+# ... and inside the pair's group every window stays an event of its own. BTC 15分 16:30–16:45 and BTC 5分 16:40–16:45 end on the
+# same candle: 涨 on the first and 跌 on the second both lose when BTC falls to 16:40 and then rises a little, still under its
+# 16:30 price. Keyed on the end alone they were hedged as one event (worst $0), which made the merged group's cap looser than
+# the two separate groups had been (-50 each).
+import types
+
+card15, card5 = (next(s for s in m.WINDOW_UPDOWN_MARKETS if s.key == k) for k in ("BTC-15M", "BTC-5M"))
+W0 = 1793867400_000  # 11-05 16:30 Beijing
+w15, w5, w5_first = card15.window_spec(W0), card5.window_spec(W0 + 10 * 60_000), card5.window_spec(W0)
+assert w15.end_ms == w5.end_ms and w15.start_ms != w5.start_ms and w5_first.start_ms == w15.start_ms
+
+
+def held(card, spec, side: str, price: float = 0.5, **more) -> dict:
+    return {"kind": "updown", "key": card.key, "item": spec.name, "side": side, "price": price, "shares": 100, "status": "filled",
+            "market": spec.slug, "settle": {"end": spec.end_ms, "start": spec.start_ms, **card.tag(spec)}, **more}
+
+
+groups = m.sim_groups([held(card15, w15, "up"), held(card5, w5, "down")])
+assert [(g["driver"], g["worst"], g["markets"]) for g in groups] == [("BTCUSDT", -100.0, 2)], [(g["driver"], g["worst"], g["event"]) for g in groups]
+assert m.event_of(held(card15, w15, "up")) != m.event_of(held(card5, w5, "down"))
+assert m.sim_groups([held(card15, w15, "up"), held(card5, w5_first, "down")])[0]["worst"] == -100.0  # the same start, another end
+# the two sides of ONE window still hedge each other: 100 涨 + 100 跌 at 60¢ lose 20 whichever way it ends
+assert m.event_of(held(card15, w15, "up")) == m.event_of(held(card15, w15, "down"))
+assert abs(m.sim_groups([held(card15, w15, "up", 0.6), held(card15, w15, "down", 0.6)])[0]["worst"] + 20.0) < 1e-9
+# a window that ends with a monthly card's last candle (its record carries only the end) is another event than the month
+month = {"kind": "updown", "key": "BTC-2026-11", "item": "BTC 11月涨跌", "side": "down", "price": 0.5, "shares": 100, "status": "filled",
+         "market": "btc-nov", "settle": {"end": w15.end_ms}, "driver": "BTCUSDT", "driver_name": "BTC"}
+assert m.group_worst_case([held(card15, w15, "up"), month], "BTC")[0] == -100.0
+assert m.event_of(month) == ("updown", "", str(w15.end_ms)), "a record without a start: keyed as before"
+# the cap itself (sim_group_room, the paper and the real trader's): with 100 涨 held on the 15-minute window, 100 跌 on the
+# 5-minute window ending with it is refused under a $60 cap (was let through: the pair read as hedged, worst $0)
+room_bot = types.SimpleNamespace(config=types.SimpleNamespace(sim_group_usd=60.0), sim_resting_cost=lambda t: float(t.get("price") or 0),
+                                 sim_group_order=lambda mk, price, shares, taker=None: (price, shares))
+book15 = {"a": held(card15, w15, "up")}
+sim_market = lambda card, spec: m.SimMarket(spec.slug, spec.name, "updown", card.key, 0.5, None, 0.0, "", ("涨", "跌"),
+                                            {"end": spec.end_ms, "start": spec.start_ms, **card.tag(spec)})
+refusal = m.Bot.sim_group_room(room_bot, book15, sim_market(card5, w5), "down", 0.5, 100)
+assert "合计将亏 $100.00，超过组上限 $60" in refusal, refusal
+assert m.Bot.sim_group_room(room_bot, book15, sim_market(card15, w15), "down", 0.5, 100) == ""  # the other side of the held window: a hedge
+
 # --- SIM-OWN-ON-BOOK-CLOCK: own_on_book compares a book's read with Predict's answer on one clock (the books' wall clock) ---------
 # Predict answered at local wall time L; answered_at is on the Binance-offset clock (here the local clock lags Binance by 2 s,
 # so answered_at = L + 2000). A book read 500 ms after the answer already shows our order: it is ours, not someone else's 买1.

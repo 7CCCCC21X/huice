@@ -11228,6 +11228,8 @@ def market_driver(kind: str, key: str, settle: dict | None = None, item: str = "
     # BTC move hits them all at once: their worst ends count in the pair's SIM_GROUP_USD group. They had been left out
     # of this list when they were added, and each window card fell back to its own key ("BTC-15M"), a group (and cap) of
     # its own beside the pair's. Every WindowUpDownSpec has .symbol, and no window key is also a daily or monthly key.
+    # Inside the group each window is still an event of its own (event_of tells them apart by start and end: a 15-minute
+    # and a 5-minute window that end on the same minute are two events), so the windows' worst ends add up.
     specs = {"touch": (*TOUCH_MARKETS, *TOUCH_SETTLED),
              "updown": (*UPDOWN_MARKETS, *DAILY_UPDOWN_MARKETS, *WINDOW_UPDOWN_MARKETS),
              "range": (*RANGE_MARKETS, *STOCK_HIT_MARKETS)}.get(kind, ())
@@ -11458,10 +11460,18 @@ PATH_KINDS = {"range", "ladder", "touch"}  # the kinds one price path decides to
 def event_of(p: Mapping) -> tuple:
     """The settlement event an end-decided position belongs to: positions of one event hedge each other (the two sides of
     one day's close), positions of different events do not (1.122.0: ETH 先触高线 and ETH 当天收跌 were hedged as if one
-    move decided both — a path that touches the low line and then closes above the open loses both)."""
+    move decided both — a path that touches the low line and then closes above the open loses both). An up/down market
+    is the move from its start to its end, so the start is part of the event (1.150.0): BTC 15分 16:30–16:45 and BTC 5分
+    16:40–16:45 end on the same candle and, now that the window cards sit in their pair's group (market_driver), were
+    hedged as one event — 涨 on the first and 跌 on the second counted as a loss of nothing, while BTC falling to 16:40
+    and then rising a little, still under its 16:30 price, loses both. The same for a window that ends with the month
+    (a monthly card's record carries no start). Two sides of one market carry the same start and end and still hedge; a
+    record without the start beside one with it is counted apart, the careful way round."""
     settle = p.get("settle") or {}
-    return (str(p.get("kind") or ""), str(settle.get("key") or ""),
-            str(settle.get("target") or settle.get("end") or settle.get("deadline") or settle.get("day") or ""))
+    when = str(settle.get("target") or settle.get("end") or settle.get("deadline") or settle.get("day") or "")
+    if settle.get("start"):
+        when = f"{settle['start']}-{when}"
+    return str(p.get("kind") or ""), str(settle.get("key") or ""), when
 
 
 def group_worst_case(positions: list[dict], name: str = "") -> tuple[float, str]:
