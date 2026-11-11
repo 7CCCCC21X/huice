@@ -1668,11 +1668,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         clock.ms = c["start_ms"] + 20 * 60_000
         api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down
         soon = []
-        ctl.owner.live_redeem_soon = lambda: soon.append(1)
+        ctl.owner.live_redeem_soon = lambda market_id="": soon.append(str(market_id))
         await ctl.settle_pair(pair)
         self.assertTrue(pair["accounted"])
         self.assertAlmostEqual(pair["pnl"], 1.)
-        self.assertEqual(soon, [1], "1.131.3: a fill on the winning side (LIVE_AUTO_REDEEM on by default) — redeemed soon")
+        # 1.131.3: a fill on the winning side (LIVE_AUTO_REDEEM on by default) — redeemed soon; 1.150.0 (RDM-SOON-NO-TARGET): the
+        # market named, so the round it brings reads it first
+        self.assertEqual(soon, ["123"])
         self.assertEqual(ctl.risk(), 0.)
         await self.finish(ctl)
 

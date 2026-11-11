@@ -2152,7 +2152,10 @@ class Controller:
         if any(float(order.get("filled") or 0) > 0 and (up == 0.5 or (side == "up") == (up == 1.0)) for side, order in pair["orders"].items()):
             soon = getattr(self.owner, "live_redeem_soon", None)
             if callable(soon) and getattr(self.owner.config, "live_auto_redeem", False):
-                soon()  # a fill on the winning side: redeemed within seconds (1.131.3), the USDT back for the next quotes
+                # a fill on the winning side: redeemed within seconds (1.131.3), the USDT back for the next quotes — the market named,
+                # so that round reads it first (1.150.0, audit RDM-SOON-NO-TARGET: it only moved the clock, and with more than forty
+                # markets unjudged the round spent its reads elsewhere and the win waited for a later one)
+                soon(str(pair.get("market_id") or ""))
 
     async def monitor_pair(self, pair: dict) -> None:
         """An order ID is not proof that a deferred post-only order was accepted."""

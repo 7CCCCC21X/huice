@@ -1474,6 +1474,7 @@ class LiveBot(core.Bot):
         self.live_redeem_errors: dict[str, str] = {}         # position key -> why its last redeem failed (/live redeem check)
         self.live_redeem_unsent: dict[str, int] = {}         # position key -> its redeems in a row that never left (TxNotSent): LIVE_REDEEM_UNSENT_PULLS (1.150.0)
         self.live_redeem_read_round: dict[str, int] = {}     # market id -> the number of the redeem round that last read it (this process's rounds): the longest unread are read first (1.150.0)
+        self.live_redeem_first: dict[str, float] = {}        # market id -> when a win there asked for a round (live_redeem_soon): read ahead of the rotation, once (1.150.0)
         self.live_redeem_noted = -1e9                        # the last failed redeem told on Telegram (LIVE_REDEEM_NOTE_SECONDS)
         self.live_redeem_again_n = 0                         # early rounds in a row asked for by live_redeem_again (0 again once a round looked, 1.150.0)
         self.live_redeem_whole_at = time.monotonic()         # when a round last looked at the positions with no rate limit cutting it (the start counts)
@@ -1858,7 +1859,9 @@ class LiveBot(core.Bot):
         st = trade.get("live")
         if (isinstance(st, dict) and by == "Predict 最终结果" and trade.get("status") == "settled" and float(trade.get("shares") or 0) > 1e-9
                 and float(trade.get("payout") or 0) > 0 and self.config.live_auto_redeem):
-            self.live_redeem_soon()  # a real position settled in its favour: redeemed within seconds, not at the next ten-minute round
+            # a real position settled in its favour: redeemed within seconds, not at the next ten-minute round — its market read
+            # first by that round (1.150.0, RDM-SOON-NO-TARGET)
+            self.live_redeem_soon(str((st.get("want") or {}).get("market_id") or trade.get("market_id") or ""))
         if isinstance(st, dict) and st.get("state") in {"pending", "placing", "open", "unknown"} and trade["status"] in {"expired", "settled"}:
             st["state"], st["cancel_why"] = "cancelling", "市场已出结果"
             st["events"].append({"at": now_ms, "what": "撤单：市场已出结果"})
@@ -2716,10 +2719,19 @@ class LiveBot(core.Bot):
         cooling = max(0.0, float(getattr(self.live.api, "blocked_until", 0.0) or 0.0) - time.monotonic())
         self.live_redeem_pull(max(float(floor), cooling + self.LIVE_REDEEM_AGAIN_SECONDS * 2 ** (n - 1)))
 
-    def live_redeem_soon(self) -> None:
+    def live_redeem_soon(self, market_id: Any = "") -> None:
         """A real position just settled in the bot's favour (the pre-open mode's window, a record on Predict's final
         result): the next automatic redeem round within LIVE_REDEEM_SOON_SECONDS, not up to LIVE_REDEEM_SECONDS later —
-        the USDT back on the account for the next quotes (1.131.3)."""
+        the USDT back on the account for the next quotes (1.131.3). 1.150.0 (audit RDM-SOON-NO-TARGET): ``market_id``, the
+        market that settled, is read first by the rounds to come (live_redeem_first) — it only moved the clock, and with
+        more than LIVE_REDEEM_READS markets unjudged the round it brought spent its reads on the longest unread ones and
+        the win waited for a later round. Once read it goes back into the rotation (kept while its redeem never left and
+        that retry is pulled: live_redeem_pass), so names never take every round's reads."""
+        if market_id not in (None, ""):
+            first = self.__dict__.setdefault("live_redeem_first", {})
+            first[str(market_id)] = time.monotonic()
+            while len(first) > 10 * self.LIVE_REDEEM_READS:  # (bounded: the oldest name goes, its market keeps its turn in the rotation)
+                del first[min(first, key=first.get)]
         self.live_last_redeem = min(self.live_last_redeem, time.monotonic() - self.LIVE_REDEEM_SECONDS + self.LIVE_REDEEM_SOON_SECONDS)
 
     async def live_sync_orders(self, active: dict[str, dict], now_ms: int) -> None:
@@ -4239,8 +4251,12 @@ class LiveBot(core.Bot):
         # refusing does not double the rounds for good. A sent failure (its gas paid; its transaction may yet be mined) pulls nothing.
         unsent_runs = self.__dict__.setdefault("live_redeem_unsent", {})
         pull: list[str] = []
+        # 1.150.0 (audit RDM-SOON-NO-TARGET): a market a win just named (live_redeem_soon) is read first, inside the cap, ahead of the
+        # rotation; a real round that reads it drops the name (one read ahead per win, never a standing priority). Kept while its
+        # redeem never left and that retry is pulled (LIVE_REDEEM_UNSENT_PULLS): the retry at the wait's end reads it first too.
+        first = self.__dict__.setdefault("live_redeem_first", {})
         market_of = lambda r: str((r.get("market") if isinstance(r.get("market"), dict) else {}).get("id") or r.get("marketId") or "")
-        for row in sorted(rows, key=lambda r: (read_round.get(market_of(r), 0), -self.position_time(r))):
+        for row in sorted(rows, key=lambda r: (market_of(r) not in first, read_round.get(market_of(r), 0), -self.position_time(r))):
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
             outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
             mid = market_of(row)
@@ -4282,6 +4298,7 @@ class LiveBot(core.Bot):
                     # read — or not readable (a delisted market's 404): the other markets' turn before it is read again. One the rate
                     # limit stopped keeps its place: it is the next round's first
                     read_round[mid] = this_round
+                    first.pop(mid, None)  # (a name is one read ahead: read now, back in the rotation)
             raw = markets[mid]
             if raw is None:
                 seen.append({**entry, "kind": "unread", "error": read_errors.get(mid, "")})
@@ -4318,6 +4335,7 @@ class LiveBot(core.Bot):
                     unsent_runs[key] = runs
                     if pulled:
                         pull.append(key)
+                        first[mid] = time.monotonic()  # (RDM-SOON-NO-TARGET) still named: the pulled retry reads it first
                 else:
                     unsent_runs.pop(key, None)
                 self.live_note_error(f"领取 {entry['title']} 失败：{text}" + ("（交易没发出，5 分钟后再试）" if pulled else "（交易没发出，下一轮再试，最迟约 10 分钟）" if unsent
@@ -4337,6 +4355,8 @@ class LiveBot(core.Bot):
             del read_round[gone]  # every position on it settled here (redeemed, lost) before this round, or no longer held: forgotten
         for gone in [k for k in unsent_runs if k.split(":")[2] not in unsettled]:  # (key: live:redeemed:<market>:<index set>)
             del unsent_runs[gone]
+        for gone in set(first) - unsettled:
+            del first[gone]  # a name with nothing left to judge there (redeemed, lost, or not listed): forgotten
         if pull:  # (RDM-UNSENT-RETRY-GRID) the next round at the end of the soonest such wait, a second after it
             left = min(self.LIVE_REDEEM_RETRY_SECONDS - (time.monotonic() - self.live_redeem_failed[k]) for k in pull)
             self.live_redeem_pull(max(0.0, left) + 1)

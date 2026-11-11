@@ -339,4 +339,79 @@ async def unsent_retry_grid():
 asyncio.run(unsent_retry_grid())
 
 
+# --- RDM-SOON-NO-TARGET (the name kept through a pulled retry) ------------------------------------------------------------------
+async def soon_names_the_market():
+    """RDM-SOON-NO-TARGET: live_redeem_soon only moved the clock. With more than forty markets unjudged, the round a win brought
+    read the forty longest unread — and the market that had just settled, read a round before as still open, waited for a later
+    round. The win's market is now named (sim_settle, the pre-open settle_pair) and read first by the next real round, inside the
+    cap; once read it goes back into the rotation. Kept named while its redeem never left and that retry is pulled, so the retry
+    at the wait's end reads it first too; the check reads it first and leaves the name."""
+    bot = await ready_bot()
+    fake, chain, CAP = bot.live.api, bot.live.chain, bot.LIVE_REDEEM_READS
+    newer = [str(600 + i) for i in range(45)]
+    fake.markets.update({mid: mk(mid) for mid in newer})
+    fake.markets["500"] = mk(500)
+    fake.positions_rows = [held(mid) for mid in newer] + [held(500)]  # no time on the rows: Predict's own order, window 500 last
+    reads, market = [], fake.market
+
+    async def counting(mid):
+        reads.append(str(mid))
+        return await market(mid)
+    fake.market = counting
+
+    async def look(at):
+        reads.clear()
+        done = await bot.live_redeem(at)
+        assert len(reads) <= CAP, ("never more than the cap a round", len(reads))
+        return done, list(reads)
+
+    def won(mid, at):
+        """Predict's final result on a real record of this market, in the bot's favour (what asks for a round within seconds)."""
+        fake.markets[mid] = mk(mid, won=1)
+        record = {"shares": 10.0, "order": 10.0, "side": "up", "status": "filled", "maker": False, "revisions": [], "market_id": mid,
+                  "live": {"state": "done", "events": [], "want": {"market_id": mid, "index_set": 1}}}
+        bot.sim_settle(record, 1.0, "Predict 结算：Up", at, "Predict 最终结果")
+
+    done, r1 = await look(NOW)
+    assert done == [] and r1 == newer[:CAP], r1
+    done, r2 = await look(NOW + 10 * MIN)  # the six not reached first — 500 read, still open — then the rest
+    assert done == [] and r2[:6] == newer[CAP:] + ["500"], r2
+    won("500", NOW + 11 * MIN)
+    reads.clear()
+    report = await bot.live_redeem_report(NOW + 11 * MIN + 1000)  # the check reads it first too, and leaves the name
+    assert reads[0] == "500" and "window 500 / Up 10 份，约 $10.00" in report, (reads[:3], report)
+    assert bot.live_redeem_first.keys() == {"500"}, bot.live_redeem_first
+    done, r3 = await look(NOW + 11 * MIN + 20_000)  # the round the win brought
+    assert r3[0] == "500" and len(done) == 1 and "已领取 window 500 Up 10 份：0xredeem" in done[0], (done, r3)
+    assert bot.live_redeem_first == {} and [cid for cid, *_ in chain.redeemed] == [cond(500)], bot.live_redeem_first
+    # a named market still unresolved: read once, first, then back in the rotation
+    bot.live_redeem_soon(newer[CAP])
+    done, r4 = await look(NOW + 20 * MIN)
+    assert r4[0] == newer[CAP] and bot.live_redeem_first == {}, (r4[:3], bot.live_redeem_first)
+    # the chain behind Predict's result: the named market read first, its redeem never left — still named; inside the wait not
+    # read and still named; at the wait's end read first and redeemed, the name gone
+    chain.fail_unsent = "RPC 错误：execution reverted"
+    won(newer[0], NOW + 21 * MIN)
+    done, r5 = await look(NOW + 21 * MIN + 20_000)
+    assert r5[0] == newer[0] and done == [] and newer[0] in bot.live_redeem_first, (r5[:3], bot.live_redeem_last)
+    done, r6 = await look(NOW + 24 * MIN)
+    assert newer[0] not in r6 and newer[0] in bot.live_redeem_first and bot.live_redeem_last["counts"]["waiting"] == 1, (r6[:3], bot.live_redeem_last)
+    chain.fail_unsent = ""
+    bot.live_redeem_failed.clear()  # (the wait over)
+    done, r7 = await look(NOW + 27 * MIN)
+    assert r7[0] == newer[0] and len(done) == 1 and f"已领取 window {newer[0]}" in done[0] and bot.live_redeem_first == {}, (done, r7[:3])
+    # a name with nothing to judge there is forgotten by the next real round
+    bot.live_redeem_soon("999")
+    await look(NOW + 30 * MIN)
+    assert bot.live_redeem_first == {}
+    # a win settled without a market (an older record): the clock alone, as before
+    bot.live_last_redeem = time.monotonic()
+    bot.live_redeem_soon()
+    assert bot.live_redeem_first == {} and due(bot) <= 20
+    print("RDM_SOON_NO_TARGET_OK")
+
+
+asyncio.run(soon_names_the_market())
+
+
 print("AUDIT_REDEEM_OK")
