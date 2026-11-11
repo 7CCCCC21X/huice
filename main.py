@@ -17622,7 +17622,8 @@ class Bot:
         # 1.150.0: the stock cards' closes too. sim_note_closes ran only inside sim_step, which is scheduled only with SIM
         # and PREDICT both on, so with the paper trader off the stock snapshots saved above were never scored by /calib
         # (no outcome:{SYMBOL}:{day} ever written). Harmless when the trader is on as well: note_outcome writes only a
-        # changed value, and a stock outcome never moves the index σ factors (index_sigma_calibs keeps the indices alone).
+        # changed value, and a stock outcome no longer triggers the index σ factors' measurement (XR-STOCK-CLOSE-RECALC: it
+        # never moved them, index_sigma_calibs keeps the indices alone, yet each stock close paid a full one on the event loop).
         self.sim_note_closes()
 
     PRED_FIELDS = frozenset({"key", "t", "target", "mode", "ref", "up", "move", "R", "beta", "sigma"})
@@ -18726,7 +18727,12 @@ class Bot:
         value = float(value)
         if self.store.get(f"outcome:{key}:{day}") != value:
             self.store.put(f"outcome:{key}:{day}", value)
-            self.vols.calib = self.index_sigma_calibs() if self.config.sigma_calib else {}  # a new outcome: the σ factors measured again
+            # 1.150.0 (audit XR-STOCK-CLOSE-RECALC): only an index's outcome is an input of the σ factors (index_sigma_calibs
+            # reads the three indices' own snapshots and outcomes alone). A stock card's close, which record_predictions now
+            # notes every second with SIM / PREDICT off too, paid a full measurement on the event loop (most of a second on a
+            # full store, one per close: several back to back when a market's cards close together) for the same factors.
+            if key in PREDICT_KEYS.values():
+                self.vols.calib = self.index_sigma_calibs() if self.config.sigma_calib else {}  # a new outcome: the σ factors measured again
         record = {"value": value, "source": source}
         if {k: v for k, v in (self.store.get(f"outsrc:{key}:{day}") or {}).items() if k != "at"} != record:
             self.store.put(f"outsrc:{key}:{day}", {**record, "at": self.market.now_ms()})

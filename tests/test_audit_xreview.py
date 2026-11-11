@@ -425,5 +425,55 @@ def driver_windows_perf():
     assert refusals > 100, refusals
 
 
+
+def stock_close_recalc():
+    """XR-STOCK-CLOSE-RECALC: note_outcome measured the index σ factors again (index_sigma_calibs, most of a second on a full
+    store, on the event loop) at every new outcome, a stock card's too, although only the three indices' own snapshots and
+    outcomes are its inputs. record_predictions now notes the stock cards' closes every second, SIM / PREDICT off as well, so
+    each stock close paid a full measurement for the same factors. Only an index's new outcome measures them now; the stock
+    outcome and its source are still written, and an index outcome gives exactly a fresh measurement."""
+    import datetime as dt, math, os, random, tempfile
+    store = m.Store(os.path.join(tempfile.mkdtemp(), "x.db"))
+    rnd = random.Random(3)
+    t0 = int(dt.datetime(2026, 9, 1, tzinfo=m.BEIJING).timestamp() * 1000)
+    rows = []
+    for i in range(40):
+        day = (dt.date(2026, 9, 1) + dt.timedelta(days=i)).isoformat()
+        for key in ("HSI", "KOSPI", "SSE", "SKHYNIXUSDT"):
+            if i < 39:
+                rows.append((f"outcome:{key}:{day}", 100 * math.exp(rnd.gauss(0, .01))))
+            for k in range(6):
+                t = t0 + i * 86_400_000 + k * 3_600_000
+                rows.append((f"pred:{key}:{t}", {"key": key, "t": t, "target": day, "mode": "盘中" if k % 2 else "盘后", "ref": 100.0,
+                                                 "ref_raw": 100.0, "up": .5, "move": .001, "beta": 1.0, "sigma": .01, "R": .5}))
+    store.put_many(rows)
+    store.flush()
+
+    class Clock:
+        config = None
+
+        def now_ms(self):
+            return t0 + 41 * 86_400_000
+
+    bot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SSE_INDEX": "off"}),
+                store, Clock(), None)
+    assert bot.config.sigma_calib and bot.vols.calib, "SIGMA_CALIB on by default: factors measured at the start"
+    calls, real = [], bot.index_sigma_calibs
+    bot.index_sigma_calibs = lambda: calls.append(1) or real()
+    start = dict(bot.vols.calib)
+    last = (dt.date(2026, 9, 1) + dt.timedelta(days=39)).isoformat()
+    bot.note_outcome("SKHYNIXUSDT", last, 101.0, "t")
+    bot.note_outcome("S1", last, 99.0, "t")
+    assert len(calls) == 0, f"stock closes measured the index σ factors {len(calls)}x"
+    assert bot.vols.calib == start
+    assert bot.store.get(f"outcome:SKHYNIXUSDT:{last}") == 101.0 and bot.store.get(f"outcome:S1:{last}") == 99.0
+    assert bot.store.get(f"outsrc:SKHYNIXUSDT:{last}")["value"] == 101.0 and bot.store.get(f"outsrc:S1:{last}")["source"] == "t"
+    bot.note_outcome("HSI", last, 101.0, "t")
+    assert len(calls) == 1 and bot.vols.calib != start and bot.vols.calib == real()
+    bot.note_outcome("HSI", last, 101.0, "t")  # the same value again: nothing new to measure
+    assert len(calls) == 1
+
+
 driver_windows_perf()
+stock_close_recalc()
 print("AUDIT_XREVIEW_OK")
