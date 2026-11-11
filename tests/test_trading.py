@@ -387,7 +387,7 @@ async def run():
     assert L.LiveTrader(dataclasses.replace(bot.config, live_chain=97)).api.base == "https://api-testnet.predict.fun/v1"
     assert "真实交易未就绪" in bot.live_room({}, hsi(0.70, [], [], NOW), "up", 0.5, 100)
     lines = await bot.live_prepare()
-    assert bot.live.ready and bot.live.usd() == 1000.0 and bot.live.approvals == {"CTF_EXCHANGE": True, "NEG_RISK_CTF_EXCHANGE": True}
+    assert bot.live.ready and bot.live.usd() == 1000.0 and bot.live.approvals == {"CTF_EXCHANGE": True, "NEG_RISK_CTF_EXCHANGE": True, "YIELD_BEARING_CTF_EXCHANGE": True, "YIELD_BEARING_NEG_RISK_CTF_EXCHANGE": True}
     assert any("普通钱包" in line and "0x8fd3…7A03" in line for line in lines) and any("USDT 1,000.00" in line for line in lines), lines
     # a market whose details are not read yet is not traded, and is read when its suggestion nears the bar
     assert "尚未读到" in bot.live_room({}, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW), "up", 0.58, 100)

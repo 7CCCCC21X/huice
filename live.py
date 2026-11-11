@@ -35,6 +35,7 @@ import asyncio
 import base64
 import collections
 import contextlib
+import contextvars
 import dataclasses
 import datetime as dt
 import decimal
@@ -584,6 +585,19 @@ async def remove_in_batches(api: Any, ids: list, limit: RemoveLimit, *, workers:
     return out
 
 
+# 1.150.0 (audit LIVE-SEND-AFTER-PAUSE): the model trader's last check (live_send_gate) ran before create_order's own waits — a
+# slot of PredictApi.gate (busy with reads and cancels) — so an order held there went out after /live pause, the emergency stop or
+# LIVE=off had come meanwhile: a new position opened after the operator paused, or a taker filled before its withdrawal's cancel.
+# live_place_order sets this (task-local: it follows authed -> call -> gate -> send in the same task) to a function that judges
+# the order again; PredictApi.send runs it inside the slot, right before the request is handed to the transport, as the pre-open
+# mode's safe_api does with its before_send. Unset (every other caller) nothing changes.
+ORDER_SEND_CHECK: contextvars.ContextVar[Any] = contextvars.ContextVar("order_send_check", default=None)
+
+
+class SendRefused(core.RemoteError):
+    """A local gate refused the order inside the request slot, before its bytes were dispatched: nothing went out."""
+
+
 class PredictApi:
     """Signed-in requests to Predict's REST API. The API key goes in x-api-key on every request; the JWT from the
     sign-in flow (GET /v1/auth/message → sign → POST /v1/auth) in Authorization, renewed before it expires or after a
@@ -597,6 +611,7 @@ class PredictApi:
         self.base, self.api_key, self.wallet = base.rstrip("/"), api_key, wallet
         self.jwt, self.jwt_exp, self.jwt_at = "", 0, 0.0
         self.auth_error = ""
+        self._auth_lock: tuple[Any, asyncio.Lock] | None = None  # (loop, lock): the sign-in runs once at a time (see auth_lock)
         self.gate = asyncio.Semaphore(self.PARALLEL)
         self.read_gate = asyncio.Semaphore(max(1, min(self.READ_PARALLEL, self.PARALLEL - 1)))  # the reads leave slots: an order or a cancel never queues behind them
         self.writes_inflight = 0  # orders and cancels on their way (call: priority): the shutdown drain waits for their answers
@@ -643,6 +658,8 @@ class PredictApi:
         # here too: nothing goes out into it — refused by the client (status 0, retry_after), so an order is deferred, not failed
         if (left := self.blocked_until - time.monotonic()) > 0:
             raise core.RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
+        if method == "POST" and path == "/orders" and (check := ORDER_SEND_CHECK.get()) is not None and (why := check()):
+            raise SendRefused(why)  # 1.150.0: judged again inside the slot (see ORDER_SEND_CHECK) — never sent
         try:
             return await core.predict_blocking(core._http_get, self.base + path, payload, timeout, self.headers())
         except core.RemoteError as error:
@@ -656,22 +673,52 @@ class PredictApi:
         """A request that needs the sign-in: signs in first when the token is missing or about to expire, once more
         after a 401."""
         await self.ensure_auth()
+        used = self.jwt  # the token this request goes out with (a renewal while it waits for its slot is fine: it then carries the newer one)
         try:
             return await self.call(method, path, payload, timeout, priority)
         except core.RemoteError as error:
             if http_status(error) != 401 or not self.wallet:
                 raise
-            self.jwt = ""
+            # 1.150.0 (audit LIVE-AUTH-SINGLEFLIGHT): only the token that was refused is dropped. Several requests in flight share
+            # one token: on its 401 each of them used to blank self.jwt — wiping the fresh token another one had just signed in for
+            # — and sign in again on its own (N × GET /auth/message + POST /auth on the key's shared rate limit, and, should a new
+            # sign-in revoke the older tokens, their retries refusing each other). Now the first clears it, the sign-in runs once
+            # under auth_lock, and the others retry with its token.
+            if self.jwt == used:
+                self.jwt = ""
             await self.ensure_auth()
             return await self.call(method, path, payload, timeout, priority)
 
+    def fresh(self) -> bool:
+        """A token that is there and not about to expire (five minutes' margin)."""
+        return bool(self.jwt) and (not self.jwt_exp or time.time() < self.jwt_exp - 300)
+
+    @property
+    def auth_lock(self) -> asyncio.Lock:
+        """The lock that makes the sign-in single-flight, one per event loop (a client reused across asyncio.run calls — the
+        tests — never meets a lock bound to a closed loop)."""
+        loop = asyncio.get_running_loop()
+        if self._auth_lock is None or self._auth_lock[0] is not loop:
+            self._auth_lock = (loop, asyncio.Lock())
+        return self._auth_lock[1]
+
     async def ensure_auth(self) -> None:
-        if self.jwt and (not self.jwt_exp or time.time() < self.jwt_exp - 300):
+        if self.fresh():
             return
-        await self.authenticate()
+        async with self.auth_lock:
+            if self.fresh():  # 1.150.0: signed in by the caller ahead in the queue — its token serves this one too
+                return
+            await self._sign_in()
 
     async def authenticate(self) -> str:
-        """The sign-in flow: a message to sign, its signature, a JWT. Raises (and records why) when it fails."""
+        """A sign-in now (the background renewal, /control): single-flight with ensure_auth's — it waits for one already
+        running, then signs in itself (the caller asked for a new token, not just a fresh one)."""
+        async with self.auth_lock:
+            return await self._sign_in()
+
+    async def _sign_in(self) -> str:
+        """The sign-in flow: a message to sign, its signature, a JWT. Raises (and records why) when it fails. Callers hold
+        auth_lock (ensure_auth, authenticate)."""
         if self.wallet is None:
             raise core.RemoteError("没有签名钱包，无法登录 Predict")
         try:
@@ -1149,7 +1196,11 @@ class LiveTrader:
 
     async def refresh_approvals(self) -> None:
         try:
-            keys = ["CTF_EXCHANGE", "NEG_RISK_CTF_EXCHANGE"]
+            # 1.150.0 (audit LIVE-YIELD-ALLOWANCE): the yield-bearing twins too. Orders on a yield-bearing market are signed
+            # for YIELD_BEARING_*_EXCHANGE (exchange_key), and live_room's gate only refuses a key it has read: with just the
+            # two standard keys an account lacking the yield-bearing allowance sent orders Predict / the chain then rejected,
+            # over and over, while the page said approvals were fine.
+            keys = [exchange_key(neg, yb) for yb in (False, True) for neg in (False, True)]
             found = await asyncio.gather(*(self.chain.allowance(k) for k in keys))
             self.approvals = {k: v >= 10 ** 20 for k, v in zip(keys, found)}  # ≥ 100 USDT of allowance counts as set
             self.approvals_at, self.approvals_mono, self.approvals_error = time.time(), time.monotonic(), ""
@@ -1169,6 +1220,14 @@ class LiveTrader:
     def usd(self) -> float | None:
         return from_wei(self.balance[0]) if self.balance else None
 
+    def approvals_ok(self) -> tuple[bool, bool]:
+        """(standard track, yield-bearing track) USDT allowances in place. 1.150.0: shown apart, so an account that never
+        trades yield-bearing markets is not painted red for them (live_room refuses those markets on its own), while a
+        missing yield-bearing allowance is no longer hidden behind a green ✓."""
+        a = self.approvals
+        return (bool(a.get("CTF_EXCHANGE")) and bool(a.get("NEG_RISK_CTF_EXCHANGE")),
+                bool(a.get("YIELD_BEARING_CTF_EXCHANGE")) and bool(a.get("YIELD_BEARING_NEG_RISK_CTF_EXCHANGE")))
+
     def summary_lines(self) -> list[str]:
         c = self.config
         lines = [f"钱包：{self.wallet.kind}｜下单账户 {short_addr(self.wallet.maker)}"
@@ -1185,9 +1244,12 @@ class LiveTrader:
         else:
             lines.append(f"余额：未读到（{self.balance_error or '尚未读取'}）")
         if self.approvals:
+            std_ok, yb_ok = self.approvals_ok()
             lines.append("授权：交易所 USDT 额度 " + ("✓" if self.approvals.get("CTF_EXCHANGE") else "✗")
                          + "｜多结果交易所 " + ("✓" if self.approvals.get("NEG_RISK_CTF_EXCHANGE") else "✗")
-                         + ("" if all(self.approvals.values()) else "（python main.py --approve，或在网站交易一次）"))
+                         + "｜收益型 " + ("✓" if yb_ok else "✗")
+                         + ("" if std_ok else "（python main.py --approve，或在网站交易一次）")
+                         + ("" if yb_ok or not std_ok else "（收益型市场不会真实下单，直到运行 python main.py --approve）"))
         else:
             lines.append(f"授权：未读到（{self.approvals_error or '尚未读取'}）")
         lines.append(f"风控：单笔 ≤${c.live_max_order_usd:g}｜持仓+挂单 ≤${c.live_max_open_usd:g}｜日亏损 ≤${c.live_max_daily_loss_usd:g}"
@@ -1218,10 +1280,13 @@ class LiveTrader:
         else:
             rows.append({"k": "余额", "v": f"未读到（{self.balance_error or '尚未读取'}）", "tone": "warn"})
         if self.approvals:
-            ok = all(self.approvals.values())
+            ok, yb_ok = self.approvals_ok()
             rows.append({"k": "授权", "v": "交易所 USDT 额度 " + ("✓" if self.approvals.get("CTF_EXCHANGE") else "✗")
                          + "，多结果交易所 " + ("✓" if self.approvals.get("NEG_RISK_CTF_EXCHANGE") else "✗")
-                         + ("" if ok else "（python main.py --approve，或在网站交易一次）"), "tone": "ok" if ok else "bad"})
+                         + "，收益型交易所 " + ("✓" if yb_ok else "✗")
+                         + ("" if ok else "（python main.py --approve，或在网站交易一次）")
+                         + ("" if yb_ok or not ok else "（收益型市场不会真实下单，直到运行 python main.py --approve）"),
+                         "tone": "bad" if not ok else "ok" if yb_ok else "warn"})
         else:
             rows.append({"k": "授权", "v": f"未读到（{self.approvals_error or '尚未读取'}）", "tone": "warn"})
         rows.append({"k": "风控", "v": f"单笔 ≤${c.live_max_order_usd:g}，持仓+挂单 ≤${c.live_max_open_usd:g}，日亏损 "
@@ -1316,6 +1381,8 @@ class LiveBot(core.Bot):
         self.live_noted: dict[str, float] = {}
         self.live_misses: dict[str, int] = {}
         self.live_seq = 0
+        self.live_note_buffer: dict[str, list[str]] = {}  # sub id -> unkeyed live notices waiting for that chat's one batch message (live_notify)
+        self.live_note_dropped: dict[str, int] = {}       # sub id -> notices dropped from a full buffer since its last batch
         self.live_last_sync = 0.0
         self.live_last_redeem = -1e9
         self.live_last_balance = -1e9
@@ -1494,7 +1561,7 @@ class LiveBot(core.Bot):
             return f"结果名称无法确认方向，不下真实单（{assumed}）"  # a guessed side is a paper matter, never a real order
         key = exchange_key(info.neg_risk, info.yield_bearing)
         if self.live.approvals and key in self.live.approvals and not self.live.approvals[key]:
-            return f"未授权{'多结果' if info.neg_risk else ''}交易所使用 USDT（python main.py --approve）"
+            return f"未授权{'收益型' if info.yield_bearing else ''}{'多结果' if info.neg_risk else ''}交易所使用 USDT（python main.py --approve）"
         return ""
 
     def sim_taker_limit(self, q: dict) -> float:
@@ -2095,16 +2162,47 @@ class LiveBot(core.Bot):
             # decisions, the sign-in, the signing and the save took before the request went out)
             st["sent_at"] = self.market.now_ms()
             sent = time.monotonic()
-            result = await self.live.api.create_order(body)
+
+            def still_sendable() -> str:
+                # 1.150.0 (audit LIVE-SEND-AFTER-PAUSE): run by PredictApi.send inside the request slot — the wait for it came after
+                # the check above, and a pause, the emergency stop, LIVE=off or a withdrawal set meanwhile let the order out
+                if trade.get("withdrawn") or st.get("state") != "placing":
+                    return "发出前已撤单"
+                return self.live_send_block(trade, self.sim_trades(), self.market.now_ms())
+
+            token = ORDER_SEND_CHECK.set(still_sendable)
+            try:
+                result = await self.live.api.create_order(body)
+            finally:
+                ORDER_SEND_CHECK.reset(token)
             took = time.monotonic() - sent
             st["answered_at"] = st["sent_at"] + int(took * 1000)
         except Exception as error:
             tid = st.get("rekeyed") or tid  # 1.138.0: withdrawn and moved (sim_rekey) while it waited: it lives there now — never saved back at the slot
             text = core.clean_error(error) or type(error).__name__
+            if isinstance(error, SendRefused):
+                # 1.150.0 (audit LIVE-SEND-AFTER-PAUSE): refused inside the request slot — nothing went out (it would otherwise read as
+                # "result unknown", status 0). Withdrawn meanwhile: finished unsent, nothing to cancel; else failed as the gate above fails it
+                for k in ("sent_at", "answered_at"):
+                    st.pop(k, None)
+                st["hash"] = ""
+                if trade.get("withdrawn") or st.get("state") == "cancelling":
+                    self.live_end_unsent(tid, trade, now_ms)
+                    return
+                st["state"] = "pending"
+                at_ms = self.market.now_ms()
+                own = text.startswith("决定已过时") or text == self.sim_quiet(trade.get("settle"), at_ms)
+                self.live_fail(tid, trade, f"未下单：{text}", now_ms, retry=0 if own else None)
+                self.sim_save([(st.get("rekeyed") or tid, trade)])
+                return
             definite = isinstance(error, OrderRejected) or 400 <= http_status(error) < 500
             # 1.122.0: an answer that the order already exists (a resend taken twice, a hash Predict holds) is Predict having it,
             # not a refusal: the record is "result unknown" and the sync adopts the order by its hash, nothing is freed
-            duplicate = any(w in text.lower() for w in ("already exist", "already placed", "duplicate", "exists"))
+            # 1.150.0: a bare 409 Conflict on an order POST is the same answer without the wording (Predict, or a gateway in front
+            # of it, holding that hash): failed and freed, a taker it took and filled at once was never looked at again (no order
+            # id) — real shares outside exposure, P&L and the loss stop. Kept "result unknown": the sync adopts it by its hash,
+            # or the positions evidence books it, or the grace period gives it up. Other 4xx answers stay definite refusals
+            duplicate = http_status(error) == 409 or any(w in text.lower() for w in ("already exist", "already placed", "duplicate", "exists"))
             limited = isinstance(error, core.RemoteError) and (http_status(error) == 429 or (error.retry_after and http_status(error) == 0))
             if limited and not trade.get("withdrawn") and st.get("state") != "cancelling":
                 # refused by the client itself (a cooldown that began between the check above and the request), or by Predict's rate
@@ -2499,15 +2597,17 @@ class LiveBot(core.Bot):
         return preopen is not None and getattr(preopen, "account_rows", None) is not None and bool(at) and 0 <= now_ms - at <= self.LIVE_SNAPSHOT_MAX_AGE_MS
 
     def live_known_markets(self) -> tuple[dict[str, str], dict[str, str]]:
-        """(market id -> name, outcome token -> name) of every market this bot trades or traded for real: the markets
-        priced for its orders, its records, the pre-open mode's windows."""
+        """(market id -> name, outcome token -> name) of every market this bot trades or traded for real: its records,
+        the pre-open mode's windows.
+
+        1.150.x: not the market-details cache (self.live.markets) any more: live_prefetch reads it for any card whose
+        suggestion is merely near the bar, and /live test for its test market, so a market the bot only priced counted as
+        its own for the rest of the run and the operator's manual order there was withdrawn by the orphan sweep, against
+        the documented promise that only the markets the bot 做过 are swept. Every real order has a record before it is
+        sent (the "pending" record carries market_id and want.token) and sim_prune keeps any record whose order may still
+        rest, so the records and the ledger still cover the lost-tracking case the sweep exists for."""
         ids: dict[str, str] = {}
         tokens: dict[str, str] = {}
-        for mid, info in getattr(self.live, "markets", {}).items():
-            ids[str(mid)] = str(mid)
-            for o in getattr(info, "outcomes", None) or []:
-                if o.get("token"):
-                    tokens[str(o["token"])] = str(mid)
         for t in self.sim_trades().values():
             st = t.get("live")
             if not isinstance(st, dict):
@@ -3228,6 +3328,33 @@ class LiveBot(core.Bot):
         bounds = [b for b in ((expires * 1000 if 0 < expires < FAR_FUTURE else 0), (end + 2 * 3600_000 if end else 0)) if b]
         return min(bounds) if bounds else 0
 
+    def live_unknown_suspects(self, trade: dict) -> list[dict]:
+        """The unrecorded open orders (live_unknown_open) that could be this unknown record's own order under a hash it
+        did not expect. 1.150.0: before, every one of them held the record's release — a manual order on a market this
+        bot never touched is never swept (live_orphan_sweep withdraws only on its markets), so it blocked every unknown
+        record until its expiry plus the margin (a daily maker: the close plus two hours), the 11-04 "blocked for a day"
+        case the 1.104.9 release was made for. The record's signed order names its market and outcome token, so an order
+        resting on another market and another token cannot be it. Kept as suspects: an order on the same market or the
+        same token, one that cannot be compared (its row, or the record, names neither the market nor the token on the
+        other's side: nothing says where it rests)."""
+        want = (trade.get("live") or {}).get("want") or {}
+        my_mid, my_token = str(want.get("market_id") or trade.get("market_id") or ""), str(want.get("token") or "")
+        if not my_mid and not my_token:
+            return list(self.live_unknown_open)
+
+        def could_be_this(u: dict) -> bool:
+            row = self.live_unrecorded_rows.get(u["id"]) or {}
+            market = row.get("market") if isinstance(row.get("market"), dict) else {}
+            order = row.get("order") if isinstance(row.get("order"), dict) else {}
+            mid = str(market.get("id") or row.get("marketId") or row.get("market_id") or "")
+            token = str(order.get("tokenId") or "")
+            same_market, same_token = (mid == my_mid if mid and my_mid else None), (token == my_token if token and my_token else None)
+            if same_market is None and same_token is None:
+                return True  # nothing to compare it by: it may be this one
+            return bool(same_market) or bool(same_token)
+
+        return [u for u in self.live_unknown_open if could_be_this(u)]
+
     async def live_recheck(self, tid: str, trade: dict, by_id: dict, by_hash: dict, mk: Any, now_ms: int) -> None:
         """An unknown record, every step: found on the list or by its hash, it is tracked again (or finished on a final
         word). Missing from LIVE_UNKNOWN_LOOKS complete open lists, unknown to the hash read and unknown for
@@ -3244,7 +3371,14 @@ class LiveBot(core.Bot):
                 row = await self.live.api.order(str(st.get("order_id") or ""), str(st.get("hash") or ""))
             except Exception as error:
                 st["last_error"] = core.clean_error(error) or type(error).__name__
-                return
+                # 1.15x.x (LIVE-RECHECK-ERROR): a hash read that keeps failing (success=false, a 4xx other than 404, a 5xx)
+                # must not hold the record past its signed expiry — it used to return here forever, so an order nothing can
+                # fill kept its reservation and its slot until /live release. Once the expiry plus the margin has passed the
+                # expiry backstop below decides, by the account's positions (still holding when they cannot be read, booking
+                # a surplus as filled). Before that an error is no evidence either way: wait, nothing is released on it.
+                deadline = self.live_order_deadline(trade)
+                if not deadline or now_ms < deadline + self.LIVE_UNKNOWN_MARGIN_MS:
+                    return
         if row is not None:
             st["order_id"] = str(row.get("id") or st.get("order_id") or "")
             st["events"].append({"at": now_ms, "what": f"找回了订单 #{st['order_id']}（{str(row.get('status') or '?')}）"})
@@ -3263,11 +3397,12 @@ class LiveBot(core.Bot):
         settled = (not expired and int(st.get("unknown_misses") or 0) >= self.LIVE_UNKNOWN_LOOKS and unknown_ms >= self.LIVE_UNKNOWN_SETTLE_MS)
         if not expired and not settled:
             return
-        if not expired and self.live_unknown_open:
+        suspects = self.live_unknown_suspects(trade)
+        if not expired and suspects:
             # an order on the account this bot has no record of may be this very one under a hash it did not expect: an
             # operator looks first (/live release, or /live cancel account), nothing is released on top of it
-            st["last_error"] = (f"连续 {st['unknown_misses']} 次完整列表没有它，但账户上还有 {len(self.live_unknown_open)} 张本机器人没有记录的挂单"
-                                f"（#{'、#'.join(u['id'] for u in self.live_unknown_open[:3])}）：可能就是这张，先核对；核对后 /live release 或 /live cancel account")
+            st["last_error"] = (f"连续 {st['unknown_misses']} 次完整列表没有它，但账户上还有 {len(suspects)} 张本机器人没有记录的挂单"
+                                f"（#{'、#'.join(u['id'] for u in suspects[:3])}）：可能就是这张，先核对；核对后 /live release 或 /live cancel account")
             return
         if not expired and now_ms - int(st.get("unexplained_at") or 0) < self.LIVE_UNEXPLAINED_EVERY_MS:
             return  # the positions are read for it once a minute at most
@@ -3743,9 +3878,19 @@ class LiveBot(core.Bot):
         return "\n".join(lines)
 
     # --- telling the administrator ------------------------------------------------------------------------------------------
+    LIVE_NOTE_BUFFER = 50   # unkeyed notices held per chat for its next batch message; beyond it the oldest are dropped (and counted)
+
     def live_notify(self, text: str, key: str = "") -> None:
         """A line to every active subscription (the administrator's chats); a keyed notice repeats at most every
-        LIVE_NOTE_SECONDS."""
+        LIVE_NOTE_SECONDS.
+
+        1.150.0 (audit LIVE-NOTIFY-PRIORITY): the unkeyed notices (📤 each placement, ✅ each fill, 💵, ℹ️ …) are coalesced
+        per chat: each one joins that chat's buffer, and one batch delivery per chat sends everything buffered as ONE message, then whatever
+        arrived while that message waited in Telegram's per-chat queue (about one message per 1.1 s), until the buffer
+        is empty. They used to be one message each: a maker re-quoting every few seconds over a few slots, plus fills,
+        outran that rate, the queue grew without bound, and a keyed critical alert (🛑 kill switch, ❓ unknown order,
+        ⚠️ …) waited behind every notice already queued — minutes late. Now a critical alert waits behind at most one
+        live batch message. Keyed notices keep their own delivery each, as before."""
         if not self.config.live_notify or self.telegram is None:
             return
         if key:
@@ -3755,11 +3900,33 @@ class LiveBot(core.Bot):
         for sub_id, sub in self.subscriptions().items():
             if not sub.get("active"):
                 continue
+            if not key:
+                buffer = self.live_note_buffer.setdefault(sub_id, [])
+                buffer.append(text)
+                if len(buffer) > self.LIVE_NOTE_BUFFER:
+                    over = len(buffer) - self.LIVE_NOTE_BUFFER
+                    del buffer[:over]
+                    self.live_note_dropped[sub_id] = self.live_note_dropped.get(sub_id, 0) + over
+                # one batch per chat at a time: while it is in flight this does nothing, and the batch takes this line too
+                async def batch(sub_id: str = sub_id, sub: dict = sub) -> None:
+                    await self.live_note_batch(sub_id, sub)
+                self.deliver(f"live:batch:{sub_id}", batch)
+                continue
             self.live_seq += 1
 
             async def send(sub: dict = sub, text: str = text) -> None:
                 await self.tell(sub["chat"], sub["thread"], text)
             self.deliver(f"live:{self.live_seq}:{sub_id}", send)
+
+    async def live_note_batch(self, sub_id: str, sub: dict) -> None:
+        """live_notify's batch delivery for one chat: send the buffered notices as one message, and again for those
+        that arrived while it waited in the send queue, until none are left (no await between the last check and the
+        end, so a notice is never left behind in the buffer without a batch on its way)."""
+        while lines := self.live_note_buffer.pop(sub_id, []):
+            dropped = self.live_note_dropped.pop(sub_id, 0)
+            if dropped:
+                lines = [f"（另有 {dropped} 条较早的真实交易通知未单独发送）", *lines]
+            await self.tell(sub["chat"], sub["thread"], "\n\n".join(lines))
 
     # --- commands and texts -------------------------------------------------------------------------------------------------
     async def cmd_live(self, req: core.Request) -> Any:
@@ -3925,7 +4092,10 @@ class LiveBot(core.Bot):
         positions, at = self.live_positions
         return {"ready": self.live.ready, "ready_error": self.live.not_ready_why, "mode": c.live_mode, "paused": self.live_paused(), "killed": self.live_killed(),
                 "lines": self.live.summary_lines(), "info": self.live.summary_info(), "account": short_addr(self.live.wallet.maker),
-                "exposure": self.live_exposure(trades), "daily_pnl": self.live_daily_pnl(trades, now_ms),
+                "exposure": self.live_exposure(trades), "daily_pnl": (own_pnl := self.live_daily_pnl(trades, now_ms)),
+                # the stop (live_check_kill / live_send_block) compares the model trader's day PLUS the pre-open mode's against
+                # LIVE_MAX_DAILY_LOSS_USD (1.125.0): the page shows that same sum (day_pnl), daily_pnl stays the model trader's own
+                "preopen_pnl": (pre_pnl := self.preopen_pnl()), "day_pnl": own_pnl + pre_pnl,
                 "caps": {"order": c.live_max_order_usd, "open": c.live_max_open_usd, "daily_loss": c.live_max_daily_loss_usd},
                 "resting": sum(t["status"] == "resting" for _, t in live),
                 "unconfirmed": sum(t["live"].get("state") in {"pending", "placing", "cancelling", "unknown"} for _, t in live),
@@ -4048,12 +4218,23 @@ class LiveBot(core.Bot):
         elif action == "release":
             text = await self.live_action("release", [str(data.get("id") or "")], now_ms)
         elif action == "stop":  # the emergency stop: no new orders, every resting order of the strategy asked to be withdrawn
-            first = await self.live_action("pause", ["紧急停止"], now_ms)
+            # Audit LIVE-STOP-OK: the stop's verdict is its cancels', not the pause's. The pause reply used to be the
+            # head of the message, and the generic check below only reads the head ("⏸ …", never a failure), so a stop whose
+            # cancels all failed (❌ HTTP 500, unsent requests, pre-open orders left behind) still came back ok=True and the page
+            # showed a green toast — during an emergency, the one moment it matters. The pause is still recorded the same way;
+            # its text ("已有挂单保留", which the stop contradicts) is replaced by the stop's own head line.
+            await self.live_action("pause", ["紧急停止"], now_ms)
+            first = "⛔ 紧急停止：已暂停开新仓，正在撤掉本策略的全部挂单（以 Predict 的确认为准）。/live resume 恢复。"
             second = await self.live_cancel_command(["all"], now_ms)
+            line = ""
             if getattr(self, "preopen", None) is not None:
                 line = await self.preopen.withdraw_all("紧急停止")
                 second += (f"\n{line}" if line else "") + "\n" + self.preopen.status()
             text = f"{first}\n{second}"
+            # "⏳" (sent, awaiting Predict's confirmation) and "没有真实挂单可撤。" are not failures; "❌"/"未就绪" and pre-open
+            # orders the stop could not withdraw ("没撤成") are
+            stop_failed = second.startswith(("❌", "未就绪")) or "没撤成" in line
+            return {"ok": not stop_failed, "message": text}
         elif action in {"resume", "redeem", "check", "orders", "positions"}:
             text = await self.live_action(action, [], now_ms)
         else:
@@ -4296,8 +4477,13 @@ class LiveBot(core.Bot):
         since = int(today.timestamp() * 1000)
         placed_today = sum(int(t["opened"]) >= since for t in live)
         failed_today = sum(int(t["opened"]) >= since and (t["live"].get("final") == "failed") for t in live)
-        lines.append(f"持仓+挂单 ${exposure:,.2f} / ${self.config.live_max_open_usd:g}｜今日已结算盈亏 {money(self.live_daily_pnl(trades, now_ms))}"
-                     f"（上限 −${self.config.live_max_daily_loss_usd:g}）｜挂单中 {resting}｜今日下单 {placed_today}｜失败 {failed_today}")
+        # the stop (live_check_kill / live_send_block) compares the model trader's day plus the pre-open mode's against
+        # LIVE_MAX_DAILY_LOSS_USD (1.125.0), so the line shows the same number (and the split when the pre-open part is non-zero):
+        # showing only the model trader's part read e.g. −$15 of a −$50 cap while the stop had tripped at a combined −$55
+        own, pre = self.live_daily_pnl(trades, now_ms), self.preopen_pnl()
+        lines.append(f"持仓+挂单 ${exposure:,.2f} / ${self.config.live_max_open_usd:g}｜今日已结算盈亏 {money(own + pre)}"
+                     + (f"（原策略 {money(own)} + 预挂 {money(pre)}）" if pre else "")
+                     + f"（上限 −${self.config.live_max_daily_loss_usd:g}）｜挂单中 {resting}｜今日下单 {placed_today}｜失败 {failed_today}")
         lines.append(self.live_redeem_status_line())
         stats = core.sim_stats(live)
         if stats["settled"]:
@@ -4317,7 +4503,9 @@ class LiveBot(core.Bot):
             lines.append("\n最近挂单测试：" + str(last).split("\n")[0].removeprefix("🧪 挂单测试 ") + "…（/live test 重跑）")
         lines.append("\n/live mode off|pause|on｜pause｜resume｜cancel all｜redeem｜redeem check｜check｜orders｜positions｜test [市场] [份数] [价格¢]")
         if getattr(self, "preopen", None) is not None:
-            lines.append("\n" + core.html.escape(self.preopen.status()) + "\n/preopen 查看预挂；紧急停止会撤销本模式订单")
+            # no html.escape here: the /live reply is sent with Bot.tell's to_html, which escapes the whole text once; escaping the
+            # status too showed "&amp;lt;" etc. for any &, < or > in it (e.g. a remote error in "最近问题：")
+            lines.append("\n" + self.preopen.status() + "\n/preopen 查看预挂；紧急停止会撤销本模式订单")
         return "\n".join(lines)
 
     def sim_text(self) -> str:
@@ -4596,17 +4784,20 @@ async def live_check(config: core.Config) -> int:
                 ok = False
                 print(f"FAIL {name}: {core.clean_error(error) or type(error).__name__}")
     try:
-        for label, done in await trader.chain.check_approvals(False):
-            print(f"{'OK' if done else 'MISSING'} 授权 {label}")
+        for yb in (False, True):  # 1.150.0: both tracks; yield-bearing markets settle on their own exchanges
+            for label, done in await trader.chain.check_approvals(yb):
+                print(f"{'OK' if done else 'MISSING'} 授权 {label}")
     except Exception as error:
         ok = False
         print(f"FAIL 授权读取: {core.clean_error(error) or type(error).__name__}")
     return 0 if ok else 1
 
 
-async def live_approve(config: core.Config, yield_bearing: bool = False) -> int:
+async def live_approve(config: core.Config, yield_bearing: bool | None = None) -> int:
     """Send the approvals the exchange needs (USDT allowance, outcome-token operator), one transaction each, from the
-    signing wallet (gas in BNB). Idempotent: what is in place is skipped."""
+    signing wallet (gas in BNB). Idempotent: what is in place is skipped. 1.150.0: both tracks by default (None) — the
+    standard and the yield-bearing exchanges — since the bot trades yield-bearing markets too and `--approve` had no
+    way to set those; True / False still does just one track."""
     trader = LiveTrader(config)
     print(f"下单账户 {trader.wallet.maker}（{trader.wallet.kind}）；gas 由 {trader.wallet.signer} 支付；{CHAIN_NAMES.get(config.live_chain)}")
     try:
@@ -4618,7 +4809,9 @@ async def live_approve(config: core.Config, yield_bearing: bool = False) -> int:
     except Exception as error:
         print(f"FAIL 读取 BNB 余额: {core.clean_error(error) or type(error).__name__}")
         return 1
-    results = await trader.chain.set_approvals(yield_bearing, log=print)
+    results = []
+    for yb in ((False, True) if yield_bearing is None else (yield_bearing,)):
+        results += await trader.chain.set_approvals(yb, log=print)
     for label, outcome in results:
         print(f"{label}：{outcome}")
     return 0 if all(not outcome.startswith("失败") for _, outcome in results) else 1

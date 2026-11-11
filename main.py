@@ -5048,10 +5048,15 @@ PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
 PREDICT_PARALLEL = 16           # Predict requests in flight at once, on Predict's own thread pool (predict_blocking): the
                                 # hot round (a dozen markets, each answer about a second) goes out in one batch
-PREDICT_POOL_WORKERS = 32       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
-                                # (1.138.0: 20 was the feed's 16 and the trader's 4; the pre-open mode's two clients add 8 — an order
-                                # or a cancel queued behind their reads)
-                                # feeds' pool, where a 502-ing scraper held threads for the 12-second timeout (a round took 60 s)
+PREDICT_POOL_WORKERS = 40       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
+                                # feeds' pool, where a 502-ing scraper held threads for the 12-second timeout (a round took 60 s).
+                                # It must hold every request the asyncio gates above it can let through at once, or an order or a
+                                # cancel that got its client's priority slot still waits in this pool's FIFO queue behind reads
+                                # holding every thread for up to their 8/12-second timeouts (1.138.0: 20 was the feed's 16 and the
+                                # trader's 4; the pre-open mode's two clients add 8 = 28). 1.150.0 (audit LIVE-POOL-THREADS): at least
+                                # PREDICT_PARALLEL (16) + live.PredictApi.PARALLEL (5, since 1.138.2) x 4 clients (the bot's own, and
+                                # the pre-open mode's api / cancel_api / bulk_api since 1.141.1) = 36, plus headroom — 32 left 4 short.
+                                # KEEPALIVE_PER_HOST is no cap here: it only bounds the idle connections kept.
 PREDICT_LADDER_PARALLEL = 8     # of those, at most this many may be ladder levels at once: a hot ladder's levels never
                                 # queue the daily cards' books behind them
 _PREDICT_POOL: ThreadPoolExecutor | None = None
@@ -14278,7 +14283,9 @@ function renderLive(L,liveOn){const box=$("livelines");box.replaceChildren();
   (L.info||[]).forEach(r=>box.append(...kvRow(r.k,r.v,r.tone)));
   box.append(...kvRow("策略",data.scope.join("；"),""));
   box.append(...kvRow("占用","持仓+挂单 $"+L.exposure.toFixed(2)+"，上限 $"+L.caps.open,L.exposure>=L.caps.open*0.9?"warn":""));
-  box.append(...kvRow("今日","已结算盈亏 "+money(L.daily_pnl)+(L.caps.daily_loss?"，亏损上限 $"+L.caps.daily_loss:"，亏损不设上限"),L.daily_pnl<0?"bad":""));
+  // the day's stop counts the pre-open mode's P&L with the model trader's (1.125.0): show that sum, and the split when non-zero
+  const dayPnl=L.day_pnl??L.daily_pnl;
+  box.append(...kvRow("今日","已结算盈亏 "+money(dayPnl)+(L.preopen_pnl?"（原策略 "+money(L.daily_pnl)+" + 预挂 "+money(L.preopen_pnl)+"）":"")+(L.caps.daily_loss?"，亏损上限 $"+L.caps.daily_loss:"，亏损不设上限"),dayPnl<0?"bad":""));
   box.append(...kvRow("订单","挂单中 "+L.resting+"，未确认 "+L.unconfirmed+"，今日下单 "+L.placed_today+"，失败 "+L.failed_today,L.unconfirmed?"warn":""));
   if(L.synced_at)box.append(...kvRow("订单同步",L.synced_at,""));
   if(L.unknown_open&&L.unknown_open.length)box.append(...kvRow("注意","账户上有 "+L.unknown_open.length+" 张本机器人没有记录的挂单（#"+L.unknown_open.map(u=>u.id).join("、#")+"）：不计入这里的额度；“撤掉账户全部挂单”可一起撤","warn"))}
@@ -14294,7 +14301,7 @@ function renderBar(){const L=data.live,b=$("bar");b.replaceChildren();const live
   const mode=L?(L.mode==="off"?"LIVE=off 只记账":L.mode==="pause"?"LIVE=pause 不开仓":L.paused?"已暂停":L.killed?"今日停开新仓":L.ready?(L.gate?"LIVE=on 新单受限":"LIVE=on 运行中"):"LIVE=on 未就绪"):"纸面模拟";
   b.append(el("span","state "+(L?(L.mode==="off"?"":L.mode==="pause"||L.paused||L.killed||(L.ready&&L.gate)?"warn":L.ready?"on":"off"):""),mode));
   b.append(chip("持仓",data.sim.open),chip("挂单中",data.sim.resting),chip("已结算",data.sim.settled+" 笔 "+money(data.sim.pnl)));
-  if(liveOn)b.append(chip("持仓+挂单","$"+L.exposure.toFixed(2)+" / $"+L.caps.open),chip("今日",money(L.daily_pnl)),chip("未确认",L.unconfirmed),chip("对账",L.sync_age_s!=null?L.sync_age_s+" 秒前":"—"));
+  if(liveOn)b.append(chip("持仓+挂单","$"+L.exposure.toFixed(2)+" / $"+L.caps.open),chip("今日",money(L.day_pnl??L.daily_pnl)),chip("未确认",L.unconfirmed),chip("对账",L.sync_age_s!=null?L.sync_age_s+" 秒前":"—"));
   b.append(chip("刷新于",new Date().toTimeString().slice(0,8)))}
 // the quick switches: the few settings that are turned on and off most, one tap each, their value from the cards below
 const QUICK_DEFAULT={SIM_TAKER_AFTER_HOURS_CENTS:"15",SIM_MAKER_AFTER_HOURS_CENTS:"10",SIM_MAKER_DEEP_CENTS:"25",SIM_QUIET_MINUTES:"15"};
@@ -19408,7 +19415,17 @@ class Bot:
         the attempt stays in the journal. A record already numbered keeps its key."""
         if "#" in tid.rsplit("|", 1)[-1]:
             return tid
-        numbers = [int(k.rpartition("#")[2]) for k in self.sim_trades() if k.startswith(tid + "#") and k.rpartition("#")[2].isdigit()]
+        current = self.sim_trades()
+        # 1.150.x: already moved. sim_decide takes its copy of the records and then yields once; a placement task resuming in
+        # that slice can fail or end the record (live_fail / live_end_unsent -> slot#1), and the step, still seeing it under the
+        # slot in its stale copy, asked to move it again: the same attempt was stored a second time at slot#2. The record's
+        # own marker alone is not proof (a record cloned back to the slot keeps its old "rekeyed"), nor is the cache's identity
+        # (a rebuild holds new objects): moved only when the marker names a tid#n that exists AND the slot no longer does.
+        live = trade.get("live")
+        moved = live.get("rekeyed") if isinstance(live, dict) else None
+        if isinstance(moved, str) and moved.startswith(tid + "#") and tid not in current and moved in current:
+            return moved
+        numbers = [int(k.rpartition("#")[2]) for k in current if k.startswith(tid + "#") and k.rpartition("#")[2].isdigit()]
         new_tid = f"{tid}#{max(numbers, default=0) + 1}"  # past the highest ever used: a number sim_prune removed is never reused
         if isinstance(trade.get("live"), dict):
             trade["live"]["rekeyed"] = new_tid
