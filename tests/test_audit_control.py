@@ -456,4 +456,149 @@ async def ctrl_prune_notice():
 
 
 asyncio.run(ctrl_prune_notice())
+
+
+async def ctrl_datajson_leak():
+    """CTRL-DATAJSON-LEAK: data.json, which the page link alone opens, carried the trader's own lines on every card — 挂单
+    (挂涨 挂单中 5.0¢, 等待发送 before the order is even sent), 距吃单 (each side's filled shares, 这一边持仓 300 份, an order in
+    flight with its Predict id) and the paper-trading card's nearest markets — while why.json (the same facts at length), the
+    journal and control.json asked for the control key. With a real account behind the trader (a real-trading key, or real
+    orders in the records) they are left out now: a card keeps a 距吃单 stub (no line is drawn; its 为什么挂 / 不挂单 row stays
+    and asks for the key) and nothing in the file follows the account's orders or positions. A paper bot's page keeps them."""
+    import datetime as dt
+    D = m.D
+    BJ = lambda h, mi=0: int(dt.datetime(2026, 10, 5, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+    now, slug, key = BJ(10), "sk-hynix-inc-up-or-down-on-october-5-2026", "control-key-123456"
+    settle = {"key": "SKHYNIXUSDT", "target": "2026-10-05", "line": 1398000.0, "close_ms": BJ(16, 10)}
+    stub = {"state": "off", "text": "", "private": True}
+    driver = m.market_driver("close", "SKHYNIXUSDT", settle, "SK 海力士")
+    taker = lambda side, real, **fields: (f"{slug}|{side}|吃", {
+        "v": 2, "market": slug, "slug": slug, "market_id": "201", "item": "SK 海力士", "kind": "close", "key": "SKHYNIXUSDT", "side": side,
+        "label": "吃涨" if side == "up" else "吃跌", "maker": False, "fills": [], "revisions": [], "settle": settle, "driver": driver[0],
+        "driver_name": driver[1], "opened": now - 3_600_000, **fields, **({"live": real} if real else {})})
+    flying = lambda: taker("up", {"state": "open", "order_id": "LIVEORDER4", "hash": "0xdef"},  # a real taker order on Predict, nothing filled yet
+                           status="resting", shares=0.0, order=50.0, price=0.07, edge=0.1, fair=0.177)
+
+    def build(live_key=False, orders="", control_key=True):
+        env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_WAYS": "both",
+               "SIM_MARKETS": "all", "SIM_MAKER_POINTS": "off", "SIM_MAKER_FLOOR_SHARES": "0", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0",
+               "SIM_TAKER_MAX_SHARES": "300",
+               **({"WEB_CONTROL_KEY": key} if control_key else {}), **({"PREDICT_PRIVATE_KEY": "0x" + "a" * 64} if live_key else {})}
+        bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(now), None)
+        book = m.PredictBook("SKHYNIXUSDT", slug, "201", "t", tuple((D(p), D(q)) for p, q in (("0.10", "212"), ("0.05", "312.1"), ("0.01", "1000"))),
+                             tuple((D(p), D(q)) for p, q in (("0.35", "127.1"), ("0.43", "175"))), now, None)
+        card = m.SimMarket(slug, "SK 海力士", "close", "SKHYNIXUSDT", 0.177, book, 0.04, "", ("涨", "跌"), settle, {}, in_session=True)
+        bot.sim_markets = lambda now_ms, only=None: [card]
+        pk = bot.predict_key("SK 海力士｜SKHYNIXUSDT")
+        bot.predict.slugs[pk], bot.predict.books[pk] = slug, book  # the page's SK 海力士 card shows this market's book (id 201)
+        if orders:
+            real, changed = orders == "real", []
+            bot.sim_quote(card, m.TradeMap({}), now, changed)  # the trader rests 挂跌 65¢ and 挂涨 5¢, 100 shares each ...
+            assert sorted(tid.rpartition("|")[0].rpartition("|")[2] for tid, _ in changed) == ["down", "up"], changed
+            for n, (_, t) in enumerate(sorted(changed, key=lambda kv: kv[0])):  # ... as real orders: 跌 on Predict's book, 涨 decided and not sent yet
+                if real:
+                    t["live"] = {"state": ("open", "pending")[n], "order_id": f"LIVEORDER{n + 1}", "hash": "0xabc"}
+            held = taker("down", real and {"state": "done", "order_id": "LIVEORDER3", "final": "filled"},  # ... and holds 300 跌 shares a taker
+                         status="filled", shares=300.0, order=300.0, price=0.62, edge=0.12, fair=0.82)  # bought: the per-side total, reached
+            bot.sim_save([*changed, held])
+        return bot
+
+    async def fetch(bot, name="data.json", extra=""):
+        web = m.WebServer(bot, 0, TOKEN); web.CACHE_SECONDS = {}; port = await web.start()
+        try:
+            st, body = await request(port, f"GET /p/{TOKEN}/{name} HTTP/1.1\r\nHost: x\r\n{extra}\r\n".encode())
+        finally:
+            await web.stop()
+        return st, body.decode()
+
+    card_of = lambda data: next(i for i in data["items"] if i.get("symbol") == "SKHYNIXUSDT")["predict"]
+    sim_of = lambda data: next(i for i in data["items"] if i.get("kind") == "sim")
+    cards = lambda data: [{k: v for k, v in i.items() if k != "sim"} for i in data["items"]]  # every card, less the paper-trading card's totals
+    told = lambda text: [w for w in ("挂单中", "等待发送", "真实订单", "吃单等待成交", "持仓", "已吃", "LIVEORDER", "300 份") if w in text]
+
+    # real trading set up (the key configured, real orders in the records) and WEB_CONTROL_KEY set
+    live = build(live_key=True, orders="real")
+    full = card_of(live.odds_payload())  # the lines are still built (the keyed row, /sim): this block is what data.json carried
+    assert full["maker"] == {"text": "挂涨 等待发送 5.0¢；挂跌 挂单中 65.0¢", "state": "resting"}, full["maker"]
+    assert [(s["label"], s["taken"], s["block"]) for s in full["taker"]["sides"]] == [("吃涨", 0, ""), ("吃跌", 300, "这一边持仓 300 份，达到上限 300 份")], full["taker"]
+    st, text = await fetch(live)
+    data = json.loads(text)
+    p, sim = card_of(data), sim_of(data)
+    assert st == 200 and "maker" not in p and p["taker"] == stub, (st, p.get("maker"), p.get("taker"))
+    assert p == {**{k: v for k, v in full.items() if k not in ("maker", "taker")}, "taker": stub} and p["market_id"] == "201" and p["bids"] and p["asks"]  # the book is all there
+    assert sim["near"] == [] and sim["sim"]["private"] is True and sim["sim"]["rows"] == [] and sim["sim"]["total"]["trades"] == 3, sim  # the totals stay, as documented
+    assert not told(text), told(text)
+    # ... then a real taker order in flight: its Predict id and progress were in the line and its hover text
+    live.sim_save([flying()])
+    assert "真实订单 #LIVEORDER4 已成交 0/50 份" in card_of(live.odds_payload())["taker"]["text"]
+    st, text2 = await fetch(live)
+    assert st == 200 and card_of(json.loads(text2)) == p and sim_of(json.loads(text2))["near"] == [] and not told(text2), told(text2)
+    # nothing in the file follows the account's orders: the same bot with an empty record serves the very same cards
+    st, clean = await fetch(build(live_key=True))
+    assert st == 200 and cards(json.loads(clean)) == cards(data) == cards(json.loads(text2))
+    # the owner's way to the same facts is as before: why.json, with the key
+    st, body = await fetch(live, "why.json")
+    assert st == 403 and json.loads(body)["locked"], body[:200]
+    st, body = await fetch(live, "why.json", f"X-Control-Key: {key}\r\n")
+    why = json.loads(body)["markets"]["201"]
+    assert st == 200 and why["maker"]["text"] == full["maker"]["text"] and "持仓 300 份" in why["maker"]["sides"][1]["text"], why["maker"]
+    assert "真实订单 #LIVEORDER4 已成交 0/50 份" in why["taker"]["text"] and "这一边持仓 300 份" in why["taker"]["text"], why["taker"]
+    # without WEB_CONTROL_KEY the account is as private (CTRL-NO-CONTROL-KEY): the same file
+    st, text = await fetch(build(live_key=True, orders="real", control_key=False))
+    assert st == 200 and card_of(json.loads(text)) == p and not told(text), told(text)
+
+    # a paper bot (no key, no real order in the records): its page keeps the trader's lines
+    paper = build(orders="paper")
+    st, text = await fetch(paper)
+    data = json.loads(text)
+    p2, sim2 = card_of(data), sim_of(data)
+    assert st == 200 and p2["maker"] == {"text": "挂涨 挂单中 5.0¢；挂跌 挂单中 65.0¢", "state": "resting"}, p2.get("maker")
+    assert p2["taker"]["state"] == "near" and p2["taker"]["sides"][1]["taken"] == 300 and "这一边持仓 300 份" in p2["taker"]["detail"], p2["taker"]
+    assert sim2["near"] and sim2["near"][0]["text"] == p2["taker"]["text"] and sim2["sim"]["private"] is False and len(sim2["sim"]["rows"]) == 3, sim2
+    # ... until its records hold a real order (a database kept after the key was removed). The cache is on here, as in
+    # production (a body a second): the copy built a moment before the order is never served after it
+    web = m.WebServer(paper, 0, TOKEN); port = await web.start()
+    try:
+        st, body = await get(port, "data.json")
+        assert st == 200 and "挂单中" in card_of(json.loads(body))["maker"]["text"] and not web.account_private()
+        paper.sim_save([flying()])
+        assert web.account_private()
+        st, body = await get(port, "data.json")
+        assert st == 200 and card_of(json.loads(body)) == p and sim_of(json.loads(body))["near"] == [] and not told(body.decode()), told(body.decode())
+    finally:
+        await web.stop()
+
+    # page_payload itself: the price / market-cap ladders' levels as the cards, the payload given left as it is
+    payload = {"items": [{"predict": {"edges": [1], "fair": 0.7, "maker": {"text": "挂涨 挂单中 5.0¢", "state": "resting"}, "taker": {"state": "ready", "sides": [{"taken": 9}]}},
+                          "ladder": {"rows": [{"edges": [1], "fair": 0.5, "market_id": "7", "maker": {"text": "挂Yes 等待发送 3.0¢"}, "taker": {"state": "near", "gap": 0.02}},
+                                              {"fair": 0.4}, "odd"]}},
+                         {"kind": "sim", "sim": {"private": True}, "near": [{"text": "可吃单：吃涨 封顶 59.0¢，可买 128 份（已吃 172 份，上限 300）"}]}, {"missing": "x"}]}
+    before = json.dumps(payload, ensure_ascii=False)
+    private = m.page_payload(payload, True)
+    assert private["items"][0]["predict"] == {"fair": 0.7, "taker": stub}, private["items"][0]
+    assert private["items"][0]["ladder"]["rows"] == [{"fair": 0.5, "market_id": "7", "taker": stub}, {"fair": 0.4}, "odd"]  # no stub on a level the trader does not price
+    assert private["items"][1:] == [{"kind": "sim", "sim": {"private": True}, "near": []}, {"missing": "x"}] and json.dumps(payload, ensure_ascii=False) == before
+    public = m.page_payload(payload)  # a paper bot's: only the edge chips go, as before
+    assert public["items"][0]["predict"] == {k: v for k, v in payload["items"][0]["predict"].items() if k != "edges"}
+    assert public["items"][0]["ladder"]["rows"][0]["taker"] == {"state": "near", "gap": 0.02} and public["items"][1] == payload["items"][1]
+
+    # the page's side of the stub: neither line is drawn for it, the 为什么挂 / 不挂单 row (keyed) stays; a paper bot's blocks draw both
+    src = m.WEB_PAGE
+    assert 'if(!t||t.state==="off")return null' in src and "if(!p||!p.market_id||!p.taker)return null" in src and "if(it.near&&it.near.length)" in src
+    import shutil, subprocess
+    node = shutil.which("node")
+    if node:
+        lines = src[src.index("function makerLine("):src.index("// 为什么挂 / 不挂单:")]
+        row = src[src.index("function whyRow("):src.index("function whyBody(")]
+        js = ("const $=(tag,cls,text)=>({tag,cls,text,kids:[],append(...a){this.kids.push(...a)},addEventListener(){},setAttribute(){}}),"
+              "cent=v=>(v*100).toFixed(1)+'¢',open=new Set();let whyData=null,whyErr='',whyBusy=false,last=null;"
+              "function loadWhy(){}function render(){}function whyBody(){return $('div')}\n" + lines + "\n" + row + "\n"
+              "const stub=" + json.dumps(stub) + ",made=whyRow({market_id:'201',taker:stub});"
+              "console.log(JSON.stringify([takerLine(stub),makerLine(undefined),made&&made.kids[0].text,whyRow({market_id:'201'}),"
+              "!!takerLine({state:'near',text:'距吃单 3.0¢：吃涨 卖1 62.0¢，封顶 59.0¢',gap:0.03}),!!makerLine({text:'挂涨 挂单中 5.0¢',state:'resting'})]))")
+        out = subprocess.run([node, "-e", js], capture_output=True, text=True, encoding="utf-8", check=True).stdout.strip()
+        assert json.loads(out) == [None, None, "▸ 为什么挂 / 不挂单", None, True, True], out
+
+
+asyncio.run(ctrl_datajson_leak())
 print("AUDIT_CONTROL_OK")

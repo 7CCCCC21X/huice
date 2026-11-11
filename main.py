@@ -12841,7 +12841,7 @@ async function loadWhy(force){
   if(again)return loadWhy(true);
   if(last)render(last)}
 function whyRow(p){
-  if(!p||!p.market_id||!p.taker)return null;  // the books the trader prices: they carry its distance to a taker buy
+  if(!p||!p.market_id||!p.taker)return null;  // the books the trader prices: they carry its distance to a taker buy (with real trading set up only a stub of it, state off: the lines themselves are an account's orders and come with the key, in this row)
   const id="why#"+p.market_id,on=open.has(id),d=$("div","why"),h=$("button","whyh",(on?"▾ ":"▸ ")+"为什么挂 / 不挂单");
   h.type="button";h.setAttribute("aria-expanded",on?"true":"false");h.title="机器人在这个盘口现在挂什么、吃什么，两边各自为什么挂或不挂";
   h.addEventListener("click",e=>{e.stopPropagation();if(open.has(id))open.delete(id);else{open.add(id);loadWhy(true)}if(last)render(last)});
@@ -14345,12 +14345,25 @@ def accepts_gzip(header_block: str) -> bool:
     return False
 
 
-def page_payload(payload: dict) -> dict:
+def page_payload(payload: dict, private: bool = False) -> dict:
     """odds_payload() as data.json carries it: the server's edge chips (four per book, eleven fields each) are left out of
     every book block. The page computes its own from the depth for the trade size the viewer picks and never reads them;
     /book, the alerts, the paper trader and the tests use the server's. Fetched every 10 seconds by every open tab, the
-    file is about 40% smaller without them (a quarter smaller after gzip). The payload given is left as it is."""
-    without = lambda block: {k: v for k, v in block.items() if k != "edges"}
+    file is about 40% smaller without them (a quarter smaller after gzip). The payload given is left as it is.
+    ``private`` (WebServer.account_private: a real account is behind the trader), 1.150.0: the trader's own lines are left
+    out as well. data.json needs the page link alone, and those lines are that account's orders and positions: 挂单 names a
+    resting order's side and price (挂涨 挂单中 55.0¢, 等待发送 before it is even sent); 距吃单 carries each side's filled
+    shares, an order in flight with its Predict id (真实订单 #… 已成交 x/y 份), 这一边持仓 N 份, the room left under the caps
+    (可买 N 份（已吃 M 份，上限 K）) and what the real-trading limits refuse (持仓+挂单 $… 已占满 LIVE_MAX_OPEN_USD, USDT
+    余额 $… 不够一份) — its state and every text of it follow the account, so none of it is kept; the paper-trading card's
+    nearest markets repeat the same texts. why.json, the same facts at length, has asked for the control key since 1.101.0,
+    while these were served to anyone holding the link. A book the trader prices keeps a 距吃单 stub (state off: the page
+    draws no line for it), so that its card still has the 为什么挂 / 不挂单 row: the keyed way to the same facts."""
+    def without(block: dict) -> dict:
+        out = {k: v for k, v in block.items() if k != "edges" and not (private and k == "maker")}
+        if private and "taker" in out:
+            out["taker"] = {"state": "off", "text": "", "private": True}
+        return out
     items = []
     for item in payload.get("items") or []:
         item = dict(item)
@@ -14359,6 +14372,8 @@ def page_payload(payload: dict) -> dict:
         ladder = item.get("ladder")
         if isinstance(ladder, dict) and isinstance(ladder.get("rows"), list):
             item["ladder"] = {**ladder, "rows": [without(row) if isinstance(row, dict) else row for row in ladder["rows"]]}
+        if private and item.get("kind") == "sim" and "near" in item:
+            item["near"] = []
         items.append(item)
     return {**payload, "items": items}
 
@@ -14438,8 +14453,13 @@ class WebServer:
             if len(parts) == 2:
                 return 200, "text/html; charset=utf-8", self.pages["page"]
             if parts[2] == "data.json":
-                return 200, "application/json; charset=utf-8", self.cached(
-                    "data.json", lambda: json.dumps(page_payload(self.bot.odds_payload()), ensure_ascii=False, default=str).encode("utf-8"))
+                # 1.150.0: this file needs the page link alone, so with a real account behind the trader it goes without
+                # the trader's own lines (page_payload: that account's resting orders and positions, card by card), as
+                # why.json, journal.json and control.json go behind the key. A body is cached per case: a copy built just
+                # before the first real order is never served after it.
+                private = self.account_private()
+                return 200, "application/json; charset=utf-8", self.cached("data.json?private" if private else "data.json", lambda: json.dumps(
+                    page_payload(self.bot.odds_payload(), private), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "journal":
                 return 200, "text/html; charset=utf-8", self.pages["journal"]
             if parts[2] == "journal.json":
@@ -14517,7 +14537,8 @@ class WebServer:
     def account_private(self) -> bool:
         """A real account is behind the data: a real-trading key is configured, or the records hold real orders (a
         database kept after the key was removed). Its account, orders, positions and trade records are then shown only
-        with the control key."""
+        with the control key, and data.json, which the page link alone opens, goes without the trader's own lines
+        (page_payload)."""
         return bool(getattr(self.bot.config, "live_key", "")) or self.bot.sim_has_real()
 
     def journal_locked(self) -> bool:
@@ -17555,7 +17576,10 @@ class Bot:
             except Exception as error:  # the cards stand without it
                 self.log_limited("maker-line", f"挂单判断计算失败：{clean_error(error) or type(error).__name__}")
                 makers = {}
-            for item in items:  # each priced book block says how far the trader is from taking it (距吃单), and what it rests (1.138.1)
+            # each priced book block says how far the trader is from taking it (距吃单), and what it rests (1.138.1). Both, and
+            # the nearest markets below, are built from the trader's orders and positions: with a real account behind it
+            # data.json leaves them out (page_payload, 1.150.0) — whatever else is added here of the trader's own must go the same way
+            for item in items:
                 ladder = item.get("ladder") if isinstance(item.get("ladder"), dict) else {}
                 for block in [item.get("predict"), *(ladder.get("rows") or [])]:
                     if isinstance(block, dict) and str(block.get("market_id") or "") in gaps:
