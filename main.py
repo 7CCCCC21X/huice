@@ -15514,6 +15514,7 @@ class Bot:
         self.tally_gate = asyncio.Semaphore(3)  # ...three reads at a time
         self.sim_report_cache: dict[tuple, dict] = {}  # the last sim_report per arguments, while the records stand
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
+        self.edge_swept = False  # ...whose first look clears the delivery records an earlier version left above their stream's count (1.150.0)
         self.reference_pool: ThreadPoolExecutor | None = None
         self.diag_pool: ThreadPoolExecutor | None = None  # /diag's probes run here, not on the feeds' pool
         self.speed_pool: ThreadPoolExecutor | None = None  # /speed's requests (1.145.0), likewise
@@ -21251,6 +21252,18 @@ class Bot:
         self.edge_ran = time.monotonic()
         state = self.store.get("edgealerts", {})
         state = state if isinstance(state, dict) else {}
+        if not self.edge_swept:
+            # 1.150.0 (audit CTRL-EDGE-SEQ), once per start, before anything is observed or sent: until this version a ladder's
+            # idle maker stream was forgotten without its delivery records (edge_observe), and the stream that followed on
+            # that level counted from 1 under them — such levels are mute in the database this version starts on. A record
+            # above its stream's own count (no stream left: 0) can only come from such an earlier stream, so it is dropped;
+            # one at or under the count stays, so nothing is sent twice. The key ends with the subscription's chat:thread
+            # (subscription_key). Tried once: a start that cannot read them goes on without the repair.
+            self.edge_swept = True
+            count = lambda key: int((state.get(key.removeprefix("edgesent:").rsplit(":", 2)[0]) or {}).get("seq") or 0)
+            if stale := [key for key, got in self.store.items("edgesent:") if int(got or 0) > count(key)]:
+                self.store.delete_keys(stale)
+                LOG.info("优势提醒整理：清掉 %d 条旧版本留下的投递记录（编号高于所属提醒流现有的编号）", len(stale))
         before = json.dumps(state, sort_keys=True)
         costs = self.edge_costs()
         bars, _ = self.edge_bars()  # read once a round, not once a market
@@ -21314,7 +21327,17 @@ class Bot:
                 st["alert"]["offer"] = {**self.edge_note(mk, best, now_ms), "fair": mk.fair_up if best.side == "涨" else 1 - mk.fair_up}
             if maker_only:
                 st["alert"].update(maker_only=True, note=note)
-        if st.get("told") or st.get("pending") or st.get("alert") or any(now_ms - t < DAY_MS for t in st.get("last", {}).values()):
+        # 1.150.0 (audit CTRL-EDGE-SEQ): a stream that has announced (it has a count, seq) is kept for as long as its market
+        # is priced. edgesent:{market}:{sub} holds the last seq each subscription got, and edge_deliver and the digest skip
+        # every announcement numbered at or under it; those records go only together with the stream, a day after its
+        # market was last priced (edge_alerts). Every other stream keeps its last announcement and with it its record; a
+        # ladder's maker stream has its announcement taken back (points / eligibility coming and going: above, and in
+        # edge_alerts), and with nothing told, pending or announced and its last 新机会 a day old it was forgotten here.
+        # Its records were not, and the next stream on that level counted from 1 under them: its 新机会 and the 建议失效 /
+        # 方向反转 after it reached nobody until the count had passed the old one. The stream is kept rather than its
+        # records deleted at this point: a send still waiting on Telegram would write its seq back after the delete.
+        if (st.get("told") or st.get("pending") or st.get("alert") or st.get("seq")
+                or any(now_ms - t < DAY_MS for t in st.get("last", {}).values())):
             st["seen"] = now_ms - now_ms % 3_600_000
             state[market] = st
         else:

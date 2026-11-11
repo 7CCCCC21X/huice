@@ -867,4 +867,202 @@ async def ctrl_config_runtime():
 
 
 asyncio.run(ctrl_config_runtime())
+
+
+async def ctrl_edge_seq():
+    """CTRL-EDGE-SEQ: a price ladder's maker alert stream (<market>|maker) is the one stream whose announcement is taken
+    back: when points / eligibility are lost or come back, or the level misses a round. With nothing announced any more
+    and its last 新机会 a day old, edge_observe forgot the stream but left edgesent:<market>|maker:<sub> (the last seq
+    each subscription got) behind; the next stream on that level counted from 1 again, under those records, so its 新机会
+    and the 建议失效 / 方向反转 after it were sent to nobody, one by one and in the digest alike, until the count had
+    passed the old one. Now a stream that has announced is kept for as long as its level is priced (it is forgotten
+    together with its records, as every other stream is), and what an earlier version left behind is cleared at the first
+    look after a start."""
+    import datetime as dt, re, time
+    D, spec = m.D, m.RANGE_MARKETS[0]
+    MIN, HOUR, mid = 60_000, 3_600_000, "lvl"
+    t0 = spec.start_ms + 2 * m.DAY_MS
+    t0 -= t0 % HOUR  # two days into the ladder's window, on a full hour (a stream's ``seen`` is kept by the hour)
+    taker = f"{spec.slug}#{mid}"
+    maker = taker + "|maker"
+    row, taker_row = f"edgesent:{maker}:1:0", f"edgesent:{taker}:1:0"
+    iso = lambda at: dt.datetime.fromtimestamp(at / 1000, dt.timezone.utc).isoformat()
+    heads = lambda texts: [t.split("｜")[0] for t in texts]
+
+    class Level:
+        """One level (↑ $120k: Yes 20¢ / 24¢, the model at 40¢, points paying) of the first price ladder, as
+        tests/test_range_rewards.py builds it: the real sim_markets -> range_maker_status -> edge_alerts path with the
+        default bar (10¢), confirmation (60 s) and cooldown (900 s); one subscription; this object is the Telegram."""
+        def __init__(self, **env):
+            self.env, self.store, self.sent, self.gate, self.bot = env, m.Store(":memory:"), [], None, None
+            self.fair, self.points, self.bid, self.ask = 0.40, True, "0.20", "0.24"
+            self.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+
+        def start(self, at):  # the bot (re)started on the database
+            cfg = m.Config.from_env({**base, "PROBABILITY": "off", **self.env})
+            assert (cfg.edge_alert_edge, cfg.edge_alert_confirm, cfg.edge_alert_cooldown) == (0.10, 60, 900)
+            self.bot = bot = m.Bot(cfg, self.store, FM(at), self)
+            bot.touches, bot.updowns, bot.flips, bot.caps = {}, {}, {}, {}
+            rm = bot.ranges[spec.key]
+            bot.ranges = {spec.key: rm}
+            rm.price, rm.sigma = D("112000"), 0.4
+            rm.model_swing = lambda *args: 0.02
+            self.store.put("range:" + spec.slug, {"start": spec.start_ms, "through": t0, "open": 112000.0, "high": 115000.0, "low": 110000.0})
+            book = m.PredictBook(spec.key, spec.slug, mid, "↑ $120k", ((D("0.20"), D("1000")),), ((D("0.24"), D("1000")),), at, 200)
+            bot.predict.ladders[spec.key] = [m.LadderRow(D("120000"), mid, "↑ $120k", book)]
+
+        async def send(self, chat, thread, text, reply_markup=None, parse_mode=None):
+            if self.gate is not None and "建议失效" in text:
+                await self.gate.wait()  # Telegram takes its time over this one
+            self.sent.append((self.bot.market.now, re.sub(r"</?b>", "", text)))
+            return True
+
+        async def look(self, at, drain=True, **change):  # one round of the alerts at ``at``, the level as given
+            vars(self).update(change)
+            bot, rm = self.bot, self.bot.ranges[spec.key]
+            bot.market.now, bot.edge_ran = at, -1e9
+            rm.priced_ms = rm.sigma_ms = rm.scanned_ms = at
+            rm.probability = lambda level, direction, now, fair=self.fair: fair  # None: the model cannot price the level
+            current = {"hourlyRate": 100, "startsAt": iso(t0 - HOUR), "endsAt": iso(t0 + 30 * m.DAY_MS)} if self.points else None
+            bot.predict.market_meta[mid] = ({"outcomes": ["Yes", "No"], "status": "REGISTERED", "trading_status": "OPEN",
+                                             "rewards": {"current": current}, "spread_threshold": 0.20, "share_threshold": 100}, time.monotonic())
+            level = bot.predict.ladders[spec.key][0]
+            bot.predict.ladders[spec.key][0] = m.dataclasses.replace(level, book=m.dataclasses.replace(
+                level.book, bids=((D(self.bid), D("1000")),), asks=((D(self.ask), D("1000")),), fetched_ms=at))
+            await bot.edge_alerts(at)
+            if drain:
+                await bot.drain_deliveries()
+
+        def stream(self):  # the maker stream's saved record
+            return (self.store.get("edgealerts") or {}).get(maker) or {}
+
+        def told(self, since=0):  # what the subscription got of the maker stream (a taker's line reads 吃Yes @)
+            return [text for at, text in self.sent if at >= since and re.search(r"挂(Yes|No) @", text)]
+
+        def sound(self):  # no delivery record above its stream's own count: nothing the stream says next can hide under it
+            return (self.store.get(row) or 0) <= (self.stream().get("seq") or 0)
+
+    # (a) three lives of one stream. Before the first: a stream that never announced is still forgotten whole
+    w = Level(); w.start(t0 - 5 * MIN)
+    await w.look(t0 - 5 * MIN, bid="0.35", ask="0.39")  # 挂Yes +5¢: suggested, under the 10¢ bar
+    await w.look(t0 - 4 * MIN, bid="0.20", ask="0.24")  # +20¢: waiting for its minute...
+    assert w.stream().get("pending") and "seq" not in w.stream(), w.stream()
+    await w.look(t0 - 4 * MIN + 30_000, bid="0.35", ask="0.39")  # ...which it does not last
+    assert not w.store.get("edgealerts") and not w.sent and not w.store.keys("edgesent:")
+    # first life: 新机会 (挂Yes +20¢); the model falls to 19¢ and the other side is suggested under the bar (方向反转, nothing
+    # announced from here on); then ONE round without the level's reward metadata takes the delivered 方向反转 back
+    await w.look(t0, bid="0.20", ask="0.24"); await w.look(t0 + MIN)
+    await w.look(t0 + 30 * MIN, fair=0.19); await w.look(t0 + 31 * MIN)
+    assert heads(w.told()) == ["🟢 新机会", "🔄 方向反转"] and w.stream()["alert"]["kind"] == "flip" and w.store.get(row) == 2, w.told()
+    await w.look(t0 + 2 * HOUR, points=False)
+    assert "alert" not in w.stream() and w.stream()["told"] is None, w.stream()
+    await w.look(t0 + 2 * HOUR + 10_000, points=True)
+    for h in range(3, 27):  # a quiet day (挂No +5¢ all along, nothing to announce), a restart in the middle of it
+        if h == 12:
+            w.start(t0 + h * HOUR)
+        await w.look(t0 + h * HOUR)
+    assert w.sound(), (w.stream(), w.store.get(row))  # was: the stream forgotten ({}), its record left at 2
+    before = w.store.get("edgealerts")
+    await w.look(t0 + 26 * HOUR + 10_000)
+    assert w.store.get("edgealerts") == before  # a quiet stream's record does not change from round to round: nothing is written
+    # second life: both announcements arrive
+    mark = t0 + 27 * HOUR
+    await w.look(mark, fair=0.40); await w.look(mark + MIN)
+    await w.look(mark + HOUR, fair=0.19); await w.look(mark + HOUR + MIN)
+    got = w.told(mark)
+    assert heads(got) == ["🟢 新机会", "🔄 方向反转"], (got, w.stream().get("seq"), w.store.get(row))  # was: [] — counted 1 and 2 again, under the old 2
+    assert "挂Yes @ 20.0¢｜净优势 +20.0¢" in got[0] and "之前提醒：挂Yes @ 20.0¢" in got[1] and "现在建议另一边：挂No @ 76.0¢" in got[1], got
+    assert w.sound() and w.stream()["seq"] == w.store.get(row), (w.stream(), w.store.get(row))
+    # the model cannot price the level for a round (edge_alerts itself takes the 方向反转 back), and then not for a day and
+    # more, as when the ladder is over: only now are the level's streams forgotten, each together with its delivery records
+    await w.look(mark + 2 * HOUR, fair=None)
+    assert "alert" not in w.stream() and w.sound(), w.stream()
+    for h in range(30, 53):
+        await w.look(t0 + h * HOUR)
+    assert w.sound() and w.store.get(row) and w.store.get(taker_row), (w.stream(), w.store.items("edgesent:"))  # 24 h after it was last priced: still there
+    await w.look(t0 + 53 * HOUR)
+    assert not w.store.get("edgealerts") and not w.store.keys("edgesent:"), (w.store.get("edgealerts"), w.store.keys("edgesent:"))
+    # third life, the level priced again: counted from 1 with no record above it, and delivered. Every announcement of the
+    # three lives arrived exactly once
+    mark = t0 + 60 * HOUR
+    await w.look(mark, fair=0.40); await w.look(mark + MIN)
+    assert heads(w.told(mark)) == ["🟢 新机会"] and w.stream()["seq"] == 1 == w.store.get(row), (w.told(mark), w.stream())
+    assert heads(w.told()) == ["🟢 新机会", "🔄 方向反转"] * 2 + ["🟢 新机会"], heads(w.told())
+
+    # (b) the report's own path, sent one by one and in digest mode: points lost (建议失效), back inside the cooldown (the
+    # withdrawal is taken back), a day under the bar, then the next chance and its withdrawal
+    for digest in ("0", "5"):
+        w = Level(EDGE_ALERT_DIGEST_MINUTES=digest); w.start(t0)
+        await w.look(t0); await w.look(t0 + MIN)
+        await w.look(t0 + 2 * MIN, points=False); await w.look(t0 + 3 * MIN)
+        assert len(w.told()) == 2 and w.told()[1].startswith("⚪ 建议失效") and w.stream()["alert"]["kind"] == "gone", (digest, w.told())
+        await w.look(t0 + 4 * MIN, points=True)
+        assert "alert" not in w.stream()
+        for h in range(25):
+            await w.look(t0 + 10 * MIN + h * HOUR, bid="0.35", ask="0.39")  # 挂Yes +5¢
+        assert w.sound(), (digest, w.stream(), w.store.get(row))
+        mark = t0 + 26 * HOUR
+        await w.look(mark, bid="0.20", ask="0.24"); await w.look(mark + MIN)
+        await w.look(mark + 2 * MIN, points=False); await w.look(mark + 3 * MIN)
+        got = w.told(mark)
+        assert heads(got) == ["📬 机会摘要" if digest == "5" else "🟢 新机会", "⚪ 建议失效"], (digest, got)  # was: [] in both modes
+        assert "挂Yes @ 20.0¢" in got[0] and "之前提醒：挂Yes @ 20.0¢" in got[1] and "挂单建议暂停：积分未激活" in got[1], (digest, got)
+
+    # (c) why the stream is kept rather than its records deleted at the moment it goes quiet: a 建议失效 is waiting on
+    # Telegram while the next round (10 s on) takes it back, a day after the stream's 新机会. Telegram accepts it afterwards
+    # and the send records its seq — written after such a delete, that record alone would hide the next 新机会 (1 under 2)
+    w = Level(); w.start(t0)
+    await w.look(t0); await w.look(t0 + MIN)
+    for h in range(1, 26):
+        await w.look(t0 + MIN + h * HOUR)  # the chance stands for a day
+    t = t0 + 26 * HOUR
+    await w.look(t, points=False)
+    w.gate = asyncio.Event()
+    await w.look(t + MIN, drain=False)  # 建议失效 confirmed: its send passes the last check and waits on Telegram
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert w.bot.delivering(row) and w.store.get(row) == 1 and w.stream()["alert"]["kind"] == "gone", w.stream()
+    await w.look(t + MIN + 10_000, drain=False, points=True, bid="0.35", ask="0.39")  # points back, 挂Yes +5¢: taken back
+    assert w.bot.delivering(row) and not (w.stream().get("alert") or w.stream().get("told") or w.stream().get("pending")), w.stream()
+    w.gate.set(); await w.bot.drain_deliveries(); w.gate = None
+    assert w.store.get(row) == 2 and heads(w.told()) == ["🟢 新机会", "⚪ 建议失效"], (w.store.get(row), w.told())
+    mark = t + 3 * HOUR
+    await w.look(mark, bid="0.20", ask="0.24"); await w.look(mark + MIN)
+    assert heads(w.told(mark)) == ["🟢 新机会"], (w.told(mark), w.stream().get("seq"), w.store.get(row))
+    assert w.stream()["seq"] == 3 == w.store.get(row)  # counted on from the 2 that Telegram accepted
+
+    # (d) a database an earlier version ran on. The level's maker stream was forgotten at 4 and no stream stands behind
+    # the record (nor behind that of a market long gone): both are cleared at the first look, the 新机会 arrives
+    w = Level()
+    w.store.put(row, 4); w.store.put("edgesent:a-market-long-gone:1:0", 3)
+    w.start(t0)
+    await w.look(t0)
+    assert w.store.keys("edgesent:") == [], w.store.keys("edgesent:")
+    await w.look(t0 + MIN)
+    assert heads(w.told()) == ["🟢 新机会"] and w.store.get(row) == 1 == w.store.get(taker_row), (w.told(), w.store.items("edgesent:"))  # was: never sent
+    count = len(w.sent)
+    w.start(t0 + MIN + 10_000)  # a restart with both 新机会 a few seconds old: records at their stream's count stay, nothing is sent twice
+    scans, items = [], w.store.items
+    w.store.items = lambda prefix: scans.append(prefix) or items(prefix)
+    for i in range(1, 4):
+        await w.look(t0 + MIN + i * 10_000)
+    assert len(w.sent) == count == 2 and w.store.get(row) == 1 == w.store.get(taker_row), w.sent
+    assert scans.count("edgesent:") == 1, scans  # the records are read through once per start, not every round
+    # ...or the next stream had already begun under the old record: its 新机会 went to nobody (here: the subscription paused,
+    # the outcome is the same), its count is 1 and the record above it says 4. Cleared too; the 建议失效 arrives (2 is under 4)
+    w = Level()
+    w.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": False}})
+    w.start(t0)
+    await w.look(t0); await w.look(t0 + MIN)
+    assert w.stream()["seq"] == 1 and w.stream()["told"] == "up" and not w.sent, w.stream()
+    w.store.put(row, 4)
+    w.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    w.start(t0 + 30 * MIN)
+    await w.look(t0 + 30 * MIN)
+    assert w.store.get(row) is None and not w.sent, (w.store.get(row), w.sent)  # ...and a 新机会 half an hour old is not sent late
+    await w.look(t0 + 31 * MIN, points=False); await w.look(t0 + 32 * MIN)
+    assert heads(w.told()) == ["⚪ 建议失效"] and w.store.get(row) == 2, (w.told(), w.store.get(row))
+
+
+asyncio.run(ctrl_edge_seq())
 print("AUDIT_CONTROL_OK")
