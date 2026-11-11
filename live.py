@@ -1432,6 +1432,9 @@ class LiveBot(core.Bot):
         self.live_place_ms = 0       # the last step's placement time (sim_after_decide), for the phases
         self.preopen = None  # the pre-open quoting mode's controller while it runs (preopen_apply: PREOPEN_15M, on the page or in the environment)
         self.preopen_task: asyncio.Task | None = None
+        self.preopen_day_read: tuple | None = None  # (ledger file, Beijing day, its accounted P&L, valid until): read while no controller holds it (preopen_file_day)
+        self.preopen_tidied = -1e9  # monotonic time of the last archive pass over the ledger file while the mode is off (preopen_tidy)
+        self.preopen_share: Any = None  # the archive's share of the review's figures, kept from call to call (preopen.ArchiveShare; preopen_review)
         self.preopen_factory: Any = None  # the tests' stand-in controller class
         self.preopen_lock = asyncio.Lock()
         self.handlers["/preopen"] = self.cmd_preopen  # the status, on / off, pause / resume, and the read-only probe of the listing
@@ -4783,14 +4786,48 @@ class LiveBot(core.Bot):
 
     def preopen_review(self) -> dict | None:
         """The review page's 开盘前预挂 section (preopen.review): the running controller's ledger, or the file read while the
-        mode is off; None when nothing is recorded."""
-        from preopen import read_rows, review
+        mode is off; None when nothing is recorded. Audit PRE-LEDGER-GROWTH: with the ledger's archive — the old finished
+        quotes that filled nothing left the working records (Ledger.archive_old), and the totals and tables count them as
+        they always did. By their counts, kept from call to call (preopen.ArchiveShare: the archive is read once, after
+        that only the rows moved in since): reading and parsing the whole archive at every call — two a build of
+        journal.json — took twice as long as the review had with every record in memory, and longer with every day of
+        history. Record by record off the file, as before that, only when the counts cannot stand for the records (one in
+        the archive that is no plain withdrawn quote) or could not be had; never kept in memory either way."""
+        from preopen import archive_share, read_archive, read_rows, review
         try:
-            rows = list(self.preopen.ledger.rows.values()) if self.preopen is not None else read_rows(self.config.preopen.db)
+            if self.preopen is not None:
+                rows, old = list(self.preopen.ledger.rows.values()), self.preopen.ledger.archived()
+            else:
+                rows, old = read_rows(self.config.preopen.db), read_archive(self.config.preopen.db)
         except Exception as error:
             LOG.warning("预挂复盘读取失败：%s", core.clean_error(error) or type(error).__name__)
             return None
-        return review(rows, self.market.now_ms()) if rows else None
+        now_ms = self.market.now_ms()
+        try:
+            share = self.preopen_share = archive_share(self.preopen.ledger if self.preopen is not None else self.config.preopen.db, rows, getattr(self, "preopen_share", None))
+            if share.fits(now_ms):
+                return review(rows, now_ms, share) if rows or share.count else None
+        except Exception as error:  # the counts could not be had: dropped (they may be half brought up to date), and the archive read record by record below
+            self.preopen_share = None
+            LOG.warning("预挂复盘的归档统计没用上（这次逐条读归档）：%s", core.clean_error(error) or type(error).__name__)
+        keys = {p.get("slug") for p in rows}  # a record in both (its move undone by hand) counts once: the working one
+        more: list[int] = [0]
+        failed: list[Exception] = []
+
+        def every() -> Any:
+            yield from rows
+            try:
+                for p in old:
+                    if p.get("slug") not in keys:
+                        more[0] += 1
+                        yield p
+            except Exception as error:  # the archive cannot be read (it is read as the review walks it): no figures, not short ones
+                failed.append(error)
+        out = review(every(), now_ms)
+        if failed:
+            LOG.warning("预挂复盘读取失败（归档）：%s", core.clean_error(failed[0]) or type(failed[0]).__name__)
+            return None
+        return out if rows or more[0] else None
 
     async def preopen_apply(self) -> None:
         """The pre-open mode as PREOPEN_15M and the PREOPEN_* settings say now (the environment, the control page's saved
@@ -4817,8 +4854,30 @@ class LiveBot(core.Bot):
             if self.preopen is None and not self.stopping.is_set():
                 if want.enabled:
                     self.preopen_start()
-                elif self.preopen_leftovers():  # off, yet its records hold orders that may rest: withdrawn all the same
-                    self.preopen_start(wind_down="预挂模式关着，但上次还有挂单没撤完")
+                else:
+                    self.preopen_tidy()  # off: no controller will ever move the old records out of the file the check below and the positions check read whole
+                    if self.preopen_leftovers():  # off, yet its records hold orders that may rest: withdrawn all the same
+                        self.preopen_start(wind_down="预挂模式关着，但上次还有挂单没撤完")
+
+    def preopen_tidy(self) -> None:
+        """The mode off and no controller on its ledger file: the old finished quotes that filled nothing still leave the
+        file's working records (preopen.archive_file — a running controller does it itself, Controller.archive). Audit
+        PRE-LEDGER-GROWTH: while the mode is off that file is read whole twice a minute by the positions check
+        (preopen_filled, preopen_unverified) and several times by every build of the review page — at 50,000 records two
+        seconds of the event loop each time. At a start and at a settings apply, an hour apart at least; a failure is
+        logged and nothing moves."""
+        from preopen import ARCHIVE_EVERY_MS, archive_file
+        path = self.config.preopen.db
+        if path == ":memory:" or time.monotonic() - getattr(self, "preopen_tidied", -1e9) < ARCHIVE_EVERY_MS / 1000:
+            return
+        self.preopen_tidied = time.monotonic()
+        try:
+            moved = archive_file(path, self.market.now_ms())
+        except Exception as error:
+            LOG.warning("预挂旧记录归档失败（记录原样保留）：%s", core.clean_error(error) or type(error).__name__)
+            return
+        if moved:
+            LOG.info("开盘前预挂（未开启）：%d 条早已结束、已撤且没成交的记录移入归档", moved)
 
     def preopen_leftovers(self) -> int:
         """Orders the pre-open mode's records say may still rest while the mode is off (1.141.0) — a stop in the middle of a
@@ -4836,6 +4895,7 @@ class LiveBot(core.Bot):
 
     def preopen_start(self, wind_down: str = "") -> None:
         from preopen import Controller
+        self.preopen_day_read = None  # a controller holds the ledger from here: its own records count (preopen_pnl), not a figure read off the file
         preopen = self.preopen = (self.preopen_factory or Controller)(self)
         if wind_down:  # nothing new goes out: the orders still resting are withdrawn, then it stops itself
             preopen.wind_down(wind_down)
@@ -4845,10 +4905,22 @@ class LiveBot(core.Bot):
             if not t.cancelled() and t.exception() is not None:
                 text = core.clean_error(t.exception()) or type(t.exception()).__name__
                 LOG.error("开盘前策略异常结束：%s", text)
-                # the bot goes on (its run() withdrew this mode's orders on the way out); the model trader is free again
+                # the bot goes on (its run() withdrew what it could of this mode's orders on the way out: counted below); the
+                # model trader is free again — within the day's loss stop, which still counts this mode's realised loss
+                # (preopen_pnl, Audit PRE-PNL-DROP)
                 preopen.error, preopen.alive = f"预挂模式已停止：{text}", False
                 self.live_note_error(f"开盘前预挂模式异常停止：{text}")
-                self.live_notify(f"⚠️ 开盘前预挂模式异常停止：{text}（本模式的挂单已撤，重启后恢复）", key="preopen:crash")
+                # Audit PRE-CRASH-WITHDRAW: what is left is counted, not assumed. "本模式的挂单已撤" went out whatever the
+                # withdrawal did — nothing at all on a ledger it could not write (fixed in on_stop), cut short by
+                # STOP_CANCEL_S, or stopped by a refusal of every request (401/403). The records in memory carry each removal.
+                try:
+                    from preopen import resting_orders
+                    left = sum(resting_orders(p, preopen.now()) for p in preopen.ledger.rows.values())
+                    gone = ("本模式的挂单已撤" if not left else
+                            f"还有 {left} 张预挂单可能还挂着，开场前 {preopen.settings.expiry_seconds} 秒签名到期之前仍可能成交，请到 Predict 核对")
+                except Exception:
+                    gone = "撤单情况不明，请到 Predict 核对"
+                self.live_notify(f"⚠️ 开盘前预挂模式异常停止：{text}（{gone}，重启后恢复）", key="preopen:crash")
             elif not t.cancelled() and getattr(preopen, "winding", "") and self.preopen is preopen and not self.stopping.is_set():
                 asyncio.get_running_loop().create_task(self.preopen_apply(), name="preopen-apply")  # wound up: cleared (or started afresh)
         task.add_done_callback(finished)
@@ -4870,6 +4942,7 @@ class LiveBot(core.Bot):
         with contextlib.suppress(Exception):
             preopen.ledger.close()
         self.preopen, self.preopen_task = None, None
+        self.preopen_day_read = None  # its last records are on file now: read afresh at the next loss check (preopen_file_day)
         LOG.info("开盘前预挂模式停止：%s", why)
 
     def preopen_active(self) -> bool:
@@ -4890,8 +4963,45 @@ class LiveBot(core.Bot):
         return float(self.preopen.risk()) if self.preopen_active() else 0.0
 
     def preopen_pnl(self) -> float:
-        """The running pre-open mode's accounted P&L of the day, counted with the model trader's against LIVE_MAX_DAILY_LOSS_USD."""
-        return float(self.preopen.daily_pnl()) if self.preopen_active() else 0.0
+        """The pre-open mode's accounted P&L of the day, counted with the model trader's against LIVE_MAX_DAILY_LOSS_USD: while
+        it runs for real, its day as it stands (a gain offsets the model trader's losses); while it does not — crashed (alive
+        False, kept until the next apply), LIVE≠on, switched off and cleared, off since a restart — its day's realised loss
+        alone, a gain counting 0."""
+        if self.preopen_active():
+            return float(self.preopen.daily_pnl())
+        # Audit PRE-PNL-DROP: this was 0.0 whenever the mode was not running (1.125.0 gated the day on preopen_active together
+        # with the reservation), so a crash, /preopen off (wound down, then cleared) or a restart with the mode off took the
+        # day's realised pre-open loss out of the stop: the model trader got its whole LIVE_MAX_DAILY_LOSS_USD back, and the
+        # account's real loss of the Beijing day could reach the cap plus that loss. A booked loss stays booked; what ends
+        # with the mode is its reservation (preopen_risk) and its exclusive hold (preopen_exclusive). Floored at 0: a stopped
+        # mode's gain never loosens the stop (it counted 0 before), so no state counts less loss than it used to. Records
+        # that cannot be read count 0, as before (logged).
+        preopen = getattr(self, "preopen", None)
+        try:
+            day = float(preopen.daily_pnl()) if preopen is not None else self.preopen_file_day()
+        except Exception as error:
+            LOG.warning("预挂当日盈亏读取失败（日亏损停机线这次只算原策略）：%s", core.clean_error(error) or type(error).__name__)
+            return 0.0
+        return min(0.0, day)
+
+    def preopen_file_day(self) -> float:
+        """Today's (Beijing) accounted P&L in the pre-open mode's ledger file while no controller holds it (Audit PRE-PNL-DROP):
+        read once and kept for the day — the loss checks run every step, every sync and every send, the file is never pruned
+        (about a second's read at 20,000 records), and nothing writes it while no controller runs; preopen_start and
+        preopen_stop drop the figure. A file that cannot be read counts 0 (the stop as it was) and is tried again a minute
+        on, not at every check."""
+        from preopen import read_rows
+        path, day, now = self.config.preopen.db, core.beijing_day(self.market.now_ms() / 1000), time.monotonic()
+        kept = getattr(self, "preopen_day_read", None)
+        if kept is not None and kept[:2] == (path, day) and now < kept[3]:
+            return kept[2]
+        try:
+            value, until = sum(float(p.get("pnl") or 0) for p in read_rows(path) if p.get("accounted_day") == day), math.inf
+        except Exception as error:
+            LOG.warning("预挂记录读取失败（日亏损停机线暂只算原策略，一分钟后再读）：%s", core.clean_error(error) or type(error).__name__)
+            value, until = 0.0, now + 60
+        self.preopen_day_read = (path, day, value, until)
+        return value
 
     def preopen_rows(self) -> list[dict]:
         """The pre-open mode's ledger records: the controller's (running or stopped), else the file; [] when neither reads."""
