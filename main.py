@@ -1895,7 +1895,11 @@ class Binance:
         self.cached: dict[str, Baseline] = {}
         self.at_cache: dict[tuple[str, int, tuple[str, ...]], tuple[D, str]] = {}  # (symbol, instant, kinds asked) -> price_at's answer
         self.offset_ms = 0
-        self.clock_checked = 0.0
+        # 1.150.0: never synced = minus infinity, not 0.0. time.monotonic() counts from the machine's boot, so on a host up
+        # for less than ten minutes "monotonic - 0.0 < 600" made sync_clock skip the first sync (the raw local clock used
+        # for up to ten minutes) and the cycle's "never synced" test (Bot.one_cycle, FEED-SYNC-CLOCK) read the zero as a sync
+        # made moments ago — found when the suite ran on a freshly booted machine
+        self.clock_checked = -math.inf
         self.blocked_until = 0.0
         self.stream: Any = None  # BinanceStream (1.87.0): its pushed rows stand in for the REST read of prices() while fresh
 

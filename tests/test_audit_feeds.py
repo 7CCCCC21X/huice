@@ -1893,4 +1893,29 @@ async def feed_hsi_spot_after_close() -> None:
 
 asyncio.run(feed_hsi_spot_after_close())
 
+
+# --- 1.150.0: the first Binance clock sync is not skipped on a freshly booted machine -------------------------------------------
+async def sync_clock_fresh_boot():
+    """time.monotonic() counts from boot: on a host up for less than ten minutes a never-synced clock (once 0.0) read as
+    synced moments ago — sync_clock skipped the first sync and the cycle took the zero for a recent sync."""
+    import types
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off"})
+    market = m.Binance(cfg)
+    asked = []
+
+    async def get(path, params=None, *a, **k):
+        asked.append(path)
+        return {"serverTime": int(time.time() * 1000) + 5000}
+    market.get = get
+    real_time = m.time
+    m.time = types.SimpleNamespace(monotonic=lambda: 120.0, time=real_time.time)  # main's view only: two minutes after boot
+    try:
+        await market.sync_clock()
+    finally:
+        m.time = real_time
+    assert asked == ["/fapi/v1/time"] and 4000 < market.offset_ms < 6000 and market.clock_checked == 120.0, (asked, market.offset_ms, market.clock_checked)
+
+
+asyncio.run(sync_clock_fresh_boot())
+
 print("AUDIT_FEEDS_OK")
