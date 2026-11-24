@@ -53,7 +53,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.39"
+VERSION = "1.154.40"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -651,16 +651,21 @@ class PreopenSettings:
 # 1.153.0: 规则吃单 (rules.py) — each rule's price setting (cents, 0 = the rule off) and its default
 RULE_SETTING_KEYS = {"gold_shut": "RULE_GOLD_SHUT_CENTS", "gold_open": "RULE_GOLD_OPEN_CENTS", "gold_0515": "RULE_GOLD_0515_CENTS",
                      "gold_0500": "RULE_GOLD_0500_CENTS", "gold_1645": "RULE_GOLD_1645_CENTS",
-                     "oil_shut": "RULE_OIL_SHUT_CENTS", "oil_open": "RULE_OIL_OPEN_CENTS", "oil_0045": "RULE_OIL_0045_CENTS"}
+                     "oil_shut": "RULE_OIL_SHUT_CENTS", "oil_open": "RULE_OIL_OPEN_CENTS", "oil_0045": "RULE_OIL_0045_CENTS",
+                     "unitree_1430": "RULE_UNITREE_1430_CENTS"}
 # oil_shut 0: ties settle Up, Down won 42% (1.153.0); oil_open 50 (1.153.2, was 55: +3¢ a share there, +8¢ at 50); the three the slot scan
 # found (1.153.2) off until tried on paper
-RULE_DEFAULT_CENTS = {"gold_shut": 58, "gold_open": 50, "gold_0515": 58, "gold_0500": 0, "gold_1645": 0, "oil_shut": 0, "oil_open": 50, "oil_0045": 0}
+# unitree_1430 0 (1.154.40): a month and a half of the card's own index — tried on paper first
+RULE_DEFAULT_CENTS = {"gold_shut": 58, "gold_open": 50, "gold_0515": 58, "gold_0500": 0, "gold_1645": 0, "oil_shut": 0, "oil_open": 50, "oil_0045": 0,
+                      "unitree_1430": 0}
 
 
-RULE_MARKET_KEYS = {"gold": ("RULE_GOLD", "RULE_GOLD_SHARES"), "oil": ("RULE_OIL", "RULE_OIL_SHARES")}  # 1.153.1: each market's switch and size
+RULE_MARKET_KEYS = {"gold": ("RULE_GOLD", "RULE_GOLD_SHARES"), "oil": ("RULE_OIL", "RULE_OIL_SHARES"),  # 1.153.1: each market's switch and size
+                    "unitree": ("RULE_UNITREE", "RULE_UNITREE_SHARES")}  # 1.154.40: 宇树's 15-minute card
 # 1.154.14: 盘中吃单 — the rules that also buy in the window's course (rules.Rule.lead: while the index is ahead of the window's start on
 # their side), each with its own highest price there (0 = not in its course)
-RULE_LIVE_KEYS = {"gold_shut": "RULE_GOLD_SHUT_LIVE_CENTS", "gold_open": "RULE_GOLD_OPEN_LIVE_CENTS"}
+RULE_LIVE_KEYS = {"gold_shut": "RULE_GOLD_SHUT_LIVE_CENTS", "gold_open": "RULE_GOLD_OPEN_LIVE_CENTS",
+                  "unitree_1430": "RULE_UNITREE_1430_LIVE_CENTS"}  # 1.154.40: in its course after a 14:15 that closed Up (rules.Rule.after)
 RULE_FAST_DEFAULT = "01:00-07:00"  # 1.154.12: RULE_FAST_HOURS — the Beijing hours in which the rule taker looks at every listed window each second
 
 
@@ -701,7 +706,7 @@ class RuleSettings:
     mode: str = "off"
     cents: tuple = tuple(RULE_DEFAULT_CENTS.items())
     markets: frozenset = frozenset(RULE_MARKET_KEYS)
-    shares: tuple = (("gold", 50), ("oil", 50))
+    shares: tuple = (("gold", 50), ("oil", 50), ("unitree", 50))
     max_day_usd: float = 0.0
     fast: tuple = ((60, 420),)  # RULE_FAST_HOURS (1.154.12): the Beijing hours of the per-second looks, minutes after midnight (day_spans)
     live: tuple = ()            # RULE_*_LIVE_CENTS (1.154.14): (rule key, cents) — the highest price in the window's course; none or 0 = only before it
@@ -766,10 +771,10 @@ class RuleSettings:
         if any(not (c == 0 or 1 <= c <= 97) for c in live.values()):
             raise ValueError("RULE_*_LIVE_CENTS 是 0（盘中不做）或 1～97（¢，开场后的最高买价）")
         if any(v not in {"on", "off"} for v in switches.values()):
-            raise ValueError("RULE_GOLD、RULE_OIL 只能是 on 或 off")
+            raise ValueError("RULE_GOLD、RULE_OIL、RULE_UNITREE 只能是 on 或 off")
         if (any(not (c == 0 or 1 <= c <= 95) for c in cents.values()) or any(not 1 <= n <= 100_000 for n in shares.values())
                 or not 0 <= max_day <= 1_000_000):
-            raise ValueError("RULE_*_CENTS 是 0（不做这条规则）或 1～95（¢，最高买价）；RULE_GOLD_SHARES、RULE_OIL_SHARES 每场最多买 1～100000 份；"
+            raise ValueError("RULE_*_CENTS 是 0（不做这条规则）或 1～95（¢，最高买价）；RULE_GOLD_SHARES、RULE_OIL_SHARES、RULE_UNITREE_SHARES 每场最多买 1～100000 份；"
                              "RULE_MAX_DAY_USD 0～1000000（每天最多花多少，0 = 不限）")
         return cls(mode, tuple(cents.items()), frozenset(m for m, v in switches.items() if v == "on"), tuple(shares.items()), max_day, fast,
                    tuple(live.items()), lead)
@@ -876,7 +881,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "BTC 5 分钟每场每边就挂这几档（第一档也按这里的价格和份数）；空 = 跟上面所有卡的一样（预挂价格 × 每次份数，加更深的价格档位）。改了只撤、重挂 BTC 5 分钟的单"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
     # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
-    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 15 秒，盘口一出现规则价以内的指定方向就立即买"
+    ("RULE_TAKER", "规则吃单", "黄金、原油、宇树 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 15 秒，盘口一出现规则价以内的指定方向就立即买"
      "（盘口变化由推送送来，不等下一次读）；黄金休市 4 档、开盘第一档另设了盘中价格时，开场后规则方向领先也接着吃（1.154.14）。off 关；paper 只记录不下单：按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；"
      "on 真实吃单（需要 LIVE=on；真实交易暂停、今日亏损停机、接口限流冷却时都不下单）"),
     ("RULE_GOLD", "规则吃单：黄金", "on = 做黄金的规则（下面价格设为 0 的那条不做）；off = 黄金一条都不做"),
@@ -912,7 +917,17 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "50¢ 每份约赚 8¢（默认，1.153.2；55¢ 只剩约 3¢）。0 = 不做"),
     ("RULE_OIL_0045_CENTS", "原油纽约 00:45：买跌不高于（¢）", "原油纽约 00:45–01:00、周一至周五（北京冬令时 13:45，夏令时 12:45）：2026-04 至 11 跌占 62%，"
      "每个月 50–76%；50¢ 每份约 +11¢。按全部时段扫出来的、显著性刚到边，默认 0 = 不做，建议先只记录"),
-    ("RULE_MAX_DAY_USD", "规则吃单：每天最多花多少（$）", "0～1000000：黄金、原油合计，一天（北京时间）下单的金额（成交的按成交价、还没结果的按全额）到这个数就不再买；0 = 不限"),
+    ("RULE_UNITREE", "规则吃单：宇树", "on = 做宇树的规则（下面价格设为 0 的那条不做）；off = 宇树一条都不做（1.154.40）"),
+    ("RULE_UNITREE_SHARES", "宇树：每场最多买多少份", "1～100000：宇树一个 15 分钟场次最多买这么多份（盘前和盘中合计）；没设时跟 RULE_SHARES（默认 50）"),
+    ("RULE_UNITREE_1430_CENTS", "宇树 14:30：买跌不高于（¢）", "北京 14:30–14:45、上交所交易日（休市日没有这一场）。按这张卡结算用的指数（币安 UNITREEUSDT 指数的 1 分钟收盘）"
+     "算，2026-10-09 至 11-20 的 31 个交易日跌 25 场（81%，95% 区间 64%～91%），全天其他场跌只占 23%～61%：收盘前回吐当天涨幅。"
+     "只有一个半月的数据：默认 0 = 不做，开的话先用小份数（RULE_UNITREE_SHARES）试。保本胜率（手续费率 2%）：60¢ 约 61%、63¢ 约 64%。"
+     "开着宇树预挂时，预挂不挂这一场（两边都挂只会被吃掉输的那边）"),
+    ("RULE_UNITREE_1430_LIVE_CENTS", "宇树 14:30·盘中：买跌不高于（¢）", "开场后也吃：前一场（14:15）收涨时，这一场开始 3 秒后到结束前 15 秒，盘口有不高于这个价的跌就买；"
+     "14:15 收跌或收平不买。按同一份指数，14:15 收涨的 16 天里 14:30 全部收跌（95% 区间 81%～100%），其中开场 5 分钟时指数还在起点上方的 4 天也一样；"
+     "14:15 收跌的 15 天只跌 9 场（60%）。前一场收没收涨在开场时就知道，所以第 1 分钟不按盘前价格封顶。和盘前共用每场份数；单子在这一场结束前 5 秒到期。"
+     "保本胜率（手续费率 2%）：70¢ 约 71%、75¢ 约 76%。0 = 盘中不做"),
+    ("RULE_MAX_DAY_USD", "规则吃单：每天最多花多少（$）", "0～1000000：各市场的规则合计，一天（北京时间）下单的金额（成交的按成交价、还没结果的按全额）到这个数就不再买；0 = 不限"),
     ("RULE_FAST_HOURS", "规则吃单：每秒检查的时段（北京时间）", "写成 01:00-07:00（可写多段，用逗号分开；结束早于开始 = 跨过半夜；off = 不做）。这段时间里，已发布的规则场次每秒看一次盘口，"
      "符合规则价就立刻下单，几场同时出现时一起发；开始前 1 分钟先准备好（登录、授权额度、撮合状态、推送订阅）。盘口靠推送，变化约 0.3 秒到；"
      "另外每秒用 REST 轮流核对一场，推送断了也能在几秒内看到（规则吃单有自己的 Key——RULE_API_KEY——时每秒核对 3 场）。"
@@ -12770,6 +12785,10 @@ CONTROL_FORMS: dict[str, dict] = {
     "RULE_GOLD_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "RULE_OIL": {"kind": "choice", "group": "规则", "options": [["on", "on 开"], ["off", "off 关"]]},
     "RULE_OIL_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
+    "RULE_UNITREE": {"kind": "choice", "group": "规则", "options": [["on", "on 开"], ["off", "off 关"]]},  # 1.154.40
+    "RULE_UNITREE_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
+    "RULE_UNITREE_1430_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "55", "58", "60", "63"], "unit": "¢", "zero": "不做"},
+    "RULE_UNITREE_1430_LIVE_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "65", "70", "75", "80"], "unit": "¢", "zero": "盘中不做"},
     "RULE_MAX_DAY_USD": {"kind": "number", "group": "规则", "presets": ["0", "50", "100", "200", "500", "1000"], "unit": "$", "zero": "不限"},
     "RULE_LEAD_MINUTES": {"kind": "number", "group": "规则", "presets": ["0", "240", "300", "360"], "unit": "分钟", "zero": "不按这个时刻",
                           "captions": {"300": "5 小时"}},
@@ -16018,7 +16037,7 @@ details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-ite
 <details class="fold" data-k="sessions"><summary><h3>按时段</h3></summary><div id="a-sessions"></div><details class="hint"><summary>说明</summary><p>按下单时标的所在的时段（交易所当地时间）；成交后市场走向 = 盘口中间价 − 成交价，每份，持续为负 = 这个时段的成交常是别人在出货；没有开盘时段的市场（加密）记在“无交易时段”。</p></details></details>
 <details class="fold" data-k="windows" id="h-windows" hidden><summary><h3>15 分钟涨跌</h3></summary><div id="a-windows" hidden></div><details class="hint" id="p-windows" hidden><summary>说明</summary><p>只算 15 分钟窗口的记录：按窗口开始的整点（北京时间，两张卡都有时分开写），和按下单时离窗口结束还有几分钟。胜率低于平均公平价、成交后 1 / 5 分钟市价持续为负的那一行，就是模型在那个时段或那个时点看错的地方。</p></details></details>
 <details class="fold" data-k="preopen" id="h-preopen" hidden><summary><h3>开盘前预挂</h3></summary><div id="a-preopen" hidden></div><details class="hint" id="p-preopen" hidden><summary>说明</summary><p>开盘前预挂模式（PREOPEN_15M）自己的记录，不受上面的筛选条影响：每场涨、跌两边各一张固定价买单，成交的那一边按官方结果结算（赢 = 1 − 价格、输 = −价格，每份，平局按 0.5）。记录 = 一次报价（同一场重新报价算两条），场次 = 不同的窗口；没成交就撤掉的场次不算输赢。按日期、开始时间都是场次开始的北京时间。</p></details></details>
-<details class="fold" data-k="ruletaker" id="h-rules" hidden><summary><h3>规则吃单</h3></summary><div id="a-rules"></div><details class="hint"><summary>说明</summary><p>黄金、原油 15 分钟的几个固定时段（控制台“规则吃单”一组，RULE_TAKER）：开场前盘口出现规则价格以下的指定方向就吃单，每场最多 RULE_SHARES 份。真实吃单和只记录（paper：按当时盘口记下会买到多少，不下单）分开算；成本含吃单手续费，按 Predict 的结果结算。不受上面的筛选条影响。</p></details></details>
+<details class="fold" data-k="ruletaker" id="h-rules" hidden><summary><h3>规则吃单</h3></summary><div id="a-rules"></div><details class="hint"><summary>说明</summary><p>黄金、原油、宇树 15 分钟的几个固定时段（控制台“规则吃单”一组，RULE_TAKER）：开场前盘口出现规则价格以下的指定方向就吃单，每场最多 RULE_SHARES 份。真实吃单和只记录（paper：按当时盘口记下会买到多少，不下单）分开算；成本含吃单手续费，按 Predict 的结果结算。不受上面的筛选条影响。</p></details></details>
 <details class="fold" data-k="makers"><summary><h3>挂单效率</h3></summary><div id="a-makers"></div></details>
 <details class="fold" data-k="blocked"><summary><h3>被拦下的机会</h3></summary><div id="a-blocked"></div><details class="hint"><summary>说明</summary><p>组上限（SIM_GROUP_USD）最近一周拦下的买入：市场已出结果的，按每笔份数（SIM_SHARES）算若当时买入的盈亏——长期为正说明上限偏紧。</p></details></details></div></section>
 <section class="box" id="statsbox"><div class="hd" id="statshd"><h2>统计与风险</h2><span class="sum" id="statsum"></span><button type="button" class="lnk" id="foldstats">展开</button></div>
@@ -16903,7 +16922,7 @@ function switchMode(v){if(data.live&&v===data.live.mode)return;
   const ask={on:"切到 LIVE=on 后，模拟交易的每个决定都会在 Predict 真实下单。继续？",off:"切到 LIVE=off 会撤掉未成交的真实挂单并回到只记账（已有持仓继续跟踪到结算）。继续？",pause:"切到 LIVE=pause：登录 Predict、可自检和挂单测试，不开新仓。继续？"}[v];
   if(ask&&!confirm(ask))return;act({action:"mode",value:v})}
 $("modebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b||b.disabled)return;switchMode(b.dataset.mode)});
-const GROUPS=[["策略","策略"],["风控","真实交易风控"],["预挂","开盘前预挂（15 分钟市场）"],["规则","规则吃单（黄金、原油固定时段）"],["高级","高级参数"]];
+const GROUPS=[["策略","策略"],["风控","真实交易风控"],["预挂","开盘前预挂（15 分钟市场）"],["规则","规则吃单（黄金、原油、宇树固定时段）"],["高级","高级参数"]];
 function fmt(s,v){return s.unit==="$"?"$"+v:s.unit==="¢"?v+"¢":s.unit?v+" "+s.unit:v}
 function capOf(s,v){return s.captions&&s.captions[v]?"（"+s.captions[v]+"）":""}  // a preset's own name: 1440 分钟（挂满） (1.152.2)
 function selected(s){return new Set(s.kind==="multi"?(s.value==="all"?s.options.map(o=>o[0]):s.value.split(",")):[s.value])}

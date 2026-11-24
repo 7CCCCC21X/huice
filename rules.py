@@ -12,8 +12,15 @@ index ahead of the window's start on the rule's side (Rule.lead; live_guard): in
 who is ahead, and a price alone would buy the side that is losing. From LIVE_START_MS after the start to LIVE_STOP_MS before the
 end, each second; in the first minute no dearer than before the window; the window's shares and the day's cap are one.
 
+宇树 14:30 (1.154.40, RULE_UNITREE_1430_CENTS / RULE_UNITREE_1430_LIVE_CENTS; off by default): the 宇树 15-minute card's
+14:30–14:45 window (Beijing; Shanghai trading days), Down. On the index the card settles on (Binance's UNITREEUSDT index, 1-minute
+closes), 2026-10-09 to 11-20, 31 trading days: Down 25 (81%; the day's other windows 23–61%) — after a 14:15 that closed Up,
+16 of 16; after one that closed Down, 9 of 15. Before the window at its own price, as the other rules; in its course only after the
+window before it closed the rule's way (Rule.after: known at the window's start, by the card's own candles — after_guard).
+
 The windows are set in New York time from CME's schedule (main.cme_shuts), so they follow daylight saving: gold's shut
-quarter hours are 06:00–06:45 Beijing in winter and 05:00–05:45 in summer. Each rule's price is a setting (RULE_*_CENTS,
+quarter hours are 06:00–06:45 Beijing in winter and 05:00–05:45 in summer; a stock card's on its exchange's own session and
+holidays (windows). Each rule's price is a setting (RULE_*_CENTS,
 0 = the rule off), RULE_TAKER switches the whole: off, paper (只记录：what it would have bought, at the book's prices,
 settled on Predict's result — no order), on (real orders, with LIVE=on and every stop the model trader has: the pause,
 the day's loss stop, the operator's switches, the API's cooldown, the balance).
@@ -211,6 +218,16 @@ def ny_slot(hour: int, minute: int) -> Callable[[int], bool]:
 ny_0515 = ny_slot(5, 15)
 
 
+def sh_slot(hour: int, minute: int) -> Callable[[int], bool]:
+    """The quarter hour from hour:minute Beijing time, Monday to Friday (1.154.40: 宇树's card follows the Shanghai session — a
+    holiday's windows have no market, left out by windows() on the card's own calendar)."""
+    def matches(start_ms: int) -> bool:
+        at = dt.datetime.fromtimestamp(start_ms / 1000, core.BEIJING)
+        return at.weekday() <= 4 and (at.hour, at.minute) == (hour, minute)
+    matches.__name__ = f"bj_{hour:02d}{minute:02d}"
+    return matches
+
+
 @dataclasses.dataclass(frozen=True)
 class Rule:
     key: str                       # its price setting (RuleSettings, RULE_SETTING_KEYS) and the records' "rule"
@@ -227,6 +244,11 @@ class Rule:
     #                                minute 2 ended Up 98% (October 80–92%), merely not under the start 93%. The reopen's first, 0.02%: 192
     #                                windows, Down 58% — Down ahead so ended Down 89–91% at minutes 1–4 (the first half-year 70–85%), 94–99%
     #                                from minute 5; Up ahead: Down 38% falling to 20%
+    after: str = ""                # 盘中 (1.154.40): bought in the window's course only after the window before it closed this way ("up" /
+    #                                "down": by the index's minute candles the card keeps — after_guard), whatever the index does in this
+    #                                one; known at the start, so the first minute is not held to the price before the window. "" — no such
+    #                                condition. 宇树 14:30 after a 14:15 that closed Up: Down 16 of 16 (2026-10-09..11-20), the index above
+    #                                the start at minute 5 on 4 of them, at minute 10 on 3, and Down all the same
 
     @property
     def word(self) -> str:
@@ -242,9 +264,10 @@ RULES: tuple[Rule, ...] = (
     Rule("oil_shut", "oil", "CL-15M", "down", "原油休市 4 档", "纽约 17:00–17:45，周一至周四（北京冬令时 06:00–06:45、夏令时 05:00–05:45）", daily_break),
     Rule("oil_0045", "oil", "CL-15M", "down", "原油纽约 00:45", "纽约 00:45，周一至周五（北京冬令时 13:45、夏令时 12:45）", ny_slot(0, 45)),
     Rule("oil_open", "oil", "CL-15M", "down", "原油开盘第一档", "纽约 18:00，周一至周四（北京冬令时 07:00、夏令时 06:00；周一早上那场不做）", daily_reopen),
+    Rule("unitree_1430", "unitree", "UNITREE-15M", "down", "宇树 14:30", "北京 14:30–14:45，上交所交易日（休市日没有这一场）", sh_slot(14, 30), after="up"),
 )
 RULE_OF = {r.key: r for r in RULES}
-MARKET_NAMES = {"gold": "黄金", "oil": "原油"}
+MARKET_NAMES = {"gold": "黄金", "oil": "原油", "unitree": "宇树"}
 
 
 def live_rule(settings: Any, rule: Rule) -> bool:
@@ -256,12 +279,17 @@ def card_of(rule: Rule) -> Any:
     return next(c for c in core.WINDOW_UPDOWN_MARKETS if c.key == rule.card)
 
 
-def windows(rule: Rule, from_ms: int, to_ms: int) -> list[int]:
-    """The starts of the rule's windows in [from_ms, to_ms)."""
+def windows(rule: Rule, from_ms: int, to_ms: int, holidays: Any = None) -> list[int]:
+    """The starts of the rule's windows in [from_ms, to_ms) — on a card that follows a stock exchange's session (宇树's, 1.154.40),
+    only those with a market on its calendar: weekends and the exchange's ``holidays`` (Config.holidays; the built-in table
+    when none is given) left out."""
     card = card_of(rule)
+    if holidays is None and getattr(card, "exchange", ""):
+        holidays = core.parse_holidays({})
+    shut = (holidays or {}).get(card.exchange, frozenset()) if getattr(card, "exchange", "") else frozenset()
     out, start = [], card.first_start(from_ms)
     while start < to_ms:
-        if rule.matches(start):
+        if rule.matches(start) and (not getattr(card, "exchange", "") or card.exists(start, shut)):
             out.append(start)
         start = card.next_start(start)
     return out
@@ -708,15 +736,18 @@ def course_stats(recs: dict[str, dict], rule: str, mode: str, since_ms: int = 0)
 
 def live_price_of(settings: Any, rule: Rule) -> int:
     """The rule's price in its window's course by the settings (RULE_*_LIVE_CENTS), 0 = none: no such price, its market off, a rule
-    with no way to judge a window's course (Rule.lead)."""
-    if not rule.lead > 0 or not settings.on(rule.market):
+    with no way to judge a window's course (Rule.lead, Rule.after)."""
+    if not (rule.lead > 0 or rule.after) or not settings.on(rule.market):
         return 0
     return int(getattr(settings, "live_price", lambda key: 0)(rule.key))
 
 
 def lead_note(rule: Rule) -> str:
-    """The course's condition in a few words: 指数比起点高 0.005% 以上才买."""
-    return f"指数比起点{'高' if rule.side == 'up' else '低'} {float(rule.lead) * 100:g}% 以上才买"
+    """The course's condition in a few words: 指数比起点高 0.005% 以上才买 / 前一场收涨才买."""
+    parts = [f"前一场收{'涨' if rule.after == 'up' else '跌'}"] if rule.after else []
+    if rule.lead > 0:
+        parts.append(f"指数比起点{'高' if rule.side == 'up' else '低'} {float(rule.lead) * 100:g}% 以上")
+    return "、".join(parts) + "才买"
 
 
 def speed_stats(recs: dict[str, dict], since_ms: int) -> dict | None:
@@ -1469,8 +1500,10 @@ class RuleTaker:
                     until, course = at + QUIET_AFTER_MS, False        # the makers' moment
                 elif (begins - QUIET_BEFORE_MS <= at_ms < begins + COURSE_QUIET_MS and self.live_cents(rule) > 0
                       # (those seconds are of the course's first minute, bought no dearer than before the window: with no price
-                      # there nothing is — nor without the bot's card of the market, which says who is ahead)
-                      and self.settings.price(rule.key) > 0 and (getattr(self.owner, "updowns", None) or {}).get(rule.card) is not None):
+                      # there nothing is — nor without the bot's card of the market, which says who is ahead. 1.154.40: a rule
+                      # that goes by the window before it is not held to that price — and is bought only after that one closed its way)
+                      and (self.settings.price(rule.key) > 0 or rule.after) and (getattr(self.owner, "updowns", None) or {}).get(rule.card) is not None
+                      and not (rule.after and self.after_guard(slug, rule))):
                     until, course = begins + COURSE_QUIET_MS, True    # its course begins
                 elif self.rushing(w):
                     until, course = at_ms + RUSH_QUIET_MS, False      # an offer in hand, matching not open yet
@@ -1802,7 +1835,7 @@ class RuleTaker:
                 course = self.live_cents(rule) > 0  # 1.154.14: bought in the window's course too — followed to LIVE_STOP_MS before its end
                 if live_rule(self.settings, rule) or course:  # its market switched on (RULE_GOLD / RULE_OIL) and a price set
                     back = card_of(rule).window_ms - 1 if course else -STOP_MS
-                    for start in windows(rule, now - back, now + HORIZON_MS):
+                    for start in windows(rule, now - back, now + HORIZON_MS, self.holidays()):
                         if not self.over({"rule": rule.key, "start": start}, now):
                             want[card_of(rule).slug_of(start)] = (rule.key, start)
         for slug in list(self.track):
@@ -1828,6 +1861,45 @@ class RuleTaker:
         """The rule's highest price in its window's course (RULE_*_LIVE_CENTS, 1.154.14), cents; 0 = it buys before the window alone
         (no such price set, its market switched off, or a rule that has no way to judge the window's course)."""
         return live_price_of(self.settings, rule)
+
+    def holidays(self) -> dict:
+        """The exchanges' holidays (Config.holidays: HOLIDAYS_CN and the rest) — a stock card's windows follow its exchange's
+        calendar (windows, 1.154.40); the built-in table for an owner without them (a test's)."""
+        got = getattr(getattr(self.owner, "config", None), "holidays", None)
+        return got if isinstance(got, dict) else core.parse_holidays({})
+
+    def candle(self, slug: str, which: str, open_ms: int) -> D | None:
+        """The close of a window's start or end candle as the bot's card of its market kept it (updown:<slug>:start / :end —
+        main.UpDownMarket.close_of), None while not read."""
+        saved = self.store.get(f"updown:{slug}:{which}")
+        with contextlib.suppress(TypeError, KeyError, ValueError, ArithmeticError):
+            if int(saved["open"]) == open_ms:
+                value = D(str(saved["close"]))
+                return value if value > 0 else None
+        return None
+
+    def after_guard(self, slug: str, rule: Rule) -> str:
+        """Why the rule's side is not bought in its window's course for the window before it (Rule.after, 1.154.40), "" when that one
+        closed the rule's way: its start candle's close against its end's — which is this window's start; by the candles the bot's
+        card of the market keeps (the card the rule's price in the course keeps followed: LiveBot.window_use). An end equal to the
+        start is neither way. Not while either candle is unread (a few seconds after the start, before the card has its minute)."""
+        card = card_of(rule)
+        start = card.start_of(slug)
+        if start is None:
+            return "场次和规则对不上"
+        this = card.window_spec(start)
+        shut = self.holidays().get(card.exchange, frozenset()) if getattr(card, "exchange", "") else frozenset()
+        prev = card.before(this, shut)
+        name = bj(prev.start_ms + 60_000, day=False)
+        first = self.candle(prev.slug, "start", prev.start_ms)
+        last = self.candle(prev.slug, "end", prev.end_ms) or (self.candle(this.slug, "start", this.start_ms) if prev.end_ms == this.start_ms else None)
+        if first is None or last is None:
+            return f"还没读到前一场（{name}）的{'起点价' if first is None else '收盘价'}，不买"
+        went = "up" if last > first else "down" if last < first else ""
+        if went == rule.after:
+            return ""
+        return (f"前一场（{name}）收{'涨' if went == 'up' else '跌' if went else '平'}（{core.fmt(first)} → {core.fmt(last)}），"
+                f"这条规则要前一场收{'涨' if rule.after == 'up' else '跌'}才买")
 
     def end_of(self, w: dict) -> int:
         return card_of(RULE_OF[w["rule"]]).end_of(w["start"])
@@ -1855,10 +1927,15 @@ class RuleTaker:
         start is the close of the index's minute candle ending there (what the backtest measured against) and, when Predict
         shows its own start price and it agrees with that candle (IndexUpDownMarket.line_used), that one too: ahead of both —
         of whichever is the less kind to the side. Not on a card still on another window, without a start or an index, nor on
-        an index too old by the card's own rule (price_problem)."""
+        an index too old by the card's own rule (price_problem). 1.154.40: a rule that goes by the window before it (Rule.after) —
+        that one's close first (after_guard); with no Rule.lead, nothing more."""
         card = (getattr(self.owner, "updowns", None) or {}).get(rule.card)
         if card is None:
-            return f"机器人没有 {rule.card} 这张卡，判断不了涨跌谁领先"
+            return f"机器人没有 {rule.card} 这张卡，判断不了{'前一场收涨还是收跌' if rule.after and not rule.lead > 0 else '涨跌谁领先'}"
+        if rule.after and (why := self.after_guard(slug, rule)):
+            return why
+        if not rule.lead > 0:
+            return ""  # (1.154.40: the window before alone — whatever the index does in this one)
         if getattr(getattr(card, "spec", None), "slug", "") != slug:
             return "卡片还没换到这一场，等起点价"
         lines = [x for x in {card.close_of("start"), card.line_used()} if x is not None and x > 0]
@@ -1937,7 +2014,7 @@ class RuleTaker:
         rec = self.record(slug)
         size = self.settings.shares_of(rule.market)
         cents = self.live_cents(rule) if course else self.settings.price(rule.key)
-        early = course and now - w["start"] < LIVE_FULL_MS
+        early = course and not rule.after and now - w["start"] < LIVE_FULL_MS  # (1.154.40: what Rule.after waits for is known at the start)
         if early:
             cents = min(cents, self.settings.price(rule.key))  # the window's first minute: no dearer than before it
         if done := self.finished(slug, rule, course):
@@ -1970,6 +2047,7 @@ class RuleTaker:
             return
         if cents <= 0:  # (its market found all the same: subscribed and at hand when the window's course begins)
             w["word"] = ("盘中：开场后第 1 分钟最高按盘前的价格买（盘前价格是 0，不买），1 分钟后按盘中的价格" if early
+                         else f"盘前不买这条（盘前价格是 0），开场后按盘中的价格买（{lead_note(rule)}）" if rule.after
                          else "盘前不买这条（盘前价格是 0），开场 1 分钟后按盘中的价格买")
             return
         if course and (why := self.live_guard(slug, rule, now)):
@@ -3044,9 +3122,12 @@ class RuleTaker:
         now, s = self.now(), self.settings
         recs = self.recs
         in_course = any(self.live_cents(r) > 0 for r in RULES)
+        # (1.154.40: the first minute held to the price before the window is the index-led rules' — one that goes by the window before
+        # it knows what it waits for at the start)
+        capped, free = (any(self.live_cents(r) > 0 and not r.after for r in RULES), any(self.live_cents(r) > 0 and r.after for r in RULES))
         lines = [f"规则吃单：{MODES.get(s.mode, s.mode)}（RULE_TAKER={s.mode}）｜{'开场前吃' if in_course else '只在开场前吃'}，盘口一有就买，到开场前 {STOP_MS // 1000} 秒"
-                 + (f"；设了盘中价格的规则开场后接着买（开场 {LIVE_START_MS // 1000} 秒后到结束前 {LIVE_STOP_MS // 1000} 秒，"
-                    f"第 1 分钟最高按盘前的价格）" if in_course else "")
+                 + (f"；设了盘中价格的规则开场后接着买（开场 {LIVE_START_MS // 1000} 秒后到结束前 {LIVE_STOP_MS // 1000} 秒"
+                    + (f"，{'看指数的规则' if free else ''}第 1 分钟最高按盘前的价格" if capped else "") + "）" if in_course else "")
                  + (f"｜每天最多花 ${s.max_day_usd:g}（今天已花 ${spent_on(recs, day_of(now), s.mode):,.2f}）" if s.max_day_usd else "")
                  + f"｜推送 {'已连接' if self.stream.ws is not None else '未连接' + ('（' + self.stream.error + '）' if self.stream.error else '')}"]
         if s.mode == "on" and (why := self.block(0.0)):

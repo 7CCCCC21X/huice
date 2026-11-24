@@ -791,7 +791,8 @@ def market_shut(rolling: Any, start_ms: int) -> str:
 # rule taker has them off by default, but the lean is the window's, whoever trades it: both sides bid there, the losing one is
 # sold to it first. With one of them on in the rule taker, this mode's bid on the other side also held the taker's limit under it
 # (the self-trade guard: rules.RuleTaker.own_asks)
-LEANING_RULES = {"XAU-15M": ("gold_0515", "gold_0500", "gold_1645"), "CL-15M": ("oil_0045",)}
+# 1.154.40: 宇树's 14:30 (Beijing) — Down 81% on its card's own index (2026-10-09..11-20), the day's other windows 23–61%
+LEANING_RULES = {"XAU-15M": ("gold_0515", "gold_0500", "gold_1645"), "CL-15M": ("oil_0045",), "UNITREE-15M": ("unitree_1430",)}
 
 
 def rules_of(key: str) -> Any:

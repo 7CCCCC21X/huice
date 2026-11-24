@@ -174,6 +174,30 @@ def gold_card(x, clock, start, line, price, strike=None, age_ms=0):
     return card
 
 
+# 1.154.40 — 宇树's 14:30: Tuesday 2026-11-17, a Shanghai trading day
+UNI = next(c for c in m.WINDOW_UPDOWN_MARKETS if c.key == "UNITREE-15M")
+UNI_1430 = bj(2026, 11, 17, 14, 30)
+UNI_ENV = {"RULE_GOLD": "off", "RULE_OIL": "off", "RULE_LEAD_MINUTES": "0"}
+
+
+def unitree_market(start, mid=905, status="OPEN"):
+    return {"id": mid, "categorySlug": f"unitree-updown-15m-{start // 1000}", "conditionId": "0xd", "status": "REGISTERED", "tradingStatus": status,
+            "question": "宇树科技 (UNITREE) Up or Down", "feeRateBps": 200,
+            "outcomes": [{"name": "Up", "indexSet": 1, "onChainId": str(mid * 2)}, {"name": "Down", "indexSet": 2, "onChainId": str(mid * 2 + 1)}]}
+
+
+def uni_candles(x, start, first, last):
+    """The candles the bot's own 宇树 card kept of the window starting at ``start`` (updown:<slug>:start / :end, as
+    main.UpDownMarket.read_candles and the card's roll write them); None: that one not read."""
+    spec = UNI.window_spec(start)
+    for which, open_ms, close in (("start", spec.start_ms, first), ("end", spec.end_ms, last)):
+        key = f"updown:{spec.slug}:{which}"
+        if close is None:
+            x.owner.store.delete_keys([key])
+        else:
+            x.owner.store.put(key, {"open": open_ms, "close": str(close), "read_ms": 0})
+
+
 class RuleTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         # a taker these tests set "running" by hand never ends its run: what its ticks held of the collector (gc_guard) is let go
@@ -2447,8 +2471,9 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError, msg=bad):
                 m.Config.from_env({**base, "RULE_TAKER": "paper", "RULE_GOLD_OPEN_LIVE_CENTS": bad})
         self.assertEqual(m.Config.from_env({**base, "RULE_GOLD_SHUT_LIVE_CENTS": "98"}).rules.live_price("gold_shut"), 0, "off: read leniently")
-        self.assertEqual({r.key for r in R.RULES if r.lead > 0}, set(m.RULE_LIVE_KEYS), "a way to judge the course, and a price for it")
-        self.assertEqual({k: R.RULE_OF[k].lead for k in m.RULE_LIVE_KEYS}, {"gold_shut": D("0.00005"), "gold_open": D("0.0002")})
+        self.assertEqual({r.key for r in R.RULES if r.lead > 0 or r.after}, set(m.RULE_LIVE_KEYS), "a way to judge the course, and a price for it")
+        self.assertEqual({k: (R.RULE_OF[k].lead, R.RULE_OF[k].after) for k in m.RULE_LIVE_KEYS},
+                         {"gold_shut": (D("0.00005"), ""), "gold_open": (D("0.0002"), ""), "unitree_1430": (D(0), "up")})  # (1.154.40: the window before)
         self.assertEqual([R.lead_note(R.RULE_OF[k]) for k in ("gold_shut", "gold_open")], ["指数比起点高 0.005% 以上才买", "指数比起点低 0.02% 以上才买"])
         for key in m.RULE_LIVE_KEYS.values():
             form = m.CONTROL_FORMS[key]
@@ -3865,6 +3890,126 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((t.journal_fd, t.journal({"slug": "s", "mode": "on"}, {})), (None, False))
             finally:
                 x.owner.store.close()
+
+    def test_unitree_1430_on_the_shanghai_calendar(self):
+        """1.154.40 — 宇树 14:30: Down, the 14:30–14:45 window (Beijing) of Shanghai trading days alone — a weekend's, a holiday's
+        (HOLIDAYS_CN: the National Day week) and the day's other quarter hours left out; off until priced (both prices 0), with its
+        own switch and size; in its course after a 14:15 that closed Up (Rule.after, no index lead); the control page has its four
+        settings; the pre-open mode leaves the window out, and only that one."""
+        rule = R.RULE_OF["unitree_1430"]
+        self.assertEqual((rule.market, rule.card, rule.side, rule.after, rule.lead, R.MARKET_NAMES["unitree"]),
+                         ("unitree", "UNITREE-15M", "down", "up", D(0), "宇树"))
+        hol = m.parse_holidays({})
+        got = R.windows(rule, bj(2026, 9, 28, 0), bj(2026, 10, 13, 0), hol)
+        self.assertEqual([dt.datetime.fromtimestamp(s / 1000, BJ).strftime("%m-%d %H:%M") for s in got],
+                         ["09-28 14:30", "09-29 14:30", "09-30 14:30", "10-08 14:30", "10-09 14:30", "10-12 14:30"],
+                         "10-01..10-07 (the holiday) and the weekends: no market")
+        self.assertEqual(R.windows(rule, bj(2026, 9, 28, 0), bj(2026, 10, 13, 0)), got, "the built-in table when none is given")
+        self.assertEqual(len(R.windows(rule, bj(2026, 9, 28, 0), bj(2026, 10, 13, 0), {"sh": frozenset()})), 11, "a calendar without holidays: every weekday")
+        self.assertEqual([rule.matches(at) for at in (bj(2026, 11, 17, 14, 15), bj(2026, 11, 17, 14, 45), bj(2026, 11, 21, 14, 30), bj(2026, 11, 17, 14, 30))],
+                         [False, False, False, True])
+        self.assertEqual(R.windows(R.RULE_OF["gold_shut"], NOW, NOW + 3_600_000, hol), R.windows(R.RULE_OF["gold_shut"], NOW, NOW + 3_600_000),
+                         "a card without an exchange session: as before")
+        base = {"TELEGRAM_BOT_TOKEN": "offline"}
+        c = m.Config.from_env({**base, "RULE_TAKER": "on"}).rules
+        self.assertEqual((c.price("unitree_1430"), c.live_price("unitree_1430"), c.on("unitree"), c.shares_of("unitree"), R.live_rule(c, rule), R.live_price_of(c, rule)),
+                         (0, 0, True, 50, False, 0), "off until priced")
+        c = m.Config.from_env({**base, "RULE_TAKER": "on", "RULE_UNITREE_1430_CENTS": "60", "RULE_UNITREE_1430_LIVE_CENTS": "75", "RULE_UNITREE_SHARES": "30"}).rules
+        self.assertEqual((c.price("unitree_1430"), c.live_price("unitree_1430"), c.shares_of("unitree"), R.live_rule(c, rule), R.live_price_of(c, rule)),
+                         (60, 75, 30, True, 75))
+        off = m.Config.from_env({**base, "RULE_TAKER": "on", "RULE_UNITREE": "off", "RULE_UNITREE_1430_LIVE_CENTS": "75"}).rules
+        self.assertEqual((R.live_rule(off, rule), R.live_price_of(off, rule), off.on("gold")), (False, 0, True), "its market switched off, the others as they were")
+        for bad in ({"RULE_UNITREE": "maybe"}, {"RULE_UNITREE_SHARES": "0"}, {"RULE_UNITREE_1430_CENTS": "96"}, {"RULE_UNITREE_1430_LIVE_CENTS": "98"}):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                m.Config.from_env({**base, "RULE_TAKER": "paper", **bad})
+        self.assertEqual(R.lead_note(rule), "前一场收涨才买")
+        for key in ("RULE_UNITREE", "RULE_UNITREE_SHARES", "RULE_UNITREE_1430_CENTS", "RULE_UNITREE_1430_LIVE_CENTS"):
+            self.assertTrue(key in m.CONTROL_KEY_SET and m.CONTROL_FORMS[key]["group"] == "规则", key)
+        self.assertEqual((m.CONTROL_FORMS["RULE_UNITREE_1430_CENTS"]["zero"], m.CONTROL_FORMS["RULE_UNITREE_1430_LIVE_CENTS"]["zero"]), ("不做", "盘中不做"))
+        bot = types.SimpleNamespace(config=m.Config.from_env({**base, "RULE_TAKER": "paper", "RULE_UNITREE_1430_LIVE_CENTS": "75"}))
+        self.assertEqual([m.Bot.control_value(bot, k) for k in ("RULE_UNITREE", "RULE_UNITREE_SHARES", "RULE_UNITREE_1430_CENTS", "RULE_UNITREE_1430_LIVE_CENTS")],
+                         ["on", "50", "0", "75"])
+        # the pre-open mode leaves the window out whoever trades it (preopen.LEANING_RULES), and only that one
+        self.assertIn("宇树 14:30 这一场不挂", p.leaning_window(UNI, UNI_1430))
+        self.assertEqual([p.leaning_window(UNI, bj(2026, 11, 17, 14, mi)) for mi in (0, 15, 45)], ["", "", ""])
+
+    async def test_unitree_1430_in_its_course_after_a_1415_that_closed_up(self):
+        """1.154.40 — 宇树 14:30 in its course (RULE_UNITREE_1430_LIVE_CENTS): Down is bought only after the 14:15 window closed Up,
+        by the candles the bot's card keeps — the window before's start against its end (this window's start, the same candle,
+        standing in while the end is unread); not while one is unread, not after a 14:15 that closed Down or level, not without
+        the card. Whatever the index does in this window (no lead), and from the course's first seconds at the course's own price:
+        what it waits for is known at the start. The status says so; the first seconds of its course are quiet for the others only
+        after a 14:15 that closed Up."""
+        t, api, clock, x = taker("on", RULE_UNITREE_1430_LIVE_CENTS="75", RULE_UNITREE_SHARES="40", **UNI_ENV)
+        t.verify_tick = lambda: None
+        slug, end, prev = f"unitree-updown-15m-{UNI_1430 // 1000}", UNI_1430 + 900_000, UNI_1430 - 900_000
+        api.markets["905"] = unitree_market(UNI_1430)
+        api.listed.add(slug)
+        api.books["905"] = {"bids": [[0.30, 30], [0.20, 50]], "asks": []}  # (an Up bid at p is Down offered at 1 − p: 70¢ × 30, 80¢ × 50)
+        clock.ms = UNI_1430 - 60_000
+        await t.tick()
+        w = t.track[slug]
+        self.assertEqual((w["word"], api.sent), ("盘前不买这条（盘前价格是 0），开场后按盘中的价格买（前一场收涨才买）", []))
+        status = t.status()
+        self.assertIn("宇树：开｜每场最多 40 份", status)
+        self.assertIn("· 宇树 14:30 买跌 盘前不买｜盘中 ≤75¢（前一场收涨才买）：北京 14:30–14:45，上交所交易日（休市日没有这一场）", status)
+        self.assertIn("设了盘中价格的规则开场后接着买（开场 3 秒后到结束前 15 秒）", status, "no first-minute cap said: it has none")
+        self.assertNotIn("黄金：开", status)
+        clock.ms = UNI_1430 + 4_000
+        await t.tick()
+        self.assertEqual((w["word"], api.sent), ("盘中：机器人没有 UNITREE-15M 这张卡，判断不了前一场收涨还是收跌", []))
+        self.assertEqual(t.quiet_ms(clock.ms), 0, "nothing to buy yet: the others need not wait")
+        x.owner.updowns = {"UNITREE-15M": object()}  # (the card itself is not read here: the candles it kept are)
+        for (first, last, this_start), word in (
+                ((None, None, None), "盘中：还没读到前一场（14:15）的起点价，不买"),
+                ((100, None, None), "盘中：还没读到前一场（14:15）的收盘价，不买"),
+                ((100, None, "99.5"), "盘中：前一场（14:15）收跌（100 → 99.5），这条规则要前一场收涨才买"),
+                ((100, 100, "100.5"), "盘中：前一场（14:15）收平（100 → 100），这条规则要前一场收涨才买")):  # (its own end first)
+            clock.ms += 1_000
+            uni_candles(x, prev, first, last)
+            uni_candles(x, UNI_1430, this_start, None)
+            await t.tick()
+            self.assertEqual((w["word"], api.sent), (word, []), (first, last, this_start))
+            self.assertEqual(t.quiet_ms(clock.ms), 0)
+        # 14:15 closed Up (its end unread: this window's start stands for it) — bought in the course's first minute, at its own 75¢
+        clock.ms += 1_000
+        uni_candles(x, prev, 100, None)
+        uni_candles(x, UNI_1430, "100.03", None)
+        self.assertGreater(t.quiet_ms(clock.ms), 0, "the course's first seconds: the others wait")
+        api.fill[1], api.price = 30.0, 0.70
+        await t.tick()
+        self.assertLess(clock.ms - UNI_1430, R.LIVE_FULL_MS)
+        self.assertEqual(len(api.sent), 1, w["word"])
+        signed = api.sent[0]["data"]["order"]
+        self.assertEqual((L.from_wei(int(signed["takerAmount"])), int(signed["expiration"])), (40.0, end // 1000 - R.EXPIRY_BEFORE_S),
+                         "30 on offer within 75¢: all the window may buy asked for; signed to end before the window does")
+        order = t.record(slug)["orders"][-1]
+        self.assertEqual((order["live"], order["limit"], t.record(slug)["side"], t.record(slug)["rule"], w["word"]),
+                         (True, 0.75, "down", "unitree_1430", "盘中 已下单：跌 ≤75¢ × 40 份"))
+        self.assertEqual(signed["tokenId"], str(905 * 2 + 1), "the Down outcome's token")
+
+    async def test_unitree_1430_on_paper_and_before_its_start(self):
+        """1.154.40 — 宇树 14:30 with a price before the window (RULE_UNITREE_1430_CENTS): bought before the start as the other rules
+        are (the offers of Down at the price), no condition there — the 14:15 window has not ended; only on paper (RULE_TAKER=paper)
+        it is recorded, and in its course too, after a 14:15 that closed Up, recorded at once — not held to the course's second minute."""
+        t, api, clock, x = taker("paper", RULE_UNITREE_1430_CENTS="60", RULE_UNITREE_1430_LIVE_CENTS="75", RULE_UNITREE_SHARES="40", **UNI_ENV)
+        t.verify_tick = lambda: None
+        slug, prev = f"unitree-updown-15m-{UNI_1430 // 1000}", UNI_1430 - 900_000
+        api.markets["905"] = unitree_market(UNI_1430)
+        api.listed.add(slug)
+        api.books["905"] = {"bids": [[0.42, 25], [0.30, 30]], "asks": []}  # Down at 58¢ × 25, 70¢ × 30
+        clock.ms = UNI_1430 - 120_000
+        await t.tick()
+        rec = t.record(slug)
+        self.assertEqual([(o.get("paper"), bool(o.get("live")), o.get("limit")) for o in rec["orders"]], [(True, False, 0.6)], t.track[slug]["word"])
+        self.assertEqual(R.filled(rec), 25.0, "the 25 at 58¢ within the rule's 60¢, on paper")
+        x.owner.updowns = {"UNITREE-15M": object()}
+        uni_candles(x, prev, 100, "100.2")
+        clock.ms = UNI_1430 + 4_000
+        await t.tick()
+        rec = t.record(slug)
+        self.assertEqual([(bool(o.get("live")), o.get("limit")) for o in rec["orders"]], [(False, 0.6), (True, 0.75)], t.track[slug]["word"])
+        self.assertEqual(R.filled(rec), 40.0, "the window's 40: 25 before, 15 in its course (70¢)")
 
 
 if __name__ == "__main__":
