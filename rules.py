@@ -209,13 +209,14 @@ def daily_break(start_ms: int) -> bool:
 
 
 def daily_reopen(start_ms: int) -> bool:
-    """The first quarter hour after CME's daily break: 18:00 New York, Monday to Thursday, the stretch shut before it the
-    one-hour break itself — not the weekend's (Sunday's 18:00, 北京周一早上: no lean, 2026: Down 41%) nor a holiday's."""
+    """The first quarter hour after CME reopens at 18:00 New York, Monday to Thursday: after its daily one-hour break — and,
+    1.154.71 (the user, of 11-27 07:00 北京 not bought: "节假日后的开盘也买"), after a holiday's shut too: Thanksgiving's from
+    noon, a holiday Monday's. Not the weekend's (Sunday's 18:00, 北京周一早上: no lean, 2026: Down 41%). A Monday-to-Thursday
+    18:00 that reopens nothing (CME shut on through it: a holiday's whole next day) is none."""
     weekday, hour, minute = et_parts(start_ms)
     if weekday > 3 or (hour, minute) != (18, 0):
         return False
-    ending = [s for s in core.market_shuts("cme", start_ms - 60_000, start_ms) if s[1] == start_ms]
-    return bool(ending) and ending[0][1] - ending[0][0] <= 65 * 60_000
+    return any(s[1] == start_ms for s in core.market_shuts("cme", start_ms - 60_000, start_ms))
 
 
 def ny_slot(hour: int, minute: int) -> Callable[[int], bool]:
@@ -258,13 +259,13 @@ class Rule:
 
 RULES: tuple[Rule, ...] = (
     Rule("gold_shut", "gold", "XAU-15M", "up", "黄金休市 4 档", "纽约 17:00–17:45，周一至周四（北京冬令时 06:00–06:45、夏令时 05:00–05:45）", daily_break, D("0.00005")),
-    Rule("gold_open", "gold", "XAU-15M", "down", "黄金开盘第一档", "纽约 18:00，周一至周四（北京冬令时 07:00、夏令时 06:00；周一早上那场不做）", daily_reopen, D("0.0002")),
+    Rule("gold_open", "gold", "XAU-15M", "down", "黄金开盘第一档", "纽约 18:00，周一至周四（北京冬令时 07:00、夏令时 06:00；周一早上那场不做，节假日停盘后的那一场也做）", daily_reopen, D("0.0002")),
     Rule("gold_0515", "gold", "XAU-15M", "down", "黄金纽约 05:15", "纽约 05:15，周一至周五（北京冬令时 18:15、夏令时 17:15）", ny_0515),
     Rule("gold_0500", "gold", "XAU-15M", "up", "黄金纽约 05:00", "纽约 05:00，周一至周五（北京冬令时 18:00、夏令时 17:00）", ny_slot(5, 0)),
     Rule("gold_1645", "gold", "XAU-15M", "up", "黄金休市前一档", "纽约 16:45，周一至周五（北京冬令时 05:45、夏令时 04:45）", ny_slot(16, 45)),
     Rule("oil_shut", "oil", "CL-15M", "down", "原油休市 4 档", "纽约 17:00–17:45，周一至周四（北京冬令时 06:00–06:45、夏令时 05:00–05:45）", daily_break),
     Rule("oil_0045", "oil", "CL-15M", "down", "原油纽约 00:45", "纽约 00:45，周一至周五（北京冬令时 13:45、夏令时 12:45）", ny_slot(0, 45)),
-    Rule("oil_open", "oil", "CL-15M", "down", "原油开盘第一档", "纽约 18:00，周一至周四（北京冬令时 07:00、夏令时 06:00；周一早上那场不做）", daily_reopen),
+    Rule("oil_open", "oil", "CL-15M", "down", "原油开盘第一档", "纽约 18:00，周一至周四（北京冬令时 07:00、夏令时 06:00；周一早上那场不做，节假日停盘后的那一场也做）", daily_reopen),
 )
 RULE_OF = {r.key: r for r in RULES}
 MARKET_NAMES = {"gold": "黄金", "oil": "原油"}

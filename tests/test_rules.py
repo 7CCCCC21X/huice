@@ -189,7 +189,12 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(R.daily_break(bj(2026, 7, 14, 5, 0)) and not R.daily_break(bj(2026, 7, 14, 6, 0)), "summer: 05:00–05:45 Beijing")
         self.assertTrue(R.daily_reopen(bj(2026, 11, 17, 7, 0)) and R.daily_reopen(bj(2026, 7, 14, 6, 0)))
         self.assertFalse(R.daily_reopen(bj(2026, 11, 16, 7, 0)), "Monday 07:00 Beijing: Sunday's reopen after the weekend")
-        self.assertFalse(R.daily_reopen(bj(2026, 11, 27, 7, 0)), "Thanksgiving: shut from noon, the 18:00 reopen ends six hours")
+        # 1.154.71 (the user: "节假日后的开盘也买"): a holiday's reopen counts — Thanksgiving (shut from noon, six hours), a holiday
+        # Monday's (MLK Day 2027, CME_EARLY) — the weekend's still does not, nor an 18:00 that reopens nothing
+        self.assertTrue(R.daily_reopen(bj(2026, 11, 27, 7, 0)), "Thanksgiving: shut from noon, reopened at 18:00")
+        self.assertTrue(R.daily_reopen(bj(2027, 1, 19, 7, 0)), "MLK Day 2027: a holiday Monday's 18:00 reopen")
+        self.assertFalse(R.daily_reopen(bj(2027, 1, 18, 7, 0)), "Monday 07:00 Beijing: still Sunday's reopen after the weekend")
+        self.assertFalse(R.daily_reopen(bj(2026, 12, 25, 7, 0)), "Christmas Eve's 18:00: CME shut on through Christmas — no reopen")
         self.assertTrue(R.daily_reopen(bj(2026, 11, 26, 7, 0)), "the Wednesday before: an ordinary reopen")
         self.assertTrue(R.ny_0515(bj(2026, 11, 17, 18, 15)) and R.ny_0515(bj(2026, 7, 14, 17, 15)))
         self.assertFalse(R.ny_0515(bj(2026, 7, 14, 18, 15)), "summer: Beijing 18:15 is 06:15 New York")
