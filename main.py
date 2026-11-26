@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.67"
+VERSION = "1.154.68"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -19239,7 +19239,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("edge", "优势提醒门槛：按栏目 / 市场 / 档位单独设置几¢才提醒", "恒指 4",
             "不带参数查看；/edge 6 改默认；/edge 价格阶梯 6、/edge 恒指 4、/edge BTC 2027前 150k 3；末尾 off 取消；/edge 清空"),
     Command("web", "获取概率网页链接（自动刷新）"),
-    Command("calib", "给日涨跌卡（三个指数和个股）的概率模型打分（Brier/校准/逐日向前）；/calib all 看全部"),
+    Command("calib", "给日涨跌卡（三个指数和个股）的概率模型打分（Brier/校准/逐日向前）；/calib all 发两个文件：完整报告和模型快照"),
     Command("samples", "导出模型样本 CSV：15 分钟 / 加密日涨跌每个市场在固定剩余时间记的公平价、盘口、σ 和结果"),
     Command("journal", "导出交易日记 CSV（一笔一行，和复盘页“导出 CSV”同一个文件）；可带筛选：市场名的一部分、挂 / 吃、类型名", "海力士 挂",
             "不带筛选是全部记录；/journal 海力士 吃 = SK 海力士 15 分钟的吃单"),
@@ -20909,6 +20909,7 @@ class Bot:
     EXPORT_ALL = ("全部", "所有", "all")
     EXPORT_KINDS = {"日记": "journal", "journal": "journal", "汇总": "summary", "summary": "summary", "样本": "samples", "samples": "samples", "json": "json",
                     "预挂": "preopen", "preopen": "preopen", "规则": "rules", "rules": "rules", "涨跌": "tally", "连涨": "tally", "tally": "tally",
+                    "校准": "calib", "回测": "calib", "calib": "calib",  # 1.154.68
                     "全部": "all", "所有": "all", "all": "all"}
     EXPORT_BREATH_S = 1.0  # /export 全部: this long between two files — each is a second or more of the loop in one piece: the trader catches up
     TALLY_WAIT_S = 90.0   # /tally: a card's candles are waited for this long at the most
@@ -20975,6 +20976,7 @@ class Bot:
                 "/export 预挂 [范围] [全部] —— 两个文件：①预挂记录，一条一行（卡、场次、档位、两边挂出和成交、结果、盈亏、提前多久挂上、多久成交）；"
                 "②预挂统计表（合计、按天、按卡、按档位含预期对实际、按开始小时、按方向、周末对工作日）。不写“全部”只出有成交的记录\n"
                 "/export 规则 —— 规则吃单每一场：卖单几点出现、多久被吃光、要了多少买到多少、结果、盈亏\n"
+                "/export 校准 —— 两个文件：①概率模型回测报告全文（= /calib all）；②日涨跌卡（三个指数和个股）的模型快照，每 30 分钟一条：当时的公平价、σ、β、盘口价和后来的收盘\n"
                 "/export json [筛选] —— 交易日记的完整记录（每笔的全部字段：下单时的盘口和行情快照、每次成交、撤单和改挂的经过），压缩的 JSON 文件；“全部”里不含它\n"
                 "/export 涨跌 [卡] [范围] —— 每一场的涨跌、前面连涨 / 连跌了几场，连同预挂在这一场的成交和盈亏（= /tally，聊天里直接看结论）\n"
                 "范围：今天、昨天、7d、30d、14天，或 2026-11-20 2026-11-25（预挂不写范围是全部日期，涨跌统计默认 7 天、最多 "
@@ -21001,6 +21003,8 @@ class Bot:
             return await self.export_preopen(words[1:])
         if kind == "rules":
             return self.export_rules()
+        if kind == "calib":
+            return await self.calib_files()
         if kind == "json":
             return await self.export_json(words[1:])
         parts: list = []
@@ -21013,7 +21017,7 @@ class Bot:
         try:
             bare = dataclasses.replace(req, args=[])
             for name, made in (("日记", lambda: self.cmd_journal(bare)), ("汇总", lambda: self.cmd_summary(bare)), ("样本", lambda: self.cmd_samples(bare)),
-                               ("预挂", lambda: self.export_preopen([])), ("规则", self.export_rules)):
+                               ("预挂", lambda: self.export_preopen([])), ("规则", self.export_rules), ("校准", self.calib_files)):
                 answer = made()
                 if inspect.isawaitable(answer):
                     answer = await answer
@@ -21732,9 +21736,65 @@ class Bot:
                 groups.setdefault((p["key"], str(p.get("mode") or "")), []).append(dict(p, y=math.log(close / float(p.get("ref_raw", p["ref"])))))
         return {key: residual_factor(rows) for key, rows in groups.items()}
 
-    async def cmd_calib(self, req: Request) -> str:
-        """/calib: the daily 涨跌 cards (the indices and stock cards); /calib all: everything (1.149.0)."""
-        return self.calibration_text(full=bool(req.args) and req.args[0].strip().lower() in {"all", "全部", "full"})
+    async def cmd_calib(self, req: Request) -> Any:
+        """/calib: the daily 涨跌 cards (the indices and stock cards), as text; /calib all: everything (1.149.0) — 1.154.68: as files
+        (calib_files), the whole report being too long for a message one can copy whole."""
+        if bool(req.args) and req.args[0].strip().lower() in {"all", "全部", "full"}:
+            return await self.calib_files()
+        return self.calibration_text(full=False)
+
+    CALIB_COLUMNS = ("卡片", "代码", "快照时间", "目标日", "模式", "参考收盘", "原始参考", "目标价", "有效价", "模型涨", "原始模型涨", "盘口涨",
+                     "代理涨跌（对数）", "β", "σ", "σ（未校准）", "校准系数", "放大", "剩余方差占比", "前半小时走向（对数）", "备选σ", "备选模型涨",
+                     "收盘", "结果", "收盘对原始参考（对数）", "代理", "提醒", "市场")
+
+    def calib_csv(self) -> tuple[bytes, int, int]:
+        """/calib all's second file (1.154.68): every saved snapshot of the daily 涨跌 cards (pred:, kept PRED_KEEP_DAYS) a row, the
+        oldest first, beside the close it was a prediction of (outcome:) — what /calib scores, to fit σ and β against. 结果 is the
+        close against the reference the card showed (Predict's target price where it used one); the log move against the raw
+        reference, the one the σ residuals are taken on (index_sigma_calibs). (the file, its rows, those with a close)."""
+        titles = {key: title for title, key in PREDICT_KEYS.items()}
+        outcomes: dict[str, float] = {}
+        for k, v in self.store.items("outcome:"):
+            with contextlib.suppress(TypeError, ValueError):
+                outcomes[k.removeprefix("outcome:")] = float(v)
+        when = lambda ms: dt.datetime.fromtimestamp(int(ms) / 1000, BEIJING).strftime("%Y-%m-%d %H:%M")
+
+        def num(v: Any, places: int = 6) -> Any:
+            try:
+                x = float(v)
+            except (TypeError, ValueError):
+                return ""
+            return round(x, places) if math.isfinite(x) else ""
+        snaps = sorted((v for _, v in self.store.items("pred:") if isinstance(v, dict) and v.get("key") and str(v.get("t") or "").isdigit()),
+                       key=lambda v: (int(v["t"]), str(v["key"])))
+        rows, scored = [], 0
+        for p in snaps:
+            key = str(p["key"])
+            close = outcomes.get(f"{key}:{p.get('target')}")
+            ref, raw = num(p.get("ref"), 10), num(p.get("ref_raw", p.get("ref")), 10)
+            result, moved = "", ""
+            if close is not None and ref != "" and ref > 0:
+                scored += 1
+                result = "涨" if close > ref else "跌" if close < ref else "平"
+                moved = num(math.log(close / raw)) if raw != "" and raw > 0 and close > 0 else ""
+            rows.append([titles.get(key) or NAMES.get(key, key), key, when(p["t"]), p.get("target", ""), p.get("mode", ""), num(ref, 4), num(raw, 4),
+                         num(p.get("strike"), 4), num(p.get("eff"), 4), num(p.get("up"), 4), num(p.get("up_raw"), 4), num(p.get("mkt"), 4),
+                         num(p.get("move")), num(p.get("beta"), 4), num(p.get("sigma")), num(p.get("sigma_raw")), num(p.get("calib"), 4),
+                         num(p.get("widen"), 4), num(p.get("R"), 4), num(p.get("trend")), num(p.get("sigma_alt")), num(p.get("up_alt"), 4),
+                         "" if close is None else close, result, moved, p.get("proxy", ""), p.get("warn", ""), p.get("slug", "")])
+        return self.export_csv(self.CALIB_COLUMNS, rows), len(rows), scored
+
+    async def calib_files(self) -> list:
+        """/calib all and /export 校准 (1.154.68): the whole report as a text file — Telegram splits a long message into pieces hard
+        to copy whole — and the snapshots it scores (calib_csv). Each reads every snapshot on the loop: a breath between them."""
+        stamp = self.export_stamp()
+        text = self.calibration_text()
+        await asyncio.sleep(self.EXPORT_BREATH_S)
+        data, n, scored = self.calib_csv()
+        return [Document(f"calib-report-{stamp}.txt", ("\ufeff" + text).encode("utf-8"), "概率模型回测报告全文（/calib all）", "text/plain"),
+                Document(f"calib-snapshots-{stamp}.csv", data,
+                         f"日涨跌卡的模型快照 {n} 条（{scored} 条已有收盘）：每 30 分钟一条——当时的公平价、σ、β、盘口价，和后来的收盘"),
+                f"已发 2 个文件：①回测报告全文 ②模型快照 {n} 条（其中 {scored} 条已有收盘结果）。只看日涨跌卡的简要回测：/calib"]
 
     async def kospi_anchor(self, kospi: IndexQuote, hl: HlQuote) -> None:
         """HL KR200 at the KOSPI 15:30 close, from the same perp as the live proxy, persisted across restarts.

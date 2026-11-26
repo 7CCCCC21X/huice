@@ -455,9 +455,11 @@ async def the_old_files_and_everything() -> None:
     # 全部: the journal, the summary, then what else there is — here no sample, no pre-open record, no rule taker
     parts = await bot.cmd_export(req("/export", "全部"))
     docs = [x for x in parts if isinstance(x, m.Document)]
-    assert [d.filename for d in docs] == ["journal-20261005.csv", "summary-20261005.csv", "tally-streaks-20260929-20261005.csv"], [d.filename for d in docs]
+    # (1.154.68: the calibration's two files too — the report, and the snapshots: none here, the header alone)
+    assert [d.filename for d in docs] == ["journal-20261005.csv", "summary-20261005.csv", "calib-report-20261005.txt", "calib-snapshots-20261005.csv",
+                                          "tally-streaks-20260929-20261005.csv"], [d.filename for d in docs]
     words = [x for x in parts if not isinstance(x, m.Document)]
-    assert words[0] == "已发 3 个文件；没有数据的：样本、预挂、规则。每个文件是什么、怎么单独要：/export" and words[1].startswith("📊 预挂按前面连涨 / 连跌｜29 张卡合计｜"), words
+    assert words[0] == "已发 5 个文件；没有数据的：样本、预挂、规则。每个文件是什么、怎么单独要：/export" and words[1].startswith("📊 预挂按前面连涨 / 连跌｜29 张卡合计｜"), words
     # ...with the loops running the tally follows by itself, and the line says so
     rows = ledger(FILLS)
     bot.preopen_rows = lambda: rows
@@ -468,8 +470,9 @@ async def the_old_files_and_everything() -> None:
     bot.answer = answer
     bot.reference_tasks = [asyncio.get_running_loop().create_future()]
     parts = await bot.cmd_export(req("/export", "all"))
-    assert [x.filename for x in parts[:-1]] == ["journal-20261005.csv", "summary-20261005.csv", "preopen-records-20261005.csv"], parts[:-1]
-    assert parts[-1] == "已发 3 个文件；涨跌统计（全部卡，近 7 天）还在读 K 线，算完随后发来；没有数据的：样本、规则。每个文件是什么、怎么单独要：/export", parts[-1]
+    assert [x.filename for x in parts[:-1]] == ["journal-20261005.csv", "summary-20261005.csv", "preopen-records-20261005.csv",
+                                                "calib-report-20261005.txt", "calib-snapshots-20261005.csv"], parts[:-1]
+    assert parts[-1] == "已发 5 个文件；涨跌统计（全部卡，近 7 天）还在读 K 线，算完随后发来；没有数据的：样本、规则。每个文件是什么、怎么单独要：/export", parts[-1]
     await bot.tally_job
     assert len(sent) == 1 and isinstance(sent[0][1], m.Document)
     print("THE_OLD_FILES_AND_EVERYTHING_OK")

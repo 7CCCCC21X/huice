@@ -126,5 +126,28 @@ whole = bot.calibration_text()
 assert "📐 OTHER·盘后" in whole and "其余部分" not in whole, whole
 req = lambda *args: m.Request("calib", list(args), 1, 0, 1)
 import asyncio
-assert asyncio.run(bot.cmd_calib(req())) == short and asyncio.run(bot.cmd_calib(req("all"))) == whole and asyncio.run(bot.cmd_calib(req("全部"))) == whole
+assert asyncio.run(bot.cmd_calib(req())) == short
+
+# --- 1.154.68: /calib all (and /export 校准) as two files — the whole report, and the snapshots it scores beside their closes ---------
+bot.EXPORT_BREATH_S = 0
+rows_in_store = len([1 for _ in store.items("pred:")])
+for answer in (asyncio.run(bot.cmd_calib(req("all"))), asyncio.run(bot.cmd_calib(req("全部"))),
+               asyncio.run(bot.cmd_export(m.Request("export", ["校准"], 1, 0, 1)))):
+    report, snaps, said = answer
+    assert isinstance(report, m.Document) and report.filename.startswith("calib-report-") and report.filename.endswith(".txt"), report
+    assert report.mime == "text/plain" and report.data.decode("utf-8-sig") == whole
+    assert isinstance(snaps, m.Document) and snaps.filename.startswith("calib-snapshots-") and snaps.mime == "text/csv", snaps
+    assert said.startswith("已发 2 个文件") and f"模型快照 {rows_in_store} 条（其中 3 条已有收盘结果）" in said, said
+import csv as _csv
+import io as _io
+table = list(_csv.reader(_io.StringIO(snaps.data.decode("utf-8-sig"))))
+assert tuple(table[0]) == m.Bot.CALIB_COLUMNS and len(table) == 1 + rows_in_store, table[0]
+col = {name: i for i, name in enumerate(table[0])}
+sse = [r for r in table[1:] if r[col["代码"]] == "SSE"]
+assert len(sse) == 3 and all(r[col["卡片"]] == "上证指数" and r[col["收盘"]] == "3020.0" and r[col["结果"]] == "涨" for r in sse), sse
+assert [r[col["模式"]] for r in sse] == ["盘中", "盘中", "盘后"] and float(sse[1][col["备选σ"]]) > 0 and sse[0][col["备选σ"]] == "", sse
+assert abs(float(sse[0][col["收盘对原始参考（对数）"]]) - math.log(3020 / 3000)) < 1e-6 and float(sse[0][col["模型涨"]]) == round(card.fair_up, 4), sse[0]
+other = [r for r in table[1:] if r[col["代码"]] == "OTHER"]
+assert len(other) == 1 and other[0][col["收盘"]] == "" and other[0][col["结果"]] == "", other  # no close for it: unscored, kept
+assert "/export 校准 —— 两个文件" in bot.export_menu()
 print("CALIB_ALT_OK")
