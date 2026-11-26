@@ -298,7 +298,8 @@ async def run():
     k_taker = bot.sim_trades()[f"{KOSPI_SLUG}|down|吃"]
     assert k_taker["confirm"] == "mismatch" and k_taker["payout"] == 1.0 and m.sim_state(k_taker) == "结果不一致"
     assert k_taker["revisions"] == [{"at": CLOSE + 92 * 60_000, "by": "Predict 最终结果", "from": 0.5, "to": 1.0,
-                                     "note": "Predict 结算：Down（本地预结算为 10-05 收盘 3,300，对 3,300）"}], k_taker["revisions"]
+                                     "note": "Predict 结算：Down（本地预结算为 10-05 收盘 3,300，对 3,300）",
+                                     "shares": float(k_taker["shares"])}], k_taker["revisions"]  # (1.154.72: the shares it was made on)
     assert k_taker["local"]["up"] == 0.5 and k_taker["final"]["up"] == 0.0  # both kept
 
     # --- the local data corrected before Predict answers: re-settled, kept as a revision ------------------------------------

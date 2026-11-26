@@ -442,6 +442,19 @@ async def r12_test_order_lost_answer():
     fake.fail_create = "HTTP 400: order value below minimum"
     text = await bot.live_action("test", [], NOW)
     assert "1/4 下单失败：HTTP 400" in text and "请求体（不含签名）" in text and "2/4" not in text, text
+    # 1.154.72 (an outside audit, P1-4): the record — its hash — not written: nothing sent (it used to be sent all the same)
+    fake.fail_create = None
+    creates, real_put = len([c for c in fake.calls if c[0] == "create"]), bot.store.put
+
+    def broken(key, value, *args, **kwargs):
+        if key == "live:test":
+            raise OSError("disk full")
+        return real_put(key, value, *args, **kwargs)
+    bot.store.put = broken
+    text = await bot.live_action("test", [], NOW)
+    bot.store.put = real_put
+    assert text.startswith("❌ 挂单测试没有发出：记录写不进数据库（") and "disk full" in text, text
+    assert len([c for c in fake.calls if c[0] == "create"]) == creates, "no request"
     print("R12_TEST_ORDER_LOST_ANSWER_OK")
 
 

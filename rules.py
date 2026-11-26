@@ -1232,11 +1232,21 @@ class RuleTaker:
         # (the review of the fix: not an order past its signed expiry — it fills nothing more — nor one whose answer went missing and
         # whose hash finds nothing past CONFLICT_GRACE_MS, what a 409's is given: held at its full price until GIVE_UP_MS past its
         # expiry, it cut every other window's size for hours. Its own window stays spoken for whatever: held)
-        return sum(max(float(o.get("shares") or 0) - float(o.get("filled") or 0), 0.0) * float(o.get("limit") or 0)
-                   for rec in self.recs.values() if rec.get("mode") == "on"
-                   for o in rec.get("orders") or () if o.get("state") in PENDING_STATES and not o.get("removed") and not o.get("paper")
-                   and int(o.get("expires") or 0) * 1000 > now
-                   and not (o.get("state") == "unknown" and not o.get("id") and now - int(o.get("at") or now) > CONFLICT_GRACE_MS))
+        out = sum(max(float(o.get("shares") or 0) - float(o.get("filled") or 0), 0.0) * float(o.get("limit") or 0)
+                  for rec in self.recs.values() if rec.get("mode") == "on"
+                  for o in rec.get("orders") or () if o.get("state") in PENDING_STATES and not o.get("removed") and not o.get("paper")
+                  and int(o.get("expires") or 0) * 1000 > now
+                  and not (o.get("state") == "unknown" and not o.get("id") and now - int(o.get("at") or now) > CONFLICT_GRACE_MS))
+        # 1.154.72 (an outside audit, P1-3): ...and what they spent since the balance was read — the chain's balance, read every
+        # minute, still holds a fill's USDT until its next read, and the filled part no longer counted above: $30 read, $29
+        # bought in one window, and the next window's order sized on the $30 again
+        balance = getattr(self.owner.live, "balance", None)
+        read_ms = float(balance[2]) * 1000 if isinstance(balance, tuple) and len(balance) > 2 and isinstance(balance[2], (int, float)) else 0.0
+        if read_ms > 0:
+            out += sum(float(o.get("filled") or 0) * float(o.get("avg") or o.get("limit") or 0)
+                       for rec in self.recs.values() if rec.get("mode") == "on"
+                       for o in rec.get("orders") or () if not o.get("paper") and int(o.get("fill_wall") or 0) > read_ms)
+        return out
 
     def before_send(self, body: dict) -> str:
         """Judged right before an order's bytes go out (preopen.safe_api): the gates again, and the window's start not passed."""
@@ -2510,10 +2520,12 @@ class RuleTaker:
             self.sending.pop(order["hash"], None)
             self.decided.pop(order["hash"], None)
             order["answered_wall"] = int(time.time() * 1000)
-        if order["state"] == "open" and order.get("id") and self.halted():
+        asked = bool(order.pop("cancel_asked", False))
+        if order["state"] == "open" and order.get("id") and (self.halted() or asked):
             # 1.154.26: real trading was stopped while the request was out (the emergency stop, a pause, the mode): its rest is
             # asked to be withdrawn now, by the id this answer brought — before its first read (which may lag or fail), not
-            # FILL_READ_MS on
+            # FILL_READ_MS on. 1.154.72 (an outside audit, P1-5): ...and so is one an operator's /live cancel all found on its
+            # way (withdraw_all: cancel_asked), the taker going on — it was left to its own course, withdrawn 1.5 s later
             await self.withdraw_one(order)
         self.save(rec)
         w["word"] = ("盘中 " if order.get("live") else "") + {
@@ -2940,6 +2952,10 @@ class RuleTaker:
         for rec, o in unknown:
             o["next_ms"] = 0
             self.save(rec)
+        for _, o in flying:
+            # 1.154.72 (an outside audit, P1-5): "应答一到就撤" — the answer's id withdraws it at once (send), whether the taker
+            # goes on or not. Only a stop (halted) did: a plain /live cancel all left the order to its own course, 1.5 s on
+            o["cancel_asked"] = True
         parts = []
         if resting:
             missed = len(resting) - off - gone
@@ -2964,11 +2980,14 @@ class RuleTaker:
         import live
         shares, _ = live.order_fill(row, float(order["shares"]))
         price = live.order_price(row)
-        if price is not None:
-            order.update(avg=price, avg_stated=True)
         before = float(order.get("filled") or 0)
+        if price is not None and shares >= before - DUST:
+            # 1.154.72 (an outside audit, P2): the average price goes with the shares it was stated for — a record lagging behind
+            # one read before (10 shares at 45¢ after 40 at 54¢) kept the 40 shares and took the 45¢: $21.60 spent booked as $18.00
+            order.update(avg=price, avg_stated=True)
         if shares > before + DUST:
             order["filled"] = shares
+            order["fill_wall"] = int(time.time() * 1000)  # 1.154.72: when the taker learned of it (pending_usd: spent after the balance was read)
             avg = float(order.get("avg") or order["limit"])
             rule = RULE_OF.get(rec.get("rule"))
             self.notify(f"🎯 规则吃单{'·盘中' if order.get('live') else ''}成交：{rec['name']} 买{rule.word if rule else rec.get('side')} {avg * 100:.1f}¢ × {shares - before:g} 份"

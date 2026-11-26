@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.71"
+VERSION = "1.154.72"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -25263,7 +25263,9 @@ class Bot:
             return
         payout = sim_payout(trade["side"], up)
         if trade["status"] == "settled" and abs(float(trade.get("payout", payout)) - payout) > 1e-9:
-            trade["revisions"].append({"at": now_ms, "by": by, "from": trade["payout"], "to": payout, "note": note})
+            # (1.154.72: with the shares it was made on — LiveBot.live_daily_pnl weighs it by them: shares stated after it are
+            # priced at the new result already, live_note_late)
+            trade["revisions"].append({"at": now_ms, "by": by, "from": trade["payout"], "to": payout, "note": note, "shares": float(trade["shares"])})
         if trade.get("maker") and float(trade["shares"]) < float(trade["order"]) - 1e-9:
             trade["unfilled"] = float(trade["order"]) - float(trade["shares"])
         # the settlement's time is the first one's: a corrected result is a revision of the same settlement. 1.150.0: but never
