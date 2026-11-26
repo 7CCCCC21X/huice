@@ -789,7 +789,8 @@ async def the_exports() -> None:
     assert [n.split("-2026")[0] for n in names[:4]] == ["journal", "summary", "preopen-records", "preopen-summary"], names
     assert len(made) == 1, f"the pre-open review was made {len(made)} times for the files of one export"
     assert all("⚠️" in x.caption for x in parts if isinstance(x, m.Document) and x.filename.split("-2026")[0] in ("summary", "preopen-summary"))
-    assert naps.count(bot.EXPORT_BREATH_S) == 5 and bot.EXPORT_BREATH_S == 1.0 and m.REVIEW_SHARED.get() is None and bot.review_held() is None, naps
+    # (1.154.68: six files and the calibration's own breath between its two)
+    assert naps.count(bot.EXPORT_BREATH_S) == 7 and bot.EXPORT_BREATH_S == 1.0 and m.REVIEW_SHARED.get() is None and bot.review_held() is None, naps
     del made[:]
     await bot.cmd_export(req("预挂"))
     assert len(made) == 1, "nothing kept beyond the export"
