@@ -1016,23 +1016,26 @@ def cards_today(rows: list[dict], now_ms: int) -> list[dict]:
     return cards_between(rows, today, today)
 
 
-def cards_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None) -> list[dict]:
+def cards_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None, since_ms: int = 0) -> list[dict]:
     """The review page's 按市场 rows of this mode over the Beijing dates ``first``..``last`` (ISO; by the window's start), per
     card, in the model trader's rows' shape (core.summary_of with settled_extras): the expectation at the order is a coin
     toss bought at the pair's price — 0.5 − price a filled share — the mean fair price 0.5, the hit rate the settled
     records' wins (a tie half). 1.151.0: any range of days (1.131.5: today's alone), each card with ``luck`` — its settled
     P&L against that expectation in σ (core.luck_of over ev_bets: a window one bet, its unhedged part at risk) — and
     ``diag``, where it was made or lost (card_diag). ``old``: the archived records (ArchiveShare: finished quotes that
-    filled nothing, moved out two days on) counted in by their kept counts — records and windows only."""
+    filled nothing, moved out two days on) counted in by their kept counts — records and windows only. ``since_ms`` (1.154.70:
+    a version's first run): the windows starting from then on — the archive's counts, kept by date, only for the days after it."""
     by: dict[str, list[dict]] = {}
     pairs: dict[str, list[dict]] = {}
     for pair in rows:
-        if any(o.get("state") not in NEVER_PLACED for o in (pair.get("orders") or {}).values()):
+        if any(o.get("state") not in NEVER_PLACED for o in (pair.get("orders") or {}).values()) and int(pair.get("start_ms") or 0) >= since_ms:
             q = quote_of(pair)
             if first <= q["date"] <= last:
                 by.setdefault(q["card"], []).append(q)
                 pairs.setdefault(q["card"], []).append(pair)
-    archived = sorted((card, date) for card, date in old.lines["cdate"] if first <= date <= last) if old is not None else []
+    after = since_day(since_ms)
+    archived = (sorted((card, date) for card, date in old.lines["cdate"] if first <= date <= last and date > after)
+                if old is not None else [])
     out = []
     for card in sorted(set(by) | {card for card, _ in archived}):
         qs = by.get(card, [])
@@ -1047,18 +1050,26 @@ def cards_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare
     return sorted(out, key=lambda x: (-x["records"], x["name"]))
 
 
-def levels_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None) -> dict:
+def since_day(since_ms: int) -> str:
+    """The Beijing date a review span from ``since_ms`` begins on, "" with none (1.154.70): the archive's counts are kept by
+    date, so that day's are left out (a part of a day cannot be told from them) — the windows after it counted whole."""
+    return dt.datetime.fromtimestamp(since_ms / 1000, core.BEIJING).date().isoformat() if since_ms > 0 else ""
+
+
+def levels_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None, since_ms: int = 0) -> dict:
     """The review page's 预挂按价格档位 over the Beijing dates ``first``..``last`` (ISO; by the window's start) — under 按市场
     and on its days (1.154.35; the user, of 1.154.34's table: "这个也可以用时间选择，给这个查看方式往上调"): each level's line
     as review() makes it (review_summary with its ev_line, the highest bid first) over the windows of those days, and the
     whole's ev_line and settled P&L. ``old``: the archived records (ArchiveShare: finished quotes that filled nothing, moved
     out two days on) counted in by their kept counts — a level's records and windows on each date (ldate), never a fill."""
-    qs = [q for q in (quote_of(p) for p in rows if any(o.get("state") not in NEVER_PLACED for o in (p.get("orders") or {}).values()))
+    qs = [q for q in (quote_of(p) for p in rows if any(o.get("state") not in NEVER_PLACED for o in (p.get("orders") or {}).values())
+                      and int(p.get("start_ms") or 0) >= since_ms)  # 1.154.70: from a version's first run (since_day for the archive)
           if first <= q["date"] <= last]
     levels: dict[tuple[float, float], list[dict]] = {}
     for q in qs:
         levels.setdefault((q["price"], q["shares"]), []).append(q)
-    archived = sorted(key for key in old.lines["ldate"] if first <= key[1] <= last) if old is not None else []
+    after = since_day(since_ms)
+    archived = sorted(key for key in old.lines["ldate"] if first <= key[1] <= last and key[1] > after) if old is not None else []
     for k, _ in archived:
         levels.setdefault(k, [])
     out = []
