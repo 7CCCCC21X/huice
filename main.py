@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.69"
+VERSION = "1.154.70"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -15360,13 +15360,19 @@ def luck_of(bets: list[dict]) -> dict:
     return {k: round(g[k], 4) if isinstance(g[k], float) else g[k] for k in ("bets", "ev", "pnl", "sigma", "z", "verdict")}
 
 
-def sim_ev_timeline(bets: list[dict], now_ms: int, days: int = EV_DAYS) -> dict:
+def sim_ev_timeline(bets: list[dict], now_ms: int, days: int = EV_DAYS, first: str = "", last: str = "", since_ms: int = 0,
+                    label: str = "") -> dict:
     """The review page's 模型 EV 对实际盈亏 (journal.json analysis.ev): over the bets of the last ``days`` Beijing days — day by
     day their EV and P&L and the running sums with the σ of the model's own probabilities (the ±2σ band the page draws),
-    the groups by strategy and by card, the last EV_WINDOW_DAYS days' verdict (recent) and the whole span's (total)."""
+    the groups by strategy and by card, the last EV_WINDOW_DAYS days' verdict (recent) and the whole span's (total).
+    1.154.70 (the user: "复盘那里可以选择日期，更新的版本时间到今天这样的选择"): over ``first``..``last`` (ISO Beijing dates) instead
+    when given, and only the bets from ``since_ms`` on (a version's first run here) — ``label`` names that span."""
     today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
-    first = (today - dt.timedelta(days=days - 1)).isoformat()
-    kept = sorted([b for b in bets if first <= b["day"] <= today.isoformat()], key=lambda b: b["at"])
+    if not (first and last):
+        first, last = (today - dt.timedelta(days=days - 1)).isoformat(), today.isoformat()
+    else:
+        days = (dt.date.fromisoformat(last) - dt.date.fromisoformat(first)).days + 1
+    kept = sorted([b for b in bets if first <= b["day"] <= last and int(b["at"]) >= since_ms], key=lambda b: b["at"])
     by_day: dict[str, list[dict]] = {}
     for b in kept:
         by_day.setdefault(b["day"], []).append(b)
@@ -15378,12 +15384,12 @@ def sim_ev_timeline(bets: list[dict], now_ms: int, days: int = EV_DAYS) -> dict:
         d = dt.date.fromisoformat(day)
         rows.append({"day": day, "label": f"{d:%m-%d} {WEEKDAYS[d.weekday()]}", "bets": g["bets"], "ev": g["ev"], "pnl": g["pnl"],
                      "cum_ev": cum_ev, "cum_pnl": cum_pnl, "sigma": sigma, "z": (cum_pnl - cum_ev) / sigma if sigma > 0 else 0.0})
-    since = (today - dt.timedelta(days=EV_WINDOW_DAYS - 1)).isoformat()
+    since = (dt.date.fromisoformat(last) - dt.timedelta(days=EV_WINDOW_DAYS - 1)).isoformat()
     names = lambda key, order: [n for n in order if n in {b[key] for b in kept}] + sorted({b[key] for b in kept} - set(order))
     groups = lambda key, order=(): [ev_group(name, [b for b in kept if b[key] == name]) for name in names(key, order)]
     return {"days": rows, "total": ev_group("全部", kept), "recent": ev_group(f"近 {EV_WINDOW_DAYS} 天", [b for b in kept if b["day"] >= since]),
             "strategies": groups("strategy", EV_STRATEGIES), "cards": sorted(groups("card"), key=lambda g: (-g["bets"], g["name"])),
-            "days_span": days, "window_days": EV_WINDOW_DAYS, "min_bets": EV_MIN_BETS, "flag_z": EV_FLAG_Z}
+            "days_span": days, "window_days": EV_WINDOW_DAYS, "min_bets": EV_MIN_BETS, "flag_z": EV_FLAG_Z, "label": label}
 
 
 # --- the review page's 按设置版本 (1.107.0): the records split by every setting that changed among them -------------------------
@@ -15675,6 +15681,24 @@ def journal_days(frm: str, to: str, rng: str, today: dt.date, max_days: int) -> 
     if (d1 - d0).days >= max_days:
         d0 = d1 - dt.timedelta(days=max_days - 1)
     return d0, d1
+
+
+def journal_span(frm: str, to: str, rng: str, since: str, now_ms: int, max_days: int,
+                 versions: Iterable[Mapping] = ()) -> tuple[dt.date, dt.date, int, str]:
+    """(first day, last day, from-this-moment ms, label) of a review query (1.154.70): ``since`` — a moment in ms, a version's
+    first run here (Bot.version_starts) — from that moment to now, labelled with the version when it is one of
+    ``versions`` ({version, at}); else journal_days and its label. A moment after now, or one that does not read: today."""
+    today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+    since_ms = int(since) if since.strip().isdigit() else 0
+    if 0 < since_ms <= now_ms:
+        d0 = dt.datetime.fromtimestamp(since_ms / 1000, BEIJING).date()
+        if (today - d0).days >= max_days:
+            d0 = today - dt.timedelta(days=max_days - 1)
+        at = dt.datetime.fromtimestamp(since_ms / 1000, BEIJING)
+        named = next((str(v.get("version")) for v in versions if int(v.get("at") or 0) == since_ms), "")
+        return d0, today, since_ms, (f"{named} 起（{at:%m-%d %H:%M} 至今）" if named else f"{at:%m-%d %H:%M} 至今")
+    d0, d1 = journal_days(frm, to, rng, today, max_days)
+    return d0, d1, 0, journal_days_label(d0, d1, today) if rng != "all" else f"全部（{d0:%m-%d} 起）"
 
 
 def journal_days_label(d0: dt.date, d1: dt.date, today: dt.date) -> str:
@@ -17233,14 +17257,14 @@ dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 .evchart{width:100%;height:auto;display:block;margin:6px 0 2px;background:var(--chip);border-radius:10px}.evchart .grid{stroke:var(--line2)}.evchart .zero{stroke:var(--faint);stroke-dasharray:3 3}.evchart text{font-size:10px;fill:var(--faint)}.evchart .band{fill:var(--best-soft);opacity:.35}.evchart .ev{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4}.evchart .pnl{fill:none;stroke:var(--best);stroke-width:2}.evchart circle.pnl{fill:var(--best)}.evchart circle.ev{fill:var(--muted)}
 .ulist{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:2px 12px}.ulist .urow{padding:8px 0;border-bottom:1px solid var(--line2);font-size:13px;line-height:1.5}.ulist .urow:last-child{border-bottom:0}.ulist .urow>a,.ulist .urow>span{overflow-wrap:anywhere}.ulist .urow .small{margin-top:2px}
-details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--muted);cursor:pointer;list-style:none;user-select:none;padding:2px 0}details.hint>summary::-webkit-details-marker{display:none}details.hint>summary:before{content:"ⓘ"}details.hint>summary:after{content:"▸";font-size:10px}details.hint[open]>summary:after{content:"▾"}details.hint[open]>summary{color:var(--text)}details.hint>p{margin:3px 0 0;font-size:12.5px;color:var(--muted);line-height:1.6}details.fold{border-top:1px solid var(--line2)}details.fold>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;padding:10px 0;user-select:none}details.fold>summary::-webkit-details-marker{display:none}details.fold>summary:before{content:"▸";color:var(--muted);font-size:11px;width:10px;flex:0 0 auto}details.fold[open]>summary:before{content:"▾"}details.fold>summary h3{margin:0;font-size:13.5px;color:var(--text)}details.fold[open]{padding-bottom:10px}details.fold.sub{border-top:0}details.fold.sub>summary{padding:6px 0 4px;font-size:12px;color:var(--muted);font-weight:600}details.fold.sub[open]{padding-bottom:4px}details.cust{display:contents}details.cust>summary{list-style:none;display:inline-flex;align-items:center;cursor:pointer;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}details.cust>summary::-webkit-details-marker{display:none}details.cust>summary:after{content:" ▾";font-size:10px}details.cust[open]>summary{border-color:var(--best);color:var(--best)}details.cust .tcust{flex-basis:100%}details.menu{display:inline-block;position:relative}details.menu>summary{list-style:none}details.menu>summary::-webkit-details-marker{display:none}details.menu .mlist{position:absolute;z-index:8;top:calc(100% + 4px);left:0;display:flex;flex-direction:column;gap:2px;min-width:160px;padding:6px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow2)}details.menu .mlist a{padding:7px 10px;border-radius:8px;color:var(--text);text-decoration:none;font-size:13px}details.menu .mlist a:hover{background:var(--chip)}.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar .tq.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}ul.notes{margin:4px 0 10px;padding-left:20px;font-size:13px;line-height:1.55}ul.notes li{margin:2px 0}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.n{opacity:.42}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
+details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--muted);cursor:pointer;list-style:none;user-select:none;padding:2px 0}details.hint>summary::-webkit-details-marker{display:none}details.hint>summary:before{content:"ⓘ"}details.hint>summary:after{content:"▸";font-size:10px}details.hint[open]>summary:after{content:"▾"}details.hint[open]>summary{color:var(--text)}details.hint>p{margin:3px 0 0;font-size:12.5px;color:var(--muted);line-height:1.6}details.fold{border-top:1px solid var(--line2)}details.fold>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;padding:10px 0;user-select:none}details.fold>summary::-webkit-details-marker{display:none}details.fold>summary:before{content:"▸";color:var(--muted);font-size:11px;width:10px;flex:0 0 auto}details.fold[open]>summary:before{content:"▾"}details.fold>summary h3{margin:0;font-size:13.5px;color:var(--text)}details.fold[open]{padding-bottom:10px}details.fold.sub{border-top:0}details.fold.sub>summary{padding:6px 0 4px;font-size:12px;color:var(--muted);font-weight:600}details.fold.sub[open]{padding-bottom:4px}details.cust{display:contents}details.cust>summary{list-style:none;display:inline-flex;align-items:center;cursor:pointer;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}details.cust>summary::-webkit-details-marker{display:none}details.cust>summary:after{content:" ▾";font-size:10px}details.cust[open]>summary{border-color:var(--best);color:var(--best)}details.cust .tcust{flex-basis:100%}details.menu{display:inline-block;position:relative}details.menu>summary{list-style:none}details.menu>summary::-webkit-details-marker{display:none}details.menu .mlist{position:absolute;z-index:8;top:calc(100% + 4px);left:0;display:flex;flex-direction:column;gap:2px;min-width:160px;padding:6px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow2)}details.menu .mlist a{padding:7px 10px;border-radius:8px;color:var(--text);text-decoration:none;font-size:13px}details.menu .mlist a:hover{background:var(--chip)}.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar .tq.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}.tbar .tver{max-width:230px}.tbar .tver.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}ul.notes{margin:4px 0 10px;padding-left:20px;font-size:13px;line-height:1.55}ul.notes li{margin:2px 0}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.n{opacity:.42}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
 .kdlg{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px}.kbox{background:var(--card);color:var(--text);border-radius:14px;padding:16px;width:min(380px,100%);box-shadow:0 8px 30px rgba(0,0,0,.25);display:flex;flex-direction:column;gap:12px}.kbox p{margin:0;white-space:pre-line;font-size:14px;line-height:1.5}.kbox input.kin{font:inherit;font-size:16px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text);width:100%}.kbox .krow{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.kbox label{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px}.kbox .kbtns{display:flex;gap:8px;margin-left:auto}.kbox button{font:inherit;font-size:14px;padding:8px 18px;border-radius:10px;border:1px solid var(--line);background:var(--chip);color:var(--text);cursor:pointer}.kbox button[type=submit]{background:var(--best);border-color:var(--best);color:var(--on-accent);font-weight:600}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><details class="menu" id="exports"><summary class="btn">导出 ▾</summary><div class="mlist"><a id="csv" href="journal.csv" download="交易日记.csv">交易日记 CSV</a><a id="scsv" href="summary.csv" download="复盘汇总.csv">复盘汇总 CSV</a><a id="mcsv" href="samples.csv" download="模型样本.csv">模型样本 CSV</a><a id="json" href="journal.json?full=1" download="交易日记.json">交易日记 JSON</a></div></details></div>
 <div class="tiles" id="tiles"></div>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
-<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>按市场 · <span id="scrng">今天</span> <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbar" id="cbar"><button type="button" class="tq on" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="all">全部</button><details class="cust" id="ccust"><summary>自定义</summary><span class="tcust"><input type="date" id="cfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="cto" aria-label="结束日期"><button type="button" id="cgo">查看</button></span></details></div><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><details class="hint"><summary>说明</summary><p>选的日子（北京时间）里下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；开盘前预挂（两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的日期算，下单时预期按五五开算。<b>偏离</b> = 实际盈亏比下单时预期差了几个 σ（σ 按下单时的概率算）：±2σ 以内可能只是运气，低于 −2σ 就不像运气了，是这个市场有问题。点一行看明细：原策略是这段时间的每一笔；开盘前预挂是钱亏在哪——只成交一边时那边赢几成、按开始时间、按成交时距开场、按方向和价格档。</p><p>按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></details><div id="plbox" hidden><h3>预挂按价格档位 · <span id="plrng">今天</span> <span class="small mut" style="font-weight:normal">（日期跟着上面“按市场”选的）</span></h3><div id="p-levels"></div></div></div></section>
+<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>按市场 · <span id="scrng">今天</span> <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbar" id="cbar"><button type="button" class="tq on" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="all">全部</button><select class="tver" id="cver" aria-label="从某个版本更新起到现在"><option value="">版本更新起…</option></select><details class="cust" id="ccust"><summary>自定义</summary><span class="tcust"><input type="date" id="cfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="cto" aria-label="结束日期"><button type="button" id="cgo">查看</button></span></details></div><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><details class="hint"><summary>说明</summary><p>选的日子（北京时间）里下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；开盘前预挂（两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的日期算，下单时预期按五五开算。<b>偏离</b> = 实际盈亏比下单时预期差了几个 σ（σ 按下单时的概率算）：±2σ 以内可能只是运气，低于 −2σ 就不像运气了，是这个市场有问题。点一行看明细：原策略是这段时间的每一笔；开盘前预挂是钱亏在哪——只成交一边时那边赢几成、按开始时间、按成交时距开场、按方向和价格档。</p><p>按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></details><div id="plbox" hidden><h3>预挂按价格档位 · <span id="plrng">今天</span> <span class="small mut" style="font-weight:normal">（日期跟着上面“按市场”选的）</span></h3><div id="p-levels"></div></div></div></section>
 <section class="box" id="tallybox"><div class="hd" id="tallyhd"><h2>市场涨跌统计</h2><span class="sum" id="tallysum"></span><button type="button" class="lnk" id="foldtally">收起</button></div>
 <div class="body" id="tallybody"><div class="tbar"><select id="tcard" aria-label="市场"></select><button type="button" class="tq" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><details class="cust" id="tcustd"><summary>自定义</summary><span class="tcust"><input type="date" id="tfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="tto" aria-label="结束日期"><button type="button" id="tgo">查看</button></span></details></div>
 <div id="tally"></div>
@@ -17248,7 +17272,7 @@ details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-ite
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="anaref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
 <div class="note fline" id="anafilt" hidden></div><div class="small mut" id="anaat"></div>
-<details class="fold" data-k="ev" id="h-ev" hidden><summary><h3>模型 EV 对实际盈亏</h3></summary><div id="a-ev" hidden></div><details class="hint" id="p-ev" hidden><summary>说明</summary><p>把每一笔已结算的单当成一次下注：模型预期 = 下单时净优势 × 份数（预挂按五五开：每边 (50¢ − 挂价) × 成交份数），实际 = 结算盈亏。按模型自己给的概率，这些注的累计盈亏有一个 ±2σ 的正常范围：实际落在带子里是运气，跌出下沿就是模型把优势看高了（激进）——这是比停机线更早的信号；冲出上沿是看低了（保守）。少于 30 笔不下结论。近 7 天跌出下沿时 Telegram 每天最多提醒一次。原策略按下单日、预挂按场次开始日（北京时间），最近 30 天；筛选条选了市场、类型、挂/吃时只算原策略的记录。</p></details></details>
+<details class="fold" data-k="ev" id="h-ev" hidden><summary><h3>模型 EV 对实际盈亏 · <span id="evrng">近 30 天</span></h3></summary><div class="tbar" id="evbar" hidden><button type="button" class="tq on" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="all">全部</button><select class="tver" id="evver" aria-label="从某个版本更新起到现在"><option value="">版本更新起…</option></select><details class="cust" id="evcust"><summary>自定义</summary><span class="tcust"><input type="date" id="evfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="evto" aria-label="结束日期"><button type="button" id="evgo">查看</button></span></details></div><div id="a-ev" hidden></div><details class="hint" id="p-ev" hidden><summary>说明</summary><p>把每一笔已结算的单当成一次下注：模型预期 = 下单时净优势 × 份数（预挂按五五开：每边 (50¢ − 挂价) × 成交份数），实际 = 结算盈亏。按模型自己给的概率，这些注的累计盈亏有一个 ±2σ 的正常范围：实际落在带子里是运气，跌出下沿就是模型把优势看高了（激进）——这是比停机线更早的信号；冲出上沿是看低了（保守）。少于 30 笔不下结论。近 7 天跌出下沿时 Telegram 每天最多提醒一次。原策略按下单日、预挂按场次开始日（北京时间），默认最近 30 天；上面可以换成近 7 天、全部、自定义日期，或“版本更新起”——从某个版本第一次运行的那一刻到现在（1.154.70，看改了以后怎么样）；筛选条选了市场、类型、挂/吃时只算原策略的记录。</p></details></details>
 <details class="fold" data-k="versions"><summary><h3>按设置版本</h3></summary><div id="a-versions"></div><details class="hint"><summary>说明</summary><p>每笔记录都存了下单时的设置。这里把每个改过的设置单独拿出来：每种取值一行，带用它的时间段（中间换过别的值又换回来的写“N 段”），比已结算盈亏对“下单时预期”、胜率对平均公平价——改了以后这两组差距变小，就是改对了。同一时间改了几个设置时，这几张表是同一种切分，分不出是哪个起的作用；时间段不同，行情也不同，样本少时差别多半是运气。代码版本按大版本合并（1.106.x 算一个）。</p></details></details>
 <details class="fold" data-k="items"><summary><h3>按标的</h3></summary><div id="a-items"></div></details>
 <details class="fold" data-k="edges"><summary><h3>按下单时净优势</h3></summary><div id="a-edges"></div><details class="hint"><summary>说明</summary><p>每桶的已结算盈亏对比“下单时预期”（净优势 × 份数），胜率（平局算半）对比平均公平价：胜率低于公平价的桶，模型把优势看高了。</p></details></details>
@@ -17462,11 +17486,16 @@ function summary(){  // per day the records were opened on: records, markets, wh
   document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"}
 function pn(x){const b=$("b","",money(x));b.className=x>=0?"ok":"bad";return b}
 let cardOpen="",dayOpen="";const rowsCache={},rowsBusy=new Set();  // the card of 按市场 (1.114.0) and the day of the summary (1.115.0) whose records are shown under their tables; the records read for a panel, by query (journal.json?rows=1&…), again after each refresh
-let cardRng="today",cardFrom="",cardTo="";const cardsCache={},cardsBusy=new Set();  // 按市场's days (1.151.0): a preset (today / yesterday / 7d / 30d / all) or from..to; the rows read for each, by query
-function cardsRange(){return cardRng?["range="+cardRng]:["from="+cardFrom,"to="+(cardTo||cardFrom)]}
+let cardRng="today",cardFrom="",cardTo="",cardSince="";const cardsCache={},cardsBusy=new Set();  // 按市场's days (1.151.0): a preset (today / yesterday / 7d / 30d / all) or from..to; the rows read for each, by query — 1.154.70: or since a version
+function cardsRange(){return cardSince?["since="+cardSince]:cardRng?["range="+cardRng]:["from="+cardFrom,"to="+(cardTo||cardFrom)]}
+function fillVersions(sel,cur){  // 1.154.70: the versions a span may begin at (journal.json's versions: each one's first run here), the latest first
+  const vs=(data&&data.versions)||[],key=vs.map(v=>v.version+"@"+v.at).join(",");
+  if(sel.dataset.k!==key){sel.dataset.k=key;const head=$("option","","版本更新起…");head.value="";
+    sel.replaceChildren(head,...vs.map(v=>{const o=$("option","",v.label);o.value=String(v.at);return o}))}
+  sel.value=cur?String(cur):"";sel.classList.toggle("on",!!cur)}
 function cardsView(S){  // 按市场: today's rows come with the summary's analysis; other days are read from the server (journal.json?cards=1&…), again after each refresh
-  const cel=document.getElementById("s-cards"),lab=document.getElementById("scrng");
-  if(cardRng==="today"){lab.textContent="今天";const ct=(S.a||{}).cards_today||[];cel.replaceChildren(ct.length?cardsTable(ct):$("p","small mut","今天还没有记录"));cardDetail(ct,"今天");
+  const cel=document.getElementById("s-cards"),lab=document.getElementById("scrng");fillVersions(document.getElementById("cver"),cardSince);
+  if(cardRng==="today"&&!cardSince){lab.textContent="今天";const ct=(S.a||{}).cards_today||[];cel.replaceChildren(ct.length?cardsTable(ct):$("p","small mut","今天还没有记录"));cardDetail(ct,"今天");
     levelsView((S.a||{}).preopen_levels_today,"今天");return}
   const fk=filterKey(),q=["cards=1",...cardsRange()].join("&")+(fk?"&"+fk:""),c=cardsCache[q];if(!c||c.at!==okAt)loadCards(q);
   if(!c||!c.data){cel.replaceChildren($("p","small mut",c&&c.error?"读取失败："+c.error:"读取中…"));cardDetail([],"");levelsView(null,"",c&&c.error?"读取失败："+c.error:"读取中…");return}
@@ -17486,7 +17515,26 @@ async function loadCards(q){const at=okAt;if(cardsBusy.has(q))return;cardsBusy.a
   catch(e){cardsCache[q]={at,error:e.message||"读取失败",data:(cardsCache[q]||{}).data}}  // a failed re-read keeps what was shown
   finally{cardsBusy.delete(q)}
   summary()}
-function cardsPick(rng,from,to){cardRng=rng;cardFrom=from||"";cardTo=to||"";cardOpen="";document.querySelectorAll("#cbar .tq").forEach(b=>b.classList.toggle("on",b.dataset.r===cardRng));summary()}
+function cardsPick(rng,from,to,since){cardRng=rng;cardFrom=from||"";cardTo=to||"";cardSince=since||"";cardOpen="";document.querySelectorAll("#cbar .tq").forEach(b=>b.classList.toggle("on",!cardSince&&b.dataset.r===cardRng));summary()}
+let evRng="30d",evFrom="",evTo="",evSince="";const evCache={},evBusy=new Set();  // 1.154.70: 模型 EV 对实际盈亏's span — the last 30 days (the analysis' own), a preset, days, or since a version (journal.json?ev=1&…)
+function evRange(){return evSince?["since="+evSince]:evRng?["range="+evRng]:["from="+evFrom,"to="+(evTo||evFrom)]}
+function evView(a){
+  const own=evRng==="30d"&&!evSince,lab=document.getElementById("evrng");let ev=own?a.ev:null,wait="";
+  if(!own){const fk=filterKey(),q=["ev=1",...evRange()].join("&")+(fk?"&"+fk:""),c=evCache[q];if(!c||c.at!==okAt)loadEv(q);
+    if(c&&c.data){ev=c.data.ev;lab.textContent=c.data.label;const fi=document.getElementById("evfrom"),ti=document.getElementById("evto");
+      if(document.activeElement!==fi&&document.activeElement!==ti){fi.value=c.data.from;ti.value=c.data.to}}
+    else wait=c&&c.error?"读取失败："+c.error:"读取中…"}
+  else lab.textContent="近 30 天";
+  const has=!!(ev&&ev.total&&ev.total.bets),show=has||!own;
+  ["h-ev","a-ev","p-ev","evbar"].forEach(id=>{document.getElementById(id).hidden=!show});fillVersions(document.getElementById("evver"),evSince);
+  if(wait){document.getElementById("a-ev").replaceChildren($("p","small mut",wait));return}
+  if(has)evSection(ev);else if(show)document.getElementById("a-ev").replaceChildren($("p","small mut","这段时间没有已结算的记录"))}
+async function loadEv(q){const at=okAt;if(evBusy.has(q))return;evBusy.add(q);
+  try{const k=ctlKey();const r=await fetch(base+"/journal.json?"+q,{cache:"no-store",headers:k?{"X-Control-Key":k}:{}});if(!r.ok)throw await oops(r);evCache[q]={at,data:await r.json()}}
+  catch(e){evCache[q]={at,error:e.message||"读取失败",data:(evCache[q]||{}).data}}  // a failed re-read keeps what was shown
+  finally{evBusy.delete(q)}
+  analysis()}
+function evPick(rng,from,to,since){evRng=rng;evFrom=from||"";evTo=to||"";evSince=since||"";document.querySelectorAll("#evbar .tq").forEach(b=>b.classList.toggle("on",!evSince&&b.dataset.r===evRng));analysis()}
 function luckCell(r){  // 偏离 (1.151.0): the settled P&L against the expectation at the order, in the σ the order's own probabilities give
   const l=r.luck;if(!l||!l.bets||!(l.sigma>0))return"—";const z=l.z,out=$("span","");
   const b=$("b",z<=-2?"bad":z>=2?"ok":"",(z>=0?"+":"−")+Math.abs(z).toFixed(1)+"σ");
@@ -17643,7 +17691,8 @@ function evSection(ev){  // 模型 EV 对实际盈亏 (1.140.0): the poker track
   const vb=g=>{const b=$("b","",g.verdict);b.className=g.flag?"bad":g.verdict==="相符"||g.verdict==="保守"?"ok":"";return b};
   const line=g=>g.bets?[g.bets+" 笔 · 模型预期 ",pn(g.ev)," · 实际 ",pn(g.pnl)," · 偏离 "+evZ(g)+" · ",vb(g)]:"还没有结算的记录";
   const d=$("dl"),p=(k,v)=>{const dd=$("dd","");if(Array.isArray(v))dd.append(...v);else dd.textContent=v;d.append($("dt","",k),dd)};
-  p("近 "+ev.window_days+" 天",line(ev.recent));p("近 "+ev.days_span+" 天",line(ev.total));el.append(d);
+  if(ev.label){p(ev.label,line(ev.total));if(ev.days_span>ev.window_days)p("其中最后 "+ev.window_days+" 天",line(ev.recent))}  // 1.154.70: a span picked
+  else{p("近 "+ev.window_days+" 天",line(ev.recent));p("近 "+ev.days_span+" 天",line(ev.total))}el.append(d);
   if((ev.days||[]).length){el.append(evChart(ev.days),hint("虚线 = 模型预期累计（净优势 × 份数），实线 = 实际累计盈亏，浅色带 = 按模型自己给的概率算的 ±2σ 范围：实线跌出下沿 = 模型把优势看高了（激进），冲出上沿 = 看低了（保守）。"),
     ...bigTable("按日期（新的在前）",table(["日期","笔数","当日预期","当日实际","累计预期","累计实际","偏离"],ev.days.slice().reverse().map(x=>[x.label,x.bets,money(x.ev),pn(x.pnl),money(x.cum_ev),pn(x.cum_pnl),evZ(x)])),ev.days.length,7))}
   const gt=rows=>table(["分组","笔数","模型预期","实际","实际 − 预期","偏离","判断"],rows.map(g=>[g.name,g.bets,money(g.ev),pn(g.pnl),pn(g.pnl-g.ev),evZ(g),vb(g)]));
@@ -17687,7 +17736,7 @@ function analysis(){  // per setting, per underlying, per net edge and fair pric
   document.getElementById("anaat").textContent=okAt?"已刷新 "+clock(okAt):"";
   const ids=["a-versions","a-items","a-edges","a-fairs","a-sessions","a-makers","a-blocked"];
   if(S.a===null){ids.forEach(id=>document.getElementById(id).replaceChildren($("p","small mut",S.err?"按筛选读取失败："+S.err:"按筛选读取中…")));
-    ["h-windows","a-windows","p-windows","h-preopen","a-preopen","p-preopen","h-rules","h-ev","a-ev","p-ev"].forEach(id=>{document.getElementById(id).hidden=true});hd.textContent=S.label;
+    ["h-windows","a-windows","p-windows","h-preopen","a-preopen","p-preopen","h-rules","h-ev","a-ev","p-ev","evbar"].forEach(id=>{document.getElementById(id).hidden=true});hd.textContent=S.label;
     document.getElementById("anabody").hidden=!anaOpen;document.getElementById("foldana").textContent=anaOpen?"收起":"展开";return}
   const a=S.a,put=(id,rows,extra)=>{const el=document.getElementById(id);el.replaceChildren(rows&&rows.length?anaTable(rows,extra):$("p","small mut","还没有记录"))};
   versions(a);put("a-items",a.items);put("a-edges",a.edges);put("a-fairs",a.fairs);
@@ -17700,8 +17749,7 @@ function analysis(){  // per setting, per underlying, per net edge and fair pric
   if(pos)preopenSection(po);
   const ru=a.rules,rus=!!(ru&&((ru.rules||[]).length||(ru.recent||[]).length));document.getElementById("h-rules").hidden=!rus;
   if(rus)rulesSection(ru);
-  const ev=a.ev,evs=!!(ev&&ev.total&&ev.total.bets);["h-ev","a-ev","p-ev"].forEach(id=>{document.getElementById(id).hidden=!evs});
-  if(evs)evSection(ev);
+  const ev=a.ev,evs=!!(ev&&ev.total&&ev.total.bets);evView(a);  // 1.154.70: the span picked above it, or the last 30 days (the fold's own line below keeps the last 7 days')
   const mk=a.makers||{},mb=document.getElementById("a-makers");mb.replaceChildren();
   if(!mk.placed)mb.append($("p","small mut","还没有挂单"));
   else{const d=$("dl"),p=(k,v)=>d.append($("dt","",k),$("dd","",v));
@@ -17977,6 +18025,10 @@ async function tallyLoad(tries){const my=++tallySeq,el=document.getElementById("
 document.getElementById("tcard").addEventListener("change",e=>{tallyKey=e.target.value;try{localStorage.setItem("jrntallykey",tallyKey)}catch(err){}tallyLoad(0)});
 document.querySelectorAll("#tallybody .tq").forEach(b=>b.addEventListener("click",()=>{tallyRng=b.dataset.r;tallyLoad(0)}));
 document.querySelectorAll("#cbar .tq").forEach(b=>b.addEventListener("click",()=>cardsPick(b.dataset.r)));  // 按市场's days (1.151.0)
+document.getElementById("cver").addEventListener("change",e=>{const v=e.target.value;if(v)cardsPick("","","",v);else cardsPick("today")});  // 1.154.70: since a version
+document.querySelectorAll("#evbar .tq").forEach(b=>b.addEventListener("click",()=>evPick(b.dataset.r)));  // 1.154.70: 模型 EV 对实际盈亏's span
+document.getElementById("evver").addEventListener("change",e=>{const v=e.target.value;if(v)evPick("","","",v);else evPick("30d")});
+document.getElementById("evgo").addEventListener("click",()=>{const f=document.getElementById("evfrom").value,t=document.getElementById("evto").value;if(f)evPick("",f,t||f)});
 document.getElementById("cgo").addEventListener("click",()=>{const f=document.getElementById("cfrom").value,t=document.getElementById("cto").value;if(f)cardsPick("",f,t||f)});
 document.getElementById("tgo").addEventListener("click",()=>{const f=document.getElementById("tfrom").value,t=document.getElementById("tto").value;if(!f)return;tallyRng="";tallyFrom=f;tallyTo=t||f;tallyLoad(0)});
 document.getElementById("tallyhd").addEventListener("click",()=>{tallyOpen=!tallyOpen;try{localStorage.setItem("jrntally",tallyOpen?"1":"0")}catch(e){}
@@ -18564,10 +18616,16 @@ class WebServer:
             name = "journal.json?analysis" + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
             return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_analysis(flt), ensure_ascii=False, default=str).encode("utf-8"))
         arg = lambda key: (params.get(key) or [""])[0].strip()[:10]
-        if flag("cards"):  # 按市场 over a range of days (1.151.0): today, yesterday, 7d, 30d, all, or from..to
+        since = (params.get("since") or [""])[0].strip()[:16]  # 1.154.70: from a version's first run (ms), to the minute
+        if flag("cards"):  # 按市场 over a range of days (1.151.0): today, yesterday, 7d, 30d, all, or from..to — or since a version (1.154.70)
             flt = journal_filter_of(params)
-            name = f"journal.json?cards&range={arg('range')}&from={arg('from')}&to={arg('to')}" + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
-            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_cards(flt, arg("from"), arg("to"), arg("range")),
+            name = f"journal.json?cards&range={arg('range')}&from={arg('from')}&to={arg('to')}&since={since}" + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
+            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_cards(flt, arg("from"), arg("to"), arg("range"), since),
+                                                                    ensure_ascii=False, default=str).encode("utf-8"))
+        if flag("ev"):  # 模型 EV 对实际盈亏 over a span (1.154.70): the same presets, days, or since a version
+            flt = journal_filter_of(params)
+            name = f"journal.json?ev&range={arg('range')}&from={arg('from')}&to={arg('to')}&since={since}" + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
+            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_ev(flt, arg("from"), arg("to"), arg("range"), since),
                                                                     ensure_ascii=False, default=str).encode("utf-8"))
         if flag("rows"):  # the records of a card (the filter) opened on a day, as list rows: under a line of 今日按市场 (1.114.0); or over a range (1.151.0)
             flt, day, lean = journal_filter_of(params), arg("day"), flag("lean")
@@ -26331,6 +26389,7 @@ class Bot:
                 "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
                           for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
                 "groups": sim_groups(values), "sources": sim_sources(values), "blocks": self.sim_blocks(),
+                "versions": self.version_starts(),  # 1.154.70: the review page's ranges 从某个版本更新起
                 "summary": self.summary_rows(values, marks),  # per day the records were opened on, per kind and way under each, and 累计 (the pre-open quotes counted in)
                 "analysis": self.sim_analysis(values, marks),  # per underlying, per edge / fair bucket, per session part, the makers, the refused buys
                 "unrealized": totals["unrealized"], "marked": totals["marked"],  # the open positions at the fresh books' middles
@@ -26393,24 +26452,61 @@ class Bot:
         """The rule taker's records (LiveBot.rules_records); none here, where there is no real trading module."""
         return {}
 
-    def preopen_cards(self, first: str, last: str) -> list[dict]:
+    def preopen_cards(self, first: str, last: str, since_ms: int = 0) -> list[dict]:
         """The pre-open mode's 按市场 rows over the Beijing dates ``first``..``last`` (LiveBot.preopen_cards); none here."""
         return []
 
-    def preopen_levels(self, first: str, last: str) -> dict | None:
+    def preopen_levels(self, first: str, last: str, since_ms: int = 0) -> dict | None:
         """The pre-open mode's 预挂按价格档位 over those dates (LiveBot.preopen_levels, 1.154.35); None here: the block is not shown."""
         return None
 
-    def journal_cards(self, flt: Mapping | None = None, frm: str = "", to: str = "", rng: str = "") -> dict:
+    VERSION_LIST_MAX = 12  # the review page's 版本更新起 list (1.154.70): this many of the latest versions
+
+    def note_version_start(self) -> None:
+        """When this code version first ran here (1.154.70): vstart:<VERSION>, written once — what the review page's ranges
+        从某个版本更新起 begin at (version_starts). Never raises: a start is never held up by it."""
+        with contextlib.suppress(Exception):
+            if self.store.get(f"vstart:{VERSION}") is None:
+                self.store.put(f"vstart:{VERSION}", self.market.now_ms())
+
+    def version_starts(self) -> list[dict]:
+        """The versions a review range may begin at (1.154.70): {version, at (ms), label}, the latest first, at most
+        VERSION_LIST_MAX — each one's first run here as noted (note_version_start), or, for one that ran before that was
+        noted, the earliest record of the model trader's it placed (each record keeps the code's version)."""
+        starts: dict[str, int] = {}
+        for t in self.sim_trades().values():
+            code, opened = str((t.get("version") or {}).get("code") or ""), int(t.get("opened") or 0)
+            if code and opened > 0 and opened < starts.get(code, 1 << 62):
+                starts[code] = opened
+        for k, v in self.store.items("vstart:"):
+            with contextlib.suppress(TypeError, ValueError):
+                starts[k.removeprefix("vstart:")] = int(v)  # (noted: the very start, before any record of it)
+        out = sorted(starts.items(), key=lambda kv: kv[1], reverse=True)[:self.VERSION_LIST_MAX]
+        return [{"version": v, "at": at, "label": f"{v} 起（{dt.datetime.fromtimestamp(at / 1000, BEIJING):%m-%d %H:%M}）"} for v, at in out]
+
+    def journal_ev(self, flt: Mapping | None = None, frm: str = "", to: str = "", rng: str = "", since: str = "") -> dict:
+        """journal.json?ev=1&range=… | from=…&to=… | since=<ms> (1.154.70): 模型 EV 对实际盈亏 over the span the review page picked —
+        a preset, days, or from a version's first run to now (journal_span) — the model trader's records in ``flt`` and,
+        unfiltered, the pre-open mode's fills, as sim_ev makes them for the last EV_DAYS days."""
+        flt = dict(flt or {})
+        now_ms = self.market.now_ms()
+        d0, d1, since_ms, label = journal_span(frm, to, rng, since, now_ms, CARDS_MAX_DAYS, self.version_starts())
+        trades = [t for t in self.sim_trades().values() if journal_match(t, flt)] if flt else None
+        return {"version": VERSION, "server_ms": now_ms, "from": d0.isoformat(), "to": d1.isoformat(), "since": since_ms, "label": label,
+                "ev": self.sim_ev(trades, preopen=not flt, first=d0.isoformat(), last=d1.isoformat(), since_ms=since_ms, label=label)}
+
+    def journal_cards(self, flt: Mapping | None = None, frm: str = "", to: str = "", rng: str = "", since: str = "") -> dict:
         """journal.json?cards=1&range=today | yesterday | 7d | 30d | all (or &from=<date>&to=<date>) — the review page's 按市场
         over a range of days (1.151.0; 今日按市场 was today's alone): the model trader's records in ``flt`` opened on those
         Beijing days, per card (sim_by_card: the figures, the settled P&L against the model's expectation in σ), and —
-        unfiltered — the pre-open mode's windows starting on them (preopen_cards: where each card's money went, card_diag)."""
+        unfiltered — the pre-open mode's windows starting on them (preopen_cards: where each card's money went, card_diag).
+        1.154.70: or &since=<ms> — from a version's first run here to now (journal_span), to the minute."""
         flt = dict(flt or {})
         now_ms = self.market.now_ms()
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
-        d0, d1 = journal_days(frm, to, rng, today, CARDS_MAX_DAYS)
-        opened = lambda t: d0 <= dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date() <= d1
+        d0, d1, since_ms, label = journal_span(frm, to, rng, since, now_ms, CARDS_MAX_DAYS, self.version_starts())
+        opened = lambda t: (d0 <= dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date() <= d1
+                            and int(t.get("opened") or 0) >= since_ms)
         trades = [t for t in self.sim_trades().values() if journal_match(t, flt) and opened(t)]
         markets: dict[str, SimMarket] = {}
         if any(t["status"] in {"resting", "filled"} for t in trades):
@@ -26421,20 +26517,22 @@ class Bot:
         rows = sim_by_card(trades, self.sim_marks(markets, now_ms))
         levels = None
         if not flt:  # the filter bar picks the model trader's records; the pre-open mode's rows stand beside them unfiltered (as in sim_analysis)
-            rows += self.preopen_cards(d0.isoformat(), d1.isoformat())
-            levels = self.preopen_levels(d0.isoformat(), d1.isoformat())  # 1.154.35: 预挂按价格档位 under 按市场, on its days
+            rows += self.preopen_cards(d0.isoformat(), d1.isoformat(), since_ms)
+            levels = self.preopen_levels(d0.isoformat(), d1.isoformat(), since_ms)  # 1.154.35: 预挂按价格档位 under 按市场, on its days
         return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）", "filter": flt,
-                "from": d0.isoformat(), "to": d1.isoformat(), "today": today.isoformat(), "range": rng if rng in JOURNAL_RANGES or rng == "all" else "",
-                "label": journal_days_label(d0, d1, today) if rng != "all" else f"全部（{d0:%m-%d} 起）", "rows": rows, "preopen_levels": levels}
+                "from": d0.isoformat(), "to": d1.isoformat(), "today": today.isoformat(), "since": since_ms,
+                "range": rng if not since_ms and (rng in JOURNAL_RANGES or rng == "all") else "", "label": label, "rows": rows, "preopen_levels": levels}
 
-    def sim_ev(self, trades: list[dict] | None = None, preopen: bool = True) -> dict:
+    def sim_ev(self, trades: list[dict] | None = None, preopen: bool = True, first: str = "", last: str = "", since_ms: int = 0,
+               label: str = "") -> dict:
         """模型 EV 对实际盈亏 (sim_ev_timeline, 1.140.0) over ``trades`` (every record when None) and, when ``preopen``, the
-        pre-open mode's settled fills (preopen.ev_bets: each window one coin-flip bet at its price, 1.150.x)."""
+        pre-open mode's settled fills (preopen.ev_bets: each window one coin-flip bet at its price, 1.150.x) — the last EV_DAYS
+        days, or the span given (1.154.70: journal_ev)."""
         bets = sim_ev_bets(list(self.sim_trades().values()) if trades is None else trades)
         if preopen and (rows := self.preopen_rows()):
             from preopen import ev_bets
             bets += ev_bets(rows)
-        return sim_ev_timeline(bets, self.market.now_ms())
+        return sim_ev_timeline(bets, self.market.now_ms(), first=first, last=last, since_ms=since_ms, label=label)
 
     SIM_EV_CHECK_SECONDS = 3600  # the EV check's cadence (sim_step)
 
@@ -29983,6 +30081,7 @@ class Bot:
         # them: a send touches no webhook); the commands loop tries the check again and polls only once it passed. The
         # refusals are unchanged: a reported webhook and a token Telegram rejects still stop the start before any loop
         # (found only later, they end the commands loop: exit 1, and the next start refuses).
+        self.note_version_start()  # 1.154.70: when this version first ran here (the review page's 版本更新起 ranges)
         down = await self.telegram_hello()
         if down is not None:
             LOG.warning("启动时 Telegram 不可用（%s）：行情、交易和网页照常启动；命令和菜单暂停，后台重试，恢复后自动接上", clean_error(down))

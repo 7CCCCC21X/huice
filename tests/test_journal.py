@@ -329,7 +329,7 @@ async def run():
     # ...the page says why (the 503's own words — in every one of its loaders), marks data that is old, asks every 5 minutes
     # instead of every one, and not at all while it is not looked at
     assert 'async function oops(r){if(r.status===503){let j={};try{j=await r.json()}catch(e){}return new Error(j.message||"HTTP 503")}return new Error("HTTP "+r.status)}' in m.JOURNAL_PAGE
-    assert m.JOURNAL_PAGE.count("if(!r.ok)throw await oops(r)") == 6 and 'throw new Error("HTTP "+r.status)' not in m.JOURNAL_PAGE
+    assert m.JOURNAL_PAGE.count("if(!r.ok)throw await oops(r)") == 7 and 'throw new Error("HTTP "+r.status)' not in m.JOURNAL_PAGE
     assert '(Date.now()-(data.server_ms||Date.now())>120000?"（"+Math.round((Date.now()-data.server_ms)/60000)+" 分钟前算的：' in m.JOURNAL_PAGE
     assert 'load();setInterval(()=>{if(document.visibilityState!=="hidden")load()},300000);' in m.JOURNAL_PAGE and "setInterval(load,60000)" not in m.JOURNAL_PAGE
     assert 'document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&Date.now()-okAt>60000)load()});' in m.JOURNAL_PAGE
@@ -475,7 +475,7 @@ async def run():
     lucky = m.sim_ev_timeline(m.sim_ev_bets([bet(i, 1.0) for i in range(40)]), NOW)
     assert lucky["total"]["verdict"] == "保守" and not lucky["total"]["flag"]
     assert m.sim_ev_timeline([], NOW) == {"days": [], "total": m.ev_group("全部", []), "recent": m.ev_group("近 7 天", []), "strategies": [], "cards": [],
-                                          "days_span": 30, "window_days": 7, "min_bets": 30, "flag_z": 2.0}
+                                          "days_span": 30, "window_days": 7, "min_bets": 30, "flag_z": 2.0, "label": ""}  # (1.154.70: a span's name, none for the default)
     assert m.ev_bet(NOW, "预挂", "BTC 15分涨跌", 0.49, 10, 0.5, 0.1, 5.1)["var"] == 25.0 and m.ev_bet(NOW, "x", "y", 0.99, 10, 1.2, 0, 0)["fair"] == 0.99
     # the hourly check: 30+ settled bets in the last 7 days falling 2σ short of the model's claim → one notice a day, to the subscribed chats
     cfg2 = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})

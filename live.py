@@ -8195,21 +8195,21 @@ class LiveBot(core.Bot):
         except Exception:
             return []
 
-    def preopen_cards(self, first: str, last: str) -> list[dict]:
+    def preopen_cards(self, first: str, last: str, since_ms: int = 0) -> list[dict]:
         """The pre-open mode's 按市场 rows over the Beijing dates ``first``..``last`` (preopen.cards_between, 1.151.0): the
         controller's ledger, or the file while the mode is off; the archived records (finished quotes that filled nothing)
         counted in by their kept counts (preopen_review's ArchiveShare, brought up to date) when those can stand for them —
         else only the records and windows of the older days come out short, never a fill or a P&L."""
         from preopen import cards_between
         rows, share = self.preopen_range("按市场")
-        return cards_between(rows, first, last, share) if rows is not None else []
+        return cards_between(rows, first, last, share, since_ms) if rows is not None else []
 
-    def preopen_levels(self, first: str, last: str) -> dict | None:
+    def preopen_levels(self, first: str, last: str, since_ms: int = 0) -> dict | None:
         """The review page's 预挂按价格档位 over the Beijing dates ``first``..``last`` (preopen.levels_between, 1.154.35) — under
         按市场, on its days: as preopen_cards reads them. None when the mode has no record at all (the block is not shown)."""
         from preopen import levels_between
         rows, share = self.preopen_range("按价格档位")
-        return levels_between(rows, first, last, share) if rows else None
+        return levels_between(rows, first, last, share, since_ms) if rows else None
 
     def preopen_range(self, what: str) -> tuple[list[dict] | None, Any]:
         """(the pre-open mode's records, the archive's share standing for its archived ones) for a table over a range of days
