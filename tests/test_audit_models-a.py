@@ -32,7 +32,7 @@ class _Clock:
 
 def _bot(now: int, calib: dict, **env: str) -> m.Bot:
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT", "KOSPI_BETA": "1",
-                             "KOSPI_BETA_DYNAMIC": "off", **env})
+                             "KOSPI_BETA_DYNAMIC": "off", "SSE_SIGMA_EXTRA": "1", **env})  # (1.154.69's extra: tests/test_sigma_extra.py)
     assert cfg.sigma_calib and cfg.big_move_sigmas == 1.5  # the defaults
     bot = m.Bot(cfg, m.Store(":memory:"), _Clock(now), None)
     for key in ("KOSPI", "SSE", "HSI"):
