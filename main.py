@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.68"
+VERSION = "1.154.69"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -880,7 +880,10 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_TAKER_AFTER_HOURS_SHARES", "盘后吃单每次最多买多少份", "0～1000000：开盘前、收盘后的吃单单独按这个份数；0 = 同盘中吃单的份数"),
     ("SIM_TAKER_MAX_SHARES", "每个市场每边吃单总份数上限", "0～10000000：同一市场同一方向优势够就继续吃，直到这一边吃单累计成交到这个数（最后一笔只吃剩下的份数）；一次只发一张吃单；0 = 每边只吃一次"),
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
-    ("SIGMA_CALIB", "σ 自动校准", "开 = 卡片的 σ 乘以按实际结果算出的系数（15 分钟和加密日涨跌限 0.5～2.0、和 10 个“刚好是 1”的先验一起平均；指数日涨跌限 0.6～2.0、和 5 日先验一起平均）：15 分钟涨跌按每张卡的定时样本，加密日涨跌三张卡合并按定时样本，指数日涨跌按 /calib 的快照残差、盘中和盘后各算；关 = 只用估计值"),
+    ("SIGMA_CALIB", "σ 自动校准", "开 = 卡片的 σ 乘以按实际结果算出的系数（15 分钟和加密日涨跌限 0.5～2.0、和 10 个“刚好是 1”的先验一起平均；指数日涨跌限 0.6～2.0、和 5 日先验一起平均）：15 分钟涨跌按每张卡的定时样本，加密日涨跌三张卡合并按定时样本，指数日涨跌按 /calib 的快照残差、盘中和盘后各算；"
+     "个股日涨跌（1.154.69）也按快照残差算，但每张卡、盘中 / 盘后分开，只在 /calib 的逐日向前检验显示校准后更准时才用；关 = 只用估计值"),
+    ("SSE_SIGMA_EXTRA", "上证盘中 σ 额外放大（倍）", "1～3，默认 1.5（1.154.69）：上证指数盘中的 σ 在自动校准之上再乘这个数。11-26 复盘：上证盘中模型比 Predict 盘口还差（逐日向前对数损失 0.58 对 0.50），"
+     "亏在指数已经跌了之后继续买跌（163 单 −$1,333：模型说跌 66%，实际赢 44%）；按真实成交回测，放大 1.5 倍后盘中 −$1,155 → −$172。1 = 不放大"),
     ("LEAD_QUOTE", "交易所现价先行（15 分钟涨跌）", "on = 卡片的现价按标的交易所的实时成交价相对窗口起点的涨跌折算（币安指数比交易所慢几秒到一分钟：卖涨给你的人先看到了下跌），和指数差超过 1% 或行情 15 秒没读到时退回指数，起点、终点仍按币安指数结算；shadow = 两种定价都记进模型样本、按指数交易，/calib 比较谁更准；off = 只用币安指数"),
     ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限、盘后每边持仓上限、加密日涨跌和 15 分钟涨跌的每边上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
@@ -1145,6 +1148,7 @@ class Config:
     sim_taker_hold: float = 0.0                # SIM_TAKER_HOLD_SECONDS: a taker buys only once its side has been buyable at every look for this long (a price wick is not); 0 = at once
     sim_taker_hold_range: float = 30.0         # SIM_TAKER_HOLD_RANGE_SECONDS: ...on a price ladder (the crypto levels: priced from every trade, their books refreshed by the minute)
     sim_max_fair: float = 0.95                 # SIM_MAX_FAIR_CENTS: the trader judges a side by its fair price at most this high (the tail a normal model cannot see); 1 = as the card says
+    sse_sigma_extra: float = 1.5               # SSE_SIGMA_EXTRA (1.154.69): the SSE card's in-session σ times this on top of SIGMA_CALIB's factor (Bot.sse_odds)
     big_move_sigmas: float = 1.5               # PROB_BIG_MOVE_SIGMAS: a daily card's σ ahead is widened once the day's move passes this many daily σ (big_move_widen); 0 = never
     sim_after_hours_max_shares: float = 300.0  # SIM_AFTER_HOURS_MAX_SHARES: after hours a market's side holds at most this many shares (positions and orders); 0 = no limit
     sigma_calib: bool = True      # SIGMA_CALIB: a 15-minute card's σ times the factor its windows' moves imply (Bot.sigma_calib)
@@ -1406,6 +1410,7 @@ class Config:
             sim_taker_hold_range=parse_bounded(e, "SIM_TAKER_HOLD_RANGE_SECONDS", "30", 0, 600),
             sim_max_fair=parse_bounded(e, "SIM_MAX_FAIR_CENTS", "95", 50, 100) / 100,
             big_move_sigmas=parse_bounded(e, "PROB_BIG_MOVE_SIGMAS", "1.5", 0, 10),
+            sse_sigma_extra=parse_bounded(e, "SSE_SIGMA_EXTRA", "1.5", 1, 3),
             sim_after_hours_max_shares=parse_bounded(e, "SIM_AFTER_HOURS_MAX_SHARES", "300", 0, 10_000_000),
             sim_open_quiet_minutes=bounded_int(e, "SIM_OPEN_QUIET_MINUTES", 3, 0, 60),
             sim_against_move_sigmas=parse_bounded(e, "SIM_AGAINST_MOVE_SIGMAS", "0", 0, 10),
@@ -5737,33 +5742,19 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
         lines.extend(trend_lines(done))
         factor, factor_days = residual_factor(done)
         lines.append(f"  σ 校准系数：×{factor:.2f}（按 {factor_days} 日残差，先验 {RESIDUAL_PRIOR_DAYS} 日按 1 计，限 {RESIDUAL_RANGE[0]:g}～{RESIDUAL_RANGE[1]:g}；"
-                     + ("SIGMA_CALIB 开着时卡片按它定价）" if key in PREDICT_KEYS.values() else "个股卡只评估、不套用）"))
+                     + ("SIGMA_CALIB 开着时卡片按它定价）" if key in PREDICT_KEYS.values()
+                        else "个股卡：下面的逐日向前检验说校准更准时，SIGMA_CALIB 开着就按它定价，否则只评估——1.154.69）"))
         if mode == "盘中":  # 1.117.0: the σ the card priced with (the opening gap taken out, before any factor) against what the residuals ask for
             raw_rows = [r for r in done if float(r.get("sigma_raw") or r.get("sigma") or 0) > 0 and r.get("R") and float(r["R"]) > 0]
             rms, _ = residual_rms(done)
             if raw_rows and rms > 0:
                 sigma_in = sum(float(r.get("sigma_raw") or r["sigma"]) for r in raw_rows) / len(raw_rows)
                 lines.append(f"  现用盘中 σ 均值 {sigma_in * 100:.2f}%/日（已扣开盘跳空，校准前），按残差均方根应为 {sigma_in * rms * 100:.2f}%")
-        if len(days) >= CALIB_MIN_DAYS + 5:
-            # the factor walked forward by target day, each day priced on the days before it, against the same formula unscaled
-            base, scaled, hits = [], [], []
-            for day in days[CALIB_MIN_DAYS:]:
-                f_day, _ = residual_factor([r for r in done if r["target"] < day])
-                for r in (r for r in done if r["target"] == day and r.get("R") and float(r["R"]) > 0):
-                    sigma = float(r.get("sigma_raw") or r["sigma"]) * math.sqrt(float(r["R"]))
-                    if sigma <= 0:
-                        continue
-                    # the distance to the reference as the page showed it (1.122.0: the Predict target price when the page used it —
-                    # the hit is judged on that reference, so the formula must stand on it too; β·move stood on the model's own)
-                    gap = (math.log(float(r["eff"]) / float(r["ref"])) if float(r.get("eff") or 0) > 0 and float(r.get("ref") or 0) > 0
-                           else float(r.get("beta") or 1.0) * float(r.get("move") or 0.0))
-                    base.append(norm_cdf(gap / sigma))
-                    scaled.append(norm_cdf(gap / (sigma * f_day)))
-                    hits.append(r["hit"])
-            if hits:
-                b0, b1 = brier_scores(base, hits), brier_scores(scaled, hits)
-                lines.append(f"  逐日向前检验（σ 校准，{len(hits)} 条，同一公式）：不校准 Brier {b0[0]:.3f} / 对数损失 {b0[1]:.3f}，"
-                             f"σ×校准 {b1[0]:.3f} / {b1[1]:.3f}" + ("（校准更准）" if b1[0] < b0[0] - 1e-9 else "（校准没有更准）" if b1[0] > b0[0] + 1e-9 else ""))
+        walk = calib_walk_scores(done)  # the factor walked forward by target day (1.154.69: also what a stock card's factor waits on)
+        if walk:
+            b0, b1, scored = walk
+            lines.append(f"  逐日向前检验（σ 校准，{scored} 条，同一公式）：不校准 Brier {b0[0]:.3f} / 对数损失 {b0[1]:.3f}，"
+                         f"σ×校准 {b1[0]:.3f} / {b1[1]:.3f}" + ("（校准更准）" if b1[0] < b0[0] - 1e-9 else "（校准没有更准）" if b1[0] > b0[0] + 1e-9 else ""))
         if mode != "盘后" or len(days) < 3:
             continue
         fit = fit_proxy(done)
@@ -5838,6 +5829,35 @@ def residual_factor(done: list[dict], prior_days: int = RESIDUAL_PRIOR_DAYS) -> 
         return 1.0, 0
     factor = math.sqrt((rms * rms * days + prior_days) / (days + prior_days))
     return min(max(factor, RESIDUAL_RANGE[0]), RESIDUAL_RANGE[1]), days
+
+
+def calib_walk_scores(done: list[dict]) -> tuple[tuple[float, float], tuple[float, float], int] | None:
+    """/calib's walk-forward check of the σ factor (逐日向前检验（σ 校准）): each target day of ``done`` from the
+    (CALIB_MIN_DAYS + 1)-th on priced with residual_factor of the days before it, against the same formula unscaled —
+    ((Brier, log loss) unscaled, (Brier, log loss) scaled, the snapshots scored); None under CALIB_MIN_DAYS + 5 days or with
+    none scored. ``done``: scored snapshots carrying ``hit`` (the close against the reference shown) and ``y`` (its log
+    against the raw reference). 1.154.69: a function, the report's and what a stock card's factor is applied on
+    (Bot.stock_sigma_calibs) — the same check in both."""
+    days = sorted({r["target"] for r in done})
+    if len(days) < CALIB_MIN_DAYS + 5:
+        return None
+    base, scaled, hits = [], [], []
+    for day in days[CALIB_MIN_DAYS:]:
+        f_day, _ = residual_factor([r for r in done if r["target"] < day])
+        for r in (r for r in done if r["target"] == day and r.get("R") and float(r["R"]) > 0):
+            sigma = float(r.get("sigma_raw") or r["sigma"]) * math.sqrt(float(r["R"]))
+            if sigma <= 0:
+                continue
+            # the distance to the reference as the page showed it (1.122.0: the Predict target price when the page used it —
+            # the hit is judged on that reference, so the formula must stand on it too; β·move stood on the model's own)
+            gap = (math.log(float(r["eff"]) / float(r["ref"])) if float(r.get("eff") or 0) > 0 and float(r.get("ref") or 0) > 0
+                   else float(r.get("beta") or 1.0) * float(r.get("move") or 0.0))
+            base.append(norm_cdf(gap / sigma))
+            scaled.append(norm_cdf(gap / (sigma * f_day)))
+            hits.append(r["hit"])
+    if not hits:
+        return None
+    return brier_scores(base, hits), brier_scores(scaled, hits), len(hits)
 
 
 def residual_lines(done: list[dict]) -> list[str]:
@@ -13785,6 +13805,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_MAKER_POINTS": {"kind": "choice", "group": "策略", "options": [["off", "都挂"], ["on", "只挂积分已激活的"]]},
     "SIM_SHARES_NET": {"kind": "choice", "group": "策略", "options": [["on", "按净头寸"], ["off", "每边单独"]]},
     "SIGMA_CALIB": {"kind": "choice", "group": "策略", "options": [["on", "按样本校准"], ["off", "只用估计值"]]},
+    "SSE_SIGMA_EXTRA": {"kind": "number", "group": "策略", "presets": ["1", "1.25", "1.5", "2"], "unit": "倍"},  # 1.154.69
     "LEAD_QUOTE": {"kind": "choice", "group": "策略", "options": [["on", "按交易所现价"], ["shadow", "只记录"], ["off", "只用指数"]]},
     "SIM_GROUP_USD": {"kind": "number", "group": "策略", "presets": ["0", "100", "300", "500", "1000"], "unit": "$", "zero": "不限"},
     "LIVE_MAX_ORDER_USD": {"kind": "number", "group": "风控", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
@@ -15396,6 +15417,7 @@ VERSION_KNOBS: dict[str, tuple[str, str, Any]] = {
     "sigma_error": ("", "", VERSION_UNRECORDED),
     "beta_error": ("", "", VERSION_UNRECORDED),
     "big_move": ("PROB_BIG_MOVE_SIGMAS", "", VERSION_UNRECORDED),
+    "sse_sigma_extra": ("SSE_SIGMA_EXTRA", "倍", 1.0),  # 1.154.69: none before it
     "sigma_calib": ("SIGMA_CALIB", "", VERSION_UNRECORDED),
     "lead_quote": ("LEAD_QUOTE", "", VERSION_UNRECORDED),
     "sim_taker_session": ("SIM_TAKER_SESSION", "", False),
@@ -17271,7 +17293,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
   session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",sim_group_usd:"组上限（$，最坏单一事件）",sim_quiet_minutes:"结束前不交易（分钟）",sim_crypto_day_shares:"加密日涨跌每笔份数",sim_crypto_day_max_shares:"加密日涨跌每边上限",sim_crypto_day_edge:"加密日涨跌买入门槛",sim_crypto_day_quiet:"加密日涨跌结束前不买（分钟）",sim_maker_min_bid:"买1 最少份数",sim_maker_floor_shares:"托底单份数",sim_maker_floor:"托底单价格",sim_maker_floor_markets:"托底单只做",sim_maker_follow_settle:"买1 变了多久才改跟（秒）",sim_maker_sweep_settle:"击穿单多久才往上改挂（秒）",sigma_calib:"σ 自动校准",lead_quote:"交易所现价先行",sigma_raw:"σ（校准前）",sigma_factor:"σ 校准系数",sim_maker_exit:"挂单撤单线",sim_maker_session:"只在开盘时段挂单",sim_maker_deeper:"买1 不够跟买2",sim_taker_session:"只在开盘时段吃单",sim_maker_after_hours:"盘后挂单门槛",sim_taker_after_hours:"盘后吃单门槛",sim_after_hours_max_price:"盘后最高买价",sim_taker_after_hours_markets:"盘后吃单只做",sim_maker_after_hours_markets:"盘后挂单只做",sim_maker_spread:"挂单价差上限",sim_maker_deep:"低价挂单门槛",sim_maker_deep_only:"只挂低价挂单",sim_maker_deep_only_markets:"只挂低价只在",sim_maker_deep_markets:"低价挂单只做",deep:"低价挂单",sim_maker_points:"只挂积分已激活的",sim_shares_net:"份数上限按净头寸",sim_skip:"详细选项排除的市场",
   sim_against_move_sigmas:"逆势不买（今日已动几个日 σ）",sim_against_move_index:"逆势不买也管指数",sim_taker_shares:"盘中吃单份数",sim_taker_after_hours_shares:"盘后吃单份数",sim_taker_max_shares:"每边吃单份数上限",sim_taker_sweep:"一次吃光份数上限",sim_taker_hold:"吃单前优势保持（秒）",sim_taker_hold_range:"价格阶梯吃单前优势保持（秒）",sim_max_fair:"公平价最多按多少计",sim_after_hours_max_shares:"盘后每边持仓上限",sim_open_quiet_minutes:"开盘后不开新单（分钟）",sim_no_odds_withdraw:"概率暂缺撤单（分钟）",live:"真实交易",live_account:"交易账户",live_max_order_usd:"单笔上限（$）",live_max_open_usd:"持仓加挂单上限（$）",
-  min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",big_move:"大波动日放宽 σ（倍日 σ）",rule:"规则",close:"收盘",
+  min_edge:"最低净优势",fee_bps:"默认费率（基点）",trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",big_move:"大波动日放宽 σ（倍日 σ）",sse_sigma_extra:"上证盘中 σ 额外放大（倍）",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
 const CENT_KEYS=new Set(["fair_up"]);
@@ -19501,7 +19523,7 @@ class Bot:
         self.vols = VolBook(config.prob_vol, self.store)
         if config.sigma_calib:
             with contextlib.suppress(Exception):
-                self.vols.calib = self.index_sigma_calibs()  # the index cards' σ factors from the snapshots on disk
+                self.vols.calib = self.sigma_calibs()  # the cards' σ factors from the snapshots on disk (1.154.69: the stock cards' too)
         if restored := self.vols.load():
             LOG.info("波动率历史已从数据库恢复：%d 个标的", restored)
         self.predict = PredictFeed(config)
@@ -21662,7 +21684,9 @@ class Bot:
                 # against the day σ before the factor (sigma_day in the card builders), so dividing the factor out leaves the σ
                 # the card would price with SIGMA_CALIB off
                 "calib": self.vols.factor(key, raw.mode),
-                "sigma_raw": raw.sigma_daily * raw.widen / self.vols.factor(key, raw.mode),
+                # 1.154.69: SSE_SIGMA_EXTRA divided out as well (kept as "extra"): the residuals stay on the estimate alone
+                "extra": (extra := self.sse_sigma_extra(raw.mode) if key == "SSE" else 1.0),
+                "sigma_raw": raw.sigma_daily * raw.widen / (self.vols.factor(key, raw.mode) * extra),
                 "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else "",
                 **(self.sse_alt(raw, shown) if key == "SSE" else {})})
         if time.time() - self.pred_pruned > 86400:  # the snapshots are kept PRED_KEEP_DAYS, not forever
@@ -21722,7 +21746,7 @@ class Bot:
     def index_sigma_calibs(self) -> dict[tuple[str, str], tuple[float, int]]:
         """The σ factor of each index card and mode (盘中 / 盘后) from its scored snapshots (residual_factor), for
         VolBook.get (SIGMA_CALIB, 1.106.1): measured when an outcome comes in (note_outcome) and at the start."""
-        # the index cards alone: a stock card's snapshots are scored, not applied (1.120.1). 1.150.0: read by each index's own
+        # the index cards alone (a stock card's: stock_sigma_calibs, 1.154.69 — applied only where the walk-forward check agrees). 1.150.0: read by each index's own
         # prefix (pred:{key}:, outcome:{key}:, as proxy_beta does) rather than every card's snapshots, kept PRED_KEEP_DAYS, parsed
         # on the event loop at each outcome only to be dropped here; the same records in the same order, so the same factors
         indices = sorted(set(PREDICT_KEYS.values()))
@@ -21735,6 +21759,50 @@ class Bot:
             if close is not None and p.get("ref_raw", p.get("ref")):
                 groups.setdefault((p["key"], str(p.get("mode") or "")), []).append(dict(p, y=math.log(close / float(p.get("ref_raw", p["ref"])))))
         return {key: residual_factor(rows) for key, rows in groups.items()}
+
+    def stock_sigma_calibs(self, symbols: Iterable[str] | None = None) -> dict[tuple[str, str], tuple[float, int]]:
+        """The σ factors of the stock cards (1.154.69), measured as an index card's are (residual_factor on each card's scored
+        snapshots, 盘中 and 盘后 apart) — and kept only where /calib's walk-forward check of that card and mode scored the
+        scaled σ better than the plain one (calib_walk_scores: a lower Brier). Before, a stock card's factor was "只评估、
+        不套用": 11-26 SHEIN 盘中 ×0.79 (its σ 3.87%/day where the residuals ask 2.73%) — the card bought 跌 at 18–20¢ on a
+        stock up 1%, saying 30% where the market said 19%, 26 times at a fair price under 30¢ without a win; the orders
+        replayed with the factor: −$668 → −$297. That day's check said yes for SHEIN 盘中 and 盘后, 宇树 盘中, 海力士 盘中, and no
+        for 长鑫 (both) and 宇树 盘后. ``symbols``: these cards alone (a stock's close: Bot.note_outcome)."""
+        out: dict[tuple[str, str], tuple[float, int]] = {}
+        for symbol in (self.config.symbols if symbols is None else symbols):
+            outcomes: dict[str, float] = {}
+            for k, v in self.store.items(f"outcome:{symbol}:"):
+                with contextlib.suppress(TypeError, ValueError):
+                    outcomes[k.removeprefix("outcome:")] = float(v)
+            groups: dict[str, list[dict]] = {}
+            for _, p in self.store.items(f"pred:{symbol}:"):
+                if not (isinstance(p, dict) and self.PRED_FIELDS <= p.keys() and p.get("key") == symbol):
+                    continue
+                close = outcomes.get(f"{symbol}:{p['target']}")
+                with contextlib.suppress(TypeError, ValueError, ZeroDivisionError):
+                    ref, raw = float(p["ref"]), float(p.get("ref_raw", p["ref"]))
+                    if close is not None and close > 0 and ref > 0 and raw > 0:
+                        groups.setdefault(str(p.get("mode") or ""), []).append(
+                            dict(p, close=close, y=math.log(close / raw), hit=1.0 if close > ref else 0.5 if close == ref else 0.0))
+            for mode, rows in groups.items():
+                walk = calib_walk_scores(rows)
+                if walk and walk[1][0] < walk[0][0] - 1e-9:
+                    factor, days = residual_factor(rows)
+                    if days:
+                        out[(symbol, mode)] = (factor, days)
+        return out
+
+    def sigma_calibs(self, symbol: str = "") -> dict[tuple[str, str], tuple[float, int]]:
+        """VolBook.calib (SIGMA_CALIB) as it should stand: the index cards' factors (index_sigma_calibs) and the stock cards' the
+        walk-forward check let through (stock_sigma_calibs, 1.154.69). ``symbol``: an outcome of that card just came in —
+        its own factors measured again, every other kept as it stands (an index's close measures the indices', a stock's
+        its own: XR-STOCK-CLOSE-RECALC's point, one card's close no longer pays for every card's snapshots)."""
+        if not symbol:
+            return {**self.index_sigma_calibs(), **self.stock_sigma_calibs()}
+        indices = set(PREDICT_KEYS.values())
+        if symbol in indices:
+            return {**{k: v for k, v in self.vols.calib.items() if k[0] not in indices}, **self.index_sigma_calibs()}
+        return {**{k: v for k, v in self.vols.calib.items() if k[0] != symbol}, **self.stock_sigma_calibs([symbol])}
 
     async def cmd_calib(self, req: Request) -> Any:
         """/calib: the daily 涨跌 cards (the indices and stock cards), as text; /calib all: everything (1.149.0) — 1.154.68: as files
@@ -21899,6 +21967,14 @@ class Bot:
         self.beta_cache[key] = (time.monotonic(), beta, note)
         return beta, note
 
+    def sse_sigma_extra(self, mode: str) -> float:
+        """SSE_SIGMA_EXTRA (1.154.69) where it is in force: the SSE card's in-session σ (``mode`` 盘中) is priced that many times wider
+        on top of SIGMA_CALIB's factor; 1 after hours. 11-26: the in-session model scored worse than Predict's own middle walked
+        forward (log loss 0.58 against 0.50) and lost buying 跌 on an index already down (163 orders −$1,333: 66% said, 44% won);
+        its σ wider by half, the real orders replayed: −$1,155 → −$172. record_predictions divides it out of the snapshot's raw
+        σ, as it does the factor: the residuals SIGMA_CALIB measures stay on the estimate alone, not on this choice."""
+        return float(getattr(self.config, "sse_sigma_extra", 1.0) or 1.0) if mode == "盘中" else 1.0
+
     def sse_odds(self, now_ms: int) -> CloseOdds | str | None:
         q = self.cn.quote
         if not self.config.probability or not self.config.sse_index:
@@ -21934,6 +22010,9 @@ class Bot:
             today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
             remaining, target = session_remaining("sh", now_ms, today - dt.timedelta(days=1), holidays)
             sigma, sigma_note = self.vols.get("SSE", "SSE", intraday=True)
+            if (extra := self.sse_sigma_extra("盘中")) != 1.0:  # 1.154.69 (SSE_SIGMA_EXTRA): on top of SIGMA_CALIB's factor
+                sigma *= extra
+                sigma_note += f"；盘中再 ×{extra:g}（SSE_SIGMA_EXTRA）"
             return close_odds("上证指数", ref, q.last, sigma, remaining, target, D("0.01"), ref_note,
                               f"上证现货 {fmt(q.last)}（盘中直接用现货）", sigma_note, sigma_day=sigma_day, big_move=self.config.big_move_sigmas)
         # After hours the reference is the close of a dated daily bar; only today's own closing print
@@ -22941,12 +23020,13 @@ class Bot:
         value = float(value)
         if self.store.get(f"outcome:{key}:{day}") != value:
             self.store.put(f"outcome:{key}:{day}", value)
-            # 1.150.0 (audit XR-STOCK-CLOSE-RECALC): only an index's outcome is an input of the σ factors (index_sigma_calibs
+            # 1.150.0 (audit XR-STOCK-CLOSE-RECALC): only an index's outcome was an input of the σ factors (index_sigma_calibs
             # reads the three indices' own snapshots and outcomes alone). A stock card's close, which record_predictions now
             # notes every second with SIM / PREDICT off too, paid a full measurement on the event loop (most of a second on a
             # full store, one per close: several back to back when a market's cards close together) for the same factors.
-            if key in PREDICT_KEYS.values():
-                self.vols.calib = self.index_sigma_calibs() if self.config.sigma_calib else {}  # a new outcome: the σ factors measured again
+            # 1.154.69: a stock card's close too, now that its factor may be applied — its own factors alone (sigma_calibs)
+            if key in PREDICT_KEYS.values() or key in self.config.symbols:
+                self.vols.calib = self.sigma_calibs(key) if self.config.sigma_calib else {}  # a new outcome: the σ factors measured again
         record = {"value": value, "source": source}
         if {k: v for k, v in (self.store.get(f"outsrc:{key}:{day}") or {}).items() if k != "at"} != record:
             self.store.put(f"outsrc:{key}:{day}", {**record, "at": self.market.now_ms()})
@@ -23141,7 +23221,7 @@ class Bot:
                 **({"sim_taker_after_hours_shares": c.sim_taker_after_hours_shares} if c.sim_taker_after_hours_shares else {}),
                 "sim_group_usd": c.sim_group_usd, "min_edge": c.predict_min_edge,
                 "fee_bps": c.predict_fee_bps, "trade_usd": c.predict_trade_usd, "a50_beta": c.a50_beta,
-                "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR, "big_move": c.big_move_sigmas,
+                "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR, "big_move": c.big_move_sigmas, "sse_sigma_extra": c.sse_sigma_extra,
                 **({"sim_taker_session": True} if c.sim_taker_session else {}),
                 **({"sim_quiet_minutes": c.sim_quiet_minutes} if c.sim_quiet_minutes else {}),
                 **({"sim_maker_min_bid": c.sim_maker_min_bid} if c.sim_maker_min_bid > 0 else {}),
@@ -27936,7 +28016,7 @@ class Bot:
             self.vols.calib = {}
             if config.sigma_calib:
                 with contextlib.suppress(Exception):  # as at the start: the estimates alone until the next outcome measures again
-                    self.vols.calib = self.index_sigma_calibs()
+                    self.vols.calib = self.sigma_calibs()
 
     def control_value(self, key: str) -> str:
         """A control setting's value in force, as the variable would be written."""
@@ -27948,7 +28028,7 @@ class Bot:
                   "SIM_TAKER_MAX_SHARES": plain(c.sim_taker_max_shares), "SIM_TAKER_SWEEP_SHARES": plain(c.sim_taker_sweep),
                   "SIM_TAKER_HOLD_SECONDS": f"{c.sim_taker_hold:g}", "SIM_TAKER_HOLD_RANGE_SECONDS": f"{c.sim_taker_hold_range:g}",
                   "SIM_MAX_FAIR_CENTS": f"{c.sim_max_fair * 100:g}", "SIM_AFTER_HOURS_MAX_SHARES": plain(c.sim_after_hours_max_shares),
-                  "PROB_BIG_MOVE_SIGMAS": f"{c.big_move_sigmas:g}", "LEAD_QUOTE": c.lead_quote,
+                  "PROB_BIG_MOVE_SIGMAS": f"{c.big_move_sigmas:g}", "SSE_SIGMA_EXTRA": f"{c.sse_sigma_extra:g}", "LEAD_QUOTE": c.lead_quote,
                   "SIM_OPEN_QUIET_MINUTES": str(c.sim_open_quiet_minutes), "SIM_NO_ODDS_WITHDRAW_MINUTES": str(c.sim_no_odds_withdraw),
                   "SIM_AGAINST_MOVE_SIGMAS": plain(c.sim_against_move_sigmas), "SIM_AGAINST_MOVE_INDEX": flag(c.sim_against_move_index),
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),

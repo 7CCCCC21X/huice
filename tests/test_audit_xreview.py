@@ -523,11 +523,19 @@ def stock_close_recalc():
     bot.note_outcome("SKHYNIXUSDT", last, 101.0, "t")
     bot.note_outcome("S1", last, 99.0, "t")
     assert len(calls) == 0, f"stock closes measured the index σ factors {len(calls)}x"
-    assert bot.vols.calib == start
+    # 1.154.69: a stock card's close measures that card's own factors again (they may be applied now: stock_sigma_calibs) — the
+    # indices' stay as they were, and a symbol no card has (S1) changes nothing
+    indices = set(m.PREDICT_KEYS.values())
+    assert {k: v for k, v in bot.vols.calib.items() if k[0] in indices} == {k: v for k, v in start.items() if k[0] in indices}
+    assert {k: v for k, v in bot.vols.calib.items() if k[0] == "SKHYNIXUSDT"} == bot.stock_sigma_calibs(["SKHYNIXUSDT"])
+    assert {k: v for k, v in bot.vols.calib.items() if k[0] not in indices | {"SKHYNIXUSDT"}} == {k: v for k, v in start.items() if k[0] not in indices | {"SKHYNIXUSDT"}}
     assert bot.store.get(f"outcome:SKHYNIXUSDT:{last}") == 101.0 and bot.store.get(f"outcome:S1:{last}") == 99.0
     assert bot.store.get(f"outsrc:SKHYNIXUSDT:{last}")["value"] == 101.0 and bot.store.get(f"outsrc:S1:{last}")["source"] == "t"
+    before_hsi = dict(bot.vols.calib)
     bot.note_outcome("HSI", last, 101.0, "t")
-    assert len(calls) == 1 and bot.vols.calib != start and bot.vols.calib == real()
+    assert len(calls) == 1 and bot.vols.calib != start and {k: v for k, v in bot.vols.calib.items() if k[0] in indices} == real()
+    # (and an index's close leaves the stock cards' factors as they stood)
+    assert {k: v for k, v in bot.vols.calib.items() if k[0] not in indices} == {k: v for k, v in before_hsi.items() if k[0] not in indices}
     bot.note_outcome("HSI", last, 101.0, "t")  # the same value again: nothing new to measure
     assert len(calls) == 1
 
