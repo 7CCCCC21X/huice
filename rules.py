@@ -66,6 +66,12 @@ OFFER_STATUS_S = 10.0         # 1.153.1: an offer at the rule's price on a marke
 # left 2.7 s after the book that showed the offer had arrived (203 of 300 bought: nobody else was there before 3.4 s). The read is
 # some 260 ms from this region: at this pace the reads follow one another, eighty of them at the most; RUSH_READS_MAX a window
 STATUS_RUSH_S, STATUS_RUSH_MS, RUSH_READS_MAX = 0.25, 20_000, 240
+# 1.154.74 (the user, of 11-27 07:00 黄金开盘第一档 — Thanksgiving's reopen, an offer of 301 shares at ≤73¢ in hand from 05:53, matching
+# closed, the offer first taken from 20 s before the start and nothing bought: "两处都改"): an offer at the rule's price still waiting
+# for matching in the start's last TAIL_RUSH_MS — the status asked every rush_pace() from then to the stop (STOP_MS before the start),
+# TAIL_READS_MAX reads a window at the most, not every FAST_S; the rest of the bot keeps out of the way (quiet_ms) only in its last
+# TAIL_QUIET_MS (a tail of two minutes held the model trader's steps that long, on a window that may never open before its start)
+TAIL_RUSH_MS, TAIL_READS_MAX, TAIL_QUIET_MS = 120_000, 480, 30_000
 # 1.154.23 — the rule taker first (the user: "每天凌晨 00:59 分开始规则吃单的优先级就要调到最高"). From WARM_MS before the per-second
 # hours (00:59 for 01:00–07:00) to their end, and while a window is at the makers' moment or bought in its course outside them
 # (first_now): a pushed book is looked at in the very turn of the loop that brought it, its order signed and its request handed to
@@ -613,6 +619,8 @@ def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
             "offer_at": shown or int(seen.get("offer_ms") or 0), "stamped": bool(shown),
             "lead_min": round((int(r.get("start_ms") or 0) - int(seen["offer_ms"])) / 60_000, 1) if seen.get("offer_ms") else None,
             "peak": float(seen.get("offer_max") or 0), "cut_ms": gap("cut"), "gone_ms": gap("gone"), "open": bool(seen.get("open")),
+            # 1.154.74: when this taker first saw matching open (its status read), and when it first saw the offer — on its own clock
+            "open_seen": int(seen.get("open_ms") or 0), "offer_seen": int(seen.get("offer_ms") or 0),
             # 1.154.28: the bids of the rule's side (clock_bids), and the first sight of one within RIVAL_BELOW of the rule's price
             "word": rule.word if rule else "", "floor_c": max(0, int(seen.get("cents") or r.get("cents") or 0) - int(RIVAL_BELOW * 100)),
             "bids_before": seen.get("bids_before"), "bids_at": seen.get("bids_at"), "bids_after": seen.get("bids_after"),
@@ -655,6 +663,7 @@ def race_text(row: dict) -> str:
                     or ("还没有被吃" if row["open"] else "到开场前没人吃")))
     else:
         text += "卖单出现的时刻没有记到（重启前的，或没看到规则价以内的卖单）"
+    text += matching_text(row, clock)
     text += bids_text(row)
     orders = row["orders"]
     if not orders:
@@ -679,6 +688,22 @@ def race_text(row: dict) -> str:
         text += (f"｜第 {i} 张 要 {o['shares']:g} 成交 {o['filled']:g}" + (f"（当时盘口上 {o['seen']:g} 份）" if o["seen"] else "")
                  + ("：" + "、".join(parts) if parts else ""))
     return text
+
+
+def matching_text(row: dict, clock: Callable[[int], str]) -> str:
+    """1.154.74 (the user, of 11-27 07:00: "两处都改"): a window whose offer waited for matching — when this taker first saw it open
+    (its own status read: Predict may have opened it a little before), or that it had not by the stop (STOP_MS before the start,
+    the last moment an order goes out before it). "" where matching was open before the offer showed (most windows: hours
+    before), and while the window is still watched."""
+    opened, shown, start = int(row.get("open_seen") or 0), int(row.get("offer_seen") or 0), int(row.get("start_ms") or 0)
+    if not shown or row.get("open"):
+        return ""
+    if opened > shown:
+        when = f"开场前 {span_text(start - opened)}" if opened < start else f"开场后 {span_text(opened - start)}"
+        return f"；卖单先到，撮合 {clock(opened)} 才看到开启（{when}，卖单出现后 {span_text(opened - shown)}）"
+    if not opened:
+        return f"；卖单一直在等撮合：到开场前 {STOP_MS // 1000} 秒（停止下单）还没看到撮合开启"
+    return ""
 
 
 def bids_text(row: dict) -> str:
@@ -1536,8 +1561,8 @@ class RuleTaker:
                       # there nothing is — nor without the bot's card of the market, which says who is ahead)
                       and self.settings.price(rule.key) > 0 and (getattr(self.owner, "updowns", None) or {}).get(rule.card) is not None):
                     until, course = begins + COURSE_QUIET_MS, True    # its course begins
-                elif self.rushing(w):
-                    until, course = at_ms + RUSH_QUIET_MS, False      # an offer in hand, matching not open yet
+                elif self.rushing(w) and (not w.get("rush_tail") or w["start"] - STOP_MS - at_ms <= TAIL_QUIET_MS):
+                    until, course = at_ms + RUSH_QUIET_MS, False      # an offer in hand, matching not open yet (a tail: its last seconds)
                 else:
                     continue
                 if not self.finished(slug, rule, course):
@@ -1668,29 +1693,39 @@ class RuleTaker:
         pace = max(STATUS_RUSH_S, 66.0 / per_min) if per_min > 0 and core.PREDICT_PACING else STATUS_RUSH_S
         return pace * max(1, sum(1 for t in self.rush_tasks if not t.done()))
 
-    def rush(self, slug: str, w: dict) -> None:
+    def rush(self, slug: str, w: dict, tail: bool = False) -> None:
         """1.154.22: an offer at the rule's price in hand on a market whose matching has not been seen open — its status asked now and
         every rush_pace() seconds for STATUS_RUSH_MS, beside the looks (their own read of it keeps its pace: FAST_S, OFFER_STATUS_S) and
         ahead of the key's other reads; the moment it says OPEN the window is looked at, and bought. Real orders only; over when
-        the offer is gone, and RUSH_READS_MAX reads a window at the most."""
-        if self.settings.mode != "on" or self.rushing(w) or int(w.get("rush_reads") or 0) >= RUSH_READS_MAX:
+        the offer is gone, and RUSH_READS_MAX reads a window at the most. 1.154.74: ``tail`` — the start's last TAIL_RUSH_MS, the offer
+        still waiting: the same reads to the stop (STOP_MS before the start), TAIL_READS_MAX at the most; the wait for matching is
+        still counted from the offer's showing (rush_wall)."""
+        if self.settings.mode != "on" or self.rushing(w):
             return
-        w["rush_wall"] = int(time.time() * 1000)
-        task = w["rush_task"] = asyncio.ensure_future(self.rush_run(slug, w))
+        if int(w.get("tail_reads" if tail else "rush_reads") or 0) >= (TAIL_READS_MAX if tail else RUSH_READS_MAX):
+            return
+        if not tail or not w.get("rush_wall"):
+            w["rush_wall"] = int(time.time() * 1000)
+        w["rush_tail"] = tail
+        task = w["rush_task"] = asyncio.ensure_future(self.rush_run(slug, w, tail))
         self.rush_tasks.add(task)  # (ended with the taker: run)
         task.add_done_callback(self.rush_tasks.discard)
 
-    async def rush_run(self, slug: str, w: dict) -> None:
-        began = time.monotonic()
+    async def rush_run(self, slug: str, w: dict, tail: bool = False) -> None:
+        began, stop_at = time.monotonic(), w["start"] - STOP_MS
         prior = "priority" in inspect.signature(self.api.market).parameters  # (a stand-in's market() may not take it)
         while (not w["open_ms"] and w.get("offer", True) and self.track.get(slug) is w and w["market"] is not None and not self.stop.is_set()
-               and self.settings.mode == "on" and time.monotonic() - began < STATUS_RUSH_MS / 1000 and int(w.get("rush_reads") or 0) < RUSH_READS_MAX):
+               and self.settings.mode == "on"
+               and ((self.now() < stop_at and int(w.get("tail_reads") or 0) < TAIL_READS_MAX) if tail
+                    else (time.monotonic() - began < STATUS_RUSH_MS / 1000 and int(w.get("rush_reads") or 0) < RUSH_READS_MAX))):
             asked = time.monotonic()
             if self.cooling() <= 0:
                 mid = str(w["market"]["id"])
                 self.reads += 1
                 self.status_reads += 1
-                w["rush_reads"] = int(w.get("rush_reads") or 0) + 1
+                w["rush_reads"] = int(w.get("rush_reads") or 0) + 1  # (the order's "读了 N 次状态": the tail's reads too)
+                if tail:
+                    w["tail_reads"] = int(w.get("tail_reads") or 0) + 1
                 try:
                     market = await (self.api.market(mid, priority=True) if prior else self.api.market(mid))
                 except asyncio.CancelledError:
@@ -2091,6 +2126,7 @@ class RuleTaker:
         w["offer"] = bool(levels)
         if not levels:
             w.pop("rushed", None)  # (the offer gone: its next showing is asked about afresh)
+            w.pop("tail_rushed", None)
         best = offered(bids, asks, rule.side, D("0.99"))[:1]
         if not course and self.note_offers(w, levels, best, now, slug, rule, (bids, asks), rec):
             self.save_watch(slug, w, rule)
@@ -2111,6 +2147,9 @@ class RuleTaker:
             if not w.get("rushed"):
                 w["rushed"] = True  # 1.154.22: this showing of the offer: the status asked beside the looks, every STATUS_RUSH_S (rush)
                 self.rush(slug, w)
+            elif not w.get("tail_rushed") and STOP_MS < w["start"] - now <= TAIL_RUSH_MS and not self.rushing(w):
+                w["tail_rushed"] = True  # 1.154.74: the start's last two minutes, the offer still waiting: asked to the stop (rush)
+                self.rush(slug, w, tail=True)
             if now - w["status_ms"] >= (FAST_S if near or self.fast else OFFER_STATUS_S) * 1000:
                 w["status_ms"] = now
                 self.reads += 1
@@ -3185,7 +3224,8 @@ class RuleTaker:
         recs = self.recs
         in_course = any(self.live_cents(r) > 0 for r in RULES)
         lines = [f"规则吃单：{MODES.get(s.mode, s.mode)}（RULE_TAKER={s.mode}）｜{'开场前吃' if in_course else '只在开场前吃'}，盘口一有就买，"
-                 + (f"到开场前 {STOP_MS // 1000} 秒（最后 {ORDER_BEFORE_MS // 1000} 秒里的单签成约 2 分钟后到期——Predict 不收更短的——所以只按盘口现有的份数下，"
+                 + (f"到开场前 {STOP_MS // 1000} 秒（卖单在等撮合开启时，开场前 {TAIL_RUSH_MS // 60_000} 分钟起每 {STATUS_RUSH_S:g} 秒左右查一次撮合；"
+                    f"最后 {ORDER_BEFORE_MS // 1000} 秒里的单签成约 2 分钟后到期——Predict 不收更短的——所以只按盘口现有的份数下，"
                     f"没成交的部分照常 {FILL_READ_MS / 1000:g} 秒后撤、没确认撤掉就每秒再撤，开场时还没撤掉会马上通知；RULE_TAIL=off 关掉）" if s.tail else
                     f"到开场前 {ORDER_BEFORE_MS // 1000} 秒（订单签到开场前 {EXPIRY_BEFORE_S} 秒到期，Predict 不收有效期不足 2 分钟的单；最后 2 分钟也吃：RULE_TAIL=on）")
                  + (f"；设了盘中价格的规则开场后接着买（开场 {LIVE_START_MS // 1000} 秒后到结束前 {ORDER_BEFORE_MS // 1000} 秒，"

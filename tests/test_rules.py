@@ -3947,7 +3947,7 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         clock.ms = GOLD_0600 + 1_000
         await t.tick()
         self.assertFalse([n for n in x.notes if n.startswith("⚠️ 规则吃单")], "off the book before the start: nothing to tell")
-        self.assertIn("盘口一有就买，到开场前 15 秒（最后 130 秒里的单签成约 2 分钟后到期——Predict 不收更短的——所以只按盘口现有的份数下，"
+        self.assertIn("盘口一有就买，到开场前 15 秒（卖单在等撮合开启时，开场前 2 分钟起每 0.25 秒左右查一次撮合；最后 130 秒里的单签成约 2 分钟后到期——Predict 不收更短的——所以只按盘口现有的份数下，"
                       "没成交的部分照常 1.5 秒后撤、没确认撤掉就每秒再撤，开场时还没撤掉会马上通知；RULE_TAIL=off 关掉）", t.status().split("\n")[0])
         # 131 s before the start an order still ends before it: as ever (swept: all the window may buy)
         t, api, clock, x = ready()
@@ -4103,6 +4103,88 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((t.journal_fd, t.journal({"slug": "s", "mode": "on"}, {})), (None, False))
             finally:
                 x.owner.store.close()
+
+    async def test_an_offer_still_waiting_for_matching_in_the_last_two_minutes_has_it_asked_fast_to_the_stop(self):
+        """1.154.74 (the user, of 11-27 07:00 黄金开盘第一档: "两处都改"): Thanksgiving's reopen — 301 shares at ≤73¢ in hand from
+        05:53, matching closed, the offer first taken from 20 s before the start, nothing bought; the status was read every FAST_S
+        then. Now, the offer still waiting in the start's last TAIL_RUSH_MS: asked every rush_pace() to the stop (rush, tail), the
+        rest of the bot keeping out of the way only in its last TAIL_QUIET_MS; bought the moment it opens. And /rules says when
+        matching was seen open after the offer — or that it was not by the stop."""
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        stop_at = GOLD_0600 - R.STOP_MS
+
+        def waiting():
+            t, api, clock, x = taker("on")
+            asked: list = []
+            plain = api.market
+
+            async def market(mid, priority=False):
+                asked.append(clock.ms)
+                return await plain(mid)
+            api.market = market
+            mkt = api.markets["901"] = gold_market(GOLD_0600, status="MATCHING_NOT_ENABLED")
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+            return t, api, clock, x, asked, mkt
+
+        with mock.patch.object(R, "STATUS_RUSH_S", 0.01), mock.patch.object(R, "STATUS_RUSH_MS", 40):
+            t, api, clock, x, asked, mkt = waiting()
+            await t.tick()  # 05:30: the offer shows, matching closed — the first rush, over in STATUS_RUSH_MS
+            w = t.track[slug]
+            await asyncio.sleep(0.08)
+            self.assertFalse(t.rushing(w))
+            clock.ms = GOLD_0600 - 180_000  # three minutes out: not yet the tail
+            await t.tick()
+            self.assertFalse(t.rushing(w), "the tail's two minutes not begun")
+            clock.ms = GOLD_0600 - 100_000  # 100 s out: the tail
+            await t.tick()
+            self.assertTrue(t.rushing(w) and w["rush_tail"], w)
+            before = len(asked)
+            await asyncio.sleep(0.06)
+            self.assertGreaterEqual(len(asked) - before, 3, "asked again and again between the looks")
+            self.assertIn("每 0.01 秒读一次状态", w["word"])
+            # the rest of the bot keeps out of the way only in the tail's last TAIL_QUIET_MS
+            self.assertEqual(t.quiet_ms(clock.ms), 0, "85 s to the stop: no hold on the others")
+            self.assertGreater(t.quiet_ms(stop_at - 20_000), 0, "20 s to the stop: held")
+            # it opens 20 s before the start: seen within the rush's pace, bought at once — before the stop
+            clock.ms = GOLD_0600 - 20_000
+            mkt["tradingStatus"] = "OPEN"
+            await asyncio.sleep(0.05)
+            self.assertTrue(w["open_ms"] and not t.rushing(w), "open: seen by the tail's reads")
+            await t.tick()
+            self.assertEqual(len(api.sent), 1, "bought at that look, before the stop")
+            order = t.record(slug)["orders"][0]
+            self.assertTrue(order["open_reads"] >= w["tail_reads"] > 0 and order["open_wait"] >= 0, order)
+            # past the stop: the window's race says when matching was seen open
+            clock.ms = stop_at + 1_000
+            await t.tick()
+            line = R.race_text(R.races(t.recs, "on", 0)[0])
+            self.assertRegex(line, r"卖单先到，撮合 05:59:40\.000 才看到开启（开场前 20\.0 秒，卖单出现后 29\.7 分钟）", line)
+            x.owner.store.close()
+
+            # never open before the stop: asked to the stop and no further, and /rules says so
+            t, api, clock, x, asked, mkt = waiting()
+            await t.tick()
+            w = t.track[slug]
+            await asyncio.sleep(0.08)
+            clock.ms = GOLD_0600 - 60_000
+            await t.tick()
+            self.assertTrue(t.rushing(w) and w["rush_tail"])
+            clock.ms = stop_at + 1  # the stop
+            await asyncio.sleep(0.05)
+            self.assertFalse(t.rushing(w), "over at the stop: no order goes out after it")
+            n = len(asked)
+            await asyncio.sleep(0.03)
+            self.assertEqual(len(asked), n, "asked no more")
+            await t.tick()
+            line = R.race_text(R.races(t.recs, "on", 0)[0])
+            self.assertIn("卖单一直在等撮合：到开场前 15 秒（停止下单）还没看到撮合开启", line)
+            self.assertEqual(api.sent, [])
+            x.owner.store.close()
+        # matching open before the offer showed (most windows): nothing more said
+        row = {"offer_seen": 1_000, "open_seen": 500, "start_ms": 9_000_000, "open": False}
+        self.assertEqual(R.matching_text(row, str), "")
+        self.assertEqual(R.matching_text({**row, "open_seen": 0, "open": True}, str), "", "still watched: nothing said yet")
 
 
 if __name__ == "__main__":
