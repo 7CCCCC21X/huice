@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.77"
+VERSION = "1.154.78"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -17540,8 +17540,18 @@ let sumOpen=true;try{sumOpen=localStorage.getItem("jrnsum")!=="0"}catch(e){}  //
 let anaOpen=false;try{anaOpen=localStorage.getItem("jrnana")==="1"}catch(e){}  // the analysis tables: folded unless opened by hand
 let unrecOpen=false;try{unrecOpen=localStorage.getItem("jrnunrec")==="1"}catch(e){}  // 账户里有、记录里没有的持仓: folded unless opened by hand (1.152.2)
 const base=location.pathname.replace(/\/journal\/?$/,"");
+// 1.154.78 (the owner: "加个强制刷新按钮"): 强制刷新 in the line at the top — for a minute after it the page's own reads carry force=1,
+// built now in the rule taker's priority period too (the server waits out only that taker's own few seconds: WebServer.force_wait)
+let forceUntil=0;const plainFetch=window.fetch.bind(window);
+window.fetch=(u,o)=>{if(Date.now()<forceUntil&&typeof u==="string"&&u.indexOf(base+"/")>=0&&!/[?&]force=1(&|$)/.test(u))u+=(u.indexOf("?")>=0?"&":"?")+"force=1";return plainFetch(u,o)};
+function showForce(){const m=document.getElementById("meta");if(!m||dead||document.getElementById("forcebtn"))return;  // (each load writes the line anew: the button with it)
+  const b=document.createElement("button");b.type="button";b.id="forcebtn";b.className="lnk";b.textContent="强制刷新";
+  b.title="马上重算一次复盘数据，规则吃单的优先时段里也算（占住机器人几秒，这几秒规则吃单可能慢一点；它抢单的那几秒仍然让开）；之后一分钟内的导出也不用等";
+  b.addEventListener("click",()=>{forceUntil=Date.now()+60000;b.disabled=true;b.textContent="强制刷新中…";load.keyBad=false;  // (a key refused or not typed: asked again)
+    if(load.busy)load.again=true;else load()});m.append(b)}
 // 1.154.26: the error of an answer that is not ok — a 503 carries the server's own words (the review data is not rebuilt while the rule taker goes first)
-async function oops(r){if(r.status===503){let j={};try{j=await r.json()}catch(e){}return new Error(j.message||"HTTP 503")}return new Error("HTTP "+r.status)}
+async function oops(r){if(r.status===503){let j={};try{j=await r.json()}catch(e){}const e=new Error(j.message||"HTTP 503");if(j.busy)e.busy=true;return e}
+  return new Error("HTTP "+r.status)}
 document.getElementById("back").href=base;document.getElementById("ctl").href=base+"/control";
 document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";document.getElementById("mcsv").href=base+"/samples.csv";  // also right under /journal/ (CTRL-MCSV: the 导出模型样本 link too, else /journal/samples.csv 404s)
 function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
@@ -18101,19 +18111,20 @@ async function load(){  // the list: light rows, the open trades and the last fe
     if(openId&&!wantAll&&j.more>0&&!j.trades.some(t=>t.id===openId)){allLoaded=true;again=true}  // a link to an older trade: the whole list
     else{if(load.more){allLoaded=true;load.more=false}data=j;okAt=Date.now();if(filterKey())loadAna();  // the filter's tables refreshed with the list
       document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at+(Date.now()-(data.server_ms||Date.now())>120000?"（"+Math.round((Date.now()-data.server_ms)/60000)+" 分钟前算的：重算一次要占住机器人几秒，所以隔几分钟才重算，规则吃单的优先时段里不重算）":"")),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"+(data.more>0?"（更早的 "+data.more+" 笔可载入）":"")));
+      showForce();
       render();if(openId&&details[openId])loadDetail(openId);
       const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}}
   catch(e){const hms=okAt?clock(okAt):"";
     if(load.more){load.more=false;load.moreFailed=e.name==="AbortError"?"20 秒没有回应":(e.message||"读取失败");if(data)render()}  // the button again, saying why
     if(e.message==="HTTP 404")dead=true;
     document.getElementById("meta").replaceChildren($("span","bad","⚠️ 读取失败："+(dead?"链接已失效，请在 Telegram 重新发送 /web；本页不再自动刷新":e.name==="AbortError"?"20 秒没有回应":e.message)+
-      (okAt?"；下面显示的是 "+hms+" 的旧数据":"")))}
+      (okAt?"；下面显示的是 "+hms+" 的旧数据":"")));showForce()}
   finally{clearTimeout(timer);load.busy=false}
   if(again||load.again){load.again=false;load()}}
-["csv","scsv","json"].forEach(id=>{const a=document.getElementById(id);a.addEventListener("click",async e=>{const key=ctlKey();if(!key)return;e.preventDefault();  // with a key: fetched with it, saved as a file
+["csv","scsv","json","mcsv"].forEach(id=>{const a=document.getElementById(id);a.addEventListener("click",async e=>{const key=ctlKey();if(!key)return;e.preventDefault();  // with a key: fetched with it, saved as a file (1.154.78: 模型样本 too — with the key a forced one is built now)
   try{const r=await fetch(a.href,{cache:"no-store",headers:{"X-Control-Key":key}});if(!r.ok)throw await oops(r);const u=URL.createObjectURL(await r.blob());
     const t=document.createElement("a");t.href=u;t.download=a.getAttribute("download");document.body.append(t);t.click();t.remove();setTimeout(()=>URL.revokeObjectURL(u),5000)}
-  catch(err){alert("导出失败："+err.message)}})});
+  catch(err){alert("导出失败："+err.message+(err.busy&&Date.now()>=forceUntil?"\n（可以先点页面最上面的“强制刷新”，之后一分钟内导出不用等）":""))}})});
 document.getElementById("unrechd").addEventListener("click",()=>{unrecOpen=!unrecOpen;try{localStorage.setItem("jrnunrec",unrecOpen?"1":"0")}catch(e){}
   document.getElementById("unrecbody").hidden=!unrecOpen;document.getElementById("foldunrec").textContent=unrecOpen?"收起":"展开"});
 document.getElementById("statshd").addEventListener("click",()=>{statsOpen=!statsOpen;try{localStorage.setItem("jrnstats",statsOpen?"1":"0")}catch(e){}
@@ -18655,6 +18666,12 @@ class WebBusy(Exception):
     """A heavy body is not built now (WebServer.cached: the rule taker goes first): the request is told to come back."""
 
 
+# 1.154.78 (the user: "加个强制刷新按钮"): a request of the review page carrying force=1 — the control key checked — builds its body now,
+# in the rule taker's priority period too (WebServer.busy): the owner chose a few seconds of the taker's loop for it. One request's
+# own flag (a contextvar: set around that request's route alone)
+WEB_FORCE: contextvars.ContextVar[bool] = contextvars.ContextVar("web_force", default=False)
+
+
 class WebServer:
     """Tiny read-only HTTP server (stdlib asyncio) for the probability page.
 
@@ -18683,7 +18700,14 @@ class WebServer:
     # reloaded), and a body kept 30 s answers none of its requests — ten builds in ten minutes, 3.2–4 s of the loop each
     HEAVY_KEEP_FACTOR = 100.0
     HEAVY_KEEP_MAX_S = 600.0
-    BUSY_TEXT = "规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），复盘数据这段时间不重算——算一次要占住机器人几秒；过后自动恢复"
+    BUSY_TEXT = ("规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），复盘数据这段时间不重算——算一次要占住机器人几秒；过后自动恢复。"
+                 "要马上看就点页面最上面的“强制刷新”（这几秒规则吃单可能慢一点）")
+    # 1.154.78: a forced request (WEB_FORCE) is built in the rule taker's priority too — but not in its own seconds, in which the
+    # whole bot keeps out of the loop's way (force_wait: LiveBot.rules_quiet — a makers' moment's first seconds, a course's, an
+    # offer waiting for matching to open); a body built less than FORCE_FRESH_S ago is served as it is (a second click, the page's
+    # sections asking at once)
+    FORCE_QUIET_TEXT = "规则吃单正在抢单的那几秒（还剩约 {left} 秒），这几秒强制刷新也不算——机器人里别的事这时都让开；过 {left} 秒再点“强制刷新”"
+    FORCE_FRESH_S = 15.0
     CONTROL_BODY_MAX = 16384   # bytes a control request may carry
     CONTROL_TRIES = 5          # wrong keys within CONTROL_LOCK_SECONDS that lock the control route for as long
     CONTROL_GLOBAL_TRIES = 50  # wrong keys from every address together that lock the route for everyone (addresses can be forged)
@@ -18703,22 +18727,56 @@ class WebServer:
         self.control_global_fails: list[float] = []         # every wrong key, whatever the address: CONTROL_GLOBAL_TRIES lock the route for all
         self.control_global_lock_until = 0.0
         self.cache: dict[str, tuple[float, bytes]] = {}  # name -> (expires, body): the JSON is built once per interval
+        self.built: dict[str, float] = {}  # name -> when (monotonic) its cached body was built: a forced request's FORCE_FRESH_S (1.154.78)
         self.gzipped: dict[bytes, bytes] = {body: gzip.compress(body, compresslevel=9) for body in self.pages.values()}
 
     def busy(self) -> bool:
-        """Whether a heavy body (HEAVY) is not to be built now: the rule taker goes first, or will within HEAVY_CLEAR_S."""
+        """Whether a heavy body (HEAVY) is not to be built now: the rule taker goes first, or will within HEAVY_CLEAR_S (priority) —
+        or, for a request the owner forced (WEB_FORCE: the review page's 强制刷新, /export … 强制, 1.154.78), only in that taker's
+        own seconds (force_wait)."""
+        if WEB_FORCE.get():
+            return self.force_wait() > 0
+        return self.priority()
+
+    def priority(self) -> bool:
+        """Whether the rule taker goes first now, or will within HEAVY_CLEAR_S (Bot.rules_clear: its per-second hours, a makers'
+        moment, a window's last quarter hour and its course)."""
         try:
             return not self.bot.rules_clear(self.HEAVY_CLEAR_S)
         except Exception:  # (a bot that cannot say keeps no page waiting)
             return False
 
+    def force_wait(self) -> float:
+        """Seconds a forced build still waits (1.154.78): the rule taker's own, in which the rest of the bot keeps out of the loop's
+        way (LiveBot.rules_quiet) — 0.0 outside them, or for a bot without that taker."""
+        quiet = getattr(self.bot, "rules_quiet", None)
+        try:
+            return max(0.0, float(quiet())) if callable(quiet) else 0.0
+        except Exception:
+            return 0.0
+
+    def busy_text(self) -> str:
+        """What a request told to come back is told (WebBusy): the priority's text, or — forced — how long that taker's seconds last."""
+        if WEB_FORCE.get() and (left := self.force_wait()) > 0:
+            return self.FORCE_QUIET_TEXT.format(left=max(1, math.ceil(left)))
+        return self.BUSY_TEXT
+
+    def forced_note(self, name: str, began: float) -> None:
+        """A forced build made in the rule taker's priority (1.154.78): said in the log, with what it held of the loop — a slow rule
+        order then has its reason in writing."""
+        if WEB_FORCE.get() and self.priority():
+            LOG.info("强制刷新：规则吃单的优先时段里重算了 %s，占了 %.1f 秒", name, time.perf_counter() - began)
+
     def cached(self, name: str, build: Any) -> bytes:
         entry = self.cache.get(name)
         now = time.monotonic()
-        if entry is None or now >= entry[0]:
-            if name.partition("?")[0] in self.HEAVY and self.busy():
-                if entry is None:
-                    raise WebBusy(self.BUSY_TEXT)
+        heavy = name.partition("?")[0] in self.HEAVY
+        # (1.154.78: forced — the owner's 强制刷新 — a heavy body is built again unless it was a moment ago, whatever its interval)
+        forced = heavy and WEB_FORCE.get() and now - self.built.get(name, -math.inf) >= self.FORCE_FRESH_S
+        if entry is None or now >= entry[0] or forced:
+            if heavy and self.busy():
+                if entry is None or WEB_FORCE.get():  # (forced, and the taker's own seconds: said, not the old one served unasked)
+                    raise WebBusy(self.busy_text())
                 return entry[1]  # (the last one built: it carries its own time)
             if len(self.cache) >= 64:  # the filtered analyses are cached by their filter (1.107.0): the expired ones go
                 # (...but for the review page's own list: what is served while the rule taker goes first)
@@ -18726,12 +18784,17 @@ class WebServer:
                 if len(self.cache) >= 64:  # 1.154.27: bodies are kept for minutes now (HEAVY_KEEP_FACTOR) — never more than 64 of them, whatever is asked: the soonest to end go
                     for k in sorted((k for k in self.cache if k not in ("journal.json", "journal.json?all")), key=lambda k: self.cache[k][0])[:len(self.cache) - 48]:
                         del self.cache[k]
+                if len(self.built) > len(self.cache) + 16:  # (when each body was built: the ones no longer kept go with them)
+                    self.built = {k: v for k, v in self.built.items() if k in self.cache}
             began = time.perf_counter()
             with self.bot.review_scope():  # (a build in one piece: what it works out of each record, once — LiveBot)
                 body = build()
             keep = self.CACHE_SECONDS.get(name.partition("?")[0], 0.0)
-            if keep > 0 and name.partition("?")[0] in self.HEAVY:  # (by what it cost: HEAVY_KEEP_FACTOR; a body that is not kept at all stays so)
+            if keep > 0 and heavy:  # (by what it cost: HEAVY_KEEP_FACTOR; a body that is not kept at all stays so)
                 keep = max(keep, min(self.HEAVY_KEEP_MAX_S, self.HEAVY_KEEP_FACTOR * (time.perf_counter() - began)))
+            if heavy:
+                self.forced_note(name, began)
+            self.built[name] = time.monotonic()
             entry = self.cache[name] = (time.monotonic() + keep, body)
         return entry[1]
 
@@ -18801,14 +18864,18 @@ class WebServer:
         if name == "journal.json":
             return self.journal_json(query)
         if self.busy():  # (an export is built whole each time: none kept to serve instead)
-            raise WebBusy(self.BUSY_TEXT)
-        if name == "journal.csv":  # with the review page's filter, when it has one (1.107.2; summary.csv since 1.107.0)
-            flt = journal_filter_of(urllib.parse.parse_qs(query, keep_blank_values=True))
-            return 200, "text/csv; charset=utf-8", self.bot.journal_csv(flt).encode("utf-8")
-        if name == "summary.csv":  # with the review page's filter, when it has one (1.107.0)
-            flt = journal_filter_of(urllib.parse.parse_qs(query, keep_blank_values=True))
-            return 200, "text/csv; charset=utf-8", self.bot.journal_summary_csv(flt).encode("utf-8")
-        return 200, "text/csv; charset=utf-8", self.bot.window_csv().encode("utf-8")  # samples.csv: the model samples (window_sample) — the model's own figures, nothing of an account
+            raise WebBusy(self.busy_text())
+        began = time.perf_counter()
+        try:
+            if name == "journal.csv":  # with the review page's filter, when it has one (1.107.2; summary.csv since 1.107.0)
+                flt = journal_filter_of(urllib.parse.parse_qs(query, keep_blank_values=True))
+                return 200, "text/csv; charset=utf-8", self.bot.journal_csv(flt).encode("utf-8")
+            if name == "summary.csv":  # with the review page's filter, when it has one (1.107.0)
+                flt = journal_filter_of(urllib.parse.parse_qs(query, keep_blank_values=True))
+                return 200, "text/csv; charset=utf-8", self.bot.journal_summary_csv(flt).encode("utf-8")
+            return 200, "text/csv; charset=utf-8", self.bot.window_csv().encode("utf-8")  # samples.csv: the model samples (window_sample) — the model's own figures, nothing of an account
+        finally:
+            self.forced_note(name, began)
 
     def journal_json(self, query: str) -> tuple[int, str, bytes]:
         """journal.json: the review page's list (light rows: the open trades and the last JOURNAL_HISTORY finished
@@ -18827,7 +18894,7 @@ class WebServer:
             return 200, ctype, json.dumps({"version": VERSION, "trade": row}, ensure_ascii=False, default=str).encode("utf-8")
         if (params.get("tally") or [""])[0].strip():  # 1.143.0: 市场涨跌统计 — not cached: it turns ready within seconds of the candles' read
             if self.busy():
-                raise WebBusy(self.BUSY_TEXT)
+                raise WebBusy(self.busy_text())
             arg = lambda key: (params.get(key) or [""])[0].strip()
             payload = self.bot.tally_payload(arg("tally"), arg("from"), arg("to"), arg("range"))
             return 200, ctype, json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
@@ -18933,7 +19000,28 @@ class WebServer:
             nokey = not self.bot.config.web_control_key
             return failed[0], "application/json; charset=utf-8", json.dumps(
                 {"ok": False, "locked": True, "nokey": nokey, "message": failed[1]}, ensure_ascii=False).encode("utf-8")
-        return self.route("GET", path, query)
+        # 1.154.78: the review page's 强制刷新 (force=1) — the key checked above: the owner's own request, built now in the rule taker's
+        # priority too (busy: all but that taker's own seconds); the page sends it for a minute after the button, nothing else does
+        token = WEB_FORCE.set(self.force_asked(query))
+        try:
+            return self.route("GET", path, query)
+        finally:
+            WEB_FORCE.reset(token)
+
+    FORCE_VALUES = frozenset({"1", "true", "on", "yes"})
+
+    @classmethod
+    def force_asked(cls, query: str) -> bool:
+        """The request asks for its body now (force=1: the review page's 强制刷新, 1.154.78)."""
+        return (urllib.parse.parse_qs(query).get("force") or [""])[0].strip().lower() in cls.FORCE_VALUES
+
+    def force_allowed(self, head: str, client: str) -> bool:
+        """Whether a forced request on a route that keys nothing (samples.csv; a paper bot's review data) is the owner's (1.154.78): the
+        control key when one is configured — a wrong one counted as any other (key_check) — else, no account behind the data, the
+        page link alone."""
+        if not self.bot.config.web_control_key:
+            return not self.account_private()
+        return self.key_check(head, client) is None
 
     def control_key_failed(self, client: str, now: float) -> None:
         fails = [t for t in self.control_failures.get(client, []) if now - t < self.CONTROL_LOCK_SECONDS] + [now]
@@ -19017,7 +19105,15 @@ class WebServer:
                                                                                  or self.is_control(path, "summary.csv") or self.is_control(path, "why.json")):
                 status, ctype, body = self.journal_keyed(path, query, rest, self.client_of(rest, writer))
             else:
-                status, ctype, body = self.route(method.upper(), path, query)
+                # 1.154.78: force=1 on a heavy body this route keys nothing for (samples.csv; a paper bot's review data) — for the owner
+                # alone (force_allowed)
+                forced = (method.upper() in {"GET", "HEAD"} and self.force_asked(query) and any(self.is_control(path, name) for name in self.HEAVY)
+                          and self.force_allowed(rest, self.client_of(rest, writer)))
+                token = WEB_FORCE.set(forced)
+                try:
+                    status, ctype, body = self.route(method.upper(), path, query)
+                finally:
+                    WEB_FORCE.reset(token)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
             status, ctype, body, method, gzip_ok = 400, "text/plain; charset=utf-8", b"bad request", "GET", False
         except Exception as error:  # Never let a page request touch the bot's loops.
@@ -21126,8 +21222,12 @@ class Bot:
         """/samples: the samples' CSV as a Telegram document. 1.154.33 (an outside review, R21): the samples read once (they were
         read and sorted twice, both on the event loop), and not while the rule taker goes first — the web export (samples.csv)
         waits then too (WebServer.busy): seconds of the loop at hundreds of thousands of samples."""
-        if not self.rules_clear(WebServer.HEAVY_CLEAR_S):
-            return "规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），样本导出这段时间不做——导出一次要占住机器人几秒；过一会儿再发 /samples"
+        forced, _ = self.take_force(getattr(req, "args", None))
+        if forced:  # 1.154.78: /samples 强制 — now, in the rule taker's priority too (its own seconds waited out: force_quiet)
+            await self.force_quiet("/samples")
+        elif not self.rules_clear(WebServer.HEAVY_CLEAR_S):
+            return ("规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），样本导出这段时间不做——导出一次要占住机器人几秒；过一会儿再发 /samples，"
+                    "或者发 /samples 强制 马上导出（这几秒规则吃单可能慢一点）")
         rows = self.window_rows()
         if not rows:
             return "还没有样本：15 分钟涨跌 / 加密日涨跌的市场定价后，每个市场在固定的剩余时间各记一条（/calib 里有说明）。"
@@ -21144,7 +21244,7 @@ class Bot:
         flt: dict[str, str] = {}
         rest: list[str] = []
         for word in (w.strip() for w in words):
-            if not word:
+            if not word or word.lower() in self.FORCE_WORDS:  # (1.154.78: /journal … 强制 — these exports never wait: nothing to force)
                 continue
             if word in {"挂", "挂单"}:
                 flt["way"] = "maker"
@@ -21207,7 +21307,42 @@ class Bot:
                         "挂单效率与撤单原因、被拦下的机会；第一列是表名" + (f"｜⚠️ 其中开盘前预挂的部分：{note}" if note else ""))
 
     # --- 1.154.51: everything the review page holds, by Telegram (/export, /tally) --------------------------------------------------
-    EXPORT_BUSY = "规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），导出和统计这段时间不做——做一次要占住机器人几秒；过一会儿再发"
+    EXPORT_BUSY = ("规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），导出和统计这段时间不做——做一次要占住机器人几秒。"
+                   "过一会儿再发，或者在命令最后加“强制”马上做（这几秒规则吃单可能慢一点），例如 ")
+    # 1.154.78 (the owner: "加个强制刷新按钮", the review page's and these): /export … 强制, /samples 强制, /tally … 强制 — made now, in
+    # the rule taker's priority too; only that taker's own seconds (rules_quiet: the whole bot keeps out of the loop's way then) are
+    # waited out first, FORCE_QUIET_MAX_S at the most
+    FORCE_WORDS = frozenset({"强制", "force"})
+    FORCE_QUIET_MAX_S = 60.0
+
+    def export_busy(self, command: str, words: list[str]) -> str:
+        """An export not made now (the rule taker's priority), and the command that makes it now (FORCE_WORDS)."""
+        return self.EXPORT_BUSY + " ".join([command, *(w for w in words if w), "强制"])
+
+    def take_force(self, words: Any) -> tuple[bool, list[str]]:
+        """(the force word was among ``words``, the words without it — stripped, none empty): an export the owner wants now."""
+        words = [w.strip() for w in (words or []) if isinstance(w, str) and w.strip()]
+        kept = [w for w in words if w.lower() not in self.FORCE_WORDS]
+        return len(kept) != len(words), kept
+
+    async def force_quiet(self, what: str, say: bool = True) -> None:
+        """Before a forced export (FORCE_WORDS): the rule taker's own seconds waited out (rules_quiet — a makers' moment's first
+        seconds, a course's, an offer waiting for matching to open), FORCE_QUIET_MAX_S at the most; and one made in its priority
+        said in the log (``say``: once a command, not before each of its files or cards), a slow rule order then having its
+        reason in writing."""
+        quiet, waited = getattr(self, "rules_quiet", None), 0.0
+        while callable(quiet) and waited < self.FORCE_QUIET_MAX_S:
+            try:
+                left = float(quiet())
+            except Exception:
+                break
+            if not left > 0:
+                break
+            step = min(left + 0.05, 5.0, self.FORCE_QUIET_MAX_S - waited)
+            await asyncio.sleep(step)
+            waited += step
+        if say and not self.rules_clear(WebServer.HEAVY_CLEAR_S):
+            LOG.info("强制导出：规则吃单的优先时段里做 %s%s", what, f"（先等了它抢单的 {waited:.0f} 秒）" if waited else "")
     EXPORT_RANGES = {"今天": "today", "today": "today", "昨天": "yesterday", "yesterday": "yesterday", "7d": "7d", "7天": "7d", "一周": "7d",
                      "30d": "30d", "30天": "30d", "一个月": "30d"}
     EXPORT_ALL = ("全部", "所有", "all")
@@ -21292,11 +21427,12 @@ class Bot:
                 "/export json [筛选] —— 交易日记的完整记录（每笔的全部字段：下单时的盘口和行情快照、每次成交、撤单和改挂的经过），压缩的 JSON 文件；“全部”里不含它\n"
                 "/export 涨跌 [卡] [范围] —— 每一场的涨跌、前面连涨 / 连跌了几场，连同预挂在这一场的成交和盈亏（= /tally，聊天里直接看结论）\n"
                 "范围：今天、昨天、7d、30d、14天，或 2026-11-20 2026-11-25（预挂不写范围是全部日期，涨跌统计默认 7 天、最多 "
-                f"{TALLY_MAX_DAYS} 天）；筛选词同 /journal，如“海力士 挂”；卡写 BTC-5M、btc 5分、15分、btc 都行")
+                f"{TALLY_MAX_DAYS} 天）；筛选词同 /journal，如“海力士 挂”；卡写 BTC-5M、btc 5分、15分、btc 都行\n"
+                "规则吃单的优先时段（抢单时刻前后、开场前 15 分钟和盘中）里导出要等；最后加“强制”马上做，如 /export json 上证 强制（这几秒规则吃单可能慢一点）")
 
     async def cmd_export(self, req: Request) -> Any:
         """/export [what] […]: the review page's data as files, each kind by its word; none — what there is (export_menu)."""
-        words = [w.strip() for w in req.args if w.strip()]
+        forced, words = self.take_force(req.args)  # 1.154.78: …强制 — made now, in the rule taker's priority too (FORCE_WORDS)
         kind = self.EXPORT_KINDS.get(words[0].lower()) if words else None
         if kind is None:
             return self.export_menu() if not words else f"没有“{words[0]}”这一种。\n\n" + self.export_menu()
@@ -21305,12 +21441,15 @@ class Bot:
             return await self.cmd_journal(sub)
         if kind == "summary":
             return await self.cmd_summary(sub)
+        force = ["强制"] if forced else []  # (the commands with a wait of their own are told)
         if kind == "samples":
-            return await self.cmd_samples(sub)
+            return await self.cmd_samples(dataclasses.replace(req, args=words[1:] + force))
         if kind == "tally":
-            return await self.cmd_tally(sub)
-        if not self.rules_clear(WebServer.HEAVY_CLEAR_S):
-            return self.EXPORT_BUSY + " /export"
+            return await self.cmd_tally(dataclasses.replace(req, args=words[1:] + force))
+        if forced:
+            await self.force_quiet("/export " + " ".join(words))
+        elif not self.rules_clear(WebServer.HEAVY_CLEAR_S):
+            return self.export_busy("/export", words)
         if kind == "preopen":
             return await self.export_preopen(words[1:])
         if kind == "rules":
@@ -21330,8 +21469,11 @@ class Bot:
         token = REVIEW_SHARED.set(shared)
         try:
             bare = dataclasses.replace(req, args=[])
-            for name, made in (("日记", lambda: self.cmd_journal(bare)), ("汇总", lambda: self.cmd_summary(bare)), ("样本", lambda: self.cmd_samples(bare)),
+            for name, made in (("日记", lambda: self.cmd_journal(bare)), ("汇总", lambda: self.cmd_summary(bare)),
+                               ("样本", lambda: self.cmd_samples(dataclasses.replace(req, args=force))),
                                ("预挂", lambda: self.export_preopen([])), ("规则", self.export_rules), ("校准", self.calib_files)):
+                if forced:  # (1.154.78: forced, each file too waits out the rule taker's own seconds)
+                    await self.force_quiet("/export 全部", say=False)
                 answer = made()
                 if inspect.isawaitable(answer):
                     answer = await answer
@@ -21343,7 +21485,7 @@ class Bot:
         finally:
             shared[0] = None
             REVIEW_SHARED.reset(token)
-        tally = await self.cmd_tally(dataclasses.replace(req, args=[]))
+        tally = await self.cmd_tally(dataclasses.replace(req, args=force))
         later = isinstance(tally, str) and tally.startswith("统计中")
         parts.extend(x for x in (tally if isinstance(tally, list) else []) if isinstance(x, Document))
         words_of = [tally] if isinstance(tally, str) and not later else [x for x in (tally if isinstance(tally, list) else []) if not isinstance(x, Document)]
@@ -21622,24 +21764,27 @@ class Bot:
         pre-open mode's filled side against chance and its fills by the run of ups or downs before each window (the doubling
         rule's question), with the windows as a file; several cards (none named: every one) — their fills by the run added up,
         and a line a card. The candles are read in the background: the answer follows when they are."""
-        if not self.rules_clear(WebServer.HEAVY_CLEAR_S):
-            return self.EXPORT_BUSY + " /tally"
+        forced, words = self.take_force(req.args)  # 1.154.78: /tally … 强制 — now, in the rule taker's priority too
+        if forced:
+            await self.force_quiet(" ".join(["/tally", *words]))
+        elif not self.rules_clear(WebServer.HEAVY_CLEAR_S):
+            return self.export_busy("/tally", words)
         try:
-            d0, d1, rest, _, _ = self.export_days(req.args, "7d", TALLY_MAX_DAYS)
+            d0, d1, rest, _, _ = self.export_days(words, "7d", TALLY_MAX_DAYS)
         except ValueError as error:
             return "❌ " + clean_error(error)
         cards, problem = self.tally_cards_named(rest)
         if problem:
             return problem
         if not self.reference_tasks:  # a one-off run, a test: answered here
-            return await self.tally_report(cards, d0, d1)
+            return await self.tally_report(cards, d0, d1, forced)
         job = getattr(self, "tally_job", None)
         if job is not None and not job.done():
             return "上一次 /tally 还在算，等它发来再要下一个"
 
         async def later() -> None:
             try:
-                parts: Any = await self.tally_report(cards, d0, d1)
+                parts: Any = await self.tally_report(cards, d0, d1, forced)
             except Exception as error:
                 LOG.exception("/tally 失败")
                 parts = f"❌ 统计失败：{clean_error(error) or type(error).__name__}"
@@ -21651,8 +21796,9 @@ class Bot:
         return (f"统计中：{tally_name(cards[0]) if len(cards) == 1 else f'{len(cards)} 张卡'}，{journal_days_label(d0, d1, today)}——要读币安的 1 分钟 K 线，"
                 f"{wait}后发来")
 
-    async def tally_report(self, cards: list, d0: dt.date, d1: dt.date) -> list:
-        """/tally's answer: the text and the file (one card: a row a window; several: a row a card and run length)."""
+    async def tally_report(self, cards: list, d0: dt.date, d1: dt.date, forced: bool = False) -> list:
+        """/tally's answer: the text and the file (one card: a row a window; several: a row a card and run length). ``forced`` (/tally …
+        强制, 1.154.78): a card waits out the rule taker's own seconds alone (force_quiet), not its priority."""
         frm, to = d0.isoformat(), d1.isoformat()
         day_ms = lambda d: int(dt.datetime(d.year, d.month, d.day, tzinfo=BEIJING).timestamp() * 1000)
         lo, hi = day_ms(d0) - 2 * DAY_MS, day_ms(d1) + 3 * DAY_MS  # the range's records, read once (days to spare: a daily card's window starts the day before its date)
@@ -21663,7 +21809,9 @@ class Bot:
         unread: list[str] = []
         held = 0.0
         for card in cards:
-            while not self.rules_clear(WebServer.HEAVY_CLEAR_S) and held < self.TALLY_HOLD_S:  # the rule taker goes first: the next card waits
+            if forced:
+                await self.force_quiet("/tally", say=False)
+            while not forced and not self.rules_clear(WebServer.HEAVY_CLEAR_S) and held < self.TALLY_HOLD_S:  # the rule taker goes first: the next card waits
                 held += 5.0
                 await asyncio.sleep(5.0)
             if held >= self.TALLY_HOLD_S:
