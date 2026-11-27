@@ -2146,7 +2146,9 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         keys = [k for k, _, _ in m.CONTROL_KEYS if m.CONTROL_FORMS.get(k, {}).get("group") == "预挂5"]
         self.assertEqual(keys, ["PREOPEN_BTC5_PRICE_CENTS", "PREOPEN_BTC5_SHARES", "PREOPEN_BTC5_DEEP_LEVELS", "PREOPEN_BTC5_CANCEL_SECONDS",
                                 "PREOPEN_BTC5_EXPIRY_SECONDS", "PREOPEN_BTC5_ENTRY_SECONDS", "PREOPEN_BTC5_AHEAD_MINUTES"])
-        self.assertIn('["预挂","开盘前预挂（15 分钟市场）"],["预挂5","开盘前预挂 · BTC 5 分钟单独设置（留 0 / 留空 = 跟上面所有卡一样）"],["规则",', m.CONTROL_PAGE)
+        self.assertIn('["预挂","开盘前预挂（15 分钟市场）"],["预挂5","开盘前预挂 · BTC 5 分钟单独设置（留 0 / 留空 = 跟上面所有卡一样）"],'
+                      '["预挂E5","开盘前预挂 · ETH 5 分钟单独设置（留 0 / 留空 = 跟上面所有卡一样）"],'
+                      '["预挂E15","开盘前预挂 · ETH 15 分钟单独设置（留 0 / 留空 = 跟上面所有卡一样）"],["规则",', m.CONTROL_PAGE)  # (1.154.75: ETH's after it)
         self.assertEqual((m.CONTROL_FORMS["PREOPEN_BTC5_PRICE_CENTS"]["zero"], m.CONTROL_FORMS["PREOPEN_BTC5_SHARES"]["zero"], m.CONTROL_FORMS["PREOPEN_BTC5_DEEP_LEVELS"]["empty"],
                           m.CONTROL_FORMS["PREOPEN_BTC5_DEEP_LEVELS"]["captions"]), ("跟所有卡一样",) * 3 + ({"none": "只挂第一档"},))
         clock = types.SimpleNamespace(now_ms=lambda: NOW, config=None)
@@ -2198,6 +2200,58 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError) as caught:
             m.Config.from_env({**base, **env})
         return caught.exception
+
+    async def test_eth_five_and_fifteen_minute_have_their_own_settings(self):
+        """1.154.75 (the user: "给ETH 5分钟 15分钟 预挂 加个单独的选项"): ETH 5- and 15-minute's own first level, deeper levels,
+        cancel time, signed expiry, entry cut-off and horizon (PREOPEN_ETH5_*, PREOPEN_ETH15_*, each 0 / empty = every card's), as
+        BTC 5-minute's: their windows are signed, withdrawn and quoted by them, every other card's by the general ones; checked
+        together as BTC 5-minute's are; the status says them; the control page has each card's seven in a group of its own."""
+        D = m.D
+        env = {"PREOPEN_MARKETS": "eth5,eth,btc5,btc", "PREOPEN_AHEAD_MINUTES": "120", "PREOPEN_PRICE_CENTS": "47", "PREOPEN_SHARES": "30",
+               "PREOPEN_LEVELS": "43x40", "PREOPEN_ETH5_CANCEL_SECONDS": "120", "PREOPEN_ETH5_ENTRY_SECONDS": "240", "PREOPEN_ETH5_DEEP_LEVELS": "none",
+               "PREOPEN_ETH15_CANCEL_SECONDS": "60", "PREOPEN_ETH15_SHARES": "3"}
+        ctl, api, clock = controller([market(stem="eth", at=NOW + 10 * 60_000, mid=7, minutes=5)], **env)
+        s = ctl.settings
+        e5, e15 = s.timing("ETH-5M"), s.timing("ETH-15M")
+        self.assertEqual((e5.cancel_seconds, e5.expiry_seconds, e5.entry_seconds, e5.ahead_minutes), (120, 10, 240, 120))
+        self.assertEqual((e15.cancel_seconds, e15.entry_seconds), (60, 180))
+        self.assertTrue(s.timing("BTC-5M") is s and s.timing("BTC-15M") is s, "BTC keeps the general timing")
+        general = ((D("0.47"), D("30")), (D("0.43"), D("40")))
+        self.assertEqual((s.levels_for("ETH-5M"), s.levels_for("ETH-15M"), s.levels_for("BTC-5M"), s.levels_for("BTC-15M")),
+                         (general[:1], ((D("0.47"), D("3")), general[1]), general, general))
+        c5 = p.candidate(market(stem="eth", at=NOW + 10 * 60_000, mid=7, minutes=5), NOW, ctl.owner.config, s)
+        c15 = p.candidate(market(stem="eth", at=NOW + 15 * 60_000, mid=8), NOW, ctl.owner.config, s)
+        b5 = p.candidate(market(at=NOW + 10 * 60_000, mid=9, minutes=5), NOW, ctl.owner.config, s)
+        self.assertEqual([c["start_ms"] - c["cancel_ms"] for c in (c5, c15, b5)], [120_000, 60_000, 20_000])
+        self.assertEqual(p.candidate_problem(market(stem="eth", at=NOW + 5 * 60_000, mid=10, minutes=5), NOW + 90_000, ctl.owner.config, s), "已开始或不足 240 秒",
+                         "210 s out — ETH 5-minute: its own 240 s")
+        self.assertEqual(p.candidate_problem(market(at=NOW + 5 * 60_000, mid=11, minutes=5), NOW + 90_000, ctl.owner.config, s), "", "BTC 5-minute: the general 180 s")
+        status = ctl.status()
+        self.assertIn("ETH 5 分钟自己的时间：开场前 120 秒撤单、10 秒签名到期，不足 240 秒不再新挂，只挂 120 分钟内开始的场次", status)
+        self.assertIn("ETH 5 分钟自己的档位：两边各 47.0¢×30 份", status)
+        self.assertIn("ETH 15 分钟自己的时间：开场前 60 秒撤单", status)
+        self.assertIn("ETH 15 分钟自己的档位：两边各 47.0¢×3 份、43.0¢×40 份", status)
+        self.assertNotIn("BTC 5 分钟自己的", status)
+        # placed at its own ladder: ETH 5-minute's first level alone
+        await ctl.place_pair(c5)
+        self.assertEqual([(o["state"], pair["shares"]) for pair in ctl.ledger.rows.values() for o in pair["orders"].values()], [("open", "30"), ("open", "30")])
+        await self.finish(ctl)
+        # checked together as BTC 5-minute's (its cancel and the general entry cut-off; the ladder in its own words)
+        base = {"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64}
+        self.assertIn("ETH 5 分钟自己的预挂时间（PREOPEN_ETH5_*", str(self.assert_bad(base, PREOPEN_ETH5_CANCEL_SECONDS="150")))
+        self.assertIn("新挂截止 180 秒", str(self.assert_bad(base, PREOPEN_ETH15_CANCEL_SECONDS="150")))
+        self.assertEqual(m.Config.from_env({**base, "PREOPEN_ETH5_CANCEL_SECONDS": "150", "PREOPEN_ETH5_ENTRY_SECONDS": "210"}).preopen.timing("ETH-5M").cancel_seconds, 150)
+        self.assertIn("ETH 15 分钟的价格档位合起来是 ", str(self.assert_bad(base, PREOPEN_ETH15_PRICE_CENTS="1", PREOPEN_ETH15_SHARES="10")))
+        self.assertEqual(m.Config.from_env(base).preopen.own, (), "nothing set: nothing of its own")
+        # the control page: each card's seven in a group of its own, as BTC 5-minute's; what is in force goes back to it as typed
+        for stem, group in (("ETH5", "预挂E5"), ("ETH15", "预挂E15")):
+            keys = [k for k, _, _ in m.CONTROL_KEYS if m.CONTROL_FORMS.get(k, {}).get("group") == group]
+            self.assertEqual(keys, [f"PREOPEN_{stem}_{part}" for part in ("PRICE_CENTS", "SHARES", "DEEP_LEVELS", "CANCEL_SECONDS", "EXPIRY_SECONDS",
+                                                                           "ENTRY_SECONDS", "AHEAD_MINUTES")])
+            self.assertTrue(set(keys) <= m.CONTROL_KEY_SET)
+        bot = m.Bot(m.Config.from_env({**base, **env}), m.Store(":memory:"), types.SimpleNamespace(now_ms=lambda: NOW, config=None), None)
+        self.assertEqual([bot.control_value(k) for k in ("PREOPEN_ETH5_CANCEL_SECONDS", "PREOPEN_ETH5_DEEP_LEVELS", "PREOPEN_ETH15_SHARES", "PREOPEN_ETH15_DEEP_LEVELS",
+                                                         "PREOPEN_ETH15_PRICE_CENTS")], ["120", "none", "3", "", "0"])
 
     async def test_five_minute_cards_are_quoted_on_their_own_rhythm(self):
         """1.137.0: btc5 / eth5 / bnb5 name the 5-minute cards (btc-updown-5m-<start>): a window every five minutes, the

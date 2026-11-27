@@ -1125,6 +1125,11 @@ def levels_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShar
 
 LEAD_BUCKETS = ((0.0, "撤单后才读到（成交时刻不详）"), (1.0, "开场前 1 分钟内"), (10.0, "开场前 1–10 分钟"), (60.0, "开场前 10–60 分钟"),
                 (360.0, "开场前 1–6 小时"), (math.inf, "开场前 6 小时以上"))  # card_diag: how long before the start the first fill was seen, the earliest first
+# 1.154.75 (the user: "搜索前面复盘的记录 建议多久前撤单"; "ETH 加个复盘详细的功能 下次方便分析") — cancel_study: the spans of how long before
+# the start a record's first fill was seen, near the start finer than LEAD_BUCKETS, and the cancel times weighed (seconds)
+CANCEL_LEADS = ((0.0, "撤单后才读到"), (30.0, "开场前 30 秒内"), (60.0, "开场前 30–60 秒"), (120.0, "开场前 1–2 分钟"), (180.0, "开场前 2–3 分钟"),
+                (300.0, "开场前 3–5 分钟"), (600.0, "开场前 5–10 分钟"), (math.inf, "开场前 10 分钟以上"))
+CANCEL_CUTS_S = (20, 30, 60, 90, 120, 180, 300, 600)
 LOSS_FOCUS_SHARE = 0.6  # card_diag: two start hours carrying this much of a card's losses are named as where it lost
 DIAG_MIN = 5            # ...and a pattern is named only over this many settled windows
 HOUR_FLAG_Z = -3.0      # ...and one start hour's filled side as far below half as this: picked off (24 hours looked at — a −2σ hour comes by chance)
@@ -1191,7 +1196,51 @@ def card_diag(qs: list[dict], luck: dict | None = None) -> dict:
     notes = diag_notes(ws, one, hours, leads, luck)
     return {"windows": len(ws), "one": one, "both": both, "hours": hours, "lead": leads,
             "sides": [review_side(name, side, qs) for side, name in (("up", "涨"), ("down", "跌"))],
-            "levels": [x for x in level_lines if x["filled"] > 0], "notes": notes}
+            "levels": [x for x in level_lines if x["filled"] > 0], "notes": notes,
+            "cancel": cancel_study(qs)}  # 1.154.75: 撤单时间参考
+
+
+def cancel_study(qs: list[dict]) -> dict:
+    """1.154.75 (the user: "搜索前面复盘的记录 建议多久前撤单"): a card's settled records (quote_of) by how long before the start their
+    first fill was seen — fill_lead_min: when the bot first saw it, its account snapshot's pace behind the fill itself (seconds,
+    a minute with tens of thousands of orders) — each span's records, the one-sided ones, the P&L; and each cancel time of
+    CANCEL_CUTS_S weighed on them: the records whose first fill was seen at least that long before the start would still have
+    filled, the rest (the fills seen after the cancel among them) would not — what they would have kept, what they would have
+    been spared. Records without the time (fills before 1.151.0) are counted apart. A record its own sample (its level, its
+    attempt): the cut falls between the fills of one window's levels."""
+    rows = [q for q in qs if q["settled"] and q.get("fill_lead_min") is not None]
+    total = sum(q["pnl"] for q in rows)
+    one = lambda q: (q["filled_up"] > 0) != (q["filled_down"] > 0)
+    buckets = []
+    for i, (bound, name) in enumerate(CANCEL_LEADS):
+        low = CANCEL_LEADS[i - 1][0] if i else -math.inf
+        group = [q for q in rows if low <= q["fill_lead_min"] * 60 < bound]
+        if group:
+            pnl = sum(q["pnl"] for q in group)
+            buckets.append({"name": name, "n": len(group), "one": sum(1 for q in group if one(q)), "pnl": round(pnl, 4), "avg": round(pnl / len(group), 4)})
+    cuts = []
+    for cut in CANCEL_CUTS_S:
+        kept = [q for q in rows if q["fill_lead_min"] * 60 >= cut]
+        pnl = sum(q["pnl"] for q in kept)
+        cuts.append({"s": cut, "label": f"开场前 {cut} 秒" if cut < 120 else f"开场前 {cut // 60} 分钟", "n": len(kept), "pnl": round(pnl, 4),
+                     "avoided": round(total - pnl, 4)})
+    return {"n": len(rows), "pnl": round(total, 4), "unknown": sum(1 for q in qs if q["settled"] and q.get("fill_lead_min") is None),
+            "buckets": buckets, "cuts": cuts}
+
+
+def cancel_study_text(name: str, study: dict, cancel_s: int | None = None) -> str:
+    """cancel_study in a few lines (/export 预挂明细): the spans, the cancel times, and the one that would have kept the most."""
+    usd = lambda x: f"{'+' if x >= 0 else '−'}${abs(x):,.2f}"
+    if not study["n"]:
+        return f"{name}：这段时间没有记下成交时刻的已结算成交" + (f"（{study['unknown']} 条是 1.151.0 之前的，没记时刻）" if study["unknown"] else "")
+    lines = [f"📊 {name}：{study['n']} 条已结算的成交，合计 {usd(study['pnl'])}" + (f"（另 {study['unknown']} 条没记成交时刻）" if study["unknown"] else "")
+             + (f"；现在开场前 {cancel_s} 秒撤单" if cancel_s else "")]
+    lines.append("按第一次看到成交的时刻：" + "；".join(f"{b['name']} {b['n']} 条 {usd(b['pnl'])}" for b in study["buckets"]))
+    lines.append("如果开场前多久撤单（第一次看到成交早于它的照样成交，其余的避开）：" + "；".join(f"{c['label']} 还成交 {c['n']} 条 {usd(c['pnl'])}" for c in study["cuts"]))
+    best = max(study["cuts"], key=lambda c: c["pnl"])
+    lines.append(f"这些成交里，{best['label']}撤单留下的最多（{usd(best['pnl'])}，避开 {usd(best['avoided'])}）。成交时刻按机器人第一次看到算，"
+                 "比真实成交晚几秒到一分钟，所以靠近开场的几档会偏乐观；样本少的时候差几十美元是运气")
+    return "\n".join(lines)
 
 
 def diag_notes(ws: list[dict], one: dict, hours: list[dict], leads: list[dict], luck: dict | None) -> list[str]:
@@ -1422,6 +1471,21 @@ def late_entries(row: dict) -> list[tuple[str, float]]:
                 out.append((str(entry["day"]), float(entry.get("pnl") or 0)))
             except (TypeError, ValueError):
                 continue
+    return out
+
+
+def own_lines(settings: Settings) -> str:
+    """The status's lines for the cards with settings of their own (core.PREOPEN_OWN) that are quoted: their timing, their ladder."""
+    out = ""
+    for key, _, name, _ in core.PREOPEN_OWN:
+        if key not in settings.markets:
+            continue
+        timed = settings.timing(key)
+        if timed is not settings:
+            out += (f"{name}自己的时间：开场前 {timed.cancel_seconds} 秒撤单、{timed.expiry_seconds} 秒签名到期，不足 {timed.entry_seconds} 秒不再新挂，"
+                    + ("挂 24 小时内已发布的全部场次" if timed.ahead_minutes >= 1440 else f"只挂 {timed.ahead_minutes} 分钟内开始的场次") + "\n")
+        if ladder := settings.own_of(key).levels:
+            out += f"{name}自己的档位：两边各 {'、'.join(f'{core.cents(float(lp))}×{float(ls):g} 份' for lp, ls in ladder)}\n"
     return out
 
 
@@ -5444,7 +5508,7 @@ class Controller:
         spent, refused, again = self.unquotable()
         quoted_to: dict[str, int] = {}  # card -> the latest window with a quote resting (the first level's, the deeper ones wait for the start)
         early = 0  # ...and those signed, before a setting changed, to leave the book earlier than the settings say now (resumable, 1.154.54)
-        expiry_of = {"BTC-5M": self.settings.timing("BTC-5M").expiry_seconds}
+        expiry_of = {key: self.settings.timing(key).expiry_seconds for key, *_ in core.PREOPEN_OWN}  # (1.154.75: every card with its own)
         for p in self.ledger.rows.values():  # (one pass for the resting ones: their count, and each card's latest)
             if p["phase"] == "active":
                 resting += 1
@@ -5484,11 +5548,7 @@ class Controller:
                 + (f"；{shut_cards['us']}只挂美股常规交易时段内的场次（纽约时间 09:30–16:00，美国假日、半日市按日历）"
                    + f"，开盘后头 {quiet} 分钟的不挂" if shut_cards["us"] else "")  # the end's date only when not the start's
                 + (f"；周末不挂（北京时间周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00 开始的场次）" if not self.settings.weekend else "") + "\n"
-                + (f"BTC 5 分钟自己的时间：开场前 {b5.cancel_seconds} 秒撤单、{b5.expiry_seconds} 秒签名到期，不足 {b5.entry_seconds} 秒不再新挂，"
-                   + ("挂 24 小时内已发布的全部场次" if b5.ahead_minutes >= 1440 else f"只挂 {b5.ahead_minutes} 分钟内开始的场次") + "\n"
-                   if "BTC-5M" in self.settings.markets and (b5 := self.settings.timing("BTC-5M")) is not self.settings else "") +  # 1.152.0
-                (f"BTC 5 分钟自己的档位：两边各 {'、'.join(f'{core.cents(float(lp))}×{float(ls):g} 份' for lp, ls in self.settings.btc5_levels)}\n"
-                 if "BTC-5M" in self.settings.markets and self.settings.btc5_levels else "") +  # 1.154.37
+                + own_lines(self.settings) +  # 1.152.0 / 1.154.37: BTC 5-minute's own; 1.154.75 ETH 5- and 15-minute's too
                 f"已记录 {len(self.ledger.windows)} 场、{total} 条（{resting} 条挂着，{cleared} 条已结清）"
                 + (f"；挂着的里面 {early} 条是改设置前签的，到期时间签在单里改不了：它们最晚在原来签的到期时间离场（比现在的设置早），排队位置保留，新挂的按现在的设置" if early else "")
                 + (f"，另有 {self.ledger.archived_count} 条已归档（结束超过 {ARCHIVE_AFTER_MS // core.DAY_MS} 天、已撤且没成交的；复盘页照常统计）" if self.ledger.archived_count else "") + "，"
