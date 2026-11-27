@@ -231,7 +231,7 @@ async def in_the_background() -> None:
     # a job that fails says so
     bot.tally_job = None
 
-    async def boom(cards, d0, d1):
+    async def boom(cards, d0, d1, forced=False):
         raise RuntimeError("坏了")
     bot.tally_report = boom
     m.LOG.disabled = True  # (the failure is logged with its traceback: not into this suite's output)
@@ -244,7 +244,8 @@ async def in_the_background() -> None:
     # the rule taker goes first: not now
     busy = tally_bot()
     busy.rules_clear = lambda seconds: False
-    assert await busy.cmd_tally(req("/tally")) == busy.EXPORT_BUSY + " /tally" and await busy.cmd_export(req("/export", "预挂")) == busy.EXPORT_BUSY + " /export"
+    # (1.154.78: with the command that makes it now — the force word, tests/test_force_refresh.py)
+    assert await busy.cmd_tally(req("/tally")) == busy.EXPORT_BUSY + "/tally 强制" and await busy.cmd_export(req("/export", "预挂")) == busy.EXPORT_BUSY + "/export 预挂 强制"
     assert (await busy.cmd_export(req("/export"))).startswith("📦 复盘数据导出"), "what there is to export is said all the same"
     # ...and a job under way waits for it between two cards, TALLY_HOLD_S at the most — then ends with what it has
     held = tally_bot()

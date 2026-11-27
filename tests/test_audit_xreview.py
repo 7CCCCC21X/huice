@@ -707,7 +707,7 @@ async def why_no_key():
         print("why_no_key: node not found, page-code run skipped")
         return
     why_js = odds[odds.index("let whyData="):odds.index("function whyRow(")]
-    jr_js = journal[journal.index("function ctlKey()"):journal.index('["csv","scsv","json"]')]
+    jr_js = journal[journal.index("function ctlKey()"):journal.index('["csv","scsv","json"')]  # (1.154.78: 模型样本 joined that list)
     harness = r"""
 const prompts=[],asks=[];let store={};
 globalThis.sessionStorage={getItem:k=>store[k]||null,setItem:(k,v)=>{store[k]=v}};
@@ -721,7 +721,7 @@ globalThis.fetch=async(u,o)=>{asks.push(u);return {status:403,ok:false,json:asyn
 console.log(JSON.stringify({prompts:prompts.length,fetches:asks.length,err:whyErr}))})();"""
     jr_run = harness + """
 let dead=false,okAt=0,allLoaded=false,openId="",data=null,details={},base="/p/T";
-function filterKey(){return ""}function loadAna(){}function render(){}function loadDetail(){}function clock(){return ""}
+function filterKey(){return ""}function loadAna(){}function render(){}function loadDetail(){}function clock(){return ""}function showForce(){}
 function $(tag,cls,text){return {tag,cls,text}}
 let meta=[];globalThis.document={getElementById:()=>({replaceChildren:(...a)=>{meta=a}}),querySelector:()=>null};
 """ + jr_js + """
