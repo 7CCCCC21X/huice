@@ -756,7 +756,11 @@ async def browser_check(bot, data):
                 "levels": [{"name": "47¢", "price": 0.47, "records": 3, "windows": 3, "resting": 0, "filled_windows": 2, "filled": 20.0, "volume": 9.4, "pending": 0,
                             "settled": 2, "wins": 0, "losses": 2, "ties": 0, "pnl": -9.4, "pending_cost": 0.0, "withdrawn": 1, "settled_shares": 20.0, "ev": 0.6,
                             "sigma": 7.0711, "z": -1.41, "both": {"windows": 0, "pnl": 0.0}, "one": {"windows": 2, "won": 0, "pnl": -9.4}}],  # 1.154.34: with its 预期对实际
-                "notes": ["亏损集中在 06:00（北京时间）开始的场次"]}
+                "notes": ["亏损集中在 06:00（北京时间）开始的场次"],
+                # 1.154.75: 撤单时间参考 (preopen.cancel_study)
+                "cancel": {"n": 2, "pnl": -9.4, "unknown": 0, "buckets": [{"name": "开场前 30 秒内", "n": 2, "one": 2, "pnl": -9.4, "avg": -4.7}],
+                           "cuts": [{"s": 20, "label": "开场前 20 秒", "n": 1, "pnl": -4.7, "avoided": -4.7},
+                                    {"s": 60, "label": "开场前 60 秒", "n": 0, "pnl": 0.0, "avoided": -9.4}]}}
         po_row = {"name": "BTC 15分涨跌 · 开盘前预挂", "preopen": True, "records": 3, "markets": 3, "filled": 10.0, "volume": 4.9, "settled": 1, "wins": 1,
                   "losses": 0, "ties": 0, "pnl": 5.1, "open": 0, "open_cost": 0.0, "resting": 2, "marked": 0, "unrealized": 0.0, "expected": 0.1, "hit": 1.0, "avg_fair": 0.5,
                   "luck": {"bets": 4, "ev": 0.1, "pnl": 5.1, "sigma": 2.5, "z": 2.0, "verdict": "样本不足"}, "diag": diag}
@@ -772,7 +776,8 @@ async def browser_check(bot, data):
         assert (await po_line.inner_text()).startswith("▾ ") and "BTC 15分涨跌 · 开盘前预挂 · 今天：钱亏在哪" in await page.inner_text("#s-detail h3")
         text = await page.inner_text("#s-detail")
         for want in ("亏损集中在 06:00（北京时间）开始的场次", "成交那边赢 0 场（0%，五五开该一半，偏离 −1.4σ）", "按开始时间", "开场前 6 小时以上", "按方向",
-                     "按价格档：预期（按五五开）对实际", "+3.0¢ → −47.0¢", "+$0.60", "−$10.00（−1.4σ）", "0/2（0%，保本 47%）"):  # 1.154.34
+                     "按价格档：预期（按五五开）对实际", "+3.0¢ → −47.0¢", "+$0.60", "−$10.00（−1.4σ）", "0/2（0%，保本 47%）",  # 1.154.34
+                     "撤单时间参考（一条记录 = 一场的一个档位", "开场前 30 秒内", "如果开场前多久撤单", "开场前 60 秒"):  # 1.154.75
             assert want in text, (want, text)
         assert await page.locator("#s-detail tr.rec").count() == 0, "the model trader's records panel is not a pre-open line's"
         await po_line.locator("td").first.click()
