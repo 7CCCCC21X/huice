@@ -326,8 +326,9 @@ async def api_checks():
     neg_selector = "0x" + L.Chain.encode("redeemPositions(bytes32,uint256[])", ["bytes32", "uint256[]"], [bytes(32), [0, 0]]).hex()[:8]
     assert signed[-1]["to"] == L.ADDRESSES[56]["NEG_RISK_ADAPTER"] and signed[-1]["data"].startswith(neg_selector)
     assert signed[-1]["data"].endswith("0" * 64 + hex(7 * WEI)[2:].rjust(64, "0"))  # amounts [0, 7 shares] for outcome 2
-    values["eth_call"] = "0x"
-    assert await chain.usdt_balance() == 0
+    values["eth_call"] = "0x"  # 1.154.76 (an outside audit, P1-8): an empty answer is a failed read — never a balance of 0
+    try: await chain.usdt_balance(); assert False
+    except m.RemoteError as e: assert "不足一个字" in str(e)
 
 
 asyncio.run(api_checks())

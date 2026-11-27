@@ -1255,7 +1255,8 @@ async def stop_ok_preopen():
     out = await stop(ctl)
     assert not out["ok"] and "还有 8 张没撤成（Predict 接口限流冷却中" in out["message"] and up(api) == 8, out
     # (b) a crashed controller's book of 50 ids: Predict takes the first batch of 20, then fails — the cancel command's own
-    # withdraw_all leaves 30, and the stop's second one (30 <= BULK_MIN_IDS, the small branch) must say so as well
+    # withdraw_all leaves 30, and the stop says so. (1.154.76, an outside audit, P0-3: the stop's second withdraw_all is gone —
+    # the cancel command's own was the stop's, the second doubled its time to 60 s and sent the removals again; red all the same)
     ctl, api = await book(25, False, ahead="1440")
     real, budget = api.remove_orders, [20]
 
@@ -1266,7 +1267,8 @@ async def stop_ok_preopen():
         return await real(ids)
     api.remove_orders = flaky
     out = await stop(ctl)
-    assert not out["ok"] and up(api) == 30 and "预挂模式已停止：还有 30 张没撤成（HTTP 500: internal error" in out["message"], out
+    assert not out["ok"] and up(api) == 30 and "预挂模式已停止：30 秒内撤了 20 张，还有 30 张没撤成" in out["message"], out
+    assert "HTTP 500: internal error" in out["message"] and out["message"].count("预挂模式已停止") == 1, out
     # (c) still green: removals that work (running and crashed), nothing to withdraw — and an order Predict answers "noop" for
     # (gone already): not a miss, though the ledger says "open" until the reconcile reads it (a recount would have said 1 left)
     for alive in (True, False):

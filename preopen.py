@@ -288,7 +288,8 @@ class Ledger:
         else:
             self.struck.pop(slug, None)
         try:
-            scored = bool(float(row.get("pnl") or 0))
+            # (1.154.76, P1-2: a pair whose P&L nets to 0 over its days still has its own day's part — +$5 that day, −$5 learned the next)
+            scored = bool(float(row.get("pnl") or 0)) or bool(late_entries(row))
         except (TypeError, ValueError):
             scored = True  # (a figure that is no number: filed, and left for the sum to stumble on as the walk did — never here, in a save)
         day = str(row.get("accounted_day") or "") if scored else ""
@@ -491,11 +492,16 @@ class Ledger:
         return next((p for p in self.rows.values() if any(o.get("hash") == digest for o in p["orders"].values())), None)
 
     def save(self, row: dict) -> None:
-        body = json.dumps(row, ensure_ascii=False)
-        with self.conn:
-            self.conn.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body", (row["slug"], body))
-        self.rows[row["slug"]] = row
-        self.index(row["slug"], row)
+        try:
+            body = json.dumps(row, ensure_ascii=False)
+            with self.conn:
+                self.conn.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body", (row["slug"], body))
+        finally:
+            # 1.154.76 (an outside audit, P1-2): the record in memory is what its caller made it, written or not — indexed as it stands.
+            # A write that failed left it out of the indexes: a pair settled (accounted, its loss) gone from day_pnl and its
+            # reservation freed, until a restart read the file's older copy. (The error goes on to the caller as before)
+            self.rows[row["slug"]] = row
+            self.index(row["slug"], row)
 
     def hold(self, row: dict) -> None:
         """A record among the working ones — and in every index — before its first save (1.154.42, Controller.place_pair): the
@@ -519,12 +525,14 @@ class Ledger:
         """Several records in one transaction (1.141.0: a batch withdrawal touches thousands — one commit, not one each)."""
         if not rows:
             return
-        with self.conn:
-            self.conn.executemany("INSERT INTO pairs VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body",
-                                  [(row["slug"], json.dumps(row, ensure_ascii=False)) for row in rows])
-        for row in rows:
-            self.rows[row["slug"]] = row
-            self.index(row["slug"], row)
+        try:
+            with self.conn:
+                self.conn.executemany("INSERT INTO pairs VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body",
+                                      [(row["slug"], json.dumps(row, ensure_ascii=False)) for row in rows])
+        finally:
+            for row in rows:  # (1.154.76, P1-2: indexed as they stand, written or not — save)
+                self.rows[row["slug"]] = row
+                self.index(row["slug"], row)
 
     def delete(self, slug: str) -> None:
         """A pair none of whose orders was ever sent (the rate limiter refused the first request): no record, so a later
@@ -1459,6 +1467,18 @@ def window_of(pair: dict) -> str:
 
 
 RESULT_PAY = {"up": 1.0, "down": 0.0, "split": 0.5}  # a settled pair's result -> what its 涨 side pays a share (settle_pair's ``up``)
+
+
+def file_day_pnl(rows: Iterable[dict], day: str) -> float:
+    """A Beijing day's accounted P&L over records read from the file (LiveBot.preopen_file_day, the mode off), on Ledger.day_pnl's
+    terms (1.154.76, an outside audit, P1-2): a P&L change learned on a later day (late_entries) on that day, off the pair's own."""
+    total = 0.0
+    for p in rows:
+        late = late_entries(p)
+        if p.get("accounted_day") == day:
+            total += float(p.get("pnl") or 0) - sum(x for _, x in late)
+        total += sum(x for d, x in late if d == day)
+    return total
 
 
 def late_entries(row: dict) -> list[tuple[str, float]]:
@@ -3097,6 +3117,21 @@ class Controller:
         ids, hashes = self.ledger.known()
         return set(ids), set(hashes)
 
+    def following(self) -> tuple[set[str], set[str]]:
+        """1.154.76 (an outside audit, P0-1): the ids and hashes of the orders this mode still follows — its records not accounted,
+        their orders not ended — what its own withdrawal (withdraw_all) takes. /live cancel account leaves these to it and withdraws
+        an order of an ended record still on the account's list as any stray one (known() names every record's, ended or not)."""
+        ids: set[str] = set()
+        hashes: set[str] = set()
+        for pair in self.ledger.pending():
+            for o in (pair.get("orders") or {}).values():
+                if o.get("state") in TERMINAL and o.get("state") != "removed":
+                    continue  # (a removal not read final yet is still this mode's to confirm)
+                if o.get("id"):
+                    ids.add(str(o["id"]))
+                hashes.update(str(o[k]).lower() for k in ("hash", "api_hash") if o.get(k))
+        return ids, hashes
+
     def unmanaged_rows(self, rows: list[dict]) -> list[dict]:
         import live
         ids, hashes = self.ledger.known()
@@ -3790,7 +3825,9 @@ class Controller:
                 # 1.154.21: on the mode's key when it has a token now, else on the rule taker's idle one (through: that key's
                 # refusal — unprocessed — sends the order on the mode's own; the signed order is the same on either)
                 result = await self.through(home, lambda api: api.create_order(order["body"]), first=bool(c.get("fresh")) and not c.get("level"), trade=True)
-                order.update(id=result["order_id"], state="open", api_hash=str(result.get("hash") or "").lower())
+                order.update(id=result["order_id"], api_hash=str(result.get("hash") or "").lower())
+                if order["state"] == "placing":  # (1.154.76, P0-4: an order another pass found by its hash and removed meanwhile stays removed)
+                    order["state"] = "open"
                 self.placed_at.append((self.now(), pair["window"]))  # 1.154.57: one more order on the book (speed_line)
             except NotSent as error:
                 order.update(state="not_sent", error=core.clean_error(error))
@@ -3798,7 +3835,7 @@ class Controller:
             except Exception as error:
                 text = core.clean_error(error) or type(error).__name__
                 status = live.http_status(error)
-                definite = isinstance(error, live.OrderRejected) or 400 <= status < 500
+                definite = isinstance(error, live.OrderRejected) or live.refused_status(status)  # (1.154.76: not a 408, P2-1)
                 if status == 429 or "限流冷却中" in text:
                     # the rate limiter refused the request before it was processed (429), or the shared cooldown kept it in: not placed
                     order.update(state="rejected" if status == 429 else "not_sent", error=text, limited=True)
@@ -3835,6 +3872,8 @@ class Controller:
                 # and that still counts): withdrawn here only for its cancel time or an operator's stop that came during the
                 # two POSTs, which the cancellation loop withdraws free ("到时撤单或真实交易暂停") — not the window's failure
                 pair["free"] = True
+            if pair["slug"] in self.cancelling:
+                pair["recancel"] = True  # 1.154.76 (P0-4): another pass is withdrawing it now — once more the moment it ends (cancel_pair)
             await self.cancel_pair(pair, "单边未确认或已到撤单时间")
         LOG.info("开盘前预挂 %s：%s", pair["slug"], {s: o["state"] for s, o in pair["orders"].items()})
         return ""
@@ -4094,6 +4133,8 @@ class Controller:
             self.bookkeep(pair)
         finally:
             self.cancelling.discard(pair["slug"])
+            if pair.pop("recancel", False):
+                pair["retry_ms"] = 0  # (1.154.76, P0-4: a side answered open while this pass ran — the loop's next turn withdraws it)
 
     async def cooled(self) -> None:
         """Waits out a cooldown of the mode's client (a 429: twenty seconds), COOL_WAIT_S at the most, before a withdrawn
@@ -4152,6 +4193,10 @@ class Controller:
         pair.update(accounted=True, accounted_day=dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat(),
                     result="split" if up == 0.5 else "up" if up == 1.0 else "down",
                     pnl=sum(((up if side == "up" else 1 - up) - price) * float(order.get("filled") or 0) for side, order in pair["orders"].items()))
+        if all(o["state"] in TERMINAL for o in pair["orders"].values()):
+            # 1.154.76 (an outside audit, P2-6): closed with its accounting — every order read final above. It stayed "closing": a
+            # settled pair walked by every withdrawal's scan and the cancellation loop's looks, never archivable
+            pair["phase"] = "closed"
         self.ledger.save(pair)
         if any(float(order.get("filled") or 0) > 0 and (up == 0.5 or (side == "up") == (up == 1.0)) for side, order in pair["orders"].items()):
             soon = getattr(self.owner, "live_redeem_soon", None)
@@ -4271,7 +4316,14 @@ class Controller:
                 if order["state"] == "prepared":
                     order["state"] = "not_sent"
                     drop_signature(order)  # (never to be sent: 1.154.33, R24)
-        self.ledger.save_many(pairs)
+        try:
+            self.ledger.save_many(pairs)
+        except Exception as error:
+            # 1.154.76 (an outside audit, P0-3): a disk that fails keeps no order on the book — the removals go out all the same; the
+            # records stand as closing in memory, written with the next save that succeeds (an error here stopped every removal)
+            why = core.clean_error(error) or type(error).__name__
+            LOG.warning("开盘前预挂：撤单前保存 %d 条记录失败（%s），照常撤单", len(pairs), why)
+            self.error = f"撤单前记录写不进数据库（{why}）：照常撤单，改为不写记录直接撤（下次启动时按 Predict 核对）"
         return await self.remove_pairs(pairs, deadline_s=deadline_s)
 
     def bulk_client(self) -> Any:
@@ -4313,7 +4365,12 @@ class Controller:
                     self.off_book(order)
                     pair.setdefault("cancel_done_ms", self.now())
                     touched[pair["slug"]] = pair
-            self.ledger.save_many(list(touched.values()))
+            try:
+                self.ledger.save_many(list(touched.values()))
+            except Exception as error:  # 1.154.76 (an outside audit, P0-3): the next batches go out all the same; the next save writes these
+                why = core.clean_error(error) or type(error).__name__
+                LOG.warning("开盘前预挂：撤单确认后保存 %d 条记录失败（%s），接着撤", len(touched), why)
+                self.error = f"撤单确认后记录写不进数据库（{why}）：接着撤，改为不写记录直接撤（下次启动时按 Predict 核对）"
         slugs = {p["slug"] for p in pairs}
         self.bulk_slugs |= slugs
         limit = self.remove_limit()
@@ -4346,7 +4403,14 @@ class Controller:
             if result.get("halted") == "refused" and any(str(o.get("id") or "") in unsent for o in pair["orders"].values()):
                 pair["bulk_refused"] = int(pair.get("bulk_refused") or 0) + 1  # BULK_REFUSED_MAX of these: one order at a time from then on
             self.bookkeep(pair, save=False)  # closed once nothing is left to cancel; the next try RETRY_MS on, doubling (not every half second)
-        self.ledger.save_many(pairs)
+        try:
+            self.ledger.save_many(pairs)
+        except Exception as error:
+            # 1.154.76 (an outside audit, P0-3): the removals are out; a save that fails now ends neither the reads of their final
+            # fills below nor the reply of the command that asked (it raised out of both: no reply, the fills read by nobody)
+            why = core.clean_error(error) or type(error).__name__
+            LOG.warning("开盘前预挂：撤单后保存 %d 条记录失败（%s），照常核对成交", len(pairs), why)
+            self.error = f"撤单后记录写不进数据库（{why}）：照常核对成交，改为不写记录直接撤（下次启动时按 Predict 核对）"
         for pair in pairs:
             if pair.get("accounted") or pair["slug"] in self.cancelling:
                 continue
@@ -4453,6 +4517,12 @@ class Controller:
         out = []
         for p in self.ledger.pending():  # (1.154.20: the records not accounted — this runs twice a second)
             if p.get("accounted"):
+                continue
+            if p["slug"] in self.placing:
+                # 1.154.76 (an outside audit, P0-4): its two requests still out — place_pair withdraws it itself as they are answered
+                # (its cancel time, an operator's stop, a side refused). Taken here meanwhile, the withdrawal looked for a side not
+                # answered yet by its hash, found nothing and waited its retry: the side answered open a moment later stood on the
+                # book till then; or it was removed and the answer wrote it back open; or the pair, deleted for a 429 on both, saved again
                 continue
             if p["phase"] == "active" and (now_ms >= p["cancel_ms"] or blocked):
                 out.append(p)

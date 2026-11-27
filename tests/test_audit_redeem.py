@@ -1240,7 +1240,14 @@ async def sent_note():
         node.answers["eth_getTransactionByHash"] = None  # dropped
         node.answers["eth_getTransactionReceipt"] = lambda params: None if params[0] == old else MINED  # (the new one is mined)
         node.answers["eth_getTransactionCount"] = "0x2"  # (the pending nonce moved on: a new transaction, not the same bytes again)
-        done = await bot.live_redeem(NOW + 62 * MIN)
+        # 1.154.76 (an outside audit, P1-8): one "the node does not know it" lets nothing go — one node of a load-balanced RPC may
+        # lag or have lost its pool while the transaction is mined after all. The note stays out, marked; the look a few minutes on
+        # that says the same lets it go
+        assert await bot.live_redeem(NOW + 62 * MIN) == [] and len(sends(node)) == 1 and bot.live_redeem_last["counts"] == {"sent": 1}
+        assert bot.store.get("live:redeem-sent:903:1")["unknown_at"] == NOW + 62 * MIN
+        assert await bot.live_redeem(NOW + 64 * MIN) == [] and len(sends(node)) == 1  # (inside the gap: still out)
+        bot.live_redeem_failed.clear()
+        done = await bot.live_redeem(NOW + 62 * MIN + bot.LIVE_REDEEM_UNKNOWN_GAP_MS)
     assert len(sends(node)) == 2 and done == [f"💵 已领取 window 903 Up 10 份：{sends(node)[1]}"] and bot.store.get("live:redeem-sent:903:1") is None, (done, bot.live_redeem_last)
     assert sends(node)[1] != old and "一小时没上链、节点里也查不到：重新领取" in bot.live_errors[-1], bot.live_errors[-2:]
     # (d) a note whose transaction was mined and reverted: a failure (its hour), the note gone; a revert seen by the wait: the same

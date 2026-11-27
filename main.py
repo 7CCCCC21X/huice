@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.75"
+VERSION = "1.154.76"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -1839,6 +1839,12 @@ class Store:
                             merged[key] = text
                     self.queue[:len(batch)] = [(through, list(merged.items()))]
                     self.lock.notify_all()
+                    if self.closing:
+                        # 1.154.76 (an outside audit, P1-11): closing with the write still failing — given up, said in the log, not
+                        # retried each second until the process is killed: close() waited its five seconds, then closed this
+                        # thread's connection under it from another thread
+                        LOG.error("关闭时数据库仍写不进（%s）：放弃没写入的 %d 条", self.write_error, len(merged))
+                        return
                 time.sleep(1.0)
                 continue
             with self.lock:
@@ -1898,7 +1904,7 @@ class Store:
                 self.closing = True
                 self.lock.notify_all()
             self.writer.join(timeout=5)
-            if self.writer_conn is not None:
+            if self.writer_conn is not None and not self.writer.is_alive():  # (1.154.76, P1-11: never under the thread still using it)
                 self.writer_conn.close()
         self.conn.close()
 
@@ -6351,6 +6357,16 @@ async def store_wait(fn: Any, *args: Any) -> Any:
     return await asyncio.get_running_loop().run_in_executor(_STORE_POOL, fn, *args)
 
 
+def predict_pools_close() -> None:
+    """The end of a run: Predict's request pools let go, made again by the next request (1.154.76, an outside audit, P1-11: they
+    were shut and kept — a request after it, a test's next bot, found a pool that takes no work)."""
+    global _PREDICT_POOL, _FIRST_POOL
+    for pool in (_PREDICT_POOL, _FIRST_POOL):
+        if pool is not None:
+            pool.shutdown(wait=False)
+    _PREDICT_POOL = _FIRST_POOL = None
+
+
 def store_wait_close() -> None:
     """The end of a run: store_wait's threads let go (made again by the next wait — a test's next bot)."""
     global _STORE_POOL
@@ -7847,10 +7863,13 @@ class PredictFeed:
             except (RemoteError, TimeoutError, OSError) as error:
                 if found:
                     pass  # the GraphQL page stands
-                elif "HTTP 404" not in str(error) and errors:
+                elif "HTTP 404" in str(error):
+                    errors.clear()  # REST answered "no such category" (404)
+                elif errors or not self.config.predict_graphql:
+                    # neither answered. 1.154.76 (an outside audit, P1-15): with GraphQL off REST is the only word, and its 500 or
+                    # timeout read as "not listed" — cached as such (PREDICT_MISS_SECONDS), the market missing from the step
                     errors.append(clean_error(error))
-                else:
-                    errors.clear()  # GraphQL answered "no such category", or REST did (404)
+                # (else GraphQL answered "no such category": that stands)
         if not found and errors:
             raise RemoteError("；".join(errors))  # network trouble: not cached as "not listed"
         return found
@@ -8574,14 +8593,17 @@ class PredictStream:
             refused = self.refused.get(mid)
             if refused and now - refused[1] < PREDICT_WS_RETRY_TOPIC_SECONDS:
                 continue
-            await self.request(ws, "subscribe", mid)
+            # 1.154.76 (an outside audit, P1-12): marked before the request goes out — its answer may be read while the send awaits
+            # (the frames are read beside this), and a refusal read then popped nothing: the market was marked subscribed after it
+            # for good, never asked for again and never pushed (a connection's end clears the marks: nothing is left over)
             self.subscribed[mid] = target
+            await self.request(ws, "subscribe", mid)
         for mid in [mid for mid in self.subscribed if mid not in self.wanted]:
-            await self.request(ws, "unsubscribe", mid)
-            self.subscribed.pop(mid, None)
+            self.subscribed.pop(mid, None)  # (the same: let go before the request, a push read meanwhile dropped)
             self.versions.pop(mid, None)
             self.live.discard(mid)
             self.heard.pop(mid, None)
+            await self.request(ws, "unsubscribe", mid)
 
     async def request(self, ws: Any, method: str, mid: str) -> None:
         self.request_id += 1
@@ -8639,7 +8661,7 @@ class PredictStream:
             return
         key, level = target
         version = data.get("version")
-        if isinstance(version, (int, float)) and not isinstance(version, bool):
+        if isinstance(version, (int, float)) and not isinstance(version, bool) and math.isfinite(version):  # (1.154.76: no NaN / infinity, P1-12)
             if version < self.versions.get(mid, -1):
                 self.dropped += 1  # out of order
                 return
@@ -12407,8 +12429,11 @@ class CapMarket:
                     hist["spike"] = [bar[0], bar[2], body]
         if finished:
             hist["through"] = max(b[0] for b in finished) + 3600
-        if now_s >= self.window_end_s and not running:
-            hist["through"] = max(hist["through"], self.window_end_s)  # hours without a bar had no trades
+        if now_s >= self.window_end_s and not running and rows:
+            # hours without a bar had no trades — 1.154.76 (an outside audit, P1-14): on an answer that HAS bars. An empty one that
+            # does not raise (GeckoTerminal's hiccup) stamped the window read to its end, its last hours never read: a target hit
+            # in them settled as missed (NO) for good. Read again at the next scan
+            hist["through"] = max(hist["through"], self.window_end_s)
         top_high(hist)
         self.hour_high = max((b[2] for b in running), default=0.0)
         self.store.put(f"cap:{self.spec.slug}", hist)
@@ -12479,7 +12504,10 @@ class CapMarket:
         if high is not None and high >= target:
             return 1.0
         if now_ms >= self.spec.end_ms + 60_000:
-            return 0.0  # the window is over: only what happened inside it counts, never today's market cap
+            # the window is over: only what happened inside it counts, never today's market cap. 1.154.76 (an outside audit, P1-14):
+            # with a bars source, only once its history is read to the end (coverage) — unread hours may hold the hit: unpriced
+            # until then (the official result settles it meanwhile), never NO on half a record
+            return None if self.spec.gecko and self.coverage() else 0.0
         if cap is None or self.sigma is None or self.input_problem(now_ms):
             return None
         if now_ms < self.spec.start_ms:
@@ -13056,7 +13084,7 @@ class RangeMarket:
                 take(row)
                 if running:
                     break
-            if not running and now_ms >= first_hour:
+            if not running and now_ms >= first_hour and rows:  # (1.154.76, P1-14: on an answer with candles in it — an empty one is read again)
                 hist["through"] = max(int(hist["through"]), first_hour)  # minutes without a candle had no trades
         for _ in range(50):
             cursor = int(hist["through"])
@@ -13068,8 +13096,11 @@ class RangeMarket:
                 take(row)
             if len(rows) < 1000 or running:
                 break
-        if now_ms >= end and not running:
-            hist["through"] = max(int(hist["through"]), end)  # hours without a candle had no trades
+        # 1.154.76 (an outside audit, P1-14): the window is read to its end once its last hour's candle is in (that candle's close
+        # is the end: "through" reaches it by itself). It was stamped so, over the end, whatever the read had brought — "hours
+        # without a candle had no trades": an empty or cut answer that does not raise (a proxy in BINANCE_BASE_URL, maintenance)
+        # closed the window with its last hours never read, a level touched in them settled as missed (NO) for good. The pairs
+        # these windows follow trade every minute: a missing hour is a read that failed, read again at the next scan
         self.running = running
         # audit MOD-RANGE-SCAN-EMPTY: count the scan as "read up to now" (advice_problem) only when the record really
         # reaches the last hour (or the window's end). An empty or short hourly answer that does not raise (a proxy in
@@ -16238,12 +16269,18 @@ def sim_upgrade(trade: dict) -> dict:
 
 def predict_resolution(market: dict) -> dict | None:
     """What a Predict market object says it settled on, if it says anything readable: {"index": the winning outcome in
-    indexSet order, "name", "split": a 50/50, "how": the field that said so}. None while open or unreadable."""
+    indexSet order, "index_set": its own indexSet (1.154.76), "name", "split": a 50/50, "how": the field that said so}. None
+    while open or unreadable."""
     rows = sorted((o for o in market.get("outcomes") or [] if isinstance(o, dict)), key=lambda o: int(o.get("indexSet") or 0))
     names = [str(o.get("name") or "") for o in rows]
+
+    def won_at(index: int, how: str) -> dict:
+        # 1.154.76 (an outside audit, P1-9): the winner's own indexSet — a bit mask, 1 << its place (1, 2, 4, …), not its place + 1:
+        # the redeem's "did this position win" compared index_set with index + 1, the same for a two-outcome market alone
+        return {"index": index, "index_set": int(rows[index].get("indexSet") or 0) or 1 << index, "name": names[index], "split": False, "how": how}
     won = [i for i, o in enumerate(rows) if str(o.get("status") or "").strip().upper() in {"WON", "WIN", "WINNER"}]
     if len(won) == 1:
-        return {"index": won[0], "name": names[won[0]], "split": False, "how": "outcomes.status"}
+        return won_at(won[0], "outcomes.status")
     if len(won) == len(rows) == 2:
         return {"index": None, "name": "50/50", "split": True, "how": "outcomes.status"}
     pays = []
@@ -16257,7 +16294,7 @@ def predict_resolution(market: dict) -> dict | None:
             return {"index": None, "name": "50/50", "split": True, "how": "outcomes.payout"}
         if sum(1 for p in pays if p > 0) == 1:
             i = pays.index(top)
-            return {"index": i, "name": names[i], "split": False, "how": "outcomes.payout"}
+            return won_at(i, "outcomes.payout")
     status = str(market.get("status") or "").upper()
     if not any(word in status for word in ("RESOLV", "SETTL", "FINAL")):
         return None
@@ -16273,7 +16310,7 @@ def predict_resolution(market: dict) -> dict | None:
         index = next((i for i, n in enumerate(names) if n.strip().lower() == str(name).strip().lower()), None)
     if index is None:
         return None
-    return {"index": index, "name": names[index], "split": False, "how": "resolution"}
+    return won_at(index, "resolution")
 
 
 def sim_payout(side: str, up_result: float) -> float:
@@ -18683,11 +18720,19 @@ class WebServer:
         self.port = self.server.sockets[0].getsockname()[1]
         return self.port
 
+    DRAIN_SECONDS = 10.0  # a write to a viewer may wait this long for its socket (1.154.76, P1-11: a slow one held the stop for ever)
+    STOP_SECONDS = 5.0    # ...and the stop this long for the open connections to end
+
+    async def drain(self, writer: asyncio.StreamWriter) -> None:
+        await asyncio.wait_for(writer.drain(), self.DRAIN_SECONDS)
+
     async def stop(self) -> None:
         if self.server:
             self.server.close()
             with contextlib.suppress(Exception):
-                await self.server.wait_closed()
+                # 1.154.76 (an outside audit, P1-11): bounded — since Python 3.12 this waits for every open connection, and an event
+                # stream to a stalled viewer stood in its drain without end; the shutdown past Railway's 45 s drain is a SIGKILL
+                await asyncio.wait_for(self.server.wait_closed(), self.STOP_SECONDS)
 
     def route(self, method: str, path: str, query: str = "") -> tuple[int, str, bytes]:
         if method not in {"GET", "HEAD"}:
@@ -18960,10 +19005,10 @@ class WebServer:
                    "script-src 'unsafe-inline'; img-src 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n")
         with contextlib.suppress(Exception):
             writer.write(headers.encode("latin-1") + (b"" if method.upper() == "HEAD" else body))
-            await writer.drain()
+            await self.drain(writer)
         with contextlib.suppress(Exception):
             writer.close()
-            await writer.wait_closed()
+            await asyncio.wait_for(writer.wait_closed(), self.DRAIN_SECONDS)
 
     def is_stream(self, path: str) -> bool:
         parts = path.strip("/").split("/")
@@ -18978,7 +19023,7 @@ class WebServer:
             with contextlib.suppress(Exception):
                 writer.write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 4\r\n"
                              b"Retry-After: 5\r\nCache-Control: no-store\r\nConnection: close\r\n\r\nbusy")
-                await writer.drain()
+                await self.drain(writer)
                 writer.close()
             return
         self.streams += 1
@@ -18986,7 +19031,7 @@ class WebServer:
             writer.write(("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store\r\n"
                           "X-Accel-Buffering: no\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
                           "X-Robots-Tag: noindex\r\nConnection: close\r\n\r\nretry: 2000\n\n").encode("latin-1"))
-            await writer.drain()
+            await self.drain(writer)
             sent, wrote, started = b"", time.monotonic(), time.monotonic()
             while not writer.is_closing() and not self.bot.stopping.is_set() and time.monotonic() - started < self.STREAM_LIFE_SECONDS:
                 try:
@@ -19000,7 +19045,7 @@ class WebServer:
                 elif time.monotonic() - wrote >= self.STREAM_PING_SECONDS:
                     writer.write(b": ping\n\n")
                     wrote = time.monotonic()
-                await writer.drain()
+                await self.drain(writer)  # (bounded: a viewer that stopped reading ends its stream, 1.154.76)
                 await asyncio.sleep(self.STREAM_SECONDS)
         except Exception:  # the viewer left (reset / broken pipe): nothing to report
             pass
@@ -19008,7 +19053,7 @@ class WebServer:
             self.streams -= 1
             with contextlib.suppress(Exception):
                 writer.close()
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), self.DRAIN_SECONDS)
 
 
 # --- diagnostics (/diag, --diag) --------------------------------------------------------------------
@@ -20069,6 +20114,10 @@ class Bot:
         self.deliveries = {k: t for k, t in self.deliveries.items() if not t.done()}
         self.deliveries[key] = asyncio.create_task(guarded(), name=f"deliver:{key}")
         return True
+
+    async def stop_beside(self) -> None:
+        """At the end of run(): what a subclass runs beside the loops, stopped before the pools and the store's threads go
+        (the real trader's rule taker and pre-open mode: LiveBot.stop_beside). Nothing here."""
 
     async def drain_orders(self) -> None:
         """At shutdown, after the deliveries: the real trader waits for the orders and cancels on their way
@@ -25116,15 +25165,26 @@ class Bot:
                 # price, dust aside) it goes back over the pusher while the edge there still clears the mode's bar, otherwise it
                 # stays where it is; the bids under it falling away, it comes down to a cent over what is left
                 target = self.sim_maker_price(mk.book, side, level, True, own, price)[0]
+
+                def placeable(at: float) -> bool:
+                    # 1.154.76 (an outside audit, P1-13): a place a fresh order would take (sim_maker_reason) — its edge over the card's
+                    # error, at or under the after-hours limit. A move to one it would not take withdrew the order for nothing: the
+                    # slot stayed empty (after hours), or the fresh order went back where this one was, and the same move came again
+                    return fair - at > mk.need + 1e-9 and (limit is None or at <= limit + 1e-9)
                 if trade.get("sweep"):  # a sweep order: to the front once that has the edge, else a cent over the next bid under the threshold
-                    if fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9:
+                    # (P1-13: "the front" only where a cent over the 买1 is to be had — on a book a cent wide the best ask is right
+                    # there, target IS the 买1, and the fresh order a sweep again: withdrawn and placed back, every step, for good.
+                    # On a book that may show the order itself (own_unsure) the front is judged as before: the 买1 may be the order,
+                    # and the guard below holds it while that book shows a bid at its price)
+                    in_front = target > level[0] + 1e-9 or own_unsure(trade, mk.book)
+                    if in_front and fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9 and placeable(target):
                         move = (target, f"盘口离公平价远了，击穿单改挂到买1 之上 1¢（{cents(target)}）")
                     else:
                         deep_bar = self.sim_maker_mode(mk, True)[0]
                         sweep = self.sweep_price(mk.book, side, fair, deep_bar, own, price)
                         if sweep is None:
                             return f"公平价 {cents(fair)} 留不出 {cents(deep_bar)}，击穿单撤掉"
-                        if abs(sweep[0] - price) >= SIM_MAKER_FOLLOW - 1e-9:
+                        if abs(sweep[0] - price) >= SIM_MAKER_FOLLOW - 1e-9 and placeable(sweep[0]):
                             top = floor_price(fair - deep_bar)  # the threshold price (sweep_price's; at least 1¢, or sweep were None)
                             if price > top + 1e-9:
                                 # 1.154.50: the threshold itself has come down under the order (the fair price fell — by less than
@@ -25140,7 +25200,7 @@ class Bot:
                                     # gone, the threshold come down) is the cheaper price and goes by the follow's, as before
                                     settle = self.sim_sweep_settle()
                 elif target > price + 1e-9:
-                    if fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9:
+                    if fair - target >= self.sim_maker_mode(mk, True)[0] - 1e-9 and placeable(target):
                         move = (target, f"买1 被顶到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
                 elif price - target >= SIM_MAKER_FOLLOW - 1e-9:
                     move = (target, f"买1 移到 {cents(target - SIM_MAKER_DEEP_STEP)}，改挂 {cents(target)}")
@@ -25542,13 +25602,25 @@ class Bot:
             side = touch_outcome(name, spec) if spec else ""
             return 1.0 if side == "high" else 0.0 if side == "low" else None
         word = name.lower()
-        if word in {"yes", "up", "涨", "higher", "above"}:
+        # (1.154.76, an outside audit, P2-6: the words the books are read by, 上涨 / 下跌 among them — missed here, a 下跌 first
+        # outcome of a daily card's market fell to the index rule below and was read as 涨)
+        if word in OUTCOME_UP_WORDS:
             return 1.0
-        if word in {"no", "down", "跌", "lower", "below"}:
+        if word in OUTCOME_DOWN_WORDS:
             return 0.0
         if trade["kind"] == "close" and resolved.get("index") in (0, 1):
             return 1.0 if resolved["index"] == 0 else 0.0  # a daily book prices its first outcome as 涨
         return None
+
+    def sim_still(self, trades: Mapping[str, dict], tid: str) -> bool:
+        """Whether the record ``trades`` held at ``tid`` before a wait is still the one kept there (1.154.76, an outside audit of
+        1.154.74, P0-2). ``trades`` is the view the step took: a record moved meanwhile (sim_rekey: a withdrawal by the express lane,
+        a failed order's attempt record) leaves it — the table's keys changing, the view is made a copy of what it held (TradeIndex)
+        — still naming the old key. sim_confirm took that for "not moved" and saved the record back under it: one fill kept under
+        two keys, counted twice in the P&L, the cost and the day's loss figure; or, the slot quoted again meanwhile, saved over
+        the new order's record."""
+        held = trades.get(tid)
+        return held is not None and self.sim_trades().get(tid) is held
 
     async def sim_confirm(self, trades: dict[str, dict], now_ms: int) -> None:
         """Predict's final word on each decided market: it confirms the local result (已确认), or differs (结果不一致: the
@@ -25578,7 +25650,7 @@ class Bot:
                 if not isinstance(market, dict) or not market.get("id"):
                     continue
                 mid = self.sim_mids[slug] = str(market["id"])
-                tids = [tid for tid in lookups[slug] if tid in trades]  # a record the step moved meanwhile: next round
+                tids = [tid for tid in lookups[slug] if self.sim_still(trades, tid)]  # a record the step moved meanwhile: next round
                 for tid in tids:
                     trades[tid]["market_id"] = mid
                     wanted.setdefault(mid, []).append(tid)
@@ -25590,7 +25662,7 @@ class Bot:
         answers = await asyncio.gather(*(self.predict.market_details(mid) for mid in due), return_exceptions=True)
         for mid, details in zip(due, answers):
             tids = wanted[mid]
-            tids = [tid for tid in tids if tid in trades]  # a record the step moved meanwhile (sim_rekey): next round
+            tids = [tid for tid in tids if self.sim_still(trades, tid)]  # a record the step moved meanwhile (sim_rekey): next round
             if isinstance(details, BaseException):
                 for tid in tids:
                     trades[tid]["final_error"] = clean_error(details) or type(details).__name__
@@ -27197,6 +27269,8 @@ class Bot:
                 hold = ("窗口已结束，等待结算" if now_ms >= spec.end_ms + 60_000
                         else "σ 是先验值，只作参考" if cap.sigma_kind == "prior" else "")
                 self.book_block(out, book, fair if priced else None, self.edge_need(swing), swing, hold, ("Yes", "No"), now_ms)
+                if not priced and hold:
+                    out["hold"] = hold  # (1.154.76: a window over, its history not read to the end — unpriced now, P1-14: still said why)
             # reached, and the book agrees (settled, gone, or ≥ 90¢): folded into one "已触及" line on the card
             out["touched"] = fair == 1.0 and "请核实" not in out["error"]
             rows.append(out)
@@ -30398,10 +30472,13 @@ class Bot:
             for task in [*tasks, *pending]:
                 task.cancel()
             await asyncio.gather(*tasks, *pending, stopper, return_exceptions=True)
-            if _PREDICT_POOL is not None:
-                _PREDICT_POOL.shutdown(wait=False)
-            if _FIRST_POOL is not None:
-                _FIRST_POOL.shutdown(wait=False)
+            # 1.154.76 (an outside audit, P1-11): what runs beside these loops (the real trader's rule taker, pre-open mode, fills
+            # reads, redeem round) stops here, while the HTTP pools and the store's threads are still there. It stopped after
+            # them: the rule taker's and the pre-open mode's last requests found the pool shut ("cannot schedule new futures
+            # after shutdown"), their last writes the store's threads gone
+            with contextlib.suppress(Exception):
+                await self.stop_beside()
+            predict_pools_close()  # (1.154.76: the references dropped too — a later request makes a fresh pool, not "after shutdown")
             store_wait_close()
             if self.reference_pool:
                 self.reference_pool.shutdown(wait=False, cancel_futures=True)
