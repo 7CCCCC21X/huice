@@ -4174,6 +4174,11 @@ class Controller:
         resolution = core.predict_resolution(market)
         if not resolution:
             return
+        if not core.PredictFeed.market_settled(market if isinstance(market, dict) else {}):
+            # 1.154.77 (an outside audit's "to verify" 1): a result named before Predict calls the market settled may still be a
+            # proposal — settled on it, a result that flips later stood in the P&L and the day's loss stop. Both words, as the
+            # redeem (RDM-OPEN-SHAPES); read again in a minute (settle_checked)
+            return
         if resolution.get("split"):
             up = 0.5
         elif str(resolution.get("name") or "").lower() in live.UP_WORDS:

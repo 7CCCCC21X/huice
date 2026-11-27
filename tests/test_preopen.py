@@ -3272,6 +3272,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((pair["phase"], pair.get("accounted"), ctl.risk()), ("closed", None, 49.))  # filled: the result decides, reserved until then
         clock.ms = c["start_ms"] + 20 * 60_000
         api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down
+        api.markets["123"]["status"] = "RESOLVED"  # (1.154.77: a result is booked on a market Predict calls settled)
         soon = []
         ctl.owner.live_redeem_soon = lambda market_id="": soon.append(str(market_id))
         await ctl.settle_pair(pair)
@@ -3643,6 +3644,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             # the window over, Predict's result in: settled as ever (Up lost: 20 shares at the pair's price), and only then the stop
             clock.ms = p.settle_from(filled) + 61_000
             api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down
+            api.markets["123"]["status"] = "RESOLVED"  # (1.154.77: a result is booked on a market Predict calls settled)
             await asyncio.wait_for(ctl.stop.wait(), 5)
             price = p.pair_quote(filled)[0]
             self.assertTrue(filled["accounted"] and filled["result"] == "down")
@@ -3815,6 +3817,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         saved = json.loads(ctl.ledger.conn.execute("SELECT body FROM pairs WHERE slug=?", (pair["slug"],)).fetchone()[0])
         self.assertEqual((saved["accounted"], saved["orders"]["up"]["filled"]), (False, 20.0), "and so on file")
         api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down won: Up's 20 shares at 49¢ are lost
+        api.markets["123"]["status"] = "RESOLVED"  # (1.154.77: a result is booked on a market Predict calls settled)
         clock.ms = p.settle_from(pair) + 61_000
         await ctl.settle_pair(pair)
         self.assertEqual((pair["accounted"], pair["result"]), (True, "down"))
@@ -3866,6 +3869,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             clock.ms += p.LATE_FILL_MS  # the records' last word (PRE-LATE-FILL)
             await self.until(lambda: orders["up"]["state"] == "final" and orders["down"]["state"] == "final")
             api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down won: Up's 40 shares at 49¢ are lost
+            api.markets["123"]["status"] = "RESOLVED"  # (1.154.77: a result is booked on a market Predict calls settled)
             clock.ms = p.settle_from(pair) + 61_000
             await self.until(lambda: bot.preopen is None, 5.0)  # settled, wound up and cleared — and none started again
             self.assertEqual((pair["accounted"], pair["result"]), (True, "down"))

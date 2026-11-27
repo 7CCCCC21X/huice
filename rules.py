@@ -3064,12 +3064,20 @@ class RuleTaker:
             rec["settle_checked"] = now
             try:
                 self.reads += 1
-                resolution = core.predict_resolution(await self.api.market(str(rec["market_id"])))
+                market = await self.api.market(str(rec["market_id"]))
+                resolution = core.predict_resolution(market)
             except Exception as error:
                 rec["settle_error"] = core.clean_error(error) or type(error).__name__
                 self.save(rec)
                 continue
             if not resolution:
+                self.save(rec)
+                continue
+            if not core.PredictFeed.market_settled(market if isinstance(market, dict) else {}):
+                # 1.154.77 (an outside audit's "to verify" 1): a result named before Predict calls the market settled may still be a
+                # proposal — booked then, a result that flips later stood in the P&L and the day's loss stop. Settled on both words,
+                # as the redeem does (RDM-OPEN-SHAPES); asked again every SETTLE_EVERY_MS meanwhile
+                rec["settle_error"] = f"Predict 已写结果（{resolution.get('name') or '?'}），但市场状态还不是已结算：等结算"
                 self.save(rec)
                 continue
             import live

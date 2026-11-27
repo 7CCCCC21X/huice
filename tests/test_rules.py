@@ -296,6 +296,7 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         # the result: Up won
         clock.ms = rec["end_ms"] + R.SETTLE_AFTER_MS
         mkt["outcomes"][0]["status"] = "WON"
+        mkt["status"] = "RESOLVED"  # (1.154.77: a result is booked on a market Predict calls settled)
         await t.tick()
         rec = t.record(slug)
         self.assertEqual((rec["result"], round(rec["pnl"], 4)), ("up", round(50 * (1 - R.fee_share(0.526, 200)) - 50 * 0.526, 4)),
@@ -366,6 +367,7 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         # settled: Down won — a loss, counted against the day
         clock.ms = rec["end_ms"] + R.SETTLE_AFTER_MS
         api.markets["901"]["outcomes"][1]["status"] = "WON"
+        api.markets["901"]["status"] = "RESOLVED"  # (1.154.77: a result is booked on a market Predict calls settled)
         await t.tick()
         rec = t.record(slug)
         self.assertEqual(rec["result"], "down")
@@ -2649,6 +2651,7 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         # the result: Down won
         clock.ms = rec["end_ms"] + R.SETTLE_AFTER_MS
         mkt["outcomes"][1]["status"] = "WON"
+        mkt["status"] = "RESOLVED"  # (1.154.77: a result is booked on a market Predict calls settled)
         await t.tick()
         rec = t.record(slug)
         part = round(40 * (1 - R.fee_share(0.75, 200)) - 40 * 0.75, 4)
