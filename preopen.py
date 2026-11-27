@@ -1684,7 +1684,7 @@ def ev_bets(rows: list[dict]) -> list[dict]:
                 if q[f"filled_{side}"] > 0 and q["side_pnl"][side] is not None}
         if not kept:
             continue
-        w = windows.setdefault(q["window"], {"q": q, "up": 0.0, "down": 0.0, "ev": 0.0, "pnl": 0.0, "cost": 0.0})
+        w = windows.setdefault(q["window"], {"q": q, "up": 0.0, "down": 0.0, "ev": 0.0, "pnl": 0.0, "cost": 0.0, "mid": pair.get("market_id")})
         for side, (f, x) in kept.items():
             w[side] += f
             w["ev"] += (0.5 - q["price"]) * f
@@ -1693,7 +1693,10 @@ def ev_bets(rows: list[dict]) -> list[dict]:
     out = []
     for w in windows.values():
         filled = w["up"] + w["down"]
-        bet = core.ev_bet(w["q"]["start_ms"], "预挂", w["q"]["card"], w["cost"] / filled, filled, 0.5, w["ev"], w["pnl"])
+        # 1.154.73: the window's market its event (core.EvSpread: a model-trader record on the same market settles with it), the
+        # side it leans to its direction
+        bet = core.ev_bet(w["q"]["start_ms"], "预挂", w["q"]["card"], w["cost"] / filled, filled, 0.5, w["ev"], w["pnl"],
+                          core.ev_event(w["mid"], f"preopen:{w['q']['window']}"), 1 if w["up"] >= w["down"] else -1)
         bet["var"] = (w["up"] - w["down"]) ** 2 * 0.25  # the unhedged part; a one-sided window keeps core.ev_bet's filled² / 4
         out.append(bet)
     return out

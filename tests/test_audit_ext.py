@@ -294,6 +294,45 @@ def rule_spent_and_cost() -> None:
     x.owner.store.close()
 
 
+def ev_events() -> None:
+    """1.154.73 (the user: 复盘里的"激进"判断偏严这件事 也改 — the audit's P2): bets on one market win or lose together; their
+    spreads add as one and they are one sample."""
+    now = bj(2026, 11, 20, 12, 0)
+    # the report's case: one window, thirty fills of a share at 40¢, the model at 50%, lost — EV +$3, P&L −$12
+    one = [m.ev_bet(now + i, "原策略吃单", "BTC 15分涨跌", 0.4, 1, 0.5, 0.1, -0.4, "id:901", 1) for i in range(30)]
+    g = m.ev_group("x", one)
+    assert (g["bets"], g["events"]) == (30, 1) and abs(g["sigma"] - 15.0) < 1e-9 and abs(g["z"] + 1.0) < 1e-9, g
+    assert g["verdict"] == "样本不足" and not g["flag"], g
+    apart = m.ev_group("x", [{**b, "event": ""} for b in one])  # counted as thirty flips, as before: −5.5σ, 激进 on one result
+    assert apart["events"] == 30 and round(apart["z"], 2) == -5.48 and apart["verdict"] == "激进", apart
+    # the two sides of one market: hedged, no spread; distinct markets: independent, each its own variance exactly
+    hedged = m.ev_group("x", [m.ev_bet(now, "s", "c", 0.5, 10, 0.5, 0, 5, "id:7", 1), m.ev_bet(now, "s", "c", 0.5, 10, 0.5, 0, -5, "id:7", -1)])
+    assert hedged["sigma"] == 0.0 and hedged["events"] == 1, hedged
+    spread = [m.ev_bet(now, "s", "c", 0.5, 10, 0.6, 1, -5, f"id:{i}", 1) for i in range(40)]
+    assert abs(m.ev_group("x", spread)["sigma"] ** 2 - sum(b["var"] for b in spread)) < 1e-9 and m.ev_group("x", spread)["events"] == 40
+    # the model trader's records: the market is the event (its id where known), the side its direction
+    rec = lambda i, market, mid, side: {"status": "settled", "shares": 10.0, "payout": 0.0, "price": 0.4, "edge": 0.1, "fair": 0.5,
+                                        "opened": now + i, "maker": False, "side": side, "market": market, "market_id": mid,
+                                        "kind": "close", "key": "SSE", "item": "上证指数"}
+    bets = m.sim_ev_bets([rec(0, "sse-1126", "55", "down"), rec(1, "sse-1126", "55", "down"), rec(2, "sse-1127", "", "up")])
+    assert [(b["event"], b["dir"]) for b in bets] == [("id:55", -1), ("id:55", -1), ("key:sse-1127", 1)], bets
+    assert m.ev_group("x", bets)["events"] == 2
+    assert m.luck_of(bets)["events"] == 2 and m.luck_of(bets)["bets"] == 3
+    # the timeline: an event's bets of two days are one spread in the running σ
+    two_days = [m.ev_bet(now, "s", "c", 0.4, 10, 0.5, 1, -4, "id:9", 1), m.ev_bet(now + DAY, "s", "c", 0.4, 10, 0.5, 1, -4, "id:9", 1)]
+    line = m.sim_ev_timeline(two_days, now + DAY)
+    assert [round(d["sigma"], 9) for d in line["days"]] == [5.0, 10.0], line["days"]  # (as two flips: 5.0, 7.07)
+    assert line["total"]["events"] == 1 and line["days"][-1]["events"] == 1
+    # the pre-open mode's window: its market its event, the side it leans to its direction (a model record on it joins it)
+    row = {"key": "BTC-15M", "slug": "btc-updown-15m-1", "name": "BTC 15分涨跌", "price": "0.48", "shares": "20", "market_id": "901",
+           "start_ms": now - 900_000, "phase": "closed", "accounted": True, "result": "down", "attempt": 0,
+           "orders": {"up": {"state": "final", "filled": 20.0}, "down": {"state": "final", "filled": 5.0}}}
+    (b,) = P.ev_bets([row])
+    assert (b["event"], b["dir"], b["var"]) == ("id:901", 1, 56.25), b
+    joined = m.ev_group("x", [b, m.ev_bet(now, "原策略吃单", "BTC 15分涨跌", 0.4, 10, 0.5, 1, -4, "id:901", 1)])
+    assert joined["events"] == 1 and abs(joined["sigma"] - (7.5 + 5.0)) < 1e-9, joined
+
+
 async def main() -> None:
     with tempfile.TemporaryDirectory() as folder:
         await preopen_late_fill(folder)
@@ -301,6 +340,7 @@ async def main() -> None:
     model_late_fill()
     await rule_cancel_asked()
     rule_spent_and_cost()
+    ev_events()
 
 
 asyncio.run(main())

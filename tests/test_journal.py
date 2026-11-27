@@ -485,7 +485,7 @@ async def run():
     notices = []
     evbot.sim_notify = lambda text: notices.append(text)
     said = evbot.sim_ev_check(NOW)
-    assert "把优势看高了" in said and "40 笔已结算，模型预期 +$40.00，实际 −$200.00，偏离 −7.7σ" in said and notices == [said] and evbot.store.get("ev_notice")["at"] == NOW, said
+    assert "把优势看高了" in said and "40 笔已结算（40 场），模型预期 +$40.00，实际 −$200.00，偏离 −7.7σ" in said and notices == [said] and evbot.store.get("ev_notice")["at"] == NOW, said
     evbot.sim_ev_checked = -1e9
     assert evbot.sim_ev_check(NOW + 3600_000) == "" and len(notices) == 1  # once a day
     evbot.sim_ev_checked = -1e9

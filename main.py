@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.72"
+VERSION = "1.154.73"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -15314,14 +15314,17 @@ def sigma_text(z: float) -> str:
     return f"{'+' if z >= 0 else '−'}{abs(z):.1f}σ"
 
 
-def ev_bet(at: int, strategy: str, card: str, price: float, shares: float, fair: float, ev: float, pnl: float) -> dict:
+def ev_bet(at: int, strategy: str, card: str, price: float, shares: float, fair: float, ev: float, pnl: float,
+           event: str = "", direction: int = 1) -> dict:
     """One settled bet as the EV timeline counts it: when (its Beijing day), which strategy placed it, on which card, at what
     price and size, the model's probability for the bought side, what the model expected of it (ev) against what it paid
-    (pnl), and the variance the model's own probability gives the outcome (shares² · p · (1 − p))."""
+    (pnl), and the variance the model's own probability gives the outcome (shares² · p · (1 − p)). 1.154.73: ``event`` — the
+    market whose one result settles it (bets on one event win or lose together: EvSpread) — and ``direction`` on it: +1 the
+    涨 / Yes side, −1 the other."""
     p = min(max(float(fair), 0.01), 0.99)
     day = dt.datetime.fromtimestamp(int(at) / 1000, BEIJING).date()
     return {"at": int(at), "day": day.isoformat(), "strategy": strategy, "card": card, "price": float(price), "shares": float(shares),
-            "fair": p, "ev": float(ev), "pnl": float(pnl), "var": float(shares) ** 2 * p * (1 - p)}
+            "fair": p, "ev": float(ev), "pnl": float(pnl), "var": float(shares) ** 2 * p * (1 - p), "event": event, "dir": -1 if direction < 0 else 1}
 
 
 def sim_ev_bets(trades: list[dict]) -> list[dict]:
@@ -15336,20 +15339,69 @@ def sim_ev_bets(trades: list[dict]) -> list[dict]:
         price, edge = float(t.get("price") or 0), float(t.get("edge") or 0)
         fair = float(t["fair"]) if t.get("fair") is not None else price + edge
         out.append(ev_bet(int(t.get("opened") or 0), "原策略挂单" if t.get("maker") else "原策略吃单", card_of(t), price, shares, fair,
-                          edge * shares, (float(t["payout"]) - price) * shares))
+                          edge * shares, (float(t["payout"]) - price) * shares, ev_event(t.get("market_id"), t.get("market")),
+                          1 if t.get("side") == "up" else -1))
     return out
+
+
+def ev_event(market_id: Any, market: Any = "") -> str:
+    """The event a bet settles on (ev_bet, 1.154.73): its Predict market — by id where known (the model trader's records and the
+    pre-open mode's windows alike carry it: one market's bets of both are one event), else by the record's market key."""
+    if market_id not in (None, "", 0, "0"):
+        return f"id:{market_id}"
+    return f"key:{market}" if market else ""
+
+
+class EvSpread:
+    """The variance of bets' P&L and their independent samples, bets added as they come (1.154.73, the user after an outside
+    audit of 1.154.71: "复盘里的'激进'判断偏严这件事 也改"). Bets on one event — the same market, settled by one result — win or
+    lose together: their spreads (shares · √(p(1 − p)) each, the model's own p) add as one, the 涨 / Yes side's against the
+    other's, and the event is ONE sample. Summed as independent flips — what ev_group did — thirty fills of one window at 40¢,
+    lost, were thirty samples and −5.5σ: 激进, on a single result (one event: −1σ, 样本不足). A day's taker orders on one daily
+    card (20 of them, 11-12) made one coin flip look like twenty. A bet without an event stands alone, as before; an event of
+    one bet adds its own variance exactly."""
+
+    def __init__(self) -> None:
+        self.alone, self.alone_n = 0.0, 0
+        self.events: dict[str, list] = {}  # event -> [signed spread summed, bets, the first bet's variance]
+
+    def add(self, b: dict) -> None:
+        key = b.get("event")
+        if not key:
+            self.alone += b["var"]
+            self.alone_n += 1
+            return
+        spread = (-1.0 if b.get("dir", 1) < 0 else 1.0) * math.sqrt(max(float(b["var"]), 0.0))
+        held = self.events.get(key)
+        if held is None:
+            self.events[key] = [spread, 1, float(b["var"])]
+        else:
+            held[0] += spread
+            held[1] += 1
+
+    @property
+    def var(self) -> float:
+        return self.alone + sum(e[2] if e[1] == 1 else e[0] * e[0] for e in self.events.values())
+
+    @property
+    def samples(self) -> int:
+        return self.alone_n + len(self.events)
 
 
 def ev_group(name: str, bets: list[dict]) -> dict:
     """One group's figures: the bets, their EV and P&L summed, σ = the root of the summed variance, z = (P&L − EV) / σ, and
     the verdict — 样本不足 under EV_MIN_BETS bets; beyond EV_FLAG_Z σ 激进 (the model claimed more than the market paid) or
     保守 (less); else 相符. ``flag``: 激进 on enough bets — the model is overclaiming, which is what the hourly check announces."""
-    ev, pnl, var = sum(b["ev"] for b in bets), sum(b["pnl"] for b in bets), sum(b["var"] for b in bets)
+    spread = EvSpread()
+    for b in bets:
+        spread.add(b)
+    ev, pnl, var = sum(b["ev"] for b in bets), sum(b["pnl"] for b in bets), spread.var
     sigma = math.sqrt(var) if var > 0 else 0.0
     z = (pnl - ev) / sigma if sigma > 0 else 0.0
-    enough = len(bets) >= EV_MIN_BETS
+    enough = spread.samples >= EV_MIN_BETS  # 1.154.73: independent samples — the events (EvSpread), not the bets
     verdict = "样本不足" if not enough else "激进" if z <= -EV_FLAG_Z else "保守" if z >= EV_FLAG_Z else "相符"
-    return {"name": name, "bets": len(bets), "ev": ev, "pnl": pnl, "sigma": sigma, "z": z, "verdict": verdict, "flag": enough and z <= -EV_FLAG_Z}
+    return {"name": name, "bets": len(bets), "events": spread.samples, "ev": ev, "pnl": pnl, "sigma": sigma, "z": z, "verdict": verdict,
+            "flag": enough and z <= -EV_FLAG_Z}
 
 
 def luck_of(bets: list[dict]) -> dict:
@@ -15357,7 +15409,7 @@ def luck_of(bets: list[dict]) -> dict:
     (ev_group): the review page's 偏离 column of 按市场 (1.151.0) — within ±EV_FLAG_Z σ a market's loss can be luck, past −EV_FLAG_Z
     it is not."""
     g = ev_group("", bets)
-    return {k: round(g[k], 4) if isinstance(g[k], float) else g[k] for k in ("bets", "ev", "pnl", "sigma", "z", "verdict")}
+    return {k: round(g[k], 4) if isinstance(g[k], float) else g[k] for k in ("bets", "events", "ev", "pnl", "sigma", "z", "verdict")}
 
 
 def sim_ev_timeline(bets: list[dict], now_ms: int, days: int = EV_DAYS, first: str = "", last: str = "", since_ms: int = 0,
@@ -15376,13 +15428,16 @@ def sim_ev_timeline(bets: list[dict], now_ms: int, days: int = EV_DAYS, first: s
     by_day: dict[str, list[dict]] = {}
     for b in kept:
         by_day.setdefault(b["day"], []).append(b)
-    rows, cum_ev, cum_pnl, cum_var = [], 0.0, 0.0, 0.0
+    rows, cum_ev, cum_pnl, running = [], 0.0, 0.0, EvSpread()
     for day in sorted(by_day):
         g = ev_group(day, by_day[day])
-        cum_ev, cum_pnl, cum_var = cum_ev + g["ev"], cum_pnl + g["pnl"], cum_var + sum(b["var"] for b in by_day[day])
+        cum_ev, cum_pnl = cum_ev + g["ev"], cum_pnl + g["pnl"]
+        for b in by_day[day]:
+            running.add(b)  # 1.154.73: an event's bets of several days are one spread (EvSpread)
+        cum_var = running.var
         sigma = math.sqrt(cum_var) if cum_var > 0 else 0.0
         d = dt.date.fromisoformat(day)
-        rows.append({"day": day, "label": f"{d:%m-%d} {WEEKDAYS[d.weekday()]}", "bets": g["bets"], "ev": g["ev"], "pnl": g["pnl"],
+        rows.append({"day": day, "label": f"{d:%m-%d} {WEEKDAYS[d.weekday()]}", "bets": g["bets"], "events": g["events"], "ev": g["ev"], "pnl": g["pnl"],
                      "cum_ev": cum_ev, "cum_pnl": cum_pnl, "sigma": sigma, "z": (cum_pnl - cum_ev) / sigma if sigma > 0 else 0.0})
     since = (dt.date.fromisoformat(last) - dt.timedelta(days=EV_WINDOW_DAYS - 1)).isoformat()
     names = lambda key, order: [n for n in order if n in {b[key] for b in kept}] + sorted({b[key] for b in kept} - set(order))
@@ -17538,8 +17593,9 @@ function evPick(rng,from,to,since){evRng=rng;evFrom=from||"";evTo=to||"";evSince
 function luckCell(r){  // 偏离 (1.151.0): the settled P&L against the expectation at the order, in the σ the order's own probabilities give
   const l=r.luck;if(!l||!l.bets||!(l.sigma>0))return"—";const z=l.z,out=$("span","");
   const b=$("b",z<=-2?"bad":z>=2?"ok":"",(z>=0?"+":"−")+Math.abs(z).toFixed(1)+"σ");
-  out.title="实际 "+money(l.pnl)+"，下单时预期 "+money(l.ev)+"，相差 "+money(l.pnl-l.ev)+"；按下单时的概率算，这些单的波动 σ = "+usd(l.sigma)+"（"+l.bets+" 场有结果）";
-  out.append(b,(z<=-2?" 不像运气":z>=2?" 好于预期":"")+(l.bets<30?"（"+l.bets+" 场）":""));return out}  // within ±2σ the number alone: it can be luck
+  const n=l.events!=null?l.events:l.bets;  // 1.154.73: the events (one market's bets settle on one result together), not the bets
+  out.title="实际 "+money(l.pnl)+"，下单时预期 "+money(l.ev)+"，相差 "+money(l.pnl-l.ev)+"；按下单时的概率算，这些单的波动 σ = "+usd(l.sigma)+"（"+l.bets+" 笔、"+n+" 场有结果；同一个市场的几笔一起赢一起输，算一场）";
+  out.append(b,(z<=-2?" 不像运气":z>=2?" 好于预期":"")+(n<30?"（"+n+" 场）":""));return out}  // within ±2σ the number alone: it can be luck
 function cardsTable(ct){  // 按市场: anaTable's lines and 偏离, each opening under the table (cardDetail) the card's records — or, a pre-open line, where its money went (1.151.0)
   if(cardOpen&&!ct.some(r=>r.name===cardOpen))cardOpen="";
   const w=anaTable(ct,{head:["偏离"],cells:r=>[luckCell(r)]});[...w.querySelectorAll("tr")].slice(1).forEach((tr,i)=>{const r=ct[i],open=r.name===cardOpen;
@@ -17672,6 +17728,7 @@ function preopenSection(po){  // 开盘前预挂 (1.128.0): the mode's own ledge
     el.append(...bigTable("有成交的场次（最近 "+po.recent.length+" 场，新的在前）",table(["开始","场次","涨成交","跌成交","价格","成交额","结果","盈亏","状态","挂上时距开场","成交时距开场","撤单确认","第几次报价"],
       po.recent.map(r=>[when(r.start_ms),r.name,num(r.filled_up),num(r.filled_down),cent(r.price),usd(r.volume),res(r.result),r.pnl==null?"—":poPn(r.pnl),r.status,r.lead_min==null?"—":r.lead_min.toFixed(0)+" 分钟",fl(r.fill_lead_min),r.cancel_s==null?"—":r.cancel_s.toFixed(1)+" 秒",r.attempt+1])),po.recent.length,8))}}
 const evZ=g=>g.bets&&g.sigma>0?(g.z>=0?"+":"−")+Math.abs(g.z).toFixed(1)+"σ":"—";
+const evN=g=>g.bets+(g.events!=null&&g.events<g.bets?"（"+g.events+" 场）":"");  // 1.154.73: the bets, and the events they settle on when fewer
 function evChart(days){  // cumulative model EV (dashed) against cumulative P&L (solid), inside the ±2σ band the model's own probabilities draw
   const W=640,H=220,L=54,R=12,T=14,B=28,ns="http://www.w3.org/2000/svg",el=(t,a)=>{const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);return e};
   const n=days.length,ys=[0];days.forEach(d=>{ys.push(d.cum_ev,d.cum_pnl,d.cum_ev+2*d.sigma,d.cum_ev-2*d.sigma)});
@@ -17689,13 +17746,13 @@ function evChart(days){  // cumulative model EV (dashed) against cumulative P&L 
 function evSection(ev){  // 模型 EV 对实际盈亏 (1.140.0): the poker tracker's all-in EV view — what the model claimed at each order against what the market paid, day by day, with the model's own ±2σ band
   const el=document.getElementById("a-ev");el.replaceChildren();
   const vb=g=>{const b=$("b","",g.verdict);b.className=g.flag?"bad":g.verdict==="相符"||g.verdict==="保守"?"ok":"";return b};
-  const line=g=>g.bets?[g.bets+" 笔 · 模型预期 ",pn(g.ev)," · 实际 ",pn(g.pnl)," · 偏离 "+evZ(g)+" · ",vb(g)]:"还没有结算的记录";
+  const line=g=>g.bets?[g.bets+" 笔"+(g.events!=null&&g.events<g.bets?"（"+g.events+" 场）":"")+" · 模型预期 ",pn(g.ev)," · 实际 ",pn(g.pnl)," · 偏离 "+evZ(g)+" · ",vb(g)]:"还没有结算的记录";
   const d=$("dl"),p=(k,v)=>{const dd=$("dd","");if(Array.isArray(v))dd.append(...v);else dd.textContent=v;d.append($("dt","",k),dd)};
   if(ev.label){p(ev.label,line(ev.total));if(ev.days_span>ev.window_days)p("其中最后 "+ev.window_days+" 天",line(ev.recent))}  // 1.154.70: a span picked
   else{p("近 "+ev.window_days+" 天",line(ev.recent));p("近 "+ev.days_span+" 天",line(ev.total))}el.append(d);
-  if((ev.days||[]).length){el.append(evChart(ev.days),hint("虚线 = 模型预期累计（净优势 × 份数），实线 = 实际累计盈亏，浅色带 = 按模型自己给的概率算的 ±2σ 范围：实线跌出下沿 = 模型把优势看高了（激进），冲出上沿 = 看低了（保守）。"),
-    ...bigTable("按日期（新的在前）",table(["日期","笔数","当日预期","当日实际","累计预期","累计实际","偏离"],ev.days.slice().reverse().map(x=>[x.label,x.bets,money(x.ev),pn(x.pnl),money(x.cum_ev),pn(x.cum_pnl),evZ(x)])),ev.days.length,7))}
-  const gt=rows=>table(["分组","笔数","模型预期","实际","实际 − 预期","偏离","判断"],rows.map(g=>[g.name,g.bets,money(g.ev),pn(g.pnl),pn(g.pnl-g.ev),evZ(g),vb(g)]));
+  if((ev.days||[]).length){el.append(evChart(ev.days),hint("虚线 = 模型预期累计（净优势 × 份数），实线 = 实际累计盈亏，浅色带 = 按模型自己给的概率算的 ±2σ 范围：实线跌出下沿 = 模型把优势看高了（激进），冲出上沿 = 看低了（保守）。同一个市场的几笔由同一个结果结算、一起赢一起输，算一场：σ 和“样本不足”（不到 "+ev.min_bets+" 场）按场数算。"),
+    ...bigTable("按日期（新的在前）",table(["日期","笔数","当日预期","当日实际","累计预期","累计实际","偏离"],ev.days.slice().reverse().map(x=>[x.label,evN(x),money(x.ev),pn(x.pnl),money(x.cum_ev),pn(x.cum_pnl),evZ(x)])),ev.days.length,7))}
+  const gt=rows=>table(["分组","笔数","模型预期","实际","实际 − 预期","偏离","判断"],rows.map(g=>[g.name,evN(g),money(g.ev),pn(g.pnl),pn(g.pnl-g.ev),evZ(g),vb(g)]));
   if((ev.strategies||[]).length)el.append($("div","sub","按策略"),gt(ev.strategies));
   if((ev.cards||[]).length)el.append($("div","sub","按市场"),gt(ev.cards))}
 function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the real and the paper apart, and the last windows bought
@@ -26552,7 +26609,7 @@ class Bot:
         if now_ms - int(noted.get("at") or 0) < EV_NOTICE_SECONDS * 1000:
             return ""
         self.store.put("ev_notice", {"at": now_ms, "z": r["z"], "bets": r["bets"]})
-        text = (f"⚠️ 模型近 {EV_WINDOW_DAYS} 天把优势看高了：{r['bets']} 笔已结算，模型预期 {signed_usd(r['ev'])}，实际 {signed_usd(r['pnl'])}，"
+        text = (f"⚠️ 模型近 {EV_WINDOW_DAYS} 天把优势看高了：{r['bets']} 笔已结算（{r['events']} 场），模型预期 {signed_usd(r['ev'])}，实际 {signed_usd(r['pnl'])}，"
                 f"偏离 {sigma_text(r['z'])}（按模型自己给的概率算，超过 {EV_FLAG_Z:g}σ 就不是运气）。"
                 f"先看复盘页“模型 EV 对实际盈亏”按策略、按市场是哪一组在亏，再考虑调高那一组的门槛或停掉它。")
         self.sim_notify(text)
