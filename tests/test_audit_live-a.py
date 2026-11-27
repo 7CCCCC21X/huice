@@ -731,17 +731,19 @@ async def maker_expiry():
     # the close nearer than that: an order ends a minute past it — a taker's five minutes ran up to five minutes past the close —
     # or two minutes after it is decided, in the market's last minute: never without an expiry while the end is known (a minute's
     # grace with the old guard as it was — "under two minutes away: none" — left every order of the last minute without one)
+    # (1.154.76, an outside audit, P1-10: the floor two minutes and ten seconds, as the order is built — Predict refuses an order
+    # with under two minutes left, and ten seconds are kept for its way there)
     for before, maker, taker in ((301, 60, -1),    # (a taker whose five minutes end before the close: as it was)
-                                 (240, 60, 60), (200, 60, 60), (61, 60, 60), (60, 60, 60),
-                                 (59, 61, 61), (30, 90, 90), (1, 119, 119)):
+                                 (240, 60, 60), (200, 60, 60), (71, 60, 60), (70, 60, 60),
+                                 (69, 61, 61), (61, 69, 69), (60, 70, 70), (30, 100, 100), (1, 129, 129)):
         at = CLOSE - before * 1000
         _, got = await looked(at)
         assert got == {"挂": END + maker, "吃": END + taker}, (before, {k: v - END for k, v in got.items()})
-        assert all(at // 1000 + 120 <= exp < L.FAR_FUTURE for exp in got.values()) and got["吃"] <= at // 1000 + 300, (before, got)
+        assert all(at // 1000 + 130 <= exp < L.FAR_FUTURE for exp in got.values()) and got["吃"] <= at // 1000 + 300, (before, got)
     # ...and an order only goes out before the end (live_send_block, unchanged): so with over a minute left, as the pre-open mode
     # asks of its own orders (SEND_MIN_LEFT_MS); at the end and after it nothing is decided at all
     late = bot.sim_open(card(CLOSE - 50_000), "up", CLOSE - 50_000, maker=m.BookEdge("涨", True, 0.55, 0.15, 300.0, 0.15), shares=100)
-    assert late["live"]["want"]["expires"] == END + 70 and bot.live_send_block(late, {}, CLOSE - 1) == "" and "已到结束时间" in bot.live_send_block(late, {}, CLOSE)
+    assert late["live"]["want"]["expires"] == END + 80 and bot.live_send_block(late, {}, CLOSE - 1) == "" and "已到结束时间" in bot.live_send_block(late, {}, CLOSE)
     for at in (CLOSE, CLOSE + 5_000):
         quiet = make_bot()
         await quiet.live_prepare(); await quiet.live_prefetch(at)
@@ -750,8 +752,8 @@ async def maker_expiry():
 
     # the rule itself, and the end as each kind of market records it (a daily card's close, a touch market's deadline, a window's or
     # a ladder's end); a market whose end is not known keeps an order without an expiry, as before
-    assert L.order_expiry(CLOSE, NOW) == L.order_expiry(CLOSE, CLOSE - 60_000) == END + 60 and L.order_expiry(CLOSE, CLOSE - 59_000) == END + 61
-    assert L.order_expiry(CLOSE, CLOSE + 3 * 3600_000) == END + 3 * 3600 + 120  # (decided after the end — sim_quiet sees to it that none is: still two minutes, not "none")
+    assert L.order_expiry(CLOSE, NOW) == L.order_expiry(CLOSE, CLOSE - 70_000) == END + 60 and L.order_expiry(CLOSE, CLOSE - 69_000) == END + 61
+    assert L.order_expiry(CLOSE, CLOSE + 3 * 3600_000) == END + 3 * 3600 + 130  # (decided after the end — sim_quiet sees to it that none is: still two minutes and ten seconds (1.154.76), not "none")
     assert L.order_expiry(None, NOW) == L.order_expiry(0, NOW) == L.FAR_FUTURE
     edge = m.BookEdge("涨", True, 0.55, 0.15, 300.0, 0.15)
     opened = lambda kind, settle: bot.sim_open(dataclasses.replace(card(NOW), kind=kind, settle=settle), "up", NOW, maker=edge, shares=100)["live"]["want"]["expires"]

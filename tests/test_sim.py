@@ -89,7 +89,7 @@ assert m.maker_fill(order, book([], [("0.40", "999")]))[0] == 100  # never more 
 outcomes = lambda *rows: [{"name": n, "indexSet": i + 1, **extra} for i, (n, extra) in enumerate(rows)]
 assert m.predict_resolution({"status": "REGISTERED", "outcomes": outcomes(("Up", {}), ("Down", {}))}) is None
 won = m.predict_resolution({"status": "RESOLVED", "outcomes": outcomes(("Up", {"status": "LOST"}), ("Down", {"status": "WON"}))})
-assert won == {"index": 1, "name": "Down", "split": False, "how": "outcomes.status"}, won
+assert won == {"index": 1, "index_set": 2, "name": "Down", "split": False, "how": "outcomes.status"}, won
 assert m.predict_resolution({"outcomes": outcomes(("Yes", {"payout": "1"}), ("No", {"payout": "0"}))})["name"] == "Yes"
 assert m.predict_resolution({"outcomes": outcomes(("Up", {"payout": 0.5}), ("Down", {"payout": 0.5}))})["split"]
 assert m.predict_resolution({"status": "RESOLVED", "resolution": {"name": "No"}, "outcomes": outcomes(("Yes", {}), ("No", {}))})["index"] == 1

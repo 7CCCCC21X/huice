@@ -440,9 +440,13 @@ async def the_orders_are_found_by_the_index() -> None:
     finally:
         m.TradeIndex.holding = holding
     # records from elsewhere (a stand-in's sim_trades): walked, as before
-    plain = types.SimpleNamespace(sim_trades=lambda: {"a": {"live": {"state": "done", "order_id": "5", "hash": "0xab", "events": []}, "status": "settled"}},
-                                  live_snapshot_held=None, __dict__={})
-    L.LiveBot.live_readopt(plain, [], {"5": {"id": "5"}}, {}, NOW)  # (settled: looked at, left alone)
+    saved: list = []
+    plain = types.SimpleNamespace(sim_trades=lambda: {"a": {"live": {"state": "done", "order_id": "5", "hash": "0xab", "events": []}, "status": "settled",
+                                                            "item": "恒指", "label": "挂涨"}},
+                                  live_snapshot_held=None, __dict__={}, sim_save=saved.extend, live_notify=lambda *a, **k: None)
+    L.LiveBot.live_readopt(plain, [], {"5": {"id": "5"}}, {}, NOW)
+    # (settled: not tracked again — but its order still on the open list is withdrawn, 1.154.76: an outside audit, P0-1)
+    assert [(k, t["live"]["state"], t["status"]) for k, t in saved] == [("a", "cancelling", "settled")], saved
     # the record's last change, kept between the minute's checks (live_updated)
     assert bot.live_updated(tid, rec) == m.trade_updated(rec)
     calls = []

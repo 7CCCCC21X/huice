@@ -463,7 +463,7 @@ WATCH = {"best": None, "offer_max": 0.0, "offer_ms": 0, "listed_ms": 0, "open_ms
          "rival_ms": 0, "rival_ts": 0, "rival_px": None, "rival_sz": None, "rival_first": False}
 OPEN_STATES = {"placing", "open", "unknown"}  # an order on its way or on the book: it may still take what the book offers
 REST_STATES = {"open", "cancelling", "unknown"}  # ...one whose rest may stand on the book, to be withdrawn by its id (withdraw_rest)
-PENDING_STATES = OPEN_STATES | {"cancelling"}   # ...one that may still fill, its removal not confirmed (pending_usd)
+PENDING_STATES = OPEN_STATES | {"cancelling"}   # ...one that may still fill or whose fills are not final yet (pending_usd)
 
 
 def open_orders(rec: dict) -> list[dict]:
@@ -1023,16 +1023,20 @@ class RuleStream:
     async def sync_loop(self, ws: Any) -> str:
         while True:
             self.wake.clear()
-            for mid in sorted(self.wanted - self.subscribed):
-                await self.request(ws, "subscribe", mid)
-                self.subscribed.add(mid)
+            # 1.154.76 (an outside audit, P1-12): the marks set before each request goes out, not after — the frames are read beside
+            # this, and an answer read while the send awaited found no mark: the first book pushed was dropped (take), and a refusal
+            # discarded nothing, the market then marked subscribed for the connection's life (never asked again, vouches() true on
+            # a REST book). Let go before subscribing anew. (A connection's end clears the marks: nothing is left over)
             for mid in sorted(self.subscribed - self.wanted):
-                await self.request(ws, "unsubscribe", mid)
                 self.subscribed.discard(mid)
                 self.books.pop(mid, None)
                 self.versions.pop(mid, None)
                 self.stamps.pop(mid, None)
                 self.changed.discard(mid)
+                await self.request(ws, "unsubscribe", mid)
+            for mid in sorted(self.wanted - self.subscribed):
+                self.subscribed.add(mid)
+                await self.request(ws, "subscribe", mid)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.wake.wait(), self.SYNC_S)
 
@@ -1082,7 +1086,8 @@ class RuleStream:
         if mid not in self.subscribed or not isinstance(data, dict):
             return
         version = data.get("version")
-        if isinstance(version, (int, float)) and not isinstance(version, bool):
+        if isinstance(version, (int, float)) and not isinstance(version, bool) and version == version and abs(version) != float("inf"):
+            # (1.154.76, P1-12: not a NaN or an infinity — JSON lets them through, int() raised on them)
             if version < self.versions.get(mid, -1):
                 return
             self.versions[mid] = int(version)
@@ -1257,9 +1262,12 @@ class RuleTaker:
         # (the review of the fix: not an order past its signed expiry — it fills nothing more — nor one whose answer went missing and
         # whose hash finds nothing past CONFLICT_GRACE_MS, what a 409's is given: held at its full price until GIVE_UP_MS past its
         # expiry, it cut every other window's size for hours. Its own window stays spoken for whatever: held)
+        # 1.154.76 (an outside audit, P1-7): ...and one Predict removed whose last read is not in yet (cancelling, final by a read
+        # LATE_FILL_MS on): a fill matched just before the removal shows in a later read only, its USDT gone meanwhile — it was let
+        # go at the removal, and an order of the same turn sized on that money
         out = sum(max(float(o.get("shares") or 0) - float(o.get("filled") or 0), 0.0) * float(o.get("limit") or 0)
                   for rec in self.recs.values() if rec.get("mode") == "on"
-                  for o in rec.get("orders") or () if o.get("state") in PENDING_STATES and not o.get("removed") and not o.get("paper")
+                  for o in rec.get("orders") or () if o.get("state") in PENDING_STATES and not o.get("paper")
                   and int(o.get("expires") or 0) * 1000 > now
                   and not (o.get("state") == "unknown" and not o.get("id") and now - int(o.get("at") or now) > CONFLICT_GRACE_MS))
         # 1.154.72 (an outside audit, P1-3): ...and what they spent since the balance was read — the chain's balance, read every
@@ -2537,7 +2545,7 @@ class RuleTaker:
         except Exception as error:
             text = core.clean_error(error) or type(error).__name__
             status = live.http_status(error)
-            definite = isinstance(error, live.OrderRejected) or 400 <= status < 500
+            definite = isinstance(error, live.OrderRejected) or live.refused_status(status)  # (1.154.76: not a 408, P2-1)
             if isinstance(error, RuntimeError) and "shutdown" in str(error):
                 # 1.154.23: the threads are gone (the process is ending: "cannot schedule new futures after shutdown") — the
                 # request was never handed to one, let alone sent. Not "unknown": that holds the window as ordered until its start
@@ -2650,6 +2658,13 @@ class RuleTaker:
                             # record that old and gone was finished, not lost
                             continue
                         rec["orders"].append({**order, "state": "unknown", "error": "重启前发出的单，记录里还没有：按哈希核对", "next_ms": 0})
+                        with contextlib.suppress(TypeError, ValueError, AttributeError):
+                            # 1.154.76 (an outside audit, P1-6): the store's copy may be the record its watch made, which knows no outcome
+                            # until its order (place sets it, then journals): the journal's copy knows it. Left at 0, this order's fills
+                            # were nobody's to the positions check (filled_by_outcome, unverified: by market and index set)
+                            for k in ("index_set", "market_id"):
+                                if not rec.get(k) and (entry.get("rec") or {}).get(k):
+                                    rec[k] = int(entry["rec"][k]) if k == "index_set" else str(entry["rec"][k])
                         self.recs[key] = rec
                         self.store.put(PREFIX + key, rec)
                         LOG.warning("规则吃单：订单日志里有一张记录里没有的单（%s），按哈希核对", order["hash"][:12])
@@ -2943,6 +2958,12 @@ class RuleTaker:
                for o in rec.get("orders") or [] if not o.get("paper") and o.get("state") not in FINAL_STATES]
         if not out:
             return ""
+        for _, o in out:
+            if not o.get("id") and o.get("state") == "placing":
+                # 1.154.72 (an outside audit, P1-5): "应答一到就撤" — the answer's id withdraws it at once (send). 1.154.76 (a second
+                # audit, P1-1): marked here, before any wait of this pass — marked after them, an answer that came during the
+                # look-ups or the removals below found no mark: its order rested, in neither list, and the reply did not name it
+                o["cancel_asked"] = True
         lost = [(rec, o) for rec, o in out if not o.get("id") and o.get("state") == "unknown" and o.get("hash")]
         unread: dict[int, str] = {}  # id(order) -> why its look-up failed on every client (CR-08)
         if lost:
@@ -2991,10 +3012,6 @@ class RuleTaker:
         for rec, o in unknown:
             o["next_ms"] = 0
             self.save(rec)
-        for _, o in flying:
-            # 1.154.72 (an outside audit, P1-5): "应答一到就撤" — the answer's id withdraws it at once (send), whether the taker
-            # goes on or not. Only a stop (halted) did: a plain /live cancel all left the order to its own course, 1.5 s on
-            o["cancel_asked"] = True
         parts = []
         if resting:
             missed = len(resting) - off - gone
@@ -3070,6 +3087,13 @@ class RuleTaker:
             # tick's end; with no loss stop set there is nothing to keep)
             if rec.get("mode") == "on" and self.owner.config.live_max_daily_loss_usd:
                 self.sum_pnl(now)
+                # 1.154.76 (an outside audit of 1.154.74, P1-2): the day's stop judged on it now — the model trader's step ran it, and with
+                # SIM=off no step runs: the orders were held back (block), the stop itself (its notice, the resting orders withdrawn,
+                # the record that keeps it for the day) never came, and a win later took the figure back over the line
+                check = getattr(self.owner, "live_check_kill", None)
+                if pnl < -DUST and callable(check):
+                    with contextlib.suppress(Exception):
+                        check(self.owner.sim_trades(), now)
             word = "赢" if pnl > DUST else "输" if pnl < -DUST else "平"
             rule = RULE_OF.get(rec.get("rule"))
             self.notify(f"{'✅' if pnl > DUST else '❌' if pnl < -DUST else '➖'} 规则吃单结算{'（只记录）' if rec.get('mode') == 'paper' else ''}："
