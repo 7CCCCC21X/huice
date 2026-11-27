@@ -2586,14 +2586,25 @@ class LiveBot(core.Bot):
                 continue
             if int(t.get("settled") or 0) >= since:
                 total += (float(t["payout"]) - float(t["price"])) * float(t["shares"])
-            elif revisions := t.get("revisions"):  # settled before today: the payout's change today (its revisions carry
+            elif t.get("revisions") or t.get("late"):  # settled before today: the payout's change today (its revisions carry
                 # their own time), when it is a loss. 1.150.0: only a record that has revisions is looked at — the stop's figure
                 # is asked several times a second (the pre-open's withdrawing(), every step, every send) over every settled
                 # record ever kept, and a generator plus a float for each old record without one cost it ~4.6x the 1.149.0 sum;
-                # a record without revisions adds nothing (min(0, 0) × shares), so the figure is the same
-                moved = sum(float(r.get("to") or 0) - float(r.get("from") or 0) for r in revisions
-                            if isinstance(r, dict) and int(r.get("at") or 0) >= since)
-                total += min(0.0, moved) * float(t["shares"])
+                # a record without revisions adds nothing (min(0, 0) × shares), so the figure is the same.
+                # 1.154.72 (an outside audit, P1-2): ...and what a read changed of it today (live_note_late: shares or cost stated
+                # after it was settled), in the same net. A revision weighs the shares it was made on when it says (sim_settle,
+                # from 1.154.72: shares stated after it are priced at its result already); an older one the shares as they stand
+                shares = float(t["shares"])
+                plain = weighted = 0.0
+                for r in t.get("revisions") or ():
+                    if isinstance(r, dict) and int(r.get("at") or 0) >= since:
+                        step = float(r.get("to") or 0) - float(r.get("from") or 0)
+                        if r.get("shares") is None:
+                            plain += step
+                        else:
+                            weighted += step * float(r["shares"])
+                late = sum(float(e.get("pnl") or 0) for e in t.get("late") or () if isinstance(e, dict) and int(e.get("at") or 0) >= since)
+                total += min(0.0, plain * shares + weighted + late)
         return total
 
     def live_pnl_rows(self, trades: dict[str, dict], since: int) -> Any:
@@ -2614,11 +2625,11 @@ class LiveBot(core.Bot):
         held = self.__dict__.get("live_pnl_held")
         if held is None or held[0] is not index or held[1] != key:
             rows = [t for t in index.records.values() if isinstance(t.get("live"), dict) and t.get("status") == "settled"
-                    and (int(t.get("settled") or 0) >= since or t.get("revisions"))]
+                    and (int(t.get("settled") or 0) >= since or t.get("revisions") or t.get("late"))]
             held = self.__dict__["live_pnl_held"] = (index, key, rows)
         elif core.TRADE_AUDIT:
             walked = [t for t in trades.values() if isinstance(t.get("live"), dict) and t.get("status") == "settled"
-                      and (int(t.get("settled") or 0) >= since or t.get("revisions"))]
+                      and (int(t.get("settled") or 0) >= since or t.get("revisions") or t.get("late"))]
             core.trade_audit("live_pnl_rows", len(walked) == len(held[2]) and all(a is b for a, b in zip(walked, held[2])), len(walked))
         return held[2]
 
@@ -5726,6 +5737,7 @@ class LiveBot(core.Bot):
         order = float(trade.get("order") or 0)
         filled, status = order_fill(row, order)
         st["api_status"], st["checked_at"] = status, now_ms
+        booked = self.live_settled_pnl(trade)  # 1.154.72: a settled record's P&L before what this read changes (live_note_late)
         price = order_price(row)
         if price is not None and not trade.get("maker"):
             fee = core.taker_fee(price, int(st["want"].get("fee_bps") or 0))
@@ -5753,6 +5765,31 @@ class LiveBot(core.Bot):
         if filled >= order - 1e-9 and trade["status"] == "resting":
             trade["status"] = "filled"
             st["state"], st["final"] = "done", "filled"
+        self.live_note_late(trade, booked, now_ms)
+
+    @staticmethod
+    def live_settled_pnl(trade: dict) -> float | None:
+        """A settled record's P&L as it stands (payout less price, a share, times the shares); None for any other record."""
+        if trade.get("status") != "settled":
+            return None
+        return (float(trade.get("payout") or 0) - float(trade.get("price") or 0)) * float(trade.get("shares") or 0)
+
+    def live_note_late(self, trade: dict, booked: float | None, now_ms: int) -> None:
+        """1.154.72 (an outside audit, P1-2): a record settled on an earlier Beijing day whose P&L a read changed today — shares
+        filled that a final read states only now (10 known at 23:59, lost: −$5 on that day; 100 stated at 00:01: −$50), or the
+        cost it states. The record keeps its settlement's time (the journal's day), and live_daily_pnl counted it on that day
+        alone: the −$45 learned today was on no day's stop. Noted on the record (``late``: when, and the change), so today's
+        figure counts it — a loss, as a correction of today does (live_daily_pnl); a record settled today counts whole anyway."""
+        now_pnl = self.live_settled_pnl(trade)
+        if booked is None or now_pnl is None or abs(now_pnl - booked) < 1e-9:
+            return
+        today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
+        if int(trade.get("settled") or 0) >= int(today.timestamp() * 1000):
+            return
+        change = now_pnl - booked
+        trade.setdefault("late", []).append({"at": now_ms, "pnl": change, "shares": float(trade.get("shares") or 0), "price": float(trade.get("price") or 0)})
+        self.__dict__["live_pnl_epoch"] = self.__dict__.get("live_pnl_epoch", 0) + 1  # live_pnl_rows: the day's records looked for afresh
+        trade["live"].setdefault("events", []).append({"at": now_ms, "what": f"结算后才读到的成交 / 成本：这笔已结算记录的盈亏变动 {money(change)}，计入今日"})
 
     def live_finish(self, tid: str, trade: dict, row: dict, mk: Any, now_ms: int) -> None:
         """The order is no longer on the book: what filled is the position, the rest lapsed."""
@@ -7133,8 +7170,12 @@ class LiveBot(core.Bot):
         record = {"at": now_ms, "market": mk.item, "market_id": info.market_id, "price": price, "shares": shares, "hash": digest, "order_id": ""}
         # 1.154.33 (an outside review, R12): the record — its hash above all — written before the request, not only after it: an order
         # whose answer is lost is found again by that hash (below), and a restart in between leaves it where /live shows it
-        with contextlib.suppress(Exception):
+        try:
             self.store.put("live:test", {**record, "text": lines[0] + "\n（发送中，结果未知）"})
+        except Exception as error:
+            # 1.154.72 (an outside audit, P1-4): not written — not sent: an order resting ten minutes that no record knows of
+            # after a restart is what writing it first is for (it used to be sent all the same)
+            return f"❌ 挂单测试没有发出：记录写不进数据库（{core.clean_error(error) or type(error).__name__}）"
         found = ""  # the order's answer lost, found again by its hash: what the first step says instead of 下单成功
         try:
             result = await self.live.api.create_order(body)

@@ -292,7 +292,12 @@ async def run():
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
         await page.wait_for_selector(".pb .edges")
         text = await page.inner_text("#g-index")
-        assert "Predict ↗" in text and "买1 81.0¢×400" in text and "挂跌 15.0" in text and "+24.9¢" in text, text
+        assert "Predict ↗" in text and "买1 81.0¢×400" in text and "挂跌 15.0" in text, text
+        # the 挂跌 edge as the card's own odds give it now (it was a fixed +24.9¢, from before the SSE model changes — 1.154.69's
+        # SSE_SIGMA_EXTRA among them; an outside audit of 1.154.71 ran the check and found +26.6¢)
+        lines = text.splitlines()
+        shown = float(lines[lines.index("挂跌 15.0") + 1].removesuffix("¢"))
+        assert abs(shown - (1 - bot.sse_odds(now_ms).fair_up - 0.15) * 100) < 0.051, (shown, bot.sse_odds(now_ms).fair_up)
         # a best edge of 10¢ or more puts a red frame round the card
         assert await page.locator("#g-index .card.hot .edge.best.hot").count() == 1
         assert await page.locator(".edge.best").count() == 1

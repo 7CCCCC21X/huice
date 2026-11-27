@@ -89,7 +89,9 @@ async def layout_check(browser, page):
     for i in range(1, 13):
         await touch("touchMove", x, y + (t["y"] + t["height"] * 0.8 - y) * i / 12)
     await touch("touchEnd")
-    assert await phone.evaluate("scrollY") == 0 and await phone.evaluate("localStorage.getItem('favs')") == '["SOLUSDT","BTCUSDT","BNBUSDT"]'
+    # (the page held still while a card was dragged: a pixel's give allowed — Chromium 1243's touch emulation scrolls by 1, an
+    # outside audit's run of 1.154.71 by none)
+    assert await phone.evaluate("scrollY") <= 1 and await phone.evaluate("localStorage.getItem('favs')") == '["SOLUSDT","BTCUSDT","BNBUSDT"]'
     b = await phone.locator("#g-index .card .odds").bounding_box()
     await touch("touchStart", b["x"] + 20, b["y"] + 5)
     for i in range(1, 9):
@@ -102,7 +104,7 @@ async def layout_check(browser, page):
     await page.evaluate("localStorage.removeItem('favs')"); await page.reload(); await page.wait_for_selector(".card .odds")
     assert not await page.is_visible("#custom") and await page.locator(".ctl").count() == 0
     await page.click("#edit")
-    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 23
+    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == await page.locator(".card").count() > 20  # (every card: 25 now — it was a fixed 23, the cards added since)
     lad = "#g-ladder .card"
     assert await page.is_disabled(f"{lad}:nth-child(1) .ctl button[title='前移']") and await page.is_disabled(f"{lad}:nth-child(8) .ctl button[title='后移']")
     await page.click(f"{lad}:nth-child(1) .ctl button[title='后移']")

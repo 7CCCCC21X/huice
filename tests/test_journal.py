@@ -485,7 +485,7 @@ async def run():
     notices = []
     evbot.sim_notify = lambda text: notices.append(text)
     said = evbot.sim_ev_check(NOW)
-    assert "把优势看高了" in said and "40 笔已结算，模型预期 +$40.00，实际 −$200.00，偏离 −7.7σ" in said and notices == [said] and evbot.store.get("ev_notice")["at"] == NOW, said
+    assert "把优势看高了" in said and "40 笔已结算（40 场），模型预期 +$40.00，实际 −$200.00，偏离 −7.7σ" in said and notices == [said] and evbot.store.get("ev_notice")["at"] == NOW, said
     evbot.sim_ev_checked = -1e9
     assert evbot.sim_ev_check(NOW + 3600_000) == "" and len(notices) == 1  # once a day
     evbot.sim_ev_checked = -1e9
@@ -831,10 +831,10 @@ async def browser_check(bot, data):
         await page.wait_for_selector("#scrng:text-is('今天')")
         assert await page.locator("#cbar .tq.on").count() == 0 and "上证指数" not in await page.inner_text("#s-cards")
         po_range = {**po_row, "name": "黄金 15分涨跌 · 开盘前预挂", "luck": {**po_row["luck"], "z": -3.29, "bets": 30}}
-        bot.preopen_cards = lambda first, last: [po_range] if first <= "2026-10-04" <= last else []
+        bot.preopen_cards = lambda first, last, since_ms=0: [po_range] if first <= "2026-10-04" <= last else []  # (1.154.70: since_ms too)
         # 1.154.35: 预挂按价格档位 under 按市场, on its days (preopen.levels_between) — hidden without the mode (the paper bot's today)
         assert await page.is_hidden("#plbox")
-        bot.preopen_levels = lambda first, last: P.levels_between(po_rows, first, last)
+        bot.preopen_levels = lambda first, last, since_ms=0: P.levels_between(po_rows, first, last)
         await page.click("#cbar [data-r='30d']")
         await page.wait_for_selector("#s-cards tr.dayrow:has-text('黄金 15分涨跌')")
         await page.wait_for_selector("#plbox:not([hidden])")

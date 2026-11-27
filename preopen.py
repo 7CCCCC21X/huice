@@ -194,6 +194,9 @@ class Ledger:
         self.working: dict[str, dict] = {}  # the records not accounted when last saved, in the records' own order (pending)
         self.scored: dict[str, dict[str, dict]] = {}  # Beijing day -> the records accounted that day with a P&L (day_pnl)
         self.scored_day: dict[str, str] = {}  # ...and the day each is filed under
+        # 1.154.72: Beijing day -> the records with a P&L change learned that day, after the day they were accounted on (late_entries)
+        self.late: dict[str, dict[str, dict]] = {}
+        self.late_days: dict[str, tuple[str, ...]] = {}  # ...and the days each is filed under
         self.tries: dict[str, dict[str, int]] = {}  # record key (a window's level) -> its records' attempt + 1 each (attempt_after: the discovery's salt)
         self.tries_key: dict[str, str] = {}  # ...and the record key each record is filed under
         self.struck: dict[str, dict] = {}  # the records that counted against their window's MAX_ATTEMPTS when last saved (strikes)
@@ -298,6 +301,16 @@ class Ledger:
         if day:
             self.scored.setdefault(day, {})[slug] = row
             self.scored_day[slug] = day
+        days = tuple(sorted({d for d, _ in late_entries(row)}))
+        if self.late_days.get(slug, ()) != days:
+            self.unlate(slug)
+            for d in days:
+                self.late.setdefault(d, {})[slug] = row
+            if days:
+                self.late_days[slug] = days
+        else:
+            for d in days:
+                self.late[d][slug] = row  # (the row may be a new object: a test's, a reload's)
         unsure = filled = False
         for o in orders:
             if not o.get("index_set"):
@@ -354,6 +367,14 @@ class Ledger:
             self.scored.get(was, {}).pop(slug, None)
             if not self.scored.get(was):
                 self.scored.pop(was, None)
+        self.unlate(slug)
+
+    def unlate(self, slug: str) -> None:
+        """A record out of the days its late P&L changes are filed under (late_entries)."""
+        for d in self.late_days.pop(slug, ()):
+            self.late.get(d, {}).pop(slug, None)
+            if not self.late.get(d):
+                self.late.pop(d, None)
 
     def unmark(self, slug: str) -> None:
         mark = self.marks.pop(slug, None)
@@ -402,6 +423,7 @@ class Ledger:
         """Every index made again from ``rows`` as they stand (a test that put records in by hand; index and unindex keep them
         in step otherwise)."""
         self.by_hash, self.working, self.scored, self.scored_day, self.seq, self.seq_next, self.unordered = {}, {}, {}, {}, {}, 0, False
+        self.late, self.late_days = {}, {}
         self.tries, self.tries_key, self.struck = {}, {}, {}
         self.ids, self.hashes, self.marks, self.windows = {}, {}, {}, {}
         self.markets, self.tokens, self.market_name, self.token_name = {}, {}, {}, {}
@@ -445,10 +467,18 @@ class Ledger:
         for term and in the same order, over the day's records that have one — a record without a P&L added 0.0 there."""
         if not self.in_step():
             self.reindex()
-        held = self.scored.get(day)
-        if not held:
+        held, late = self.scored.get(day), self.late.get(day)
+        if not held and not late:
             return 0.0
-        return sum(float(p.get("pnl") or 0) for _, p in sorted(held.items(), key=lambda kv: self.seq[kv[0]]) if p.get("accounted_day") == day)
+        # 1.154.72 (an outside audit, P1-1): a P&L change learned on a later day (late_entries: a fill read after the pair was
+        # settled — Controller.late_fill) counts on that day and not on the pair's own: the stop of the day it became known
+        # sees it, and the days together still add up to each pair's one P&L. A pair without one adds its P&L as before
+        order = lambda kv: self.seq[kv[0]]
+        total = sum(float(p.get("pnl") or 0) - sum(x for _, x in late_entries(p)) for _, p in sorted((held or {}).items(), key=order)
+                    if p.get("accounted_day") == day)
+        if late:
+            total += sum(x for _, p in sorted(late.items(), key=order) for d, x in late_entries(p) if d == day)
+        return total
 
     def holder(self, digest: str) -> dict | None:
         """The record one of whose orders has this hash (Controller.before_send). By the index: the walk it replaces went
@@ -475,6 +505,15 @@ class Ledger:
         either order could go out. Nothing of it is on disk until that save; nothing of it is sent before."""
         self.rows[row["slug"]] = row
         self.index(row["slug"], row)
+
+    def unhold(self, slug: str) -> None:
+        """A record held (hold) whose first save failed, out of ``rows`` and every index again (1.154.72, an outside audit, P1-6):
+        nothing of it is on disk (the transaction rolled back) and nothing of it was sent — the requests go out only after that
+        save. Left there, it kept its money reserved (risk) and its window placed: the queue's retry found the window in the
+        records and dropped it, the next windows found the budget spoken for, and no order went out at all."""
+        row = self.rows.pop(slug, None)
+        if row is not None:
+            self.unindex(slug, row)
 
     def save_many(self, rows: list[dict]) -> None:
         """Several records in one transaction (1.141.0: a batch withdrawal touches thousands — one commit, not one each)."""
@@ -1370,6 +1409,22 @@ def window_of(pair: dict) -> str:
     return record_key(pair).split("#")[0]
 
 
+RESULT_PAY = {"up": 1.0, "down": 0.0, "split": 0.5}  # a settled pair's result -> what its 涨 side pays a share (settle_pair's ``up``)
+
+
+def late_entries(row: dict) -> list[tuple[str, float]]:
+    """1.154.72: a pair's P&L changes learned on a Beijing day after the one it was accounted on — (day, change) each
+    (Controller.late_fill; Ledger.day_pnl counts each on its own day)."""
+    out = []
+    for entry in row.get("late") or ():
+        if isinstance(entry, dict) and entry.get("day"):
+            try:
+                out.append((str(entry["day"]), float(entry.get("pnl") or 0)))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
 def levels_text(settings: Settings) -> str:
     """The levels as the status and the probe say them: 49.0¢×10 份、48.0¢×20 份 …, and when the deeper ones wait for the start."""
     text = "、".join(f"{core.cents(float(p))}×{float(s):g} 份" for p, s in settings.levels)
@@ -1629,7 +1684,7 @@ def ev_bets(rows: list[dict]) -> list[dict]:
                 if q[f"filled_{side}"] > 0 and q["side_pnl"][side] is not None}
         if not kept:
             continue
-        w = windows.setdefault(q["window"], {"q": q, "up": 0.0, "down": 0.0, "ev": 0.0, "pnl": 0.0, "cost": 0.0})
+        w = windows.setdefault(q["window"], {"q": q, "up": 0.0, "down": 0.0, "ev": 0.0, "pnl": 0.0, "cost": 0.0, "mid": pair.get("market_id")})
         for side, (f, x) in kept.items():
             w[side] += f
             w["ev"] += (0.5 - q["price"]) * f
@@ -1638,7 +1693,10 @@ def ev_bets(rows: list[dict]) -> list[dict]:
     out = []
     for w in windows.values():
         filled = w["up"] + w["down"]
-        bet = core.ev_bet(w["q"]["start_ms"], "预挂", w["q"]["card"], w["cost"] / filled, filled, 0.5, w["ev"], w["pnl"])
+        # 1.154.73: the window's market its event (core.EvSpread: a model-trader record on the same market settles with it), the
+        # side it leans to its direction
+        bet = core.ev_bet(w["q"]["start_ms"], "预挂", w["q"]["card"], w["cost"] / filled, filled, 0.5, w["ev"], w["pnl"],
+                          core.ev_event(w["mid"], f"preopen:{w['q']['window']}"), 1 if w["up"] >= w["down"] else -1)
         bet["var"] = (w["up"] - w["down"]) ** 2 * 0.25  # the unhedged part; a one-sided window keeps core.ev_bet's filled² / 4
         out.append(bet)
     return out
@@ -3654,7 +3712,13 @@ class Controller:
             for side in sides:
                 pair["orders"][side]["state"] = "placing"
         finally:
-            self.ledger.save(pair)  # both hashes durable before either POST (and whatever a gate that failed left: a record held is a record saved)
+            try:
+                self.ledger.save(pair)  # both hashes durable before either POST (and whatever a gate that failed left: a record held is a record saved)
+            except BaseException:
+                # 1.154.72 (an outside audit, P1-6): not written (a disk error) — and nothing sent: out of the records again, its
+                # money no longer reserved, and the worker's retry (ERROR_RETRY_MS) places the window afresh
+                self.ledger.unhold(pair["slug"])
+                raise
 
         async def send(side: str) -> None:
             order = pair["orders"][side]
@@ -3735,8 +3799,31 @@ class Controller:
                 pair.pop("accounted_day", None)
                 pair.pop("pnl", None)
                 LOG.warning("开盘前预挂 %s：已按没成交结清后又读到成交 %.2f 份，改为等结果结算", pair.get("slug"), order["filled"])
+            elif pair.get("accounted") and pair.get("result") in RESULT_PAY:
+                self.late_fill(pair, order)
         if order["filled"] > 0:
             self.ledger.note_filled(pair)  # 1.154.22: counted among the mode's fills from this moment, not from the record's next save (Ledger.filled)
+
+    def late_fill(self, pair: dict, order: dict) -> None:
+        """1.154.72 (an outside audit, P1-1): a fill read after its pair was settled on Predict's result — the account snapshot's
+        rows (a read of thousands of orders takes minutes) stating more than the order's own final read had when the pair was
+        settled. The shares were written in and the P&L left as it was settled: 10 shares at 49¢ settled lost (−$4.90), a
+        snapshot's 20 after it, and the day's loss stop still read −$4.90 (settle_pair passes an accounted pair by). Priced now
+        on the same result at the same price, as settle_pair priced it; a change learned on a day after the pair's own is noted
+        on that day (``late``: Ledger.day_pnl counts it there and takes it off the pair's own day — the stop of the day it became
+        known sees it, the history keeps each pair's one P&L). Each caller saves the record."""
+        up = RESULT_PAY[pair["result"]]
+        price = pair_quote(pair)[0]
+        pnl = sum(((up if side == "up" else 1 - up) - price) * float(o.get("filled") or 0) for side, o in pair["orders"].items())
+        change = pnl - float(pair.get("pnl") or 0)
+        if abs(change) < 1e-9:
+            return
+        today = dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat()
+        if pair.get("accounted_day") and pair["accounted_day"] != today:
+            pair.setdefault("late", []).append({"day": today, "pnl": change, "at": self.now()})
+        pair["pnl"] = pnl
+        LOG.warning("开盘前预挂 %s：结算后又读到成交 %.2f 份，按原结果重算盈亏 %+.2f（变动 %+.2f，计入 %s）",
+                    pair.get("slug"), float(order.get("filled") or 0), pnl, change, today)
 
     def gave_up(self, pair: dict) -> bool:
         """Past the window's start by GIVE_UP_MS: an order Predict cannot show cannot fill any more (it expired before
