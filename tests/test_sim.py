@@ -128,8 +128,10 @@ def hsi(fair, bids, asks, at, **kw):
 
 
 async def run():
+    # (SIM_MARKET_BLEND none: these SSE trades are judged by the model alone, as when they were written — the blend, 1.154.79:
+    # tests/test_market_blend.py)
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0", "SIM_MAKER_FLOOR_SHARES": "0",
-                             "WEB_PORT": "8080", "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY})  # every kind and both ways, as below
+                             "WEB_PORT": "8080", "SIM_WAYS": "both", "SIM_MARKETS": "all", **LEGACY, "SIM_MARKET_BLEND": "none"})  # every kind and both ways, as below
     store = m.Store(":memory:")
     bot = m.Bot(cfg, store, FM(NOW), None)
     bot.sim_markets = lambda now: world["markets"]
@@ -164,7 +166,7 @@ async def run():
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
     assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_skip": sorted(m.DEFAULT_SIM_SKIP), "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
-                                "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sse_sigma_extra": 1.5, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_against_move_sigmas": 0.0, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60, "sim_shares_net": True, "sim_no_odds_withdraw": 30, "sim_taker_hold_range": 30.0,
+                                "beta_error": m.MODEL_BETA_ERROR, "big_move": 1.5, "sse_sigma_extra": 1.0, "sim_taker_max_shares": 0.0, "sim_taker_sweep": 0.0, "sim_max_fair": 0.95, "sim_after_hours_max_shares": 300.0, "sim_open_quiet_minutes": 3, "sim_against_move_sigmas": 0.0, "sim_maker_spread": 0.10, "sim_after_hours_max_price": 0.60, "sim_shares_net": True, "sim_no_odds_withdraw": 30, "sim_taker_hold_range": 30.0,
                                     "sim_maker_follow_settle": 0.0, "sigma_calib": True, "lead_quote": "on"} and maker["market_id"] == "101"  # 1.107.0: the two always written  # LEGACY keeps the 10¢ rule
     # the edge lasting for hours buys nothing more
     await step(bot, NOW + 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 60_000))

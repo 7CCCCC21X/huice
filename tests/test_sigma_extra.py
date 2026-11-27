@@ -41,7 +41,8 @@ def bot_at(now: int, store=None, **env: str) -> m.Bot:
 
 
 # --- the setting ------------------------------------------------------------------------------------------------------------
-assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).sse_sigma_extra == 1.5, "the default the user chose"
+# (1.154.79, the owner: "两条都改" — the default back to 1, no extra widening: tests/test_market_blend.py; the setting itself stays)
+assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).sse_sigma_extra == 1.0, "the default: none since 1.154.79"
 assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SSE_SIGMA_EXTRA": "1"}).sse_sigma_extra == 1.0
 assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SSE_SIGMA_EXTRA": "2.25"}).sse_sigma_extra == 2.25
 for bad in ("0.5", "4"):

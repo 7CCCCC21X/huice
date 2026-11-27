@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.78"
+VERSION = "1.154.79"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -978,8 +978,13 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_AFTER_HOURS_MAX_SHARES", "盘后每个市场每边最多持有多少份", "0～10000000：标的没开盘时（概率来自代理），同一市场同一方向的持仓加挂单合计不超过这个数，超出的部分不买、只买剩下的额度；低价挂单不受限、也不占额度；0 = 不限"),
     ("SIGMA_CALIB", "σ 自动校准", "开 = 卡片的 σ 乘以按实际结果算出的系数（15 分钟和加密日涨跌限 0.5～2.0、和 10 个“刚好是 1”的先验一起平均；指数日涨跌限 0.6～2.0、和 5 日先验一起平均）：15 分钟涨跌按每张卡的定时样本，加密日涨跌三张卡合并按定时样本，指数日涨跌按 /calib 的快照残差、盘中和盘后各算；"
      "个股日涨跌（1.154.69）也按快照残差算，但每张卡、盘中 / 盘后分开，只在 /calib 的逐日向前检验显示校准后更准时才用；关 = 只用估计值"),
-    ("SSE_SIGMA_EXTRA", "上证盘中 σ 额外放大（倍）", "1～3，默认 1.5（1.154.69）：上证指数盘中的 σ 在自动校准之上再乘这个数。11-26 复盘：上证盘中模型比 Predict 盘口还差（逐日向前对数损失 0.58 对 0.50），"
-     "亏在指数已经跌了之后继续买跌（163 单 −$1,333：模型说跌 66%，实际赢 44%）；按真实成交回测，放大 1.5 倍后盘中 −$1,155 → −$172。1 = 不放大"),
+    ("SSE_SIGMA_EXTRA", "上证盘中 σ 额外放大（倍）", "1～3，默认 1 = 不放大（1.154.79 撤掉了 1.154.69 的 1.5 倍）：上证指数盘中的 σ 在自动校准之上再乘这个数。"
+     "1.5 倍那次只按真实成交回测——只看得出会少买哪些，看不出会多买冷门那边：11-27 上证涨了 1.9% 时模型还说跌有 11%，1¢ 的托底单 8 分钟成交 24 次，"
+     "没有这 1.5 倍那天的托底单一笔都不会挂、21 笔吃单少 16 笔。上证改用下面的“估值往市场价靠”"),
+    ("SIM_MARKET_BLEND", "估值往市场价靠（按市场）", "写成 SSE:0.5（多张卡用逗号分开）：交易判断用的公平价 = 模型价 + 比例 ×（市场价 − 模型价）——0 = 只看模型，0.5 = 模型和市场各一半，"
+     "1 = 完全按市场（没有优势，不会下单）。市场价 = Predict 盘口买一和卖一的中间价；只有一边有报价时用这一边自己的买价，这一边没人买就算 0（宁可少买）。"
+     "只影响下单、挂单、撤单的判断，卡片上的概率仍是模型的。默认 SSE:0.5（1.154.79：上证 33 个交易日里市场比模型准，模型一直偏空，32 天在买跌，净亏 $491；"
+     "各取一半回头看这 33 天，275 笔里留下 65 笔、由亏变赚）；none = 哪张卡都不靠"),
     ("LEAD_QUOTE", "交易所现价先行（15 分钟涨跌）", "on = 卡片的现价按标的交易所的实时成交价相对窗口起点的涨跌折算（币安指数比交易所慢几秒到一分钟：卖涨给你的人先看到了下跌），和指数差超过 1% 或行情 15 秒没读到时退回指数，起点、终点仍按币安指数结算；shadow = 两种定价都记进模型样本、按指数交易，/calib 比较谁更准；off = 只用币安指数"),
     ("SIM_SHARES_NET", "份数上限按净头寸计", "开 = 每边吃单份数上限、盘后每边持仓上限、加密日涨跌和 15 分钟涨跌的每边上限都按净头寸算：这一边的持仓（盘后连同挂着的单）减去另一边已成交的持仓，两边各 400 份时净头寸 0、上限 500 还能再买 500；关 = 每边单独计"),
     ("SIM_OPEN_QUIET_MINUTES", "开盘后多少分钟不开新单", "0～60：指数 / 个股日涨跌市场在标的开盘后这么多分钟内不吃也不挂（集合竞价刚结束、行情源最容易滞后的几分钟，优势多半是假的）；0 = 不限"),
@@ -1245,7 +1250,10 @@ class Config:
     sim_taker_hold: float = 0.0                # SIM_TAKER_HOLD_SECONDS: a taker buys only once its side has been buyable at every look for this long (a price wick is not); 0 = at once
     sim_taker_hold_range: float = 30.0         # SIM_TAKER_HOLD_RANGE_SECONDS: ...on a price ladder (the crypto levels: priced from every trade, their books refreshed by the minute)
     sim_max_fair: float = 0.95                 # SIM_MAX_FAIR_CENTS: the trader judges a side by its fair price at most this high (the tail a normal model cannot see); 1 = as the card says
-    sse_sigma_extra: float = 1.5               # SSE_SIGMA_EXTRA (1.154.69): the SSE card's in-session σ times this on top of SIGMA_CALIB's factor (Bot.sse_odds)
+    sse_sigma_extra: float = 1.0               # SSE_SIGMA_EXTRA (1.154.69; 1.154.79: 1, the 1.5 withdrawn): the SSE card's in-session σ times this on top of SIGMA_CALIB's factor (Bot.sse_odds)
+    # SIM_MARKET_BLEND (1.154.79): (card key, weight) — the trader judges that card's sides by its fair price taken this far toward the
+    # market's own (Bot.sim_fair: market_view); none listed = the model alone
+    sim_market_blend: tuple = (("SSE", 0.5),)
     big_move_sigmas: float = 1.5               # PROB_BIG_MOVE_SIGMAS: a daily card's σ ahead is widened once the day's move passes this many daily σ (big_move_widen); 0 = never
     sim_after_hours_max_shares: float = 300.0  # SIM_AFTER_HOURS_MAX_SHARES: after hours a market's side holds at most this many shares (positions and orders); 0 = no limit
     sigma_calib: bool = True      # SIGMA_CALIB: a 15-minute card's σ times the factor its windows' moves imply (Bot.sigma_calib)
@@ -1507,7 +1515,8 @@ class Config:
             sim_taker_hold_range=parse_bounded(e, "SIM_TAKER_HOLD_RANGE_SECONDS", "30", 0, 600),
             sim_max_fair=parse_bounded(e, "SIM_MAX_FAIR_CENTS", "95", 50, 100) / 100,
             big_move_sigmas=parse_bounded(e, "PROB_BIG_MOVE_SIGMAS", "1.5", 0, 10),
-            sse_sigma_extra=parse_bounded(e, "SSE_SIGMA_EXTRA", "1.5", 1, 3),
+            sse_sigma_extra=parse_bounded(e, "SSE_SIGMA_EXTRA", "1", 1, 3),
+            sim_market_blend=parse_market_blend(e["SIM_MARKET_BLEND"]) if "SIM_MARKET_BLEND" in e else DEFAULT_SIM_MARKET_BLEND,
             sim_after_hours_max_shares=parse_bounded(e, "SIM_AFTER_HOURS_MAX_SHARES", "300", 0, 10_000_000),
             sim_open_quiet_minutes=bounded_int(e, "SIM_OPEN_QUIET_MINUTES", 3, 0, 60),
             sim_against_move_sigmas=parse_bounded(e, "SIM_AGAINST_MOVE_SIGMAS", "0", 0, 10),
@@ -13935,6 +13944,8 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_SHARES_NET": {"kind": "choice", "group": "策略", "options": [["on", "按净头寸"], ["off", "每边单独"]]},
     "SIGMA_CALIB": {"kind": "choice", "group": "策略", "options": [["on", "按样本校准"], ["off", "只用估计值"]]},
     "SSE_SIGMA_EXTRA": {"kind": "number", "group": "策略", "presets": ["1", "1.25", "1.5", "2"], "unit": "倍"},  # 1.154.69
+    "SIM_MARKET_BLEND": {"kind": "text", "group": "策略", "presets": ["", "none", "SSE:0.5", "SSE:0.3", "SSE:0.7", "SSE:0.5,HK0625USDT:0.5"], "unit": "",
+                         "empty": "默认（上证 0.5）"},  # 1.154.79
     "LEAD_QUOTE": {"kind": "choice", "group": "策略", "options": [["on", "按交易所现价"], ["shadow", "只记录"], ["off", "只用指数"]]},
     "SIM_GROUP_USD": {"kind": "number", "group": "策略", "presets": ["0", "100", "300", "500", "1000"], "unit": "$", "zero": "不限"},
     "LIVE_MAX_ORDER_USD": {"kind": "number", "group": "风控", "presets": ["20", "50", "100", "200", "500"], "unit": "$"},
@@ -15456,6 +15467,54 @@ def ev_bet(at: int, strategy: str, card: str, price: float, shares: float, fair:
             "fair": p, "ev": float(ev), "pnl": float(pnl), "var": float(shares) ** 2 * p * (1 - p), "event": event, "dir": -1 if direction < 0 else 1}
 
 
+DEFAULT_SIM_MARKET_BLEND = (("SSE", 0.5),)  # SIM_MARKET_BLEND unset (1.154.79: the owner's choice for 上证)
+
+
+def parse_market_blend(text: str) -> tuple:
+    """SIM_MARKET_BLEND: "SSE:0.5,HK0625USDT:0.3" → (("HK0625USDT", 0.3), ("SSE", 0.5)) — card keys upper-cased, each weight 0–1,
+    a full-width colon or comma taken as theirs; "" or none / off: none (the model alone everywhere). A weight of 0 is dropped."""
+    text = str(text or "").replace("：", ":").replace("，", ",").strip()
+    if text.lower() in {"", "none", "off", "0"}:
+        return ()
+    out: dict[str, float] = {}
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        key, sep, value = part.partition(":")
+        key = key.strip().upper()
+        try:
+            weight = float(value) if sep else math.nan
+        except ValueError:
+            weight = math.nan
+        if not key or len(key) > 40 or not key.isascii() or not math.isfinite(weight) or not 0 <= weight <= 1:
+            raise ValueError("SIM_MARKET_BLEND 写成 市场代码:比例（0～1），多张卡用逗号分开，例如 SSE:0.5；none = 都不靠")
+        out[key] = weight
+    if len(out) > 200:
+        raise ValueError("SIM_MARKET_BLEND 最多 200 张卡")
+    return tuple(sorted((k, w) for k, w in out.items() if w > 0))
+
+
+def market_blend_text(blend: tuple) -> str:
+    """SIM_MARKET_BLEND as the variable is written: SSE:0.5 ("" for none)."""
+    return ",".join(f"{k}:{w:g}" for k, w in blend)
+
+
+def market_view(book: "PredictBook", side: str) -> float:
+    """What the market says one side of it is worth, for SIM_MARKET_BLEND (1.154.79): the middle of the Yes bid and ask (their
+    complement for 跌 / No); with one of the two missing, the side's own best bid — the most anybody there pays for it — and 0
+    when nobody bids for it: a lone quote on the other side is no price for this one (a 98¢ 涨 bid with nothing offered said
+    nothing of what 跌 is worth beyond 2¢ at the most), and the weight is there to buy less, never more."""
+    bid = float(book.bid[0]) if book.bid else None
+    ask = float(book.ask[0]) if book.ask else None
+    if bid is not None and ask is not None:
+        mid = (bid + ask) / 2
+        return mid if side == "up" else 1 - mid
+    if side == "up":
+        return bid if bid is not None else 0.0
+    return 1 - ask if ask is not None else 0.0
+
+
 def judged_fair(trade: Mapping, fair: Any = None) -> float:
     """The probability a record's side was judged by: the model's (``fair`` given, else the record's), capped as the trader capped
     it — entry.fair_cap where the cap cut it at the order, else the record's SIM_MAX_FAIR_CENTS (version.sim_max_fair) for a later
@@ -15463,6 +15522,8 @@ def judged_fair(trade: Mapping, fair: Any = None) -> float:
     the model's own — a 99¢ model judged at 95¢ had its spread taken at p = 0.99, a fifth of the 0.95 one, and a loss read as
     several σ (激进) where it was one; a taker filled at once read 成交时预期 above 下单时预期."""
     p = float(fair if fair is not None else trade.get("fair") or 0.0)
+    if fair is None and (blended := (trade.get("entry") or {}).get("fair_blend")) is not None:
+        p = float(blended)  # 1.154.79 (SIM_MARKET_BLEND): the model's taken toward the market — what the edge was judged by
     cap = (trade.get("entry") or {}).get("fair_cap") if fair is None else None
     if cap is not None:
         return min(p, float(cap))
@@ -15622,6 +15683,7 @@ VERSION_KNOBS: dict[str, tuple[str, str, Any]] = {
     "beta_error": ("", "", VERSION_UNRECORDED),
     "big_move": ("PROB_BIG_MOVE_SIGMAS", "", VERSION_UNRECORDED),
     "sse_sigma_extra": ("SSE_SIGMA_EXTRA", "倍", 1.0),  # 1.154.69: none before it
+    "sim_market_blend": ("SIM_MARKET_BLEND", "", ()),  # 1.154.79: none before it
     "sigma_calib": ("SIGMA_CALIB", "", VERSION_UNRECORDED),
     "lead_quote": ("LEAD_QUOTE", "", VERSION_UNRECORDED),
     "sim_taker_session": ("SIM_TAKER_SESSION", "", False),
@@ -15694,7 +15756,7 @@ def version_text(key: str, value: Any) -> str:
     if isinstance(value, bool):
         return "开" if value else "关"
     if isinstance(value, tuple):
-        return "、".join(value) if value else ("不排除" if key == "sim_skip" else "全部市场")
+        return "、".join(value) if value else ("不排除" if key == "sim_skip" else "都不靠（只看模型）" if key == "sim_market_blend" else "全部市场")
     if key in VERSION_ZERO and value == 0:
         return VERSION_ZERO[key]
     if isinstance(off, float) and value == off:
@@ -16353,7 +16415,9 @@ def sim_fill_expectation(trade: dict) -> float:
     if not fills:
         return trade["edge"] * trade["shares"]
     # (each fill's fair price capped as the trader caps a side, 1.154.77: judged_fair — the order's edge is the capped one)
-    return sum((judged_fair(trade, f.get("fair", trade["fair"])) - trade["price"]) * float(f["shares"]) for f in fills)
+    # (1.154.79: a fill of a card SIM_MARKET_BLEND takes toward the market — its own "judged" fair, as the order's edge)
+    return sum((judged_fair(trade, f["judged"] if f.get("judged") is not None else f.get("fair", trade["fair"])) - trade["price"]) * float(f["shares"])
+               for f in fills)
 
 
 def sim_stats(trades: list[dict]) -> dict:
@@ -23743,6 +23807,7 @@ class Bot:
                 "sim_group_usd": c.sim_group_usd, "min_edge": c.predict_min_edge,
                 "fee_bps": c.predict_fee_bps, "trade_usd": c.predict_trade_usd, "a50_beta": c.a50_beta,
                 "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR, "big_move": c.big_move_sigmas, "sse_sigma_extra": c.sse_sigma_extra,
+                **({"sim_market_blend": [f"{k}:{w:g}" for k, w in c.sim_market_blend]} if c.sim_market_blend else {}),  # 1.154.79
                 **({"sim_taker_session": True} if c.sim_taker_session else {}),
                 **({"sim_quiet_minutes": c.sim_quiet_minutes} if c.sim_quiet_minutes else {}),
                 **({"sim_maker_min_bid": c.sim_maker_min_bid} if c.sim_maker_min_bid > 0 else {}),
@@ -24042,6 +24107,8 @@ class Bot:
                  "order": (float(taker.get("want") or self.sim_taker_shares(mk)) if taker is not None
                            else self.config.sim_shares if shares is None else float(shares)), "fills": [], "revisions": [],
                  "entry": {"at": now_ms, "fair": model, "fair_up": mk.fair_up, "need": mk.need, **({"fair_cap": fair} if cut > 0 else {}),
+                           # 1.154.79 (SIM_MARKET_BLEND): the weight, the market's own price and the fair price taken toward it (before the cap)
+                           **({"blend": blend, "mkt": market_view(mk.book, side), "fair_blend": fair + cut} if (blend := self.sim_blend(mk)) > 0 else {}),
                            "book": book_snapshot(mk.book),
                            "card": [edge_json(e, shown, e.label.replace("涨", mk.sides[0]).replace("跌", mk.sides[1]))
                                     for e in edges], **self.evidence_of(mk)},
@@ -24056,7 +24123,7 @@ class Bot:
             trade.update(price=taker["cost"], avg=taker["avg"], fee=taker["fee"], best=taker["best"],
                          slip=taker["avg"] - taker["best"], signal=fair - taker["cost"], shares=taker["got"], status="filled", cap=taker.get("cap"),
                          filled=now_ms, fill_fair=model,
-                         fills=[{"at": now_ms, "shares": taker["got"], "fair": model, "how": "吃单立即成交",
+                         fills=[{"at": now_ms, "shares": taker["got"], "fair": model, **self.sim_judged(mk, side), "how": "吃单立即成交",
                                  "levels": taker["levels"], "short": taker["short"]}])
         trade["edge"] = fair - trade["price"]  # the expectation per share when the decision was made (by the judged fair price)
         return trade
@@ -24082,6 +24149,7 @@ class Bot:
         self.sim_paper_took(mk, side, took, resting=True)
         fair = mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up
         trade["fills"].append({"at": now_ms, "shares": credited - float(trade["shares"]), "fair": fair, "fair_up": mk.fair_up,
+                               **self.sim_judged(mk, trade["side"]),  # 1.154.79: the fair the trader judges by then, where not the model's
                                "how": "推定成交", "seen": seen, "book": book_snapshot(mk.book), **self.evidence_of(mk)})
         trade["shares"] = credited
         if trade.get("filled") is None:
@@ -24394,6 +24462,8 @@ class Bot:
             fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: a near-certain side is judged at the limit, no higher
             if cut > 0:
                 capped.append(f"{name}的公平价 {cents(fair + cut)} 按上限 {cents(fair)} 计")
+            if (note := self.sim_blend_note(mk, side)) and note not in capped:
+                capped.append(note)  # 1.154.79 (SIM_MARKET_BLEND): judged nearer the market's price than the card says
             own, own_price = self.sim_own_resting(trades, mk.market, side, mk.book)
             level = maker_level(mk.book, side, c.sim_maker_min_bid, own, own_price)
             if level is None:
@@ -24618,7 +24688,8 @@ class Bot:
             label = "吃" + mk.sides[0 if side == "up" else 1]
             model = mk.fair_up if side == "up" else 1 - mk.fair_up
             fair, cut = self.sim_fair(mk, side)  # SIM_MAX_FAIR_CENTS: judged at the limit when the card says more
-            capped = f"（公平价 {cents(model)} 按上限 {cents(fair)} 计）" if cut > 0 else ""
+            capped = (f"（{self.sim_blend_note(mk, side)}）" if self.sim_blend(mk) > 0  # 1.154.79: the blend says it all (and the cap's)
+                      else f"（公平价 {cents(model)} 按上限 {cents(fair)} 计）" if cut > 0 else "")
             # 1.150.0 (audit SIM-SELF-MATCH): the trader's own cap (sim_take), a cent under our own real buy of the other side
             # while one is not off the book — the card read 可吃单 … 可买 N 份 for our own order, which the trader never takes
             base = self.sim_taker_cap(mk, side, bps)
@@ -24931,15 +25002,42 @@ class Bot:
         mine, other = side_held(trades, mk.market, side)["positions"], self.sim_other_held(trades, mk, side)
         return f"这一边持仓 {mine:g} 份" + (f"减另一边 {other:g} 份、净 {mine - other:g} 份" if other > 1e-9 else "") + f"，达到上限 {cap:g} 份"
 
+    def sim_blend(self, mk: SimMarket) -> float:
+        """SIM_MARKET_BLEND's weight for this card (1.154.79): how far toward the market's own price (market_view) the trader takes
+        the card's fair price — 0 not at all (the model alone), 0.5 halfway, 1 all the way (no edge is ever left)."""
+        key = str(mk.key).upper()
+        return next((float(w) for k, w in self.config.sim_market_blend if k == key), 0.0)
+
     def sim_fair(self, mk: SimMarket, side: str) -> tuple[float, float]:
-        """The fair price the trader judges ``side`` by, and what was cut off it: the card's, at most SIM_MAX_FAIR_CENTS.
+        """The fair price the trader judges ``side`` by, and what was cut off it: the card's — 1.154.79: taken toward the market's
+        own by SIM_MARKET_BLEND (sim_blend: SSE halfway; 33 days of 上证 where the market had been the better judge, the model
+        bearish on 32 of them) — at most SIM_MAX_FAIR_CENTS.
         The model is trusted that far and no further — an outcome it calls near certain has a tail a normal model
         cannot see (a 99¢ side goes to zero when something happens) — so such a side is bought or quoted only when the
         price leaves the bar under the limit (跌 99.6¢ fair, 85¢ ask: judged as 95 − 85.3 = 9.7¢, not 14.3¢), rather
         than refused whatever the price (1.72.0–1.84.0: the 14¢ at 85¢ went untouched along with the 2¢ at 97¢)."""
         fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+        if (weight := self.sim_blend(mk)) > 0 and mk.book is not None:
+            fair += weight * (market_view(mk.book, side) - fair)
         limit = self.config.sim_max_fair
         return (limit, fair - limit) if limit < 1 - 1e-9 and fair > limit + 1e-9 else (fair, 0.0)
+
+    def sim_blend_note(self, mk: SimMarket, side: str) -> str:
+        """Words for SIM_MARKET_BLEND where it takes this card's side off the model's (1.154.79): the model's, the market's and the
+        figure judged by; "" for a card it leaves alone."""
+        weight = self.sim_blend(mk)
+        if weight <= 0 or mk.book is None:
+            return ""
+        model = mk.fair_up if side == "up" else 1 - mk.fair_up
+        fair, cut = self.sim_fair(mk, side)
+        name = mk.sides[0 if side == "up" else 1]
+        return (f"{name}按模型 {cents(model)}、市场 {cents(market_view(mk.book, side))} 往市场靠 {weight * 100:g}% 计 {cents(fair + cut)}"
+                + (f"、按上限 {cents(fair)}" if cut > 0 else "") + "（SIM_MARKET_BLEND）")
+
+    def sim_judged(self, mk: SimMarket, side: str) -> dict:
+        """A fill's {"judged": the fair price the trader judges ``side`` by now} where SIM_MARKET_BLEND takes it off the model's
+        (1.154.79) — the fills' expectation (sim_fill_expectation) is valued at it, as the order's edge is; {} elsewhere."""
+        return {"judged": self.sim_fair(mk, side)[0]} if self.sim_blend(mk) > 0 else {}
 
     def sim_taker_want(self, mk: SimMarket, side: str, cap: float) -> float:
         """Shares a taker asks for on this market's side now: the per-buy count (sim_taker_shares), or — with
@@ -26751,6 +26849,10 @@ class Bot:
                        + "（SIM_AFTER_HOURS_MAX_PRICE_CENTS）")
         if self.config.sim_skip:
             how.append(f"详细选项排除了 {len(self.config.sim_skip)} 个市场（{'、'.join(sorted(self.config.sim_skip)[:8])}{'…' if len(self.config.sim_skip) > 8 else ''}）")
+        if self.config.sim_market_blend:  # 1.154.79
+            names = {key: name for key, name, _ in PREDICT_ITEMS}
+            how.append("估值往市场价靠：" + "、".join(f"{names.get(k) or NAMES.get(k, k)} {w * 100:g}%" for k, w in self.config.sim_market_blend)
+                       + "（SIM_MARKET_BLEND：下单判断用模型价和盘口中间价的折中）")
         lines = [f"🧪 {bold('模拟交易')}（净优势 ≥{edge:g}¢ 时按卡片建议买 {shares} 份，只记账不下单）",
                  f"范围：{r['scope']}；{r['ways']}。" + "；".join(how) + "。先按机器人数据预结算，再以 Predict 的结果确认。"]
         try:  # 距吃单: the markets nearest a taker buy right now, by the trader's own bar, cap and size
@@ -28535,6 +28637,14 @@ class Bot:
         saved values that no longer validate are dropped (and forgotten) with a warning, never a crash at start-up. Also
         the lines naming what was dropped: run() tells the administrator (1.150.0: Railway's log was the only trace)."""
         saved = store.get("control:env")
+        if not store.get("mig:sse_sigma_extra"):
+            # 1.154.79 (the owner: 撤掉上证盘中再放宽 1.5 倍): a value saved on the page while 1.5 was the default goes with it — once,
+            # a value saved after this start is the owner's own again
+            if isinstance(saved, dict) and "SSE_SIGMA_EXTRA" in saved:
+                LOG.warning("1.154.79：网页控制台保存的 SSE_SIGMA_EXTRA=%s 已删除（上证盘中不再额外放宽 σ）", saved["SSE_SIGMA_EXTRA"])
+                saved = {k: v for k, v in saved.items() if k != "SSE_SIGMA_EXTRA"}
+                store.put("control:env", saved)
+            store.put("mig:sse_sigma_extra", True)
         if not isinstance(saved, dict) or not saved:
             return config, []
         kept = {k: str(v) for k, v in saved.items() if k in CONTROL_KEY_SET}
@@ -28623,6 +28733,7 @@ class Bot:
                   "SIM_TAKER_HOLD_SECONDS": f"{c.sim_taker_hold:g}", "SIM_TAKER_HOLD_RANGE_SECONDS": f"{c.sim_taker_hold_range:g}",
                   "SIM_MAX_FAIR_CENTS": f"{c.sim_max_fair * 100:g}", "SIM_AFTER_HOURS_MAX_SHARES": plain(c.sim_after_hours_max_shares),
                   "PROB_BIG_MOVE_SIGMAS": f"{c.big_move_sigmas:g}", "SSE_SIGMA_EXTRA": f"{c.sse_sigma_extra:g}", "LEAD_QUOTE": c.lead_quote,
+                  "SIM_MARKET_BLEND": market_blend_text(c.sim_market_blend) or "none",
                   "SIM_OPEN_QUIET_MINUTES": str(c.sim_open_quiet_minutes), "SIM_NO_ODDS_WITHDRAW_MINUTES": str(c.sim_no_odds_withdraw),
                   "SIM_AGAINST_MOVE_SIGMAS": plain(c.sim_against_move_sigmas), "SIM_AGAINST_MOVE_INDEX": flag(c.sim_against_move_index),
                   "SIM_MARKETS": "all" if c.sim_markets >= set(SIM_KINDS) else ",".join(k for k in SIM_KINDS if k in c.sim_markets),
