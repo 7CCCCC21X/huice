@@ -494,7 +494,7 @@ async def run():
     line = evbot.sim_ev_line()
     assert line.startswith("⚠️ 模型 EV 对实际（近 7 天，含预挂）：40 笔｜预期 +$40.00｜实际 −$200.00｜偏离 −7.7σ → 激进"), line
     assert "偏离 −7.7σ → 激进" in evbot.sim_text() and m.Bot(cfg2, m.Store(":memory:"), FM(NOW), None).sim_ev_line() == ""
-    assert "📐 模型 EV 对实际（近 7 天，含预挂）：4 笔｜" in bot.sim_text() and "（不足 30 笔）" in bot.sim_text()
+    assert "📐 模型 EV 对实际（近 7 天，含预挂）：4 笔｜" in bot.sim_text() and "独立场次" in bot.sim_text() and "不足 30 场）" in bot.sim_text()  # (1.154.77: the events counted)
     # the notice goes out through the deliveries, to the active subscriptions only (the real sim_notify)
     evbot2 = m.Bot(cfg2, m.Store(":memory:"), FM(NOW), object())
     told = []

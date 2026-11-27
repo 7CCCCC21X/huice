@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.76"
+VERSION = "1.154.77"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -327,17 +327,31 @@ EXCHANGE_BASE_HOLD_DAYS = 30  # safety cap for a held exchange-close baseline; N
 # Only dates that are certain are listed: a holiday missing here costs a "close pending" evening, a wrong one would
 # skip a real session. 2027 Lunar New Year closures are added once the exchanges publish them.
 DEFAULT_HOLIDAYS = {
-    "CN": "2026-09-25,2026-10-01..2026-10-07,2027-01-01",   # SSE notice: Mid-Autumn 9/25, National Day 10/1-10/7; New Year
-    "KR": "2026-09-24,2026-09-25,2026-10-05,2026-10-09,2026-12-25,2026-12-31,2027-01-01",  # Chuseok, Foundation Day (substitute), Hangul Day, Christmas, year-end closure, New Year
-    "HK": "2026-10-01,2026-10-19,2026-12-25,2027-01-01",  # National Day, the day after Chung Yeung (10-18 is a Sunday), Christmas (Boxing Day falls on a Saturday: no weekday off), New Year
+    # 1.154.77: 2027 added, each from its official notice. CN: the State Council's arrangement of 2026-11-05 (国办发明电〔2026〕10号) —
+    # the exchanges close on every day of a holiday period (the weekend makeup working days are no trading days either).
+    # KR: KASA's (우주항공청) 2027 월력요항 (2026-06-29) — with 노동절 and 제헌절 public holidays since 2026, seven substitute days
+    # (02-09, 05-03, 07-19, 08-16, 10-04, 10-11, 12-27) — and KRX's year-end closure (12-31); KRX's own notice comes in late
+    # December. HK: the general holidays gazetted 2026-05-15. SG: MOM's list of 2026-06-18. Each table reaches the next
+    # New Year's Day, so calendar_warning reminds a month before the year runs out
+    "CN": "2026-09-25,2026-10-01..2026-10-07,"
+          "2027-01-01..2027-01-03,2027-02-05..2027-02-13,2027-04-03..2027-04-05,2027-05-01..2027-05-05,2027-06-09,2027-09-15,"
+          "2027-10-01..2027-10-07,2028-01-01",
+    "KR": "2026-09-24,2026-09-25,2026-10-05,2026-10-09,2026-12-25,2026-12-31,"  # Chuseok, Foundation Day (substitute), Hangul Day, Christmas, year-end closure
+          "2027-01-01,2027-02-08,2027-02-09,2027-03-01,2027-05-03,2027-05-05,2027-05-13,2027-07-19,2027-08-16,2027-09-14..2027-09-16,"
+          "2027-10-04,2027-10-11,2027-12-27,2027-12-31,2028-01-01",
+    "HK": "2026-10-01,2026-10-19,2026-12-25,"  # National Day, the day after Chung Yeung (10-18 is a Sunday), Christmas (Boxing Day falls on a Saturday)
+          "2027-01-01,2027-02-08,2027-02-09,2027-03-26,2027-03-29,2027-04-05,2027-05-13,2027-06-09,2027-07-01,2027-09-16,2027-10-01,"
+          "2027-10-08,2027-12-27,2028-01-01",  # (2027: Lunar New Year day 1 a Saturday, day 4 for the Sunday; Christmas a Saturday, 12-27 the first weekday after)
     # SGX (the A50 futures): Singapore's gazetted holidays; a weekday one shuts both the day and the night session
-    "SG": "2026-01-01,2026-02-17,2026-02-18,2026-04-03,2026-05-01,2026-05-27,2026-06-01,2026-08-10,2026-11-09,2026-12-25,2027-01-01",
+    "SG": "2026-01-01,2026-02-17,2026-02-18,2026-04-03,2026-05-01,2026-05-27,2026-06-01,2026-08-10,2026-11-09,2026-12-25,"
+          "2027-01-01,2027-02-08,2027-03-10,2027-03-26,2027-05-17,2027-05-20,2027-08-09,2027-10-28,2028-01-01",  # (2027: Labour Day and Christmas on Saturdays)
 }
 # Days whose session differs from the usual one (verified notices; override with HK_HALF_DAYS / KR_LATE_DAYS):
 #   HKEX half days (the eves of Christmas, New Year and Lunar New Year): morning session only, closing auction
 #     12:00–12:10, HSI futures day session ends 12:30 and there is no after-hours session that evening.
 #   KRX CSAT day (the college entrance exam, third Thursday of November): everything one hour later, regular
-#     session 10:00–16:30 KST, close fixed at 16:30, Nextrade after-hours from 16:40.
+#     session 10:00–16:30 KST, close fixed at 16:30, Nextrade after-hours from 16:40. (2027's — the 2028학년도 수능 — is not
+#     announced yet: added once the ministry's plan names it, in the spring)
 #   SGX half days (the eves of Lunar New Year, Christmas and New Year): the A50 day session ends at noon
 #     (A50_HALF_DAY_END) and there is no T+1 session that evening.
 #   CME Globex holiday schedules (1.151.0; gold and oil, the pre-open mode's CME cards — override with CME_EARLY_DAYS /
@@ -345,8 +359,8 @@ DEFAULT_HOLIDAYS = {
 #     the eves of Christmas and New Year — 12:15 to 14:45 New York time by product and year, CME fixes them about two weeks
 #     ahead: taken as shut from noon), and the days with no session (Christmas, New Year's Day, Good Friday). Listed wide on
 #     purpose: a day too many costs an afternoon of gold and oil quotes, a day missing leaves them on a standing index.
-DEFAULT_SPECIAL_DAYS = {"HK_HALF": "2026-12-24,2026-12-31,2027-02-05", "KR_LATE": "2026-11-19",
-                        "SG_HALF": "2026-02-16,2026-12-24,2026-12-31",
+DEFAULT_SPECIAL_DAYS = {"HK_HALF": "2026-12-24,2026-12-31,2027-02-05,2027-12-24,2027-12-31", "KR_LATE": "2026-11-19",
+                        "SG_HALF": "2026-02-16,2026-12-24,2026-12-31,2027-02-05,2027-12-24,2027-12-31",
                         "CME_EARLY": "2026-11-26,2026-11-27,2026-12-24,2026-12-31,2027-01-18,2027-02-15,2027-05-31,2027-06-18,2027-07-05,"
                                      "2027-09-06,2027-11-25,2027-11-26",
                         "CME_CLOSED": "2026-12-25,2027-01-01,2027-03-26,2027-12-24"}
@@ -15442,6 +15456,20 @@ def ev_bet(at: int, strategy: str, card: str, price: float, shares: float, fair:
             "fair": p, "ev": float(ev), "pnl": float(pnl), "var": float(shares) ** 2 * p * (1 - p), "event": event, "dir": -1 if direction < 0 else 1}
 
 
+def judged_fair(trade: Mapping, fair: Any = None) -> float:
+    """The probability a record's side was judged by: the model's (``fair`` given, else the record's), capped as the trader capped
+    it — entry.fair_cap where the cap cut it at the order, else the record's SIM_MAX_FAIR_CENTS (version.sim_max_fair) for a later
+    fill. 1.154.77 (an outside audit of 1.154.74, P2-8): the edge was the capped figure, the variance and the fills' expectation
+    the model's own — a 99¢ model judged at 95¢ had its spread taken at p = 0.99, a fifth of the 0.95 one, and a loss read as
+    several σ (激进) where it was one; a taker filled at once read 成交时预期 above 下单时预期."""
+    p = float(fair if fair is not None else trade.get("fair") or 0.0)
+    cap = (trade.get("entry") or {}).get("fair_cap") if fair is None else None
+    if cap is not None:
+        return min(p, float(cap))
+    top = (trade.get("version") or {}).get("sim_max_fair")
+    return min(p, float(top)) if isinstance(top, (int, float)) and not isinstance(top, bool) and 0 < top <= 1 else p
+
+
 def sim_ev_bets(trades: list[dict]) -> list[dict]:
     """The model trader's settled records as bets: EV = the net edge at the order × shares (the page's 下单时预期), P&L =
     (payout − price) × shares; the way (挂单 / 吃单) is the strategy, the card (card_of) the market. A record without a
@@ -15452,7 +15480,7 @@ def sim_ev_bets(trades: list[dict]) -> list[dict]:
         if t.get("status") != "settled" or shares <= 0 or t.get("payout") is None:
             continue
         price, edge = float(t.get("price") or 0), float(t.get("edge") or 0)
-        fair = float(t["fair"]) if t.get("fair") is not None else price + edge
+        fair = judged_fair(t) if t.get("fair") is not None else price + edge  # (the probability its edge was judged by: capped as it was)
         out.append(ev_bet(int(t.get("opened") or 0), "原策略挂单" if t.get("maker") else "原策略吃单", card_of(t), price, shares, fair,
                           edge * shares, (float(t["payout"]) - price) * shares, ev_event(t.get("market_id"), t.get("market")),
                           1 if t.get("side") == "up" else -1))
@@ -16324,7 +16352,8 @@ def sim_fill_expectation(trade: dict) -> float:
     fills = trade.get("fills") or []
     if not fills:
         return trade["edge"] * trade["shares"]
-    return sum((float(f.get("fair", trade["fair"])) - trade["price"]) * float(f["shares"]) for f in fills)
+    # (each fill's fair price capped as the trader caps a side, 1.154.77: judged_fair — the order's edge is the capped one)
+    return sum((judged_fair(trade, f.get("fair", trade["fair"])) - trade["price"]) * float(f["shares"]) for f in fills)
 
 
 def sim_stats(trades: list[dict]) -> dict:
@@ -25669,10 +25698,14 @@ class Bot:
                 self.sim_save((tid, trades[tid]) for tid in tids)
                 continue
             resolved = details.get("resolved")
+            # 1.154.77 (an outside audit's "to verify" 1): only on a market Predict calls settled — a result named before that may
+            # still be a proposal; confirmed on it, a result that flips later was the record's for good. Both words, as the redeem
+            # (RDM-OPEN-SHAPES). Meanwhile it waits, its local result standing, asked again at the next round
+            final = resolved if resolved and PredictFeed.market_settled(details) else None
             for tid in tids:
                 trade = trades[tid]
                 trade.pop("final_error", None)
-                up = self.resolution_up(trade, resolved) if resolved else None
+                up = self.resolution_up(trade, final) if final else None
                 if up is None:
                     trade["final_check"] = {"at": now_ms, "status": details.get("status", ""), "resolved": resolved}
                     since = int((trade.get("local") or {}).get("at") or now_ms)
@@ -26878,7 +26911,9 @@ class Bot:
         if not r["bets"]:
             return ""
         return (f"{'⚠️' if r['flag'] else '📐'} 模型 EV 对实际（近 {EV_WINDOW_DAYS} 天，含预挂）：{r['bets']} 笔｜预期 {signed_usd(r['ev'])}｜实际 {signed_usd(r['pnl'])}"
-                f"｜偏离 {sigma_text(r['z'])} → {r['verdict']}" + ("" if r["bets"] >= EV_MIN_BETS else f"（不足 {EV_MIN_BETS} 笔）"))
+                f"｜偏离 {sigma_text(r['z'])} → {r['verdict']}"
+                # (1.154.77, P2-8: the verdict counts independent events since 1.154.73 — the note says that count, not the fills')
+                + ("" if int(r.get("events", r["bets"])) >= EV_MIN_BETS else f"（独立场次 {int(r.get('events', r['bets']))} 场，不足 {EV_MIN_BETS} 场）"))
 
     def sim_notify(self, text: str) -> None:
         """A line to every active subscription (the administrator's chats), in the background (deliver): the model trader's

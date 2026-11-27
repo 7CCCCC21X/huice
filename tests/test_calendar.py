@@ -89,8 +89,10 @@ assert m.auction_running("kr", bj(11, 18, 14, 25)) and m.auction_window("sh", bj
 
 # --- the holiday table warns before it runs out ---------------------------------------------------------------------
 assert m.calendar_warning(cfg.holidays, dt.date(2026, 10, 4)) == ""
-assert "2027-01-01" in m.calendar_warning(cfg.holidays, dt.date(2026, 12, 10)) and "HOLIDAYS_CN/HK/KR" in m.calendar_warning(cfg.holidays, dt.date(2026, 12, 10))
-assert "已过期" in m.calendar_warning(cfg.holidays, dt.date(2027, 1, 5))
+# (1.154.77: the built-in tables carry 2027 and reach 2028-01-01 — no warning this December, one the next)
+assert m.calendar_warning(cfg.holidays, dt.date(2026, 12, 10)) == ""
+assert "2028-01-01" in m.calendar_warning(cfg.holidays, dt.date(2027, 12, 10)) and "HOLIDAYS_CN/HK/KR" in m.calendar_warning(cfg.holidays, dt.date(2027, 12, 10))
+assert "已过期" in m.calendar_warning(cfg.holidays, dt.date(2028, 1, 5))
 assert "未配置" in m.calendar_warning({"sh": frozenset()}, dt.date(2026, 10, 4))
 assert m.calendar_until({"hk": frozenset({dt.date(2027, 1, 1)}), "kr": frozenset({dt.date(2026, 12, 25)})}) == dt.date(2026, 12, 25)
 

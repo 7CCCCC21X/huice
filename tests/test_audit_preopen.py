@@ -178,6 +178,7 @@ async def _pnl_drop(folder):
     await asyncio.gather(*list(ctl.settling.values()), return_exceptions=True)
     clock.ms = c["start_ms"] + 20 * 60_000  # 10:20 Beijing, the same day
     api.markets["123"]["outcomes"][0]["status"] = "WON"
+    api.markets["123"]["status"] = "RESOLVED"  # (1.154.77: a result is booked on a market Predict calls settled)
     await ctl.settle_pair(pair)
     assert pair["accounted_day"] == "2026-11-06" and abs(pair["pnl"] + 49) < 1e-9, (pair.get("accounted_day"), pair.get("pnl"))
     ctl.ledger.save({**copy.deepcopy(pair), "slug": pair["slug"] + "-yesterday", "accounted_day": "2026-11-05", "pnl": -500.0})
@@ -569,6 +570,7 @@ async def _ledger_growth(folder):
     for slug in (D, E):
         await ctl.cancel_pair(ctl.ledger.rows[slug], ctl.ledger.rows[slug].get("reason") or "撤单状态核对")
     api.markets[str(mB["id"])]["outcomes"][0]["status"] = "WON"
+    api.markets[str(mB["id"])]["status"] = "RESOLVED"  # (1.154.77: a result is booked on a market Predict calls settled)
     await ctl.settle_pair(ctl.ledger.rows[B])
     await _read_finals(ctl, clock)  # (the pairs withdrawn at their cancel times with nothing filled: their records, long since due)
     # Saturday: U's second order times out too, and the process stops before it is given up — in doubt, its money
@@ -919,6 +921,7 @@ async def _late_fill(folder):
     assert (bot.preopen_filled(), bot.preopen_unverified()) == ({k_up: 20.0}, set()), "read: the ledger explains the position"
     clock.ms = c["start_ms"] + 20 * 60_000
     api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down won: the 20 Up shares bought at 49¢ are lost
+    api.markets["123"]["status"] = "RESOLVED"  # (1.154.77: a result is booked on a market Predict calls settled)
     await ctl.settle_pair(pair)
     assert pair["accounted"] and pair["result"] == "down" and abs(pair["pnl"] + 9.8) < 1e-9, (pair.get("accounted"), pair.get("pnl"))
     assert abs(ctl.daily_pnl() + 9.8) < 1e-9, "the loss is in the day's figure the loss stop reads"
