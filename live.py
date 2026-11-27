@@ -5873,6 +5873,7 @@ class LiveBot(core.Bot):
             fair = (mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up) if mk is not None else float(trade["fair"])
             new = filled - prev - cut
             trade["fills"].append({"at": now_ms, "shares": new, "fair": fair,
+                                   **(self.sim_judged(mk, trade["side"]) if mk is not None else {}),  # 1.154.79 (SIM_MARKET_BLEND): the fair judged by then
                                    "how": "真实成交（" + ("挂单" if trade.get("maker") else "吃单") + "）", "order_id": st.get("order_id"),
                                    **({"book": core.book_snapshot(mk.book)} if mk is not None else {})})
             trade["shares"] = filled - cut
