@@ -1063,7 +1063,43 @@ def cards_today(rows: list[dict], now_ms: int) -> list[dict]:
     return cards_between(rows, today, today)
 
 
-def cards_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None, since_ms: int = 0) -> list[dict]:
+def week_keep(start_ms: int, week: str) -> bool:
+    """Whether a window starting at ``start_ms`` belongs to ``week`` (1.154.80): "weekend" — on_weekend's span (Saturday 00:00 to
+    Monday WEEKEND_END_HOUR, Beijing), "weekday" — the rest, "" — every window."""
+    return not week or on_weekend(start_ms) == (week == "weekend")
+
+
+def date_week(date: str, week: str) -> bool:
+    """Whether the archive's counts kept for a Beijing ``date`` go with ``week`` (1.154.80). They are kept by date (方案一: no new
+    count), so a Saturday or Sunday goes with the weekend, every other day with the weekdays — Monday whole, its first
+    WEEKEND_END_HOUR hours the weekend's: those hours' windows archived (two days on, nothing filled) are counted as the
+    weekdays' (a record or a window, never a fill or a P&L)."""
+    return not week or (dt.date.fromisoformat(date).weekday() >= 5) == (week == "weekend")
+
+
+def round_clock_coins() -> frozenset:
+    """The coins of the cards whose windows run round the clock (1.154.80, the weekend review's 仅加密): no exchange's session and
+    no CME or US hours to keep to (core.preopen_cards: WindowUpDownSpec.exchange / hours) — BTC, ETH, BNB, whose hourly and
+    daily markets are theirs alone."""
+    return frozenset(str(c.coin) for c in core.preopen_cards() if not getattr(c, "exchange", "") and not getattr(c, "hours", ""))
+
+
+def crypto_card(card: str, coins: frozenset | None = None) -> bool:
+    """Whether a card of the review (quote_of's card: "BTC 5分涨跌", "ETH 小时涨跌") is a round-the-clock one: its name begins with
+    the coin (round_clock_coins)."""
+    return str(card).split(" ", 1)[0] in (round_clock_coins() if coins is None else coins)
+
+
+def scope_keep(scope: str) -> Any:
+    """The card test of a scope (1.154.80): "crypto" — the round-the-clock cards alone (crypto_card), else every card."""
+    if scope != "crypto":
+        return lambda card: True
+    coins = round_clock_coins()
+    return lambda card: crypto_card(card, coins)
+
+
+def cards_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None, since_ms: int = 0, week: str = "",
+                  scope: str = "") -> list[dict]:
     """The review page's 按市场 rows of this mode over the Beijing dates ``first``..``last`` (ISO; by the window's start), per
     card, in the model trader's rows' shape (core.summary_of with settled_extras): the expectation at the order is a coin
     toss bought at the pair's price — 0.5 − price a filled share — the mean fair price 0.5, the hit rate the settled
@@ -1071,17 +1107,20 @@ def cards_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare
     P&L against that expectation in σ (core.luck_of over ev_bets: a window one bet, its unhedged part at risk) — and
     ``diag``, where it was made or lost (card_diag). ``old``: the archived records (ArchiveShare: finished quotes that
     filled nothing, moved out two days on) counted in by their kept counts — records and windows only. ``since_ms`` (1.154.70:
-    a version's first run): the windows starting from then on — the archive's counts, kept by date, only for the days after it."""
+    a version's first run): the windows starting from then on — the archive's counts, kept by date, only for the days after it.
+    1.154.80: ``week`` — the weekend's windows alone, or the weekdays' (week_keep; the archive's by date: date_week) — and ``scope``
+    "crypto": the round-the-clock cards alone (scope_keep)."""
     by: dict[str, list[dict]] = {}
     pairs: dict[str, list[dict]] = {}
+    keep = scope_keep(scope)
     for pair in rows:
         if any(o.get("state") not in NEVER_PLACED for o in (pair.get("orders") or {}).values()) and int(pair.get("start_ms") or 0) >= since_ms:
             q = quote_of(pair)
-            if first <= q["date"] <= last:
+            if first <= q["date"] <= last and week_keep(q["start_ms"], week) and keep(q["card"]):
                 by.setdefault(q["card"], []).append(q)
                 pairs.setdefault(q["card"], []).append(pair)
     after = since_day(since_ms)
-    archived = (sorted((card, date) for card, date in old.lines["cdate"] if first <= date <= last and date > after)
+    archived = (sorted((card, date) for card, date in old.lines["cdate"] if first <= date <= last and date > after and date_week(date, week) and keep(card))
                 if old is not None else [])
     out = []
     for card in sorted(set(by) | {card for card, _ in archived}):
@@ -1103,20 +1142,25 @@ def since_day(since_ms: int) -> str:
     return dt.datetime.fromtimestamp(since_ms / 1000, core.BEIJING).date().isoformat() if since_ms > 0 else ""
 
 
-def levels_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None, since_ms: int = 0) -> dict:
+def levels_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None, since_ms: int = 0, week: str = "",
+                   scope: str = "") -> dict:
     """The review page's 预挂按价格档位 over the Beijing dates ``first``..``last`` (ISO; by the window's start) — under 按市场
     and on its days (1.154.35; the user, of 1.154.34's table: "这个也可以用时间选择，给这个查看方式往上调"): each level's line
     as review() makes it (review_summary with its ev_line, the highest bid first) over the windows of those days, and the
     whole's ev_line and settled P&L. ``old``: the archived records (ArchiveShare: finished quotes that filled nothing, moved
-    out two days on) counted in by their kept counts — a level's records and windows on each date (ldate), never a fill."""
+    out two days on) counted in by their kept counts — a level's records and windows on each date (ldate), never a fill.
+    1.154.80: ``week`` and ``scope`` as cards_between's — but the archive keeps a level's counts by date alone, not by card: under
+    scope "crypto" they are left out (``archived``, said with a scope: False — the windows counted are the working records', two days of them)."""
+    keep = scope_keep(scope)
     qs = [q for q in (quote_of(p) for p in rows if any(o.get("state") not in NEVER_PLACED for o in (p.get("orders") or {}).values())
                       and int(p.get("start_ms") or 0) >= since_ms)  # 1.154.70: from a version's first run (since_day for the archive)
-          if first <= q["date"] <= last]
+          if first <= q["date"] <= last and week_keep(q["start_ms"], week) and keep(q["card"])]
     levels: dict[tuple[float, float], list[dict]] = {}
     for q in qs:
         levels.setdefault((q["price"], q["shares"]), []).append(q)
     after = since_day(since_ms)
-    archived = sorted(key for key in old.lines["ldate"] if first <= key[1] <= last and key[1] > after) if old is not None else []
+    counts = old is not None and scope != "crypto"
+    archived = sorted(key for key in old.lines["ldate"] if first <= key[1] <= last and key[1] > after and date_week(key[1], week)) if counts else []
     for k, _ in archived:
         levels.setdefault(k, [])
     out = []
@@ -1128,7 +1172,7 @@ def levels_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShar
                 r = old.counted(r, "ldate", key, [q for q in group if q["date"] == key[1]])
         out.append({**r, "price": k[0], "size": k[1], **ev_line(group)})
     total = review_summary("全部", qs)
-    return {"levels": out, "ev": ev_line(qs), "pnl": total["pnl"], "settled": total["settled"]}
+    return {"levels": out, "ev": ev_line(qs), "pnl": total["pnl"], "settled": total["settled"], **({"archived": counts} if scope else {})}
 
 
 LEAD_BUCKETS = ((0.0, "撤单后才读到（成交时刻不详）"), (1.0, "开场前 1 分钟内"), (10.0, "开场前 1–10 分钟"), (60.0, "开场前 10–60 分钟"),
@@ -1852,6 +1896,126 @@ def review(rows: Iterable[dict], now_ms: int, old: ArchiveShare | None = None) -
             "weekly": [summary(f"周末（周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00）", [q for q in qs if on_weekend(q["start_ms"])], "week", True),
                        summary("工作日", [q for q in qs if not on_weekend(q["start_ms"])], "week", False)],
             "recent": [{k: q[k] for k in shown} for q in recent]}
+
+
+# --- 1.154.80: the review page's 周末数据 — the weekend's windows, weekend by weekend, by level, card, stretch of hours ------------
+WEEKEND_SLOTS = ((0, 8, "周六 00:00–08:00", "美东周五下午到收盘后"), (8, 20, "周六 08:00–20:00", "亚洲、欧洲的周六白天"),
+                 (20, 32, "周六 20:00–周日 08:00", "美东周六白天到夜里"), (32, 44, "周日 08:00–20:00", "亚洲、欧洲的周日白天"),
+                 (44, 48, "周日 20:00–周一 00:00", "美东周日上午"), (48, 56, "周一 00:00–08:00", "美东周日下午到晚上，CME 周日 18:00 ET 重开"))
+WEEKEND_RECENT = 60  # the filled weekend windows listed, the newest first
+
+
+def weekend_hour(ms: int) -> int | None:
+    """The hours from the weekend's Saturday 00:00 (Beijing) to the moment, 0 to 55 (Monday WEEKEND_END_HOUR); None on a weekday."""
+    if not on_weekend(ms):
+        return None
+    at = dt.datetime.fromtimestamp(ms / 1000, core.BEIJING)
+    return ((at.weekday() - 5) % 7) * 24 + at.hour
+
+
+def weekend_of(ms: int) -> str:
+    """The weekend a moment falls in, by its Saturday's Beijing date (ISO) — Monday's first hours go with the Saturday before; ""
+    on a weekday."""
+    hour = weekend_hour(ms)
+    if hour is None:
+        return ""
+    return (dt.datetime.fromtimestamp(ms / 1000, core.BEIJING).date() - dt.timedelta(days=hour // 24)).isoformat()
+
+
+def weekend_label(sat: str) -> str:
+    """A weekend by its Saturday (ISO): 11-21 周末（周六 00:00 – 11-23 周一 08:00）."""
+    d = dt.date.fromisoformat(sat)
+    return f"{d:%m-%d} 周末（周六 00:00 – {d + dt.timedelta(days=2):%m-%d} 周一 {WEEKEND_END_HOUR:02d}:00）"
+
+
+def week_line(name: str, qs: list[dict]) -> dict:
+    """One line of the weekend review over the quotes ``qs`` (quote_of): review_summary's figures with ev_line's 预期对实际 — a
+    window (its levels and re-quotes) one coin toss — and the price paid on average (where a one-sided window breaks even)."""
+    r = review_summary(name, qs)
+    return {**r, **ev_line(qs), "avg_price": round(r["volume"] / r["filled"], 4) if r["filled"] else None}
+
+
+def weekend_review(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None, since_ms: int = 0,
+                   scope: str = "crypto") -> dict:
+    """The review page's 周末数据 for the pre-open mode (1.154.80; journal.json?weekend=1): the windows starting on the Beijing
+    dates ``first``..``last`` (ISO) — from ``since_ms`` on (a version's first run) — of the round-the-clock cards (``scope``
+    "crypto", the default) or of every card ("all": the US stocks' Friday afternoons, gold's and oil's Friday close and Monday
+    reopen fall in the Beijing weekend too). The weekend as PREOPEN_WEEKEND draws it (on_weekend: Saturday 00:00 to Monday
+    WEEKEND_END_HOUR), each one named by its Saturday (weekend_of).
+
+    compare — the weekend's windows against the weekdays' of the same span; weekends — one line a weekend, the newest first,
+    with its cards' and stretches' brief lines; levels — the weekend's by price level; cards — by card as 按市场 shows them
+    (cards_between: luck, card_diag); slots / hours — by stretch of the weekend (WEEKEND_SLOTS) and by its hour (0–55); lead —
+    by how long before the start the first fill was seen; recent — the filled windows, the newest first.
+
+    ``old``: the archived records (finished quotes that filled nothing, moved out two days on) counted in by their kept counts —
+    records and windows, on the lines that are counted by date: compare, weekends, cards (the card's on each date), levels (with
+    scope "all" alone: a level's are not kept by card). Kept by date, Monday's go with the weekdays (date_week)."""
+    rows = list(rows)  # (walked three times: here, levels_between, cards_between)
+    keep = scope_keep(scope)
+    qs: list[dict] = []
+    weekend_pairs: list[dict] = []  # (the weekend's records themselves: its luck, ev_bets)
+    for pair in rows:
+        if not any(o.get("state") not in NEVER_PLACED for o in (pair.get("orders") or {}).values()) or int(pair.get("start_ms") or 0) < since_ms:
+            continue
+        q = quote_of(pair)
+        if first <= q["date"] <= last and keep(q["card"]):
+            qs.append(q)
+            if on_weekend(q["start_ms"]):
+                weekend_pairs.append(pair)
+    weekend = [q for q in qs if on_weekend(q["start_ms"])]
+    weekdays = [q for q in qs if not on_weekend(q["start_ms"])]
+    after = since_day(since_ms)
+    archived = (sorted((card, date) for card, date in old.lines["cdate"] if first <= date <= last and date > after and keep(card))
+                if old is not None else [])
+
+    def counted(line: dict, group: list[dict], dates: Any) -> dict:  # the archive's card-and-date lines of the dates a line takes
+        for card, date in archived:
+            if dates(date):
+                line = old.counted(line, "cdate", (card, date), [q for q in group if q["card"] == card and q["date"] == date])
+        return line
+
+    def brief(name: str, group: list[dict]) -> dict:  # a weekend's card or stretch: what filled and what it made
+        r = week_line(name, group)
+        return {k: r[k] for k in ("name", "records", "windows", "filled_windows", "filled", "volume", "settled", "settled_shares", "pnl", "ev", "sigma", "z",
+                                  "both", "one", "avg_price")}
+    on_date = lambda date: date_week(date, "weekend")
+    compare = [counted(week_line(f"周末（周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00）", weekend), weekend, on_date),
+               counted(week_line("工作日", weekdays), weekdays, lambda date: not on_date(date))]
+    by_weekend: dict[str, list[dict]] = {}
+    for q in weekend:
+        by_weekend.setdefault(weekend_of(q["start_ms"]), []).append(q)
+    for _, date in archived:  # a weekend whose records were all archived: its counts alone
+        if on_date(date):
+            d = dt.date.fromisoformat(date)
+            by_weekend.setdefault((d - dt.timedelta(days=d.weekday() - 5)).isoformat(), [])
+    weekends = []
+    for sat in sorted(by_weekend, reverse=True):
+        group = by_weekend[sat]
+        days = {sat, (dt.date.fromisoformat(sat) + dt.timedelta(days=1)).isoformat()}
+        line = counted(week_line(weekend_label(sat), group), group, lambda date, days=days: date in days)
+        filled = [q for q in group if q["filled"] > 0]
+        line["sat"] = sat
+        line["cards"] = [brief(card, [q for q in group if q["card"] == card]) for card in sorted({q["card"] for q in filled})]
+        line["slots"] = [brief(label, part) for lo, hi, label, _ in WEEKEND_SLOTS
+                         if (part := [q for q in group if lo <= (weekend_hour(q["start_ms"]) or 0) < hi]) and any(q["filled"] > 0 for q in part)]
+        weekends.append(line)
+    hourly: dict[int, list[dict]] = {}
+    for q in weekend:
+        hourly.setdefault(weekend_hour(q["start_ms"]) or 0, []).append(q)
+    day_names = ("周六", "周日", "周一")
+    luck = core.luck_of(ev_bets(weekend_pairs))  # the weekend's settled P&L against a coin toss, in σ — and the notes say it in words
+    diag = card_diag(weekend, luck)
+    shown = ("start_ms", "name", "key", "filled_up", "filled_down", "price", "volume", "result", "pnl", "status", "lead_min", "cancel_s", "attempt", "fill_lead_min")
+    recent = sorted((q for q in weekend if q["filled"] > 0), key=lambda q: q["start_ms"], reverse=True)[:WEEKEND_RECENT]
+    return {"scope": scope, "first": first, "last": last, "since": since_ms, "compare": compare, "weekends": weekends,
+            "levels": levels_between(rows, first, last, old, since_ms, "weekend", scope),
+            "cards": cards_between(rows, first, last, old, since_ms, "weekend", scope),
+            "slots": [{**week_line(label, [q for q in weekend if lo <= (weekend_hour(q["start_ms"]) or 0) < hi]), "note": note}
+                      for lo, hi, label, note in WEEKEND_SLOTS],
+            "hours": [week_line(f"{day_names[h // 24]} {h % 24:02d} 时", hourly[h]) for h in sorted(hourly)],
+            "lead": diag["lead"], "one": diag["one"], "both": diag["both"], "notes": diag["notes"], "luck": luck,
+            "recent": [{k: q[k] for k in shown} for q in recent], "archived": old is not None}
 
 
 REVIEW_KINDS = ("all", "date", "day", "card", "level", "hour", "week", "cdate", "ldate")  # the review's tables (and 按市场's card by date, 1.151.0; a level by date, 1.154.35), as ArchiveShare keeps the archive's lines of each
