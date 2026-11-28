@@ -100,6 +100,11 @@ CARD_CHECK_MS = 5_000     # the stock cards' limit / halt check (card_hold) this
 CARD_HOLD_NEAR_MS = 60 * 60_000  # ...and a hold keeps back / withdraws only the windows starting within this (a day's windows stay: the hold is about the next ones)
 LUNCH = {"sh": (dt.time(11, 30), dt.time(13, 0)), "hk": (dt.time(12, 0), dt.time(13, 0))}  # the lunch breaks (Beijing time) the halt rule does not count (core.quiet_ms)
 FILL_SETTLE_MS = 45 * 60_000  # a pair with a fill is cleared by the result: "stuck" only this long past the start
+# 1.154.81 (the owner: 改): a filled pair whose market Predict has not called settled yet (settle_pair: settle_wait — 1.154.77 waits
+# for that word) is shown as waiting on Predict, a problem only this long past its window's end; the hourly and daily markets were
+# called stuck half an hour on, while Predict was still to write 已结算
+SETTLE_WAIT_MAX_MS = 6 * 3600_000
+REFUSALS_KEPT = 1000  # 1.154.81: the refusals checked against the balance (refusal_context) kept for the status, since the start
 SKIP_RETRY_MS = 60_000    # a listed window that is no candidate (a missing field, a fee, a status) is asked again this often, not every poll
 MONITOR_MS = 5_000        # an active pair's orders are looked at this often (monitor_pair), the first look 10 s after the placement
 SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
@@ -961,6 +966,16 @@ def settle_from(pair: dict) -> int:
     """When a pair's window is over and its result may be read: its end (1.142.0: an hour or a day after the start for the
     hourly and daily cards); a record from before kept no end — a quarter hour after its start, as then."""
     return int(pair.get("end_ms") or 0) or int(pair["start_ms"]) + 15 * 60_000
+
+
+def settle_wait_text(pair: dict, now_ms: int) -> str:
+    """A pair waiting on Predict's settlement (settle_pair's settle_wait) in a few words: the market's status, the result Predict
+    named if any, how long past the window's end (1.154.81)."""
+    wait = pair.get("settle_wait") or {}
+    minutes = max(0, (now_ms - settle_from(pair)) // 60_000)
+    named = f"已写结果 {wait['result']}，" if wait.get("result") else "还没写结果，"
+    return (f"{pair.get('name') or pair.get('slug')}（{named}市场状态 {wait.get('status') or '没说'}，结束后已 "
+            + (f"{minutes // 60} 小时 {minutes % 60} 分" if minutes >= 60 else f"{minutes} 分钟") + "）")
 
 
 def hms(ms: int) -> str:
@@ -2516,6 +2531,7 @@ class Controller:
         self.archive(self.now())
         self.account_at = 0
         self.balance = 0.0
+        self.refusals: collections.deque = collections.deque(maxlen=REFUSALS_KEPT)  # 1.154.81: refusal_context of each refusal seen since the start
         self.open_reserved = 0.0
         self.listed_ids: set[str] = set()
         self.unmanaged = 0  # open orders on the account that neither strategy placed: shown; their money is in the balance check (no hold since 1.126.0)
@@ -2729,8 +2745,53 @@ class Controller:
         """The withdrawn pairs not cleared STUCK_MS past their cancel time: a cancel or a read that keeps failing, an order in doubt."""
         def late(p: dict) -> bool:  # a pair with a fill waits for the result (FILL_SETTLE_MS past the start); one without should clear in minutes
             filled = any(float(o.get("filled") or 0) > 0 for o in p["orders"].values())
+            if filled and p.get("settle_wait"):  # 1.154.81: its market read, Predict not done with it — waiting on Predict, not stuck
+                return now_ms > settle_from(p) + SETTLE_WAIT_MAX_MS
             return now_ms > (settle_from(p) + FILL_SETTLE_MS - 15 * 60_000 if filled else int(p.get("cancel_ms") or 0) + STUCK_MS)
         return [p for p in self.ledger.pending() if not p.get("accounted") and p["phase"] != "active" and late(p)]
+
+    def settle_waiting(self, now_ms: int) -> list[dict]:
+        """1.154.81: the filled pairs waiting on Predict to settle their market (settle_pair's settle_wait), not stuck yet: the
+        check lists them apart — the market's status then, and how long they have waited."""
+        stuck = {id(p) for p in self.stuck_pairs(now_ms)}
+        return [p for p in self.ledger.pending() if not p.get("accounted") and p.get("settle_wait") and id(p) not in stuck
+                and any(float(o.get("filled") or 0) > 0 for o in p["orders"].values())]
+
+    def refusal_context(self, pair: dict, refused: dict) -> dict:
+        """1.154.81 (the owner: 先加核对，再决定): what stood beside an order Predict invalidated once on the book — the money this mode's
+        orders on the same market were bidding, both sides and every level (the unfilled part of each order still out, the refused
+        one counted as it stood), and the USDT balance of the last account snapshot. The question it is to answer: does Predict
+        refuse a market's bids past the balance (BTC 5-minute's seven levels on both sides: $1,388, against $1,029)?"""
+        mid = str(pair.get("market_id") or "")
+        usd = 0.0
+        for p in (self.ledger.working.values() if mid else ()):  # (every record with an order still out is not accounted: among these)
+            if str(p.get("market_id") or "") != mid:
+                continue
+            price, shares = pair_quote(p)
+            for o in (p.get("orders") or {}).values():
+                if o is refused or o.get("state") in ("open", "placing", "unknown"):
+                    usd += price * max(0.0, shares - float(o.get("filled") or 0))
+        return {"at": self.now(), "usd": round(usd, 2), "balance": round(float(self.balance), 2),
+                "age_s": (self.now() - self.account_at) // 1000 if self.account_at else None,
+                "name": str(pair.get("name") or pair.get("slug") or ""), "level": int(pair.get("level") or 0)}
+
+    def refusal_line(self) -> str:
+        """1.154.81: the refusals since the start checked against the balance (refusal_context), in a line: how many, how many with
+        their market's bids past the balance, the medians, and what that says ("" with none)."""
+        xs = list(self.refusals)
+        if not xs:
+            return ""
+        over = sum(1 for x in xs if x["usd"] > x["balance"] + 1e-9)
+        mid = lambda v: sorted(v)[len(v) // 2]
+        text = (f"作废核对（本次启动后 {len(xs)} 次）：被作废时那一场两边挂单合计中位 ${mid([x['usd'] for x in xs]):,.0f}，当时余额中位 "
+                f"${mid([x['balance'] for x in xs]):,.0f}；合计超过余额的 {over} 次（{round(over * 100 / len(xs))}%）")
+        if len(xs) < 10:
+            return text + "——次数还少，再看一阵"
+        if over >= 0.9 * len(xs):
+            return text + "——基本可以确定：Predict 不许同一场的挂单合计超过余额，超出的被作废（补 USDT 或调小这张卡的份数就不会再有）"
+        if over <= 0.5 * len(xs):
+            return text + "——和余额关系不大，原因另找"
+        return text + "——还说不准，再看一阵"
 
     def check_stuck(self, now_ms: int) -> None:
         """The stuck pairs announced (once in a while each; at most three a pass, the count of the rest)."""
@@ -2766,6 +2827,12 @@ class Controller:
             lines.append("股票卡暂停：" + "；".join(self.card_holds.values()))
         lines.append(f"撤单后超过 {STUCK_MS // 60_000} 分钟未结清：{len(stuck)} 场"
                      + ("：" + "；".join(f"{p.get('name') or p['slug']}（{'/'.join(o['state'] for o in p['orders'].values())}，{p.get('reason') or '?'}）" for p in stuck[:5]) if stuck else ""))
+        waiting = self.settle_waiting(now)
+        if waiting:  # 1.154.81: filled, read final, Predict not done with the market yet — no problem till SETTLE_WAIT_MAX_MS past the end
+            lines.append(f"等 Predict 结算（有成交、两边已读完，等 Predict 把市场写成已结算；超过结束后 {SETTLE_WAIT_MAX_MS // 3600_000} 小时才算有问题）：{len(waiting)} 场："
+                         + "；".join(settle_wait_text(p, now) for p in waiting[:5]) + ("…" if len(waiting) > 5 else ""))
+        if refusal := self.refusal_line():
+            lines.append(refusal)
         lines.append(f"状态未知的订单：{len(unknown)} 张" + ("：" + "；".join(f"{p.get('name') or p['slug']} {s}" for p, s in unknown[:5]) if unknown else ""))
         lines.append(self.bulk_line())
         lines.append("最近 10 分钟的问题：" + ("；".join(f"{hms(t)} {e}" for t, e in recent[-5:]) if recent else "无"))
@@ -4336,9 +4403,17 @@ class Controller:
         pair["settle_checked"] = self.now()
         market = await self.cancel_api.market(pair["market_id"])
         resolution = core.predict_resolution(market)
+        settled = core.PredictFeed.market_settled(market if isinstance(market, dict) else {})
+        if not resolution or not settled:
+            # 1.154.81: what Predict says of the market while it is not done with it — shown by the check (settle_waiting), and
+            # the pair not called stuck for SETTLE_WAIT_MAX_MS past its end (stuck_pairs). Memory only: a start reads it again
+            wait = pair.get("settle_wait") or {}
+            pair["settle_wait"] = {"since": int(wait.get("since") or self.now()), "at": self.now(),
+                                   "status": str((market or {}).get("status") or "") if isinstance(market, dict) else "",
+                                   "result": str((resolution or {}).get("name") or "")}
         if not resolution:
             return
-        if not core.PredictFeed.market_settled(market if isinstance(market, dict) else {}):
+        if not settled:
             # 1.154.77 (an outside audit's "to verify" 1): a result named before Predict calls the market settled may still be a
             # proposal — settled on it, a result that flips later stood in the P&L and the day's loss stop. Both words, as the
             # redeem (RDM-OPEN-SHAPES); read again in a minute (settle_checked)
@@ -4416,6 +4491,8 @@ class Controller:
                         why = next((str(row.get(f)) for f in REFUSAL_FIELDS if row.get(f)), "")
                         order["refused_why"] = (str(row.get("status") or "").upper() + (f"：{why}" if why else ""))[:120]
                         pair["refused_ms"] = self.now()
+                        order["refused_ctx"] = ctx = self.refusal_context(pair, order)  # 1.154.81: the market's bids and the balance then
+                        self.refusals.append(ctx)
         if read:
             # Audit PRE-MONITOR-SAVES: saved only when a record was read (a fill or a final state may have changed). checked_ms
             # is pacing only (the same dict sits in ledger.rows, so the next look is paced from memory; after a restart a
@@ -5759,7 +5836,11 @@ class Controller:
         shut_cards = {h: "、".join(r.coin for r in core.preopen_cards() if getattr(r, "hours", "") == h and r.key in self.settings.markets) for h in SHUT_TEXT}  # 1.150.1: the cards a shut keeps back
         quiet = open_quiet_ms(self.settings) // 60_000  # 1.151.1: the minutes in force (the first window after an open always)
         cme_next = next(iter(core.cme_shuts(self.now(), self.now() + 5 * core.DAY_MS)), None) if shut_cards["cme"] else None  # CME's shut now in force, or the next
-        named = lambda ps: "、".join(str(p.get("name") or window_of(p)) + (f" 第 {int(p['level']) + 1} 档" if p.get("level") else "") for p in ps[:3]) + ("…" if len(ps) > 3 else "")
+        def beside(p: dict) -> str:  # 1.154.81: a refused level's market bids and the balance when it was refused (refusal_context)
+            ctx = next((o["refused_ctx"] for o in p["orders"].values() if o.get("refused_ctx")), None)
+            return f"（这场两边挂单合计 ${ctx['usd']:,.0f}，余额 ${ctx['balance']:,.0f}）" if ctx else ""
+        named = lambda ps: "、".join(str(p.get("name") or window_of(p)) + (f" 第 {int(p['level']) + 1} 档" if p.get("level") else "") + beside(p)
+                                    for p in ps[:3]) + ("…" if len(ps) > 3 else "")
         # (1.154.65: why Predict refused them, by kind, the most first — it said "post-only 会吃单等" whatever the answers were)
         reasons = lambda ps: "按原因：" + "、".join(f"{why} {n} 档" for why, n in collections.Counter(refusal_words(p) or "没说原因" for p in ps).most_common(4))
         why = (self.hold() or self.budget_problem()) if self.alive else ""
@@ -5820,5 +5901,6 @@ class Controller:
                 + (f"\n不再报价：{len(refused)} 档被 Predict 拒绝——{reasons(refused)}；如 {named(refused)}"
                    f"（开场前 {REFUSED_RETRY_AHEAD_MS // 60_000} 分钟内的、或这一档已经试满 {MAX_ATTEMPTS} 次的不再重挂）" if refused else "")
                 + (f"\n被拒后等重挂：{len(again)} 档——{reasons(again)}；被拒 {REFUSED_RETRY_MS // 60_000} 分钟后再挂一次（每档最多 {MAX_ATTEMPTS} 次），如 {named(again)}"
-                   if again else "") + "\n"
+                   if again else "")
+                + (f"\n{refusal}" if (refusal := self.refusal_line()) else "") + "\n"
                 f"实测：{self.timing_line()}" + ("" if busy else "\n" + bulk))
