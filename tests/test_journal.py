@@ -331,7 +331,8 @@ async def run():
     # (1.154.78: a busy answer marked as such — the export's alert then points to 强制刷新, tests/test_force_refresh.py)
     assert 'async function oops(r){if(r.status===503){let j={};try{j=await r.json()}catch(e){}const e=new Error(j.message||"HTTP 503");if(j.busy)e.busy=true;return e}' in m.JOURNAL_PAGE
     assert 'return new Error("HTTP "+r.status)}' in m.JOURNAL_PAGE
-    assert m.JOURNAL_PAGE.count("if(!r.ok)throw await oops(r)") == 7 and 'throw new Error("HTTP "+r.status)' not in m.JOURNAL_PAGE
+    # (1.154.80: 周末数据's own loader the eighth — tests/test_weekend.py)
+    assert m.JOURNAL_PAGE.count("if(!r.ok)throw await oops(r)") == 8 and 'throw new Error("HTTP "+r.status)' not in m.JOURNAL_PAGE
     assert '(Date.now()-(data.server_ms||Date.now())>120000?"（"+Math.round((Date.now()-data.server_ms)/60000)+" 分钟前算的：' in m.JOURNAL_PAGE
     assert 'load();setInterval(()=>{if(document.visibilityState!=="hidden")load()},300000);' in m.JOURNAL_PAGE and "setInterval(load,60000)" not in m.JOURNAL_PAGE
     assert 'document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&Date.now()-okAt>60000)load()});' in m.JOURNAL_PAGE

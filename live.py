@@ -8417,21 +8417,35 @@ class LiveBot(core.Bot):
         except Exception:
             return []
 
-    def preopen_cards(self, first: str, last: str, since_ms: int = 0) -> list[dict]:
+    def preopen_cards(self, first: str, last: str, since_ms: int = 0, week: str = "") -> list[dict]:
         """The pre-open mode's 按市场 rows over the Beijing dates ``first``..``last`` (preopen.cards_between, 1.151.0): the
         controller's ledger, or the file while the mode is off; the archived records (finished quotes that filled nothing)
         counted in by their kept counts (preopen_review's ArchiveShare, brought up to date) when those can stand for them —
-        else only the records and windows of the older days come out short, never a fill or a P&L."""
+        else only the records and windows of the older days come out short, never a fill or a P&L. 1.154.80: ``week`` — the
+        weekend's windows alone, or the weekdays' (preopen.week_keep)."""
         from preopen import cards_between
         rows, share = self.preopen_range("按市场")
-        return cards_between(rows, first, last, share, since_ms) if rows is not None else []
+        return cards_between(rows, first, last, share, since_ms, week) if rows is not None else []
 
-    def preopen_levels(self, first: str, last: str, since_ms: int = 0) -> dict | None:
+    def preopen_levels(self, first: str, last: str, since_ms: int = 0, week: str = "") -> dict | None:
         """The review page's 预挂按价格档位 over the Beijing dates ``first``..``last`` (preopen.levels_between, 1.154.35) — under
         按市场, on its days: as preopen_cards reads them. None when the mode has no record at all (the block is not shown)."""
         from preopen import levels_between
         rows, share = self.preopen_range("按价格档位")
-        return levels_between(rows, first, last, share, since_ms) if rows else None
+        return levels_between(rows, first, last, share, since_ms, week) if rows else None
+
+    def preopen_weekend(self, first: str, last: str, since_ms: int = 0, scope: str = "crypto") -> dict | None:
+        """The review page's 周末数据 of the pre-open mode (preopen.weekend_review, 1.154.80) over the Beijing dates ``first``..``last``,
+        as preopen_cards reads the records; ``archive_note`` when the archive's counts could not stand for its records (the
+        windows quoted of older days come out short, never a fill or a P&L). None when the mode has no record at all."""
+        from preopen import weekend_review
+        rows, share = self.preopen_range("周末数据")
+        if not rows:
+            return None
+        out = weekend_review(rows, first, last, share, since_ms, scope)
+        if share is None:
+            out["archive_note"] = "归档的旧记录（两天前没成交就撤掉的）这次没算进挂出场次，较早日子的场次数偏少；成交、盈亏不受影响"
+        return out
 
     def preopen_range(self, what: str) -> tuple[list[dict] | None, Any]:
         """(the pre-open mode's records, the archive's share standing for its archived ones) for a table over a range of days

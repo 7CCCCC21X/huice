@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.79"
+VERSION = "1.154.80"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -1062,7 +1062,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "每分钟最多 1000 次，不低于原来的 220；关 = 都按每分钟 220 次。11-26 主 Key 报的是 5000、规则吃单 Key 2000，却都按 220 跑：盘口读取在规则吃单 Key 上排队，一分钟里等了 182 秒"),
     ("PREOPEN_EXCLUSIVE", "预挂时原策略暂停开新仓", "开 = 本模式真实运行时普通模型策略不开新仓（原策略也在交易同一批 15 分钟市场时建议开）；关 = 两边同时跑，额度和日亏损合并计算"),
     ("PREOPEN_MARKETS", "预挂哪几张卡", "点亮要挂的卡，可多选，全选 = all（默认只挂 BTC）；BTC 5分、ETH 5分、BNB 5分 是每 5 分钟一场的卡（1.137.0，只给预挂用）；BTC 小时、ETH 小时、BNB 小时 是每小时一场（bitcoin-up-or-down-<日期>-<几点>-et，那一小时开始前撤单），BTC 日、ETH 日、BNB 日 是每天一场（<币>-up-or-down-on-<日期>，前一天 12:00 ET 开始，开始前撤单）（1.142.0，只给预挂用）；“一键全关”= none：一张都不挂、已挂的预挂单撤掉，本模式仍开着，再点亮一张就恢复；和“做哪些市场”互不影响：那边排除 15 分钟卡只管原策略，预挂只认这里"),
-    ("PREOPEN_WEEKEND", "周末也挂", "开 = 周末的场次照挂；关 = 周末不挂：北京时间周六 00:00 到周一 08:00 开始的场次不挂（周日晚到周一早上是币圈最薄的时段），周五起就不挂周六的场次，周末里已挂的按“设置不同”撤掉（不算再报价次数），周一 08:00 起恢复。股票卡周末本来没有场次，这项只影响 BTC、ETH、BNB 这些周末也有场次的卡"),
+    ("PREOPEN_WEEKEND", "周末也挂", "开 = 周末的场次照挂；关 = 周末不挂：北京时间周六 00:00 到周一 08:00 开始的场次不挂（周日晚到周一早上是币圈最薄的时段），周五起就不挂周六的场次，周末里已挂的按“设置不同”撤掉（不算再报价次数），周一 08:00 起恢复。"
+     "按北京时间一律不挂：除了 BTC、ETH、BNB 这些周末也有场次的卡，美股卡周五美东 11:00（夏令时 12:00）以后的场次、黄金原油周五尾盘和周一早上重开后的场次也落在这段里，一样不挂（1.154.80 起说明写准，做法没变）"),
     ("PREOPEN_SHARES", "预挂每边份数", "1～500：每场每边各挂这么多份（默认 10），每边不少于 $1"),
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
     ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 7 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
@@ -15961,6 +15962,44 @@ def journal_span(frm: str, to: str, rng: str, since: str, now_ms: int, max_days:
     return d0, d1, 0, journal_days_label(d0, d1, today) if rng != "all" else f"全部（{d0:%m-%d} 起）"
 
 
+JOURNAL_WEEKS = {"weekend": "仅周末", "weekday": "仅工作日"}  # 1.154.80: 按市场 / 模型 EV over the weekend's or the weekdays' alone
+WEEKEND_SPANS = {"last": 1, "4w": 4, "8w": 8, "all": 0}  # 1.154.80: 周末数据's presets — the weekends back from the latest (0: every one)
+
+
+def journal_week(value: str) -> str:
+    """A query's week (1.154.80): weekend / weekday, else "" (every day)."""
+    value = str(value or "").strip().lower()
+    return value if value in JOURNAL_WEEKS else ""
+
+
+def at_week(ms: int, week: str) -> bool:
+    """Whether a moment (a record's order, a window's start) belongs to ``week`` (preopen.week_keep: the weekend as PREOPEN_WEEKEND
+    draws it, Saturday 00:00 to Monday 08:00 Beijing)."""
+    from preopen import week_keep
+    return week_keep(int(ms or 0), week)
+
+
+def weekend_span(span: str, frm: str, to: str, since: str, now_ms: int, versions: Iterable[Mapping] = ()) -> tuple[dt.date, dt.date, int, str]:
+    """(first day, last day, from-this-moment ms, label) of 周末数据 (1.154.80): a preset of WEEKEND_SPANS — the latest weekend (the
+    one under way, else the last one over) and the weekdays of its week, the latest four or eight with every weekday since, or
+    every day kept (CARDS_MAX_DAYS) — else days or a version's first run, as journal_span reads them. A span of weekends
+    begins on the Monday before the first of them, so the weekdays it is weighed against are of the same weeks."""
+    from preopen import on_weekend, weekend_of
+    today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+    if span not in WEEKEND_SPANS:
+        return journal_span(frm, to, "" if frm else "30d", since, now_ms, CARDS_MAX_DAYS, versions)
+    sat = dt.date.fromisoformat(weekend_of(now_ms)) if on_weekend(now_ms) else today - dt.timedelta(days=(today.weekday() - 5) % 7)
+    n = WEEKEND_SPANS[span]
+    if not n:
+        first = today - dt.timedelta(days=CARDS_MAX_DAYS - 1)
+        return first, today, 0, f"全部周末（{first:%m-%d} 起）"
+    first = sat - dt.timedelta(days=7 * (n - 1) + 5)
+    if n == 1:
+        last = min(today, sat + dt.timedelta(days=2))
+        return first, last, 0, ("本周末" if on_weekend(now_ms) else "上个周末") + f"（{sat:%m-%d}，对照它前面的工作日）"
+    return first, today, 0, f"近 {n} 个周末（{first + dt.timedelta(days=5):%m-%d} 起）"
+
+
 def journal_days_label(d0: dt.date, d1: dt.date, today: dt.date) -> str:
     """今天 / 昨天 / 11-16 / 11-10 至 11-16（7 天）."""
     if d0 == d1:
@@ -17533,7 +17572,12 @@ details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-ite
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><details class="menu" id="exports"><summary class="btn">导出 ▾</summary><div class="mlist"><a id="csv" href="journal.csv" download="交易日记.csv">交易日记 CSV</a><a id="scsv" href="summary.csv" download="复盘汇总.csv">复盘汇总 CSV</a><a id="mcsv" href="samples.csv" download="模型样本.csv">模型样本 CSV</a><a id="json" href="journal.json?full=1" download="交易日记.json">交易日记 JSON</a></div></details></div>
 <div class="tiles" id="tiles"></div>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
-<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>按市场 · <span id="scrng">今天</span> <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbar" id="cbar"><button type="button" class="tq on" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="all">全部</button><select class="tver" id="cver" aria-label="从某个版本更新起到现在"><option value="">版本更新起…</option></select><details class="cust" id="ccust"><summary>自定义</summary><span class="tcust"><input type="date" id="cfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="cto" aria-label="结束日期"><button type="button" id="cgo">查看</button></span></details></div><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><details class="hint"><summary>说明</summary><p>选的日子（北京时间）里下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；开盘前预挂（两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的日期算，下单时预期按五五开算。<b>偏离</b> = 实际盈亏比下单时预期差了几个 σ（σ 按下单时的概率算）：±2σ 以内可能只是运气，低于 −2σ 就不像运气了，是这个市场有问题。点一行看明细：原策略是这段时间的每一笔；开盘前预挂是钱亏在哪——只成交一边时那边赢几成、按开始时间、按成交时距开场、按方向和价格档。</p><p>按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></details><div id="plbox" hidden><h3>预挂按价格档位 · <span id="plrng">今天</span> <span class="small mut" style="font-weight:normal">（日期跟着上面“按市场”选的）</span></h3><div id="p-levels"></div></div></div></section>
+<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>按市场 · <span id="scrng">今天</span> <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbar" id="cbar"><button type="button" class="tq on" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="all">全部</button><select class="tver" id="cver" aria-label="从某个版本更新起到现在"><option value="">版本更新起…</option></select><details class="cust" id="ccust"><summary>自定义</summary><span class="tcust"><input type="date" id="cfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="cto" aria-label="结束日期"><button type="button" id="cgo">查看</button></span></details><span class="tcust" id="cweek"><button type="button" class="tq on" data-w="">全部日子</button><button type="button" class="tq" data-w="weekend">仅周末</button><button type="button" class="tq" data-w="weekday">仅工作日</button></span></div><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><details class="hint"><summary>说明</summary><p>选的日子（北京时间）里下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；开盘前预挂（两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的日期算，下单时预期按五五开算。<b>偏离</b> = 实际盈亏比下单时预期差了几个 σ（σ 按下单时的概率算）：±2σ 以内可能只是运气，低于 −2σ 就不像运气了，是这个市场有问题。点一行看明细：原策略是这段时间的每一笔；开盘前预挂是钱亏在哪——只成交一边时那边赢几成、按开始时间、按成交时距开场、按方向和价格档。</p><p>按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></details><div id="plbox" hidden><h3>预挂按价格档位 · <span id="plrng">今天</span> <span class="small mut" style="font-weight:normal">（日期跟着上面“按市场”选的）</span></h3><div id="p-levels"></div></div></div></section>
+<section class="box" id="wkbox"><div class="hd" id="wkhd"><h2>周末数据</h2><span class="sum" id="wksum"></span><button type="button" class="lnk" id="foldwk">展开</button></div>
+<div class="body" id="wkbody" hidden><div class="tbar" id="wkbar"><button type="button" class="tq" data-s="last">本 / 上个周末</button><button type="button" class="tq on" data-s="4w">近 4 个周末</button><button type="button" class="tq" data-s="8w">近 8 个周末</button><button type="button" class="tq" data-s="all">全部周末</button><select class="tver" id="wkver" aria-label="从某个版本更新起到现在"><option value="">版本更新起…</option></select><details class="cust" id="wkcust"><summary>自定义</summary><span class="tcust"><input type="date" id="wkfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="wkto" aria-label="结束日期"><button type="button" id="wkgo">查看</button></span></details></div>
+<div class="tbar" id="wkbar2"><button type="button" class="tq on" data-c="crypto">仅加密</button><button type="button" class="tq" data-c="all">全部卡</button><span class="mut">｜</span><button type="button" class="tq on" data-m="preopen">开盘前预挂</button><button type="button" class="tq" data-m="sim">原策略</button><button type="button" class="tq" data-m="both">两个都看</button></div>
+<div id="wk"></div>
+<details class="hint"><summary>说明</summary><p>周末 = 北京时间周六 00:00 到周一 08:00，和控制台“周末也挂”是同一段；预挂按场次开始时间算，原策略按下单时间算。“仅加密”只看 BTC、ETH、BNB 这些 24 小时都有场次的卡；“全部卡”还包括落在这段时间里的美股周五美东下午（北京周六凌晨）、黄金原油周五尾盘和周一早上重开后的场次。“同区间工作日”是这几个周末所在那几周里的工作日（近 4 个周末 = 从第一个周末前的周一起到今天），这样比的是同一批设置。每份：预期 = 按五五开算一份值 50¢ 减去买价（47¢ 一份预期赚 3¢），实际 − 预期在 ±2σ 以内可以是运气，低于 −2σ 就不像运气了。只成交一边时，成交那边要赢过保本线（买价）才赚钱；两边都成交的场次两边对冲，每场赚 1 − 两边价格。挂出场次（成交率的分母）里，两天前周一 00:00–08:00 没成交就撤掉的场次算在工作日——归档只按日期记了数；成交、盈亏、预期、偏离、胜率都不受影响。</p></details></div></section>
 <section class="box" id="tallybox"><div class="hd" id="tallyhd"><h2>市场涨跌统计</h2><span class="sum" id="tallysum"></span><button type="button" class="lnk" id="foldtally">收起</button></div>
 <div class="body" id="tallybody"><div class="tbar"><select id="tcard" aria-label="市场"></select><button type="button" class="tq" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><details class="cust" id="tcustd"><summary>自定义</summary><span class="tcust"><input type="date" id="tfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="tto" aria-label="结束日期"><button type="button" id="tgo">查看</button></span></details></div>
 <div id="tally"></div>
@@ -17541,7 +17585,7 @@ details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-ite
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="anaref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
 <div class="note fline" id="anafilt" hidden></div><div class="small mut" id="anaat"></div>
-<details class="fold" data-k="ev" id="h-ev" hidden><summary><h3>模型 EV 对实际盈亏 · <span id="evrng">近 30 天</span></h3></summary><div class="tbar" id="evbar" hidden><button type="button" class="tq on" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="all">全部</button><select class="tver" id="evver" aria-label="从某个版本更新起到现在"><option value="">版本更新起…</option></select><details class="cust" id="evcust"><summary>自定义</summary><span class="tcust"><input type="date" id="evfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="evto" aria-label="结束日期"><button type="button" id="evgo">查看</button></span></details></div><div id="a-ev" hidden></div><details class="hint" id="p-ev" hidden><summary>说明</summary><p>把每一笔已结算的单当成一次下注：模型预期 = 下单时净优势 × 份数（预挂按五五开：每边 (50¢ − 挂价) × 成交份数），实际 = 结算盈亏。按模型自己给的概率，这些注的累计盈亏有一个 ±2σ 的正常范围：实际落在带子里是运气，跌出下沿就是模型把优势看高了（激进）——这是比停机线更早的信号；冲出上沿是看低了（保守）。少于 30 笔不下结论。近 7 天跌出下沿时 Telegram 每天最多提醒一次。原策略按下单日、预挂按场次开始日（北京时间），默认最近 30 天；上面可以换成近 7 天、全部、自定义日期，或“版本更新起”——从某个版本第一次运行的那一刻到现在（1.154.70，看改了以后怎么样）；筛选条选了市场、类型、挂/吃时只算原策略的记录。</p></details></details>
+<details class="fold" data-k="ev" id="h-ev" hidden><summary><h3>模型 EV 对实际盈亏 · <span id="evrng">近 30 天</span></h3></summary><div class="tbar" id="evbar" hidden><button type="button" class="tq on" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="all">全部</button><select class="tver" id="evver" aria-label="从某个版本更新起到现在"><option value="">版本更新起…</option></select><details class="cust" id="evcust"><summary>自定义</summary><span class="tcust"><input type="date" id="evfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="evto" aria-label="结束日期"><button type="button" id="evgo">查看</button></span></details><span class="tcust" id="evweek"><button type="button" class="tq on" data-w="">全部日子</button><button type="button" class="tq" data-w="weekend">仅周末</button><button type="button" class="tq" data-w="weekday">仅工作日</button></span></div><div id="a-ev" hidden></div><details class="hint" id="p-ev" hidden><summary>说明</summary><p>把每一笔已结算的单当成一次下注：模型预期 = 下单时净优势 × 份数（预挂按五五开：每边 (50¢ − 挂价) × 成交份数），实际 = 结算盈亏。按模型自己给的概率，这些注的累计盈亏有一个 ±2σ 的正常范围：实际落在带子里是运气，跌出下沿就是模型把优势看高了（激进）——这是比停机线更早的信号；冲出上沿是看低了（保守）。少于 30 笔不下结论。近 7 天跌出下沿时 Telegram 每天最多提醒一次。原策略按下单日、预挂按场次开始日（北京时间），默认最近 30 天；上面可以换成近 7 天、全部、自定义日期，或“版本更新起”——从某个版本第一次运行的那一刻到现在（1.154.70，看改了以后怎么样）；筛选条选了市场、类型、挂/吃时只算原策略的记录。</p></details></details>
 <details class="fold" data-k="versions"><summary><h3>按设置版本</h3></summary><div id="a-versions"></div><details class="hint"><summary>说明</summary><p>每笔记录都存了下单时的设置。这里把每个改过的设置单独拿出来：每种取值一行，带用它的时间段（中间换过别的值又换回来的写“N 段”），比已结算盈亏对“下单时预期”、胜率对平均公平价——改了以后这两组差距变小，就是改对了。同一时间改了几个设置时，这几张表是同一种切分，分不出是哪个起的作用；时间段不同，行情也不同，样本少时差别多半是运气。代码版本按大版本合并（1.106.x 算一个）。</p></details></details>
 <details class="fold" data-k="items"><summary><h3>按标的</h3></summary><div id="a-items"></div></details>
 <details class="fold" data-k="edges"><summary><h3>按下单时净优势</h3></summary><div id="a-edges"></div><details class="hint"><summary>说明</summary><p>每桶的已结算盈亏对比“下单时预期”（净优势 × 份数），胜率（平局算半）对比平均公平价：胜率低于公平价的桶，模型把优势看高了。</p></details></details>
@@ -17766,7 +17810,8 @@ function summary(){  // per day the records were opened on: records, markets, wh
 function pn(x){const b=$("b","",money(x));b.className=x>=0?"ok":"bad";return b}
 let cardOpen="",dayOpen="";const rowsCache={},rowsBusy=new Set();  // the card of 按市场 (1.114.0) and the day of the summary (1.115.0) whose records are shown under their tables; the records read for a panel, by query (journal.json?rows=1&…), again after each refresh
 let cardRng="today",cardFrom="",cardTo="",cardSince="";const cardsCache={},cardsBusy=new Set();  // 按市场's days (1.151.0): a preset (today / yesterday / 7d / 30d / all) or from..to; the rows read for each, by query — 1.154.70: or since a version
-function cardsRange(){return cardSince?["since="+cardSince]:cardRng?["range="+cardRng]:["from="+cardFrom,"to="+(cardTo||cardFrom)]}
+let cardWeek="",evWeek="";  // 1.154.80: 按市场 / 模型 EV over the weekend's alone ("weekend"), the weekdays' ("weekday"), or every day ("")
+function cardsRange(){return [...(cardSince?["since="+cardSince]:cardRng?["range="+cardRng]:["from="+cardFrom,"to="+(cardTo||cardFrom)]),...(cardWeek?["week="+cardWeek]:[])]}
 function fillVersions(sel,cur){  // 1.154.70: the versions a span may begin at (journal.json's versions: each one's first run here), the latest first
   const vs=(data&&data.versions)||[],key=vs.map(v=>v.version+"@"+v.at).join(",");
   if(sel.dataset.k!==key){sel.dataset.k=key;const head=$("option","","版本更新起…");head.value="";
@@ -17774,7 +17819,7 @@ function fillVersions(sel,cur){  // 1.154.70: the versions a span may begin at (
   sel.value=cur?String(cur):"";sel.classList.toggle("on",!!cur)}
 function cardsView(S){  // 按市场: today's rows come with the summary's analysis; other days are read from the server (journal.json?cards=1&…), again after each refresh
   const cel=document.getElementById("s-cards"),lab=document.getElementById("scrng");fillVersions(document.getElementById("cver"),cardSince);
-  if(cardRng==="today"&&!cardSince){lab.textContent="今天";const ct=(S.a||{}).cards_today||[];cel.replaceChildren(ct.length?cardsTable(ct):$("p","small mut","今天还没有记录"));cardDetail(ct,"今天");
+  if(cardRng==="today"&&!cardSince&&!cardWeek){lab.textContent="今天";const ct=(S.a||{}).cards_today||[];cel.replaceChildren(ct.length?cardsTable(ct):$("p","small mut","今天还没有记录"));cardDetail(ct,"今天");
     levelsView((S.a||{}).preopen_levels_today,"今天");return}
   const fk=filterKey(),q=["cards=1",...cardsRange()].join("&")+(fk?"&"+fk:""),c=cardsCache[q];if(!c||c.at!==okAt)loadCards(q);
   if(!c||!c.data){cel.replaceChildren($("p","small mut",c&&c.error?"读取失败："+c.error:"读取中…"));cardDetail([],"");levelsView(null,"",c&&c.error?"读取失败："+c.error:"读取中…");return}
@@ -17794,11 +17839,11 @@ async function loadCards(q){const at=okAt;if(cardsBusy.has(q))return;cardsBusy.a
   catch(e){cardsCache[q]={at,error:e.message||"读取失败",data:(cardsCache[q]||{}).data}}  // a failed re-read keeps what was shown
   finally{cardsBusy.delete(q)}
   summary()}
-function cardsPick(rng,from,to,since){cardRng=rng;cardFrom=from||"";cardTo=to||"";cardSince=since||"";cardOpen="";document.querySelectorAll("#cbar .tq").forEach(b=>b.classList.toggle("on",!cardSince&&b.dataset.r===cardRng));summary()}
+function cardsPick(rng,from,to,since){cardRng=rng;cardFrom=from||"";cardTo=to||"";cardSince=since||"";cardOpen="";document.querySelectorAll("#cbar .tq[data-r]").forEach(b=>b.classList.toggle("on",!cardSince&&b.dataset.r===cardRng));summary()}
 let evRng="30d",evFrom="",evTo="",evSince="";const evCache={},evBusy=new Set();  // 1.154.70: 模型 EV 对实际盈亏's span — the last 30 days (the analysis' own), a preset, days, or since a version (journal.json?ev=1&…)
-function evRange(){return evSince?["since="+evSince]:evRng?["range="+evRng]:["from="+evFrom,"to="+(evTo||evFrom)]}
+function evRange(){return [...(evSince?["since="+evSince]:evRng?["range="+evRng]:["from="+evFrom,"to="+(evTo||evFrom)]),...(evWeek?["week="+evWeek]:[])]}
 function evView(a){
-  const own=evRng==="30d"&&!evSince,lab=document.getElementById("evrng");let ev=own?a.ev:null,wait="";
+  const own=evRng==="30d"&&!evSince&&!evWeek,lab=document.getElementById("evrng");let ev=own?a.ev:null,wait="";
   if(!own){const fk=filterKey(),q=["ev=1",...evRange()].join("&")+(fk?"&"+fk:""),c=evCache[q];if(!c||c.at!==okAt)loadEv(q);
     if(c&&c.data){ev=c.data.ev;lab.textContent=c.data.label;const fi=document.getElementById("evfrom"),ti=document.getElementById("evto");
       if(document.activeElement!==fi&&document.activeElement!==ti){fi.value=c.data.from;ti.value=c.data.to}}
@@ -17813,7 +17858,7 @@ async function loadEv(q){const at=okAt;if(evBusy.has(q))return;evBusy.add(q);
   catch(e){evCache[q]={at,error:e.message||"读取失败",data:(evCache[q]||{}).data}}  // a failed re-read keeps what was shown
   finally{evBusy.delete(q)}
   analysis()}
-function evPick(rng,from,to,since){evRng=rng;evFrom=from||"";evTo=to||"";evSince=since||"";document.querySelectorAll("#evbar .tq").forEach(b=>b.classList.toggle("on",!evSince&&b.dataset.r===evRng));analysis()}
+function evPick(rng,from,to,since){evRng=rng;evFrom=from||"";evTo=to||"";evSince=since||"";document.querySelectorAll("#evbar .tq[data-r]").forEach(b=>b.classList.toggle("on",!evSince&&b.dataset.r===evRng));analysis()}
 function luckCell(r){  // 偏离 (1.151.0): the settled P&L against the expectation at the order, in the σ the order's own probabilities give
   const l=r.luck;if(!l||!l.bets||!(l.sigma>0))return"—";const z=l.z,out=$("span","");
   const b=$("b",z<=-2?"bad":z>=2?"ok":"",(z>=0?"+":"−")+Math.abs(z).toFixed(1)+"σ");
@@ -17845,7 +17890,7 @@ function cardDetail(ct,span){  // under 按市场: the opened card's records of 
   if(r.preopen){el.hidden=false;el.replaceChildren(...poDiag(r,span,fold));return}
   const flt=$("button","lnk","在下面列表里筛选这个市场");flt.type="button";
   flt.addEventListener("click",()=>{cardF=name;stateF="all";shown=PAGE;render();document.getElementById("filters").scrollIntoView({block:"start"})});
-  const today=cardRng==="today";
+  const today=cardRng==="today"&&!cardWeek;  // (1.154.80: a week picked reads the range, as 按市场 does)
   panel(el,name+" · "+(today?"今天":span+" ")+"的每一笔",[fold,flt],panelQuery([...(today?["day=today"]:cardsRange()),"card="+encodeURIComponent(name)]),
     "盈亏 = (结算价 − 买价) × 份数，合计就是上表这一行的盈亏；状态是结果的确认情况（预结算 / 已确认 / 结果不一致）。点一行看完整记录。",
     {key:t=>t.item||"",label:k=>itemLess(k,name),sub:t=>itemLess(t.item,name)},(today?"今天":"这段时间")+"还没有成交、持仓或挂单")}
@@ -17950,7 +17995,8 @@ function preopenSection(po){  // 开盘前预挂 (1.128.0): the mode's own ledge
   el.append(d,...bigTable("按日期",poTable(po.days||[]),(po.days||[]).length),$("div","sub","按标的"),poTable(po.cards||[]));
   if((po.levels||[]).length)el.append($("p","small mut","按价格档位的预期对实际在上面“按市场”下方，跟着那里选的日期（全部日子选“全部”）。"));  // 1.154.35: moved up
   el.append(...bigTable("按开始时间",poTable(po.hours||[]),(po.hours||[]).length));
-  if((po.weekly||[]).length)el.append($("div","sub","周末 vs 工作日（按场次开始时间；周末 = 北京时间周六 00:00 到周一 08:00，和“周末也挂”的开关同一区间）"),poTable(po.weekly));
+  if((po.weekly||[]).length){const go=$("button","lnk","看完整的周末数据 ↑");go.type="button";go.addEventListener("click",()=>{wkFold(true);document.getElementById("wkbox").scrollIntoView({block:"start"})});
+    const h=$("div","sub","周末 vs 工作日（按场次开始时间；周末 = 北京时间周六 00:00 到周一 08:00，和“周末也挂”的开关同一区间） ");h.append(go);el.append(h,poTable(po.weekly))}  // 1.154.80: the whole of it above
   el.append($("div","sub","按方向（一场的涨、跌是两张单）"),table(["方向","挂出","有成交","成交份数","成交额","已结算","盈亏"],(po.sides||[]).map(r=>[r.name,r.records,r.filled_windows||"—",num(r.filled),usd(r.volume),poWl(r),r.settled?poPn(r.pnl):"—"])));
   if((po.recent||[]).length){const res=x=>x==="up"?"涨":x==="down"?"跌":x==="split"?"平":"未出";
     const fl=m=>m==null?"—":m<0?"撤单后才读到":m>=120?(m/60).toFixed(1)+" 小时":m.toFixed(0)+" 分钟";  // 1.151.0: the first fill seen, this long before the start
@@ -18176,7 +18222,7 @@ async function load(){  // the list: light rows, the open trades and the last fe
     else{if(load.more){allLoaded=true;load.more=false}data=j;okAt=Date.now();if(filterKey())loadAna();  // the filter's tables refreshed with the list
       document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at+(Date.now()-(data.server_ms||Date.now())>120000?"（"+Math.round((Date.now()-data.server_ms)/60000)+" 分钟前算的：重算一次要占住机器人几秒，所以隔几分钟才重算，规则吃单的优先时段里不重算）":"")),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"+(data.more>0?"（更早的 "+data.more+" 笔可载入）":"")));
       showForce();
-      render();if(openId&&details[openId])loadDetail(openId);
+      render();if(openId&&details[openId])loadDetail(openId);wkView();
       const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}}
   catch(e){const hms=okAt?clock(okAt):"";
     if(load.more){load.more=false;load.moreFailed=e.name==="AbortError"?"20 秒没有回应":(e.message||"读取失败");if(data)render()}  // the button again, saying why
@@ -18309,11 +18355,104 @@ async function tallyLoad(tries){const my=++tallySeq,el=document.getElementById("
     if(!j.ready){el.replaceChildren($("p","small mut",j.message||"读取中…"));if((tries||0)<40)setTimeout(()=>{if(my===tallySeq)tallyLoad((tries||0)+1)},1000);return}
     tallyRender(j)}
   catch(e){if(my===tallySeq)el.replaceChildren($("p","small mut","读取失败："+(e.message||e)))}}
+// 1.154.80 (周末数据): the weekend's windows on their own — against the weekdays of the same weeks, weekend by weekend, by level, by card
+// (where the money went: poDiag), by stretch of hours and by the hour, by how long before the start they filled; the model trader's beside them
+let wkOpen=false,wkSpan="4w",wkFrom="",wkTo="",wkSince="",wkScope="crypto",wkMode="preopen",wkPickSat="",wkCardOpen="";const wkCache={},wkBusy=new Set();
+try{wkOpen=localStorage.getItem("jrnwk")==="1";const m=localStorage.getItem("jrnwkmode"),c=localStorage.getItem("jrnwkscope");
+  if(m==="preopen"||m==="sim"||m==="both")wkMode=m;if(c==="crypto"||c==="all")wkScope=c}catch(e){}
+function wkQuery(){return ["weekend=1",...(wkSince?["since="+wkSince]:wkSpan?["span="+wkSpan]:["from="+wkFrom,"to="+(wkTo||wkFrom)]),"scope="+wkScope].join("&")}
+async function wkLoad(q){const at=okAt;if(wkBusy.has(q))return;wkBusy.add(q);
+  try{const k=ctlKey();const r=await fetch(base+"/journal.json?"+q,{cache:"no-store",headers:k?{"X-Control-Key":k}:{}});if(!r.ok)throw await oops(r);wkCache[q]={at,data:await r.json()}}
+  catch(e){wkCache[q]={at,error:e.message||"读取失败",data:(wkCache[q]||{}).data}}  // a failed re-read keeps what was shown
+  finally{wkBusy.delete(q)}
+  wkView()}
+function wkTable(rows,head,denom){  // a line a group: what filled, the settled fills against a coin toss (preopen.ev_line), the hedged windows and the one-sided ones
+  const per=v=>(v>=0?"+":"−")+Math.abs(v*100).toFixed(1)+"¢",pc=(a,b)=>b?Math.round(a*100/b)+"%":"—",zt=z=>z==null?"":"（"+(z>=0?"+":"−")+Math.abs(z).toFixed(1)+"σ）";
+  const span=(...xs)=>{const s=$("span","");s.append(...xs);return s};
+  return table([head,denom?"有成交 / 场次（成交率）":"有成交场次","已结算份数","成交额","每份：预期 → 实际","预期","实际","实际 − 预期（偏离）","两边都成交","只成交一边：那边赢"],
+    rows.map(r=>{const sh=r.settled_shares||0,b=r.both||{},o=r.one||{};
+      return [r.name,denom?num(r.filled_windows||0)+" / "+num(r.windows||0)+"（"+pc(r.filled_windows||0,r.windows||0)+"）":num(r.filled_windows||0),sh?num(sh):"—",r.volume?usd(r.volume):"—",
+        sh?per(r.ev/sh)+" → "+per(r.pnl/sh):"—",sh?money(r.ev):"—",sh?poPn(r.pnl):"—",sh?span(poPn(r.pnl-r.ev),zt(r.z)):"—",b.windows?span(b.windows+" 场 ",poPn(b.pnl)):"—",
+        o.windows?o.won+"/"+o.windows+"（"+pc(o.won,o.windows)+(r.avg_price!=null?"，保本 "+Math.round(r.avg_price*100)+"%":"")+"）":"—"]}))}
+function wkWeeks(rows){  // ② a line a weekend, the newest first; a line opened shows that weekend's cards and stretches
+  if(!rows.length)return [$("p","small mut","这段时间没有周末的记录")];
+  if(wkPickSat&&!rows.some(r=>r.sat===wkPickSat))wkPickSat="";
+  const w=wkTable(rows,"周末",true);[...w.querySelectorAll("tr")].slice(1).forEach((tr,i)=>{const r=rows[i],open=r.sat===wkPickSat;tr.className="dayrow"+(open?" open":"");
+    tr.title=open?"收起":"点开看这个周末各张卡、各个时段";tr.firstChild.textContent=(open?"▾ ":"▸ ")+r.name;tr.addEventListener("click",()=>{wkPickSat=open?"":r.sat;wkView()})});
+  const out=[w],r=rows.find(x=>x.sat===wkPickSat);
+  if(r)out.push($("div","sub",r.name+"：按标的"),(r.cards||[]).length?wkTable(r.cards,"标的",false):$("p","small mut","这个周末没有成交"),
+    $("div","sub",r.name+"：按时段（北京时间）"),(r.slots||[]).length?wkTable(r.slots,"时段",false):$("p","small mut","这个周末没有成交"));
+  return out}
+function wkCards(rows,label){  // ④ by card as 按市场 shows them; a line opened shows where its money went (poDiag)
+  if(!rows.length)return [$("p","small mut","这段时间周末没有记录")];
+  if(wkCardOpen&&!rows.some(r=>r.name===wkCardOpen))wkCardOpen="";
+  const w=anaTable(rows,{head:["偏离"],cells:r=>[luckCell(r)]});[...w.querySelectorAll("tr")].slice(1).forEach((tr,i)=>{const r=rows[i],open=r.name===wkCardOpen;tr.className="dayrow"+(open?" open":"");
+    tr.title=open?"收起":"点开看钱亏在哪：只成交一边时那边赢几成，按开始时间、按成交时距开场、按方向和价格档";tr.firstChild.textContent=(open?"▾ ":"▸ ")+r.name;
+    tr.addEventListener("click",()=>{wkCardOpen=open?"":r.name;wkView()})});
+  const out=[w],r=rows.find(x=>x.name===wkCardOpen);
+  if(r){const fold=$("button","lnk","收起");fold.type="button";fold.addEventListener("click",()=>{wkCardOpen="";wkView()});out.push(...poDiag(r,label+"的周末",fold))}
+  return out}
+function wkPreopen(p,label){const out=[sec("开盘前预挂")];
+  if(!p){out.push($("p","small mut","没有开盘前预挂的记录"));return out}
+  if(p.archive_note)out.push($("p","small warn","⚠️ "+p.archive_note));
+  if((p.notes||[]).length){const ul=$("ul","notes");p.notes.forEach(n=>ul.append($("li","",n)));out.push(ul)}
+  out.push($("div","sub","① 周末 vs 同区间工作日（按场次开始时间）"),wkTable(p.compare||[],"分组",true));
+  out.push($("div","sub","② 逐个周末（新的在前，点一行看那个周末各张卡、各个时段）"),...wkWeeks(p.weekends||[]));
+  const lv=p.levels||{};out.push($("div","sub","③ 周末按价格档位"),(lv.levels||[]).length?poLevels(lv.levels):$("p","small mut","没有记录"));
+  if((lv.levels||[]).length&&!lv.archived)out.push($("p","small mut","（“仅加密”时这张表的场次只算最近两天还没归档的记录：归档只按日期记了各档挂出多少，分不出是哪张卡的。成交、盈亏、预期、偏离、胜率不受影响；要看完整的场次数选“全部卡”。）"));
+  out.push($("div","sub","④ 周末按标的（点一行看钱亏在哪）"),...wkCards(p.cards||[],label));
+  const slots=(p.slots||[]).filter(s=>s.records).map(s=>({...s,name:s.name+"（"+s.note+"）"}));
+  out.push($("div","sub","⑤ 周末按时段（北京时间，按场次开始）"),slots.length?wkTable(slots,"时段",false):$("p","small mut","没有记录"),
+    ...bigTable("按小时（周六 00 时到周一 07 时）",wkTable(p.hours||[],"小时",false),(p.hours||[]).length,-1));
+  const line=x=>[x.name,x.windows,x.settled||"—",x.settled?poPn(x.pnl):"—",x.one?x.won+"/"+x.one+"（"+tallyPc(x.won,x.one)+"）":"—"];
+  if((p.lead||[]).length)out.push($("div","sub","⑥ 按成交时距开场（第一次看到成交的时刻，1.151.0 起才记）"),table(["成交","有成交","已结算","盈亏","只成交一边：那边赢"],p.lead.map(line)));
+  if((p.recent||[]).length){const res=x=>x==="up"?"涨":x==="down"?"跌":x==="split"?"平":"未出";
+    const fl=m=>m==null?"—":m<0?"撤单后才读到":m>=120?(m/60).toFixed(1)+" 小时":m.toFixed(0)+" 分钟";
+    out.push(...bigTable("周末有成交的场次（最近 "+p.recent.length+" 场，新的在前）",table(["开始","场次","涨成交","跌成交","价格","成交额","结果","盈亏","状态","挂上时距开场","成交时距开场"],
+      p.recent.map(r=>[when(r.start_ms),r.name,num(r.filled_up),num(r.filled_down),cent(r.price),usd(r.volume),res(r.result),r.pnl==null?"—":poPn(r.pnl),r.status,r.lead_min==null?"—":r.lead_min.toFixed(0)+" 分钟",fl(r.fill_lead_min)])),p.recent.length,-1))}
+  return out}
+function wkSim(m,label){const out=[sec("原策略（按下单时间；不分加密和全部卡）")];
+  if(!m||!(m.compare||[]).some(r=>r.records)){out.push($("p","small mut","这段时间原策略没有记录"));return out}
+  const luck={head:["偏离"],cells:r=>[luckCell(r)]};
+  out.push($("div","sub","周末 vs 同区间工作日"),anaTable(m.compare,luck));
+  if((m.weekends||[]).length)out.push(...bigTable("逐个周末（新的在前）",anaTable(m.weekends,luck),m.weekends.length,8));
+  if((m.cards||[]).length)out.push($("div","sub","周末按市场"),anaTable(m.cards,luck));
+  return out}
+function wkView(){if(!wkOpen)return;const el=document.getElementById("wk"),q=wkQuery(),c=wkCache[q];if(!c||c.at!==okAt)wkLoad(q);
+  fillVersions(document.getElementById("wkver"),wkSince);
+  document.querySelectorAll("#wkbar .tq").forEach(b=>b.classList.toggle("on",!wkSince&&!!wkSpan&&b.dataset.s===wkSpan));
+  document.querySelectorAll("#wkbar2 .tq[data-c]").forEach(b=>b.classList.toggle("on",b.dataset.c===wkScope));
+  document.querySelectorAll("#wkbar2 .tq[data-m]").forEach(b=>b.classList.toggle("on",b.dataset.m===wkMode));
+  if(!c||!c.data){el.replaceChildren($("p","small mut",c&&c.error?"读取失败："+c.error:"读取中…"));return}
+  const j=c.data,fi=document.getElementById("wkfrom"),ti=document.getElementById("wkto");
+  if(document.activeElement!==fi&&document.activeElement!==ti){fi.value=j.from;ti.value=j.to}fi.max=ti.max=j.today;
+  const kids=[$("p","small mut",j.label+" · "+j.from+" 至 "+j.to+(j.scope==="all"?" · 全部卡":" · 仅加密（BTC、ETH、BNB）"))];
+  if(c.error)kids.push($("p","small bad","刷新失败："+c.error+"，下面是上一次读到的"));
+  if(wkMode!=="sim")kids.push(...wkPreopen(j.preopen,j.label));
+  if(wkMode!=="preopen")kids.push(...wkSim(j.sim,j.label));
+  el.replaceChildren(...kids);
+  const w=j.preopen&&(j.preopen.compare||[])[0],s=j.sim&&(j.sim.compare||[])[0];  // the header's line: the weekend's settled P&L (the pre-open's against a coin toss)
+  document.getElementById("wksum").textContent=j.label+(wkMode!=="sim"&&w&&w.settled?" · 预挂 "+w.settled+" 条已结算 "+money(w.pnl)+(w.z!=null?"（"+(w.z>=0?"+":"−")+Math.abs(w.z).toFixed(1)+"σ）":""):"")
+    +(wkMode!=="preopen"&&s&&s.settled?" · 原策略 "+s.settled+" 笔 "+money(s.pnl):"")}
+function wkFold(open){wkOpen=open;try{localStorage.setItem("jrnwk",open?"1":"0")}catch(e){}
+  document.getElementById("wkbody").hidden=!open;document.getElementById("foldwk").textContent=open?"收起":"展开";if(open)wkView()}
+function wkPick(span,from,to,since){wkSpan=span||"";wkFrom=from||"";wkTo=to||"";wkSince=since||"";wkPickSat="";wkCardOpen="";wkView()}
+document.getElementById("wkhd").addEventListener("click",()=>wkFold(!wkOpen));
+document.querySelectorAll("#wkbar .tq").forEach(b=>b.addEventListener("click",()=>wkPick(b.dataset.s)));
+document.getElementById("wkver").addEventListener("change",e=>{const v=e.target.value;if(v)wkPick("","","",v);else wkPick("4w")});
+document.getElementById("wkgo").addEventListener("click",()=>{const f=document.getElementById("wkfrom").value,t=document.getElementById("wkto").value;if(f)wkPick("",f,t||f)});
+document.querySelectorAll("#wkbar2 .tq[data-c]").forEach(b=>b.addEventListener("click",()=>{wkScope=b.dataset.c;wkPickSat="";wkCardOpen="";try{localStorage.setItem("jrnwkscope",wkScope)}catch(e){}wkView()}));
+document.querySelectorAll("#wkbar2 .tq[data-m]").forEach(b=>b.addEventListener("click",()=>{wkMode=b.dataset.m;try{localStorage.setItem("jrnwkmode",wkMode)}catch(e){}wkView()}));
+document.getElementById("wkbody").hidden=!wkOpen;document.getElementById("foldwk").textContent=wkOpen?"收起":"展开";
 document.getElementById("tcard").addEventListener("change",e=>{tallyKey=e.target.value;try{localStorage.setItem("jrntallykey",tallyKey)}catch(err){}tallyLoad(0)});
 document.querySelectorAll("#tallybody .tq").forEach(b=>b.addEventListener("click",()=>{tallyRng=b.dataset.r;tallyLoad(0)}));
-document.querySelectorAll("#cbar .tq").forEach(b=>b.addEventListener("click",()=>cardsPick(b.dataset.r)));  // 按市场's days (1.151.0)
+document.querySelectorAll("#cbar .tq[data-r]").forEach(b=>b.addEventListener("click",()=>cardsPick(b.dataset.r)));  // 按市场's days (1.151.0)
+document.querySelectorAll("#cweek .tq").forEach(b=>b.addEventListener("click",()=>{cardWeek=b.dataset.w;cardOpen="";  // 1.154.80: 仅周末 / 仅工作日
+  document.querySelectorAll("#cweek .tq").forEach(x=>x.classList.toggle("on",x===b));summary()}));
+document.querySelectorAll("#evweek .tq").forEach(b=>b.addEventListener("click",()=>{evWeek=b.dataset.w;
+  document.querySelectorAll("#evweek .tq").forEach(x=>x.classList.toggle("on",x===b));analysis()}));
 document.getElementById("cver").addEventListener("change",e=>{const v=e.target.value;if(v)cardsPick("","","",v);else cardsPick("today")});  // 1.154.70: since a version
-document.querySelectorAll("#evbar .tq").forEach(b=>b.addEventListener("click",()=>evPick(b.dataset.r)));  // 1.154.70: 模型 EV 对实际盈亏's span
+document.querySelectorAll("#evbar .tq[data-r]").forEach(b=>b.addEventListener("click",()=>evPick(b.dataset.r)));  // 1.154.70: 模型 EV 对实际盈亏's span
 document.getElementById("evver").addEventListener("change",e=>{const v=e.target.value;if(v)evPick("","","",v);else evPick("30d")});
 document.getElementById("evgo").addEventListener("click",()=>{const f=document.getElementById("evfrom").value,t=document.getElementById("evto").value;if(f)evPick("",f,t||f)});
 document.getElementById("cgo").addEventListener("click",()=>{const f=document.getElementById("cfrom").value,t=document.getElementById("cto").value;if(f)cardsPick("",f,t||f)});
@@ -18968,15 +19107,24 @@ class WebServer:
             return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_analysis(flt), ensure_ascii=False, default=str).encode("utf-8"))
         arg = lambda key: (params.get(key) or [""])[0].strip()[:10]
         since = (params.get("since") or [""])[0].strip()[:16]  # 1.154.70: from a version's first run (ms), to the minute
+        week = journal_week(arg("week"))  # 1.154.80: 按市场 / 模型 EV / a line's records over the weekend's alone, or the weekdays'
+        if flag("weekend"):  # 1.154.80: 周末数据 — a preset of weekends, days, or since a version; the round-the-clock cards or every card
+            scope = "all" if arg("scope") == "all" else "crypto"
+            span = arg("span") if arg("span") in WEEKEND_SPANS else "" if (arg("from") or since) else "4w"
+            name = f"journal.json?weekend&span={span}&from={arg('from')}&to={arg('to')}&since={since}&scope={scope}"
+            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_weekend(span, arg("from"), arg("to"), since, scope),
+                                                                    ensure_ascii=False, default=str).encode("utf-8"))
         if flag("cards"):  # 按市场 over a range of days (1.151.0): today, yesterday, 7d, 30d, all, or from..to — or since a version (1.154.70)
             flt = journal_filter_of(params)
-            name = f"journal.json?cards&range={arg('range')}&from={arg('from')}&to={arg('to')}&since={since}" + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
-            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_cards(flt, arg("from"), arg("to"), arg("range"), since),
+            name = (f"journal.json?cards&range={arg('range')}&from={arg('from')}&to={arg('to')}&since={since}&week={week}"
+                    + "".join(f"&{k}={v}" for k, v in sorted(flt.items())))
+            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_cards(flt, arg("from"), arg("to"), arg("range"), since, week),
                                                                     ensure_ascii=False, default=str).encode("utf-8"))
         if flag("ev"):  # 模型 EV 对实际盈亏 over a span (1.154.70): the same presets, days, or since a version
             flt = journal_filter_of(params)
-            name = f"journal.json?ev&range={arg('range')}&from={arg('from')}&to={arg('to')}&since={since}" + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
-            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_ev(flt, arg("from"), arg("to"), arg("range"), since),
+            name = (f"journal.json?ev&range={arg('range')}&from={arg('from')}&to={arg('to')}&since={since}&week={week}"
+                    + "".join(f"&{k}={v}" for k, v in sorted(flt.items())))
+            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_ev(flt, arg("from"), arg("to"), arg("range"), since, week),
                                                                     ensure_ascii=False, default=str).encode("utf-8"))
         if flag("rows"):  # the records of a card (the filter) opened on a day, as list rows: under a line of 今日按市场 (1.114.0); or over a range (1.151.0)
             flt, day, lean = journal_filter_of(params), arg("day"), flag("lean")
@@ -18984,9 +19132,9 @@ class WebServer:
             if ranged:
                 today = dt.datetime.fromtimestamp(self.bot.market.now_ms() / 1000, BEIJING).date()
                 first, last = journal_days(arg("from"), arg("to"), arg("range"), today, CARDS_MAX_DAYS)
-            name = ("journal.json?rows&day=" + day + (f"&from={first}&to={last}" if ranged else "") + ("&lean=1" if lean else "")
+            name = ("journal.json?rows&day=" + day + (f"&from={first}&to={last}" if ranged else "") + ("&lean=1" if lean else "") + (f"&week={week}" if week else "")
                     + "".join(f"&{k}={v}" for k, v in sorted(flt.items())))
-            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_rows(flt, day, lean, *((first, last) if ranged else ())),
+            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_rows(flt, day, lean, *((first, last) if ranged else (None, None)), week),
                                                                     ensure_ascii=False, default=str).encode("utf-8"))
         full, everything = flag("full"), flag("all")
         name = "journal.json" + ("?full" if full else "?all" if everything else "")
@@ -21482,8 +21630,9 @@ class Bot:
                 "/export 日记 [筛选] —— 原策略每一笔：时间、市场、挂 / 吃、价格、公平价、净优势、结果、盈亏、撤单原因、数据来源、成交后市场走向（= /journal）\n"
                 "/export 汇总 [筛选] —— 复盘页的统计表：每日、按市场、按净优势 / 公平价 / 时段、按设置版本、挂单效率与撤单原因、被拦下的机会（= /summary）\n"
                 "/export 样本 —— 模型样本：每个市场在固定剩余时间记的公平价、盘口、σ 和结果（= /samples）\n"
-                "/export 预挂 [范围] [全部] —— 两个文件：①预挂记录，一条一行（卡、场次、档位、两边挂出和成交、结果、盈亏、提前多久挂上、多久成交）；"
-                "②预挂统计表（合计、按天、按卡、按档位含预期对实际、按开始小时、按方向、周末对工作日）。不写“全部”只出有成交的记录\n"
+                "/export 预挂 [范围] [全部] [周末] —— 两个文件：①预挂记录，一条一行（卡、场次、档位、两边挂出和成交、结果、盈亏、提前多久挂上、多久成交）；"
+                "②预挂统计表（合计、按天、按卡、按档位含预期对实际、按开始小时、按方向、周末对工作日）。不写“全部”只出有成交的记录；"
+                "写“周末”只出北京时间周六 00:00 到周一 08:00 开场的（“工作日”是其余的）\n"
                 "/export 规则 —— 规则吃单每一场：卖单几点出现、多久被吃光、要了多少买到多少、结果、盈亏\n"
                 "/export 校准 —— 两个文件：①概率模型回测报告全文（= /calib all）；②日涨跌卡（三个指数和个股）的模型快照，每 30 分钟一条：当时的公平价、σ、β、盘口价和后来的收盘\n"
                 "/export 预挂明细 [卡] [范围] —— 预挂每条有成交的记录：两边各自几点第一次成交（距开场几秒）、那一刻的标的价、起点价和终点价、成交到开场标的走了多少、结果、盈亏；"
@@ -21587,17 +21736,26 @@ class Bot:
         return Document(name, bytes(out), f"交易日记完整记录 {len(trades)} 笔（{scope}）：gzip 压缩的 JSON，解压后 trades 里一笔一条，带下单时的快照和每次成交、撤单的经过",
                         "application/gzip")
 
+    EXPORT_WEEKS = {"周末": "weekend", "weekend": "weekend", "工作日": "weekday", "weekday": "weekday"}  # 1.154.80: /export 预挂 … 周末
+
     async def export_preopen(self, words: list[str]) -> Any:
-        """/export 预挂 [范围] [全部]: the pre-open mode's records, a row each (preopen_records_csv), and its review's tables
-        (preopen_summary_csv)."""
+        """/export 预挂 [范围] [全部] [周末 | 工作日]: the pre-open mode's records, a row each (preopen_records_csv), and its review's
+        tables (preopen_summary_csv). 1.154.80: 周末 — the windows starting on the weekend alone (Saturday 00:00 to Monday 08:00
+        Beijing, as PREOPEN_WEEKEND draws it), 工作日 — the others'."""
+        week = next((self.EXPORT_WEEKS[w.strip().lower()] for w in words if w.strip().lower() in self.EXPORT_WEEKS), "")
+        words = [w for w in words if w.strip().lower() not in self.EXPORT_WEEKS]
         d0, d1, _, everything, given = self.export_days(words, "all", CARDS_MAX_DAYS)
         day_ms = lambda d: int(dt.datetime(d.year, d.month, d.day, tzinfo=BEIJING).timestamp() * 1000)
         lo, hi = (day_ms(d0), day_ms(d1 + dt.timedelta(days=1))) if given else (None, None)
         rows = self.preopen_rows()
+        if week:
+            rows = [p for p in rows if at_week(int(p.get("start_ms") or 0), week)]
         data, n, filled = await self.preopen_records_csv(rows, lo, hi, everything)
         if not n:
-            return "预挂没有记录（开盘前预挂没开过，或这段时间没有" + ("挂单" if everything else "成交；加“全部”连没成交的也导出") + "）"
-        span = f"{d0:%m-%d} 至 {d1:%m-%d} 开场的" if given else "全部日期"
+            return ("预挂没有记录（开盘前预挂没开过，或这段时间" + ("的" + JOURNAL_WEEKS[week].removeprefix("仅") if week else "") + "没有"
+                    + ("挂单" if everything else "成交；加“全部”连没成交的也导出") + "）")
+        span = (f"{d0:%m-%d} 至 {d1:%m-%d} 开场的" if given else "全部日期") + (f"，{JOURNAL_WEEKS[week]}（北京时间周六 00:00 到周一 08:00 开场的"
+                                                                         + ("" if week == "weekend" else "以外") + "）" if week else "")
         docs = [Document(f"preopen-records-{self.export_stamp()}.csv", data,
                          f"预挂记录 {n} 条（{span}，{'含没成交的' if everything else '只有有成交的'}；其中有成交 {filled} 条）：一条记录 = 一场的一个档位的一次挂单，"
                          "涨跌两边在同一行；更早的、没成交且已撤的旧记录已归档，不在这个文件里")]
@@ -27046,12 +27204,16 @@ class Bot:
         """The rule taker's records (LiveBot.rules_records); none here, where there is no real trading module."""
         return {}
 
-    def preopen_cards(self, first: str, last: str, since_ms: int = 0) -> list[dict]:
+    def preopen_cards(self, first: str, last: str, since_ms: int = 0, week: str = "") -> list[dict]:
         """The pre-open mode's 按市场 rows over the Beijing dates ``first``..``last`` (LiveBot.preopen_cards); none here."""
         return []
 
-    def preopen_levels(self, first: str, last: str, since_ms: int = 0) -> dict | None:
+    def preopen_levels(self, first: str, last: str, since_ms: int = 0, week: str = "") -> dict | None:
         """The pre-open mode's 预挂按价格档位 over those dates (LiveBot.preopen_levels, 1.154.35); None here: the block is not shown."""
+        return None
+
+    def preopen_weekend(self, first: str, last: str, since_ms: int = 0, scope: str = "crypto") -> dict | None:
+        """The pre-open mode's 周末数据 (LiveBot.preopen_weekend, 1.154.80); None here, where there is no mode."""
         return None
 
     VERSION_LIST_MAX = 12  # the review page's 版本更新起 list (1.154.70): this many of the latest versions
@@ -27078,29 +27240,36 @@ class Bot:
         out = sorted(starts.items(), key=lambda kv: kv[1], reverse=True)[:self.VERSION_LIST_MAX]
         return [{"version": v, "at": at, "label": f"{v} 起（{dt.datetime.fromtimestamp(at / 1000, BEIJING):%m-%d %H:%M}）"} for v, at in out]
 
-    def journal_ev(self, flt: Mapping | None = None, frm: str = "", to: str = "", rng: str = "", since: str = "") -> dict:
+    def journal_ev(self, flt: Mapping | None = None, frm: str = "", to: str = "", rng: str = "", since: str = "", week: str = "") -> dict:
         """journal.json?ev=1&range=… | from=…&to=… | since=<ms> (1.154.70): 模型 EV 对实际盈亏 over the span the review page picked —
         a preset, days, or from a version's first run to now (journal_span) — the model trader's records in ``flt`` and,
-        unfiltered, the pre-open mode's fills, as sim_ev makes them for the last EV_DAYS days."""
+        unfiltered, the pre-open mode's fills, as sim_ev makes them for the last EV_DAYS days. 1.154.80: ``week`` — the bets of the
+        weekend alone, or of the weekdays (at_week: a record's order, a window's start)."""
         flt = dict(flt or {})
         now_ms = self.market.now_ms()
         d0, d1, since_ms, label = journal_span(frm, to, rng, since, now_ms, CARDS_MAX_DAYS, self.version_starts())
+        week = journal_week(week)
+        label += f" · {JOURNAL_WEEKS[week]}" if week else ""
         trades = [t for t in self.sim_trades().values() if journal_match(t, flt)] if flt else None
-        return {"version": VERSION, "server_ms": now_ms, "from": d0.isoformat(), "to": d1.isoformat(), "since": since_ms, "label": label,
-                "ev": self.sim_ev(trades, preopen=not flt, first=d0.isoformat(), last=d1.isoformat(), since_ms=since_ms, label=label)}
+        return {"version": VERSION, "server_ms": now_ms, "from": d0.isoformat(), "to": d1.isoformat(), "since": since_ms, "label": label, "week": week,
+                "ev": self.sim_ev(trades, preopen=not flt, first=d0.isoformat(), last=d1.isoformat(), since_ms=since_ms, label=label, week=week)}
 
-    def journal_cards(self, flt: Mapping | None = None, frm: str = "", to: str = "", rng: str = "", since: str = "") -> dict:
+    def journal_cards(self, flt: Mapping | None = None, frm: str = "", to: str = "", rng: str = "", since: str = "", week: str = "") -> dict:
         """journal.json?cards=1&range=today | yesterday | 7d | 30d | all (or &from=<date>&to=<date>) — the review page's 按市场
         over a range of days (1.151.0; 今日按市场 was today's alone): the model trader's records in ``flt`` opened on those
         Beijing days, per card (sim_by_card: the figures, the settled P&L against the model's expectation in σ), and —
         unfiltered — the pre-open mode's windows starting on them (preopen_cards: where each card's money went, card_diag).
-        1.154.70: or &since=<ms> — from a version's first run here to now (journal_span), to the minute."""
+        1.154.70: or &since=<ms> — from a version's first run here to now (journal_span), to the minute. 1.154.80: &week=weekend |
+        weekday — the records opened on the weekend alone (Saturday 00:00 to Monday 08:00 Beijing), or on the weekdays; the
+        pre-open mode's windows by their start."""
         flt = dict(flt or {})
         now_ms = self.market.now_ms()
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         d0, d1, since_ms, label = journal_span(frm, to, rng, since, now_ms, CARDS_MAX_DAYS, self.version_starts())
+        week = journal_week(week)
+        label += f" · {JOURNAL_WEEKS[week]}" if week else ""
         opened = lambda t: (d0 <= dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date() <= d1
-                            and int(t.get("opened") or 0) >= since_ms)
+                            and int(t.get("opened") or 0) >= since_ms and at_week(int(t.get("opened") or 0), week))
         trades = [t for t in self.sim_trades().values() if journal_match(t, flt) and opened(t)]
         markets: dict[str, SimMarket] = {}
         if any(t["status"] in {"resting", "filled"} for t in trades):
@@ -27111,14 +27280,47 @@ class Bot:
         rows = sim_by_card(trades, self.sim_marks(markets, now_ms))
         levels = None
         if not flt:  # the filter bar picks the model trader's records; the pre-open mode's rows stand beside them unfiltered (as in sim_analysis)
-            rows += self.preopen_cards(d0.isoformat(), d1.isoformat(), since_ms)
-            levels = self.preopen_levels(d0.isoformat(), d1.isoformat(), since_ms)  # 1.154.35: 预挂按价格档位 under 按市场, on its days
+            rows += self.preopen_cards(d0.isoformat(), d1.isoformat(), since_ms, week)
+            levels = self.preopen_levels(d0.isoformat(), d1.isoformat(), since_ms, week)  # 1.154.35: 预挂按价格档位 under 按市场, on its days
         return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）", "filter": flt,
                 "from": d0.isoformat(), "to": d1.isoformat(), "today": today.isoformat(), "since": since_ms,
-                "range": rng if not since_ms and (rng in JOURNAL_RANGES or rng == "all") else "", "label": label, "rows": rows, "preopen_levels": levels}
+                "range": rng if not since_ms and (rng in JOURNAL_RANGES or rng == "all") else "", "label": label, "week": week, "rows": rows, "preopen_levels": levels}
+
+    def journal_weekend(self, span: str = "4w", frm: str = "", to: str = "", since: str = "", scope: str = "crypto") -> dict:
+        """journal.json?weekend=1&span=last | 4w | 8w | all (or &from=…&to=…, &since=<ms>) &scope=crypto | all — the review page's
+        周末数据 (1.154.80): the span as weekend_span draws it; the pre-open mode's weekend (preopen_weekend: the windows by their
+        start, the round-the-clock cards alone unless ``scope`` is "all") and the model trader's (its records by their order:
+        the weekend's against the weekdays', by card, weekend by weekend — every card: its own markets say which trade then)."""
+        from preopen import WEEKEND_END_HOUR, on_weekend, weekend_label, weekend_of
+        now_ms = self.market.now_ms()
+        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+        scope = "all" if scope == "all" else "crypto"
+        span = span if span in WEEKEND_SPANS else ""
+        d0, d1, since_ms, label = weekend_span(span, frm, to, since, now_ms, self.version_starts())
+        at = lambda t: int(t.get("opened") or 0)
+        trades = [t for t in self.sim_trades().values()
+                  if d0 <= dt.datetime.fromtimestamp(at(t) / 1000, BEIJING).date() <= d1 and at(t) >= since_ms]
+        markets: dict[str, SimMarket] = {}
+        if any(t["status"] in {"resting", "filled"} for t in trades):
+            try:
+                markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
+            except Exception as error:  # the rows still come; open trades just cannot be marked
+                LOG.warning("journal: markets unavailable: %s", clean_error(error) or type(error).__name__)
+        marks = self.sim_marks(markets, now_ms)
+        row = lambda name, rows: {"name": name, **summary_of(rows, marks), **settled_extras(rows), "luck": luck_of(sim_ev_bets(rows))}
+        weekend = [t for t in trades if on_weekend(at(t))]
+        by_weekend: dict[str, list[dict]] = {}
+        for t in weekend:
+            by_weekend.setdefault(weekend_of(at(t)), []).append(t)
+        sim = {"compare": [row(f"周末（周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00）", weekend), row("工作日", [t for t in trades if not on_weekend(at(t))])],
+               "cards": sim_by_card(weekend, marks),
+               "weekends": [{**row(weekend_label(sat), by_weekend[sat]), "sat": sat} for sat in sorted(by_weekend, reverse=True)]}
+        return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）", "from": d0.isoformat(), "to": d1.isoformat(),
+                "today": today.isoformat(), "since": since_ms, "span": span, "label": label, "scope": scope,
+                "preopen": self.preopen_weekend(d0.isoformat(), d1.isoformat(), since_ms, scope), "sim": sim}
 
     def sim_ev(self, trades: list[dict] | None = None, preopen: bool = True, first: str = "", last: str = "", since_ms: int = 0,
-               label: str = "") -> dict:
+               label: str = "", week: str = "") -> dict:
         """模型 EV 对实际盈亏 (sim_ev_timeline, 1.140.0) over ``trades`` (every record when None) and, when ``preopen``, the
         pre-open mode's settled fills (preopen.ev_bets: each window one coin-flip bet at its price, 1.150.x) — the last EV_DAYS
         days, or the span given (1.154.70: journal_ev)."""
@@ -27126,6 +27328,8 @@ class Bot:
         if preopen and (rows := self.preopen_rows()):
             from preopen import ev_bets
             bets += ev_bets(rows)
+        if week:  # 1.154.80: the weekend's bets alone, or the weekdays'
+            bets = [b for b in bets if at_week(int(b["at"]), week)]
         return sim_ev_timeline(bets, self.market.now_ms(), first=first, last=last, since_ms=since_ms, label=label)
 
     SIM_EV_CHECK_SECONDS = 3600  # the EV check's cadence (sim_step)
@@ -27339,7 +27543,7 @@ class Bot:
                 "summary": self.summary_rows(values, marks, flt), "analysis": self.sim_analysis(values, marks, flt)}
 
     def journal_rows(self, flt: Mapping | None = None, day: str = "", lean: bool = False, first: dt.date | None = None,
-                     last: dt.date | None = None) -> dict:
+                     last: dt.date | None = None, week: str = "") -> dict:
         """The records in ``flt`` (journal_filter_of) opened on ``day`` — a Beijing date, "today" for the bot's, "" (or
         one that does not read) for any day — as list rows (journal_row), newest first, with summary_of them: what
         the review page shows under a line of 今日按市场 (journal.json?rows=1&day=today&card=…, 1.114.0) and under a
@@ -27359,7 +27563,8 @@ class Bot:
             opened_on = lambda t: first <= dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date() <= last
         else:
             opened_on = lambda t: wanted is None or dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date() == wanted
-        trades = sorted(((tid, t) for tid, t in self.sim_trades().items() if journal_match(t, flt) and opened_on(t)),
+        week = journal_week(week)  # 1.154.80: 按市场 over the weekend's alone, or the weekdays'
+        trades = sorted(((tid, t) for tid, t in self.sim_trades().items() if journal_match(t, flt) and opened_on(t) and at_week(int(t.get("opened") or 0), week)),
                         key=lambda kv: kv[1].get("opened", 0), reverse=True)
         values = [t for _, t in trades]
         markets: dict[str, SimMarket] = {}
